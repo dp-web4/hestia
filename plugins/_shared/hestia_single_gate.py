@@ -549,6 +549,11 @@ class _Invocation:
     role: Optional[str] = None
     notices: list = field(default_factory=list)
     warnings: list = field(default_factory=list)   # [(rule, reason, verdict_available)]
+    #: Refused paths a scope escalation lifted, to be SPENT atomically only once society law has
+    #: permitted the act (Codex review of #1232, P2). Empty = nothing to spend.
+    scope_spend: list = field(default_factory=list)
+    scope_rule: str = ""
+    scope_act_digest: str = ""
 
     budget: float = DEFAULT_DEADLINE_SECONDS
     registered: Optional[RegisteredSurface] = None
@@ -1125,11 +1130,19 @@ def _local_law(inv: _Invocation, nev: core.NormalizedEvent,
         # its own (C10: gemini's MCP command scoping, now every seat's). Same law, same order.
         views = [nev] + [core.NormalizedEvent(tool=nev.tool, command=s, cwd=nev.cwd, raw=nev.raw)
                          for s in mcp_transport_reach(inv.event)]
-        for view in views:
+        for i, view in enumerate(views):
             v = core.evaluate(view, cprofile, workspace, policy=policy)
             if v.blocks:
                 # The rollout softens a TUNABLE policy disagreement, and only when there IS a policy.
                 if v.innate or inv.rollout == "enforce":
+                    # A scope refusal of the ACT ITSELF is an escalation (#1232): a request a
+                    # NOT-SAME peer rules. The MCP transport's own reach (views[1:]) is operator
+                    # configuration, not an act a peer could rule on, and stays a plain refusal.
+                    if i == 0 and v.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(v, "target", ""):
+                        d = _scope_escalation(inv, nev, cprofile, policy, v)
+                        if d is not None:
+                            return d, False
+                        continue
                     return _verdict_deny(v), False
                 inv.warnings.append((v.rule, v.reason, True))
         return None, False
@@ -1148,6 +1161,126 @@ def _local_law(inv: _Invocation, nev: core.NormalizedEvent,
               f"(in every rollout mode)")
     return _verdict_deny(core._deny("gate.degraded", reason, innate=True),
                          verdict_available=False, anomaly=True), True
+
+
+#: How many distinct refused paths one act may carry into the scope escalation. Each is one local
+#: re-evaluation and at most two daemon round trips, all inside the phase deadline.
+SCOPE_CLAIM_MAX_PATHS = 8
+
+
+def _claimed_scope_entry(target: str) -> str:
+    """The `in_scope` entry a lifted refusal adds for THIS act's re-evaluation only. A glob reach
+    (`dir/*`, see the core's `_glob_probe`) needs the subtree; anything else exactly its path. An
+    unenumerated target (`core.UNPRICEABLE_PREFIX…`) is added as itself: the core reads it as the
+    once-only lift of what it could not enumerate, in this trial scope and nowhere else."""
+    if target.endswith("/*"):
+        return "path:" + (target[:-2] or "/") + core.RECURSIVE_SUFFIX
+    return "path:" + target
+
+
+def _scope_request_path(target: str, act_digest: str) -> str:
+    """The path the daemon's scope request is keyed on. A real path is itself. An UNENUMERATED
+    target names no path (dp, 2026-10-10: nothing an expansion produces is modelled), so its
+    request is keyed on the ACT: the sentinel plus the first 16 hex of the complete-act digest.
+    Two different unenumerated acts are two requests (the (member, path) dedup would otherwise
+    answer act B with act A's pending id), and the daemon grants such a request ONCE or not at
+    all — there is no path a session or standing grant could name."""
+    if target.startswith(core.UNPRICEABLE_PREFIX):
+        return f"{target}#{act_digest[:16]}"
+    return target
+
+
+def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
+                      cprofile: core.HarnessProfile, policy, v: core.Verdict) -> Optional[GateDecision]:
+    """A scope refusal becomes an ESCALATION (dp, 2026-10-05: "escalation should allow standing
+    grants"). Returns None when every refused path is lifted LOCALLY (the act then meets society
+    law, and only after society permits is anything spent — `_spend_scope`), else the refusal
+    naming the scope request(s) the operator now holds. NOTHING IS CONSUMED HERE.
+
+    1. Collect, LOCALLY, every path this act is refused on: re-evaluate with each refused path
+       provisionally added. If the act still has an unclaimed refused path at
+       SCOPE_CLAIM_MAX_PATHS, collection is INCOMPLETE: refuse before asking the daemon anything
+       (Codex review of #1232, P2 — the old shape spent four approvals, then denied on a fifth).
+    2. PEEK every path (`spend: false`): this opens or re-finds requests and reports approvals,
+       consuming none. The binding is `act_digest` over the COMPLETE act (P1-1), never the
+       masked summary, which travels only for display.
+    3. Lifted only if every path is `approved` or `in_force` AND the act, re-judged with all of
+       them added, passes. The one-time approvals are recorded on `inv.scope_spend` and spent in
+       ONE atomic call after society law permits the act — a denied act consumes nothing."""
+    import dataclasses
+    ws = core.detect_workspace(cprofile)
+    targets, cur = [], v
+    while cur.blocks and cur.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(cur, "target", ""):
+        if cur.target in targets:
+            break
+        if len(targets) >= SCOPE_CLAIM_MAX_PATHS:
+            return _verdict_deny(core._deny(
+                v.rule, v.reason + f" The act is refused on more than {SCOPE_CLAIM_MAX_PATHS} "
+                f"paths, so it was not escalated and nothing was claimed: split it.",
+                innate=bool(v.innate), target=v.target))
+        targets.append(cur.target)
+        trial = dataclasses.replace(policy, scope=tuple(policy.scope)
+                                    + tuple(_claimed_scope_entry(t) for t in targets))
+        cur = core.evaluate(nev, cprofile, ws, policy=trial)
+    if cur.blocks:
+        # Another rule refuses regardless (or a scope refusal with no target to escalate):
+        # nothing to escalate, nothing asked.
+        return _verdict_deny(cur if cur.rule not in mechanism.SCOPE_ESCALATING_RULES else v)
+
+    prof, ev = inv.profile, inv.event
+    digest = mechanism.scope_act_digest(ev.tool, ev.tool_input, ev.cwd, ev.session_id)
+
+    def ask(target: str):
+        try:
+            got = _bounded(inv.phase_deadline, mechanism.claim_scope,
+                           _scope_request_path(target, digest), ev.tool,
+                           inv.attempted, v.rule, plugin_id=prof.member_id, role=_role(inv),
+                           client_name=_client_name(prof), host_session_id=ev.session_id,
+                           spend=False, act_digest=digest, deadline=inv.phase_deadline)
+        except Exception:  # noqa: BLE001 — an unusable mechanism opens nothing and lifts nothing
+            got = None
+        if got is _LATE or not isinstance(got, tuple):
+            return ("unknown", "the daemon did not answer inside the gate's deadline; re-issuing "
+                    "this identical act is safe — it finds the same request", None)
+        return got
+
+    answers = [(t,) + ask(t) for t in targets]
+    if all(a[1] in ("approved", "in_force") for a in answers):
+        inv.scope_spend = list(targets)
+        inv.scope_rule = v.rule
+        inv.scope_act_digest = digest
+        for t, verdict, detail, _rid in answers:
+            inv.notices.append(f"hestia: scope {verdict} for {t} — {detail}")
+        return None
+
+    notes, first_id = [], None
+    for t, verdict, detail, rid in answers:
+        if verdict in ("approved", "in_force"):
+            continue
+        if rid and first_id is None:
+            first_id = rid
+        if verdict in ("opened", "pending") and t.startswith(core.UNPRICEABLE_PREFIX):
+            notes.append(f"Scope request {rid} is {'open' if verdict == 'opened' else 'still pending'} "
+                         f"for THIS ACT — the gate cannot enumerate what it reaches, so a NOT-SAME "
+                         f"peer (or the operator) can approve it only ONCE, as written; no session "
+                         f"or standing grant can cover it. Watch it with hestia_scope_status and "
+                         f"re-issue this identical act afterwards, or rewrite it with every path "
+                         f"spelled out literally.")
+        elif verdict in ("opened", "pending"):
+            notes.append(f"Scope request {rid} is {'open' if verdict == 'opened' else 'still pending'} "
+                         f"for '{t}' — a NOT-SAME peer decides it (this act once, for the session, "
+                         f"or standing; exact or recursive), the operator may override, and you "
+                         f"cannot decide it yourself. Watch it with hestia_scope_status and "
+                         f"re-issue this identical act afterwards.")
+        elif verdict == "refused":
+            notes.append(f"Scope request {rid} for '{t}' was REFUSED ({detail}); "
+                         f"re-issuing does not re-open it inside its window.")
+        else:
+            notes.append(f"No scope request could be opened for '{t}' ({detail}); ask with "
+                         f"hestia_request_scope (one path, with a reason).")
+    reason = v.reason + " " + " ".join(notes)
+    return GateDecision("deny", v.rule, reason, v.remedy, innate=bool(v.innate),
+                        escalation_id=first_id)
 
 
 def _society(inv: _Invocation) -> GateDecision:
@@ -1223,7 +1356,85 @@ def _sequence(inv: _Invocation, permitted_roles: str) -> GateDecision:
     # EVERY act asks the governor, reads included (dp 2026-10-01: align upward). A read-class
     # permit that fails to commit keeps the C11 read posture (allowed, anomaly surfaced); a
     # write/exec permit that fails to commit becomes gate.evidence_uncommitted.
-    return _finalize(inv, _society(inv), consequential=nev.tool not in core.READ_CLASS)
+    d = _society(inv)
+    consequential = nev.tool not in core.READ_CLASS
+    if inv.scope_spend and d.decision != "deny":
+        # Society permitted the act. The one-time scope approvals it needs are RESERVED now,
+        # the final verdict and its evidence are recorded, and only then are they COMMITTED
+        # (the act stands) or RELEASED (the act was denied after all) — Codex re-review of
+        # #1232, P2: a denied act consumes nothing, and an unknown outcome is reported as
+        # unknown, never as "nothing was consumed".
+        return _scope_reserve_finalize_settle(inv, d, consequential)
+    return _finalize(inv, d, consequential=consequential)
+
+
+def _scope_rpc(inv: _Invocation, op: str, key: str, paths=(), end: Optional[float] = None) -> tuple:
+    """One reserve/commit/release/lookup, bounded by `end` (an absolute monotonic deadline that
+    the mechanism also checks before EVERY request). Returns (state, detail); a call abandoned
+    in flight is `uncertain`."""
+    prof, ev = inv.profile, inv.event
+    end = inv.phase_deadline if end is None else end
+    try:
+        got = _bounded(end, mechanism.scope_batch, op, key, inv.scope_act_digest, tuple(paths),
+                       plugin_id=prof.member_id, role=_role(inv), client_name=_client_name(prof),
+                       host_session_id=ev.session_id, deadline=end)
+    except Exception:  # noqa: BLE001
+        got = None
+    if got is _LATE or not isinstance(got, tuple):
+        return mechanism.SCOPE_UNCERTAIN, "no answer inside the deadline"
+    return got
+
+
+def _scope_reserve_finalize_settle(inv: _Invocation, d: GateDecision, consequential: bool) -> GateDecision:
+    ev = inv.event
+    paths = [_scope_request_path(t, inv.scope_act_digest) for t in inv.scope_spend]
+    key = mechanism.scope_op_key(inv.scope_act_digest, inv.key, paths)
+    rule = inv.scope_rule or "mrh.command"
+    state, detail = _scope_rpc(inv, "reserve", key, paths)
+    if state == mechanism.SCOPE_UNCERTAIN:
+        # The reserve went out and no answer came: ask what became of this operation.
+        look, _ = _scope_rpc(inv, "lookup", key)
+        if look == "reserved":
+            state = "reserved"
+        elif look == "unknown":
+            state, detail = "not_reserved", "the reserve did not land (lookup: unknown)"
+    if state != "reserved":
+        if state == mechanism.SCOPE_UNCERTAIN:
+            # Withdraw whatever may have been reserved; say what is and is not known.
+            rel, _ = _scope_rpc(inv, "release", key)
+            consumed = ("nothing was consumed (the release confirmed it)"
+                        if rel in ("released", "unknown", "settled") else
+                        f"UNCERTAIN whether an approval was reserved — if it was, it lapses into "
+                        f"spent in at most {mechanism_reservation_secs()} s; look up operation "
+                        f"{key[:16]}… with hestia_scope_claim op=lookup")
+        else:
+            consumed = "nothing was consumed" if state in ("not_all", "not_sent", "not_reserved",
+                                                           "unknown") else \
+                f"the daemon answered '{state}' ({detail})"
+        refused = _verdict_deny(core._deny(
+            rule, f"'{ev.tool}' was lifted by one-time scope approvals that could not be "
+                  f"reserved ({state}: {detail}); {consumed}.", target=inv.scope_spend[0]))
+        return _finalize(inv, refused, consequential=False)
+    out = _finalize(inv, d, consequential=consequential)
+    if out.blocks:
+        # The act ended DENIED (e.g. its evidence did not commit): give the approvals back.
+        st, _ = _scope_rpc(inv, "release", key, end=inv.deadline)
+        note = ("hestia: scope approvals released — the act was denied, nothing consumed"
+                if st in ("released", "settled", "unknown") else
+                f"hestia: scope approval release UNCERTAIN ({st}) — if it did not land, the "
+                f"reservation lapses into spent; operation {key[:16]}…")
+    else:
+        st, _ = _scope_rpc(inv, "commit", key, end=inv.deadline)
+        note = (f"hestia: scope approvals spent for {', '.join(inv.scope_spend)}"
+                if st in ("committed", "settled") else
+                f"hestia: scope approval commit UNCERTAIN ({st}) — an unreported reservation "
+                f"lapses into spent, so the approval is consumed either way; operation {key[:16]}…")
+    return replace(out, notices=tuple(out.notices) + (note,))
+
+
+def mechanism_reservation_secs() -> int:
+    """The daemon's reservation window, as the deny text states it (`SCOPE_RESERVATION_SECS`)."""
+    return 120
 
 
 def _unbounded(bound: HarnessBound, profile: Any, event: Any, mode: str,

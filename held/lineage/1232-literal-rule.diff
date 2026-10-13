@@ -1,0 +1,301 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1520,6 +1520,8 @@
+     "git": {"string_opts": {"-m", "--message", "--grep", "--author", "--format", "--pretty", "-S", "-G"}},
+ }
+ _CMD_SPECS["gawk"] = _CMD_SPECS["mawk"] = _CMD_SPECS["awk"]
++#: Heads whose `-c` value is shell code (they also disqualify the literal rule).
++_CODE_OPT_HEADS = frozenset(("su", "runuser", "script", "flock"))
+ #: Arguments that are SHELL CODE (judged as a command of their own, found writing the narrowed
+ #: battery): `eval` and `watch` take code as positionals; `su`/`runuser`/`script`/`flock` take it
+ #: as `-c`. (`sh -c` anywhere in argv — `find -exec sh -c`, `docker exec c bash -c` — is caught by
+@@ -1640,9 +1642,11 @@
+     return f"the variable {ref}"
+ 
+ 
+-def _word_value(value: str) -> str:
++def _word_value(value: str, known=None) -> str:
+     """The text a tokenised word is judged as. Raises `_Unenumerated` when an expansion's value
+-    would decide it (see `_PLACEHOLDER_PARAMS`): never a model, never a guess."""
++    would decide it (see `_PLACEHOLDER_PARAMS`): never a model, never a guess. `known` holds the
++    names `_literal_names` proved to carry ONE literal at this point of the command (dp,
++    2026-10-11); only a bare `$N` / `${N}` resolves — any operator (`${N:-x}`) stays unenumerated."""
+     if _BRACE in value:
+         raise _Unenumerated("brace expansion")
+     out, last = [], 0
+@@ -1653,6 +1657,8 @@
+             out.append("0")                      # arithmetic: a number (its bodies are judged)
+         elif ref in _PLACEHOLDER_PARAMS:
+             out.append(_PLACEHOLDER_PARAMS[ref])
++        elif known and (ref[2:-1] if ref.startswith("${") else ref[1:]) in known:
++            out.append(known[ref[2:-1] if ref.startswith("${") else ref[1:]])
+         else:
+             raise _Unenumerated(_expansion_kind(ref))
+         last = b
+@@ -1679,6 +1685,81 @@
+         self.unenum = []            # why a value the gate would judge is unenumerated
+         self.dirs = []              # literal directories relative paths may resolve under
+         self.dirs_unknown = None    # why a directory change cannot be followed
++        self.known = {}             # names bound to ONE literal so far (`_literal_names`)
++
++
++#: THE SINGLE-LITERAL-ASSIGNMENT RULE (dp's ruling, 2026-10-11, measured on #1232 first: ~45% of
++#: the once-only requests were `S=/tmp/x; cat $S/y`). A variable assigned exactly ONE literal
++#: earlier in the SAME command, and never otherwise bound, resolves to that literal where it is
++#: used as a path — and is then judged like the literal. Everything else stays unenumerated:
++#: names the shell or the environment owns; a second assignment, `unset`, `export`, `read`,
++#: `for`, `declare`/`local`/`typeset`/`readonly` (incl. `-n` namerefs), arrays (`N[i]=`,
++#: `N=(…)`), appends (`N+=`), `printf -v`, `mapfile`, `let`, `getopts`; any command that runs a
++#: string or a file as shell in this command (`eval`, `source`/`.`, `sh -c`, `watch`, `su -c`, …)
++#: or defines a function; a value with `$`, a backtick, a glob character, a brace or a `..`
++#: component; an assignment that is not a top-level statement of its own (inside `( )`, `{ }`,
++#: a loop, a branch, a function, a substitution body; entered after `&&` / `||` / `|`; ended by
++#: anything but `;`, a newline or `&&`; or a prefix to a command, which does not bind for that
++#: command's own expansions); and a use BEFORE the assignment.
++_SHELL_OWNED_NAMES = frozenset(("HOME", "PWD", "OLDPWD", "IFS", "PATH", "CDPATH", "ENV",
++                                "BASH_ENV", "SHELLOPTS", "BASHOPTS", "PS4", "UID", "EUID", "PPID",
++                                "RANDOM", "SECONDS", "LINENO", "BASH_ARGV0", "GLOBIGNORE"))
++_BINDING_COMMANDS = frozenset(("unset", "export", "read", "declare", "local", "typeset", "readonly",
++                               "for", "select", "mapfile", "readarray", "getopts", "let"))
++_CODE_COMMANDS = frozenset(("eval", "source", ".", "watch", "function"))
++
++
++def _literal_names(toks) -> set:
++    """Names that may bind (see the rule above): assigned exactly once anywhere in the token
++    stream (substitution bodies included), never bound any other way, not shell- or
++    environment-owned, and the command runs no string or file as shell and defines no function."""
++    words = [w for k, w, _g in toks if k == "word"]
++    for i, (k, w, _g) in enumerate(toks):
++        if k == "word" and (os.path.basename(w) in _CODE_COMMANDS
++                            or (w in ("-c", "--command") and i > 0 and toks[i - 1][0] == "word"
++                                and (_HEREDOC_SHELL.match(os.path.basename(toks[i - 1][1]))
++                                     or os.path.basename(toks[i - 1][1]) in _CODE_OPT_HEADS))):
++            return set()
++        if (k == "sep" and w == "(" and i > 0 and toks[i - 1][0] == "word"
++                and i + 1 < len(toks) and toks[i + 1] == ("sep", ")", False)):
++            return set()                                   # `f() …`: a function definition
++    if "printf" in words and "-v" in words:
++        return set()
++    count, banned = {}, set()
++    after_binder = False
++    for k, w, _g in toks:
++        if k != "word":
++            after_binder = False
++            continue
++        if os.path.basename(w) in _BINDING_COMMANDS:
++            after_binder = True
++            continue
++        m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?(\+)?=", w)
++        if m:
++            name = m.group(1)
++            if m.group(2) or m.group(3) or after_binder:
++                banned.add(name)                           # arrays, appends, declared/exported
++            if after_binder:
++                banned.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", w))   # `-n R=N`: N too
++            count[name] = count.get(name, 0) + 1
++            continue
++        if after_binder:
++            name = w.split("=", 1)[0]
++            if name.isidentifier():
++                banned.add(name)                           # `unset N`, `read N`, `for N`, `-n R=N`
++            for ref in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", w):
++                banned.add(ref)                            # a nameref's TARGET too (`R=N`)
++    return {n for n, c in count.items()
++            if c == 1 and n not in banned and n not in _SHELL_OWNED_NAMES and n not in os.environ}
++
++
++def _is_bindable_literal(val: str, uglob: bool) -> bool:
++    """A value that is a literal and nothing else: no `$` (live or quoted), backtick, glob
++    character, brace or `..` component."""
++    if uglob or _BRACE in val or any(c in val for c in "$`*?[{}") or _LIT_DOLLAR in val \
++            or _LIT_TICK in val:
++        return False
++    return ".." not in val.split("/")
+ 
+ 
+ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> list:
+@@ -1700,7 +1781,7 @@
+         if not _path_shaped(value, uglob):
+             return
+         try:
+-            v = _word_value(value)
++            v = _word_value(value, found.known)
+         except _Unenumerated as why:
+             found.unenum.append(str(why))
+             return
+@@ -1729,7 +1810,7 @@
+ 
+     def chdir(value, uglob):
+         try:
+-            v = _word_value(value)
++            v = _word_value(value, found.known)
+         except _Unenumerated as why:
+             found.dirs_unknown = f"a directory change to {why}"
+             return
+@@ -1740,6 +1821,11 @@
+ 
+     toks = _shell_words(cmd)
+     state = {}
++    # The literal rule binds only in the OUTER command's own statements: substitution bodies are
++    # appended after them by `_shell_words`, and a body is a subshell.
++    main_len = len(_tokenize(cmd)) if depth == 0 else 0
++    bindable = _literal_names(toks) if depth == 0 else set()
++    bind = {"pending": None, "prev_sep": ";", "paren": 0, "kw": 0}
+ 
+     def new_segment():
+         # `cd` with no argument goes HOME; `pushd` with none swaps the stack (not followed).
+@@ -1756,8 +1842,22 @@
+     new_segment()
+     loop_state = None
+     seg_words, prev = [], None
+-    for kind, w, uglob in toks:
++    for idx, (kind, w, uglob) in enumerate(toks):
+         p, prev = prev, (kind, w)
++        if bind["pending"] is not None:
++            name_, val_ = bind["pending"]
++            bind["pending"] = None
++            if kind == "sep" and w in (";", "&&"):
++                found.known[name_] = val_                  # the statement ended: N is bound
++        if kind == "sep" and w == "(":
++            bind["paren"] += 1
++        elif kind == "sep" and w == ")":
++            bind["paren"] = max(0, bind["paren"] - 1)
++        elif kind == "word" and state["head"] is None and w in ("if", "while", "until", "for",
++                                                                "case", "select", "{"):
++            bind["kw"] += 1
++        elif kind == "word" and state["head"] is None and w in ("fi", "done", "esac", "}"):
++            bind["kw"] = max(0, bind["kw"] - 1)
+         # `for V in W…; do` — V is a variable (unenumerated wherever it is used as a path); a
+         # globbed W is itself a reach.
+         if loop_state == "var" and kind == "word":
+@@ -1780,6 +1880,7 @@
+         if kind == "sep" or (kind == "word" and state["head"] is None and w in _SHELL_KEYWORDS):
+             seg_words = []
+             new_segment()
++            bind["prev_sep"] = w if kind == "sep" else "keyword"
+             continue
+         if kind == "word":
+             seg_words.append(w)
+@@ -1814,6 +1915,12 @@
+                         emit(val, uglob)
+                     elif state["env_expansion"] is None:
+                         state["env_expansion"] = name
++                if (literal and name in bindable and idx < main_len and bind["paren"] == 0
++                        and bind["kw"] == 0 and bind["prev_sep"] == ";"
++                        and _is_bindable_literal(val, uglob)):
++                    # Bound only if the NEXT token ends the statement (`;`, newline, `&&`):
++                    # a word next makes this a prefix assignment, which binds nothing here.
++                    bind["pending"] = (name, _word_value(val))
+                 continue
+             base = os.path.basename(w)
+             if base in _STDIN_ARGV:
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -1086,7 +1086,8 @@
+     stub = Stub(Policy(scope_claim=lambda p: "approved"))
+     try:
+         with _Env(m, stub.url, home):
+-            d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D"}, home)
++            # `$D` alone would now resolve (dp, 2026-10-11: one literal binds); `$E` does not.
++            d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D $E"}, home)
+         peeks = [a.get("path") for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
+         check("unenum-mixed-collects-both", d.decision == "allow" and len(peeks) == 2
+               and "/etc/hostname" in peeks and any(p.startswith(unenum + "#") for p in peeks), (d, peeks))
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -111,6 +111,7 @@
+     old_home = os.environ.get("HOME")
+     os.environ["HOME"] = fx.base
+     deny, allow, request = [], [], []
++    os.environ["SCOPE_BATTERY_ENV_SET"] = "1"
+     try:
+         deny += [
+             # plain, quoted, and the Read-parity target
+@@ -248,6 +249,10 @@
+             ("find-root-after-newline", "echo start\nfind / -maxdepth 1"),
+             # Codex review 17054 (notice 17068), P1-quote-context: a dequoted apostrophe must not
+             # hide a live substitution from the body lifter.
++            # A resolved literal is judged like the literal it is (dp, 2026-10-11).
++            ("lit-resolves-to-outside", f"S={o}/secret.txt; cat \"$S\""),
++            ("lit-resolves-under-outside-dir", f"S={o}; cat $S/secret.txt"),
++            ("lit-empty-value-then-root-path", "S=; cat $S/etc/hostname"),
+             ("17054-printf-apostrophe-subst", f"printf '%s\\n' \"'$(cat {o}/secret.txt)'\""),
+             ("17054-echo-apostrophe-subst", f"echo \"'$(cat {o}/secret.txt)'\""),
+             # Codex review 17054, P1-output-model, and the class the author's probes widened it to
+@@ -324,8 +329,54 @@
+             ("was-lister-pipeline-head", "cat $(find . -name '*.txt' 2>/dev/null | head -1)"),
+             ("was-lister-pipeline-sort-grep", "cat $(ls | sort | grep txt | tail -1)"),
+             ("was-lister-pipeline-sed-n-line", "f=$(ls -t *.txt | sed -n 2p); cat \"$f\""),
+-            ("was-assigned-var-under-temp", "D=/tmp/review-probe; cat $D/x"),
+             ("was-pwd-subst", "cat \"$(pwd)/a.txt\""),
++            # dp, 2026-10-11: the single-literal-assignment rule is scoped exactly this tightly.
++            # Each row is an exclusion that must stay UNENUMERATED (a scope request).
++            ("lit-use-before-assignment", "cat $S/x; S=/tmp/review-probe"),
++            ("lit-assignment-is-a-pipeline-stage", "S=/tmp/review-probe | cat $S/x"),
++            ("lit-assignment-entered-from-a-pipe", "true | S=/tmp/review-probe; cat $S/x"),
++            ("lit-prefix-assignment-does-not-bind", "S=/tmp/review-probe cat $S/x"),
++            ("lit-reassigned", "S=/tmp/review-probe; S=/tmp/review-probe-2; cat $S/x"),
++            ("lit-conditional-and", "true && S=/tmp/review-probe; cat $S/x"),
++            ("lit-conditional-or", "S=/tmp/review-probe || S=/tmp/review-probe-2; cat $S/x"),
++            ("lit-default-expansion", "S=/tmp/review-probe; cat ${S:-/tmp/x}/y"),
++            ("lit-assigned-in-subshell", "(S=/tmp/review-probe); cat $S/x"),
++            ("lit-used-in-its-subshell", "(S=/tmp/review-probe; cat $S/x)"),
++            ("lit-assigned-in-brace-group", "{ S=/tmp/review-probe; }; cat $S/x"),
++            ("lit-assigned-in-function", "f() { S=/tmp/review-probe; }; f; cat $S/x"),
++            ("lit-assigned-in-substitution", "x=$(S=/tmp/review-probe); cat $S/x"),
++            ("lit-substitution-to-substitution", "a=$(S=/tmp/review-probe; true); b=$(cat $S/x)"),
++            ("lit-value-is-a-substitution", "S=$(echo /tmp/review-probe); cat $S/x"),
++            ("lit-value-has-a-dollar", "S=/tmp/$SCOPE_BATTERY_UNSET_VAR; cat $S/x"),
++            ("lit-value-has-a-quoted-dollar", "S='/tmp/$x'; cat $S/y"),
++            ("lit-value-has-a-glob", "S=/tmp/*; cat $S/x"),
++            ("lit-value-has-dotdot", "S=/tmp/../tmp; cat $S/x"),
++            ("lit-value-has-a-brace", "S=/tmp/{a,b}; cat $S/x"),
++            ("lit-HOME", "HOME=/tmp/review-probe; cat $HOME/x"),
++            ("lit-PWD", "PWD=/tmp/review-probe; cat $PWD/x"),
++            ("lit-OLDPWD", "OLDPWD=/tmp/review-probe; cat $OLDPWD/x"),
++            ("lit-IFS", "IFS=/tmp/review-probe; cat $IFS/x"),
++            ("lit-PATH", "PATH=/tmp/review-probe; cat $PATH/x"),
++            ("lit-name-in-the-environment", "SCOPE_BATTERY_ENV_SET=/tmp/review-probe; cat $SCOPE_BATTERY_ENV_SET/x"),
++            ("lit-for-loop", "for S in /tmp/review-probe; do cat $S/x; done"),
++            ("lit-read", "read S; cat $S/x"),
++            ("lit-read-after", "S=/tmp/review-probe; read S; cat $S/x"),
++            ("lit-unset", "S=/tmp/review-probe; unset S; cat $S/x"),
++            ("lit-exported-elsewhere", "export S; S=/tmp/review-probe; cat $S/x"),
++            ("lit-export-assignment", "export S=/tmp/review-probe; cat $S/x"),
++            ("lit-declare", "declare S=/tmp/review-probe; cat $S/x"),
++            ("lit-local", "local S=/tmp/review-probe; cat $S/x"),
++            ("lit-eval-reassigns", "S=/tmp/review-probe; eval S=/tmp/review-probe-2; cat $S/x"),
++            ("lit-sh-c-reassigns", "S=/tmp/review-probe; sh -c 'S=/tmp/review-probe-2'; cat $S/x"),
++            ("lit-source", "S=/tmp/review-probe; source ./f.sh; cat $S/x"),
++            ("lit-nameref", "S=/tmp/review-probe; declare -n R=S; R=/tmp/review-probe-2; cat $S/x"),
++            ("lit-array-element", "S=/tmp/review-probe; S[0]=/tmp/review-probe-2; cat $S/x"),
++            ("lit-array-assignment", "S=(/tmp/review-probe); cat $S/x"),
++            ("lit-append", "S=/tmp/review-probe; S+=/../../etc; cat $S/hostname"),
++            ("lit-printf-v", "S=/tmp/review-probe; printf -v S %s /tmp/review-probe-2; cat $S/x"),
++            ("lit-mapfile", "S=/tmp/review-probe; mapfile S < f; cat $S/x"),
++            ("lit-let", "S=/tmp/review-probe; let S=1; cat $S/x"),
++            ("lit-background", "S=/tmp/review-probe & cat $S/x"),
+         ]
+         allow += [
+             # device sinks stay reachable
+@@ -380,6 +431,17 @@
+             ("cd-temp-then-relative-inside", f"cd {fx.tmp} && ls sub/x"),
+             ("eval-of-inscope", "eval \"cat a.txt\""),
+             ("sh-c-in-find-exec-inscope", "find . -exec sh -c 'cat a.txt' \\;"),
++            # dp, 2026-10-11: a variable assigned exactly ONE literal earlier in the same command,
++            # at top level, never otherwise bound, resolves to that literal (then judged like any
++            # literal path). Formerly `was-assigned-var-under-temp`, a request.
++            ("lit-assigned-var-under-temp", "D=/tmp/review-probe; cat $D/x"),
++            ("lit-and-then", "S=/tmp/review-probe && cat \"${S}/x\""),
++            ("lit-newline", "S=/tmp/review-probe\ncat $S/x"),
++            ("lit-relative-in-repo", "S=a.txt; cat $S"),
++            ("lit-used-inside-a-later-substitution", "S=/tmp/review-probe; echo \"$(cat $S/x)\""),
++            # regression: a code literal before the binding must not break the scan
++            ("lit-after-a-python-c-literal",
++             "python3 -c \"print(open('/tmp/review-probe').read())\"; S=/tmp/review-probe; cat $S/x"),
+             ("commit-message-heredoc-apostrophe",
+              "git commit -m \"$(cat <<'EOF'\nit's fine (really\nEOF\n)\""),
+             ("comment-is-not-run", f"ls  # {o}/secret.txt"),

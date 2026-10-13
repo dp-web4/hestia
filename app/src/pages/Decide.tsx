@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { decideGateEscalation, getDashboard, operatorStatus, ruleScopeRequest } from "../lib/tauri";
 import type { OperatorStatus, PendingEscalation, PendingScopeRequest, WriteEffect } from "../lib/types";
+import {
+  DURATION_LABEL,
+  scopeBreadthOptions,
+  scopeDurations,
+  scopeRulingOpts,
+  scopeAwaitsOperator,
+  type ScopeDuration,
+} from "../lib/scope";
 
 /**
  * Decide — governance-surface escalations awaiting this operator.
@@ -154,20 +162,31 @@ function ScopeRequestCard({
   onDecided: (id: string, result: string) => void;
 }) {
   const [reason, setReason] = useState("");
-  const [recursive, setRecursive] = useState(false);
-  const [standing, setStanding] = useState(false);
+  // DURATION and BREADTH, chosen at decide time (spec decide-scope-request, 2026-10-05).
+  const durations = scopeDurations(req);
+  // An act the gate could not enumerate (once_only) offers only "this act once".
+  const [duration, setDuration] = useState<ScopeDuration>(
+    durations.includes("session") ? "session" : (durations[0] ?? "once"),
+  );
+  const breadths = scopeBreadthOptions(req.path, !!req.subtree);
+  const [breadthIdx, setBreadthIdx] = useState(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const fromGate = req.origin === "gate_deny";
+  // A peer-routed request: the operator's controls are an OVERRIDE (dp, 2026-10-05).
+  const override = !scopeAwaitsOperator(req);
 
   const rule = async (granted: boolean) => {
     setBusy(true);
     setErr(null);
     try {
-      const out = await ruleScopeRequest(req.request_id, granted, reason || null, {
-        // A standing refusal is not a thing; only a grant may be standing.
-        standing: granted && standing,
-        recursive,
-      });
+      // A refusal carries no duration and no breadth (a standing refusal is not a thing).
+      const out = await ruleScopeRequest(
+        req.request_id,
+        granted,
+        reason || null,
+        scopeRulingOpts(req, granted, duration, breadths[breadthIdx]),
+      );
       if (out.outcome === "already_decided") {
         onDecided(req.request_id, "already ruled elsewhere");
       } else {
@@ -195,11 +214,48 @@ function ScopeRequestCard({
           {req.role ? ` · ${req.role}` : ""}
         </dd>
         <dt>path</dt>
-        {/* Exactly one path. The asker cannot request recursion; only the ruler can grant it. */}
-        <dd className="pre">{req.path}</dd>
-        <dt>their reason</dt>
-        {/* Whole: truncating the asker's words is how a request gets ruled on its summary. */}
-        <dd className="pre">{req.reason || <span className="muted">— none given —</span>}</dd>
+        {/* Exactly one path. The asker cannot request recursion; only the ruler can grant it.
+            An act the gate could not enumerate names no path (dp, 2026-10-10). */}
+        {req.once_only ? (
+          <dd data-scope-once-only>
+            no path: the gate cannot enumerate what this act reaches — approve it once, as
+            written, or refuse
+          </dd>
+        ) : (
+          <dd className="pre">{req.path}</dd>
+        )}
+        {fromGate ? (
+          <>
+            {/* A GATE-OPENED request is a refused act, not an ask: the act is what is being
+                ruled on, and it is never presented as the member's reason. */}
+            <dt>refused act</dt>
+            <dd className="pre" data-scope-act>
+              {req.act}
+              <div className="muted">
+                {req.rule} · {req.tool} · opened by the gate; the member stated no reason
+                {(req.reissues ?? 0) > 0 ? ` · re-issued ${req.reissues}×` : ""}
+              </div>
+            </dd>
+            {req.subtree && (
+              <>
+                <dt>reach</dt>
+                <dd>a glob over this directory — only a recursive grant covers it</dd>
+              </>
+            )}
+            <dt>decided by</dt>
+            <dd data-scope-route>
+              {override
+                ? `a NOT-SAME peer — invited: ${(req.invited_peers ?? []).join(", ")} · the controls below are your OVERRIDE`
+                : "no NOT-SAME peer can clear this (unproven asker, or no admissible peer) — it is yours to decide"}
+            </dd>
+          </>
+        ) : (
+          <>
+            <dt>their reason</dt>
+            {/* Whole: truncating the asker's words is how a request gets ruled on its summary. */}
+            <dd className="pre">{req.reason || <span className="muted">— none given —</span>}</dd>
+          </>
+        )}
       </dl>
 
       {err && <div className="error-banner">{err}</div>}
@@ -219,27 +275,41 @@ function ScopeRequestCard({
               placeholder="what they should know about this ruling"
             />
           </label>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={recursive}
-              onChange={(e) => setRecursive(e.target.checked)}
-            />
-            include everything below this path
+          <label>
+            duration{" "}
+            <select
+              aria-label="duration"
+              value={duration}
+              onChange={(e) => setDuration(e.target.value as ScopeDuration)}
+            >
+              {durations.map((d) => (
+                <option key={d} value={d}>
+                  {DURATION_LABEL[d]}
+                </option>
+              ))}
+            </select>
           </label>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={standing}
-              onChange={(e) => setStanding(e.target.checked)}
-            />
-            standing (grant only)
+          <label>
+            reach{" "}
+            {/* Each option IS the path the grant will reach from. A one-time approval has none. */}
+            <select
+              aria-label="reach"
+              value={breadthIdx}
+              disabled={duration === "once"}
+              onChange={(e) => setBreadthIdx(Number(e.target.value))}
+            >
+              {breadths.map((b, i) => (
+                <option key={b.label} value={i}>
+                  {b.label}
+                </option>
+              ))}
+            </select>
           </label>
           <button disabled={busy} onClick={() => rule(true)}>
-            Grant
+            {override ? "Override: grant" : "Grant"}
           </button>
           <button disabled={busy} onClick={() => rule(false)}>
-            Refuse
+            {override ? "Override: refuse" : "Refuse"}
           </button>
         </div>
       ) : (

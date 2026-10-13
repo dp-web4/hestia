@@ -1547,6 +1547,30 @@ impl ServerState {
                             "requested_at": r.requested_at,
                             "expires_at": r.expires_at,
                             "secs_remaining": r.expires_at.saturating_sub(now),
+                            // 2026-10-05 — a GATE-OPENED request carries the refusal it
+                            // answers: the act the operator rules on, the rule, the tool, how
+                            // often the member re-issued it, and whether only a recursive grant
+                            // can cover it (a glob). `once_available` says whether "this act
+                            // once" is a choice: a member-filed ask names no act to bind.
+                            "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                            "rule": r.ext.gate.as_ref().map(|g| g.rule.clone()),
+                            "tool": r.ext.gate.as_ref().map(|g| g.tool.clone()),
+                            "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
+                            "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
+                            "subtree": r.ext.gate.as_ref().is_some_and(|g| g.subtree),
+                            "once_available": r.ext.gate.is_some(),
+                            // dp, 2026-10-10 (#1232 narrowed): an act the gate could not
+                            // enumerate names no path — "this act once" is the ONLY grant.
+                            "once_only": crate::server::state::is_unpriceable_scope_path(&r.path),
+                            // dp, 2026-10-05: NOT-SAME peers decide gate-opened requests; the
+                            // operator surfaces show who was invited and offer the OVERRIDE.
+                            "invited_peers": r.ext.invited_peers,
+                            "asker_basis": r.ext.gate.as_ref().map(|g| g.asker_basis),
+                            "decided_by_default": if r.ext.gate.is_some() && !r.ext.invited_peers.is_empty() {
+                                "peer"
+                            } else {
+                                "operator"
+                            },
                         })
                     })
                     .collect();
@@ -1571,12 +1595,17 @@ impl ServerState {
                         serde_json::json!({
                             "lifetime": "live",
                             "plugin_id": r.plugin_id,
-                            "path": r.path,
+                            // The breadth in force (the operator may have granted an ancestor
+                            // of the asked path, recursively); the asked path rides beside it.
+                            "path": r.reach_path(),
+                            "asked_path": r.path,
                             "reason": r.decision_reason,
                             "requested_because": r.reason,
                             "granted_by": r.decided_by,
                             "request_id": r.id,
-                            "origin": "member_request",
+                            "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                            // A PEER's ruling shows who and on what NOT-SAME basis (read-only).
+                            "peer_basis": r.ext.peer_basis,
                             "expires_at": r.expires_at,
                             "secs_remaining": r.expires_at.saturating_sub(now),
                             "recursive": r.recursive,
@@ -1612,6 +1641,11 @@ impl ServerState {
                             "granted_by": g.granted_by,
                             "request_id": g.request_id,
                             "recursive": g.recursive,
+                            // A peer's standing grant shows its NOT-SAME basis while the request
+                            // it answered is still in memory (the chain row keeps it for good).
+                            "peer_basis": g.request_id.as_ref()
+                                .and_then(|id| self.scope_requests.get(id))
+                                .and_then(|r| r.ext.peer_basis.clone()),
                             // The distinction the route table argues for: a grant that
                             // ratified a member's ask carries that ask's id; one the operator
                             // originated carries none. Derived, never stored twice.
@@ -1918,7 +1952,7 @@ mod tests {
             decided_at: granted.map(|_| now),
             decision_reason: None,
             recursive: false,
-            revoked: None,
+            revoked: None, ext: Default::default(),
         };
 
         state.scope_requests.insert(

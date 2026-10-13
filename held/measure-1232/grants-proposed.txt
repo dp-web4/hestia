@@ -1,0 +1,17 @@
+# all seats
+path:/home/dp/.local/state/hestia-mesh/**
+path:/home/dp/.hestia
+path:/home/dp/.hestia/endpoint
+path:/home/dp/.hestia/shared/**
+path:/home/dp/.hestia/deploy/**
+path:/home/dp/.hestia/deploy.log
+path:/home/dp/.hestia/current-build.json
+path:/home/dp/.hestia/telemetry/**
+path:/home/dp/.local/bin/**
+path:/usr/bin/**
+path:/home/dp
+path:/home/dp/ai-workspace
+# claude-code only (applied to all in this replay)
+path:/home/dp/.local/state/hub-mesh/**
+path:/home/dp/.cargo-target/**
+path:/home/dp/.nvm/**
