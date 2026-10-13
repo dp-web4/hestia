@@ -20,6 +20,13 @@ Cases:
  10. the release is already published                        -> refused, nothing uploaded
  11. re-run onto a draft that already holds the assets       -> replaced (delete+upload), published
  12. check-dir: exact manifest passes; missing / extra fail
+ 13. published release is bound to its tag (the publish PATCH names it; by-tag lookup verifies)
+ 14. GitHub ignores tag_name -> one re-bind, then a loud failure, never a silent untagged release
+ 15. publish PATCH drops tag_name, re-bind takes it          -> recovered, exit 0
+ 16. publish PATCH drops tag_name, re-bind errors (Codex HOLD #1285)
+                                                             -> exit 1, reports PUBLISHED + untagged
+                                                                with the repair command, no DRAFT claim
+ 17. publish PATCH applied but gh reports failure            -> exit 1, re-read state, no DRAFT claim
 
 Run: python3 tools/release_publish_test.py   (bare; exit 1 on failure)
 """
@@ -64,8 +71,24 @@ rel = st["release"]
 base = f"repos/{st['repo']}/releases/{rel['id']}"
 if method == "GET" and endpoint == base:
     save(); print(json.dumps(rel)); sys.exit(0)
+if method == "GET" and endpoint == f"repos/{st['repo']}/releases/tags/" + rel["tag_name"] and not rel["draft"]:
+    save(); print(json.dumps(rel)); sys.exit(0)
+if method == "GET" and endpoint.startswith(f"repos/{st['repo']}/releases/tags/"):
+    save(); print("HTTP 404: Not Found", file=sys.stderr); sys.exit(1)
 if method == "PATCH" and endpoint == base:
-    rel.update(fields); save(); print("{}"); sys.exit(0)
+    # GitHub's behaviour, measured on v0.3.0-rc.1: publishing a draft without naming its tag
+    # leaves the release under an `untagged-<hex>` placeholder.
+    publishing = fields.get("draft") is False
+    if os.environ.get("MOCK_GH_IGNORES_TAG") or (publishing and os.environ.get("MOCK_GH_IGNORES_TAG_ONCE")):
+        fields = {k: v for k, v in fields.items() if k != "tag_name"}
+    if set(fields) == {"tag_name"} and os.environ.get("MOCK_GH_FAIL_REBIND"):
+        save(); print("HTTP 500: mock rebind failure", file=sys.stderr); sys.exit(1)
+    if fields.get("draft") is False and rel["draft"] and "tag_name" not in fields:
+        rel["tag_name"] = "untagged-d4c9c308d31f0db84ef6"
+    rel.update(fields); save()
+    if publishing and os.environ.get("MOCK_GH_PUBLISH_APPLIED_THEN_FAILS"):
+        print("HTTP 502: applied, but the response was lost", file=sys.stderr); sys.exit(1)
+    print("{}"); sys.exit(0)
 if method == "DELETE" and endpoint.startswith(f"repos/{st['repo']}/releases/assets/"):
     aid = int(endpoint.rsplit("/", 1)[1])
     rel["assets"] = [x for x in rel["assets"] if x["id"] != aid]; save(); sys.exit(0)
@@ -95,7 +118,8 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 def run_case(tmp: pathlib.Path, tag: str, *, dist: str = "full", assemble: str = "success",
              draft: bool = True, remote: list[str] | None = None, kind: str | None = None,
-             fail_upload: str = "", extra_local: str | None = None, drop_local: str | None = None):
+             fail_upload: str = "", extra_local: str | None = None, drop_local: str | None = None,
+             extra_env: dict | None = None):
     """Returns (exit code, final release state, calls, stdout)."""
     case = pathlib.Path(tempfile.mkdtemp(dir=tmp))
     bindir = case / "bin"
@@ -127,7 +151,8 @@ def run_case(tmp: pathlib.Path, tag: str, *, dist: str = "full", assemble: str =
     notes.write_text(f"notes for {tag}")
 
     env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
-               MOCK_GH_STATE=str(sp), GH_REPO=REPO, MOCK_GH_FAIL_UPLOAD=fail_upload)
+               MOCK_GH_STATE=str(sp), GH_REPO=REPO, MOCK_GH_FAIL_UPLOAD=fail_upload,
+               **(extra_env or {}))
     kind = kind or ("prerelease" if "-rc." in tag else "release")
     r = subprocess.run([sys.executable, str(SCRIPT), "publish", "--tag", tag, "--release-id", RID,
                         "--dist", str(d), "--assemble", assemble, "--notes", str(notes),
@@ -176,6 +201,36 @@ def main() -> int:
         check("4 rc is never latest", rel.get("make_latest") == "false")
         check("4 rc asset names carry the full tag",
               all(RC in n for n in names(rel) if n != "SHA256SUMS"), names(rel))
+
+        # 13. the published release is reachable BY ITS TAG (v0.3.0-rc.1 shipped as untagged-<hex>).
+        for tag in (V, RC):
+            rc, rel, calls, out = run_case(tmp, tag)
+            check(f"13 {tag} publish PATCH names the tag",
+                  any(f"tag_name={tag}" in c for c in publish_patches(calls)), calls)
+            check(f"13 {tag} published release keeps its tag", rel["tag_name"] == tag, rel["tag_name"])
+            check(f"13 {tag} verified by the by-tag lookup",
+                  any(c[-1].endswith(f"/releases/tags/{tag}") for c in calls), calls)
+        # 14. GitHub drops tag_name from every PATCH -> re-bind once -> still unbound -> loud failure.
+        rc, rel, calls, out = run_case(tmp, V, extra_env={"MOCK_GH_IGNORES_TAG": "1"})
+        check("14 an unbindable publish fails loudly", rc != 0 and "NOT bound to its tag" in out, out)
+        # 15. tag dropped by the publish PATCH only -> the one re-bind restores it -> exit 0.
+        rc, rel, calls, out = run_case(tmp, V, extra_env={"MOCK_GH_IGNORES_TAG_ONCE": "1"})
+        check("15 one re-bind recovers the tag", rc == 0 and rel["tag_name"] == V, out)
+        # 16. Codex HOLD #1285: tag dropped AND the re-bind errors -> public + untagged, and the
+        #     script must say so (never "left as a DRAFT"), with the repair command.
+        rc, rel, calls, out = run_case(tmp, V, extra_env={"MOCK_GH_IGNORES_TAG_ONCE": "1",
+                                                          "MOCK_GH_FAIL_REBIND": "1"})
+        check("16 a failed re-bind exits non-zero", rc != 0, out)
+        check("16 the release really is public and untagged",
+              rel["draft"] is False and rel["tag_name"].startswith("untagged-"), rel)
+        check("16 never claims the public release is a draft", "left as a DRAFT" not in out, out)
+        check("16 reports the re-read remote state", "draft=false" in out and "untagged-" in out, out)
+        check("16 carries the repair command", f"-f tag_name={V}" in out and "fix by hand" in out, out)
+        # 17. the publish PATCH is applied but gh reports failure -> no draft claim, real state read.
+        rc, rel, calls, out = run_case(tmp, V, extra_env={"MOCK_GH_PUBLISH_APPLIED_THEN_FAILS": "1"})
+        check("17 a lost publish response exits non-zero", rc != 0, out)
+        check("17 never claims an applied publish left a draft", "left as a DRAFT" not in out, out)
+        check("17 reports the re-read remote state", "draft=false" in out, out)
 
         # 5-7. missing / extra / stale assets block.
         rc, rel, calls, out = run_case(tmp, V, drop_local=f"hestia-app-{V}-android-universal.apk")
