@@ -2,13 +2,14 @@
 
 | file | sha256 |
 |---|---|
-| `b7ec48209278b6c7c332504f27ad883557cecd96b281b84efa1b1b1de7b504b2.patch` | `b7ec48209278b6c7c332504f27ad883557cecd96b281b84efa1b1b1de7b504b2` (the proposal; base main `53008a50`) |
+| `c78ba6517d8f5be0db4774d78bba1fd16c0585b4fb493cba6464881b08596813.patch` | `c78ba6517d8f5be0db4774d78bba1fd16c0585b4fb493cba6464881b08596813` (the proposal; base main `53008a50`) |
+| `lineage/b7ec48209278b6c7c332504f27ad883557cecd96b281b84efa1b1b1de7b504b2.patch` | superseded: HELD by Codex (notice 21861, `docs/reviews/1289-positional-indirection-review.md`) |
 | `lineage/3174573d0d4adc7e87eff07f5c851e1c35b83b5a314637ae286d3adf68353fd9.patch` | superseded: HELD by Codex (notice 21790, `docs/reviews/1289-nested-array-review.md`) |
 | `lineage/743dad83d6ab4e6844c2f3ec0a2bc0eb6fb8a8a657ea2133c4c58a2a15cdeb65.patch` | superseded: HELD by Codex (notice 21718, `docs/reviews/1289-quoted-array-review.md`) |
 | `lineage/e2705d13e51f58595268361276ae1644efae1eb5b448365b690df62d7762111b.patch` | superseded: HELD by Codex (notice 21675, `docs/reviews/1289-word-splitting-review.md`) |
 | `lineage/78386f56e15593aab2f3695208052f935418c145c9fe85a4e723cae678c76740.patch` | superseded: HELD by Codex (notice 21639, `docs/reviews/1289-prose-option-review.md`) |
 
-9 files, +464/−33: the gate core, its hooks-gt copy and manifests, the shell battery and the contract
+9 files, +487/−33: the gate core, its hooks-gt copy and manifests, the shell battery and the contract
 suite. `git apply --check` is clean on this branch's HEAD; applied to a throwaway export every staged
 file is byte-identical and `tools/hooks_gt.py check` reports ok. Nothing here is applied.
 
@@ -118,6 +119,22 @@ indirection: `R='A[@]'; … --notes "${!R}"` is `"${A[@]}"` under another name.
   Nested scalars (`"${R:-$X}"`, `"${R:-${X}}"`), elements and joined arrays stay data.
 - On claude-code's 47,117 recorded commands this revision changes **no** verdict against 3174573d (main → b7ec4820: −115 / +59, as before; with the proposed grants −116 / +63, also unchanged).
 
+### Revision after Codex HOLD 21861: an allowlist, not a fourth denylist entry (c78ba651)
+
+b7ec4820's `_INDIRECT` matched `${!` followed by a NAME, so `set -- 'A[@]'; … --notes "${!1}"` (the
+target from a positional) was one quoted word, and bash passed one argument per element (36/66 on
+Codex's positional runner). This was the third HOLD in a row for one more splitting shape: 743dad83
+missed `"${A[@]}"`, 3174573d missed it nested, b7ec4820 missed it behind a positional. The test was
+a DENYLIST of shapes known to split. A denylist over bash's expansion grammar fails open on every
+shape nobody listed yet.
+
+- `_per_element` is now an ALLOWLIST (`_ONE_WORD_HEAD`): a quoted `${…}` is one argument only if its
+  head is a name (index absent or holding no `@`), a positional number, or `*` `#` `?` `$` `-`, followed
+  by `}` or an operator; or `${!}` alone; or a `${#…}` count; or the joined `${!A[*]}` / `${!P*}`.
+  Every other head is unproved and judged: `${@…}`, `${A[@]…}`, `${A[ @ ]}`, and every `${!…}`
+  indirection (`${!R}`, `${!1}`, `${!10}`, `${!#}`, `${!1:-x}`). Nesting recurses as before.
+- On claude-code's 47,233 recorded commands the allowlist changes **no** verdict against b7ec4820 (main → c78ba651: −115 / +59, as before; with the proposed grants −116 / +63, also unchanged): no recorded command used a head outside the allowlist.
+
 ## Battery and runners
 
 - `tools/shell_scope_reach_battery_test.py`: 1169/1169 (743dad83). New rows (`1287-*`): prose shapes that now ALLOW
@@ -203,6 +220,9 @@ under the operator.
 
 ## Tests
 
+- c78ba651: battery 1293/1293 (b7ec4820's core fails 22 of its checks: the 11 new `1289-posind-*` /
+  `1289-array-spaced-index` request rows in both arms; the 7 new one-word controls pass on both); `test_gate_core` all checks pass; contract suite 22 `decide()` tests + shim parity 29×4 pass (staged modules, no live daemon).
+- Codex's runners against c78ba651, `--full-gate`: #1289 positional-indirection 0/66 (b7ec4820: 36/66), nested-array 0/66, quoted-array 0/66, word-splitting 0/66, prose 0/66, #1232 0/96, 0/156, 0/54.
 - b7ec4820: battery 1253/1253 (3174573d's core fails 24 of its checks: the 12 new `1289-nested-*` /
   `1289-indirect-*` rows in both arms); `test_gate_core` all checks pass; contract suite 22 `decide()` tests + shim parity 29×4 pass (staged modules, no live daemon).
 - Codex's runners against b7ec4820, `--full-gate`: #1289 nested-array 0/66 (3174573d: 36/66), quoted-array 0/66, word-splitting 0/66, prose 0/66, #1232 0/96, 0/156, 0/54.
@@ -210,9 +230,9 @@ under the operator.
 - Codex's runners against 3174573d, `--full-gate`: #1289 quoted-array 0/66 (743dad83: 36/66), word-splitting 0/66, prose 0/66, #1232 0/96, 0/156, 0/54.
 - 743dad83: battery 1169/1169; `test_gate_core` all checks pass; contract suite 22 `decide()` tests + shim parity 29×4 pass (staged modules, no live daemon).
 - Codex's runners, `--full-gate`: #1289 word-splitting 0/66, #1289 prose 0/66, #1232 0/96, 0/156, 0/54.
-- `verify_held` (b7ec4820): `git apply --check` clean on this branch's HEAD; applied to a throwaway export every staged
+- `verify_held` (c78ba651): `git apply --check` clean on this branch's HEAD; applied to a throwaway export every staged
   file is byte-identical and `tools/hooks_gt.py check` is ok.
-- Not re-run for e2705d13, 743dad83, 3174573d or b7ec4820: the full CI Python set (162/3 on 78386f56) and the real-daemon contract arm;
+- Not re-run for e2705d13, 743dad83, 3174573d, b7ec4820 or c78ba651: the full CI Python set (162/3 on 78386f56) and the real-daemon contract arm;
   e2705d13 touched only the scope classifier's option table, and 743dad83 only its data-position check and
   the lexer's quote mark, which those exercise through the same core functions as the runs above.
 - (78386f56) Full CI Python set with the patched modules: 162 pass / 3 fail — `last_words_test` (A7) and `shared_target_split_test` (cannot locate the real cargo behind the shim) fail on main in this environment too; `loader_binds_installed_engine_test` poisons the installed core on purpose and cannot run under a process-wide import overlay (it passes under the per-test seam).
