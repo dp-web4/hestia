@@ -1,0 +1,443 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -112,6 +112,7 @@
+ import json
+ import os
+ import re
++import subprocess
+ import shlex
+ from dataclasses import dataclass, field
+ from typing import Optional
+@@ -2681,6 +2682,70 @@
+     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
+ 
+ 
++def github_repository_parts(value: str):
++    """Qualified GitHub identity, not a filesystem path or a URL."""
++    if not isinstance(value, str):
++        return None
++    match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)", value)
++    if not match or match[2] in (".", ".."):
++        return None
++    return match[1], match[2]
++
++
++def github_origin_identity(value: str):
++    """Recognize unambiguous GitHub origin spellings; never resolve aliases/network."""
++    match = re.fullmatch(
++        r"(?:https://github[.]com/|ssh://git@github[.]com(?::22)?/|git@github[.]com:)"
++        r"([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+?)(?:[.]git)?/?",
++        value, re.IGNORECASE)
++    if not match or match[2] in (".", ".."):
++        return None
++    return (match[1] + "/" + match[2]).casefold()
++
++
++def checkout_origin_identity(candidate: str):
++    """Read only this checkout's local origin, including linked worktree metadata.
++
++    No global/includes, inherited GIT_* overrides, URL rewrites or remote access.
++    Both common and worktree config participate; multiple origins fail closed.
++    The local config is A1
++    configuration evidence, not cryptographic ownership proof.
++    """
++    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
++    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
++    try:
++        result = subprocess.run(
++            ["git", "-C", candidate, "config", "--no-includes",
++             "--get-all", "remote.origin.url"],
++            env=env, capture_output=True, text=True, timeout=1, check=False)
++    except (OSError, subprocess.SubprocessError, UnicodeError):
++        return None
++    urls = result.stdout.splitlines()
++    if result.returncode != 0 or len(urls) != 1:
++        return None
++    return github_origin_identity(urls[0])
++
++
++def repo_in_scope(repository: str, scopes, workspace: str) -> bool:
++    """Narrow existing basename authority by the checkout's full origin identity."""
++    parts = github_repository_parts(repository)
++    if parts is None:
++        return False  # a basename-only adapter cannot establish the remote identity
++    owner, repo = parts
++    # Preserve the existing authority prerequisite. Neither recursive path grants
++    # nor a new qualified-grant spelling gain remote reach through local writes.
++    if repo not in scopes:
++        return False
++    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++    candidate = ws + "/" + repo
++    if os.path.realpath(candidate).replace("\\", "/") != candidate:
++        return False  # neither escaping symlinks nor internal aliases identify this repo
++    marker = os.path.join(candidate, ".git")
++    if not os.path.isdir(candidate) or not (os.path.isdir(marker) or os.path.isfile(marker)):
++        return False
++    return checkout_origin_identity(candidate) == (owner + "/" + repo).casefold()
++
++
+ # ── The decision ─────────────────────────────────────────────────────────────────────────
+ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
+              workspace: Optional[str] = None,
+@@ -2757,7 +2822,7 @@
+     # them); file paths use path-scope; shell commands use command-scope.
+     if event.repos:
+         for rname in event.repos:
+-            if rname not in scopes:
++            if not repo_in_scope(rname, scopes, ws):
+                 return _deny(
+                     "mrh.repo",
+                     f"'{event.tool}' targets repository '{rname}' outside your granted "
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -631,11 +631,36 @@
+ def _mcp_repo(tool: str, tool_input: Any) -> Optional[str]:
+     if not (isinstance(tool, str) and tool.startswith("mcp__")) or not isinstance(tool_input, dict):
+         return None
++    # Preserve authority-bearing owner/repo. Conflicting aliases are not first-key-wins:
++    # the connector might interpret a different field from the gate.
++    identities = []
++    # Invalid identity must still expose the original strings to innate egress
++    # scanning, including when scope='*' skips repository scope validation.
++    raw_keys = ("owner", "repository_full_name", "repo_full_name", "repository", "repo")
++    invalid = "!invalid-repository-identity! " + " ".join(
++        tool_input[key] for key in raw_keys if isinstance(tool_input.get(key), str))
++    owner = tool_input.get("owner")
+     for key in ("repository_full_name", "repo_full_name", "repository", "repo"):
+-        value = tool_input.get(key)
+-        if isinstance(value, str) and value.strip():
+-            return value.strip().rstrip("/").split("/")[-1]
+-    return None
++        if key not in tool_input or tool_input[key] is None:
++            continue
++        value = tool_input[key]
++        if not isinstance(value, str) or not value.strip():
++            return invalid
++        value = value.strip()
++        if "/" not in value and isinstance(owner, str):
++            value = owner.strip() + "/" + value
++        parts = core.github_repository_parts(value)
++        if parts is None:
++            return invalid
++        if owner is not None and (not isinstance(owner, str)
++                                  or owner.strip().casefold() != parts[0].casefold()):
++            return invalid
++        identities.append(value)
++    if not identities:
++        return None
++    if len({value.casefold() for value in identities}) != 1:
++        return invalid
++    return identities[0]
+ 
+ 
+ def normalized_event(event: GateEvent) -> core.NormalizedEvent:
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 8be4cc4ff6601c3f8db088750eec31a2247d2129eab532d1f80357bd5bf28a63  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -113,6 +113,7 @@
+ import json
+ import os
+ import re
++import subprocess
+ import shlex
+ from dataclasses import dataclass, field
+ from typing import Optional
+@@ -2682,6 +2683,70 @@
+     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
+ 
+ 
++def github_repository_parts(value: str):
++    """Qualified GitHub identity, not a filesystem path or a URL."""
++    if not isinstance(value, str):
++        return None
++    match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)", value)
++    if not match or match[2] in (".", ".."):
++        return None
++    return match[1], match[2]
++
++
++def github_origin_identity(value: str):
++    """Recognize unambiguous GitHub origin spellings; never resolve aliases/network."""
++    match = re.fullmatch(
++        r"(?:https://github[.]com/|ssh://git@github[.]com(?::22)?/|git@github[.]com:)"
++        r"([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+?)(?:[.]git)?/?",
++        value, re.IGNORECASE)
++    if not match or match[2] in (".", ".."):
++        return None
++    return (match[1] + "/" + match[2]).casefold()
++
++
++def checkout_origin_identity(candidate: str):
++    """Read only this checkout's local origin, including linked worktree metadata.
++
++    No global/includes, inherited GIT_* overrides, URL rewrites or remote access.
++    Both common and worktree config participate; multiple origins fail closed.
++    The local config is A1
++    configuration evidence, not cryptographic ownership proof.
++    """
++    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
++    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
++    try:
++        result = subprocess.run(
++            ["git", "-C", candidate, "config", "--no-includes",
++             "--get-all", "remote.origin.url"],
++            env=env, capture_output=True, text=True, timeout=1, check=False)
++    except (OSError, subprocess.SubprocessError, UnicodeError):
++        return None
++    urls = result.stdout.splitlines()
++    if result.returncode != 0 or len(urls) != 1:
++        return None
++    return github_origin_identity(urls[0])
++
++
++def repo_in_scope(repository: str, scopes, workspace: str) -> bool:
++    """Narrow existing basename authority by the checkout's full origin identity."""
++    parts = github_repository_parts(repository)
++    if parts is None:
++        return False  # a basename-only adapter cannot establish the remote identity
++    owner, repo = parts
++    # Preserve the existing authority prerequisite. Neither recursive path grants
++    # nor a new qualified-grant spelling gain remote reach through local writes.
++    if repo not in scopes:
++        return False
++    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++    candidate = ws + "/" + repo
++    if os.path.realpath(candidate).replace("\\", "/") != candidate:
++        return False  # neither escaping symlinks nor internal aliases identify this repo
++    marker = os.path.join(candidate, ".git")
++    if not os.path.isdir(candidate) or not (os.path.isdir(marker) or os.path.isfile(marker)):
++        return False
++    return checkout_origin_identity(candidate) == (owner + "/" + repo).casefold()
++
++
+ # ── The decision ─────────────────────────────────────────────────────────────────────────
+ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
+              workspace: Optional[str] = None,
+@@ -2758,7 +2823,7 @@
+     # them); file paths use path-scope; shell commands use command-scope.
+     if event.repos:
+         for rname in event.repos:
+-            if rname not in scopes:
++            if not repo_in_scope(rname, scopes, ws):
+                 return _deny(
+                     "mrh.repo",
+                     f"'{event.tool}' targets repository '{rname}' outside your granted "
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: a17fd403da82d8484a97b3f89da6c8662f2e256d56015531a1ee7cc9fa2d9cfa  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: b34b802f42ae18c3f58d28fbd53ef747ec495bc0d631711debab127af8755b86  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -632,11 +632,36 @@
+ def _mcp_repo(tool: str, tool_input: Any) -> Optional[str]:
+     if not (isinstance(tool, str) and tool.startswith("mcp__")) or not isinstance(tool_input, dict):
+         return None
++    # Preserve authority-bearing owner/repo. Conflicting aliases are not first-key-wins:
++    # the connector might interpret a different field from the gate.
++    identities = []
++    # Invalid identity must still expose the original strings to innate egress
++    # scanning, including when scope='*' skips repository scope validation.
++    raw_keys = ("owner", "repository_full_name", "repo_full_name", "repository", "repo")
++    invalid = "!invalid-repository-identity! " + " ".join(
++        tool_input[key] for key in raw_keys if isinstance(tool_input.get(key), str))
++    owner = tool_input.get("owner")
+     for key in ("repository_full_name", "repo_full_name", "repository", "repo"):
+-        value = tool_input.get(key)
+-        if isinstance(value, str) and value.strip():
+-            return value.strip().rstrip("/").split("/")[-1]
+-    return None
++        if key not in tool_input or tool_input[key] is None:
++            continue
++        value = tool_input[key]
++        if not isinstance(value, str) or not value.strip():
++            return invalid
++        value = value.strip()
++        if "/" not in value and isinstance(owner, str):
++            value = owner.strip() + "/" + value
++        parts = core.github_repository_parts(value)
++        if parts is None:
++            return invalid
++        if owner is not None and (not isinstance(owner, str)
++                                  or owner.strip().casefold() != parts[0].casefold()):
++            return invalid
++        identities.append(value)
++    if not identities:
++        return None
++    if len({value.casefold() for value in identities}) != 1:
++        return invalid
++    return identities[0]
+ 
+ 
+ def normalized_event(event: GateEvent) -> core.NormalizedEvent:
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d",
++      "sha256": "8be4cc4ff6601c3f8db088750eec31a2247d2129eab532d1f80357bd5bf28a63",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "a17fd403da82d8484a97b3f89da6c8662f2e256d56015531a1ee7cc9fa2d9cfa",
++      "sha256": "b34b802f42ae18c3f58d28fbd53ef747ec495bc0d631711debab127af8755b86",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7"
++  "gt_version": "0a6c82eaffaa155eb9b052c42456edfe28aaec7879920c881b34063bcd789e5d"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7",
++    "gt_version": "0a6c82eaffaa155eb9b052c42456edfe28aaec7879920c881b34063bcd789e5d",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "8be4cc4ff6601c3f8db088750eec31a2247d2129eab532d1f80357bd5bf28a63"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "a17fd403da82d8484a97b3f89da6c8662f2e256d56015531a1ee7cc9fa2d9cfa"
++        "sha256": "b34b802f42ae18c3f58d28fbd53ef747ec495bc0d631711debab127af8755b86"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "c8b7e3b04f5344001aec1625f03a3c8b727f909ec09aeeb5e600d12fbf8c7a08"
++  "gt_version": "5b6b67dd2dd8630d0f92bd168aeb9fe825fdb8bc32d477781ed42379e77b59a7"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7",
++    "gt_version": "0a6c82eaffaa155eb9b052c42456edfe28aaec7879920c881b34063bcd789e5d",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "8be4cc4ff6601c3f8db088750eec31a2247d2129eab532d1f80357bd5bf28a63"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "a17fd403da82d8484a97b3f89da6c8662f2e256d56015531a1ee7cc9fa2d9cfa"
++        "sha256": "b34b802f42ae18c3f58d28fbd53ef747ec495bc0d631711debab127af8755b86"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "5024e8b7e6d4b6e40279050f36dea4b79bd21074e77e86a6d498b56f55afa287"
++  "gt_version": "4b94b742a4de2c36926d03277b94a4c6c95fc0385ae0d109c429917e6c63c2e9"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7",
++    "gt_version": "0a6c82eaffaa155eb9b052c42456edfe28aaec7879920c881b34063bcd789e5d",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "8be4cc4ff6601c3f8db088750eec31a2247d2129eab532d1f80357bd5bf28a63"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "a17fd403da82d8484a97b3f89da6c8662f2e256d56015531a1ee7cc9fa2d9cfa"
++        "sha256": "b34b802f42ae18c3f58d28fbd53ef747ec495bc0d631711debab127af8755b86"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "69dc3c1346dc1dbf691ca2643024ab0e092a56c3c067f18021ae48b8c9f0011d"
++  "gt_version": "5932c5152a510261a3956f411b973038337e0bee2cf1adb2d23b770b4ef7d865"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7",
++    "gt_version": "0a6c82eaffaa155eb9b052c42456edfe28aaec7879920c881b34063bcd789e5d",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "8be4cc4ff6601c3f8db088750eec31a2247d2129eab532d1f80357bd5bf28a63"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "a17fd403da82d8484a97b3f89da6c8662f2e256d56015531a1ee7cc9fa2d9cfa"
++        "sha256": "b34b802f42ae18c3f58d28fbd53ef747ec495bc0d631711debab127af8755b86"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "a36254f041bc1d714fb3981654f76eb83e08d27ee492f30f26d5847eb12a29ef"
++  "gt_version": "527c86e689e475791986c2a7507f9e38341e66ce1f5bfa41fe4cb1f0853e5055"
+ }
