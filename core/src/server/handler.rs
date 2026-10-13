@@ -16253,6 +16253,57 @@ mod tests {
         );
     }
 
+    /// The scope peer pool is the THIRD selection pool and the most rivalrous of them:
+    /// `take(3)` over an ALPHABETICAL list with no liveness ranking, so residue sorts in
+    /// early (claude-code's re-review, 2026-10-13, measured on the live chain:
+    /// `claudecode` and `codex-cli` took two of three slots on a real scope request
+    /// within the hour). The exclusion is the same two type-marks as the invitation and
+    /// appeal pools (#990), seeded here on the store the one retire verb commits.
+    /// The control half runs first: the prefix-recognised residue name IS pooled while
+    /// active, so the exclusion assert below is what removes it.
+    #[tokio::test]
+    async fn a_retired_name_holds_no_scope_peer_slot() {
+        let (_dir, shared) = make_shared_state();
+        for id in ["claude-code", "claudecode", "codex", "kimi-code"] {
+            tool_connect(&shared, &json!({"plugin_id": id, "host_agent": "h",
+                                          "gate_capabilities": ["society-floor:v1", REVIEW_CAPABILITY]}))
+                .await.unwrap();
+        }
+        // CONTROL: recognised (the `claude` prefix) + door-declared residue is pooled.
+        let before = {
+            let s = shared.lock().await;
+            scope_peer_pool(&s, "kimi-code")
+        };
+        assert!(
+            before.contains(&"claudecode".to_string()),
+            "control: the residue name takes a slot while active: {before:?}"
+        );
+        {
+            let mut s = shared.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "claudecode".into(),
+                retired_at: 1,
+                reason: "probe residue".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: false,
+                retired_by: "op".into(),
+            });
+        }
+        let after = {
+            let s = shared.lock().await;
+            scope_peer_pool(&s, "kimi-code")
+        };
+        assert!(
+            !after.contains(&"claudecode".to_string()),
+            "the retired name holds no slot: {after:?}"
+        );
+        assert!(
+            after.contains(&"claude-code".to_string()) && after.contains(&"codex".to_string()),
+            "the real seats are untouched: {after:?}"
+        );
+    }
+
     /// THE BAR A PEER CAN CLEAR ALONE IS THE BAR THAT MUST INVITE. `resolve_invitation` built
     /// its pool only under `SovereignPlusPeer`, reasoning that `SingleApprover` "names no peer
     /// conjunct". But `SingleApprover` is defined as one sovereign-channel decision OR a
@@ -24070,12 +24121,23 @@ fn scope_how_to_decide(id: &str, no_peer: bool, once_only: bool) -> String {
 /// The NOT-SAME peers invited to decide `asker`'s scope request: recorded members other than
 /// the asker (and its aliases), with a declared review door, that `arbiter::eligibility_for`
 /// admits in the GRANTING direction. Ordered as the registry orders them; capped at 3.
+///
+/// The same two names that can never answer are excluded by TYPE here as at
+/// `resolve_invitation` and the appeal pool (#990) — and this pool is the MOST
+/// rivalrous of the three: `take(3)` over an ALPHABETICAL list with no liveness
+/// ranking, so residue sorts in early (claude-code's re-review, measured live:
+/// `claudecode` and `codex-cli` took two of three slots on a real request within
+/// the hour). `is_recognised_reasoner` inside `eligibility_for` is a lineage
+/// PREFIX match and does not stop them; the retirement row and the filler mark
+/// do.
 fn scope_peer_pool(s: &super::state::ServerState, asker: &str) -> Vec<String> {
     use crate::arbiter::{eligibility_for, AppealParties, AskerBasis, Disposition, Eligibility};
     s.member_registry
         .iter_sorted()
         .into_iter()
         .map(|(id, _)| id.clone())
+        .filter(|id| !s.retired_members.is_retired(id))
+        .filter(|id| !s.member_registry.is_filler(id))
         .filter(|id| id != asker && !s.same_entity(asker, id))
         .filter(|id| review_capability(s, id).is_ok())
         .filter(|id| matches!(

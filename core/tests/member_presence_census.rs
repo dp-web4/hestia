@@ -1239,7 +1239,17 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // direction: a member absent from the registry is never invited and the pool silently
     // narrows. NOT a gate: an empty pool sends the request to the operator (the record says
     // `decided_by_default: operator`), so nothing is granted or refused by this read.
+    //
+    // AMENDED 2026-10-13 (kimi-code, claude-code's #1036 re-review finding): the pool now also
+    // EXCLUDES by type, like the two sibling pools — the filler mark (this line) and the
+    // retirement row (on `retired_members`, outside this census's symbol set; pinned by
+    // `a_retired_name_holds_no_scope_peer_slot`, control included). The review's measurement:
+    // with `take(3)` over the registry's ALPHABETICAL order and no liveness ranking, this was
+    // the most rivalrous pool of the three — residue took two of three live slots within the
+    // hour the review landed. The reading above stands: the exclusion is a witnessed,
+    // undoable administrative act, never an evidence read.
     ("server/handler.rs::scope_peer_pool", &[
+        ".filter(|id| !s.member_registry.is_filler(id))",
         ".iter_sorted()",
         "s.member_registry",
     ]),
