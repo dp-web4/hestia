@@ -1928,14 +1928,18 @@ async fn operator_member_retire(
         )
             .into_response();
     }
-    // The author is the operator the challenge-signed session resolved. A session
-    // always carries a principal, so the fallback names the degradation rather than
-    // inventing an operator.
+    // The author is the operator the challenge-signed session resolved. `operator` is the
+    // authenticated principal for EVERY session kind (codex review of #1035, finding 1:
+    // reading provenance.principal alone wrote the office literal for a direct dashboard
+    // session); provenance.principal is the composed-session fallback. A session always
+    // carries one, so the final fallback names the degradation rather than inventing an
+    // operator.
     let retired_by = match &gate {
-        Some(axum::Extension(w)) => match &w.provenance {
-            Some(p) => p.principal.clone(),
-            None => "operator (direct session)".to_string(),
-        },
+        Some(axum::Extension(w)) => w
+            .operator
+            .clone()
+            .or_else(|| w.provenance.as_ref().map(|p| p.principal.clone()))
+            .unwrap_or_else(|| "operator (direct session)".to_string()),
         None => "operator (session not recorded on this path)".to_string(),
     };
     let now = super::state::unix_now();
@@ -13108,9 +13112,10 @@ mod member_retire_route_tests {
         let (_dir, state) = test_state().await;
         seed_member(&state, "attest-probe").await;
         let body = OperatorMemberRetire { plugin_id: "attest-probe".into(), reason: "probe residue".into() };
-        operator_member_retire(State(state.clone()), None, Json(body))
+        let retired = operator_member_retire(State(state.clone()), None, Json(body))
             .await
             .into_response();
+        assert_eq!(retired.status(), StatusCode::OK, "setup retirement lands");
 
         let reinstate = || OperatorMemberReinstate { plugin_id: "attest-probe".into() };
         let resp = operator_member_reinstate(State(state.clone()), None, Json(reinstate()))
@@ -13140,6 +13145,7 @@ mod member_retire_route_tests {
         let (_dir, state) = test_state().await;
         seed_member(&state, "attest-probe").await;
         let witness = crate::server::operator_auth::GateWitness {
+            operator: Some("lct:web4:operator:dp".into()),
             provenance: Some(crate::server::operator_auth::OperatorProvenance {
                 actor: "lct:web4:harness:kimi-code".into(),
                 principal: "lct:web4:operator:dp".into(),

@@ -1125,6 +1125,28 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/http.rs::scope_floor_add", &[
         "let members_affected = s.member_registry.len();",
     ]),
+    // ADDED 2026-10-13 (kimi-code, #1036 review response). READING, answering the
+    // question this table schedules — **is this a safety use of presence?**
+    //
+    // NO — these are the PRECONDITION checks of the operator's own administrative
+    // command, not selection by presence: `validate_retire`/`validate_reinstate`
+    // answer "is this name a member, and is it in the state the command
+    // presumes?" so that a refusal mints nothing and a witness row never stands
+    // for a state change that did not happen (the validate → witness → commit
+    // ordering, claude-code's review item 2). No slot is spent, no peer is
+    // chosen, no authority is derived from the answer.
+    //
+    // DEGRADATION DIRECTION: a registry that fails to load fails the command
+    // CLOSED — `UnknownId`/`PersistFailed`, a refusal the operator sees — and
+    // never a tombstone nobody witnessed; the dangerous direction (a wrong name
+    // retired) is exactly what the check exists to refuse, and the tombstone
+    // carries `retired_by` for the audit either way.
+    ("server/http.rs::operator_member_retire", &[
+        "if let Some(outcome) = crate::member_registry::validate_retire(&s.member_registry, &member) {",
+    ]),
+    ("server/http.rs::operator_member_reinstate", &[
+        "if let Some(outcome) = crate::member_registry::validate_reinstate(&s.member_registry, &member) {",
+    ]),
     // Added 2026-08-07 (claude-code, the #226 invitation writer). READING, answering the
     // question this table schedules — **is this a safety use of presence?**
     //
