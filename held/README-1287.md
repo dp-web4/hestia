@@ -2,12 +2,13 @@
 
 | file | sha256 |
 |---|---|
-| `3174573d0d4adc7e87eff07f5c851e1c35b83b5a314637ae286d3adf68353fd9.patch` | `3174573d0d4adc7e87eff07f5c851e1c35b83b5a314637ae286d3adf68353fd9` (the proposal; base main `53008a50`) |
+| `b7ec48209278b6c7c332504f27ad883557cecd96b281b84efa1b1b1de7b504b2.patch` | `b7ec48209278b6c7c332504f27ad883557cecd96b281b84efa1b1b1de7b504b2` (the proposal; base main `53008a50`) |
+| `lineage/3174573d0d4adc7e87eff07f5c851e1c35b83b5a314637ae286d3adf68353fd9.patch` | superseded: HELD by Codex (notice 21790, `docs/reviews/1289-nested-array-review.md`) |
 | `lineage/743dad83d6ab4e6844c2f3ec0a2bc0eb6fb8a8a657ea2133c4c58a2a15cdeb65.patch` | superseded: HELD by Codex (notice 21718, `docs/reviews/1289-quoted-array-review.md`) |
 | `lineage/e2705d13e51f58595268361276ae1644efae1eb5b448365b690df62d7762111b.patch` | superseded: HELD by Codex (notice 21675, `docs/reviews/1289-word-splitting-review.md`) |
 | `lineage/78386f56e15593aab2f3695208052f935418c145c9fe85a4e723cae678c76740.patch` | superseded: HELD by Codex (notice 21639, `docs/reviews/1289-prose-option-review.md`) |
 
-9 files, +350/−31: the gate core, its hooks-gt copy and manifests, the shell battery and the contract
+9 files, +464/−33: the gate core, its hooks-gt copy and manifests, the shell battery and the contract
 suite. `git apply --check` is clean on this branch's HEAD; applied to a throwaway export every staged
 file is byte-identical and `tools/hooks_gt.py check` reports ok. Nothing here is applied.
 
@@ -101,6 +102,22 @@ unenumerated wherever another argument can be a file (`fields`), and the refusal
 the lexer, so it was already a request. On claude-code's 47,002 recorded commands this revision changes
 **no** verdict against 743dad83 (main → 3174573d: −115 / +59, as before).
 
+### Revision after Codex HOLD 21790: nested and indirect expansions (b7ec4820)
+
+3174573d tested only the OUTER expansion's prefix, and `_expansion_spans` ended a `${` at its first
+`}`. So `"${R:-${A[@]}}"` (span `${R:-${A[@]}`) was data, but bash still passes one argument per element
+when the default is taken: `--notes "${R:-${A[@]}}"` uploads OUTSIDE (36/66 on Codex's nested runner).
+Probing the same class found two more the review did not list. `"${R:-$@}"` is per element. So is
+indirection: `R='A[@]'; … --notes "${!R}"` is `"${A[@]}"` under another name.
+
+- `_expansion_spans` now closes a `${` at its BALANCED `}`: nested `${` counted, a backslash-escaped
+  character skipped (`"${R:-x\}y}"` is one word). Unbalanced is unmodelled, as before.
+- A quoted `${…}` is one argument only if `_per_element` says so: not `_PER_ELEMENT`, not an
+  indirection `${!name…}` (the target decides; `${!A[*]}` / `${!P*}` join and stay one word; `${!}`
+  is the last PID), and recursively no `$@` or per-element `${…}` inside its operator word.
+  Nested scalars (`"${R:-$X}"`, `"${R:-${X}}"`), elements and joined arrays stay data.
+- On claude-code's 47,117 recorded commands this revision changes **no** verdict against 3174573d (main → b7ec4820: −115 / +59, as before; with the proposed grants −116 / +63, also unchanged).
+
 ## Battery and runners
 
 - `tools/shell_scope_reach_battery_test.py`: 1169/1169 (743dad83). New rows (`1287-*`): prose shapes that now ALLOW
@@ -186,13 +203,16 @@ under the operator.
 
 ## Tests
 
+- b7ec4820: battery 1253/1253 (3174573d's core fails 24 of its checks: the 12 new `1289-nested-*` /
+  `1289-indirect-*` rows in both arms); `test_gate_core` all checks pass; contract suite 22 `decide()` tests + shim parity 29×4 pass (staged modules, no live daemon).
+- Codex's runners against b7ec4820, `--full-gate`: #1289 nested-array 0/66 (3174573d: 36/66), quoted-array 0/66, word-splitting 0/66, prose 0/66, #1232 0/96, 0/156, 0/54.
 - 3174573d: battery 1210/1210 (743dad83's core fails 22 of its checks); `test_gate_core` all checks pass; contract suite 22 `decide()` tests + shim parity 29×4 pass (staged modules, no live daemon).
 - Codex's runners against 3174573d, `--full-gate`: #1289 quoted-array 0/66 (743dad83: 36/66), word-splitting 0/66, prose 0/66, #1232 0/96, 0/156, 0/54.
 - 743dad83: battery 1169/1169; `test_gate_core` all checks pass; contract suite 22 `decide()` tests + shim parity 29×4 pass (staged modules, no live daemon).
 - Codex's runners, `--full-gate`: #1289 word-splitting 0/66, #1289 prose 0/66, #1232 0/96, 0/156, 0/54.
-- `verify_held`: `git apply --check` clean on this branch's HEAD; applied to a throwaway export every staged
+- `verify_held` (b7ec4820): `git apply --check` clean on this branch's HEAD; applied to a throwaway export every staged
   file is byte-identical and `tools/hooks_gt.py check` is ok.
-- Not re-run for e2705d13, 743dad83 or 3174573d: the full CI Python set (162/3 on 78386f56) and the real-daemon contract arm;
+- Not re-run for e2705d13, 743dad83, 3174573d or b7ec4820: the full CI Python set (162/3 on 78386f56) and the real-daemon contract arm;
   e2705d13 touched only the scope classifier's option table, and 743dad83 only its data-position check and
   the lexer's quote mark, which those exercise through the same core functions as the runs above.
 - (78386f56) Full CI Python set with the patched modules: 162 pass / 3 fail — `last_words_test` (A7) and `shared_target_split_test` (cannot locate the real cargo behind the shim) fail on main in this environment too; `loader_binds_installed_engine_test` poisons the installed core on purpose and cannot run under a process-wide import overlay (it passes under the per-test seam).
