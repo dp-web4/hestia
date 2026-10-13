@@ -1191,7 +1191,35 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
         ".iter_sorted()",
         ".member_registry",
     ]),
+    // AMENDED 2026-09-17 (kimi-code, #1036 NOT-SAME review by claude-code, item 3).
+    // The census went red the moment the two filter lines were written — the
+    // instrument working, on the integration binary `cargo test --lib` never runs.
+    //
+    // READING of the two new sites, against the question this table schedules —
+    // **is this a safety use of presence?** They are the same two lines as
+    // `resolve_invitation` above, byte-identical and deliberately so, and the
+    // reading recorded there carries over with ONE difference: this pool is MORE
+    // rivalrous, not less. Invitations spend up to `MAX_INVITED_PEERS` slots;
+    // this pool spends exactly ONE, on `select_arbiter`'s pick. The review found
+    // the gap: `is_recognised_reasoner` is a lineage PREFIX match, so residue
+    // names (`codex-cli`, `claudecode`) pass it, and act-liveness can rank one
+    // first — codex acting as `codex` while its gate witnessed as `codex-cli` is
+    // the measured case this file already records. An operator retiring such a
+    // name reasonably reads it as out of EVERY selection path, and the open pool
+    // routed the appeal to a mailbox nobody reads. Both lines are SELECTION gates
+    // on registry STATE (the tombstone, the mint-time type mark), never on
+    // evidence — dp's reorder-never-exclude rule stands beside them, exactly as
+    // at `resolve_invitation`.
+    //
+    // DEGRADATION DIRECTION: a WRONG tombstone excludes a real arbiter — visible,
+    // attributable (`retired_by`), undoable by one operator command, and the
+    // appeal then routes to the next candidate rather than to silence; a registry
+    // that fails to load yields the empty pool the tool already renders as "no
+    // admissible arbiter is known". The pre-filter failure was the opposite
+    // direction: a routed appeal that LOOKED answered and was not.
     ("server/handler.rs::tool_appeal", &[
+        ".filter(|id| !s.member_registry.is_filler(id))",
+        ".filter(|id| !s.member_registry.is_retired(id))",
         ".iter_sorted()",
         ".member_registry",
     ]),

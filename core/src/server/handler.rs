@@ -3388,6 +3388,20 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
         .iter_sorted()
         .into_iter()
         .map(|(id, _)| id.clone())
+        // The two names that can never answer, excluded by TYPE, exactly as at
+        // `resolve_invitation` (#990) — and this pool is MORE rivalrous, not
+        // less: it spends ONE slot where invitations spend up to a cap. The
+        // exclusions are needed here on top of the reasoner check because
+        // `is_recognised_reasoner` is a lineage PREFIX match, so residue names
+        // (`codex-cli`, `claudecode`) pass it, and act-liveness can rank one
+        // first: codex acting as `codex` while its gate witnessed as
+        // `codex-cli` is the measured case recorded in this file's own history.
+        // An operator who retires such a name reasonably reads it as out of
+        // EVERY selection path; leaving this pool open routed the appeal to a
+        // mailbox nobody reads — the silent-routing failure the reasoner check
+        // was added to stop, one clause downstream of it.
+        .filter(|id| !s.member_registry.is_retired(id))
+        .filter(|id| !s.member_registry.is_filler(id))
         .filter(|id| {
             // Only drop a candidate PROVEN to be the same entity. member_lct fails closed to
             // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
@@ -20356,6 +20370,98 @@ mod appeal_tests {
                 "a sovereign ruling is not evidence that {id} is working"
             );
         }
+    }
+
+    /// #990 at the arbiter pool: a RETIRED name holds no arbiter slot, even when
+    /// every other signal would hand it the appeal — a recognised lineage prefix
+    /// (`codex-cli` passes the reasoner check on the `codex` prefix) AND Live on
+    /// its own witnessed acts. This is the exact shape claude-code's #1036 review
+    /// measured: residue passes the prefix check, act-liveness can rank it first,
+    /// and the appeal then goes to a mailbox nobody reads. The control half below
+    /// pins that the test would catch a missing filter: while the name is active,
+    /// it wins.
+    #[tokio::test]
+    async fn a_retired_recognised_prefix_name_is_live_and_still_not_routed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // The pool reads the registry: seed the residue name and a real peer.
+        {
+            let mut s = state.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                "codex-cli",
+                false,
+                "sid",
+                "anchor",
+            )
+            .unwrap();
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                "kimi-code",
+                false,
+                "sid",
+                "anchor",
+            )
+            .unwrap();
+        }
+        // codex-cli is LIVE on its own acts — the review's measured case: the
+        // gate's acts witness under the residue id while the member acts as codex.
+        {
+            let s = state.lock().await;
+            s.append_chain("outcome", json!({
+                "plugin_id": "codex-cli", "role_lct": APPELLANT_ROLE,
+                "session_id": "gate-session", "tool_name": "Bash", "success": true,
+                "target": "cargo test"})).unwrap();
+        }
+        let appellant_sid = seat(&state, "claude-code").await;
+        let deny_hash = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+        let filed = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": appellant_sid.to_string(),
+            "reason": "the preset permits deletes under /tmp",
+        })).await.unwrap();
+        assert_eq!(
+            filed.pointer("/dispatched/arbiter").and_then(Value::as_str),
+            Some("codex-cli"),
+            "CONTROL: Live + recognised + cross-vendor wins the slot while the name is active: {filed}"
+        );
+        // The operator retires the residue name.
+        {
+            let mut s = state.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            assert_eq!(
+                crate::member_registry::retire_member(
+                    vault,
+                    member_registry,
+                    "codex-cli",
+                    "op",
+                    "probe residue",
+                    1,
+                ),
+                crate::member_registry::RetireOutcome::Retired
+            );
+        }
+        let deny_hash2 = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+        let filed2 = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash2, "session_id": appellant_sid.to_string(),
+            "reason": "and the deny was over-broad a second time",
+        })).await.unwrap();
+        assert_eq!(
+            filed2.pointer("/dispatched/arbiter").and_then(Value::as_str),
+            Some("kimi-code"),
+            "the tombstone excludes the Live residue name; the appeal routes to a \
+             member that can answer: {filed2}"
+        );
     }
 
     /// End to end: file, rule, and check that the CONDUCT SCALE moved. If the emitted shape

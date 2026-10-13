@@ -402,6 +402,48 @@ pub enum ReinstateOutcome {
 /// presence is a fact, a governance slot is a grant, and only the second is
 /// revoked here. The daemon witnesses the act as `member_retired` (who/when/why)
 /// beside this durable copy; the operator surface is the only writer.
+///
+/// ORDERING CONTRACT (dp's #1036 hold item, claude-code's review): the caller
+/// validates ([`validate_retire`]), appends the witness row, and only then calls
+/// this fn to commit — so a `PersistFailed` here means the retirement never took
+/// effect, and the caller compensates the now-orphan witness row with
+/// `member_retire_failed` carrying its hash. The rule the ordering buys: no
+/// retirement stays in force without its witness row, in either failure
+/// direction.
+/// The refusal `retire_member` would return, computed with no side effects.
+/// The operator surface validates BEFORE it witnesses (`validate` → append
+/// `member_retired` → `retire_member` to commit): a witnessed refusal is a
+/// contradiction — the chain would carry the act for an ask that was never
+/// attempted. The caller holds the state lock across all three steps, so the
+/// verdict cannot drift between check and commit.
+pub fn validate_retire(registry: &MemberRegistry, plugin_id: &str) -> Option<RetireOutcome> {
+    if !registry.members.contains_key(plugin_id) {
+        return Some(RetireOutcome::UnknownId);
+    }
+    if registry.fillers.contains(plugin_id) {
+        return Some(RetireOutcome::FillerIsNotAMember);
+    }
+    if registry.retired.contains_key(plugin_id) {
+        return Some(RetireOutcome::AlreadyRetired);
+    }
+    None
+}
+
+/// `validate_retire` for the undo, under the same ordering rule: validate,
+/// witness `member_reinstated`, then commit.
+pub fn validate_reinstate(
+    registry: &MemberRegistry,
+    plugin_id: &str,
+) -> Option<ReinstateOutcome> {
+    if !registry.members.contains_key(plugin_id) {
+        return Some(ReinstateOutcome::UnknownId);
+    }
+    if !registry.retired.contains_key(plugin_id) {
+        return Some(ReinstateOutcome::NotRetired);
+    }
+    None
+}
+
 pub fn retire_member(
     vault: &mut crate::vault::Vault,
     registry: &mut MemberRegistry,
@@ -410,14 +452,8 @@ pub fn retire_member(
     reason: &str,
     now: u64,
 ) -> RetireOutcome {
-    if !registry.members.contains_key(plugin_id) {
-        return RetireOutcome::UnknownId;
-    }
-    if registry.fillers.contains(plugin_id) {
-        return RetireOutcome::FillerIsNotAMember;
-    }
-    if registry.retired.contains_key(plugin_id) {
-        return RetireOutcome::AlreadyRetired;
+    if let Some(outcome) = validate_retire(registry, plugin_id) {
+        return outcome;
     }
     let tombstone = Retirement {
         retired_by: retired_by.to_string(),
@@ -431,9 +467,16 @@ pub fn retire_member(
         crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
             .unwrap_or_default();
     let Some(p) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) else {
-        // In memory but not in the vault doc (a persist failure at mint). Treat as
-        // unknown: retiring an undurable row would witness a fact nothing keeps.
-        return RetireOutcome::UnknownId;
+        // In memory but not in the vault doc (a persist failure at mint, or the
+        // vault read above failed closed to an empty doc). A STORAGE fault, not a
+        // wrong name — reporting it `UnknownId` made the route answer 404 "no
+        // member named" for a member that exists, sending the operator hunting a
+        // spelling that was never wrong (reinstate already reports this arm as
+        // PersistFailed; the two now agree).
+        return RetireOutcome::PersistFailed(
+            "member row absent from the vault doc (no tombstone written, member left active)"
+                .to_string(),
+        );
     };
     p.retired = Some(tombstone.clone());
     if let Err(e) = crate::vault::save_doc(
@@ -459,11 +502,8 @@ pub fn reinstate_member(
     registry: &mut MemberRegistry,
     plugin_id: &str,
 ) -> ReinstateOutcome {
-    if !registry.members.contains_key(plugin_id) {
-        return ReinstateOutcome::UnknownId;
-    }
-    if !registry.retired.contains_key(plugin_id) {
-        return ReinstateOutcome::NotRetired;
+    if let Some(outcome) = validate_reinstate(registry, plugin_id) {
+        return outcome;
     }
     // Same ordering as `retire_member` — persist first, memory last — so a failed
     // save leaves both copies exactly as they were.
@@ -1181,6 +1221,23 @@ mod tests {
         assert!(reloaded.is_retired("claude-code"));
         assert!(!reloaded.is_retired("ollama:m@sha256:00"));
         assert!(!reloaded.is_retired("ghost"));
+    }
+
+    /// A member in memory whose row is absent from the vault doc (a persist
+    /// failure at mint leaves exactly this on the next boot) is a STORAGE fault,
+    /// not a wrong name: reported `UnknownId`, the route answered 404 "no member
+    /// named" for a member that exists (claude-code's #1036 review, minor item).
+    #[test]
+    fn an_in_memory_member_absent_from_the_vault_doc_is_a_storage_fault_not_a_wrong_name() {
+        let (_dir_a, mut vault_a) = fresh_vault();
+        let (_dir_b, mut vault_b) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        ensure_member(&mut vault_a, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
+        match retire_member(&mut vault_b, &mut reg, "claude-code", "op", "r", 1) {
+            RetireOutcome::PersistFailed(_) => {}
+            other => panic!("a storage fault must not read as a wrong name: {other:?}"),
+        }
+        assert!(!reg.is_retired("claude-code"), "nothing took effect");
     }
 
     #[test]
