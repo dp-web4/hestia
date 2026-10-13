@@ -3400,7 +3400,10 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
         // EVERY selection path; leaving this pool open routed the appeal to a
         // mailbox nobody reads — the silent-routing failure the reasoner check
         // was added to stop, one clause downstream of it.
-        .filter(|id| !s.member_registry.is_retired(id))
+        // RETIRED reads `retired_members` — the store the operator's one retire
+        // verb (`POST /api/agents/:id/retire`, #1100) writes — so the exclusion
+        // takes effect on the surface the operator actually uses.
+        .filter(|id| !s.retired_members.is_retired(id))
         .filter(|id| !s.member_registry.is_filler(id))
         .filter(|id| {
             // Only drop a candidate PROVEN to be the same entity. member_lct fails closed to
@@ -16106,12 +16109,13 @@ mod tests {
     /// and the exclusion stands until an operator lifts it.
     ///
     /// This is NOT the evidence-based exclusion dp's rule forbids ("it reorders
-    /// routing, it never excludes" — pinned one test above). The tombstone is not
-    /// evidence: it is an operator's witnessed judgement (`retire_member`), the
-    /// administrative remove the append-only registry never had. The two halves
-    /// pinned here: the retired name takes no slot WHILE the tombstone stands, and
-    /// `reinstate_member` returns it to the pool — the reversibility that keeps the
-    /// act a single-operator call rather than a quorum one.
+    /// routing, it never excludes" — pinned one test above). The retirement row is
+    /// not evidence: it is an operator's witnessed judgement (`POST
+    /// /api/agents/:id/retire`, #1100 — the one retire verb, whose store this pool
+    /// now reads), the administrative remove the append-only registry never had.
+    /// The two halves pinned here: the retired name takes no slot WHILE the row
+    /// stands, and `reinstate` returns it to the pool — the reversibility that
+    /// keeps the act a single-operator call rather than a quorum one.
     #[tokio::test]
     async fn a_retired_member_holds_no_invitation_slot_until_reinstated() {
         let (_dir, shared) = make_shared_state();
@@ -16122,25 +16126,20 @@ mod tests {
                 .unwrap();
             session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
         }
-        // The operator act, applied directly to the state (the HTTP door is tested
-        // beside it in http.rs): tombstone the probe name.
+        // The operator act, applied directly to the state's copy of the store the
+        // route commits (the HTTP door — grant revocation included — is tested
+        // beside it in http.rs): retire the probe name.
         {
             let mut s = shared.lock().await;
-            let now = crate::server::gate_escalation::now_secs();
-            let crate::server::state::ServerState {
-                vault,
-                member_registry,
-                ..
-            } = &mut *s;
-            let out = crate::member_registry::retire_member(
-                vault,
-                member_registry,
-                "attest-probe",
-                "lct:web4:operator:test",
-                "probe residue — never a real seat",
-                now,
-            );
-            assert_eq!(out, crate::member_registry::RetireOutcome::Retired);
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "attest-probe".into(),
+                retired_at: crate::server::gate_escalation::now_secs(),
+                reason: "probe residue — never a real seat".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: false,
+                retired_by: "lct:web4:operator:test".into(),
+            });
         }
 
         let claim = |act: &str| {
@@ -16174,7 +16173,7 @@ mod tests {
         let invited = invited_of(claim("Edit -> file one").await);
         assert!(
             !invited.contains(&"attest-probe".to_string()),
-            "the tombstoned name holds no slot: {invited:?}"
+            "the retired name holds no slot: {invited:?}"
         );
         assert!(
             invited.contains(&"kimi-code".to_string())
@@ -16185,14 +16184,9 @@ mod tests {
         // Reversibility, visible at the pool: reinstated, the name is invited again.
         {
             let mut s = shared.lock().await;
-            let crate::server::state::ServerState {
-                vault,
-                member_registry,
-                ..
-            } = &mut *s;
-            assert_eq!(
-                crate::member_registry::reinstate_member(vault, member_registry, "attest-probe"),
-                crate::member_registry::ReinstateOutcome::Reinstated
+            assert!(
+                s.retired_members.reinstate("attest-probe").is_some(),
+                "the row existed to remove"
             );
         }
         let invited = invited_of(claim("Edit -> file two").await);
@@ -20431,25 +20425,19 @@ mod appeal_tests {
             Some("codex-cli"),
             "CONTROL: Live + recognised + cross-vendor wins the slot while the name is active: {filed}"
         );
-        // The operator retires the residue name.
+        // The operator retires the residue name — seeded on the store the one
+        // retire verb (#1100) commits, which is the store the pool now reads.
         {
             let mut s = state.lock().await;
-            let crate::server::state::ServerState {
-                vault,
-                member_registry,
-                ..
-            } = &mut *s;
-            assert_eq!(
-                crate::member_registry::retire_member(
-                    vault,
-                    member_registry,
-                    "codex-cli",
-                    "op",
-                    "probe residue",
-                    1,
-                ),
-                crate::member_registry::RetireOutcome::Retired
-            );
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "codex-cli".into(),
+                retired_at: 1,
+                reason: "probe residue".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: true,
+                retired_by: "op".into(),
+            });
         }
         let deny_hash2 = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
         let filed2 = tool_appeal(&state, &json!({
@@ -20459,7 +20447,7 @@ mod appeal_tests {
         assert_eq!(
             filed2.pointer("/dispatched/arbiter").and_then(Value::as_str),
             Some("kimi-code"),
-            "the tombstone excludes the Live residue name; the appeal routes to a \
+            "the retirement excludes the Live residue name; the appeal routes to a \
              member that can answer: {filed2}"
         );
     }
@@ -22560,8 +22548,11 @@ fn resolve_invitation(
             // rank (#990). A slot on this list is RIVALROUS (top `MAX_INVITED_PEERS`
             // of a pool that only grew), and every ranking fix left the residue in
             // place underneath the cap:
-            //   * RETIRED — the registry's one administrative remove, the operator's
-            //     tombstone (`retire_member`). dp's standing call is that evidence
+            //   * RETIRED — the operator's administrative remove, recorded in
+            //     `retired_members` by the one retire verb (`POST
+            //     /api/agents/:id/retire`, #1100): witnessed as
+            //     `member_retire_intent`/`member_retired`, and it revokes the id's
+            //     grants in the same act. dp's standing call is that evidence
             //     (liveness, mailbox rows) may ORDER the pool but never shrink it —
             //     a legitimate new member has no rows yet — so the shrink is an
             //     administrative act, and this filter is where it takes effect.
@@ -22569,9 +22560,9 @@ fn resolve_invitation(
             //     connect, witness, or answer, so a slot spent on it is dead by
             //     construction. Same defect class as probe residue, one field over.
             // Both stay in the registry (presence, history) — this is a SELECTION
-            // exclusion, not an erasure; the tombstone and the type mark are the
-            // record.
-            .filter(|id| !s.member_registry.is_retired(id))
+            // exclusion, not an erasure; the retirement row and the type mark are
+            // the record.
+            .filter(|id| !s.retired_members.is_retired(id))
             .filter(|id| !s.member_registry.is_filler(id))
             .map(|id| {
                 let l = actor_liveness(&window, &id);

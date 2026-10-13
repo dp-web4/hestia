@@ -59,6 +59,13 @@ pub struct RetiredMember {
     /// True when the operator overrode the recently-acted guard.
     #[serde(default)]
     pub was_active: bool,
+    /// WHO retired it: the operator principal the daemon's challenge-signed session resolved
+    /// (#1036 — the route used to write the literal `"operator"`, which names a role, not a
+    /// party; the witnessed `member_retire_intent`/`member_retired` rows carry the same
+    /// principal). Empty on rows written before this field existed — read it as "not
+    /// recorded", never as a party.
+    #[serde(default)]
+    pub retired_by: String,
 }
 
 /// `plugin_id -> retirement`, rebuilt from the vault at load like the member registry.
@@ -132,6 +139,7 @@ mod tests {
             evidence_ref: "dp 2026-09-08".into(),
             revoked_paths: vec![],
             was_active: false,
+            retired_by: String::new(),
         }
     }
 

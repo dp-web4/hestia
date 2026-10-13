@@ -127,9 +127,10 @@ enum Command {
     #[command(subcommand)]
     Scope(ScopeCmd),
 
-    /// Member registry governance (#990): retire a residue name from the
-    /// invitation pool, or reinstate it. Operator-signed against the daemon's
-    /// challenge surface — adds no authority the daemon does not already enforce.
+    /// Member lifecycle (#990, on #1100's store): retire a residue id out of the
+    /// governance pools (grants revoked in the same act), or reinstate it.
+    /// Operator-signed against the daemon's challenge surface — adds no authority
+    /// the daemon does not already enforce.
     Member {
         #[command(subcommand)]
         cmd: MemberCmd,
@@ -246,21 +247,33 @@ enum GateCmd {
 
 #[derive(Subcommand, Debug)]
 enum MemberCmd {
-    /// Retire a member name: tombstone it so no governance-selection pool spends a
-    /// slot on it again (#990). Reversible — see `reinstate`.
+    /// Retire a member id: out of every governance-selection pool, grants revoked
+    /// in the same act (#990, on #1100's store). Reversible — see `reinstate`.
     Retire {
         /// The member id to retire (e.g. a probe-residue name)
         plugin_id: String,
-        /// WHY — required, single line; carried on the tombstone and the witnessed
-        /// event. A prune without a stated basis cannot be challenged.
+        /// WHY — required, single line; carried on the retirement row and the
+        /// witnessed events. A prune without a stated basis cannot be challenged.
         #[arg(long)]
         reason: String,
+        /// The evidence pointer for the judgement (e.g. "dp 2026-09-08", a forum
+        /// post, a chain hash) — required, like the reason.
+        #[arg(long, rename_all = "kebab-case")]
+        r#ref: String,
+        /// Override the daemon's recently-acted guard: the id has acted in the
+        /// last 24h and you mean to revoke its grants anyway.
+        #[arg(long)]
+        confirm_active: bool,
     },
 
-    /// Reinstate a retired member name: clear the tombstone, return it to the pool.
+    /// Reinstate a retired member id: lift the retirement, return it to the
+    /// pools. Grants revoked at retirement are NOT restored.
     Reinstate {
         /// The member id to reinstate
         plugin_id: String,
+        /// WHY — required; the witnessed `member_reinstated` pair carries it.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -1139,11 +1152,11 @@ pub fn run() -> AnyResult<()> {
             }
         }
         Command::Member { cmd, endpoint, key } => match cmd {
-            MemberCmd::Retire { plugin_id, reason } => {
-                hestia::member_cli::retire(&endpoint, &key, &plugin_id, &reason)
+            MemberCmd::Retire { plugin_id, reason, r#ref, confirm_active } => {
+                hestia::member_cli::retire(&endpoint, &key, &plugin_id, &reason, &r#ref, confirm_active)
             }
-            MemberCmd::Reinstate { plugin_id } => {
-                hestia::member_cli::reinstate(&endpoint, &key, &plugin_id)
+            MemberCmd::Reinstate { plugin_id, reason } => {
+                hestia::member_cli::reinstate(&endpoint, &key, &plugin_id, &reason)
             }
         },
         Command::Vault(v) => match v {

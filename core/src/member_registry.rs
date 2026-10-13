@@ -49,27 +49,6 @@ struct PersistedMember {
     /// row written before this field existed reads as a member, which is what it was.
     #[serde(default)]
     filler: bool,
-    /// The retirement tombstone, when this name has been retired (#990). The row is
-    /// kept whole — LCT and sealed keypair included — because both verify the
-    /// member's HISTORICAL witnessed acts, and a deletion would make that record
-    /// unverifiable to anyone who didn't already trust the deleter. Retirement
-    /// subtracts the name from every governance-selection pool; it rewrites nothing
-    /// that already happened. Defaults `None` so every row written before this field
-    /// existed reads as active, which is what it was.
-    #[serde(default)]
-    retired: Option<Retirement>,
-}
-
-/// The tombstone written by [`retire_member`]: WHO retired this name, WHEN, and
-/// WHY — the three facts #990 requires the record to carry. The same triple rides
-/// the witnessed `member_retired` chain event; this row is the durable copy a
-/// restart reloads. `retired_by` is the operator principal the daemon's
-/// challenge-signed session resolved — evidence, not a caller-supplied string.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Retirement {
-    pub retired_by: String,
-    pub retired_at: u64,
-    pub reason: String,
 }
 
 /// In-memory member registry: `plugin_id → LCT`, rebuilt from the vault each boot.
@@ -80,13 +59,6 @@ pub struct MemberRegistry {
     /// LCT because the LCT is what gets PUBLISHED, and the registry ingest is not the
     /// place to teach a new field; the refusals that need this fact all run here.
     fillers: HashSet<String>,
-    /// The subset of `members` an operator has RETIRED (#990), with each name's
-    /// tombstone. Retired names stay in `members` — their LCTs still verify
-    /// historical acts, and `get` still resolves them — but every
-    /// governance-selection pool (`resolve_invitation`) filters them out. Kept
-    /// beside the map for the same reason `fillers` is: the fact gates selection,
-    /// and selection runs here.
-    retired: HashMap<String, Retirement>,
 }
 
 /// Which namespace proved a member reference.
@@ -271,17 +243,6 @@ impl MemberRegistry {
         }
     }
 
-    /// Is this id retired — an operator-tombstoned name (#990) that no
-    /// governance-selection pool may spend a slot on? The name keeps its LCT and
-    /// its place in `members`; retirement is a selection fact, not an erasure.
-    pub fn is_retired(&self, plugin_id: &str) -> bool {
-        self.retired.contains_key(plugin_id)
-    }
-    /// The tombstone itself (who/when/why), for surfaces that render the fact
-    /// rather than merely acting on it.
-    pub fn retirement(&self, plugin_id: &str) -> Option<&Retirement> {
-        self.retired.get(plugin_id)
-    }
     /// Every (plugin_id, LCT) pair, for the publish set. Sorted by plugin_id so
     /// dry-runs and publishes are reproducible.
     pub fn iter_sorted(&self) -> Vec<(&String, &Lct)> {
@@ -300,21 +261,13 @@ pub fn load_members(vault: &crate::vault::Vault) -> MemberRegistry {
             .unwrap_or_default();
     let mut members = HashMap::new();
     let mut fillers = HashSet::new();
-    let mut retired = HashMap::new();
     for p in persisted {
         if p.filler {
             fillers.insert(p.plugin_id.clone());
         }
-        if let Some(r) = p.retired {
-            retired.insert(p.plugin_id.clone(), r);
-        }
         members.insert(p.plugin_id, p.lct);
     }
-    MemberRegistry {
-        members,
-        fillers,
-        retired,
-    }
+    MemberRegistry { members, fillers }
 }
 
 /// Attach a citizenship reference to a member's LCT and re-persist, so the member
@@ -356,178 +309,6 @@ pub fn attach_citizenship(
         }
     }
     true
-}
-
-/// The outcome of [`retire_member`]. An enum, not a bool: the operator surface
-/// maps each arm to a different HTTP status, and a caller that cannot tell
-/// "unknown id" from "already retired" will misreport one of them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RetireOutcome {
-    Retired,
-    UnknownId,
-    AlreadyRetired,
-    /// A filler is never a member and never held a governance slot (the pool
-    /// excludes it by type), so there is nothing to retire. Refusing, loudly, is
-    /// what keeps `member_retired` an event ABOUT members.
-    FillerIsNotAMember,
-    PersistFailed(String),
-}
-
-/// The outcome of [`reinstate_member`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReinstateOutcome {
-    Reinstated,
-    UnknownId,
-    NotRetired,
-    PersistFailed(String),
-}
-
-/// Retire a member name out of every governance-selection pool (#990): the
-/// registry's one administrative REMOVE, tombstoning rather than deleting.
-///
-/// Why a tombstone and not a delete. The row's sealed keypair verifies the
-/// member's whole historical witness record; deleting it would make the fleet's
-/// own chain unverifiable against the registry, and would make retirement
-/// IRREVERSIBLE — which under the operator-surface stakes classification is the
-/// quorum tier, not a single operator's call. A tombstone keeps the act
-/// high-consequence but UNDOABLE ([`reinstate_member`]), which is the tier the
-/// judgement actually belongs to: an operator pruning probe residue, not a
-/// society rewriting its membership.
-///
-/// What retirement does NOT do. It does not refuse connects, un-mint the LCT, or
-/// rewrite the publish set — the entry side of the registry (#63's caller-supplied
-/// `plugin_id`, free and unauthenticated) is #824/#832's repair, not this one's.
-/// A retired name that connects again still resolves (`get`, `member_lct`), still
-/// verifies its history, and stays retired until an operator reinstates it:
-/// presence is a fact, a governance slot is a grant, and only the second is
-/// revoked here. The daemon witnesses the act as `member_retired` (who/when/why)
-/// beside this durable copy; the operator surface is the only writer.
-///
-/// ORDERING CONTRACT (dp's #1036 hold item, claude-code's review): the caller
-/// validates ([`validate_retire`]), appends the witness row, and only then calls
-/// this fn to commit — so a `PersistFailed` here means the retirement never took
-/// effect, and the caller compensates the now-orphan witness row with
-/// `member_retire_failed` carrying its hash. The rule the ordering buys: no
-/// retirement stays in force without its witness row, in either failure
-/// direction.
-/// The refusal `retire_member` would return, computed with no side effects.
-/// The operator surface validates BEFORE it witnesses (`validate` → append
-/// `member_retired` → `retire_member` to commit): a witnessed refusal is a
-/// contradiction — the chain would carry the act for an ask that was never
-/// attempted. The caller holds the state lock across all three steps, so the
-/// verdict cannot drift between check and commit.
-pub fn validate_retire(registry: &MemberRegistry, plugin_id: &str) -> Option<RetireOutcome> {
-    if !registry.members.contains_key(plugin_id) {
-        return Some(RetireOutcome::UnknownId);
-    }
-    if registry.fillers.contains(plugin_id) {
-        return Some(RetireOutcome::FillerIsNotAMember);
-    }
-    if registry.retired.contains_key(plugin_id) {
-        return Some(RetireOutcome::AlreadyRetired);
-    }
-    None
-}
-
-/// `validate_retire` for the undo, under the same ordering rule: validate,
-/// witness `member_reinstated`, then commit.
-pub fn validate_reinstate(
-    registry: &MemberRegistry,
-    plugin_id: &str,
-) -> Option<ReinstateOutcome> {
-    if !registry.members.contains_key(plugin_id) {
-        return Some(ReinstateOutcome::UnknownId);
-    }
-    if !registry.retired.contains_key(plugin_id) {
-        return Some(ReinstateOutcome::NotRetired);
-    }
-    None
-}
-
-pub fn retire_member(
-    vault: &mut crate::vault::Vault,
-    registry: &mut MemberRegistry,
-    plugin_id: &str,
-    retired_by: &str,
-    reason: &str,
-    now: u64,
-) -> RetireOutcome {
-    if let Some(outcome) = validate_retire(registry, plugin_id) {
-        return outcome;
-    }
-    let tombstone = Retirement {
-        retired_by: retired_by.to_string(),
-        retired_at: now,
-        reason: reason.to_string(),
-    };
-    // Persist FIRST, memory second: the durable copy is the one a restart reads,
-    // so a failed save must leave nothing behind in memory either (the same
-    // ordering `mint_once` uses — not durable → don't advertise).
-    let mut persisted: Vec<PersistedMember> =
-        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
-            .unwrap_or_default();
-    let Some(p) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) else {
-        // In memory but not in the vault doc (a persist failure at mint, or the
-        // vault read above failed closed to an empty doc). A STORAGE fault, not a
-        // wrong name — reporting it `UnknownId` made the route answer 404 "no
-        // member named" for a member that exists, sending the operator hunting a
-        // spelling that was never wrong (reinstate already reports this arm as
-        // PersistFailed; the two now agree).
-        return RetireOutcome::PersistFailed(
-            "member row absent from the vault doc (no tombstone written, member left active)"
-                .to_string(),
-        );
-    };
-    p.retired = Some(tombstone.clone());
-    if let Err(e) = crate::vault::save_doc(
-        vault,
-        MEMBERS_NAMESPACE,
-        MEMBERS_DOC,
-        MEMBERS_LEGACY_FILE,
-        &persisted,
-    ) {
-        return RetireOutcome::PersistFailed(e.to_string());
-    }
-    registry.retired.insert(plugin_id.to_string(), tombstone);
-    RetireOutcome::Retired
-}
-
-/// Undo a retirement (#990): clear the tombstone, restore the name to the
-/// invitation pool. This is what keeps the pair `retire`/`reinstate` inside
-/// `HighReversible` — an undoable act needs one operator's signature, never the
-/// quorum the irreversible tier demands. Witnessed by the daemon as
-/// `member_reinstated`.
-pub fn reinstate_member(
-    vault: &mut crate::vault::Vault,
-    registry: &mut MemberRegistry,
-    plugin_id: &str,
-) -> ReinstateOutcome {
-    if let Some(outcome) = validate_reinstate(registry, plugin_id) {
-        return outcome;
-    }
-    // Same ordering as `retire_member` — persist first, memory last — so a failed
-    // save leaves both copies exactly as they were.
-    let mut persisted: Vec<PersistedMember> =
-        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
-            .unwrap_or_default();
-    let Some(p) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) else {
-        return ReinstateOutcome::PersistFailed(
-            "member row absent from the vault doc (in-memory tombstone left in place)"
-                .to_string(),
-        );
-    };
-    p.retired = None;
-    if let Err(e) = crate::vault::save_doc(
-        vault,
-        MEMBERS_NAMESPACE,
-        MEMBERS_DOC,
-        MEMBERS_LEGACY_FILE,
-        &persisted,
-    ) {
-        return ReinstateOutcome::PersistFailed(e.to_string());
-    }
-    registry.retired.remove(plugin_id);
-    ReinstateOutcome::Reinstated
 }
 
 /// Vouch a member's **operational witnessing key** on its LCT (concord ruling (B),
@@ -723,7 +504,6 @@ fn mint_once(
         lct: lct.clone(),
         keypair_secret_hex: hex::encode(keypair.secret_key_bytes()),
         filler,
-        retired: None,
     });
     if let Err(e) = crate::vault::save_doc(
         vault,
@@ -1154,119 +934,5 @@ mod tests {
         let reloaded = load_members(&vault);
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded.get("claude-code").unwrap().lct_id(), minted);
-    }
-
-    #[test]
-    fn retirement_tombstones_persists_and_leaves_history_verifiable() {
-        let (_dir, mut vault) = fresh_vault();
-        let mut reg = MemberRegistry::default();
-        let minted =
-            ensure_member(&mut vault, &mut reg, "attest-probe", false, "sid", "anchor").unwrap();
-        assert!(!reg.is_retired("attest-probe"));
-        let out = retire_member(
-            &mut vault,
-            &mut reg,
-            "attest-probe",
-            "lct:web4:operator:dp",
-            "probe residue — never a real seat (#990)",
-            12345,
-        );
-        assert_eq!(out, RetireOutcome::Retired);
-        assert!(reg.is_retired("attest-probe"));
-        let t = reg.retirement("attest-probe").unwrap();
-        assert_eq!(t.retired_by, "lct:web4:operator:dp");
-        assert_eq!(t.retired_at, 12345);
-        assert!(t.reason.contains("probe residue"));
-        // The tombstone survives the vault round trip, which is where a restart reads it.
-        let reloaded = load_members(&vault);
-        assert!(reloaded.is_retired("attest-probe"));
-        assert_eq!(
-            reloaded.retirement("attest-probe").unwrap().retired_by,
-            "lct:web4:operator:dp"
-        );
-        // And the row is NOT deleted: the LCT still resolves and still verifies, so the
-        // member's historical witnessed acts stay checkable against the registry.
-        let lct = reloaded.get("attest-probe").expect("retirement keeps the LCT");
-        assert_eq!(lct.lct_id(), minted);
-        assert!(lct.verify_binding());
-    }
-
-    #[test]
-    fn retire_refuses_the_three_non_member_arms() {
-        let (_dir, mut vault) = fresh_vault();
-        let mut reg = MemberRegistry::default();
-        ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
-        ensure_filler(&mut vault, &mut reg, "ollama:m@sha256:00", "sid", "anchor").unwrap();
-        assert_eq!(
-            retire_member(&mut vault, &mut reg, "ghost", "op", "r", 1),
-            RetireOutcome::UnknownId
-        );
-        assert_eq!(
-            retire_member(&mut vault, &mut reg, "ollama:m@sha256:00", "op", "r", 1),
-            RetireOutcome::FillerIsNotAMember,
-            "a filler never held a governance slot — there is nothing to retire"
-        );
-        assert_eq!(
-            retire_member(&mut vault, &mut reg, "claude-code", "op", "r", 1),
-            RetireOutcome::Retired
-        );
-        assert_eq!(
-            retire_member(&mut vault, &mut reg, "claude-code", "op", "r", 2),
-            RetireOutcome::AlreadyRetired,
-            "a second retire mints no second tombstone"
-        );
-        // None of the refusals touched the durable copy: a reload shows exactly one
-        // tombstone, on the one member that earned it.
-        let reloaded = load_members(&vault);
-        assert!(reloaded.is_retired("claude-code"));
-        assert!(!reloaded.is_retired("ollama:m@sha256:00"));
-        assert!(!reloaded.is_retired("ghost"));
-    }
-
-    /// A member in memory whose row is absent from the vault doc (a persist
-    /// failure at mint leaves exactly this on the next boot) is a STORAGE fault,
-    /// not a wrong name: reported `UnknownId`, the route answered 404 "no member
-    /// named" for a member that exists (claude-code's #1036 review, minor item).
-    #[test]
-    fn an_in_memory_member_absent_from_the_vault_doc_is_a_storage_fault_not_a_wrong_name() {
-        let (_dir_a, mut vault_a) = fresh_vault();
-        let (_dir_b, mut vault_b) = fresh_vault();
-        let mut reg = MemberRegistry::default();
-        ensure_member(&mut vault_a, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
-        match retire_member(&mut vault_b, &mut reg, "claude-code", "op", "r", 1) {
-            RetireOutcome::PersistFailed(_) => {}
-            other => panic!("a storage fault must not read as a wrong name: {other:?}"),
-        }
-        assert!(!reg.is_retired("claude-code"), "nothing took effect");
-    }
-
-    #[test]
-    fn reinstate_round_trips_and_reports_a_member_that_was_not_retired() {
-        let (_dir, mut vault) = fresh_vault();
-        let mut reg = MemberRegistry::default();
-        ensure_member(&mut vault, &mut reg, "claude-code", false, "sid", "anchor").unwrap();
-        assert_eq!(
-            reinstate_member(&mut vault, &mut reg, "ghost"),
-            ReinstateOutcome::UnknownId
-        );
-        assert_eq!(
-            reinstate_member(&mut vault, &mut reg, "claude-code"),
-            ReinstateOutcome::NotRetired,
-            "reinstating an active member is reported, not a silent no-op"
-        );
-        retire_member(&mut vault, &mut reg, "claude-code", "op", "probe", 7).into_ok();
-        assert_eq!(
-            reinstate_member(&mut vault, &mut reg, "claude-code"),
-            ReinstateOutcome::Reinstated
-        );
-        assert!(!reg.is_retired("claude-code"));
-        assert!(!load_members(&vault).is_retired("claude-code"));
-    }
-
-    impl RetireOutcome {
-        #[track_caller]
-        fn into_ok(self) {
-            assert_eq!(self, RetireOutcome::Retired);
-        }
     }
 }
