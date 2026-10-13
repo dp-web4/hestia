@@ -675,6 +675,56 @@ def test_the_review_door_comment_names_the_seats_own_identity():
           "certifies nothing")
 
 
+def test_attempted_for_record_carries_past_the_display_bound():
+    """#648: the scope-request record must carry the act past the 220 display cut — a
+    NOT-SAME peer ruling from the record alone was refusing requests whose stored act
+    truncated inside the command (5 refusals, 2026-10-13)."""
+    cmd = "git apply " + "held/" + "a" * 300 + ".patch"
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("record act carries the whole 307-char command",
+          cmd in out and "…" not in out, repr(out[-60:]))
+
+
+def test_attempted_for_record_cut_is_visible_and_rare():
+    """A cut at the record bound is allowed — but it must SAY so, at SCOPE_ACT_MAX, with the
+    same marker the daemon writes. The pre-fix shape cut silently at 400 on the daemon and
+    at 220 on the gate."""
+    cmd = "x" * 5000
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("cut at SCOPE_ACT_MAX with the marker",
+          out.endswith(m.SCOPE_ACT_MARK) and len(out) == len("Bash: ") + m.SCOPE_ACT_MAX
+          + len(m.SCOPE_ACT_MARK), repr(out[-40:]))
+    cmd = "y" * 3000
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("under the bound: no cut, no marker",
+          out == f"Bash: {cmd}", repr(out[-40:]))
+
+
+def test_attempted_summary_display_bound_unchanged():
+    """The 220 display cut is the member-mid-task reader's bound (#185) — the record-depth
+    variant must not have widened IT."""
+    cmd = "z" * 300
+    out = m.attempted_summary("Bash", {"command": cmd}, command=cmd)
+    check("display summary still cuts at 220 with ' …'",
+          out == f"Bash: {'z' * 220} …", repr(out[-30:]))
+
+
+def test_attempted_for_record_keeps_the_redaction_rules():
+    """Record depth widens the bound, never the exposure: whole-withhold on credential-shaped
+    text, value-masking otherwise — identical rules to the display summary."""
+    cmd = "curl -H authorization: Bearer eye rolled off " + "q" * 300
+    # The shape list matches lowercase; the point here is the shape, not a real token.
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("credential-shaped command is withheld whole at record depth too",
+          "REDACTED" in out and "qqqq" not in out, repr(out[:120]))
+    # A bare `--token VALUE` is not credential-SHAPED (the shapes carry `token=`, `_token`),
+    # so the command survives with only the value masked — masking, not withholding.
+    cmd = "vault login --token hunter2 and then " + "b" * 300
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("key value masked, the rest of the long command survives",
+          "hunter2" not in out and "--token ***" in out and "bbb" in out, repr(out[:120]))
+
+
 ALL = [
     test_allow_proceeds,
     test_deny_enforced_blocks,
@@ -706,6 +756,10 @@ ALL = [
     test_the_review_door_is_the_callers_assertion_not_the_librarys,
     test_the_review_capability_spelling_matches_the_daemons,
     test_the_review_door_comment_names_the_seats_own_identity,
+    test_attempted_for_record_carries_past_the_display_bound,
+    test_attempted_for_record_cut_is_visible_and_rare,
+    test_attempted_summary_display_bound_unchanged,
+    test_attempted_for_record_keeps_the_redaction_rules,
 ]
 
 if __name__ == "__main__":
