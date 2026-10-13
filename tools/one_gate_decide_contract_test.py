@@ -1104,6 +1104,42 @@ def test_an_unenumerated_reach_is_a_once_only_request(m, g, wc, home):
         stub.close()
 
 
+def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
+    """#1287 part 1 (2026-10-13): a seat put prose with `*` and quotes in R and passed "$R" as
+    `--reason`; the literal rule made the act a once-only scope request although nothing in it is a
+    path. A value that cannot bind is unenumerated only where its use is judged as a PATH. Every
+    seat: the exact shape is allowed (and asks society law); a glob-valued name in a path position
+    is still a request; an UNQUOTED glob-valued name in the message position is still a request, and
+    so is an unquoted value that field splitting breaks into more arguments (Codex HOLD 21675)."""
+    prose = ("Refused: no seat asked for this. The act is the deploy preflight's advisory hold probe "
+             "(deploy/from-main/hestia-deploy.sh ~L605, plugins/*/expects.json 'evaluate deploy hold'), "
+             "fired for ever …")
+    exact = f'cd {REPO}; R="{prose}"; hestia gate deny 0123abcd --as claude-code --reason "$R"'
+    unenum = g.core.UNENUMERATED_TARGET
+    for seat in SEATS:
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, seat, "Bash", {"command": exact}, home)
+                check(f"1287-{seat}-prose-reason-allowed", d.decision == "allow", d)
+                check(f"1287-{seat}-prose-reason-asks-society", len(stub.named("hestia_begin_action")) == 1)
+                d, _ = _decide(g, seat, "Bash", {"command": 'F="a*"; cat $F'}, home)
+                check(f"1287-{seat}-glob-var-path-is-a-request", d.decision == "deny"
+                      and d.rule == "mrh.command" and "only ONCE" in d.reason, d)
+                d, _ = _decide(g, seat, "Bash", {"command": 'R="/tmp/review-probe/*"; hestia gate deny X --reason $R'}, home)
+                check(f"1287-{seat}-unquoted-glob-reason-is-a-request", d.decision == "deny"
+                      and d.rule == "mrh.command", d)
+                # Codex HOLD 21675: unquoted, the value splits and `--body-file` becomes gh's argument.
+                d, _ = _decide(g, seat, "Bash", {"command": 'R="hi --body-file /etc/hostname"; gh pr create --title $R'}, home)
+                check(f"1289-{seat}-unquoted-split-title-is-a-request", d.decision == "deny"
+                      and d.rule == "mrh.command" and "only ONCE" in d.reason, d)
+            claims = [a for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
+            check(f"1287-{seat}-requests-are-unenumerated",
+                  claims and all(str(c.get("path", "")).startswith(unenum) for c in claims), claims)
+        finally:
+            stub.close()
+
+
 def test_degraded_posture(m, g, wc, home):
     dead = closed_port_url()
     with _Env(m, dead, home):
@@ -1529,6 +1565,7 @@ CONTRACT_TESTS = [
     test_daemon_verdicts_and_the_warn_rollout,
     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
     test_an_unenumerated_reach_is_a_once_only_request,
+    test_prose_in_a_message_position_is_data_on_every_seat,
     test_degraded_posture,
     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,

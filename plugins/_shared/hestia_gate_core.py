@@ -1331,8 +1331,9 @@ _SHELL_PUNCT = frozenset(";|&()<>")
 #: Sentinels in a tokenised word: a `$` / backtick the shell will NOT expand (quoted or escaped),
 #: and an UNQUOTED brace expansion (`{a,b}`, `{1..3}`) about to open.
 _LIT_DOLLAR, _LIT_TICK, _BRACE = "\x00", "\x02", "\x03"
-#: Marks a `$NAME` / `${…}` reference written INSIDE double quotes (no field splitting, no
-#: globbing at that use) — evidence the literal rule needs before a whitespace value may bind.
+#: Marks a `$NAME` / `${…}` reference, or a `$(…)` / backtick substitution, written INSIDE double
+#: quotes (no field splitting, no globbing at that use) — evidence the literal rule needs before a
+#: whitespace value may bind, and that a data position needs before an expansion is one argument.
 _DQ_REF = "\x04"
 #: `$'…'` (ANSI-C) and `$"…"` (locale) quoting rewrite their content; never modelled. The word
 #: carries this unbound parameter reference, so wherever it is judged as a path it is
@@ -1402,14 +1403,14 @@ def _tokenize(text: str) -> list:
                     continue
                 if text.startswith("$(", j):
                     k = _balanced_end(text, j + 1)
-                    seg.append(text[j:k + 1])
+                    seg.append(_DQ_REF + text[j:k + 1])   # a quoted substitution
                     j = k + 1
                     continue
                 if text[j] == "`":
                     k = text.find("`", j + 1)
                     if k < 0:
                         raise _Unmodelled("an unclosed backtick")
-                    seg.append(text[j:k + 1])
+                    seg.append(_DQ_REF + text[j:k + 1])
                     j = k + 1
                     continue
                 if text[j] == "$" and j + 1 < n and (text[j + 1] == "{" or text[j + 1] == "_"
@@ -1570,6 +1571,42 @@ for _h in ("su", "runuser"):
                       "value_opts": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"}}
 _CMD_SPECS["script"] = {"code_opts": {"-c", "--command"}}
 _CMD_SPECS["flock"] = {"code_opts": {"-c", "--command"}, "value_opts": {"-w", "--timeout"}}
+#: PROSE OPTIONS (#1287): values that are messages, not paths — a reason, a body, a title. A seat's
+#: `--reason "$R"` with prose in R (a `*`, quotes) was made a once-only scope request by the literal
+#: rule although nothing in it is a path. Keyed by (command, subcommand words) and NEVER generic: an
+#: option's arity is the command's, and often the subcommand's (`grep --text`, `readelf --notes`,
+#: `git diff --summary` and `gh pr review -c` take no value, so a generic prose `--text` swallowed
+#: the file after it — Codex HOLD 21639). Each entry is checked against the tool's own definition:
+#: hestia's clap tree (every `--reason` / `--argument` is a String) and `gh <sub> --help`. A
+#: subcommand word must precede the option; anything else stays a path. An UNQUOTED glob in the
+#: word itself is still judged (the shell expands it first), as for every other string position.
+_PROSE_OPTS = {
+    ("hestia",): {"--reason", "--argument"},
+    ("gh", "pr", "create"): {"--title", "-t", "--body", "-b"},
+    ("gh", "pr", "edit"): {"--title", "-t", "--body", "-b"},
+    ("gh", "issue", "create"): {"--title", "-t", "--body", "-b"},
+    ("gh", "issue", "edit"): {"--title", "-t", "--body", "-b"},
+    ("gh", "pr", "comment"): {"--body", "-b"},
+    ("gh", "issue", "comment"): {"--body", "-b"},
+    ("gh", "pr", "review"): {"--body", "-b"},
+    ("gh", "pr", "close"): {"--comment", "-c"},
+    ("gh", "issue", "close"): {"--comment", "-c"},
+    ("gh", "pr", "merge"): {"--subject", "-t", "--body", "-b"},
+    ("gh", "release", "create"): {"--title", "-t", "--notes", "-n"},
+    ("gh", "release", "edit"): {"--title", "-t", "--notes", "-n"},
+}
+
+
+def _string_opts(head, spec, subs=()) -> set:
+    """The options whose value is a plain string for `head` after the positional words `subs`:
+    its spec's, plus the prose options `_PROSE_OPTS` names for that command and subcommand."""
+    out = set(spec.get("string_opts", set()))
+    for key, opts in _PROSE_OPTS.items():
+        if key[0] == head and tuple(subs[:len(key) - 1]) == key[1:]:
+            out |= opts
+    return out
+
+
 #: Commands whose argv is built from STDIN: what they reach is another command's output.
 _STDIN_ARGV = frozenset(("xargs", "parallel"))
 #: Commands that resolve their relative arguments against a directory option (`-C D`).
@@ -1625,6 +1662,55 @@ OVERFLOW_TARGET = UNPRICEABLE_PREFIX + "overflow"
 #: `$!` (digits) and `$-` (flag letters), replaced by a placeholder of the same class.
 _PLACEHOLDER_PARAMS = {"$?": "0", "$#": "0", "$$": "0", "$!": "0", "$-": "x"}
 
+#: The heads of a `${…}` PROVED to be one word inside double quotes: a name with no index or an index
+#: holding no `@` (`${A[*]}` joins), a positional number, or `*` `#` `?` `$` `-`, then the closing
+#: brace or an operator; `${!}` (the last pid) alone; `${#…}` counts; the joined key and prefix
+#: lists `${!A[*]}` / `${!P*}`. This is an ALLOWLIST: `${@…}`, `${A[@]…}` and every other `${!…}`
+#: (a name, `${!1}`, `${!#}` — the target decides, and `set -- 'A[@]'` makes `"${!1}"` one argument
+#: per element) are unproved. A list of shapes known to split was held three times, each for one
+#: more shape (Codex HOLDs 21718, 21790, 21861).
+_ONE_WORD_HEAD = re.compile(r"\$\{(?:(?:[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]@]*\])?|[0-9]+|[*#?$-])"
+                            r"(?=[}:+=?#%/^,@-])|!\}|#[^}]*\}$|![A-Za-z_][A-Za-z0-9_]*(?:\[\*\]|\*)\}$)")
+
+
+def _brace_end(value: str, i: int) -> int:
+    """Index of the `}` closing the `${` at `i`, counting nested `${` (bash balances them:
+    `${R:-${A[@]}}` is ONE expansion, Codex HOLD 21790) and skipping a backslash-escaped char."""
+    depth, j, n = 0, i, len(value)
+    while j < n:
+        if value[j] == "\\":
+            j += 2
+            continue
+        if value.startswith("${", j):
+            depth += 1
+            j += 2
+            continue
+        if value[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def _per_element(ref: str) -> bool:
+    """Whether a QUOTED `${…}` can still expand to more than one argument: any head not in
+    `_ONE_WORD_HEAD` (`${A[@]}` and its forms, Codex HOLD 21718; every indirection, whose target
+    decides, Codex HOLD 21861), or an unproved form NESTED in an operator word (`"${R:-${A[@]}}"`,
+    `"${R+$@}"`, Codex HOLD 21790). Recursive; a nested scalar (`"${R:-$X}"`) or joined array
+    (`"${R:-${A[*]}}"`) stays one argument."""
+    if not ref.startswith("${"):
+        return False
+    if not _ONE_WORD_HEAD.match(ref):
+        return True
+    body = ref[2:-1].replace(_DQ_REF, "")
+    try:
+        inner = _expansion_spans(body)
+    except _Unmodelled:
+        return True
+    return any(body[a:b] == "$@" or (body[a:b].startswith("${") and _per_element(body[a:b]))
+               for a, b in inner)
+
 
 def _expansion_spans(value: str) -> list:
     """`(start, end)` of every live expansion in a tokenised word: `$(…)`, `$((…))`, backticks,
@@ -1642,7 +1728,7 @@ def _expansion_spans(value: str) -> list:
             spans.append((i, k + 1))
             i = k + 1
         elif value.startswith("${", i):
-            k = value.find("}", i + 2)
+            k = _brace_end(value, i)
             if k < 0:
                 raise _Unmodelled("an unclosed ${")
             spans.append((i, k + 1))
@@ -1885,6 +1971,52 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
 
     toks = _shell_words(cmd)
     state = {}
+    # Names assigned a value holding a glob character anywhere in the command (#1287). In a data
+    # position such a name is still DATA when quoted; UNQUOTED, the shell expands the glob there —
+    # a directory read — so that one use is unenumerated.
+    globby = {m.group(1) for k, w_, _g in toks if k == "word"
+              for m in [re.match(r"([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)", w_, re.S)]
+              if m and any(c in m.group(2) for c in "*?[")}
+
+    def data(word, fields=True):
+        """A word in a DATA position (a message, pattern or string operand): no path is judged.
+        A QUOTED expansion is one argument and stays data, unless it holds `@` (`"${A[@]}"`,
+        `"${A[@]:1}"`, `"${!A[@]}"`, `"${@:1}"`): one argument per element, so where `fields` holds it
+        is unenumerated (Codex HOLD 21718). An UNQUOTED one is expanded by the
+        shell first. A glob-valued name expands to a directory read, so it is unenumerated in
+        every data position. And where the next argument would be a file (`fields`: an option
+        value, the grep / sed / awk program, a prose option) a value that field splitting breaks
+        apart inserts more arguments: `--title $R` with R="hi --body-file F" hands gh a file
+        (Codex HOLD 21675; main had it at `grep $R`, `git commit -m $R`). There an unquoted
+        expansion is data only when it is provably ONE field: a name bound to one literal
+        with no IFS whitespace (`in_force`), arithmetic, or a digit / flag-letter parameter.
+        `$'…'` is quoted. In an `echo` / `printf` / `tr` operand (`fields=False`) another field is
+        another string."""
+        try:
+            spans = _expansion_spans(word)
+        except _Unmodelled as why:
+            found.unenum.append(str(why))
+            return
+        one = in_force() if fields else {}
+        for a, b in spans:
+            ref = word[a:b]
+            if a > 0 and word[a - 1] == _DQ_REF:
+                # Quoted, but `@` inside `${…}` is one argument PER ELEMENT (Codex HOLD 21718):
+                # `"${A[@]}"` with A=(hello OUTSIDE) hands `--notes` hello and gh an asset.
+                if fields and _per_element(ref):
+                    kind = _expansion_kind(ref.replace(_DQ_REF, ""))
+                    found.unenum.append(f"{kind}, quoted, still passes one argument per element "
+                                        "where another argument can be a file (use a scalar "
+                                        "variable)")
+                continue
+            name = ref[2:-1] if ref.startswith("${") else ref[1:]
+            if name in globby:
+                found.unenum.append(f"an unquoted ${name} whose value holds a glob")
+            elif fields and not (ref.startswith("$((") or ref in _PLACEHOLDER_PARAMS
+                                 or ref == _ANSI_C_MARK or (name in one and not one[name][1])):
+                # `$'…'` is a quoted word of its own: its placeholder never splits.
+                found.unenum.append(f"{_expansion_kind(ref)} unquoted where field splitting can "
+                                    "add arguments (quote it to pass one argument)")
     # The literal rule binds only in the OUTER command's own statements: substitution bodies are
     # appended after them by `_shell_words`, and a body is a subshell.
     main_len = len(_tokenize(cmd)) if depth == 0 else 0
@@ -1918,7 +2050,7 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 found.dirs.append(home)
             else:
                 found.dirs_unknown = f"`{state['head']}` with no directory"
-        state.update(head=None, spec={}, pending=None, redirect=False, positional=0,
+        state.update(head=None, spec={}, pending=None, redirect=False, positional=0, subs=[],
                      pattern_given=False, opts_done=False, dirpending=False, chdir_seen=False,
                      env_expansion=None, code_opt=False, stdin_prog=False, herestring=False,
                      script_arg=False, heredoc=False, piped_in=sep in ("|", "|&"))
@@ -2053,9 +2185,10 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 code(w)
                 continue
             if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
-                    or opt in spec.get("string_opts", ())) and not uglob:
+                    or opt in _string_opts(head, spec, state["subs"])) and not uglob:
                 if opt in spec.get("pattern_opts", ()):
                     state["pattern_given"] = True
+                data(w)
                 continue
             if opt == "-c" and _HEREDOC_SHELL.match(head):
                 code(w)
@@ -2083,8 +2216,9 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                     chdir(w[2:], uglob)
                     emit(w[2:], uglob)
                     continue
+            strs = _string_opts(head, spec, state["subs"])
             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
-                     | spec.get("string_opts", set()) | spec.get("file_opts", set())
+                     | strs | spec.get("file_opts", set())
                      | spec.get("value_opts", set()) | spec.get("code_opts", set()))
             if eq:
                 if name in spec.get("code_opts", ()):
@@ -2094,8 +2228,10 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                     state["pattern_given"] = True
                 if uglob or not (name in spec.get("delim_opts", ())
                                  or name in spec.get("pattern_opts", ())
-                                 or name in spec.get("string_opts", ())):
+                                 or name in strs):
                     emit(val, uglob)
+                else:
+                    data(val)
                 continue
             if (_HEREDOC_SHELL.match(head) or _CODE_ARG_HEADS.match(head)) and not w.startswith("--") \
                     and re.fullmatch(r"-[A-Za-z]*[ce][A-Za-z]*", w) \
@@ -2129,6 +2265,8 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 emit(m.group(1), uglob)                    # `-I/usr/include`, `-C/elsewhere`
             continue
         state["positional"] += 1
+        if len(state["subs"]) < 3:
+            state["subs"].append(w)
         if state["positional"] == 1 and _HEREDOC_INTERPRETER.match(head) and not state["code_opt"]:
             # The program: a script file (judged as a path below), or stdin / a descriptor.
             if w == "-" or w.startswith(("/dev/fd/", "/dev/stdin", "/proc/self/fd/")):
@@ -2164,9 +2302,11 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
         # (command, position) exception can make it a string or a pattern: `tr /x/* y` and
         # `grep /x/*` read /x (Codex review 17029c). Exceptions apply to glob-free words only.
         if mode in ("strings", "strings_noglob") and not uglob:
+            data(w, fields=False)
             continue
         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
                 and not uglob:
+            data(w)
             continue
         name, eq, val = w.partition("=")
         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
