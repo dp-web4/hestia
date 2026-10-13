@@ -8,7 +8,9 @@ D = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(D))
 import corpus, replay
 def main():
-    WS = "/home/dp/ai-workspace"
+    WS = os.environ.get("HESTIA_WORKSPACE")
+    if not WS:
+        raise SystemExit("HESTIA_WORKSPACE must name the workspace to measure")
     repos = [d for d in os.listdir(WS) if os.path.isdir(os.path.join(WS, d)) and not d.startswith(".")]
     grants = [l.strip() for l in open(D / "grants-proposed.txt") if l.strip() and not l.startswith("#")]
     seen, jobs = set(), []
