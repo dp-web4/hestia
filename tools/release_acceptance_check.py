@@ -110,19 +110,25 @@ def main() -> int:
     if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-rc\.\d+)?", args.tag):
         parser.error("tag must be vX.Y.Z or vX.Y.Z-rc.N")
     prefix = f"repos/{args.repo}/releases"
+    stage = "by-tag lookup"
     try:
         release = json.loads(get(f"{prefix}/tags/{args.tag}"))
+        stage = "latest lookup"
         latest = json.loads(get(f"{prefix}/latest"))
+        stage = "asset enumeration"
         checksums = {}
         for asset in release.get("assets", []):
             name = asset["name"]
             if name in manifest(args.tag) and (name == "SHA256SUMS" or name.endswith(".sha256")):
+                stage = f"checksum asset {name}"
                 if not isinstance(asset.get("size"), int) or not 0 < asset["size"] <= 65536:
                     raise ValueError("checksum asset exceeds bounded download size")
                 checksums[name] = get(f"{prefix}/assets/{int(asset['id'])}", binary=True)
+        stage = "validation"
         result = validate(release, latest, args.tag, args.expected_latest, checksums)
-    except (ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+    except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as exc:
         print(json.dumps({"pass": False, "error": type(exc).__name__,
+                          "stage": stage,
                           "evidence": "acceptance check incomplete"}))
         return 1
     print(json.dumps(result, indent=2))

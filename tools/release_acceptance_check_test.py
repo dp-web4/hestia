@@ -1,10 +1,14 @@
 """Offline acceptance invariants; no GitHub access or bundle execution."""
 import copy
 import hashlib
+import io
+import json
+import subprocess
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from release_acceptance_check import checksum_rows, get, validate
+from release_acceptance_check import checksum_rows, get, main, validate
 from release_publish import manifest
 
 
@@ -86,6 +90,37 @@ class AcceptanceTests(unittest.TestCase):
                                       "-H", "Accept: application/octet-stream"])
             self.assertTrue(kwargs["check"])
             self.assertEqual(kwargs["timeout"], 45)
+
+    def run_cli(self, responses):
+        output = io.StringIO()
+        with patch("sys.argv", ["check", "--tag", "v0.3.0-rc.1",
+                                "--expected-latest", "v0.0.4"]), \
+                patch("release_acceptance_check.get", side_effect=responses), \
+                redirect_stdout(output):
+            status = main()
+        return status, json.loads(output.getvalue())
+
+    def test_missing_gh_returns_json(self):
+        status, result = self.run_cli([FileNotFoundError("gh")])
+        self.assertEqual(status, 1)
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["error"], "FileNotFoundError")
+        self.assertEqual(result["stage"], "by-tag lookup")
+
+    def test_failed_request_names_stage(self):
+        release, latest, _ = fixture()
+        sidecar = next(a for a in release["assets"] if a["name"].endswith(".sha256"))
+        sidecar["id"] = 1
+        for prior, stage in (([], "by-tag lookup"),
+                             ([json.dumps(release)], "latest lookup"),
+                             ([json.dumps(release), json.dumps(latest)],
+                              "checksum asset " + sidecar["name"])):
+            with self.subTest(stage=stage):
+                status, result = self.run_cli(prior + [subprocess.CalledProcessError(1, "gh")])
+                self.assertEqual(status, 1)
+                self.assertFalse(result["pass"])
+                self.assertEqual(result["error"], "CalledProcessError")
+                self.assertEqual(result["stage"], stage)
 
 
 if __name__ == "__main__":
