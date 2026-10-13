@@ -269,6 +269,12 @@ pub struct LedgerRow {
     /// case, on one row. Advisory: nothing here permitted or refused anything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advisories: Vec<String>,
+    /// A scope request's rulings the decide endpoint ACCEPTS (#1287 part 2), from
+    /// `state::scope_allowed_decisions` over the asked path and whether the gate opened it — the
+    /// function the endpoint's refusal reads. The ledger's buttons render exactly these. Empty on
+    /// every other kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_decisions: Vec<String>,
     /// The chain entry this row opened at, and the one that decided it. Both, so an operator can
     /// go from the ledger to the witnessed evidence without a search.
     pub opened_hash: String,
@@ -383,6 +389,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     coalesced: 0,
                     payload_flags: Vec::new(),
         advisories: Vec::new(),
+        allowed_decisions: Vec::new(),
                     opened_hash: e.hash.clone(),
                     decided_hash: None,
                     chain_position: e.chain_position,
@@ -417,6 +424,15 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     coalesced: 0,
                     payload_flags: Vec::new(),
         advisories: Vec::new(),
+                    // #1287 part 2: the chain row carries the asked path and the origin, the
+                    // two inputs the decide endpoint's check reads off the live request.
+                    allowed_decisions: crate::server::state::scope_allowed_decisions(
+                        s(d, "path").as_deref().unwrap_or(""),
+                        d.get("origin").and_then(|v| v.as_str()) == Some("gate_deny"),
+                    )
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
                     opened_hash: e.hash.clone(),
                     decided_hash: None,
                     chain_position: e.chain_position,
@@ -480,6 +496,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     coalesced: 0,
                     payload_flags: Vec::new(),
         advisories: Vec::new(),
+        allowed_decisions: Vec::new(),
                         opened_hash: e.hash.clone(),
                         decided_hash: Some(e.hash.clone()),
                         chain_position: e.chain_position,
@@ -735,6 +752,7 @@ fn one_shot(
                     coalesced: 0,
                     payload_flags: Vec::new(),
         advisories: Vec::new(),
+        allowed_decisions: Vec::new(),
         opened_hash: e.hash.clone(),
         decided_hash: None,
         chain_position: e.chain_position,

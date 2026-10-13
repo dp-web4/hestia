@@ -17,17 +17,50 @@ export function scopeAwaitsOperator(
   return !(req.origin === "gate_deny" && (req.invited_peers?.length ?? 0) > 0);
 }
 
+export type ScopeDecision = ScopeDuration | "refuse";
+
+type DecisionInputs = Pick<PendingScopeRequest, "once_available" | "once_only" | "allowed_decisions">;
+
 /**
- * "This act once" is a choice only when the gate recorded an act to bind; for an act the gate
- * could not enumerate (`once_only`, dp 2026-10-10) it is the ONLY choice — there is no path a
- * session or standing grant could name.
+ * #1287 part 2: the rulings the daemon's decide endpoint ACCEPTS for this request, as the
+ * daemon reports them (`allowed_decisions`, from the same function its refusal reads). An older
+ * daemon without the field falls back to the flags it did send: "this act once" only when the
+ * gate recorded an act to bind; no session or standing for an act the gate could not enumerate
+ * (`once_only`, dp 2026-10-10).
  */
-export function scopeDurations(
-  req: Pick<PendingScopeRequest, "once_available" | "once_only">,
-): ScopeDuration[] {
-  if (req.once_only === true) return req.once_available === true ? ["once"] : [];
-  return req.once_available === true ? ["once", "session", "standing"] : ["session", "standing"];
+export function scopeAllowedDecisions(req: DecisionInputs): ScopeDecision[] {
+  if (Array.isArray(req.allowed_decisions)) return req.allowed_decisions;
+  const out: ScopeDecision[] = [];
+  if (req.once_available === true) out.push("once");
+  if (req.once_only !== true) out.push("session", "standing");
+  out.push("refuse");
+  return out;
 }
+
+/** The grant durations the card may offer: exactly the accepted ones. */
+export function scopeDurations(req: DecisionInputs): ScopeDuration[] {
+  const a = scopeAllowedDecisions(req);
+  return (["once", "session", "standing"] as const).filter((d) => a.includes(d));
+}
+
+/**
+ * No session and no standing ruling: what the act reaches is decided by an expansion, so the
+ * only grant is this exact act. The card renders exactly "Approve once" and "Refuse".
+ */
+export function scopeOnceOnly(req: DecisionInputs): boolean {
+  const a = scopeAllowedDecisions(req);
+  return !a.includes("session") && !a.includes("standing");
+}
+
+/** Whether the request names a path at all (false for an act the gate could not enumerate). */
+export function scopeEnumerable(
+  req: Pick<PendingScopeRequest, "enumerable" | "once_only">,
+): boolean {
+  return typeof req.enumerable === "boolean" ? req.enumerable : req.once_only !== true;
+}
+
+export const SCOPE_ONCE_ONLY_WHY =
+  "what this act reaches is decided by an expansion, so only this exact act can be approved";
 
 export const DURATION_LABEL: Record<ScopeDuration, string> = {
   once: "this act once (spent by the identical act, inside the claim window)",

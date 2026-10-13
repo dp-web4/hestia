@@ -259,21 +259,58 @@ describe("Decide — scope requests (Sprint 2)", () => {
     expect(ruleScopeRequest.mock.calls[0][3]).toEqual({ once: true, askedPath: gateScopeRequest().path });
   });
 
-  it("offers ONLY 'this act once' for an act the gate could not enumerate (dp, 2026-10-10)", async () => {
+  it("renders exactly 'Approve once' and 'Refuse' for an act the gate could not enumerate (#1287)", async () => {
+    // dp hit a plain grant on scope-1981a1b1f6e5 and learnt the rule from the decide error.
+    // The card now offers exactly what the daemon says the endpoint accepts.
     const path = "hestia:unpriceable:unenumerated#0123456789abcdef";
     const req = gateScopeRequest({ request_id: "scope-unenum-1", path, once_only: true,
+                                   enumerable: false, allowed_decisions: ["once", "refuse"],
                                    act: 'for f in a b; do cat "$f"; done' });
     getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [req] });
     operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
     ruleScopeRequest.mockResolvedValue({ outcome: "decided", result: {} });
     render(<Decide />);
-    const dur = (await screen.findByRole("combobox", { name: /duration/i })) as HTMLSelectElement;
-    expect([...dur.options].map((o) => o.value)).toEqual(["once"]);
-    // the sentinel is not presented as a filesystem path
+    const approve = await screen.findByRole("button", { name: "Approve once" });
+    const buttons = screen.getAllByRole("button").map((b) => b.textContent);
+    expect(buttons).toEqual(["Approve once", "Refuse"]);
+    // no duration and no reach: there is nothing to choose
+    expect(screen.queryByRole("combobox", { name: /duration/i })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: /reach/i })).toBeNull();
+    // the one line saying why, and the sentinel is not presented as a filesystem path
+    expect(
+      screen.getByText("what this act reaches is decided by an expansion, so only this exact act can be approved"),
+    ).toBeTruthy();
     expect(screen.getByText(/no path: the gate cannot enumerate/)).toBeTruthy();
-    screen.getByRole("button", { name: /grant/i }).click();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "one run" } });
+    approve.click();
     await waitFor(() => expect(ruleScopeRequest).toHaveBeenCalled());
+    expect(ruleScopeRequest.mock.calls[0][1]).toBe(true);
     expect(ruleScopeRequest.mock.calls[0][3]).toEqual({ once: true, askedPath: path });
+  });
+
+  it("follows allowed_decisions over the older flags (#1287)", async () => {
+    // allowed_decisions is the decide endpoint's own set; a stale once_only must not widen it.
+    const req = gateScopeRequest({ request_id: "scope-ad-1", once_only: false,
+                                   allowed_decisions: ["once", "refuse"] });
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [req] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    await screen.findByRole("button", { name: "Approve once" });
+    expect(screen.queryByRole("button", { name: /^grant$/i })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: /duration/i })).toBeNull();
+  });
+
+  it("keeps duration, reach, Grant and Refuse for a request that names a path (#1287)", async () => {
+    const req = gateScopeRequest({ enumerable: true,
+                                   allowed_decisions: ["once", "session", "standing", "refuse"] });
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [req] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    const dur = (await screen.findByRole("combobox", { name: /duration/i })) as HTMLSelectElement;
+    expect([...dur.options].map((o) => o.value)).toEqual(["once", "session", "standing"]);
+    expect(screen.getByRole("combobox", { name: /reach/i })).toBeTruthy();
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Grant", "Refuse"]);
+    expect(screen.queryByText(/decided by an expansion/)).toBeNull();
   });
 
   it("grants standing at a directory above the asked path, recursively", async () => {

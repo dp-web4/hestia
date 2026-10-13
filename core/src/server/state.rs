@@ -695,6 +695,45 @@ pub fn is_unpriceable_scope_path(path: &str) -> bool {
     unpriceable_scope_path(path).is_some()
 }
 
+/// The ruling KINDS a pending scope request can take: `once` (this act, exactly), `session`
+/// (memory-only, expires), `standing` (vault), `refuse`.
+pub const SCOPE_DECISION_KINDS: [&str; 4] = ["once", "session", "standing", "refuse"];
+
+/// Which kind a decide body asks for. A refusal is `refuse` whatever else it carries; the
+/// decide endpoint rejects the malformed combinations (once+standing, a standing refusal) on
+/// their own terms before this matters.
+pub fn scope_decision_kind(granted: bool, once: bool, standing: bool) -> &'static str {
+    match (granted, once, standing) {
+        (false, _, _) => "refuse",
+        (true, true, _) => "once",
+        (true, false, true) => "standing",
+        (true, false, false) => "session",
+    }
+}
+
+/// THE decisions a pending scope request accepts (#1287 part 2) — the one source both the decide
+/// endpoint's refusal and every operator surface's offer read, so the UI cannot offer a ruling
+/// the endpoint then refuses after the click.
+///
+/// * `once` only when the GATE opened the request: it binds to the act the gate refused, and a
+///   member-filed ask names no act.
+/// * `session` and `standing` only when the request names a PATH: an act whose reach the gate
+///   could not enumerate (`is_unpriceable_scope_path`, #1232) names none a grant could reach.
+/// * `refuse` always.
+///
+/// Order is `SCOPE_DECISION_KINDS` order, so surfaces can render it as given.
+pub fn scope_allowed_decisions(path: &str, gate_act: bool) -> Vec<&'static str> {
+    let enumerable = !is_unpriceable_scope_path(path);
+    SCOPE_DECISION_KINDS
+        .into_iter()
+        .filter(|k| match *k {
+            "once" => gate_act,
+            "session" | "standing" => enumerable,
+            _ => true,
+        })
+        .collect()
+}
+
 /// A `path:` scope grant MUST be stored absolute (#722). A relative grant renders in the seat's
 /// grant set — e.g. `path:home/dp/ai-workspace` with no leading slash — but can never match a
 /// resolved absolute candidate under #597 prefix containment (`_within_path_grant`/`_scope_parts`),

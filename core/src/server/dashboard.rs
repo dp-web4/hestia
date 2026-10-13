@@ -1562,6 +1562,12 @@ impl ServerState {
                             // dp, 2026-10-10 (#1232 narrowed): an act the gate could not
                             // enumerate names no path — "this act once" is the ONLY grant.
                             "once_only": crate::server::state::is_unpriceable_scope_path(&r.path),
+                            // #1287 part 2: the decisions the decide endpoint ACCEPTS for this
+                            // request, from the function its refusal reads — the surfaces render
+                            // exactly these, so no button is refused after the click.
+                            "enumerable": !crate::server::state::is_unpriceable_scope_path(&r.path),
+                            "allowed_decisions": crate::server::state::scope_allowed_decisions(
+                                &r.path, r.ext.gate.is_some()),
                             // dp, 2026-10-05: NOT-SAME peers decide gate-opened requests; the
                             // operator surfaces show who was invited and offer the OVERRIDE.
                             "invited_peers": r.ext.invited_peers,
