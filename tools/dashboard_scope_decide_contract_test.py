@@ -171,6 +171,11 @@ def main() -> int:
     # dp, 2026-10-05: "scope escalations should go to peers not to me".
     check("the banner counts only what no peer can clear",
           "pend.filter(r => scopeAwaitsOperator(r))" in g and "no peer can clear" in g)
+    # dp, 2026-10-13: every gate request invites peers, so a banner shown only for operator-only
+    # requests never showed, and the decide control (a modal) was unreachable from the main view.
+    check("the banner shows whenever anything is pending, quietly when all are peer-routed",
+          "banner.hidden = pend.length === 0;" in g and "with peers to decide" in g
+          and "esc-banner-quiet" in g)
     check("a peer-routed row says who was invited and labels the controls as override",
           "scopeRouteText(r)" in g and "scopeGrantLabel(r, override)" in g
           and "scopeRefuseLabel(r, override)" in g)
