@@ -58,7 +58,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -232,8 +232,7 @@ pub fn act_shape_problem(action: &str) -> Option<Option<String>> {
 
 // ------------------------------------------------------------------------------- snapshot
 
-/// Everything delegation-related, read from the ON-DISK vault (so a `hestia delegate grant` the
-/// CLI wrote after the daemon started is seen without a restart, as #952 requires).
+/// Everything delegation-related, as of the last state-lock release that changed an input.
 #[derive(Debug, Default)]
 pub struct Snapshot {
     pub mode: Option<GateMode>,
@@ -263,8 +262,17 @@ impl Snapshot {
         self.mode.unwrap_or(GateMode::Record)
     }
 
-    /// Build from a freshly opened vault.
-    pub fn from_vault(vault: &crate::vault::Vault, home: &std::path::Path) -> Self {
+    /// Build from the daemon's own in-memory state. While the daemon runs it holds the vault's
+    /// writer lease (`Vault::hold_writer_lease`), so no other process can save the vault: the
+    /// in-memory vault and registries ARE the current state, and building from them costs no
+    /// key derivation. (An operator changes delegations or the mode on a running daemon through
+    /// the operator HTTP plane; the CLI writes only while the daemon is stopped.)
+    pub fn build(
+        vault: &crate::vault::Vault,
+        home: &std::path::Path,
+        members: &crate::member_registry::MemberRegistry,
+        roles: &web4_core::RoleRegistry,
+    ) -> Self {
         let mut s = Snapshot { loaded_at: Some(Utc::now()), ..Default::default() };
         match load_mode(vault) {
             Ok(Some(doc)) => {
@@ -282,11 +290,14 @@ impl Snapshot {
             Ok((_, kp)) => s.operator_key = Some(kp.verifying_key()),
             Err(e) => s.operator_key_error = Some(format!("{e:#}")),
         }
-        let reg = crate::member_registry::load_members(vault);
-        for (id, lct) in reg.iter_sorted() {
+        for (id, lct) in members.iter_sorted() {
             s.member_lcts.insert(id.clone(), lct.lct_id());
         }
-        s.role_lcts = crate::role_registry::persisted_role_lct_ids(vault);
+        for label in roles.labels() {
+            if let Some(r) = roles.get(label) {
+                s.role_lcts.insert(label.to_string(), r.lct.lct_id());
+            }
+        }
         s
     }
 
@@ -295,58 +306,85 @@ impl Snapshot {
     }
 }
 
-/// What identifies the on-disk inputs, so the snapshot is rebuilt only when one changed.
-/// The vault is saved by atomic rename, so the inode moves on every save (unix).
+/// What identifies the inputs, so the snapshot is rebuilt only when one changed: the vault's
+/// save generation (moves on every save), the member and role counts (a member minted on
+/// connect), and `operator.key` on disk (the verification key; written outside the vault).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Fingerprint {
-    vault: Option<(std::time::SystemTime, u64, u64)>,
-    operator_key: Option<(std::time::SystemTime, u64, u64)>,
+    vault_generation: u64,
+    members: usize,
+    roles: usize,
+    operator_key: Option<(std::time::SystemTime, u64)>,
 }
 
-fn file_fp(p: &std::path::Path) -> Option<(std::time::SystemTime, u64, u64)> {
-    let m = std::fs::metadata(p).ok()?;
-    #[cfg(unix)]
-    let ino = std::os::unix::fs::MetadataExt::ino(&m);
-    #[cfg(not(unix))]
-    let ino = 0u64;
-    Some((m.modified().ok()?, m.len(), ino))
-}
-
-/// The daemon's handle: where the vault is and how to open it, plus the cached snapshot. Shared
-/// by the state and the lock-free publication, so the decision path reads it without the state
-/// lock.
+/// The daemon's handle: the cached snapshot, refreshed at every state-lock release whose
+/// inputs changed (the same point the policy publication is refreshed), and read lock-free by
+/// the decision path and `hestia_operating_law` through the publication's shared `Arc`.
 pub struct DelegationGate {
-    vault_path: PathBuf,
-    passphrase: zeroize::Zeroizing<String>,
     home: PathBuf,
-    cache: StdMutex<Option<(Fingerprint, Arc<Snapshot>)>>,
+    cache: RwLock<Option<(Fingerprint, Arc<Snapshot>)>>,
     /// The mode this daemon last WITNESSED (see [`DelegationGate::mode_transition`]).
     witnessed_mode: StdMutex<Option<GateMode>>,
 }
 
 impl std::fmt::Debug for DelegationGate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DelegationGate").field("vault_path", &self.vault_path).finish()
+        f.debug_struct("DelegationGate").field("home", &self.home).finish()
     }
 }
 
 impl DelegationGate {
-    pub fn new(vault_path: PathBuf, passphrase: &str, home: PathBuf) -> Self {
-        Self {
-            vault_path,
-            passphrase: zeroize::Zeroizing::new(passphrase.to_string()),
-            home,
-            cache: StdMutex::new(None),
-            witnessed_mode: StdMutex::new(None),
+    pub fn new(home: PathBuf) -> Self {
+        Self { home, cache: RwLock::new(None), witnessed_mode: StdMutex::new(None) }
+    }
+
+    /// Rebuild the snapshot if an input changed. Called with the state lock held (at release and
+    /// at open), so it sees one consistent state. Cost when nothing changed: one `stat`.
+    pub fn refresh(
+        &self,
+        vault: &crate::vault::Vault,
+        members: &crate::member_registry::MemberRegistry,
+        roles: &web4_core::RoleRegistry,
+    ) {
+        let fp = Fingerprint {
+            vault_generation: vault.generation(),
+            members: members.iter_sorted().len(),
+            roles: roles.len(),
+            operator_key: std::fs::metadata(self.home.join("operator.key"))
+                .ok()
+                .and_then(|m| Some((m.modified().ok()?, m.len()))),
+        };
+        {
+            let r = self.cache.read().unwrap_or_else(|p| p.into_inner());
+            if r.as_ref().is_some_and(|(cached, _)| *cached == fp) {
+                return;
+            }
+        }
+        let snap = Arc::new(Snapshot::build(vault, &self.home, members, roles));
+        *self.cache.write().unwrap_or_else(|p| p.into_inner()) = Some((fp, snap));
+    }
+
+    /// The current snapshot. Never blocks on the state lock.
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        match self.cache.read().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            Some((_, snap)) => snap.clone(),
+            None => Arc::new(Snapshot::unavailable("delegation snapshot not yet built".into())),
         }
     }
 
-    /// The mode is set by the operator CLI writing the vault directly, which leaves no chain row
-    /// of its own. So the daemon witnesses the mode it OBSERVES: the first decision after a
-    /// start, and the first decision after any change, gets back `Some(event_data)` for a
-    /// `delegation_gate_mode` row, appended (by the caller, under the state lock) BEFORE that
-    /// decision's own row. Every decision row also names its mode, so the record is complete
-    /// either way; this row makes the change itself findable without scanning decisions.
+    /// A door that witnessed a mode change itself (the operator HTTP route) records it here, so
+    /// the next decision does not witness the same change a second time.
+    pub fn note_witnessed(&self, mode: GateMode) {
+        *self.witnessed_mode.lock().unwrap_or_else(|p| p.into_inner()) = Some(mode);
+    }
+
+    /// The mode is changed by the operator (HTTP plane, or the CLI while the daemon is
+    /// stopped). The HTTP door witnesses its own change; a CLI change leaves no row. So the
+    /// daemon also witnesses the mode it OBSERVES: the first decision after any change, and the
+    /// first after a start when the mode was set explicitly, gets `Some(event_data)` for a
+    /// `delegation_gate_mode` row, appended by the caller BEFORE that decision's own row. The
+    /// implicit default (no document) is not witnessed at start: every decision row already
+    /// names its mode, and a row per daemon start would be noise on the gate's hot path.
     pub fn mode_transition(&self, snap: &Snapshot) -> Option<Value> {
         let now = snap.effective_mode();
         let mut g = match self.witnessed_mode.lock() {
@@ -356,8 +394,12 @@ impl DelegationGate {
         if *g == Some(now) {
             return None;
         }
+        let first = g.is_none();
         let from = g.map(|m| m.as_str());
         *g = Some(now);
+        if first && snap.mode_doc.is_none() && snap.mode_error.is_none() {
+            return None;
+        }
         Some(json!({
             "from": from,
             "to": now.as_str(),
@@ -366,35 +408,8 @@ impl DelegationGate {
             "reason": snap.mode_doc.as_ref().and_then(|d| d.reason.clone()),
             "mode_error": snap.mode_error,
             "observed_by": "query_policy",
-            "note": if from.is_none() { "first observation since daemon start" } else { "mode changed" },
+            "note": if first { "first observation since daemon start" } else { "mode changed" },
         }))
-    }
-
-    /// The current snapshot. A `stat` of two files on the hot path; a vault re-open (one KDF)
-    /// only when the vault or the operator key changed on disk since the last read. Held under
-    /// the cache mutex so concurrent decisions after a change re-open once, not once each.
-    pub fn snapshot(&self) -> Arc<Snapshot> {
-        let fp = Fingerprint {
-            vault: file_fp(&self.vault_path),
-            operator_key: file_fp(&self.home.join("operator.key")),
-        };
-        let mut guard = match self.cache.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        if let Some((cached_fp, snap)) = guard.as_ref() {
-            if *cached_fp == fp && fp.vault.is_some() {
-                return snap.clone();
-            }
-        }
-        let snap = Arc::new(
-            match crate::vault::Vault::open(self.vault_path.clone(), (*self.passphrase).clone()) {
-                Ok(v) => Snapshot::from_vault(&v, &self.home),
-                Err(e) => Snapshot::unavailable(format!("cannot re-read the vault from disk: {e}")),
-            },
-        );
-        *guard = Some((fp, snap.clone()));
-        snap
     }
 }
 

@@ -1040,6 +1040,9 @@ enum DelegateCmd {
     /// or that none did; no verdict changes. `enforce`: an act no active, operator-signed
     /// delegation covers (`act`, `act:<category|Tool>`, `act:<file_*>:/abs/prefix`) is denied.
     /// `off`: not consulted. Operator-only: written to the vault, never through an MCP tool.
+    /// The daemon holds the vault's writer lease while it runs, so this sets the mode only
+    /// while the daemon is stopped; on a running daemon use the operator plane:
+    /// `PUT /api/delegation/mode {"mode": "...", "reason": "..."}`.
     Mode {
         /// off | record | enforce (omit to show the current mode)
         mode: Option<String>,
@@ -5850,8 +5853,8 @@ fn cmd_delegate_revoke(home: &std::path::Path, id: &str) -> AnyResult<()> {
 /// `hestia delegate mode [off|record|enforce]` -- the delegation gate's mode, operator-only.
 ///
 /// The mode is a vault document, so setting it requires opening the vault: the same footing as
-/// `hestia policy` and `hestia delegate grant`. The running daemon sees the change on its next
-/// decision (it re-reads the delegation snapshot when the vault file changes), no restart.
+/// `hestia policy` and `hestia delegate grant`. A running daemon holds the writer lease, so this
+/// writes only while it is stopped; the daemon witnesses the mode it finds on its first decision.
 fn cmd_delegate_mode(
     home: &std::path::Path,
     mode: Option<String>,
@@ -5875,7 +5878,12 @@ fn cmd_delegate_mode(
         anyhow::bail!("unknown mode '{mode}': expected off, record or enforce");
     };
     let mut vault = open_vault(home)?;
-    save_mode(&mut vault, m, reason)?;
+    save_mode(&mut vault, m, reason).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}\n(if the daemon is running it holds the vault's writer lease: set the mode on \
+             the operator plane instead, PUT /api/delegation/mode)"
+        )
+    })?;
     println!("delegation gate: {}", m.as_str());
     if m == GateMode::Enforce {
         println!(

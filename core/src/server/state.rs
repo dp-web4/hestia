@@ -980,12 +980,9 @@ impl ServerState {
             crate::server::standing_scope::AuthorityStatus::Fresh
         };
 
-        let delegation_vault_path = vault.path().to_path_buf();
         let mut st = Self {
             gate_capabilities: Arc::new(crate::server::published::GateCapabilities::default()),
             delegation_gate: Arc::new(crate::server::delegation_gate::DelegationGate::new(
-                delegation_vault_path,
-                passphrase,
                 home.to_path_buf(),
             )),
             // REBUILT FROM THE CHAIN, not started empty. Starting empty loses the ability to
@@ -2295,6 +2292,7 @@ impl super::state_lock::Publish for ServerState {
     type Snapshot = crate::server::published::PolicyPublication;
 
     fn initial_snapshot(&mut self) -> Self::Snapshot {
+        self.delegation_gate.refresh(&self.vault, &self.member_registry, &self.role_registry);
         let _ = self.take_policy_dirty();
         self.sessions.apply_pending();
         self.build_publication()
@@ -2309,6 +2307,10 @@ impl super::state_lock::Publish for ServerState {
                 self.chain_store.len().unwrap_or(0),
             );
         }
+        // The delegation snapshot follows the same rule as the publication: a change made under
+        // the lock is visible to lock-free readers no later than this release. One generation
+        // compare and one `stat` when nothing changed (`DelegationGate::refresh`).
+        self.delegation_gate.refresh(&self.vault, &self.member_registry, &self.role_registry);
         let dirty = self.take_policy_dirty();
         if dirty {
             self.publication_version += 1;

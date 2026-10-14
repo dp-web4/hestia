@@ -156,7 +156,7 @@ This is the part that runs every day and has the scars to prove it.
 | **Vault** | Measured | ChaCha20-Poly1305 + Argon2id, passphrase-first. |
 | **MCP server** | Measured | Registered tools over rmcp + Axum, with source and live use. Exact tool count is intentionally read from `tools/list`, not frozen into this README. |
 | **Web dashboard** | Measured | Served by the daemon at `/`; the interface actually used daily. Operator-gated behind an Ed25519 challenge-signed session. |
-| **Delegation** | Signing + revocation measured; on the tool-call path: **record mode** (#1320) | Signed by the operator key, scoped by `actions`, expiring, revocable (`hestia delegate grant/list/revoke`). Until #1320 it was consulted by ONE surface, delegated scope rulings (`scope.decide`, #952); no tool-call decision asked which delegation authorised the act. Now every decision row carries a `delegation` object (`match` / `none` / `uncovered` / `expired` / `revoked` / `invalid_signature`, with delegation id and delegator), and `hestia_operating_law` discloses the mode and the member's delegations under `law_hash`. Default mode `record` changes no verdict; it runs once deployed. `enforce` (`hestia delegate mode enforce`, operator-only, vault-held) denies an act no valid `act…` delegation covers: **available, off** on live seats, since no seat holds `act` grants yet. Member identity is the session's asserted `plugin_id` (A1). |
+| **Delegation** | Signing + revocation measured; on the tool-call path: **record mode** (#1320) | Signed by the operator key, scoped by `actions`, expiring, revocable (`hestia delegate grant/list/revoke`). Until #1320 it was consulted by ONE surface, delegated scope rulings (`scope.decide`, #952); no tool-call decision asked which delegation authorised the act. Now every decision row carries a `delegation` object (`match` / `none` / `uncovered` / `expired` / `revoked` / `invalid_signature`, with delegation id and delegator), and `hestia_operating_law` discloses the mode and the member's delegations under `law_hash`. Default mode `record` changes no verdict; it runs once deployed. `enforce` (operator-only, vault-held: `PUT /api/delegation/mode` on a running daemon, `hestia delegate mode` while it is stopped) denies an act no valid `act…` delegation covers: **available, off** on live seats, since no seat holds `act` grants yet. Member identity is the session's asserted `plugin_id` (A1). |
 | **Plugin SDK** | Measured | Rust, TypeScript, Python — same interface. |
 
 **Assurance ceiling, stated with it:** all of the above is profile **A1** — a cooperative
@@ -323,7 +323,7 @@ do, what requires your presence, what your agents are delegated), and Hestia
 through your **policy engine** and is recorded in your local **witness chain**;
 delegations are scoped and revocable, and every decision records which delegation (if any)
 covered the act. Refusing acts outside the authority you granted is an operator switch
-(`hestia delegate mode enforce`), off by default today — see the Delegation row above. This is the Web4 posture (web4's "Law is witnessed, not dictated") at
+(`PUT /api/delegation/mode` / `hestia delegate mode`), off by default today — see the Delegation row above. This is the Web4 posture (web4's "Law is witnessed, not dictated") at
 *personal / constellation* scale — the same shape a hub has at society scale:
 the system doesn't mandate the policy, it insists that whatever your policy is,
 is followed verifiably. Convenience is your choice; the audit trail is not.

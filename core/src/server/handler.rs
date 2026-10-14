@@ -1600,8 +1600,8 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let (plugin_id_for_chain, role_lct) = (session_plugin_id.clone(), session_role.clone());
 
     // UNDER WHOSE AUTHORITY (delegation_gate). Still phase 2, still no state lock: the
-    // delegation snapshot is the publication's shared handle, re-read from disk only when the
-    // vault changed. In `record` (the default) the finding is evidence and changes nothing; in
+    // delegation snapshot is the publication's shared handle, rebuilt at lock release whenever
+    // its inputs changed. In `record` (the default) the finding is evidence and changes nothing; in
     // `enforce` an act no valid delegation covers is denied BEFORE any side effect below, and a
     // law deny already in force is kept as the verdict (its rule is the more specific one).
     let delegation_act = super::delegation_gate::Act {
@@ -4233,7 +4233,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let role_lct = crate::reputation::normalize_constellation_role(&declared_role);
     // UNDER WHOSE AUTHORITY, on the witnessed row too (delegation_gate) — this is where a PERMIT
     // is recorded (`policy_allow`), since the daemon's own evaluation writes no row for an allow.
-    // Assessed BEFORE the state lock (a changed vault costs one re-read, never under the lock).
+    // Assessed from the lock-free snapshot, before the state lock is taken.
     // The member is the one this call names, on the same caller-asserted footing as the rest of
     // this row; the row says `assessed_by: witness_decision` so it is never read as the daemon's
     // own evaluation-time finding (that one is on `query_policy`'s reply and its deny rows).
@@ -31889,12 +31889,12 @@ mod delegation_gate_tests {
         let d = &deny[0]["delegation"];
         assert_eq!((d["mode"].as_str(), d["status"].as_str()), (Some("enforce"), Some("none")));
         assert_eq!(d["enforced_rule"], "delegation.absent");
-        // The mode change itself is witnessed: first observation (record), then the switch.
+        // The change itself is witnessed ahead of the first decision under it. The implicit
+        // default at start is not (every row already names its mode; no hot-path noise).
         let modes = rows(&s, "delegation_gate_mode");
-        assert_eq!(modes.len(), 2, "{modes:?}");
+        assert_eq!(modes.len(), 1, "{modes:?}");
         assert_eq!((modes[0]["from"].as_str(), modes[0]["to"].as_str()), (Some("record"), Some("enforce")));
         assert_eq!(modes[0]["reason"], "test");
-        assert_eq!((modes[1]["from"].clone(), modes[1]["to"].as_str()), (Value::Null, Some("record")));
     }
 
     #[tokio::test]
