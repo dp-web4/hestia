@@ -18,3 +18,6 @@ keystore.properties
 
 /.tauri
 /tauri.settings.gradle
+# The release keystore and its properties are written by CI only; never commit them.
+/keystore.properties
+/release.jks

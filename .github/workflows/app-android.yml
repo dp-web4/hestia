@@ -10,9 +10,12 @@ name: app-android
 # job is the only thing that attaches the APK. The recipe lives here, once, so a manual APK build
 # (workflow_dispatch) and the release build cannot drift apart.
 #
-# The APK is debug-signed (Gradle debug keystore): installable on any device with "install unknown
-# apps" enabled. A store-grade signing config can be layered in later via secrets without changing
-# the build.
+# SIGNING (dp, 2026-10-14, web4#904 option b). When the repository holds the release keystore
+# (ANDROID_KEYSTORE_B64 + ANDROID_KEYSTORE_PASSWORD + ANDROID_KEY_ALIAS + ANDROID_KEY_PASSWORD),
+# the APK is signed with it; gen/android/app/build.gradle.kts reads keystore.properties. Without
+# them (a fork, a dispatch before the key exists) it falls back to the Gradle debug keystore and
+# says so in the step summary. The APK must never switch keys after the release key ships: a
+# device cannot upgrade across keys.
 
 on:
   workflow_call:
@@ -25,6 +28,19 @@ on:
         description: 'asset label, e.g. v0.3.0 (release.yml has already checked it against VERSION)'
         required: true
         type: string
+    outputs:
+      signing:
+        description: "'release' or 'debug': the key the APK was signed with"
+        value: ${{ jobs.android.outputs.signing }}
+    secrets:
+      ANDROID_KEYSTORE_B64:
+        required: false
+      ANDROID_KEYSTORE_PASSWORD:
+        required: false
+      ANDROID_KEY_ALIAS:
+        required: false
+      ANDROID_KEY_PASSWORD:
+        required: false
   # Manual APK build from any branch: artifact only.
   workflow_dispatch:
 
@@ -35,6 +51,8 @@ jobs:
   android:
     name: build android apk
     runs-on: ubuntu-latest
+    outputs:
+      signing: ${{ steps.key.outputs.signing }}
     steps:
       # app/src-tauri path-depends on ../../../web4/web4-core, so materialize the same sibling
       # layout release.yml does, with web4 at the hestia source's web4.pin (a release must not
@@ -116,9 +134,50 @@ jobs:
         working-directory: hestia/app
         run: npm ci
 
-      - name: Build Android APK (release profile, debug-keystore signed)
+      # Never echoes a value. The keystore and properties file live in the gitignored gen/android
+      # dir of this runner's checkout and die with the runner.
+      - name: Release key (when configured)
+        id: key
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          G=hestia/app/src-tauri/gen/android
+          if [ -n "$KS_B64" ] && [ -n "$KS_PASS" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASS" ]; then
+            printf '%s' "$KS_B64" | base64 -d > "$G/release.jks"
+            umask 077
+            {
+              echo "storeFile=release.jks"
+              echo "password=$KS_PASS"
+              echo "keyAlias=$KEY_ALIAS"
+              echo "keyPassword=$KEY_PASS"
+            } > "$G/keystore.properties"
+            echo "signing=release" >> "$GITHUB_OUTPUT"
+            echo "APK signing: **release key**" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "signing=debug" >> "$GITHUB_OUTPUT"
+            echo "APK signing: debug keystore (release key not configured)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build Android APK (release profile)
         working-directory: hestia/app
         run: cargo tauri android build --apk
+
+      # A release-signed APK proves it: apksigner prints the signer's certificate digest, which
+      # the summary records so a later key change is visible.
+      - name: Verify the APK signature
+        if: steps.key.outputs.signing == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(find hestia/app/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' | head -1)
+          AS=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$AS" verify --print-certs "$APK" | tee cert.txt
+          { echo '```'; grep -i 'SHA-256' cert.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stage APK with versioned name
         shell: bash
