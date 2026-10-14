@@ -1,0 +1,256 @@
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 9ca91a17744e53a96b16584a1b63cb82e720a46b092e372438bc32651918a781  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -2677,6 +2677,37 @@
+     return None
+ 
+ 
++_WORD = re.compile(r"[a-z0-9_]")
++
++
++def names_forbidden_token(low: str, token: str) -> bool:
++    """True when `low` (already lower-cased) names the forbidden `token`.
++
++    A DOT-FILE TOKEN EMBEDDED IN AN IDENTIFIER IS NOT A FILE (#1192). Gate 1a matched every token as a
++    raw substring, so the dot-env token was found inside `os.environ`, `vllm.envs` and `environ.get`:
++    two seats logged ~8 false egress denials on 2026-10-04 alone (#1192 comment), each "fixed" by
++    re-routing through an editor tool, which is the silent workaround the law asks to be reported.
++
++    Narrow and conservative: only tokens that START with "." change, and an occurrence is skipped
++    only when it sits BETWEEN identifier characters on both sides (`os.environ`, `vllm.envs`).
++    A non-word character on EITHER side still denies, so every file spelling keeps its deny:
++    `cat .env`, `a/.env`, `.env.local`, `.envrc` (non-word on the left) and `prod.env`,
++    `config.env` (non-word on the right). Path tokens (`/.ssh`) and plain words (`credentials`,
++    `secrets`) are unchanged: their false positives are #983/#1019 and a different decision."""
++    if not token.startswith("."):
++        return token in low
++    start = 0
++    while True:
++        i = low.find(token, start)
++        if i < 0:
++            return False
++        left = low[i - 1] if i > 0 else ""
++        right = low[i + len(token)] if i + len(token) < len(low) else ""
++        if not (left and right and _WORD.match(left) and _WORD.match(right)):
++            return True
++        start = i + 1
++
++
+ def forbidden_tokens(profile: HarnessProfile) -> tuple:
+     extra = os.environ.get(profile.forbidden_extra_env, "")
+     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
+@@ -2709,7 +2740,7 @@
+                  + ([event.command] if event.command else [])):
+         low = blob.lower()
+         for f in forbidden:
+-            if f in low:
++            if names_forbidden_token(low, f):
+                 return _deny(
+                     "egress.secret",
+                     f"'{event.tool}' touches a forbidden path (secret/credential or "
+@@ -2942,7 +2973,7 @@
+                  + ([event.command] if event.command else [])):
+         low = blob.lower()
+         for f in forbidden:
+-            if f in low:
++            if names_forbidden_token(low, f):
+                 return _deny(
+                     "egress.secret",
+                     f"'{event.tool}' touches a forbidden path (secret/credential or "
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: 7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 2f51428d878f9ef0b94ca81ea1e827a9d8bf74ba047f29e84fa46983dff140db  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -1114,7 +1114,7 @@
+     for blob in egress_surfaces(inv.event):
+         low = blob.lower()
+         for token in forbidden:
+-            if token in low:
++            if core.names_forbidden_token(low, token):
+                 return _verdict_deny(core._deny(
+                     "egress.secret",
+                     f"'{inv.event.tool}' carries a forbidden secret/credential token through an "
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d",
++      "sha256": "9ca91a17744e53a96b16584a1b63cb82e720a46b092e372438bc32651918a781",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1",
++      "sha256": "2f51428d878f9ef0b94ca81ea1e827a9d8bf74ba047f29e84fa46983dff140db",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "45324e4ae06ce45b482d17623e5a81328fd9aafff047e3010f750608ab717f9f"
++  "gt_version": "65b52dd013dd8d812713909f2dc4d2f912a7803381f99a0c61a4a6bfaec93d97"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "45324e4ae06ce45b482d17623e5a81328fd9aafff047e3010f750608ab717f9f",
++    "gt_version": "65b52dd013dd8d812713909f2dc4d2f912a7803381f99a0c61a4a6bfaec93d97",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "9ca91a17744e53a96b16584a1b63cb82e720a46b092e372438bc32651918a781"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1"
++        "sha256": "2f51428d878f9ef0b94ca81ea1e827a9d8bf74ba047f29e84fa46983dff140db"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "d4ebbe7190c2ed5f5250a5c63465b0811384ac0b1ef4ade2da4e88bae831716e"
++  "gt_version": "e61efa4658881e0ac7107253ac72387f2b478dbf8f4063abad978a6ae4e19942"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "45324e4ae06ce45b482d17623e5a81328fd9aafff047e3010f750608ab717f9f",
++    "gt_version": "65b52dd013dd8d812713909f2dc4d2f912a7803381f99a0c61a4a6bfaec93d97",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "9ca91a17744e53a96b16584a1b63cb82e720a46b092e372438bc32651918a781"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1"
++        "sha256": "2f51428d878f9ef0b94ca81ea1e827a9d8bf74ba047f29e84fa46983dff140db"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "1e4e2aa2639004bee31396b4d4d517aee8e3a951f1176ef11c66ce033dbf5614"
++  "gt_version": "29e3f38cc8278901a675999f84f8e1fa531910c45e085cd71eeb0a60e2283094"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "45324e4ae06ce45b482d17623e5a81328fd9aafff047e3010f750608ab717f9f",
++    "gt_version": "65b52dd013dd8d812713909f2dc4d2f912a7803381f99a0c61a4a6bfaec93d97",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "9ca91a17744e53a96b16584a1b63cb82e720a46b092e372438bc32651918a781"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1"
++        "sha256": "2f51428d878f9ef0b94ca81ea1e827a9d8bf74ba047f29e84fa46983dff140db"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "c3771144541d0001b7f16e844bbbdc23e4f2996b9803a86922715c2afbe0f86a"
++  "gt_version": "1cbcc4240e436f24c36e5e0aa88519d627c8bdddc7a8502521a31252de58be27"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "45324e4ae06ce45b482d17623e5a81328fd9aafff047e3010f750608ab717f9f",
++    "gt_version": "65b52dd013dd8d812713909f2dc4d2f912a7803381f99a0c61a4a6bfaec93d97",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "9ca91a17744e53a96b16584a1b63cb82e720a46b092e372438bc32651918a781"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1"
++        "sha256": "2f51428d878f9ef0b94ca81ea1e827a9d8bf74ba047f29e84fa46983dff140db"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "973811d9b032830a434606dd669be2a72586b7daceb6655159bb284c3a564dce"
++  "gt_version": "aa3dd7121e2d65655b59350553073a2408cb130d0431c606717f4c22762148c2"
+ }
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -1113,7 +1113,7 @@
+     for blob in egress_surfaces(inv.event):
+         low = blob.lower()
+         for token in forbidden:
+-            if token in low:
++            if core.names_forbidden_token(low, token):
+                 return _verdict_deny(core._deny(
+                     "egress.secret",
+                     f"'{inv.event.tool}' carries a forbidden secret/credential token through an "
