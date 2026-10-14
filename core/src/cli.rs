@@ -64,6 +64,13 @@ enum Command {
     /// Show hestia home + vault info
     Info,
 
+    /// Verify the witness chain: link integrity AND chain-witness signatures (#339).
+    ///
+    /// Reads an online-backup SNAPSHOT of witness.db (safe while the daemon runs; nothing is
+    /// written to the live chain). Prints both predicates, per-witness-key row counts, and
+    /// the first failures. Exits non-zero if the link breaks or any required signature fails.
+    ChainVerify,
+
     /// Run the MCP server daemon
     Serve {
         /// Bind address (default 127.0.0.1:7711). Loopback-only unless
@@ -1103,6 +1110,7 @@ pub fn run() -> AnyResult<()> {
     match cli.command {
         Command::Init { force, ai } => cmd_init(&home, force, ai),
         Command::Info => cmd_info(&home),
+        Command::ChainVerify => cmd_chain_verify(&home),
         Command::Serve { bind, allow_remote, callback } => cmd_serve(&home, &bind, allow_remote, callback),
         Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
         Command::Scope(ScopeCmd::Arbitrate { request_id, grant, deny, reason, as_member, endpoint, target }) => {
@@ -4761,7 +4769,7 @@ fn cmd_receiver_send(
     let store_key = hestia::storage::storage_key(home, &passphrase)
         .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
     let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
-    let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
+    let chain = open_witnessed_chain(home, &vault, store_key)?;
     let content_hash = compute_content_hash(pointer);
     let rt = tokio::runtime::Runtime::new()?;
     let report = rt.block_on(hestia::router_forwarder::originate_once(
@@ -4922,13 +4930,64 @@ fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
     Ok(())
 }
 
+/// Open the live witness chain for a CLI pass that APPENDS, with the Society chain witness
+/// installed (#339) — the same signer the daemon uses, so a CLI receiver pass never extends a
+/// signed chain with unsigned rows (the store refuses that). No policy publication exists in
+/// the CLI, so these rows record `policy_generation = "none"`.
+fn open_witnessed_chain(
+    home: &std::path::Path,
+    vault: &Vault,
+    store_key: [u8; 32],
+) -> AnyResult<hestia::storage::SqliteChainStore> {
+    let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
+    match hestia::sovereign::Sovereign::chain_witness_signer(vault) {
+        Ok(signer) => chain.install_witness_signer(std::sync::Arc::new(signer))?,
+        Err(e) if chain.signed_from()?.is_some() => {
+            return Err(e.context("witness chain is signed but the chain witness key is unavailable"));
+        }
+        Err(e) => eprintln!("WARNING: witness chain rows from this pass will be UNSIGNED: {e:#}"),
+    }
+    Ok(chain)
+}
+
+fn cmd_chain_verify(home: &std::path::Path) -> AnyResult<()> {
+    let (vault, passphrase) = open_vault_with_passphrase(home)?;
+    let key = hestia::storage::storage_key(home, &passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let tmp = std::env::temp_dir().join(format!("hestia-chain-verify-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).context("creating snapshot dir")?;
+    let copy = tmp.join("witness.db");
+    let result = (|| -> AnyResult<hestia::storage::ChainVerification> {
+        hestia::storage::SqliteChainStore::backup_encrypted(home.join("witness.db"), &copy, key)
+            .context("snapshotting the witness chain")?;
+        let store = hestia::storage::SqliteChainStore::open(&copy, key)?;
+        store.verify_chain()
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    let v = result?;
+    let sovereign = hestia::sovereign::Sovereign::persisted_lct_id(&vault);
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "link_intact": v.link_intact(),
+        "signatures_authentic": v.signatures_authentic(),
+        "current_sovereign_lct": sovereign,
+        "report": v,
+    }))?);
+    anyhow::ensure!(
+        v.link_intact() && v.signatures_authentic(),
+        "witness chain verification FAILED (link_intact={}, signatures_authentic={})",
+        v.link_intact(),
+        v.signatures_authentic()
+    );
+    Ok(())
+}
+
 fn cmd_receiver_drain(home: &std::path::Path, parent: Option<&str>) -> AnyResult<()> {
     let (vault, passphrase) = open_vault_with_passphrase(home)?;
     let router_lct = receiver_router_lct(&vault, parent)?;
     let store_key = hestia::storage::storage_key(home, &passphrase)
         .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
     let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
-    let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
+    let chain = open_witnessed_chain(home, &vault, store_key)?;
     let rt = tokio::runtime::Runtime::new()?;
     let local = rt.block_on(hestia::fleet_receiver::drain_once(
         &vault, &router_lct, &inbox, &chain,

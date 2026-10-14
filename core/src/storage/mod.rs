@@ -14,7 +14,10 @@ pub mod durability;
 pub mod inbox;
 pub mod trust;
 
-pub use chain::{ChainEntry, SqliteChainStore};
+pub use chain::{
+    ChainEntry, ChainSignatureRecord, ChainVerification, ChainWitnessSigner, SignatureState,
+    SqliteChainStore,
+};
 pub use inbox::{HubReceiptCustody, InboxNotice, RouterPacketState, SqliteInboxStore};
 pub use trust::TrustStore;
 
