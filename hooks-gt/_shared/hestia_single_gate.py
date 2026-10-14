@@ -1,4 +1,4 @@
-# hestia-gt-sha256: a17fd403da82d8484a97b3f89da6c8662f2e256d56015531a1ee7cc9fa2d9cfa  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -547,6 +547,10 @@ class _Invocation:
     deadline: float
     key: Optional[str]
     attempted: str = ""
+    #: The same act at RECORD depth (mechanism.attempted_for_record), sent on the scope-claim
+    #: path — the NOT-SAME peer ruling on the request reads the record, not the deny display
+    #: (#648). Empty until set; falls back to `attempted` when unset.
+    attempted_full: str = ""
     role: Optional[str] = None
     notices: list = field(default_factory=list)
     warnings: list = field(default_factory=list)   # [(rule, reason, verdict_available)]
@@ -705,6 +709,17 @@ def attempted_of(event: GateEvent) -> str:
     patch-body targets. Since stage C every seat holds the claude-code seat's #185 rule."""
     ti = event.tool_input
     return mechanism.attempted_summary(
+        event.tool, ti, command=_command_text(ti) if isinstance(ti, dict) else None,
+        targets=_patch_targets(event.tool, ti))
+
+
+def attempted_record_of(event: GateEvent) -> str:
+    """The same act at RECORD depth (`attempted_for_record`, #648): same masking as the
+    display summary, bounded wide with a visible cut marker. The scope-request record is
+    ruled on by a NOT-SAME peer who was never shown the deny display, so the record must
+    carry the act at the depth a ruling needs."""
+    ti = event.tool_input
+    return mechanism.attempted_for_record(
         event.tool, ti, command=_command_text(ti) if isinstance(ti, dict) else None,
         targets=_patch_targets(event.tool, ti))
 
@@ -1235,7 +1250,8 @@ def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
         try:
             got = _bounded(inv.phase_deadline, mechanism.claim_scope,
                            _scope_request_path(target, digest), ev.tool,
-                           inv.attempted, v.rule, plugin_id=prof.member_id, role=_role(inv),
+                           inv.attempted_full or inv.attempted, v.rule,
+                           plugin_id=prof.member_id, role=_role(inv),
                            client_name=_client_name(prof), host_session_id=ev.session_id,
                            spend=False, act_digest=digest, deadline=inv.phase_deadline)
         except Exception:  # noqa: BLE001 — an unusable mechanism opens nothing and lifts nothing
@@ -1503,6 +1519,7 @@ def decide(event: GateEvent, profile: GateProfile, *, rollout: Optional[str] = N
                           registered=registered_surface(bound, profile),
                           key=mechanism.correlation_key(event.raw), budget=budget)
         inv.attempted = attempted_of(event)
+        inv.attempted_full = attempted_record_of(event)
         return _sequence(inv, permitted_roles)
     except BaseException as exc:  # noqa: BLE001 — a gate that cannot decide must not allow
         detail = f"{type(exc).__name__}: {exc}"[:300]
