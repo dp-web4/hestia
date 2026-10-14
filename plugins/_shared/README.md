@@ -1,8 +1,21 @@
 # One policy gate, adapter shims for harness semantics
 
-**Status: NOT WIRED.** Nothing imports this. Each harness migration is an edit to that
-harness's governance surface and needs its own escalation. This lands first so the migration
-is reviewable before anything switches over.
+**Status (re-checked 2026-10-14): WIRED.** Since one-gate stage C (PR #1231, commit
+`bcc59af1`, 2026-10-05) every seat's gate module is the certified template
+(`plugins/_template/shim_template.py`) and delegates every decision to
+`hestia_single_gate.decide()`, which imports `hestia_gate_core`. The four shims that load it
+are `plugins/claude-code/hooks/pre_tool_use.py`, `plugins/codex/hooks/pre_tool_use.py`,
+`plugins/kimi/hooks/pre_tool_use.py` and `plugins/gemini/hooks/before_tool.py`; each loads the
+installed copy from `$HESTIA_HOME/shared/`, never this checkout. Live daily use is three of
+the four (Claude Code, Codex, Kimi). Gemini was verified live once, 2026-07-22, and is not in
+daily use. Cursor has a witness hook only, no pre-tool gate. See `SHIM_LEDGER.md`.
+
+The rest of this README was written before the cutover (2026-08) and is kept as the design
+record. Where it says "no shim exists yet" or that the core is unprotected, read the notes
+marked *2026-10-14* below.
+
+*Original status, 2026-08 (historical):* NOT WIRED. Nothing imported this. Each harness
+migration was an edit to that harness's governance surface and needed its own escalation.
 
 > *"that's why we need one policy hook with adapter shims for harness semantics, not separate
 > hook for each one..."* — dp, 2026-08-02
@@ -109,6 +122,11 @@ currently **reports that it checked nothing** rather than passing silently. The 
 of this README credited that test before it was written (codex finding 4a) — a doc that
 credits an absent check is worse than no doc, because it retires the reviewer's attention.
 
+*2026-10-14:* the paragraph above is historical. Since stage C the test inspects the real
+shims: the four seats' hook modules and `plugins/_template/shim_template.py`, reporting any
+missing one rather than skipping it (`test_gate_core.py`, `test_shims_contain_no_policy`).
+`shim_structure_test.py` checks that each seat's function set is exactly the template's.
+
 What legitimately differs, and is therefore all a profile carries: identity path, home markers,
 launch-cwd env var, mode env var, workspace env var, member id, default role. That is the
 entire measured delta between five gates.
@@ -133,11 +151,18 @@ cannot mistake "the core returned nothing" for "the core allowed it".
   hook is denied as a *write* because the path is mentioned); this is the same weakness in the
   permissive direction. **The rule must cover this file before anything is wired to it**, or
   consolidation moves the whole policy surface somewhere unguarded.
+  *2026-10-14: closed.* `hestia_governance_closure.py` now protects the whole `plugins/_shared`
+  directory and names `hestia_gate_core.py` in its literal floor, keyed on write position. A
+  write to this README was itself refused as `gate.self_access` and needed an approved
+  escalation on 2026-10-14.
 - **`command_in_scope` residual, inherited and accepted:** relative traversal that never names a
   path (`grep -r .`) escapes string parsing entirely. The engine sandbox, not this check, is the
   filesystem boundary.
 - **Society-safety is stage 2 and lives in the shim**, because it needs a live transport. A shim
   must map an unreachable daemon to `society.unreachable`, never to allow.
+  *2026-10-14:* it now lives in the common gate, not the shim: step 5 of
+  `hestia_single_gate.decide()`, where a check with no verdict is `society.unreachable`, denied
+  in every rollout mode.
 - **`path[:60]` truncation was hiding the trigger.** The inherited hooks elided the target from
   the front, so on a long path the member was handed a string that did not contain the segment
   that tripped the gate. Now the offending segment is named separately and elision keeps the

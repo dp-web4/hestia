@@ -1,6 +1,41 @@
 # Gate bypass catalog — what routes around hestia, and what we can see
 
 **Status:** living document · CBP, 2026-07-26 · companion to [`GATE_PROFILE.md`](GATE_PROFILE.md)
+· **re-baselined against code 2026-10-14, see "Re-baseline" below; sections 1-18 are the
+dated record and are kept as written**
+
+> ### Re-baseline 2026-10-14: one-gate stage C (PR #1231) versus classes B and C
+>
+> Sections 3, 4 and 8 below were measured on 2026-07-26, when each seat carried its own gate,
+> fail-closed was opt-in (`HESTIA_PRE_FAIL_CLOSED`) and a legacy fallback could allow. Since
+> stage C (PR #1231, commit `bcc59af1`, 2026-10-05) every seat runs the certified template
+> shim and one common gate, `plugins/_shared/hestia_single_gate.py`. Read against current
+> code, not re-measured:
+>
+> | entry | status now | basis in code |
+> |---|---|---|
+> | **B1** `HESTIA_ENDPOINT` to a dead port | **closed by stage C** | a society check with no verdict is `society.unreachable`, denied in every rollout mode (`hestia_single_gate.py` module docstring step 5 and the `society.unreachable` return in `decide`); no endpoint at all is a `refused` no-verdict (`hestia_gate_mechanism.py` `query_society_safety`); with no policy snapshot every act is `gate.degraded` (step 3) |
+> | **B1** `HESTIA_ENDPOINT` to a permissive look-alike daemon | **open, inferred, not measured** | `_discover_endpoint()` in `hestia_gate_mechanism.py` still reads `HESTIA_ENDPOINT` from the environment first. The seat's vault projection is exported over the launcher's environment (`_load_projection`, `plugins/claude-code/hooks/pre_tool_use.py:92-95`), so a projected `HESTIA_ENDPOINT` wins; a key the projection does not carry is left as the launcher set it. Verdicts are not signed, so a look-alike that answers both the snapshot and the society check is indistinguishable (section 9's signed-verdict fix is not built) |
+> | **B2** `PATH` / interpreter substitution | **open, inferred** | unchanged: the registered hook line still begins `python3` |
+> | **C1** timeout starvation (`HESTIA_PRE_TOTAL_BUDGET_MS=1`) | **closed by stage C** | a seat always passes `bound=`; the deadline is the harness's registered timeout minus a margin, and with a caller deadline the module budgets do not apply (`hestia_gate_mechanism.py` `_bound`). Running out is a no-verdict, which is a deny. `HESTIA_HOOK_TIMEOUT_S` can only shorten the bound. An unreadable registration is `gate.harness_timeout_unknown`, denied at once. Starvation now costs availability, not safety |
+> | **C2** ambient slowness | **closed as a fail-open; remains an availability cost** | same deadline: a slow daemon yields a recorded no-verdict deny before the harness can time the hook out |
+> | **C3** missing fallback means allow | **closed by stage C** | the legacy fallback is gone from the gate path: neither the shims nor `hestia_single_gate.py` / `hestia_gate_mechanism.py` reference `HESTIA_LEGACY_FALLBACK` or `invoke_legacy_fallback` (remaining mentions are in deploy-side scripts and tests) |
+> | `HESTIA_PRE_FAIL_CLOSED` (the "single highest-value mitigation" box) | **superseded** | fail-closed is no longer a knob; no code on the gate path reads it. Only `HESTIA_GATE_MODE` = enforce / warn remains, set only by the vault projection (a launcher value is dropped, `pre_tool_use.py:48`), and warn never softens innate denies or no-verdict denies |
+>
+> **What remains open or unmeasured, and is new in form: env-locator trust.** The shim still
+> trusts two launcher-supplied locators to find the gate it loads
+> (`plugins/claude-code/hooks/pre_tool_use.py:104-111`, the same in every seat):
+> `HESTIA_HOME` selects which projection is read and, absent `HESTIA_SHARED_DIR`, which
+> `shared/` engine is imported; an explicit `HESTIA_SHARED_DIR` names the engine directory
+> directly (a projected value overrides a launcher one). A launcher that controls these can
+> point the seat at its own projection and a permissive copy of the gate. This is the B1
+> class moved from "which daemon is asked" to "which gate runs". It is **inferred from code,
+> not measured**, and it is inside what A1 (cooperative, same-UID) already accepts (section
+> 0). The `/proc/<pid>/environ` sweep recommended under B1 would see it; that sweep is still
+> not built.
+>
+> Section 8's grading table is therefore stale for B1, C1 and C3; its "gap" cells describe
+> the 2026-07-26 gate.
 
 > **We are at PGG — pretty good governance. Not a bulletproof sandbox.** (dp, 2026-07-26)
 
