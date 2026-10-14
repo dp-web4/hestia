@@ -1033,6 +1033,20 @@ enum DelegateCmd {
         /// Delegation ID (UUID)
         id: String,
     },
+
+    /// Show or set how delegation participates in tool-call decisions.
+    ///
+    /// `record` (the default): every decision row records which delegation covered the act,
+    /// or that none did; no verdict changes. `enforce`: an act no active, operator-signed
+    /// delegation covers (`act`, `act:<category|Tool>`, `act:<file_*>:/abs/prefix`) is denied.
+    /// `off`: not consulted. Operator-only: written to the vault, never through an MCP tool.
+    Mode {
+        /// off | record | enforce (omit to show the current mode)
+        mode: Option<String>,
+        /// Why (stored with the mode)
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1197,6 +1211,7 @@ pub fn run() -> AnyResult<()> {
             }
             DelegateCmd::List => cmd_delegate_list(&home),
             DelegateCmd::Revoke { id } => cmd_delegate_revoke(&home, &id),
+            DelegateCmd::Mode { mode, reason } => cmd_delegate_mode(&home, mode, reason),
         },
         Command::Witness(w) => match w {
             WitnessCmd::Attest { subject_lct_id, r#as, target, out } => {
@@ -5829,6 +5844,46 @@ fn cmd_delegate_revoke(home: &std::path::Path, id: &str) -> AnyResult<()> {
     store.revoke(delegation_id)?;
     store.save(&mut vault)?;
     println!("Delegation {delegation_id} revoked");
+    Ok(())
+}
+
+/// `hestia delegate mode [off|record|enforce]` -- the delegation gate's mode, operator-only.
+///
+/// The mode is a vault document, so setting it requires opening the vault: the same footing as
+/// `hestia policy` and `hestia delegate grant`. The running daemon sees the change on its next
+/// decision (it re-reads the delegation snapshot when the vault file changes), no restart.
+fn cmd_delegate_mode(
+    home: &std::path::Path,
+    mode: Option<String>,
+    reason: Option<String>,
+) -> AnyResult<()> {
+    use hestia::server::delegation_gate::{load_mode, save_mode, GateMode};
+    let Some(mode) = mode else {
+        let vault = open_vault(home)?;
+        match load_mode(&vault)? {
+            Some(doc) => println!(
+                "delegation gate: {} (set {}{})",
+                doc.mode,
+                doc.set_at.format("%Y-%m-%d %H:%M UTC"),
+                doc.reason.map(|r| format!(", reason: {r}")).unwrap_or_default()
+            ),
+            None => println!("delegation gate: record (default; never set)"),
+        }
+        return Ok(());
+    };
+    let Some(m) = GateMode::parse(&mode) else {
+        anyhow::bail!("unknown mode '{mode}': expected off, record or enforce");
+    };
+    let mut vault = open_vault(home)?;
+    save_mode(&mut vault, m, reason)?;
+    println!("delegation gate: {}", m.as_str());
+    if m == GateMode::Enforce {
+        println!(
+            "  note: every tool act now needs an active, operator-signed delegation naming the \
+             member (or its role) with an `act` action. Check each seat's coverage first: \
+             `hestia delegate list`, and the `delegation` object on recent decision rows."
+        );
+    }
     Ok(())
 }
 

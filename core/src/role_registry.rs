@@ -87,6 +87,20 @@ const ROLES_NAMESPACE: &str = "roles";
 const ROLES_DOC: &str = "registry";
 const ROLES_LEGACY_FILE: &str = "roles.json";
 
+/// The persisted role LCT ids, label -> lct id, READ-ONLY (no minting, no healing). For the
+/// delegation gate, which keys a role's delegations exactly as a member's: UUIDv5 of the LCT id
+/// (`delegation::agent_key_for_lct`). An unreadable document reads as no roles: role-keyed
+/// delegation is then simply not found, which records as such rather than failing the act.
+pub fn persisted_role_lct_ids(
+    vault: &crate::vault::Vault,
+) -> std::collections::HashMap<String, String> {
+    crate::vault::load_doc::<Vec<PersistedRole>>(vault, ROLES_NAMESPACE, ROLES_DOC, ROLES_LEGACY_FILE)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.label, p.lct.lct_id()))
+        .collect()
+}
+
 /// Load the role registry from the vault, minting (and persisting) any published
 /// constellation role not yet present. Role LCTs are therefore STABLE across
 /// daemon restarts — "the role has presence" requires a durable identity, not a

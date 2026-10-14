@@ -1413,6 +1413,15 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
             }))
             .collect::<Vec<_>>(),
         "law": statements,
+        // UNDER WHOSE AUTHORITY you act: the delegation mode and the delegations naming you (or
+        // your role), inside the hashed body — a grant appearing, lapsing or being revoked, or
+        // the operator switching record -> enforce, MOVES law_hash.
+        "delegation": super::delegation_gate::law_section(
+            &p.delegation_gate.snapshot(),
+            &who.plugin_id,
+            &who.role_lct,
+            chrono::Utc::now(),
+        ),
     });
 
     // THE HASH COVERS WHAT WAS RETURNED (kimi, finding 1). It was
@@ -1463,6 +1472,8 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // hash covers, for both grant lists.
         "scope_grants": out.get("scope_grants").cloned().unwrap_or(Value::Null),
         "standing_grants": out.get("standing_grants").cloned().unwrap_or(Value::Null),
+        // SIXTH field forwarded explicitly: hashed above, so it must be returned here.
+        "delegation": out.get("delegation").cloned().unwrap_or(Value::Null),
         "law": out.get("law").cloned().unwrap_or(Value::Null),
         // Quote THIS to say which law you read: it covers every layer, every bound list,
         // and the redaction applied to you. `society_policy_hash` is kept only because
@@ -1585,12 +1596,58 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // lock's second-largest holder (~3-4 ms a call, measured on #1267).
     let published = state.published();
     let policy_version = published.version;
-    let evaluation = published.evaluate(&session_plugin_id, &session_role, &pa);
+    let mut evaluation = published.evaluate(&session_plugin_id, &session_role, &pa);
     let (plugin_id_for_chain, role_lct) = (session_plugin_id.clone(), session_role.clone());
+
+    // UNDER WHOSE AUTHORITY (delegation_gate). Still phase 2, still no state lock: the
+    // delegation snapshot is the publication's shared handle, re-read from disk only when the
+    // vault changed. In `record` (the default) the finding is evidence and changes nothing; in
+    // `enforce` an act no valid delegation covers is denied BEFORE any side effect below, and a
+    // law deny already in force is kept as the verdict (its rule is the more specific one).
+    let delegation_act = super::delegation_gate::Act {
+        plugin_id: &session_plugin_id,
+        role: &session_role,
+        tool_name: &action.tool_name,
+        category,
+        target: action.target.as_deref(),
+    };
+    let delegation_snapshot = published.delegation_gate.snapshot();
+    let delegation_mode_change = published.delegation_gate.mode_transition(&delegation_snapshot);
+    let delegation_finding = super::delegation_gate::assess(
+        &delegation_snapshot,
+        &delegation_act,
+        chrono::Utc::now(),
+    );
+    if let (Some(rule), Some(reason)) = (
+        delegation_finding.enforced_rule(),
+        delegation_finding.deny_reason(&delegation_act),
+    ) {
+        if !(evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced) {
+            evaluation = crate::policy::PolicyEvaluation {
+                decision: crate::policy::PolicyDecision::Deny,
+                rule_id: Some(rule.to_string()),
+                rule_name: Some(rule.to_string()),
+                reason,
+                enforced: true,
+                constraints: vec![
+                    "policy:delegation".to_string(),
+                    "decision:deny".to_string(),
+                    format!("rule:{rule}"),
+                ],
+                inert_content_skipped: evaluation.inert_content_skipped,
+            };
+        }
+    }
+    let delegation_record = delegation_finding.to_json("query_policy");
 
     // PHASE 3 (state lock): only the writes this verdict needs — the scope tally, the decision
     // row and its charge.
     let mut s = state.lock().await;
+    // The delegation mode in force, witnessed when first observed or changed, ahead of the
+    // first decision made under it (see `DelegationGate::mode_transition`).
+    if let Some(data) = delegation_mode_change {
+        let _ = s.append_chain("delegation_gate_mode", data);
+    }
     // SCOPE ATTESTATION — count what the gate judged, allows included.
     //
     // The window, not the action, is the unit of evidence. 1,000 in-scope calls attest
@@ -1728,6 +1785,8 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         if let Some(h) = &charge_held_by {
             own_data["charge_held_by"] = json!(h);
         }
+        // Under whose authority: the delegation finding rides the row it was assessed for.
+        own_data["delegation"] = delegation_record.clone();
         let own_row = s.append_chain("policy_decision", own_data);
         // The verdict never depends on this append (as before: a failed append was, and is,
         // not a reason to change the ruling). What changes is that its success is no longer
@@ -1814,6 +1873,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         "status": "decided",
         "nextPollMs": serde_json::Value::Null,
         "policyVersion": policy_version,
+        // The delegation finding for this act (mode, status, delegation ids, delegator). An
+        // allow writes no row here, so the gate's own decision witness records it for permits.
+        "delegation": delegation_record,
     }))
 }
 
@@ -1999,6 +2061,20 @@ fn gate_direct_tool(
                 "rule_id": evaluation.rule_id,
                 "rule_name": evaluation.rule_name,
                 "reason": evaluation.reason,
+                // Every decision row names the authority it was assessed under (record only on
+                // this direct-tool path: delegation enforcement lives on the tool-call path).
+                "delegation": super::delegation_gate::assess(
+                    &s.delegation_gate.snapshot(),
+                    &super::delegation_gate::Act {
+                        plugin_id: &who.plugin_id,
+                        role: &who.role_lct,
+                        tool_name,
+                        category,
+                        target: Some(target),
+                    },
+                    chrono::Utc::now(),
+                )
+                .to_json("direct_tool_gate"),
                 // No `attempted` here: this is the DIRECT-TOOL gate (vault reads, MCP
                 // calls), which is handed a tool name and a target and never a command
                 // payload. Emitting an empty string would let the UI render "no attempt
@@ -4155,6 +4231,28 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     });
     let declared_role = optional_string(args, "role").unwrap_or_default();
     let role_lct = crate::reputation::normalize_constellation_role(&declared_role);
+    // UNDER WHOSE AUTHORITY, on the witnessed row too (delegation_gate) — this is where a PERMIT
+    // is recorded (`policy_allow`), since the daemon's own evaluation writes no row for an allow.
+    // Assessed BEFORE the state lock (a changed vault costs one re-read, never under the lock).
+    // The member is the one this call names, on the same caller-asserted footing as the rest of
+    // this row; the row says `assessed_by: witness_decision` so it is never read as the daemon's
+    // own evaluation-time finding (that one is on `query_policy`'s reply and its deny rows).
+    let delegation_record = {
+        let category = crate::policy::classify(&tool_name);
+        let act = super::delegation_gate::Act {
+            plugin_id: &plugin_id,
+            role: &role_lct,
+            tool_name: &tool_name,
+            category,
+            target: Some(target.as_str()).filter(|t| !t.is_empty()),
+        };
+        super::delegation_gate::assess(
+            &state.published().delegation_gate.snapshot(),
+            &act,
+            chrono::Utc::now(),
+        )
+        .to_json("witness_decision")
+    };
 
     let mut s = state.lock().await;
     // ONE VERDICT, ONE ROW. A committed row already witnesses this verdict for this member and
@@ -4212,6 +4310,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         "attempted": attempted,
         "rule_id": rule_id,
         "verdict_available": verdict_available,
+        "delegation": delegation_record,
     });
     // Join keys and the deployed-generation attestation ride the row only when SENT, so a
     // deployed refusal shim that sends none of them writes exactly the row it always wrote.
@@ -31649,5 +31748,263 @@ mod query_policy_off_lock_tests {
                 reason: "test".into(), expires_at: None });
         }
         check("operator grant").await;
+    }
+}
+
+/// DELEGATION ON THE TOOL-CALL DECISION PATH (`delegation_gate`), end to end through the real
+/// handlers: the finding on `query_policy`'s reply and rows, on the witnessed permit, in the
+/// operating law, and the mode's operator-only door.
+#[cfg(test)]
+mod delegation_gate_tests {
+    use super::*;
+    use crate::server::delegation_gate::{save_mode, GateMode};
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState, plugin: &str) -> String {
+        let c = tool_connect(state, &json!({"plugin_id": plugin, "host_agent": "t"}))
+            .await
+            .unwrap();
+        c["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// Write `operator.key`, and return its keypair.
+    async fn operator_key(state: &SharedState) -> web4_core::crypto::KeyPair {
+        let op = web4_core::crypto::KeyPair::generate();
+        let s = state.lock().await;
+        std::fs::write(
+            s.home.join("operator.key"),
+            json!({ "secret_key_hex": hex::encode(op.secret_key_bytes()) }).to_string(),
+        )
+        .unwrap();
+        op
+    }
+
+    /// The operator delegates `actions` to `member` (its registry key), signed by `signer`.
+    /// `mutate` runs on the record before it is saved (to revoke or expire it).
+    async fn delegate(
+        state: &SharedState,
+        member: &str,
+        actions: &[&str],
+        signer: &web4_core::crypto::KeyPair,
+        mutate: impl FnOnce(&mut web4_core::delegation::DelegatedAuthority),
+    ) -> String {
+        let mut s = state.lock().await;
+        let (op_id, _) = crate::delegation::operator_delegator(&s.vault, &s.home).unwrap();
+        let lct = s.member_registry.get(member).unwrap().lct_id();
+        let mut store = crate::delegation::DelegationStore::load(&s.vault).unwrap();
+        store.create_delegation(
+            op_id,
+            crate::delegation::agent_key_for_lct(&lct),
+            vec![],
+            actions.iter().map(|a| a.to_string()).collect(),
+            Some(4),
+            signer,
+        );
+        let d = store.delegations.last_mut().unwrap();
+        mutate(d);
+        let id = d.id.to_string();
+        store.save(&mut s.vault).unwrap();
+        id
+    }
+
+    async fn set_mode(state: &SharedState, m: GateMode) {
+        let mut s = state.lock().await;
+        save_mode(&mut s.vault, m, Some("test".into())).unwrap();
+    }
+
+    /// begin + query_policy for one Bash `ls` by the session; returns (action_id, reply).
+    async fn decide(state: &SharedState, sid: &str) -> (String, Value) {
+        let b = tool_begin_action(
+            state,
+            &json!({"tool_name": "Bash", "target": "ls", "parameters": {"command": "ls"}, "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        let aid = b["actionId"].as_str().unwrap().to_string();
+        let q = tool_query_policy(state, &json!({"action_id": aid})).await.unwrap();
+        (aid, q)
+    }
+
+    fn rows(state_guard: &crate::server::state::ServerState, ty: &str) -> Vec<Value> {
+        state_guard
+            .chain_store
+            .scan_recent(None, Some(&[ty]), 1000, |r| serde_json::from_str::<Value>(r.event_data).ok())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn covering_delegation_is_recorded_as_a_match_on_reply_and_witnessed_permit() {
+        let (_d, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        let op = operator_key(&state).await;
+        let id = delegate(&state, "codex", &["act:command"], &op, |_| {}).await;
+        let (aid, q) = decide(&state, &sid).await;
+        assert_eq!(q["decision"], "allow", "{q}");
+        assert_eq!(q["delegation"]["mode"], "record");
+        assert_eq!(q["delegation"]["status"], "match", "{q}");
+        assert_eq!(q["delegation"]["delegation_ids"], json!([id]));
+        assert!(q["delegation"]["delegator_lct"].is_string());
+        // The permit's witness row (the only row an allow gets) carries it too.
+        let w = tool_witness_decision(
+            &state,
+            &json!({"plugin_id": "codex", "decision": "allow", "adjudicator": "test-gate",
+                    "tool_name": "Bash", "target": "ls", "action_id": aid}),
+        )
+        .await
+        .unwrap();
+        assert!(w["witnessEntryHash"].is_string(), "{w}");
+        let s = state.lock().await;
+        let allow = rows(&s, super::super::decision_witness::ALLOW_EVENT);
+        let d = &allow[0]["delegation"];
+        assert_eq!((d["status"].as_str(), d["assessed_by"].as_str()), (Some("match"), Some("witness_decision")));
+        assert_eq!(d["delegation_ids"], json!([id]));
+    }
+
+    #[tokio::test]
+    async fn no_delegation_record_mode_allows_and_records_none_enforce_denies_with_remedy() {
+        let (_d, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        let (_, q) = decide(&state, &sid).await;
+        assert_eq!(q["decision"], "allow", "record mode must not newly deny: {q}");
+        assert_eq!(q["delegation"]["status"], "none");
+        assert_eq!(q["delegation"].get("enforced_rule"), None);
+
+        set_mode(&state, GateMode::Enforce).await;
+        let (_, q) = decide(&state, &sid).await;
+        assert_eq!(q["decision"], "deny", "{q}");
+        assert_eq!(q["ruleId"], "delegation.absent");
+        assert_eq!(q["enforced"], true);
+        let g = q["guidance"].as_str().unwrap();
+        assert!(g.contains("hestia delegate grant") && g.contains("act:command"), "remedy names the grant: {g}");
+        let s = state.lock().await;
+        let deny = rows(&s, "policy_decision");
+        let d = &deny[0]["delegation"];
+        assert_eq!((d["mode"].as_str(), d["status"].as_str()), (Some("enforce"), Some("none")));
+        assert_eq!(d["enforced_rule"], "delegation.absent");
+        // The mode change itself is witnessed: first observation (record), then the switch.
+        let modes = rows(&s, "delegation_gate_mode");
+        assert_eq!(modes.len(), 2, "{modes:?}");
+        assert_eq!((modes[0]["from"].as_str(), modes[0]["to"].as_str()), (Some("record"), Some("enforce")));
+        assert_eq!(modes[0]["reason"], "test");
+        assert_eq!((modes[1]["from"].clone(), modes[1]["to"].as_str()), (Value::Null, Some("record")));
+    }
+
+    #[tokio::test]
+    async fn revoked_and_expired_are_recorded_and_denied_under_enforce() {
+        for (label, rule) in [("revoked", "delegation.revoked"), ("expired", "delegation.expired")] {
+            let (_d, state) = test_state().await;
+            let sid = connect(&state, "codex").await;
+            let op = operator_key(&state).await;
+            let id = delegate(&state, "codex", &["act"], &op, |d| {
+                if label == "revoked" {
+                    d.revoke();
+                } else {
+                    d.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+                }
+            })
+            .await;
+            let (_, q) = decide(&state, &sid).await;
+            assert_eq!(q["decision"], "allow", "{label}: record mode allows");
+            assert_eq!(q["delegation"]["status"], label);
+            assert_eq!(q["delegation"]["delegation_ids"], json!([id]));
+            set_mode(&state, GateMode::Enforce).await;
+            let (_, q) = decide(&state, &sid).await;
+            assert_eq!((q["decision"].as_str(), q["ruleId"].as_str()), (Some("deny"), Some(rule)), "{label}: {q}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delegation_not_signed_by_this_operator_is_invalid() {
+        let (_d, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        let _op = operator_key(&state).await;
+        let stranger = web4_core::crypto::KeyPair::generate();
+        delegate(&state, "codex", &["act"], &stranger, |_| {}).await;
+        let (_, q) = decide(&state, &sid).await;
+        assert_eq!(q["delegation"]["status"], "invalid_signature", "{q}");
+        set_mode(&state, GateMode::Enforce).await;
+        let (_, q) = decide(&state, &sid).await;
+        assert_eq!(q["ruleId"], "delegation.invalid_signature");
+    }
+
+    /// A law deny already in force stays the verdict; the delegation finding is still recorded.
+    #[tokio::test]
+    async fn a_law_deny_keeps_its_rule_and_still_records_the_delegation() {
+        let (_d, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        set_mode(&state, GateMode::Enforce).await;
+        let b = tool_begin_action(
+            &state,
+            &json!({"tool_name": "Bash", "target": "rm -rf /home/user/data",
+                    "parameters": {"command": "rm -rf /home/user/data"}, "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        let q = tool_query_policy(&state, &json!({"action_id": b["actionId"]})).await.unwrap();
+        assert_eq!(q["decision"], "deny");
+        assert_ne!(q["ruleId"], "delegation.absent", "the law's own rule is the more specific one");
+        assert_eq!(q["delegation"]["status"], "none");
+    }
+
+    #[tokio::test]
+    async fn operating_law_states_mode_and_delegations_and_law_hash_covers_them() {
+        let (_d, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        let law = |state: SharedState, sid: String| async move {
+            tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap()
+        };
+        let a = law(state.clone(), sid.clone()).await;
+        assert_eq!(a["delegation"]["mode"], "record");
+        assert_eq!(a["delegation"]["active"], json!([]));
+        let op = operator_key(&state).await;
+        let id = delegate(&state, "codex", &["act:file_write:/w"], &op, |_| {}).await;
+        let b = law(state.clone(), sid.clone()).await;
+        assert_eq!(b["delegation"]["active"][0]["id"], json!(id));
+        assert_eq!(b["delegation"]["active"][0]["signature"], "valid");
+        assert_ne!(a["law_hash"], b["law_hash"], "a new delegation must move law_hash");
+        set_mode(&state, GateMode::Enforce).await;
+        let c = law(state.clone(), sid.clone()).await;
+        assert_eq!(c["delegation"]["mode"], "enforce");
+        assert_ne!(b["law_hash"], c["law_hash"], "a mode change must move law_hash");
+    }
+
+    /// The mode is operator-only: no MCP tool writes it. `hestia_vault_set` (the one MCP door that
+    /// writes the vault) writes ENTRIES, and the mode is read from a DOCUMENT only.
+    #[tokio::test]
+    async fn the_mode_cannot_be_set_through_mcp_tools() {
+        let (_d, state) = test_state().await;
+        let sid = connect(&state, "codex").await;
+        set_mode(&state, GateMode::Enforce).await;
+        for name in ["delegation-gate", "presence/delegation-gate", "presence:delegation-gate"] {
+            let _ = tool_vault_set(
+                &state,
+                &json!({"name": name, "value": r#"{"mode":"off","set_at":"2026-01-01T00:00:00Z"}"#,
+                        "session_id": sid}),
+            )
+            .await;
+        }
+        {
+            let s = state.lock().await;
+            let doc = crate::server::delegation_gate::load_mode(&s.vault).unwrap().unwrap();
+            assert_eq!(doc.mode, "enforce");
+        }
+        let (_, q) = decide(&state, &sid).await;
+        assert_eq!(q["delegation"]["mode"], "enforce");
+        // And no tool on the MCP surface names the mode or grants/revokes delegations.
+        for t in hestia_tools() {
+            let n = t.name.to_string();
+            assert!(
+                !(n.contains("delegat") && (n.contains("mode") || n.contains("grant") || n.contains("revoke"))),
+                "MCP tool {n} looks like a delegation-authority writer"
+            );
+        }
     }
 }

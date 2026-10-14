@@ -420,6 +420,11 @@ pub struct ServerState {
     /// it understood a newly served field. #481 remains the integrity boundary for proving
     /// which installed bytes made that report.
     pub gate_capabilities: Arc<crate::server::published::GateCapabilities>,
+    /// Delegation on the tool-call decision path (`delegation_gate`): where the on-disk vault
+    /// is and how to re-read it, plus the cached delegation snapshot. A shared handle, like
+    /// `gate_capabilities`: the publication carries the same `Arc`, so the decision path reads
+    /// delegations without the state lock.
+    pub delegation_gate: Arc<crate::server::delegation_gate::DelegationGate>,
     /// Member → wall-clock time its current seat-config finding was FIRST observed.
     ///
     /// The edge, not the level. A stateless check can only ever report "miswired again" on every
@@ -975,8 +980,14 @@ impl ServerState {
             crate::server::standing_scope::AuthorityStatus::Fresh
         };
 
+        let delegation_vault_path = vault.path().to_path_buf();
         let mut st = Self {
             gate_capabilities: Arc::new(crate::server::published::GateCapabilities::default()),
+            delegation_gate: Arc::new(crate::server::delegation_gate::DelegationGate::new(
+                delegation_vault_path,
+                passphrase,
+                home.to_path_buf(),
+            )),
             // REBUILT FROM THE CHAIN, not started empty. Starting empty loses the ability to
             // close any finding opened before this restart, because the pass that opened it
             // also repaired the artifact — so the next pass sees clean, has nothing to close,
@@ -2244,6 +2255,7 @@ impl ServerState {
             standing_projection_audit: (*self.standing_projection_audit).clone(),
             sessions: self.sessions.directory(),
             gate_capabilities: self.gate_capabilities.clone(),
+            delegation_gate: self.delegation_gate.clone(),
             chain_durability: self.chain_store.durability().clone(),
             observed_len: self.chain_store.len().unwrap_or(0),
         }

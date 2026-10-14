@@ -301,9 +301,20 @@ pub enum ActionShape {
     Inert(String),
     /// Not a verb this daemon interprets. Stored as given; not validated.
     Uninterpreted,
+    /// `act`, `act:<category|Tool|*>`, `act:<file_read|file_write|*>:/abs/prefix` -- authority
+    /// to ACT, read on the tool-call decision path (`server::delegation_gate::act_covers`).
+    Act,
 }
 
 pub fn action_shape(action: &str) -> ActionShape {
+    // The `act` family is read by the delegation gate, so it is validated here like
+    // `scope.decide` rather than accepted as uninterpreted (#1110's rule: a grant that binds
+    // nothing is refused, not stored).
+    match crate::server::delegation_gate::act_shape_problem(action) {
+        Some(None) => return ActionShape::Act,
+        Some(Some(why)) => return ActionShape::Inert(why),
+        None => {}
+    }
     let Some((name, rest)) = action.split_once(':') else {
         return if action == ACTION_SCOPE_DECIDE { ActionShape::ScopeDecide } else { ActionShape::Uninterpreted };
     };
@@ -364,7 +375,7 @@ pub fn check_actions(
     let mut unvalidated = Vec::new();
     for a in actions {
         match action_shape(a) {
-            ActionShape::ScopeDecide => {}
+            ActionShape::ScopeDecide | ActionShape::Act => {}
             ActionShape::ScopeDecideFor(m) if is_member(&m) => {}
             ActionShape::ScopeDecideFor(m) => {
                 let nearest = crate::member_registry::nearest_member_ids(&m, suggest_from);
@@ -487,6 +498,11 @@ mod tests {
         assert!(v(&["scope.decide:/w", "scope.decide:codx:/w"]).is_err());
         // Nothing resembles it: say so rather than invent a suggestion.
         assert!(v(&["scope.decide:zzzzzzzz:/w"]).unwrap_err().contains("No recorded member resembles it."));
+        // The `act` family is interpreted (delegation on the tool-call path): validated, and
+        // NOT handed back as unvalidated; a shape that binds nothing is refused.
+        assert_eq!(v(&["act", "act:command", "act:file_write:/w"]).unwrap(), Vec::<String>::new());
+        assert!(v(&["act:file_write:rel"]).unwrap_err().contains("binds nothing"));
+        assert!(v(&["act:command:/usr"]).unwrap_err().contains("path bound"));
     }
 
     #[test]
