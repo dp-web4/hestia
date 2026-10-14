@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 5b43df3dfb51ae1ed71108ac71b29863681a0ef20c0ccaf536685ba847d51ae0  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 34026f2c12b3b5e96190e3f070f6543e93dbea962de3fe8161c48229bc857983  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -312,6 +312,17 @@ _CREDENTIAL_SHAPES = (
 ATTEMPTED_MAX = 220
 ATTEMPTED_PATH_MAX = 140
 
+#: The bound for the act carried on a scope-request RECORD, and its marker. The 220 display
+#: summary is sized for a member mid-task (#185); the record's reader is a NOT-SAME peer
+#: ruling from the record alone, on another seat (dp 2026-10-05: scope escalations go to
+#: peers) — a peer cannot approve bytes it cannot see, and on 2026-10-13 codex refused five
+#: scope requests on exactly that ground (#648). A cut at this bound is rare and VISIBLE.
+#: The daemon's `SCOPE_ACT_MAX` (core/src/server/handler.rs) holds the same value and marker —
+#: change them together (the truncation-census lesson: same marker, same number, no shared
+#: constant is how the 220/400 split stayed invisible for five weeks).
+SCOPE_ACT_MAX = 4000
+SCOPE_ACT_MARK = "…[truncated]"
+
 
 def credential_shaped(text: str) -> bool:
     """Does this text plausibly carry a credential? One helper for the command AND the path
@@ -321,7 +332,8 @@ def credential_shaped(text: str) -> bool:
 
 
 def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str] = None,
-                      targets: Optional[list] = None) -> str:
+                      targets: Optional[list] = None,
+                      max_len: int = ATTEMPTED_MAX, mark: str = " …") -> str:
     """WHAT was attempted, in one bounded, self-censoring line, for the record and for the
     human who rules on an escalation (dp 2026-08-03: "they don't tell me what i'm approving").
 
@@ -331,7 +343,11 @@ def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str]
          with its length stated (`[REDACTED — ...; N chars withheld ...]`); otherwise the
          value after a credential-ish key is masked (`_mask_credential_values`).
       2. The daemon (`handler.rs`) masks `key=value` / `--key value` again on receipt.
-    Only layer 1 covers key files, ssh/gpg paths, PEM blocks and credential-shaped paths."""
+    Only layer 1 covers key files, ssh/gpg paths, PEM blocks and credential-shaped paths.
+
+    `max_len`/`mark` exist for the ONE second reader this summary was re-pointed at: the
+    scope-request record (`attempted_for_record`), whose reader is a NOT-SAME peer ruling
+    from the record alone, not the member mid-task the default 220 is sized for (#648)."""
     if not isinstance(tool_input, dict):
         return f"{tool_name} (no inspectable input)"
     if isinstance(command, str):
@@ -340,7 +356,7 @@ def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str]
             return (f"{tool_name} [REDACTED — names a credential-shaped token; "
                     f"{len(s)} chars withheld rather than copied into the record]")
         s = _mask_credential_values(s)
-        return f"{tool_name}: {s[:ATTEMPTED_MAX]}" + (" …" if len(s) > ATTEMPTED_MAX else "")
+        return f"{tool_name}: {s[:max_len]}" + (mark if len(s) > max_len else "")
     paths = [tool_input.get(k) for k in ("file_path", "path", "notebook_path", "url")]
     paths = [p for p in paths if isinstance(p, str) and p][:1] or [
         t for t in (targets or []) if isinstance(t, str) and t]
@@ -361,8 +377,18 @@ def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str]
             return (f"{tool_name} [REDACTED — names a credential-shaped token; "
                     f"{len(s)} chars withheld rather than copied into the record]")
         s = _mask_credential_values(s)
-        return f"{tool_name}: {s[:ATTEMPTED_MAX]}" + (" …" if len(s) > ATTEMPTED_MAX else "")
+        return f"{tool_name}: {s[:max_len]}" + (mark if len(s) > max_len else "")
     return f"{tool_name} (no command or path in input)"
+
+
+def attempted_for_record(tool_name: str, tool_input: Any, *, command: Optional[str] = None,
+                         targets: Optional[list] = None) -> str:
+    """The act at RECORD depth, for the scope-request record (#648): attempted_summary's
+    masking under SCOPE_ACT_MAX with a visible cut marker. The 220 display summary answers
+    the member mid-task ("what did the gate just refuse?"); this answers the NOT-SAME peer
+    ruling from the record alone ("exactly which bytes am I approving?")."""
+    return attempted_summary(tool_name, tool_input, command=command, targets=targets,
+                             max_len=SCOPE_ACT_MAX, mark=SCOPE_ACT_MARK)
 
 
 def _shell_target(command: str) -> str:
@@ -1810,19 +1836,25 @@ def claim_scope(path, tool_name, attempted, rule, *, plugin_id, role, client_nam
     one path added before anything proceeds. `spend=False` PEEKS: a one-time approval is reported
     as "approved" but not spent (the caller has other refused paths to clear first). Never
     raises, never waits."""
+    act = attempted or f"{tool_name} -> {path}"
+    if len(act) > SCOPE_ACT_MAX:
+        act = act[:SCOPE_ACT_MAX] + SCOPE_ACT_MARK
     args = {
         "plugin_id": plugin_id,
         "role": role,
         "path": path,
         "rule": rule,
         "tool_name": tool_name,
-        # The ATTEMPTED ACT, as the operator will read it — not a rationale. The member did not
-        # choose to ask; the gate opened this on a refusal, and the record says so.
-        "act": (attempted or f"{tool_name} -> {path}")[:400],
+        # The ATTEMPTED ACT at record depth — not a rationale, and not the 220 display summary:
+        # since dp's 2026-10-05 ruling the decider is a NOT-SAME PEER whose only view of the
+        # act is this record (#648), so the caller passes `attempted_for_record` output. The
+        # member did not choose to ask; the gate opened this on a refusal, and says so.
+        "act": act,
         "request_key": scope_request_key(plugin_id, path),
         "spend": bool(spend),
         # The authorisation binding: a digest of the COMPLETE act (scope_act_digest). `act`
-        # above is the masked summary, for the operator's eyes only.
+        # above is evidence for the deciding peer; the digest, never the display text, is what
+        # an approval binds (P1-1).
         "act_digest": act_digest or "",
     }
     if host_session_id:

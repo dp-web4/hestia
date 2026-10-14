@@ -2944,6 +2944,15 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
 /// patch header), short enough that a runaway heredoc cannot inflate the chain.
 const ATTEMPTED_MAX: usize = 400;
 
+/// The act carried on a scope request is ruled on by a NOT-SAME peer whose only view of it is
+/// the record (dp 2026-10-05: scope escalations go to peers), so the record carries it at
+/// review depth, not display depth — #648: on 2026-10-13 a peer refused five scope requests
+/// because the stored act truncated inside the command it was asked to approve. Same value
+/// and marker as the gate's `SCOPE_ACT_MAX`/`SCOPE_ACT_MARK`
+/// (plugins/_shared/hestia_gate_mechanism.py) — change them together: the truncation census
+/// lesson was "same marker, same number, three sites, no shared constant".
+const SCOPE_ACT_MAX: usize = 4000;
+
 /// Gate decisions per scope attestation. Small enough that a working member earns
 /// evidence within a session, large enough that the chain does not grow by one entry per
 /// tool call (17,649 outcomes on this chain would have become 17,649 attestations).
@@ -23803,7 +23812,16 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         ));
     }
     let tool = optional_string(args, "tool_name").unwrap_or_default();
-    let act: String = optional_string(args, "act").unwrap_or_default().chars().take(400).collect();
+    // The act at record depth: capped wide, the cut MARKED (the silent 400-take this replaces
+    // made a cut act indistinguishable from a complete one — the shape #648's scope-path
+    // instance was refused over), then re-masked on receipt — the layer-2 parity
+    // `policy_decision.attempted` already has (see `redact_secrets`).
+    let act_raw = optional_string(args, "act").unwrap_or_default();
+    let act = redact_secrets(&if act_raw.chars().count() > SCOPE_ACT_MAX {
+        act_raw.chars().take(SCOPE_ACT_MAX).collect::<String>() + "…[truncated]"
+    } else {
+        act_raw
+    });
     let spend = args.get("spend").and_then(Value::as_bool).unwrap_or(true);
     let role = optional_string(args, "role").unwrap_or_default();
     let host_session_id = optional_string(args, "host_session_id");
@@ -31360,6 +31378,64 @@ mod durable_reads_tests {
         durable.unwrap();
         assert_eq!(again["verdict"], json!("pending"), "{again}");
         assert_eq!(again["request_id"], first["request_id"]);
+    }
+
+    /// #648: the scope record carries the act at REVIEW depth, not display depth. A NOT-SAME
+    /// peer rules from this record alone (dp 2026-10-05), so a 600-char act is stored whole,
+    /// a cut past SCOPE_ACT_MAX is VISIBLE, and receipt-side masking applies — the silent
+    /// 400-take this replaced made a cut act indistinguishable from a complete one, which is
+    /// what the five scope refusals of 2026-10-13 were declined over.
+    #[tokio::test]
+    async fn the_scope_record_carries_the_act_at_review_depth() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+
+        // 604 chars: whole under the record bound (the old silent take cut this at 400).
+        let long_act = format!("cat {}", "q".repeat(600));
+        let opened = tool_scope_claim(
+            &state,
+            &json!({"plugin_id": "codex", "path": "/srv/depth.txt", "rule": "mrh.command",
+                    "tool_name": "Bash", "act": long_act, "act_digest": "b".repeat(64),
+                    "spend": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened["verdict"], json!("opened"), "{opened}");
+        let rid = opened["request_id"].as_str().unwrap().to_string();
+        let stored = state.lock().await.scope_requests[&rid].reason.clone();
+        assert!(stored.contains(&"q".repeat(600)), "the record carries the act whole: {stored}");
+        assert!(!stored.contains("…[truncated]"), "no cut, no marker: {stored}");
+
+        // Past SCOPE_ACT_MAX: the cut is allowed but must announce itself.
+        let huge = "x".repeat(SCOPE_ACT_MAX + 50);
+        let opened = tool_scope_claim(
+            &state,
+            &json!({"plugin_id": "codex", "path": "/srv/depth2.txt", "rule": "mrh.command",
+                    "tool_name": "Bash", "act": huge, "act_digest": "c".repeat(64),
+                    "spend": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened["verdict"], json!("opened"), "{opened}");
+        let rid = opened["request_id"].as_str().unwrap().to_string();
+        let stored = state.lock().await.scope_requests[&rid].reason.clone();
+        assert!(stored.ends_with("…[truncated]"), "the cut is marked: {stored}");
+        assert!(stored.chars().count() <= SCOPE_ACT_MAX + 200, "the cap holds: {}", stored.len());
+
+        // Receipt-side value-masking fires on this field too (the gate masks first; the
+        // daemon re-masks whatever it is handed).
+        let opened = tool_scope_claim(
+            &state,
+            &json!({"plugin_id": "codex", "path": "/srv/depth3.txt", "rule": "mrh.command",
+                    "tool_name": "Bash", "act": "curl --token sekritexample https://x",
+                    "act_digest": "d".repeat(64), "spend": false}),
+        )
+        .await
+        .unwrap();
+        let rid = opened["request_id"].as_str().unwrap().to_string();
+        let stored = state.lock().await.scope_requests[&rid].reason.clone();
+        assert!(!stored.contains("sekritexample"), "receipt-side masking fires: {stored}");
+        assert!(stored.contains("--token ***"), "the key stays legible: {stored}");
     }
 
     /// The gate's hot path is NOT held hostage by other requests' unsynced rows: a begin_action

@@ -1572,11 +1572,15 @@ impl ServerState {
                             // operator surfaces show who was invited and offer the OVERRIDE.
                             "invited_peers": r.ext.invited_peers,
                             "asker_basis": r.ext.gate.as_ref().map(|g| g.asker_basis),
-                            "decided_by_default": if r.ext.gate.is_some() && !r.ext.invited_peers.is_empty() {
-                                "peer"
-                            } else {
-                                "operator"
-                            },
+                            // dp, 2026-10-13: a peer-routed request ESCALATES to the operator
+                            // when no peer has ruled within the window (scope_decided_by).
+                            "decided_by_default": crate::server::state::scope_decided_by(
+                                r.ext.gate.is_some(), r.ext.invited_peers.len(),
+                                r.requested_at, now, crate::server::state::scope_peer_window_secs()).0,
+                            "peer_window_lapsed": crate::server::state::scope_decided_by(
+                                r.ext.gate.is_some(), r.ext.invited_peers.len(),
+                                r.requested_at, now, crate::server::state::scope_peer_window_secs()).1,
+                            "peer_window_secs": crate::server::state::scope_peer_window_secs(),
                         })
                     })
                     .collect();
