@@ -3388,6 +3388,23 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
         .iter_sorted()
         .into_iter()
         .map(|(id, _)| id.clone())
+        // The two names that can never answer, excluded by TYPE, exactly as at
+        // `resolve_invitation` (#990) — and this pool is MORE rivalrous, not
+        // less: it spends ONE slot where invitations spend up to a cap. The
+        // exclusions are needed here on top of the reasoner check because
+        // `is_recognised_reasoner` is a lineage PREFIX match, so residue names
+        // (`codex-cli`, `claudecode`) pass it, and act-liveness can rank one
+        // first: codex acting as `codex` while its gate witnessed as
+        // `codex-cli` is the measured case recorded in this file's own history.
+        // An operator who retires such a name reasonably reads it as out of
+        // EVERY selection path; leaving this pool open routed the appeal to a
+        // mailbox nobody reads — the silent-routing failure the reasoner check
+        // was added to stop, one clause downstream of it.
+        // RETIRED reads `retired_members` — the store the operator's one retire
+        // verb (`POST /api/agents/:id/retire`, #1100) writes — so the exclusion
+        // takes effect on the surface the operator actually uses.
+        .filter(|id| !s.retired_members.is_retired(id))
+        .filter(|id| !s.member_registry.is_filler(id))
         .filter(|id| {
             // Only drop a candidate PROVEN to be the same entity. member_lct fails closed to
             // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
@@ -16088,6 +16105,205 @@ mod tests {
         );
     }
 
+    /// #990's remedy at the pool: a RETIRED name is excluded by administrative act,
+    /// and the exclusion stands until an operator lifts it.
+    ///
+    /// This is NOT the evidence-based exclusion dp's rule forbids ("it reorders
+    /// routing, it never excludes" — pinned one test above). The retirement row is
+    /// not evidence: it is an operator's witnessed judgement (`POST
+    /// /api/agents/:id/retire`, #1100 — the one retire verb, whose store this pool
+    /// now reads), the administrative remove the append-only registry never had.
+    /// The two halves pinned here: the retired name takes no slot WHILE the row
+    /// stands, and `reinstate` returns it to the pool — the reversibility that
+    /// keeps the act a single-operator call rather than a quorum one.
+    #[tokio::test]
+    async fn a_retired_member_holds_no_invitation_slot_until_reinstated() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "kimi-code", "attest-probe", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        // The operator act, applied directly to the state's copy of the store the
+        // route commits (the HTTP door — grant revocation included — is tested
+        // beside it in http.rs): retire the probe name.
+        {
+            let mut s = shared.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "attest-probe".into(),
+                retired_at: crate::server::gate_escalation::now_secs(),
+                reason: "probe residue — never a real seat".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: false,
+                retired_by: "lct:web4:operator:test".into(),
+            });
+        }
+
+        let claim = |act: &str| {
+            let shared = shared.clone();
+            let sid = session_of["codex"].clone();
+            let act = act.to_string();
+            async move {
+                tool_gate_escalation_claim(
+                    &shared,
+                    &json!({
+                        "plugin_id": "codex",
+                        "session_id": sid,
+                        "tool_name": "Edit",
+                        "marker": "pre_tool_use.py",
+                        "reason": act,
+                    }),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let invited_of = |claimed: serde_json::Value| -> Vec<String> {
+            claimed["invited_peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let invited = invited_of(claim("Edit -> file one").await);
+        assert!(
+            !invited.contains(&"attest-probe".to_string()),
+            "the retired name holds no slot: {invited:?}"
+        );
+        assert!(
+            invited.contains(&"kimi-code".to_string())
+                && invited.contains(&"claude-code".to_string()),
+            "the live seats are untouched: {invited:?}"
+        );
+
+        // Reversibility, visible at the pool: reinstated, the name is invited again.
+        {
+            let mut s = shared.lock().await;
+            assert!(
+                s.retired_members.reinstate("attest-probe").is_some(),
+                "the row existed to remove"
+            );
+        }
+        let invited = invited_of(claim("Edit -> file two").await);
+        assert!(
+            invited.contains(&"attest-probe".to_string()),
+            "a reinstated name returns to the pool: {invited:?}"
+        );
+    }
+
+    /// The same exclusion by TYPE: a filler is minted never-a-member, so the pool
+    /// never spends a slot on it — the residue defect one field over, caught at the
+    /// type mark rather than waiting for an operator to prune each filler by hand.
+    #[tokio::test]
+    async fn a_filler_is_never_spent_an_invitation_slot() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        {
+            let mut s = shared.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            crate::member_registry::ensure_filler(
+                vault,
+                member_registry,
+                "ollama:test-model@sha256:ff",
+                "sid",
+                "anchor",
+            )
+            .expect("the filler mints");
+        }
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"claude-code".to_string()),
+            "the real peer is invited: {invited:?}"
+        );
+        assert!(
+            !invited.contains(&"ollama:test-model@sha256:ff".to_string()),
+            "the filler holds no slot, even with slots free: {invited:?}"
+        );
+    }
+
+    /// The scope peer pool is the THIRD selection pool and the most rivalrous of them:
+    /// `take(3)` over an ALPHABETICAL list with no liveness ranking, so residue sorts in
+    /// early (claude-code's re-review, 2026-10-13, measured on the live chain:
+    /// `claudecode` and `codex-cli` took two of three slots on a real scope request
+    /// within the hour). The exclusion is the same two type-marks as the invitation and
+    /// appeal pools (#990), seeded here on the store the one retire verb commits.
+    /// The control half runs first: the prefix-recognised residue name IS pooled while
+    /// active, so the exclusion assert below is what removes it.
+    #[tokio::test]
+    async fn a_retired_name_holds_no_scope_peer_slot() {
+        let (_dir, shared) = make_shared_state();
+        for id in ["claude-code", "claudecode", "codex", "kimi-code"] {
+            tool_connect(&shared, &json!({"plugin_id": id, "host_agent": "h",
+                                          "gate_capabilities": ["society-floor:v1", REVIEW_CAPABILITY]}))
+                .await.unwrap();
+        }
+        // CONTROL: recognised (the `claude` prefix) + door-declared residue is pooled.
+        let before = {
+            let s = shared.lock().await;
+            scope_peer_pool(&s, "kimi-code")
+        };
+        assert!(
+            before.contains(&"claudecode".to_string()),
+            "control: the residue name takes a slot while active: {before:?}"
+        );
+        {
+            let mut s = shared.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "claudecode".into(),
+                retired_at: 1,
+                reason: "probe residue".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: false,
+                retired_by: "op".into(),
+            });
+        }
+        let after = {
+            let s = shared.lock().await;
+            scope_peer_pool(&s, "kimi-code")
+        };
+        assert!(
+            !after.contains(&"claudecode".to_string()),
+            "the retired name holds no slot: {after:?}"
+        );
+        assert!(
+            after.contains(&"claude-code".to_string()) && after.contains(&"codex".to_string()),
+            "the real seats are untouched: {after:?}"
+        );
+    }
+
     /// THE BAR A PEER CAN CLEAR ALONE IS THE BAR THAT MUST INVITE. `resolve_invitation` built
     /// its pool only under `SovereignPlusPeer`, reasoning that `SingleApprover` "names no peer
     /// conjunct". But `SingleApprover` is defined as one sovereign-channel decision OR a
@@ -20201,6 +20417,92 @@ mod appeal_tests {
         }
     }
 
+    /// #990 at the arbiter pool: a RETIRED name holds no arbiter slot, even when
+    /// every other signal would hand it the appeal — a recognised lineage prefix
+    /// (`codex-cli` passes the reasoner check on the `codex` prefix) AND Live on
+    /// its own witnessed acts. This is the exact shape claude-code's #1036 review
+    /// measured: residue passes the prefix check, act-liveness can rank it first,
+    /// and the appeal then goes to a mailbox nobody reads. The control half below
+    /// pins that the test would catch a missing filter: while the name is active,
+    /// it wins.
+    #[tokio::test]
+    async fn a_retired_recognised_prefix_name_is_live_and_still_not_routed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // The pool reads the registry: seed the residue name and a real peer.
+        {
+            let mut s = state.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                "codex-cli",
+                false,
+                "sid",
+                "anchor",
+            )
+            .unwrap();
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                "kimi-code",
+                false,
+                "sid",
+                "anchor",
+            )
+            .unwrap();
+        }
+        // codex-cli is LIVE on its own acts — the review's measured case: the
+        // gate's acts witness under the residue id while the member acts as codex.
+        {
+            let s = state.lock().await;
+            s.append_chain("outcome", json!({
+                "plugin_id": "codex-cli", "role_lct": APPELLANT_ROLE,
+                "session_id": "gate-session", "tool_name": "Bash", "success": true,
+                "target": "cargo test"})).unwrap();
+        }
+        let appellant_sid = seat(&state, "claude-code").await;
+        let deny_hash = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+        let filed = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": appellant_sid.to_string(),
+            "reason": "the preset permits deletes under /tmp",
+        })).await.unwrap();
+        assert_eq!(
+            filed.pointer("/dispatched/arbiter").and_then(Value::as_str),
+            Some("codex-cli"),
+            "CONTROL: Live + recognised + cross-vendor wins the slot while the name is active: {filed}"
+        );
+        // The operator retires the residue name — seeded on the store the one
+        // retire verb (#1100) commits, which is the store the pool now reads.
+        {
+            let mut s = state.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "codex-cli".into(),
+                retired_at: 1,
+                reason: "probe residue".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: true,
+                retired_by: "op".into(),
+            });
+        }
+        let deny_hash2 = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+        let filed2 = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash2, "session_id": appellant_sid.to_string(),
+            "reason": "and the deny was over-broad a second time",
+        })).await.unwrap();
+        assert_eq!(
+            filed2.pointer("/dispatched/arbiter").and_then(Value::as_str),
+            Some("kimi-code"),
+            "the retirement excludes the Live residue name; the appeal routes to a \
+             member that can answer: {filed2}"
+        );
+    }
+
     /// End to end: file, rule, and check that the CONDUCT SCALE moved. If the emitted shape
     /// drifts from what `derivation.rs` matches on, this fails — which is the point.
     #[tokio::test]
@@ -22293,6 +22595,26 @@ fn resolve_invitation(
                     false
                 }
             })
+            // The two names that can never answer, excluded by TYPE rather than by
+            // rank (#990). A slot on this list is RIVALROUS (top `MAX_INVITED_PEERS`
+            // of a pool that only grew), and every ranking fix left the residue in
+            // place underneath the cap:
+            //   * RETIRED — the operator's administrative remove, recorded in
+            //     `retired_members` by the one retire verb (`POST
+            //     /api/agents/:id/retire`, #1100): witnessed as
+            //     `member_retire_intent`/`member_retired`, and it revokes the id's
+            //     grants in the same act. dp's standing call is that evidence
+            //     (liveness, mailbox rows) may ORDER the pool but never shrink it —
+            //     a legitimate new member has no rows yet — so the shrink is an
+            //     administrative act, and this filter is where it takes effect.
+            //   * FILLER — typed never-a-member at mint (`ensure_filler`): it cannot
+            //     connect, witness, or answer, so a slot spent on it is dead by
+            //     construction. Same defect class as probe residue, one field over.
+            // Both stay in the registry (presence, history) — this is a SELECTION
+            // exclusion, not an erasure; the retirement row and the type mark are
+            // the record.
+            .filter(|id| !s.retired_members.is_retired(id))
+            .filter(|id| !s.member_registry.is_filler(id))
             .map(|id| {
                 let l = actor_liveness(&window, &id);
                 let reachable = has_mailbox_reader(&s.inbox_store, &id);
@@ -23799,12 +24121,23 @@ fn scope_how_to_decide(id: &str, no_peer: bool, once_only: bool) -> String {
 /// The NOT-SAME peers invited to decide `asker`'s scope request: recorded members other than
 /// the asker (and its aliases), with a declared review door, that `arbiter::eligibility_for`
 /// admits in the GRANTING direction. Ordered as the registry orders them; capped at 3.
+///
+/// The same two names that can never answer are excluded by TYPE here as at
+/// `resolve_invitation` and the appeal pool (#990) — and this pool is the MOST
+/// rivalrous of the three: `take(3)` over an ALPHABETICAL list with no liveness
+/// ranking, so residue sorts in early (claude-code's re-review, measured live:
+/// `claudecode` and `codex-cli` took two of three slots on a real request within
+/// the hour). `is_recognised_reasoner` inside `eligibility_for` is a lineage
+/// PREFIX match and does not stop them; the retirement row and the filler mark
+/// do.
 fn scope_peer_pool(s: &super::state::ServerState, asker: &str) -> Vec<String> {
     use crate::arbiter::{eligibility_for, AppealParties, AskerBasis, Disposition, Eligibility};
     s.member_registry
         .iter_sorted()
         .into_iter()
         .map(|(id, _)| id.clone())
+        .filter(|id| !s.retired_members.is_retired(id))
+        .filter(|id| !s.member_registry.is_filler(id))
         .filter(|id| id != asker && !s.same_entity(asker, id))
         .filter(|id| review_capability(s, id).is_ok())
         .filter(|id| matches!(

@@ -6676,10 +6676,29 @@ fn refuse_if_retired(
 
 const RETIRE_ACTIVE_WINDOW_HOURS: i64 = 24;
 
+/// The operator principal for a retirement's act rows: `operator` is the authenticated
+/// principal for EVERY session kind (codex review of #1035, finding 1: reading
+/// provenance.principal alone wrote the office literal for a direct dashboard session);
+/// provenance.principal is the composed-session fallback. WHO retired is evidence — the
+/// literal "operator" this replaced named a role, not a party (#1036). A session always
+/// carries a principal, so the final fallback names the degradation (the dev-override
+/// path inserts no witness) rather than inventing an operator.
+fn gate_operator(gate: &Option<axum::Extension<super::operator_auth::GateWitness>>) -> String {
+    match gate {
+        Some(axum::Extension(w)) => w
+            .operator
+            .clone()
+            .or_else(|| w.provenance.as_ref().map(|p| p.principal.clone()))
+            .unwrap_or_else(|| "operator (direct session)".to_string()),
+        None => "operator (session not recorded on this path)".to_string(),
+    }
+}
+
 /// Retire an id on THIS seat: revoke its standing grants and take it out of the default view.
 /// Never deletion; see `server::retirement` for what it is and is deliberately not.
 async fn agent_retire(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -6713,6 +6732,7 @@ async fn agent_retire(
     let recent = measured.clone().unwrap_or(0);
 
     let now = crate::server::gate_escalation::now_secs();
+    let retired_by = gate_operator(&gate);
     let held: Vec<String> = s.standing_scope.grants.iter()
         .filter(|g| g.member == plugin_id).map(|g| g.path.clone()).collect();
     let record = serde_json::json!({
@@ -6725,14 +6745,14 @@ async fn agent_retire(
         "acts_measurable": measured.is_ok(),
         "window_hours": RETIRE_ACTIVE_WINDOW_HOURS,
         "confirmed_active": confirm_active,
-        "retired_by": "operator",
+        "retired_by": retired_by,
         "scope": "this seat only — a retirement is not published to the hub and does not reach \
                   another seat's registry",
     });
     // INTENT -> COMMIT -> SUCCESS, the ordering `witness_and_commit_standing_grant` exists to
     // keep: a failed commit must not leave the chain asserting an authority change that never
     // took effect.
-    let intent = match s.append_chain("member_retire_intent", record.clone()) {
+    let intent = match s.append_chain("member_retire_intent", stamp_gate(record.clone(), &gate)) {
         Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
@@ -6740,6 +6760,7 @@ async fn agent_retire(
     let rec = crate::server::retirement::RetiredMember {
         plugin_id: plugin_id.clone(), retired_at: now, reason: reason.clone(),
         evidence_ref: evidence_ref.clone(), revoked_paths: held.clone(), was_active: recent > 0,
+        retired_by: retired_by.clone(),
     };
     let revoked = match s.commit_retirement(&reason, |st| { st.retire(rec); Some(plugin_id.clone()) }) {
         Ok(v) => v,
@@ -6758,7 +6779,7 @@ async fn agent_retire(
         m.insert("revoked_delegations".into(), serde_json::json!(revoked.delegations));
         m.insert("intent".into(), serde_json::json!(intent.hash));
     }
-    let entry = s.append_chain("member_retired", done).ok();
+    let entry = s.append_chain("member_retired", stamp_gate(done, &gate)).ok();
     let gen = s.retired_members.generation;
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "retired": true,
@@ -6780,6 +6801,7 @@ async fn agent_retire(
 /// was revoked so the operator can re-grant deliberately.
 async fn agent_reinstate(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -6802,9 +6824,9 @@ async fn agent_reinstate(
         "was_retired_at": existing.retired_at,
         "was_retired_because": existing.reason,
         "paths_revoked_then_and_NOT_restored_now": existing.revoked_paths,
-        "reinstated_by": "operator",
+        "reinstated_by": gate_operator(&gate),
     });
-    let intent = match s.append_chain("member_reinstate_intent", record.clone()) {
+    let intent = match s.append_chain("member_reinstate_intent", stamp_gate(record.clone(), &gate)) {
         Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
@@ -6813,7 +6835,7 @@ async fn agent_reinstate(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": format!("still retired: {e}"), "intentEntryHash": intent.hash })));
     }
-    let entry = s.append_chain("member_reinstated", record).ok();
+    let entry = s.append_chain("member_reinstated", stamp_gate(record, &gate)).ok();
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "retired": false,
         "generation": s.retired_members.generation,
@@ -10063,14 +10085,35 @@ mod disposition_tests {
     }
 
     async fn retire(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let resp = agent_retire(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        retire_gated(state, id, body, None).await
+    }
+
+    /// The same call carrying the gate witness the `operator_gate` middleware inserts —
+    /// the shape the production route always runs with (tests calling a handler directly
+    /// must opt in; `None` is the dev-override / direct-call shape).
+    async fn retire_gated(
+        state: &SharedState,
+        id: &str,
+        body: serde_json::Value,
+        gate: Option<axum::Extension<crate::server::operator_auth::GateWitness>>,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = agent_retire(State(state.clone()), gate, Path(id.to_string()), Json(body)).await.into_response();
         let st = resp.status();
         let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (st, serde_json::from_slice(&b).unwrap())
     }
 
     async fn reinstate(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let resp = agent_reinstate(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        reinstate_gated(state, id, body, None).await
+    }
+
+    async fn reinstate_gated(
+        state: &SharedState,
+        id: &str,
+        body: serde_json::Value,
+        gate: Option<axum::Extension<crate::server::operator_auth::GateWitness>>,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = agent_reinstate(State(state.clone()), gate, Path(id.to_string()), Json(body)).await.into_response();
         let st = resp.status();
         let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (st, serde_json::from_slice(&b).unwrap())
@@ -10622,6 +10665,68 @@ mod disposition_tests {
         assert!(rec.event_data["scope"].as_str().unwrap().contains("this seat only"),
                 "the record states it is per-seat, so a later fleet-wide ruling changes a stated \
                  decision rather than discovering an accident");
+    }
+
+    /// WHO retired is evidence (#1036's review item 1, ported onto this route when the
+    /// duplicate `/api/operator/member/*` surface was dropped in favour of this one): the
+    /// record names the principal the gate middleware authenticated — never the literal
+    /// "operator", never a body field. The two session shapes carry the principal in
+    /// different places, so both are pinned: a direct dashboard session has `operator`
+    /// and NO provenance (codex review of #1035, finding 1), and a composed session has
+    /// both, with `operator` winning — the fixture below makes them disagree so the
+    /// precedence, not just the plumbing, is what the assert pins.
+    #[tokio::test]
+    async fn a_retirement_names_the_operator_the_gate_authenticated() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "caude-code").await;
+        // Shape 1: the dashboard's ordinary signed-in operator.
+        let direct = Some(axum::Extension(crate::server::operator_auth::GateWitness {
+            operator: Some("lct:web4:operator:dp".into()),
+            provenance: None,
+            gate_entry_hash: Some("gate-row-1".into()),
+        }));
+        let (st, b) = retire_gated(&state, "caude-code", serde_json::json!({
+            "reason": "typo", "ref": "dp 2026-09-08"}), direct).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        {
+            let s = state.lock().await;
+            let chain = s.recent_chain(20);
+            for t in ["member_retire_intent", "member_retired"] {
+                let rec = chain.iter().find(|e| e.event_type == t)
+                    .unwrap_or_else(|| panic!("{t} is witnessed"));
+                assert_eq!(rec.event_data["retired_by"], serde_json::json!("lct:web4:operator:dp"),
+                    "{t} names the authenticated operator, not the role literal");
+                assert_eq!(rec.event_data["authorized_by_gate"], serde_json::json!("gate-row-1"),
+                    "{t} binds the gate row that admitted the request");
+            }
+            assert_eq!(s.retired_members.get("caude-code").unwrap().retired_by,
+                "lct:web4:operator:dp", "the durable row carries the same WHO");
+        }
+        // Shape 2: composed session, with the two principals made to DISAGREE so the
+        // read order is what is pinned.
+        let composed = Some(axum::Extension(crate::server::operator_auth::GateWitness {
+            operator: Some("lct:web4:operator:dp".into()),
+            provenance: Some(crate::server::operator_auth::OperatorProvenance {
+                actor: "lct:web4:actor:app".into(),
+                principal: "lct:web4:operator:other".into(),
+                via_device: "lct:web4:device:cbp".into(),
+                office: "operator".into(),
+                authority: "session-ref-42".into(),
+            }),
+            gate_entry_hash: Some("gate-row-2".into()),
+        }));
+        let (st, b) = reinstate_gated(&state, "caude-code", serde_json::json!({
+            "reason": "restoring the typo for the test"}), composed).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        for t in ["member_reinstate_intent", "member_reinstated"] {
+            let rec = chain.iter().find(|e| e.event_type == t)
+                .unwrap_or_else(|| panic!("{t} is witnessed"));
+            assert_eq!(rec.event_data["reinstated_by"], serde_json::json!("lct:web4:operator:dp"),
+                "{t}: `operator` — the authenticated principal — wins over provenance.principal");
+            assert_eq!(rec.event_data["authorized_by_gate"], serde_json::json!("gate-row-2"));
+        }
     }
 
     /// #1067, measured on McNugget: a grant to `Claude-code` succeeded, was witnessed, was

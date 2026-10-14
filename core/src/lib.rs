@@ -22,6 +22,7 @@ pub mod gate_cli;
 pub mod hub;
 pub mod lct_publish;
 pub mod legacy_parity;
+pub mod member_cli;
 pub mod member_registry;
 pub mod orchestrators;
 pub mod pairing;
