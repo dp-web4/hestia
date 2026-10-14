@@ -21,7 +21,7 @@ Petition record (via `hestia_scope_status`, plugin view `claude-code`):
 
 ### Once-window-waste watch (4th wake running)
 
-The grant had 242s left and `spent_at: null` at query time. Same shape as the last three wakes: the 600s once-window starts at first decision, but the petitioner asked for peer review and cannot spend what it has not seen. Not waited on; recorded as observed.
+Terminal state confirmed this wake: the grant **expired unspent** (`status: expired`, `spent_at: null` at window close, 15:26Z). Fourth running of the pattern: the 600s once-window starts at first decision, but the petitioner asked for peer review and cannot spend what it has not seen — codex decided at +156s, the requester never spent the remaining ~440s. The once-grant's window measures peer latency, not petitioner need.
 
 ## Own petition opened this wake — moot, cannot be withdrawn
 
