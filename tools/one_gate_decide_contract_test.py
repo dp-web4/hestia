@@ -1041,58 +1041,51 @@ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home)
         stub.close()
 
 
-def test_an_unenumerated_reach_is_a_once_only_request(m, g, wc, home):
-    """dp, 2026-10-10 ("narrow and land"): nothing an expansion produces is modelled. A command
-    whose reach depends on one is refused with the UNENUMERATED target, and the refusal is a scope
-    REQUEST for the act — keyed on the act's complete digest, decidable only as "this act once" —
-    never a silent allow (Codex 17054 P1-output-model: `cat "$(date +/x)"` was allowed)."""
+def test_an_unenumerated_reach_is_refused_with_rewrite_guidance(m, g, wc, home):
+    """dp, 2026-10-10 ("narrow and land"): nothing an expansion produces is modelled. dp, 2026-10-14
+    (hestia#1313, option b): a command whose reach depends on one is refused under its OWN rule,
+    `mrh.command.unenumerated`, which is not a scope-escalating rule. So the gate asks the daemon
+    nothing (no peer scope request is opened, for the act or for any concrete path beside it),
+    and the remedy names the rewrite that works. Never a silent allow (Codex 17054
+    P1-output-model: `cat "$(date +/x)"` was allowed)."""
     unenum = g.core.UNENUMERATED_TARGET
-    act = 'cat "$(date +/etc/hostname)"'
+    rule = "mrh.command.unenumerated"
     stub = Stub(Policy())
     try:
         with _Env(m, stub.url, home):
-            d, _ = _decide(g, "codex", "Bash", {"command": act}, home)
-        claims = [a for a, _ in stub.named("hestia_scope_claim")]
-        c = claims[0] if claims else {}
-        dg = c.get("act_digest") or ""
-        check("unenum-17054-date-format-is-refused", d.decision == "deny" and d.rule == "mrh.command", d)
-        check("unenum-opens-one-request", len(claims) == 1 and c.get("spend") is False, claims)
-        check("unenum-request-keyed-on-the-act",
-              len(dg) == 64 and c.get("path") == f"{unenum}#{dg[:16]}", c)
-        check("unenum-deny-names-the-request", d.escalation_id and d.escalation_id in d.reason, d)
-        check("unenum-deny-says-once-only", "only ONCE" in d.reason and "no session" in d.reason, d.reason)
-        with _Env(m, stub.url, home):
-            d2, _ = _decide(g, "codex", "Bash", {"command": 'cat "$(date +/etc/os-release)"'}, home)
-        claims = [a for a, _ in stub.named("hestia_scope_claim")]
-        check("unenum-two-acts-two-requests",
-              d2.decision == "deny" and len({a.get("path") for a in claims}) == 2, claims)
+            d, _ = _decide(g, "codex", "Bash", {"command": 'cat "$(date +/etc/hostname)"'}, home)
+        claims = stub.named("hestia_scope_claim")
+        check("unenum-17054-date-format-is-refused", d.decision == "deny" and d.rule == rule, d)
+        check("unenum-opens-no-request", claims == [] and not d.escalation_id, (claims, d))
+        check("unenum-remedy-names-the-rewrite", "spell every path out literally" in d.remedy
+              and "script file" in d.remedy and "not a recast" in d.remedy, d.remedy)
+        check("unenum-says-no-request", "No scope request was opened" in d.remedy, d.remedy)
+        check("unenum-no-once-only-promise", "only ONCE" not in d.reason + d.remedy, d)
+        check("unenum-names-the-expansion", "a command substitution" in d.reason, d.reason)
     finally:
         stub.close()
-    # A one-time approval of the act lifts it: reserved after society, committed after evidence,
-    # under the same act-keyed path.
-    stub = Stub(Policy(scope_claim=lambda p: "approved" if p.startswith(unenum) else "opened"))
-    try:
-        with _Env(m, stub.url, home):
-            d, _ = _decide(g, "codex", "Bash", {"command": "cat /tmp/run-$(date +%s)/../x"}, home)
-        calls = [a for a, _ in stub.named("hestia_scope_claim")]
-        ops = [a.get("op") for a in calls if "op" in a]
-        reserve = [a for a in calls if a.get("op") == "reserve"]
-        check("unenum-once-approval-lifts", d.decision == "allow", d)
-        check("unenum-once-reserve-then-commit", ops == ["reserve", "commit"]
-              and reserve and all(p.startswith(unenum + "#") for p in reserve[0]["paths"]), calls)
-    finally:
-        stub.close()
-    # A concrete refusal in the same act is collected too, and is its own request.
+    # Even a daemon that WOULD approve is never asked: there is no approval route as written.
     stub = Stub(Policy(scope_claim=lambda p: "approved"))
     try:
         with _Env(m, stub.url, home):
-            # `$D` alone would now resolve (dp, 2026-10-11: one literal binds); `$E` does not.
-            d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D $E"}, home)
-        peeks = [a.get("path") for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
-        check("unenum-mixed-collects-both", d.decision == "allow" and len(peeks) == 2
-              and "/etc/hostname" in peeks and any(p.startswith(unenum + "#") for p in peeks), (d, peeks))
+            d, _ = _decide(g, "codex", "Bash", {"command": "cat /tmp/run-$(date +%s)/../x"}, home)
+        check("unenum-never-lifted", d.decision == "deny" and d.rule == rule, d)
+        check("unenum-daemon-never-asked", stub.named("hestia_scope_claim") == [], stub.named("hestia_scope_claim"))
     finally:
         stub.close()
+    # A concrete refusal in the same act is not escalated either: the act cannot pass as written.
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            # `$D` alone would resolve (dp, 2026-10-11: one literal binds); `$E` does not.
+            d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D $E"}, home)
+        check("unenum-mixed-is-refused-unescalated", d.decision == "deny" and d.rule == rule
+              and stub.named("hestia_scope_claim") == [], (d, stub.named("hestia_scope_claim")))
+    finally:
+        stub.close()
+    # The once-only lift still exists in the core (a trial scope carrying the sentinel), but no
+    # path in the gate builds that scope any more; pinned so a later change notices.
+    check("unenum-core-target-unchanged", unenum == "hestia:unpriceable:unenumerated", unenum)
     # Codex 17054 P1-quote-context, through decide(): the live substitution is found and judged.
     stub = Stub(Policy())
     try:
@@ -1124,18 +1117,18 @@ def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
                 check(f"1287-{seat}-prose-reason-allowed", d.decision == "allow", d)
                 check(f"1287-{seat}-prose-reason-asks-society", len(stub.named("hestia_begin_action")) == 1)
                 d, _ = _decide(g, seat, "Bash", {"command": 'F="a*"; cat $F'}, home)
-                check(f"1287-{seat}-glob-var-path-is-a-request", d.decision == "deny"
-                      and d.rule == "mrh.command" and "only ONCE" in d.reason, d)
+                check(f"1287-{seat}-glob-var-path-is-refused", d.decision == "deny"
+                      and d.rule == "mrh.command.unenumerated", d)
                 d, _ = _decide(g, seat, "Bash", {"command": 'R="/tmp/review-probe/*"; hestia gate deny X --reason $R'}, home)
-                check(f"1287-{seat}-unquoted-glob-reason-is-a-request", d.decision == "deny"
-                      and d.rule == "mrh.command", d)
+                check(f"1287-{seat}-unquoted-glob-reason-is-refused", d.decision == "deny"
+                      and d.rule == "mrh.command.unenumerated", d)
                 # Codex HOLD 21675: unquoted, the value splits and `--body-file` becomes gh's argument.
                 d, _ = _decide(g, seat, "Bash", {"command": 'R="hi --body-file /etc/hostname"; gh pr create --title $R'}, home)
-                check(f"1289-{seat}-unquoted-split-title-is-a-request", d.decision == "deny"
-                      and d.rule == "mrh.command" and "only ONCE" in d.reason, d)
-            claims = [a for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
-            check(f"1287-{seat}-requests-are-unenumerated",
-                  claims and all(str(c.get("path", "")).startswith(unenum) for c in claims), claims)
+                check(f"1289-{seat}-unquoted-split-title-is-refused", d.decision == "deny"
+                      and d.rule == "mrh.command.unenumerated", d)
+            # hestia#1313: none of these opens a scope request any more.
+            check(f"1313-{seat}-no-requests-opened", stub.named("hestia_scope_claim") == [],
+                  stub.named("hestia_scope_claim"))
         finally:
             stub.close()
 
@@ -1564,7 +1557,7 @@ CONTRACT_TESTS = [
     test_superseded_is_denied_in_every_mode,
     test_daemon_verdicts_and_the_warn_rollout,
     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
-    test_an_unenumerated_reach_is_a_once_only_request,
+    test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
     test_prose_in_a_message_position_is_data_on_every_seat,
     test_degraded_posture,
     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
@@ -2055,16 +2048,14 @@ def test_against_an_isolated_real_daemon(m, g, wc, home):
         check("real-scope-reissue-finds-the-same-request", again.escalation_id == d.escalation_id,
               (d.escalation_id, again.escalation_id))
         check("real-scope-reissue-says-pending", "still pending" in again.reason, again.reason)
-        # dp, 2026-10-10 (narrowed): an act whose reach an expansion decides is a request for THE
-        # ACT against the real handler too — the daemon accepts the act-keyed sentinel, and a
-        # re-issue of the identical act finds the same request.
+        # dp, 2026-10-14 (hestia#1313): an act whose reach an expansion decides is refused under
+        # its own rule against the real handler too, and opens no request, on a re-issue either.
         u = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 7)
-        check("real-unenumerated-is-mrh-command", u.decision == "deny" and u.rule == "mrh.command", u)
-        check("real-unenumerated-opens-a-request", bool(u.escalation_id)
-              and str(u.escalation_id).startswith("scope-") and "only ONCE" in u.reason, u)
+        check("real-unenumerated-own-rule", u.decision == "deny"
+              and u.rule == "mrh.command.unenumerated", u)
+        check("real-unenumerated-opens-no-request", not u.escalation_id, u)
         u2 = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 8)
-        check("real-unenumerated-reissue-finds-it", u2.escalation_id == u.escalation_id,
-              (u.escalation_id, u2.escalation_id))
+        check("real-unenumerated-reissue-opens-none", not u2.escalation_id, u2)
 
 
 def teardown_module(module=None):

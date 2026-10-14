@@ -220,6 +220,23 @@ REMEDIES: dict[str, Remedy] = {
         "is a separate act.",
         ("hestia_request_scope", "hestia_scope_status", "hestia_appeal"),
     ),
+    # AN UNENUMERABLE REACH (dp's ruling, 2026-10-14, hestia#1313: option (b) of three). The act's
+    # reach depends on an expansion the gate does not model, so no path exists for a grant to
+    # name. Until this ruling the refusal also opened a once-only peer scope request for the act;
+    # measured on claude-code's own 50,091 recorded commands, 9,178 (18%) were such requests and
+    # most lapsed or were refused as noise. Now it is its own rule, NOT a scope-escalating one
+    # (mechanism.SCOPE_ESCALATING_RULES), so the single gate asks the daemon nothing, and the
+    # remedy names the two rewrites that work. The rewrite is the asked-for act, not a recast.
+    "mrh.command.unenumerated": Remedy(
+        "Rewrite the act so the gate can see what it reaches. That rewrite is what this refusal "
+        "asks for; it is not a recast. Either spell every path out literally (if a value comes "
+        "from a command, run that command on its own first and use what it printed), or put "
+        "the expansion in a script file and run the script by its literal path. No scope "
+        "request was opened: no grant can name a path the gate cannot see. If the spelled-out "
+        "command then reaches outside your scope, its own refusal opens a request for that "
+        "path.",
+        ("hestia_request_scope",),
+    ),
     "mrh.command": Remedy(
         "Scope the command to a granted path. If the path is genuinely needed: when this "
         "refusal names a scope request id, the gate already opened it for you — a NOT-SAME "
@@ -2932,10 +2949,14 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                         f"could not be judged completely, and an incompletely judged command is "
                         f"refused — split it, or the act can be approved once as written")
             elif offending and offending.startswith(_UNMODELLED_PREFIX):
-                what = (f"the gate cannot enumerate what it reaches "
-                        f"({offending[len(_UNMODELLED_PREFIX):-1]}): nothing an expansion produces is "
-                        f"modelled, so this act can only be approved ONCE, as written — or rewritten "
-                        f"with every path spelled out literally")
+                # hestia#1313: its own rule, so nothing escalates (see REMEDIES).
+                return _deny(
+                    "mrh.command.unenumerated",
+                    f"'{event.tool}' command: the gate cannot enumerate what it reaches "
+                    f"({offending[len(_UNMODELLED_PREFIX):-1]}). Nothing an expansion produces is "
+                    f"modelled, so no grant can cover it as written",
+                    target=refused or "",
+                )
             elif outside:
                 what = f"'{offending}' is outside the workspace and no grant reaches it"
             else:
