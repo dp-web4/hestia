@@ -3607,7 +3607,7 @@
       const n = mine.length;
       const peer = pend.length - n;
       $('scope-banner-text').textContent =
-        `${n} scope request${n > 1 ? 's' : ''} no peer can clear — awaiting your decision`
+        `${n} scope request${n > 1 ? 's' : ''} awaiting your decision (no peer can clear it, or no peer ruled in time)`
         + (peer ? ` (+${peer} with peers)` : '');
     } else if (pend.length) {
       const n = pend.length;
@@ -3791,12 +3791,20 @@
   // tools/dashboard_scope_decide_contract_test.py, which also runs them under node) ----
   // dp, 2026-10-05: a gate-opened request from a proven asker is decided by a NOT-SAME PEER;
   // only one no peer can clear (no invited peer) awaits the operator.
+  // dp, 2026-10-13: "escalate to me after a timeout". The daemon says whose queue a request is
+  // in (`decided_by_default`, which turns "operator" once the peer window lapses); an older
+  // daemon without the field falls back to the routing rule.
   function scopeAwaitsOperator(r) {
+    if (r && typeof r.decided_by_default === 'string') return r.decided_by_default !== 'peer';
     return !(r && r.origin === 'gate_deny' && Array.isArray(r.invited_peers)
              && r.invited_peers.length > 0);
   }
 
   function scopeRouteText(r) {
+    if (r && r.peer_window_lapsed) {
+      const mins = Math.round(Number(r.peer_window_secs || 0) / 60);
+      return `no invited peer (${(r.invited_peers || []).map(p => escapeHtml(String(p))).join(', ')}) ruled within ${mins} min — ESCALATED to you; a peer may still decide`;
+    }
     if (scopeAwaitsOperator(r)) {
       return 'no NOT-SAME peer can clear this (unproven asker, or no admissible peer) — it is yours to decide';
     }

@@ -170,7 +170,7 @@ def main() -> int:
           "chosenDuration()" in g and "onceOnly ? 'once' : duration.value" in g)
     # dp, 2026-10-05: "scope escalations should go to peers not to me".
     check("the banner counts only what no peer can clear",
-          "pend.filter(r => scopeAwaitsOperator(r))" in g and "no peer can clear" in g)
+          "pend.filter(r => scopeAwaitsOperator(r))" in g and "awaiting your decision" in g)
     # dp, 2026-10-13: every gate request invites peers, so a banner shown only for operator-only
     # requests never showed, and the decide control (a modal) was unreachable from the main view.
     check("the banner shows whenever anything is pending, quietly when all are peer-routed",
@@ -187,6 +187,10 @@ const out = {};
 out.awaitPeer = scopeAwaitsOperator({origin: 'gate_deny', invited_peers: ['kimi-code']});
 out.awaitOpNoPeer = scopeAwaitsOperator({origin: 'gate_deny', invited_peers: []});
 out.awaitOpMember = scopeAwaitsOperator({origin: 'member_request'});
+// dp, 2026-10-13: a peer-routed request escalates to the operator when the window lapses.
+out.awaitPeerInWindow = scopeAwaitsOperator({origin: 'gate_deny', invited_peers: ['kimi-code'], decided_by_default: 'peer'});
+out.awaitEscalated = scopeAwaitsOperator({origin: 'gate_deny', invited_peers: ['kimi-code'], decided_by_default: 'operator', peer_window_lapsed: true});
+out.routeEscalated = scopeRouteText({origin: 'gate_deny', invited_peers: ['kimi-code', 'codex'], decided_by_default: 'operator', peer_window_lapsed: true, peer_window_secs: 1800});
 out.route = scopeRouteText({origin: 'gate_deny', invited_peers: ['kimi-code', 'codex']});
 out.durGate = scopeDurationOptions({once_available: true}).map(x => x[0]);
 out.durMember = scopeDurationOptions({once_available: false}).map(x => x[0]);
@@ -221,6 +225,11 @@ process.stdout.write(JSON.stringify(out));
     if o is not None:
         check("a gate request with invited peers awaits a PEER, not the operator",
               o["awaitPeer"] is False and o["awaitOpNoPeer"] is True and o["awaitOpMember"] is True, o)
+        check("a lapsed peer window escalates to the operator; inside it, it stays with the peers",
+              o["awaitPeerInWindow"] is False and o["awaitEscalated"] is True, o)
+        check("an escalated row says no peer ruled in time and that a peer may still decide",
+              "30 min" in o["routeEscalated"] and "ESCALATED" in o["routeEscalated"]
+              and "kimi-code, codex" in o["routeEscalated"], o["routeEscalated"])
         check("the route text names the invited peers and the override",
               "kimi-code, codex" in o["route"] and "OVERRIDE" in o["route"], o["route"])
         check("once is offered only when the gate recorded an act",
