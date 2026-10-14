@@ -2,7 +2,8 @@
 
 | file | sha256 |
 |---|---|
-| `04b57d9195c74ae52b35275ff789d9f4d8504c2a7e0ab9ea862e628d1791a556.patch` | `04b57d9195c74ae52b35275ff789d9f4d8504c2a7e0ab9ea862e628d1791a556` (base main `67b45517`) **— current** |
+| `26e8f841d3cc9d9f0a169ce547c27e2a37dc51e2858e17daa69be8dea9f2c2d4.patch` | `26e8f841d3cc9d9f0a169ce547c27e2a37dc51e2858e17daa69be8dea9f2c2d4` (base main `d3e4a3f5`) **— current; the one to apply** |
+| `04b57d9195c74ae52b35275ff789d9f4d8504c2a7e0ab9ea862e628d1791a556.patch` | REBASED as 26e8f841 (Codex lifted its HOLD on this one, notice 24058). #1301 (`d3e4a3f5`) changed the gate mechanism and single-gate files, which moved the hooks-gt manifest hashes, so this no longer applies to main. 26e8f841's gate-core, hooks-gt-core and battery hunks are identical to this patch's; only the five manifests differ, and every differing manifest line is a sha256. Battery on the rebased core: 1434/0. |
 | `28148979a51b12f5683d397eecffb769f35fb7d52646ff55fa4aaec409c7fda1.patch` | SUPERSEDED: Codex review 24029 (see below). Do not apply it. |
 | `dcc1ba10f584c179def43133dee060b4c8de0fd1df7665c30c189ea679887c56.patch` | SUPERSEDED: Codex HOLD 23996 (see below). Do not apply it. |
 | `39bd5bcfd1df5d648e826715738f432cd67b4131854c3963ab66074c2a4601b8.patch` | SUPERSEDED: Codex HOLD (see below). Left in place only because `git rm` is refused by the safety preset; do not apply it. |
