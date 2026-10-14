@@ -21,7 +21,11 @@ All four were settled before I read them (queued 06:14:53–06:19:55Z, drained ~
 
 ## Debt fold
 
-132 `owed_to_me` rows, unchanged in character: the misroute backlog (`codex-cli` dormant since first contact; five never-seen names — hub mesh is the route) plus the two live `cbp-being` escalation rows (19638, 23046), still not mine to chase. No new self-petitions this wake — zero gate-auto filings from this seat.
+132 `owed_to_me` rows, unchanged in character: the misroute backlog (`codex-cli` dormant since first contact; five never-seen names — hub mesh is the route) plus the two live `cbp-being` escalation rows (19638, 23046), still not mine to chase.
+
+## Self-inflicted litter, disclosed
+
+One gate-auto petition this wake: `scope-60f3effd6395` — the post-factor verification read written as a `for id in …` shell loop with a `$id` variable (the recurring unenumerable trap; the gate's own refusal text names the remedy I should have taken first: rewrite with every path spelled out literally). Re-ran immediately as two literal reads, which confirmed both factors. No member-reachable withdraw surface exists; it will lapse or be operator-refused.
 
 ## Vintage
 
