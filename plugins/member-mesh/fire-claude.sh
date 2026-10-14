@@ -509,8 +509,8 @@ fi
 # PIN THE MODEL (sprout, 2026-10-14; dp: "pinned to fleet-defined model, currently opus-5-5").
 # This call passed no --model, so a wake ran on whatever the interactive Claude Code default
 # was that day. hub-watch.sh had the same gap and dead-lettered its notices `quota-paused`
-# when that default ran out of credits; Legion's launchers drifted from fable-5-1 to
-# "unknown" the same way (private-context legion/pin-claude-model.sh). Same knob shape as
+# when that default ran out of credits; another seat's unpinned launchers drifted from
+# fable-5-1 to "unknown" the same way. Same knob shape as
 # hub-watch's HUB_WATCH_MODEL: unset -> the fleet model; set to empty -> no --model (the CLI
 # default, the old behaviour); set to a model id -> that model.
 FIRE_CLAUDE_MODEL="${HESTIA_FIRE_CLAUDE_MODEL-claude-opus-5-5}"
