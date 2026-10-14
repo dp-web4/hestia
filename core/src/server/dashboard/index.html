@@ -946,6 +946,10 @@
      guard (line ~640); this rule was omitted and the banner was in fact permanently visible —
      only noticeable once it had a reason to appear. */
   .esc-banner[hidden] { display: none; }
+  /* Peer-routed only: present, not alarming (the peers decide first). */
+  .esc-banner.esc-banner-quiet { background: transparent; border-color: var(--border); color: var(--fg-dim); }
+  .esc-banner.esc-banner-quiet .esc-dot { background: var(--fg-dim); animation: none; }
+  .esc-banner.esc-banner-quiet .esc-banner-btn { background: var(--border); color: var(--fg); }
   .esc-banner { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; padding: 0.5rem 0.8rem;
     background: #ff7a6618; border: 1px solid var(--coral); border-radius: 6px; color: var(--coral); font-size: 0.82rem; }
   .esc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--coral); flex: none; animation: escpulse 2s ease-in-out infinite; }
@@ -3590,11 +3594,27 @@
     // NOT-SAME peer and are shown here read-only with the operator's OVERRIDE.
     const mine = pend.filter(r => scopeAwaitsOperator(r));
     const banner = $('scope-banner');
-    banner.hidden = mine.length === 0;
+    // THE BANNER IS THE ONLY DOOR TO THE DECIDE CONTROL ON THE MAIN VIEW (dp, 2026-10-13: "there is
+    // still no way to rule an escalation or scope request as standing/one time/live - that i can
+    // see"). It used to appear only for requests NO peer can clear; every gate-opened request
+    // invites peers, so on 10-13 every request was peer-routed, the banner never showed, and
+    // requests sat 8 h with no peer deciding and no sign to the operator. Routing is unchanged:
+    // peer-routed requests are still the peers to decide and the operator controls are an
+    // override -- but the operator is told they exist, quietly, with the age of the oldest.
+    banner.hidden = pend.length === 0;
+    banner.classList?.toggle('esc-banner-quiet', mine.length === 0 && pend.length > 0);
     if (mine.length) {
       const n = mine.length;
+      const peer = pend.length - n;
       $('scope-banner-text').textContent =
-        `${n} scope request${n > 1 ? 's' : ''} no peer can clear — awaiting your decision`;
+        `${n} scope request${n > 1 ? 's' : ''} awaiting your decision (no peer can clear it, or no peer ruled in time)`
+        + (peer ? ` (+${peer} with peers)` : '');
+    } else if (pend.length) {
+      const n = pend.length;
+      const oldest = Math.min(...pend.map(r => Number(r.requested_at) || Date.now() / 1000));
+      const age = escFmtAge(Math.max(0, Math.floor(Date.now() / 1000 - oldest)));
+      $('scope-banner-text').textContent =
+        `${n} scope request${n > 1 ? 's' : ''} with peers to decide (oldest ${age}) — you may override`;
     }
     $('scope-count').textContent = pend.length ? `${pend.length} pending` : '';
 
@@ -3771,12 +3791,20 @@
   // tools/dashboard_scope_decide_contract_test.py, which also runs them under node) ----
   // dp, 2026-10-05: a gate-opened request from a proven asker is decided by a NOT-SAME PEER;
   // only one no peer can clear (no invited peer) awaits the operator.
+  // dp, 2026-10-13: "escalate to me after a timeout". The daemon says whose queue a request is
+  // in (`decided_by_default`, which turns "operator" once the peer window lapses); an older
+  // daemon without the field falls back to the routing rule.
   function scopeAwaitsOperator(r) {
+    if (r && typeof r.decided_by_default === 'string') return r.decided_by_default !== 'peer';
     return !(r && r.origin === 'gate_deny' && Array.isArray(r.invited_peers)
              && r.invited_peers.length > 0);
   }
 
   function scopeRouteText(r) {
+    if (r && r.peer_window_lapsed) {
+      const mins = Math.round(Number(r.peer_window_secs || 0) / 60);
+      return `no invited peer (${(r.invited_peers || []).map(p => escapeHtml(String(p))).join(', ')}) ruled within ${mins} min — ESCALATED to you; a peer may still decide`;
+    }
     if (scopeAwaitsOperator(r)) {
       return 'no NOT-SAME peer can clear this (unproven asker, or no admissible peer) — it is yours to decide';
     }

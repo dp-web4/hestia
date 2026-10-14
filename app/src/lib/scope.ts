@@ -12,8 +12,11 @@ export type ScopeDuration = "once" | "session" | "standing";
  * invited peers awaits a NOT-SAME peer; only a request no peer can clear awaits the operator.
  */
 export function scopeAwaitsOperator(
-  req: Pick<PendingScopeRequest, "origin" | "invited_peers">,
+  req: Pick<PendingScopeRequest, "origin" | "invited_peers"> & { decided_by_default?: string },
 ): boolean {
+  // dp, 2026-10-13: "escalate to me after a timeout" -- the daemon turns `decided_by_default`
+  // to "operator" once the peer window lapses; an older daemon falls back to the routing rule.
+  if (typeof req.decided_by_default === "string") return req.decided_by_default !== "peer";
   return !(req.origin === "gate_deny" && (req.invited_peers?.length ?? 0) > 0);
 }
 
