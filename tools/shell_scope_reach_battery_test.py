@@ -962,12 +962,16 @@ def run(fx: Fixture) -> dict:
         # there — the verdict a seat acts on, not only the helper.
         for name, cmd in deny:
             ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
-            check(f"evaluate-denies:{name}", ve.blocks and ve.rule in ("mrh.command", "egress.secret"),
+            check(f"evaluate-denies:{name}", ve.blocks and ve.rule in (
+                      "mrh.command", "mrh.command.unenumerated", "egress.secret"),
                   f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}")
+        # hestia#1313 (dp, 2026-10-14): an unenumerable reach is refused under its own rule, which
+        # does not escalate (no scope request is opened). The target still names the sentinel.
+        unenum_rule = "mrh.command.unenumerated" if "mrh.command.unenumerated" in G.REMEDIES else "mrh.command"
         for name, cmd in request:
             ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
             check(f"evaluate-requests:{name}",
-                  ve.blocks and ve.rule == "mrh.command" and getattr(ve, "target", "") == UNENUM,
+                  ve.blocks and ve.rule == unenum_rule and getattr(ve, "target", "") == UNENUM,
                   f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}/{getattr(ve, 'target', None)}")
         # Parity on the deny side: every absolute deny target is also refused to Read.
         for name, cmd in deny:
