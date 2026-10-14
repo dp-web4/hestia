@@ -173,6 +173,100 @@ pub struct ScopeRequest {
     /// facts, and the member's `hestia_scope_status` must be able to say which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked: Option<ScopeRevocation>,
+    /// What 2026-10-05 added: the gate-opened origin, the one-time answer, and the breadth the
+    /// operator chose. One struct so every existing construction stays a one-line default.
+    #[serde(default)]
+    pub ext: ScopeRequestExt,
+}
+
+/// The fields a GATE-OPENED scope request carries, and the operator's answer shape.
+///
+/// dp, 2026-10-05: *"yes on gate gap, let's fix it. escalation should allow standing grants (i
+/// recall it being discussed but it's not implemented that i can see)."* It was discussed:
+/// PRD_ALLOWLISTS §5 — *"on denial escalation, the operator should have the choice of expansion
+/// being one-time, session, or member-permanent."* An `mrh.path` / `mrh.command` refusal used to
+/// be a plain deny: nothing reached the operator unless the member chose to file. Now the gate
+/// asks `hestia_scope_claim`, which opens a request in THIS store (not a new one) carrying what
+/// was refused, and the operator answers with one of the three durations — and, for session and
+/// standing, the breadth.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScopeRequestExt {
+    /// `Some` when the gate opened this request on a refusal; `None` when the member filed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateDenyOrigin>,
+    /// The operator answered ONE-TIME: this exact act (`gate.act_digest`), once, inside the
+    /// claim window. Never a live grant: it is not served in `live_grants`, so no snapshot
+    /// carries it; only `hestia_scope_claim` can spend it.
+    #[serde(default)]
+    pub once: bool,
+    /// When the one-time approval was spent. A spent approval permits nothing more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spent_at: Option<u64>,
+    /// The breadth the operator granted, when it differs from the asked path: the asked path or
+    /// an ANCESTOR of it (always recursive then — an exact grant on an ancestor would not reach
+    /// the asked path). `None` = exactly the asked path. The asked path is never rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_path: Option<String>,
+    /// RESERVE / COMMIT (Codex re-review of #1232, P2): the gate's operation key holding this
+    /// one-time approval while the act's final evidence is recorded. A reservation is released
+    /// (the act was denied), committed (the act was permitted), or — if neither arrives before
+    /// `reserved_until` — it LAPSES INTO SPENT: an outcome nobody reported is treated as an act
+    /// that may have run, so the approval can never be spent twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_until: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<u64>,
+    /// dp, 2026-10-05: *"scope escalations should go to peers not to me."* The NOT-SAME peers
+    /// invited to rule a gate-opened request (mesh `review_request` notices).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invited_peers: Vec<String>,
+    /// For a request a PEER decided: `{"arbiter", "asker", "asker_basis", "independence"}` — the
+    /// NOT-SAME basis the ruling rested on. `None` for an operator ruling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_basis: Option<serde_json::Value>,
+}
+
+impl ScopeRequestExt {
+    /// A reservation that is neither released nor committed.
+    pub fn reservation_open(&self) -> bool {
+        self.reserved_by.is_some() && self.released_at.is_none() && self.spent_at.is_none()
+    }
+
+    /// An open reservation past its deadline: consumed (see `reserved_by`).
+    pub fn reservation_lapsed(&self, now: u64) -> bool {
+        self.reservation_open() && self.reserved_until.is_some_and(|t| now >= t)
+    }
+}
+
+/// What the gate knew when it opened a request: the refusal it is answering.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateDenyOrigin {
+    /// `mrh.path` | `mrh.command`.
+    pub rule: String,
+    pub tool: String,
+    /// The attempted act as the gate rendered it (masked, truncated at the gate). This is what
+    /// the operator rules on — not a rationale: the member did not choose to ask.
+    pub act: String,
+    /// sha256 over `tool \x1f act`: a one-time approval is spent only by the act it was shown.
+    pub act_digest: String,
+    /// sha256 over `"hestia:scope-request-key" \x1f member \x1f path` — re-issues find this row.
+    pub request_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
+    /// The refused reach was a glob over this directory (`dir/*`): only a recursive grant
+    /// covers it, and the operator is told so.
+    #[serde(default)]
+    pub subtree: bool,
+    /// How many times the member re-issued the refused act while this was pending.
+    #[serde(default)]
+    pub reissues: u32,
+    /// Whether the asker was resolved from a live session (`session`) or asserted. NOT-SAME
+    /// peers may rule only a PROVEN asker's request (`arbiter::eligibility_for` clause 0); an
+    /// asserted asker's request is the operator's. Rows written before this field are asserted.
+    #[serde(default)]
+    pub asker_basis: crate::arbiter::AskerBasis,
 }
 
 /// What a retirement actually removed, by channel.
@@ -200,7 +294,27 @@ impl ScopeRequest {
     /// inline now asks this, so a revocation cannot be honoured in one place and missed in
     /// another.
     pub fn is_live(&self, now: u64) -> bool {
-        self.granted == Some(true) && now < self.expires_at && self.revoked.is_none()
+        // A ONE-TIME approval is not a grant of reach: it is spent by one act through
+        // `hestia_scope_claim`, and must never ride a policy snapshot (where every act in the
+        // window would pass). PRD_ALLOWLISTS §5.2: "no code path for session or permanent calls
+        // the claim verb" — and, the converse, no one-time answer is served as policy.
+        self.granted == Some(true) && now < self.expires_at && self.revoked.is_none() && !self.ext.once
+    }
+
+    /// The path a live grant reaches from: the operator's chosen breadth, else the asked path.
+    pub fn reach_path(&self) -> &str {
+        self.ext.granted_path.as_deref().unwrap_or(&self.path)
+    }
+
+    /// A one-time approval that can still be spent: approved, not spent, not revoked, inside
+    /// its claim window (`expires_at` is set to decided_at + the claim window at decide time).
+    pub fn once_spendable(&self, now: u64) -> bool {
+        self.ext.once
+            && self.granted == Some(true)
+            && self.ext.spent_at.is_none()
+            && !self.ext.reservation_open()
+            && self.revoked.is_none()
+            && now < self.expires_at
     }
 
     /// Live = granted, and not past its window. A refused or expired request grants nothing,
@@ -209,7 +323,7 @@ impl ScopeRequest {
     /// recursive — the same rule the standing store uses, so the two channels agree.
     pub fn grants(&self, path: &str, now: u64) -> bool {
         self.is_live(now)
-            && crate::server::standing_scope::covers_path(&self.path, self.recursive, path)
+            && crate::server::standing_scope::covers_path(self.reach_path(), self.recursive, path)
     }
 
     /// One word for the whole record. `expires_at` means the same thing in both phases — the
@@ -220,6 +334,12 @@ impl ScopeRequest {
     pub fn status(&self, now: u64) -> &'static str {
         if self.revoked.is_some() {
             return "revoked";
+        }
+        if self.ext.once && (self.ext.spent_at.is_some() || self.ext.reservation_lapsed(now)) {
+            return "spent";
+        }
+        if self.ext.once && self.ext.reservation_open() {
+            return "reserved";
         }
         match self.granted {
             Some(true) if now < self.expires_at => "granted",
@@ -546,6 +666,102 @@ pub fn normalize_scope_path(path: &str) -> String {
         format!("/{joined}")
     } else {
         joined
+    }
+}
+
+/// The "path" of a scope request for an act whose reach the gate could NOT ENUMERATE (dp,
+/// 2026-10-10, #1232 narrowed): #1274's sentinel (`gate_escalation::UNPRICEABLE_PREFIX` +
+/// `unenumerated` | `overflow`), keyed on the act by `#` and the first 16 hex of its complete-act
+/// digest — `hestia:unpriceable:unenumerated#0123456789abcdef`. Nothing an expansion produces is
+/// modelled any more, so a command whose reach depends on one names no path at all; the gate asks
+/// for THE ACT instead. Such a request can be granted ONCE (that act, exactly) or refused —
+/// never for a session or standing, because there is no path a grant could name. Returns the
+/// canonical spelling, or `None` for anything else (a real path is `normalize_scope_path`'s).
+pub fn unpriceable_scope_path(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let rest = t.strip_prefix(crate::server::gate_escalation::UNPRICEABLE_PREFIX)?;
+    let (class, key) = rest.split_once('#')?;
+    if !matches!(class, "unenumerated" | "overflow") {
+        return None;
+    }
+    if key.len() != 16 || !key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// Whether a scope request's path is an UNENUMERATED act (see `unpriceable_scope_path`).
+pub fn is_unpriceable_scope_path(path: &str) -> bool {
+    unpriceable_scope_path(path).is_some()
+}
+
+/// The ruling KINDS a pending scope request can take: `once` (this act, exactly), `session`
+/// (memory-only, expires), `standing` (vault), `refuse`.
+pub const SCOPE_DECISION_KINDS: [&str; 4] = ["once", "session", "standing", "refuse"];
+
+/// Which kind a decide body asks for. A refusal is `refuse` whatever else it carries; the
+/// decide endpoint rejects the malformed combinations (once+standing, a standing refusal) on
+/// their own terms before this matters.
+pub fn scope_decision_kind(granted: bool, once: bool, standing: bool) -> &'static str {
+    match (granted, once, standing) {
+        (false, _, _) => "refuse",
+        (true, true, _) => "once",
+        (true, false, true) => "standing",
+        (true, false, false) => "session",
+    }
+}
+
+/// THE decisions a pending scope request accepts (#1287 part 2) — the one source both the decide
+/// endpoint's refusal and every operator surface's offer read, so the UI cannot offer a ruling
+/// the endpoint then refuses after the click.
+///
+/// * `once` only when the GATE opened the request: it binds to the act the gate refused, and a
+///   member-filed ask names no act.
+/// * `session` and `standing` only when the request names a PATH: an act whose reach the gate
+///   could not enumerate (`is_unpriceable_scope_path`, #1232) names none a grant could reach.
+/// * `refuse` always.
+///
+/// Order is `SCOPE_DECISION_KINDS` order, so surfaces can render it as given.
+pub fn scope_allowed_decisions(path: &str, gate_act: bool) -> Vec<&'static str> {
+    let enumerable = !is_unpriceable_scope_path(path);
+    SCOPE_DECISION_KINDS
+        .into_iter()
+        .filter(|k| match *k {
+            "once" => gate_act,
+            "session" | "standing" => enumerable,
+            _ => true,
+        })
+        .collect()
+}
+
+/// How long a peer-routed scope request waits for a NOT-SAME peer before it ESCALATES to the
+/// operator (dp, 2026-10-13: "escalate to me after a timeout"). On 10-13 every gate-opened
+/// request invited peers (codex, kimi-code), none ruled, and requests sat 8 h unseen. Default
+/// 30 min; `HESTIA_SCOPE_PEER_WINDOW_SECS` overrides it.
+pub const SCOPE_PEER_WINDOW_SECS_DEFAULT: u64 = 1800;
+
+pub fn scope_peer_window_secs() -> u64 {
+    std::env::var("HESTIA_SCOPE_PEER_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(SCOPE_PEER_WINDOW_SECS_DEFAULT)
+}
+
+/// Who a pending scope request is waiting on, and whether its peer window has lapsed.
+/// Authority does not change: peers may still decide after the window, and the operator could
+/// always override. What changes is whose queue it is in -- after the window it is the
+/// operator's, and the surfaces show it as awaiting the operator.
+/// Returns `("peer", false)` inside the window, `("operator", true)` once it has lapsed, and
+/// `("operator", false)` for a request no peer was invited to (it was always the operator's).
+pub fn scope_decided_by(gate_opened: bool, invited_peers: usize, requested_at: u64, now: u64,
+                        window_secs: u64) -> (&'static str, bool) {
+    if !(gate_opened && invited_peers > 0) {
+        return ("operator", false);
+    }
+    if now.saturating_sub(requested_at) >= window_secs {
+        ("operator", true)
+    } else {
+        ("peer", false)
     }
 }
 
@@ -2829,5 +3045,25 @@ mod tests {
             .find(|e| e.hash == intent_hash)
             .expect("the intent must be on the chain");
         assert_eq!(intent.event_data["plugin_id"].as_str(), Some("codex"));
+    }
+}
+
+#[cfg(test)]
+mod scope_peer_window_tests {
+    use super::scope_decided_by;
+
+    #[test]
+    fn a_peer_routed_request_escalates_to_the_operator_when_the_window_lapses() {
+        // invited peers, inside the window: the peers' queue
+        assert_eq!(scope_decided_by(true, 2, 1_000, 1_000 + 1_799, 1_800), ("peer", false));
+        // exactly at the window and after: escalated to the operator
+        assert_eq!(scope_decided_by(true, 2, 1_000, 1_000 + 1_800, 1_800), ("operator", true));
+        assert_eq!(scope_decided_by(true, 2, 1_000, 1_000 + 29_000, 1_800), ("operator", true));
+    }
+
+    #[test]
+    fn a_request_no_peer_was_invited_to_was_always_the_operators() {
+        assert_eq!(scope_decided_by(true, 0, 1_000, 1_001, 1_800), ("operator", false));
+        assert_eq!(scope_decided_by(false, 3, 1_000, 1_001, 1_800), ("operator", false));
     }
 }

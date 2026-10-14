@@ -5,6 +5,7 @@
 
 mod agents;
 pub mod adjudicator;
+pub mod api_version;
 mod dashboard;
 pub mod decision_witness;
 pub mod evidence;

@@ -16,7 +16,9 @@ WHAT IT DOES, in the order a host lives it:
      `serve` on a free loopback port that is never 7711) whose HOME is the fake one. The daemon
      binary must be built from the CANDIDATE (--daemon-bin): one cycle of the timer swaps the
      binary first and installs the members' surface second, and this harness simulates the cycle
-     after the swap. Seat projections come from the real seeder, which install-members.sh runs.
+     after the swap. Seat projections come from the real seeder. A `cargo` stub that refuses sits
+     first on the deploy's PATH, so a cycle that misreads the current binary as stale fails fast
+     and by name instead of building.
   1. PREVIOUS (default: the latest release tag; --previous REF or --previous-back N for
      origin/main~N). A local bare "origin" whose `main` is PREVIOUS; the deploy checkout and web4
      sibling cloned from it the way deploy/from-main/README.md says; the PREVIOUS
@@ -33,8 +35,8 @@ WHAT IT DOES, in the order a host lives it:
      arm: preflight, then the members' install. That arm is the one that printed HALF-DEPLOYED
      across the fleet.
   3. ASSERT
-       a. the cycle exits 0 and its log carries no HALF-DEPLOYED / REFUSED; the manifest's
-          build_id is the candidate;
+       a. the cycle exits 0 and its log carries no HALF-DEPLOYED / REFUSED; the manifest names
+          the candidate COMMIT (head_sha, and a build_id that resolves to it at any abbreviation);
        b. per registered member: the file its registration invokes is byte-identical to the
           candidate's gate, and run under its REGISTERED command line (the shell assignments on
           the line, plus what the harness itself supplies: Claude Code's settings.json `env`
@@ -43,7 +45,23 @@ WHAT IT DOES, in the order a host lives it:
           declared deploy-hold probe re-aimed at its own installed gate (a write to the thing
           that governs it: gate-self-access);
        c. a second cycle is a no-op: exit 0, `CURRENT`, and the installed surface (harness
-          configs, installed hooks, engine link, manifest, projections) byte-identical.
+          configs, installed hooks, identity seeds, engine link, manifest, projections)
+          byte-identical;
+       d. nothing dialled the live daemon's port;
+       e. (#1250, build ids) still a no-op when the deploy checkout spells every commit at another
+          abbreviation length -- what a different clone, or this one after enough objects, does.
+
+FRESH-HOST ARM (#1250). A machine that has never run the members' install installs the CANDIDATE
+exactly as deploy/from-main/README.md says -- clone, install the script, arm the timer -- and the
+timer's FIRST cycle must deploy. Until #1250 it refused: the preflight probes every gate under its
+seat projection, and the projections were written only by the install the preflight guarded.
+  f1. the first cycle is DEPLOYED (preflight passed, members' install ran, manifest = candidate);
+  f2. every installed harness has its seat projection under $HESTIA_HOME/seats;
+  f3. every member that ships an identity seed has it where its hydrate hook reads it;
+  f4. the installed gates allow the benign read and deny their own self-write (as b.);
+  f5. the second cycle is a no-op (as c.); f6. and stays one re-spelled (as e.); f7. as d.
+The README's `--preflight` ("before you arm") verdict is reported, not asserted: it writes
+nothing, so on an unseeded box it probes the seats unbacked. `--arms upgrade|fresh` runs one arm.
 
 WHAT IT DELIBERATELY DOES NOT DO: build a daemon (pass one), restart anything (the unit name is
 one no systemd knows, the restart command is `false`), reach the network (every remote is a local
@@ -64,6 +82,7 @@ tools/upgrade_path_plumbing_test.py.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import importlib.util
 import json
@@ -130,11 +149,27 @@ if _PORT:
 """
 
 
+#: The harness homes a simulated box carries (dir -> its config file and an empty-ish body): every
+#: harness installed, hestia not yet. `--without-harness DIR` leaves one out, to ask what a host
+#: that runs only some of them sees.
+HARNESSES = {
+    ".claude": ("settings.json", "{}\n"),
+    ".codex": ("config.toml", 'model = "sim"\n'),
+    ".kimi-code": ("config.toml", 'default_model = "sim"\n'),
+    ".gemini": ("settings.json", "{}\n"),
+}
+
+
 class SetupError(Exception):
     """The simulation could not be built. Not a verdict on the candidate."""
 
 
 # ------------------------------------------------------------------ pure helpers --------------
+# ONLY RELEASE TAGS NAME A BUILD (web4#904): the glob core/build.rs, hestia-deploy.sh
+# (BUILD_TAG_MATCH) and the member-mesh watcher describe with. app-v* tags are the app's.
+BUILD_TAG_MATCH = "v[0-9]*"
+
+
 def describe_hash_len(describe: str) -> int | None:
     """The abbreviated-sha length in a `git describe` string (`v0.0.4-968-ga7e33bc4` -> 8)."""
     m = re.search(r"-g([0-9a-f]{4,40})(?:-dirty)?$", describe.strip())
@@ -142,6 +177,38 @@ def describe_hash_len(describe: str) -> int | None:
         return len(m.group(1))
     m = re.fullmatch(r"([0-9a-f]{4,40})", describe.strip())
     return len(m.group(1)) if m else None
+
+
+def describe_hex(describe: str) -> str | None:
+    """The abbreviated sha a `git describe` string names (`v0.0.4-968-ga7e33bc4` -> `a7e33bc4`)."""
+    m = re.search(r"-g([0-9a-f]{4,40})(?:-dirty)?$", describe.strip())
+    if m:
+        return m.group(1)
+    m = re.fullmatch(r"([0-9a-f]{4,40})", describe.strip())
+    return m.group(1) if m else None
+
+
+def names_commit(describe: str, full_sha: str, repo: Path | None = None) -> bool:
+    """Whether a describe string names this commit, at whatever abbreviation length (#1250: the
+    length is a property of the clone, not of the commit). Never true for a -dirty build.
+
+    An EXACT-TAG describe (`v0.0.5`: what `git describe --tags --match 'v[0-9]*' --always` prints at a tagged
+    commit) carries no sha, so it is resolved in `repo` and must peel to this commit (Codex
+    notice 20534: without this a correctly built tagged candidate was refused). Without a repo
+    to resolve it in, a tag names nothing."""
+    describe = (describe or "").strip()
+    if not describe or describe.endswith("-dirty"):
+        return False
+    hexed = describe_hex(describe)
+    if hexed and len(hexed) >= 7 and full_sha.startswith(hexed):
+        return True
+    if repo is None or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/+-]*", describe):
+        return False
+    if not fnmatch.fnmatchcase(describe, BUILD_TAG_MATCH):
+        return False   # no producer emits a bare non-release tag (app-v*): it names no build
+    out = subprocess.run(["git", "-C", str(repo), "rev-parse", "-q", "--verify",
+                          f"refs/tags/{describe}^{{commit}}"], capture_output=True, text=True)
+    return out.returncode == 0 and out.stdout.strip() == full_sha
 
 
 def describe_of_version(line: str) -> str:
@@ -250,9 +317,9 @@ SELF_WRITE_REASON = re.compile(r"gate-self|governance surface|self-access", re.I
 #: an OPEN, separately tracked hole does not mask the upgrade-path signal this test exists for
 #: (a red that is always red hides the next red). A RATCHET, not an excuse: when the gate starts
 #: denying for the law, the entry is stale and the run fails until it is removed.
-KNOWN_SELF_WRITE_HOLES = {
-    "gemini": "#928 (the closure floor names neither .gemini/settings.json nor before_tool.py)",
-}
+#: Emptied by #1247 (2026-10-11): the gate now prices a write to any REGISTERED gate path, so
+#: gemini denies its own self-write and the ratchet fired on that PR's run.
+KNOWN_SELF_WRITE_HOLES: dict = {}
 
 
 def deny_is_for_the_law(said: str) -> bool:
@@ -307,7 +374,7 @@ def resolve_ref(repo: Path, ref: str) -> str:
 def latest_release_tag(repo: Path, of: str) -> str:
     """The newest `v*` release tag reachable from `of` (app-v* tags are the app's, not hestia's)."""
     out = subprocess.run(["git", "-C", str(repo), "describe", "--tags", "--abbrev=0",
-                          "--match", "v[0-9]*", of], capture_output=True, text=True)
+                          "--match", BUILD_TAG_MATCH, of], capture_output=True, text=True)
     if out.returncode != 0:
         raise SetupError(f"no v* release tag reachable from {of}: {last_line(out.stderr)}")
     return out.stdout.strip()
@@ -334,7 +401,9 @@ def load_module(path: Path, name: str):
 
 # ------------------------------------------------------------------ the simulated machine -----
 class Machine:
-    def __init__(self, root: Path, source: Path, daemon_bin: Path, verbose: bool = False):
+    def __init__(self, root: Path, source: Path, daemon_bin: Path, verbose: bool = False,
+                 without: Iterable[str] = ()):
+        self.without = set(without)
         self.root = root
         self.source = source
         self.daemon_bin = daemon_bin
@@ -442,18 +511,25 @@ class Machine:
         self.install_guard()
         for d in (self.home, self.workspace, self.scratch_dir, self.origin, self.home / ".local" / "bin"):
             d.mkdir(parents=True, exist_ok=True)
-        (self.home / ".claude").mkdir()
-        (self.home / ".claude" / "settings.json").write_text("{}\n")
-        (self.home / ".codex").mkdir()
-        (self.home / ".codex" / "config.toml").write_text('model = "sim"\n')
-        (self.home / ".kimi-code").mkdir()
-        (self.home / ".kimi-code" / "config.toml").write_text('default_model = "sim"\n')
-        (self.home / ".gemini").mkdir()
-        (self.home / ".gemini" / "settings.json").write_text("{}\n")
+        for harness, (config, body) in HARNESSES.items():
+            if harness in self.without:
+                continue
+            (self.home / harness).mkdir()
+            (self.home / harness / config).write_text(body)
         # A git identity for the throwaway repos, in the fake HOME (never the operator's).
         (self.home / ".gitconfig").write_text(
             "[user]\n\tname = upgrade-path-sim\n\temail = sim@invalid\n[init]\n\tdefaultBranch = main\n")
         self.hestia_home.mkdir(mode=0o700)
+        # A cargo that refuses (#1250): every cycle here runs against a daemon already built from
+        # the candidate, so a cycle that decides to BUILD has misread a current binary as stale --
+        # the unstable-build-id class. hestia-deploy puts $HOME/.cargo/bin first on PATH, so this
+        # wins over the real toolchain, and the misreading is a fast, named failure instead of a
+        # cold build inside the simulation.
+        stub = self.home / ".cargo" / "bin" / "cargo"
+        stub.parent.mkdir(parents=True)
+        stub.write_text("#!/bin/sh\necho 'upgrade-path: the deploy tried to BUILD; the daemon is already "
+                        "the candidate, so it misread a current binary as stale' >&2\nexit 97\n")
+        stub.chmod(0o755)
 
     def start_daemon(self) -> str:
         if self.port == LIVE_PORT:
@@ -538,8 +614,8 @@ class Machine:
         self.git("-C", str(self.deploy_root / "hestia"), "config", "core.abbrev", str(length))
 
     def origin_describe(self, length: int) -> str:
-        return self.git("-C", str(self.origin / "hestia.git"), "describe", "--tags", "--always",
-                        f"--abbrev={length}", "main")
+        return self.git("-C", str(self.origin / "hestia.git"), "describe", "--tags",
+                        "--match", BUILD_TAG_MATCH, "--always", f"--abbrev={length}", "main")
 
     # -- the scripts under test ---------------------------------------------------------------
     def deploy_log_offset(self) -> int:
@@ -573,6 +649,7 @@ class Machine:
                 h / ".codex" / "config.toml", h / ".codex" / "hooks",
                 h / ".kimi-code" / "config.toml", h / ".kimi-code" / "hooks",
                 h / ".gemini" / "settings.json", h / ".gemini" / "hestia-plugins",
+                h / ".codex" / "instance", h / ".kimi-code" / "instance",
                 self.hestia_home / "shared", self.hestia_home / "shared.builds",
                 self.hestia_home / "current-build.json", self.hestia_home / "seats",
                 h / ".profile", h / ".local" / "bin" / "hestia-deploy"]
@@ -613,6 +690,10 @@ class Machine:
             row: dict[str, Any] = {"member": member}
             rows.append(row)
             reg_path = self.home.joinpath(*reg["path"])
+            if not (self.home / reg["path"][0]).is_dir():
+                # The harness is not on this box (--without-harness): nothing to install or probe.
+                row.update(status="absent", reason="harness not on this box")
+                continue
             if not reg_path.exists():
                 row.update(status="FAIL", reason=f"no registration file {reg_path.name}")
                 continue
@@ -676,6 +757,323 @@ class Machine:
         return rows
 
 
+# ------------------------------------------------------------------ shared checks -------------
+def expected_seats(m: Machine, tree: Path) -> list[str]:
+    """The seat projections a host must have after installing `tree`: one per member whose harness
+    home exists here, keyed by the SEAT id (`install.member`: kimi's plugin dir is `kimi`, its
+    seat is `kimi-code`) -- the same rule tools/seed_seat_config.py seeds by."""
+    seats = []
+    for expects in sorted((tree / "plugins").glob("*/expects.json")):
+        install = json.loads(expects.read_text()).get("install") or {}
+        reg = (install.get("registration") or {}).get("path") or []
+        if install.get("member") and reg and (m.home / reg[0]).is_dir():
+            seats.append(install["member"])
+    return seats
+
+
+def seed_location(files: list[dict]) -> Path:
+    """Where hydrate's fallback (`$(dirname "$0")/..`) finds the seed: beside the INSTALLED
+    hydrate.sh when the member has one, else beside its first installed file -- the installer's
+    own anchor rule (Codex notice 20534: registrations are derived per file, so a gate and hydrate
+    can live in different directories, and checking beside the gate judged the wrong place)."""
+    chosen = next((f for f in files if Path(f.get("path", "")).name == "hydrate.sh"), files[0])
+    return Path(chosen["path"]).parent.parent / "instance" / "identity.seed.json"
+
+
+def seed_findings(m: Machine, tree: Path) -> tuple[list[dict], list[str]]:
+    """Per member that SHIPS an identity seed: is it on the host where its hooks look for it?
+
+    The hydrate hooks read `${<X>_PLUGIN_ROOT:-$(dirname "$0")/..}/instance/identity.seed.json`,
+    so the place is the parent of the directory the installed hooks run from -- read from the
+    manifest's recorded paths (where the bytes actually went), never from a declared dest."""
+    rows: list[dict] = []
+    problems: list[str] = []
+    try:
+        manifest = json.loads((m.hestia_home / "current-build.json").read_text())
+    except (OSError, ValueError):
+        manifest = {}
+    installed = {row.get("member"): row for row in manifest.get("members") or [] if isinstance(row, dict)}
+    for seed in sorted((tree / "plugins").glob("*/instance/identity.seed.json")):
+        member = seed.parent.parent.name
+        reg = ((json.loads((seed.parent.parent / "expects.json").read_text()).get("install") or {})
+               .get("registration") or {}).get("path") or []
+        if reg and not (m.home / reg[0]).is_dir():
+            rows.append({"member": member, "status": "absent"})
+            continue
+        row = installed.get(member)
+        files = (row or {}).get("files") or []
+        if not files:
+            rows.append({"member": member, "status": "FAIL", "reason": "member not installed"})
+            problems.append(f"{member}: not installed, so no seed location")
+            continue
+        where = seed_location(files)
+        present = where.is_file()
+        rows.append({"member": member, "status": "ok" if present else "FAIL",
+                     "path": str(where).replace(str(m.home), "~")})
+        if not present:
+            problems.append(f"{member}: no identity seed at {str(where).replace(str(m.home), '~')}")
+    return rows, problems
+
+
+def log_gates(m: Machine, rows: list[dict], failures: list[str], label: str) -> None:
+    for row in rows:
+        def said(probe: str) -> str:
+            denied = (row.get(probe) or {}).get("denied")
+            return "-" if denied is None else "deny" if denied else "allow"
+        m.log(f"gate {row['member']:12} {row['status']:4} "
+              f"read={said('allow')} self-write={said('deny')} "
+              f"candidate-bytes={row.get('installed_is_candidate')}"
+              + (f"  -- {row['reason']}" if row.get("reason") else ""))
+        if row["status"] not in ("ok", "known-open", "absent"):
+            failures.append(f"{label} {row['member']}: {row.get('reason')}")
+
+
+def noop_cycle(m: Machine, label: str, failures: list[str], logname: str) -> dict:
+    """One more timer cycle; it must be CURRENT and leave the installed surface byte-identical."""
+    before = snapshot(m.installed_surface())
+    rc, text = m.run_installed_deploy()
+    (m.root / logname).write_text(text)
+    after = snapshot(m.installed_surface())
+    cycle = classify_cycle(text, rc)
+    changed = snapshot_diff(before, after)
+    m.log(f"{label}: {cycle['outcome']} (rc={rc}), {len(changed)} installed file(s) changed")
+    for c in changed[:20]:
+        m.log(f"   | {c.replace(str(m.home), '~')}")
+    for ln in text.splitlines():
+        if any(w in ln for w in ("upgrade-path: the deploy tried to BUILD", "FAIL ", "build ")):
+            m.log(f"   | {ln}")
+    if cycle["outcome"] != "CURRENT" or changed:
+        failures.append(f"{label} was {cycle['outcome']} and changed {len(changed)} file(s), not a no-op")
+    return {**cycle, "changed": [c.replace(str(m.home), "~") for c in changed]}
+
+
+def abbrev_shift_cycle(m: Machine, length: int, label: str, failures: list[str], logname: str) -> dict:
+    """#1250 build ids: re-spell every commit in the deploy checkout at another abbreviation length
+    (what a different clone, or this clone after enough objects, does on its own) and run a cycle.
+    The binary and the manifest still name the same commit, so it must be a no-op -- not a rebuild
+    (the cargo stub refuses one) and not a manifest repair."""
+    shifted = min(length + 3, 40)
+    m.pin_abbrev(shifted)
+    m.log(f"{label}: deploy checkout re-spelled at --abbrev={shifted} (the binary and manifest say {length})")
+    try:
+        return {"abbrev": shifted, **noop_cycle(m, label, failures, logname)}
+    finally:
+        m.pin_abbrev(length)
+
+
+def make_machine(args: argparse.Namespace, source: Path, daemon_bin: Path, prefix: str) -> Machine:
+    parent = Path(args.workdir) if args.workdir else Path(tempfile.gettempdir())
+    # The scratch file must sit under a temp root the gate recognises (/tmp or /var/tmp; see
+    # hestia-deploy.sh's preflight), so the default workdir is /tmp, never a per-user TMPDIR.
+    if not args.workdir and not str(parent.resolve()).startswith(("/tmp", "/var/tmp")):
+        parent = Path("/tmp")
+    root = Path(tempfile.mkdtemp(prefix=prefix, dir=str(parent)))
+    m = Machine(root, source, daemon_bin, verbose=args.verbose, without=args.without_harness or ())
+    if m.home.resolve() == Path.home().resolve():
+        raise SetupError("the fake HOME resolved to the real one")
+    return m
+
+
+def finish_machine(args: argparse.Namespace, m: Machine, failures: list[str], label: str) -> list[str]:
+    m.stop_daemon()
+    attempts = m.live_port_attempts()
+    if attempts:
+        failures.append(f"{label} {len(attempts)} connection attempt(s) to 127.0.0.1:{LIVE_PORT} "
+                        "(blocked by the guard; the simulation is NOT isolated)")
+        for a in attempts[:10]:
+            m.log(f"   | {a}")
+    if not args.keep:
+        shutil.rmtree(m.root, ignore_errors=True)
+    else:
+        m.log(f"kept {m.root}")
+    return attempts
+
+
+# ------------------------------------------------------------------ arm 1: upgrade -------------
+def upgrade_arm(args: argparse.Namespace, source: Path, daemon_bin: Path, candidate: str,
+                previous_ref: str, previous: str, report: dict, failures: list[str]) -> None:
+    m = make_machine(args, source, daemon_bin, "hestia-upgrade-path-")
+    report["root"] = str(m.root)
+    m.log(f"UPGRADE ARM: previous={previous_ref} ({previous[:10]}) -> candidate={args.candidate} "
+          f"({candidate[:10]}), simulated machine at {m.root}")
+    try:
+        m.build_box()
+        daemon_describe = m.start_daemon()
+        length = describe_hash_len(daemon_describe) or 7
+        m.build_origins(previous)
+        m.install_deploy_checkout()
+        # The PREVIOUS release's script runs the first upgrade cycle, and it compares describe
+        # strings as strings, so its checkout must spell commits at the binary's length. (The
+        # candidate's script no longer needs this: see abbrev_shift_cycle.)
+        m.pin_abbrev(length)
+
+        # ---- 1. the previous release, installed as a fresh host installs it -----------------
+        rc, text = m.run_installed_deploy("--preflight")
+        verdict = next((ln.split("PREFLIGHT", 1)[1].strip() for ln in text.splitlines()
+                        if "PREFLIGHT" in ln), f"rc={rc}")
+        report["fresh_host_timer_preflight"] = verdict
+        m.log(f"previous: a fresh host's first timer cycle would preflight: {verdict} (informational; "
+              "the fresh-host arm below asserts the candidate)")
+        out = m.run_install_members()
+        report["previous_install_rc"] = out.returncode
+        (m.root / "previous-install.log").write_text(out.stdout + out.stderr)
+        if out.returncode != 0:
+            raise SetupError(f"the previous release's install-members.sh failed rc={out.returncode}: "
+                             f"{last_line(out.stderr) or last_line(out.stdout)}")
+        seats = sorted(p.name for p in (m.hestia_home / "seats").glob("*.env"))
+        m.log(f"previous: installed; manifest build_id="
+              f"{json.loads((m.hestia_home / 'current-build.json').read_text()).get('build_id')}; "
+              f"seat projections: {', '.join(seats) or 'NONE'}")
+        report["previous_seats"] = seats
+        m.check_projection_endpoints()
+
+        # ---- 2. the candidate, via the timer's path -------------------------------------------
+        m.move_main(candidate)
+        if not names_commit(daemon_describe, candidate, source):
+            raise SetupError(f"--daemon-bin describes itself as {daemon_describe!r}, which is not the "
+                             f"candidate {candidate[:12]}; build the daemon from the candidate")
+        target = m.origin_describe(length)
+        rc, text = m.run_installed_deploy()
+        (m.root / "upgrade-cycle.log").write_text(text)
+        cycle = classify_cycle(text, rc)
+        report["upgrade_cycle"] = cycle
+        m.log(f"upgrade cycle: {cycle['outcome']} (rc={rc})")
+        for ln in text.splitlines():
+            if any(w in ln for w in ("gate-preflight", "REFUSED", "HALF-DEPLOYED", "PREFLIGHT",
+                                     "WARN preflight", "manifest-repair", "self-updated", "seats:")):
+                m.log(f"   | {ln}")
+        # CURRENT is a full deploy only when there was nothing to install (previous == candidate's
+        # members' surface already); the manifest check below decides that.
+        if cycle["outcome"] not in ("DEPLOYED", "CURRENT"):
+            failures.append(f"a. upgrade cycle was {cycle['outcome']}, not a full deploy")
+        manifest = json.loads((m.hestia_home / "current-build.json").read_text())
+        report["manifest_build_id"] = manifest.get("build_id")
+        if not names_commit(manifest.get("build_id") or "", candidate, source) or manifest.get("head_sha") != candidate:
+            failures.append(f"a. manifest names {manifest.get('build_id')!r} / {str(manifest.get('head_sha'))[:12]}, "
+                            f"not the candidate {target!r}")
+
+        # ---- 3b. the installed gates, under their registered lines ----------------------------
+        scratch = m.scratch_dir / "probe"
+        scratch.write_text("")
+        cand_tree = m.deploy_root / "hestia"
+        rows = m.check_gates(cand_tree, scratch)
+        report["gates"] = rows
+        log_gates(m, rows, failures, "b.")
+        if any(r["status"] not in ("ok", "known-open") and r.get("installed_is_candidate") for r in rows):
+            # Informational: the same gates with the login profile's HESTIA_HOME. Separates "the
+            # registered line is missing the locator" from "the gate is broken".
+            for row in m.check_gates(cand_tree, scratch, with_login_home=True):
+                m.log(f"   (with ~/.profile's HESTIA_HOME) {row['member']:12} {row['status']}"
+                      + (f"  -- {row['reason']}" if row.get("reason") else ""))
+
+        # ---- 3c. the second cycle is a no-op (the candidate's script now: it self-updated) ------
+        report["second_cycle"] = noop_cycle(m, "c. second cycle", failures, "second-cycle.log")
+        # ---- 3e. ...and stays one when the checkout spells the commit differently (#1250) -------
+        report["abbrev_shift_cycle"] = abbrev_shift_cycle(m, length, "e. re-spelled cycle", failures,
+                                                          "abbrev-shift-cycle.log")
+    finally:
+        report["live_port_attempts"] = finish_machine(args, m, failures, "d.")
+
+
+# ------------------------------------------------------------------ arm 2: fresh host ----------
+def fresh_host_arm(args: argparse.Namespace, source: Path, daemon_bin: Path, candidate: str,
+                   report: dict, failures: list[str]) -> None:
+    """A machine that has NEVER run hestia's members' install installs the CANDIDATE the way
+    deploy/from-main/README.md says: clone, install the script, arm the timer -- and the timer's
+    first cycle must deploy (#1250: it refused, because the seat projections the preflight probes
+    under were written only by the install the preflight was guarding).
+
+    Asserted: f1 the first cycle deploys (preflight passes, members' install runs, manifest names
+    the candidate); f2 every installed harness has its seat projection; f3 every member that ships
+    an identity seed has it where its hooks read it; f4 the installed gates allow the benign read
+    and deny their own self-write under their registered lines; f5 the next cycle is a no-op; f6 it
+    stays a no-op when the checkout spells the commit at another abbreviation length."""
+    m = make_machine(args, source, daemon_bin, "hestia-fresh-host-")
+    report["root"] = str(m.root)
+    m.log(f"FRESH-HOST ARM: candidate={args.candidate} ({candidate[:10]}) installed from the timer, "
+          f"simulated machine at {m.root}")
+    try:
+        m.build_box()
+        daemon_describe = m.start_daemon()
+        length = describe_hash_len(daemon_describe) or 7
+        if not names_commit(daemon_describe, candidate, source):
+            raise SetupError(f"--daemon-bin describes itself as {daemon_describe!r}, which is not the "
+                             f"candidate {candidate[:12]}; build the daemon from the candidate")
+        m.build_origins(candidate)
+        m.install_deploy_checkout()
+        m.pin_abbrev(length)
+
+        # Informational: the README's "before you arm" check. It writes nothing, so on a box that
+        # has never been seeded it probes the seats unbacked.
+        rc, text = m.run_installed_deploy("--preflight")
+        verdict = next((ln.split("PREFLIGHT", 1)[1].strip() for ln in text.splitlines()
+                        if "PREFLIGHT" in ln), f"rc={rc}")
+        report["preflight_before_arming"] = verdict
+        m.log(f"--preflight before arming (informational): {verdict}")
+
+        # ---- f1. the first timer cycle ----------------------------------------------------------
+        rc, text = m.run_installed_deploy()
+        (m.root / "first-cycle.log").write_text(text)
+        cycle = classify_cycle(text, rc)
+        report["first_cycle"] = cycle
+        refused = [ln for ln in text.splitlines() if "REFUSED" in ln or "WARN preflight probe" in ln]
+        report["first_cycle_preflight"] = ("FAILED: " + refused[0].split("Z ", 1)[-1][:240]) if refused else "passed"
+        m.log(f"f1 first timer cycle: {cycle['outcome']} (rc={rc}); preflight {report['first_cycle_preflight']}")
+        for ln in text.splitlines():
+            if any(w in ln for w in ("gate-preflight", "REFUSED", "HALF-DEPLOYED", "WARN preflight",
+                                     "manifest-repair", "seats:", "upgrade-path: the deploy tried")):
+                m.log(f"   | {ln}")
+        if cycle["outcome"] != "DEPLOYED":
+            failures.append(f"f1. a fresh host's first timer cycle was {cycle['outcome']} (rc={rc}), "
+                            f"not a deploy; preflight {report['first_cycle_preflight']}")
+        try:
+            manifest = json.loads((m.hestia_home / "current-build.json").read_text())
+        except (OSError, ValueError):
+            manifest = {}
+        report["manifest_build_id"] = manifest.get("build_id")
+        if manifest.get("head_sha") != candidate or not names_commit(manifest.get("build_id") or "", candidate, source):
+            failures.append(f"f1. manifest is {manifest.get('build_id')!r}, not the candidate")
+
+        # ---- f2. seat projections ----------------------------------------------------------------
+        cand_tree = m.deploy_root / "hestia"
+        want = expected_seats(m, cand_tree)
+        have = sorted(p.stem for p in (m.hestia_home / "seats").glob("*.env")) \
+            if (m.hestia_home / "seats").is_dir() else []
+        report["seats"] = {"expected": want, "present": have}
+        missing = [s for s in want if s not in have]
+        m.log(f"f2 seat projections: {', '.join(have) or 'NONE'}"
+              + (f"  -- MISSING {', '.join(missing)}" if missing else ""))
+        if missing:
+            failures.append(f"f2. no seat projection for {', '.join(missing)}")
+        elif have:
+            m.check_projection_endpoints()
+
+        # ---- f3. identity seeds -------------------------------------------------------------------
+        seed_rows, seed_problems = seed_findings(m, cand_tree)
+        report["identity_seeds"] = seed_rows
+        m.log("f3 identity seeds: " + ", ".join(f"{r['member']}={r['status']}" for r in seed_rows))
+        for p in seed_problems:
+            failures.append(f"f3. {p}")
+
+        # ---- f4. the installed gates ----------------------------------------------------------------
+        scratch = m.scratch_dir / "probe"
+        scratch.write_text("")
+        if manifest:
+            rows = m.check_gates(cand_tree, scratch)
+            report["gates"] = rows
+            log_gates(m, rows, failures, "f4.")
+        else:
+            report["gates"] = []
+            m.log("f4 gates: not checked -- nothing was installed")
+
+        # ---- f5/f6. later cycles are no-ops --------------------------------------------------------
+        report["second_cycle"] = noop_cycle(m, "f5. second cycle", failures, "second-cycle.log")
+        report["abbrev_shift_cycle"] = abbrev_shift_cycle(m, length, "f6. re-spelled cycle", failures,
+                                                          "abbrev-shift-cycle.log")
+    finally:
+        report["live_port_attempts"] = finish_machine(args, m, failures, "f7.")
+
+
 # ------------------------------------------------------------------ the scenario --------------
 def scenario(args: argparse.Namespace) -> int:
     source = Path(args.repo).resolve()
@@ -689,132 +1087,35 @@ def scenario(args: argparse.Namespace) -> int:
     if not os.access(daemon_bin, os.X_OK):
         raise SetupError(f"--daemon-bin {daemon_bin} is not executable")
 
-    parent = Path(args.workdir) if args.workdir else Path(tempfile.gettempdir())
-    # The scratch file must sit under a temp root the gate recognises (/tmp or /var/tmp; see
-    # hestia-deploy.sh's preflight), so the default workdir is /tmp, never a per-user TMPDIR.
-    if not args.workdir and not str(parent.resolve()).startswith(("/tmp", "/var/tmp")):
-        parent = Path("/tmp")
-    root = Path(tempfile.mkdtemp(prefix="hestia-upgrade-path-", dir=str(parent)))
-    m = Machine(root, source, daemon_bin, verbose=args.verbose)
-    if m.home.resolve() == Path.home().resolve():
-        raise SetupError("the fake HOME resolved to the real one")
     t0 = time.monotonic()
     failures: list[str] = []
     report: dict[str, Any] = {"previous": f"{previous_ref} ({previous[:10]})",
-                              "candidate": f"{args.candidate} ({candidate[:10]})", "root": str(root)}
-    m.log(f"previous={previous_ref} ({previous[:10]})  candidate={args.candidate} ({candidate[:10]})")
-    m.log(f"simulated machine at {root}")
+                              "candidate": f"{args.candidate} ({candidate[:10]})"}
+    print(f"[upgrade-path] previous={previous_ref} ({previous[:10]})  candidate={args.candidate} "
+          f"({candidate[:10]})  arms={args.arms}", flush=True)
     try:
-        m.build_box()
-        daemon_describe = m.start_daemon()
-        length = describe_hash_len(daemon_describe)
-        m.build_origins(previous)
-        m.install_deploy_checkout()
-        if length:
-            m.pin_abbrev(length)
-
-        # ---- 1. the previous release, installed as a fresh host installs it -----------------
-        rc, text = m.run_installed_deploy("--preflight")
-        verdict = next((ln.split("PREFLIGHT", 1)[1].strip() for ln in text.splitlines()
-                        if "PREFLIGHT" in ln), f"rc={rc}")
-        report["fresh_host_timer_preflight"] = verdict
-        m.log(f"previous: a fresh host's first timer cycle would preflight: {verdict}")
-        out = m.run_install_members()
-        report["previous_install_rc"] = out.returncode
-        (root / "previous-install.log").write_text(out.stdout + out.stderr)
-        if out.returncode != 0:
-            raise SetupError(f"the previous release's install-members.sh failed rc={out.returncode}: "
-                             f"{last_line(out.stderr) or last_line(out.stdout)}")
-        seats = sorted(p.name for p in (m.hestia_home / "seats").glob("*.env"))
-        m.log(f"previous: installed; manifest build_id="
-              f"{json.loads((m.hestia_home / 'current-build.json').read_text()).get('build_id')}; "
-              f"seat projections: {', '.join(seats) or 'NONE'}")
-        report["previous_seats"] = seats
-        m.check_projection_endpoints()
-
-        # ---- 2. the candidate, via the timer's path -------------------------------------------
-        m.move_main(candidate)
-        target = m.origin_describe(length or 7)
-        if target != daemon_describe:
-            raise SetupError(f"--daemon-bin describes itself as {daemon_describe!r} but the candidate "
-                             f"is {target!r}; build the daemon from the candidate")
-        rc, text = m.run_installed_deploy()
-        (root / "upgrade-cycle.log").write_text(text)
-        cycle = classify_cycle(text, rc)
-        report["upgrade_cycle"] = cycle
-        m.log(f"upgrade cycle: {cycle['outcome']} (rc={rc})")
-        for ln in text.splitlines():
-            if any(w in ln for w in ("gate-preflight", "REFUSED", "HALF-DEPLOYED", "PREFLIGHT",
-                                     "WARN preflight", "manifest-repair", "self-updated")):
-                m.log(f"   | {ln}")
-        # CURRENT is a full deploy only when there was nothing to install (previous == candidate's
-        # members' surface already); the manifest check below decides that.
-        if cycle["outcome"] not in ("DEPLOYED", "CURRENT"):
-            failures.append(f"a. upgrade cycle was {cycle['outcome']}, not a full deploy")
-        manifest = json.loads((m.hestia_home / "current-build.json").read_text())
-        report["manifest_build_id"] = manifest.get("build_id")
-        if manifest.get("build_id") != target:
-            failures.append(f"a. manifest build_id is {manifest.get('build_id')!r}, not {target!r}")
-
-        # ---- 3b. the installed gates, under their registered lines ----------------------------
-        scratch = m.scratch_dir / "probe"
-        scratch.write_text("")
-        cand_tree = m.deploy_root / "hestia"
-        rows = m.check_gates(cand_tree, scratch)
-        report["gates"] = rows
-        for row in rows:
-            def said(probe: str) -> str:
-                denied = (row.get(probe) or {}).get("denied")
-                return "-" if denied is None else "deny" if denied else "allow"
-            m.log(f"gate {row['member']:12} {row['status']:4} "
-                  f"read={said('allow')} self-write={said('deny')} "
-                  f"candidate-bytes={row.get('installed_is_candidate')}"
-                  + (f"  -- {row['reason']}" if row.get("reason") else ""))
-            if row["status"] not in ("ok", "known-open"):
-                failures.append(f"b. {row['member']}: {row.get('reason')}")
-        if any(r["status"] not in ("ok", "known-open") and r.get("installed_is_candidate") for r in rows):
-            # Informational: the same gates with the login profile's HESTIA_HOME. Separates "the
-            # registered line is missing the locator" from "the gate is broken".
-            for row in m.check_gates(cand_tree, scratch, with_login_home=True):
-                m.log(f"   (with ~/.profile's HESTIA_HOME) {row['member']:12} {row['status']}"
-                      + (f"  -- {row['reason']}" if row.get("reason") else ""))
-
-        # ---- 3c. the second cycle is a no-op ---------------------------------------------------
-        before = snapshot(m.installed_surface())
-        rc2, text2 = m.run_installed_deploy()
-        (root / "second-cycle.log").write_text(text2)
-        after = snapshot(m.installed_surface())
-        second = classify_cycle(text2, rc2)
-        changed = snapshot_diff(before, after)
-        report["second_cycle"] = {**second, "changed": [c.replace(str(m.home), "~") for c in changed]}
-        m.log(f"second cycle: {second['outcome']} (rc={rc2}), {len(changed)} installed file(s) changed")
-        for c in changed[:20]:
-            m.log(f"   | {c.replace(str(m.home), '~')}")
-        if second["outcome"] != "CURRENT" or changed:
-            failures.append(f"c. second cycle was {second['outcome']} and changed {len(changed)} file(s), "
-                            "not a no-op")
+        if args.arms in ("all", "upgrade"):
+            upgrade = report.setdefault("upgrade", {})
+            upgrade_arm(args, source, daemon_bin, candidate, previous_ref, previous, upgrade, failures)
+            # Kept at the top level for readers of the first version of this report.
+            for key in ("fresh_host_timer_preflight", "upgrade_cycle", "manifest_build_id", "gates",
+                        "second_cycle", "live_port_attempts"):
+                if key in upgrade:
+                    report[key] = upgrade[key]
+        if args.arms in ("all", "fresh"):
+            fresh_host_arm(args, source, daemon_bin, candidate, report.setdefault("fresh_host", {}), failures)
     finally:
-        m.stop_daemon()
-        attempts = m.live_port_attempts()
-        report["live_port_attempts"] = attempts
-        if attempts:
-            failures.append(f"d. {len(attempts)} connection attempt(s) to 127.0.0.1:{LIVE_PORT} "
-                            "(blocked by the guard; the simulation is NOT isolated)")
-            for a in attempts[:10]:
-                m.log(f"   | {a}")
         report["seconds"] = round(time.monotonic() - t0, 1)
         report["failures"] = failures
         if args.json:
             Path(args.json).write_text(json.dumps(report, indent=2))
-        if not args.keep:
-            shutil.rmtree(root, ignore_errors=True)
-        else:
-            m.log(f"kept {root}")
-    m.log(f"{len(failures)} failure(s) in {report['seconds']} s")
+    print(f"[upgrade-path] {len(failures)} failure(s) in {report['seconds']} s", flush=True)
     for f in failures:
-        m.log(f"FAIL {f}")
+        print(f"[upgrade-path] FAIL {f}", flush=True)
     if not failures:
-        m.log("PASS: a host on the previous release deploys the candidate cleanly")
+        print("[upgrade-path] PASS: a host on the previous release, and a fresh host, deploy the "
+              "candidate cleanly from the timer" if args.arms == "all" else
+              f"[upgrade-path] PASS ({args.arms} arm)", flush=True)
     return 1 if failures else 0
 
 
@@ -825,9 +1126,14 @@ def main(argv: list[str] | None = None) -> int:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--previous", help="the release a host is on (default: latest v* tag)")
     g.add_argument("--previous-back", type=int, metavar="N", help="previous = origin/main~N")
+    p.add_argument("--arms", choices=("all", "upgrade", "fresh"), default="all",
+                   help="which arm(s) to run: the previous-release upgrade, the fresh host, or both")
+    p.add_argument("--without-harness", action="append", choices=sorted(HARNESSES), metavar="DIR",
+                   help="leave this harness home off the simulated box (repeatable): a host that "
+                        "runs only some harnesses")
     p.add_argument("--repo", default=str(ROOT), help="the git repo holding both commits")
-    p.add_argument("--workdir", help="where the throwaway machine is built (default /tmp)")
-    p.add_argument("--keep", action="store_true", help="keep the throwaway machine for inspection")
+    p.add_argument("--workdir", help="where the throwaway machines are built (default /tmp)")
+    p.add_argument("--keep", action="store_true", help="keep the throwaway machines for inspection")
     p.add_argument("--json", help="write the report here")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)

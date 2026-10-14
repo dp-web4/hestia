@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { PendingEscalation, PendingScopeRequest } from "../lib/types";
 
 const getDashboard = vi.fn();
@@ -51,6 +51,23 @@ function scopeRequest(over: Partial<PendingScopeRequest> = {}): PendingScopeRequ
     secs_remaining: 86_400,
     ...over,
   };
+}
+
+function gateScopeRequest(over: Partial<PendingScopeRequest> = {}): PendingScopeRequest {
+  return scopeRequest({
+    request_id: "scope-gate-1",
+    claimed_by: "kimi-code",
+    path: "/home/dp/.local/state/hestia-mesh/logs/watch.log",
+    reason: "opened by the gate on a refused Bash (mrh.command); act: tail -n 50 …",
+    origin: "gate_deny",
+    rule: "mrh.command",
+    tool: "Bash",
+    act: "tail -n 50 /home/dp/.local/state/hestia-mesh/logs/watch.log",
+    reissues: 2,
+    subtree: false,
+    once_available: true,
+    ...over,
+  });
 }
 
 afterEach(() => {
@@ -192,16 +209,173 @@ describe("Decide — scope requests (Sprint 2)", () => {
     expect([id, granted, reason]).toEqual(["req-7", false, null]);
   });
 
-  it("never sends a standing refusal, even with the box ticked", async () => {
+  it("never sends a standing refusal, even with standing chosen", async () => {
     getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [scopeRequest()] });
     operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
     ruleScopeRequest.mockResolvedValue({ outcome: "decided", result: {} });
 
     render(<Decide />);
-    (await screen.findByRole("checkbox", { name: /standing/i })).click();
+    const dur = (await screen.findByRole("combobox", { name: /duration/i })) as HTMLSelectElement;
+    fireEvent.change(dur, { target: { value: "standing" } });
     screen.getByRole("button", { name: /refuse/i }).click();
     await waitFor(() => expect(ruleScopeRequest).toHaveBeenCalled());
     expect(ruleScopeRequest.mock.calls[0][3]).toMatchObject({ standing: false });
+    expect(ruleScopeRequest.mock.calls[0][3]).not.toHaveProperty("grantPath");
+  });
+
+  // spec decide-scope-request obligations (2026-10-05): a scope refusal is an escalation
+  it("shows a gate-opened request's refused act as the act, never as the member's reason", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [gateScopeRequest()],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+
+    render(<Decide />);
+    expect(await screen.findByText(/refused act/)).toBeTruthy();
+    expect(document.querySelector("[data-scope-act]")?.textContent).toContain("tail -n 50");
+    expect(screen.getByText(/the member stated no reason/)).toBeTruthy();
+    expect(screen.getByText(/re-issued 2×/)).toBeTruthy();
+    expect(screen.queryByText(/their reason/)).toBeNull();
+  });
+
+  it("offers 'this act once' only for a gate-opened request, and sends it bare", async () => {
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [scopeRequest()] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    const dur = (await screen.findByRole("combobox", { name: /duration/i })) as HTMLSelectElement;
+    expect([...dur.options].map((o) => o.value)).toEqual(["session", "standing"]);
+    cleanup();
+
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [gateScopeRequest()] });
+    ruleScopeRequest.mockResolvedValue({ outcome: "decided", result: {} });
+    render(<Decide />);
+    const dur2 = (await screen.findByRole("combobox", { name: /duration/i })) as HTMLSelectElement;
+    expect([...dur2.options].map((o) => o.value)).toEqual(["once", "session", "standing"]);
+    fireEvent.change(dur2, { target: { value: "once" } });
+    expect((screen.getByRole("combobox", { name: /reach/i }) as HTMLSelectElement).disabled).toBe(true);
+    screen.getByRole("button", { name: /grant/i }).click();
+    await waitFor(() => expect(ruleScopeRequest).toHaveBeenCalled());
+    expect(ruleScopeRequest.mock.calls[0][3]).toEqual({ once: true, askedPath: gateScopeRequest().path });
+  });
+
+  it("renders exactly 'Approve once' and 'Refuse' for an act the gate could not enumerate (#1287)", async () => {
+    // dp hit a plain grant on scope-1981a1b1f6e5 and learnt the rule from the decide error.
+    // The card now offers exactly what the daemon says the endpoint accepts.
+    const path = "hestia:unpriceable:unenumerated#0123456789abcdef";
+    const req = gateScopeRequest({ request_id: "scope-unenum-1", path, once_only: true,
+                                   enumerable: false, allowed_decisions: ["once", "refuse"],
+                                   act: 'for f in a b; do cat "$f"; done' });
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [req] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    ruleScopeRequest.mockResolvedValue({ outcome: "decided", result: {} });
+    render(<Decide />);
+    const approve = await screen.findByRole("button", { name: "Approve once" });
+    const buttons = screen.getAllByRole("button").map((b) => b.textContent);
+    expect(buttons).toEqual(["Approve once", "Refuse"]);
+    // no duration and no reach: there is nothing to choose
+    expect(screen.queryByRole("combobox", { name: /duration/i })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: /reach/i })).toBeNull();
+    // the one line saying why, and the sentinel is not presented as a filesystem path
+    expect(
+      screen.getByText("what this act reaches is decided by an expansion, so only this exact act can be approved"),
+    ).toBeTruthy();
+    expect(screen.getByText(/no path: the gate cannot enumerate/)).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "one run" } });
+    approve.click();
+    await waitFor(() => expect(ruleScopeRequest).toHaveBeenCalled());
+    expect(ruleScopeRequest.mock.calls[0][1]).toBe(true);
+    expect(ruleScopeRequest.mock.calls[0][3]).toEqual({ once: true, askedPath: path });
+  });
+
+  it("follows allowed_decisions over the older flags (#1287)", async () => {
+    // allowed_decisions is the decide endpoint's own set; a stale once_only must not widen it.
+    const req = gateScopeRequest({ request_id: "scope-ad-1", once_only: false,
+                                   allowed_decisions: ["once", "refuse"] });
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [req] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    await screen.findByRole("button", { name: "Approve once" });
+    expect(screen.queryByRole("button", { name: /^grant$/i })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: /duration/i })).toBeNull();
+  });
+
+  it("keeps duration, reach, Grant and Refuse for a request that names a path (#1287)", async () => {
+    const req = gateScopeRequest({ enumerable: true,
+                                   allowed_decisions: ["once", "session", "standing", "refuse"] });
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [req] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    const dur = (await screen.findByRole("combobox", { name: /duration/i })) as HTMLSelectElement;
+    expect([...dur.options].map((o) => o.value)).toEqual(["once", "session", "standing"]);
+    expect(screen.getByRole("combobox", { name: /reach/i })).toBeTruthy();
+    expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["Grant", "Refuse"]);
+    expect(screen.queryByText(/decided by an expansion/)).toBeNull();
+  });
+
+  it("grants standing at a directory above the asked path, recursively", async () => {
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [gateScopeRequest()] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    ruleScopeRequest.mockResolvedValue({ outcome: "decided", result: {} });
+    render(<Decide />);
+    fireEvent.change(await screen.findByRole("combobox", { name: /duration/i }), {
+      target: { value: "standing" },
+    });
+    const reach = screen.getByRole("combobox", { name: /reach/i }) as HTMLSelectElement;
+    const idx = [...reach.options].findIndex((o) => o.textContent?.startsWith("/home/dp/.local/state/hestia-mesh/**"));
+    expect(idx).toBeGreaterThan(0);
+    expect([...reach.options].some((o) => o.textContent === "/**" || o.textContent?.startsWith("/** "))).toBe(false);
+    fireEvent.change(reach, { target: { value: String(idx) } });
+    screen.getByRole("button", { name: /grant/i }).click();
+    await waitFor(() => expect(ruleScopeRequest).toHaveBeenCalled());
+    expect(ruleScopeRequest.mock.calls[0][3]).toEqual({
+      standing: true,
+      recursive: true,
+      grantPath: "/home/dp/.local/state/hestia-mesh",
+      askedPath: gateScopeRequest().path,
+    });
+  });
+
+  // dp, 2026-10-05: "scope escalations should go to peers not to me".
+  it("shows a peer-routed request as awaiting a NOT-SAME peer, with OVERRIDE controls", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [gateScopeRequest({ invited_peers: ["kimi-code", "claude-code"] })],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    const route = await waitFor(() => {
+      const el = document.querySelector("[data-scope-route]");
+      if (!el) throw new Error("no route");
+      return el;
+    });
+    expect(route.textContent).toContain("NOT-SAME peer");
+    expect(route.textContent).toContain("kimi-code, claude-code");
+    expect(screen.getByRole("button", { name: /override: grant/i })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /override: refuse/i })).toBeTruthy();
+  });
+
+  it("shows a request no peer can clear as the operator's own", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [gateScopeRequest({ invited_peers: [], asker_basis: "asserted" })],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    await screen.findByText(/no NOT-SAME peer can clear this/);
+    expect(screen.queryByRole("button", { name: /override/i })).toBeNull();
+  });
+
+  it("offers no exact grant for a glob reach", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [gateScopeRequest({ path: "/var/log/app", subtree: true })],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    const reach = (await screen.findByRole("combobox", { name: /reach/i })) as HTMLSelectElement;
+    expect([...reach.options].some((o) => o.textContent?.startsWith("exactly"))).toBe(false);
+    expect(screen.getByText(/only a recursive grant covers it/)).toBeTruthy();
   });
 
   it("is exact unless the operator chooses recursion", async () => {

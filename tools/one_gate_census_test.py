@@ -183,9 +183,14 @@ def test_self_write_ratchet():
     law = {"denied": True, "said": "hestia: deny [gate.self_access] — 'Bash' would WRITE the governance surface"}
     infra = {"denied": True, "said": "hestia: deny [config.unbacked] — HESTIA_HOME is not set"}
     allowed = {"denied": False, "said": ""}
-    known = next(iter(census.KNOWN_OPEN))[0]
-    assert census.judge_self_write(known, allowed)[0] == "known-open"
-    assert census.judge_self_write(known, law)[0] == "stale"
+    # The ratchet logic, independent of whether any hole is open today: inject a fixture row.
+    known = "fixture-member"
+    census.KNOWN_OPEN[(known, "self_write")] = "#0 (fixture)"
+    try:
+        assert census.judge_self_write(known, allowed)[0] == "known-open"
+        assert census.judge_self_write(known, law)[0] == "stale"
+    finally:
+        del census.KNOWN_OPEN[(known, "self_write")]
     assert census.judge_self_write("no-such-member", law)[0] == "pass"
     assert census.judge_self_write("no-such-member", allowed)[0] == "fail"
     assert census.judge_self_write("no-such-member", infra)[0] == "fail"

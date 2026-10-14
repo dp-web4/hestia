@@ -78,6 +78,21 @@ gate registration. It cannot, on any healthy machine — `gate-self-access` refu
 A governed session has no in-band route to the rule-0 remedy, so a rule-0 finding is something
 to **refuse and report to an operator**, never something a seat repairs for itself.
 
+**A timer cycle seeds the seat documents BEFORE it preflights (#1250).** Until 2026-10-11 the only
+writer of `~/.hestia/seats/<seat>.env` was `tools/seed_seat_config.py`, run at the END of
+`install-members.sh`, after this preflight had already refused. So a fresh host's first timer cycle
+always ended `HALF-DEPLOYED … refused(FAILED(gate refuses a benign read))`, and so did every cycle
+after it. The upgrade-path harness's fresh-host arm measured this on main `7e901d3c`. Every path into
+the members' install (full cycle, manifest repair, `--hooks-only`) now runs the seeder first, in the
+installer's own `--add-missing` mode. It writes only the installed seats the vault does not declare,
+never modifies an operator's document, and grants nothing. The cycle line reports it as `seats=`:
+`ok(added)`, `ok(complete)`, `skipped(no operator key in HESTIA_HOME)`, `refused(governed session)`,
+or `FAILED(rc=N: <the seeder's last line>)`, for example a missing Ed25519 backend or no resolvable
+workspace. The preflight itself is unchanged. It still probes every gate under the projection the
+seat will load, re-pointed at the candidate engine. `--preflight` writes nothing, so on a box that
+was never seeded it still probes unbacked, and it now says so in a `NOTE` line.
+`HESTIA_DEPLOY_SEED_SEATS=0` turns the step off.
+
 **`config.unbacked` has that same property, and the printed remedy does not say so.** The verdict
 tells the reader to *"populate this seat's config in the vault (Govern → Runtime config)"* and
 then `hestia-deploy --hooks-only`. The first half is a **vault write** — operator territory,
@@ -258,6 +273,23 @@ primitive that is not there must never be indistinguishable from a lock that is 
   manager, never by hand:
   `systemctl --user start hestia-deploy.service`, or on macOS
   `launchctl kickstart -k gui/$(id -u)/com.web4.hestia.deploy`.
+
+## One build, many spellings (#1250)
+
+Every identity a cycle compares (the checkout's target, the running daemon's version, the on-disk
+binary, the manifest's `build_id`) is a `git describe` string. git sizes the abbreviated sha by the
+object count of the clone it runs in, so one commit is `-g588684d` in one clone and `-g588684d6` in
+another, or in the same clone once enough objects arrive. The script used to compare these as
+strings, so a current box could read stale and rebuild, or re-run the members' install, for nothing.
+Measured: the upgrade-path harness's re-spelled cycle on main `7e901d3c` went to `build` and failed.
+Comparisons now go through `same_build`. It treats equal strings as one build. Otherwise it resolves
+both abbreviations to a full sha in the deploy checkout and requires the same `-dirty` state. A sha
+the checkout cannot resolve counts as a different build, which means a rebuild, never a false
+"current". The dashboard and the operator update endpoint check the running abbreviation against
+the manifest's full `head_sha`. Producers keep git's default abbreviation on purpose. A fixed
+`--abbrev` in `build.rs` would make the transition cycle's new binary describe itself differently
+from what the previous, still-installed copy of this script computes, and that copy compares strings,
+so it would die once on every host at "built binary describes itself as …".
 
 ## What is deployed, and what is not
 

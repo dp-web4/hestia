@@ -128,6 +128,9 @@ ALLOWED = [
      "canonicalizing the EMPTY sys.path entry, which Python defines as cwd; not selecting authority"),
     ("cwd-root-fallback", "(cwd or os.getcwd())", None,
      "resolving the ACT's relative target against the event cwd; data about the act, not a root"),
+    ("cwd-root-fallback", "pwd = cwd or os.getcwd()", None,
+     "#1232's shell path judge: the same act-relative resolution as the row above (relative words "
+     "in a command are resolved against the event cwd); data about the act, not a root"),
     # One-gate stage C: these defaults are data about where the HARNESS itself records this hook,
     # used only to read the timeout the harness enforces. They are allowed ONLY as string literals
     # under HARNESS["registrations"]; an identical fallback anywhere else remains a hardcoded path.

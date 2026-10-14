@@ -196,6 +196,13 @@ class HarnessBound:
     on_timeout: str                       # what the harness does when the timeout expires
     sources: tuple = ()                   # where each timeout came from, for the record
     why: str = ""                         # why the bound is unknown, when it is
+    # What the harness's registration ACTUALLY points its hooks at (every event, every source
+    # that exists), read in the same pass as the timeout. The closure is built from install
+    # declarations; execution is built from this. `decide()` governs both (see
+    # `registered_surface`). `unreadable` names a source that exists but could not be parsed.
+    self_path: str = ""                   # realpath of the running gate
+    registered: tuple = ()                # ((source, absolute target), ...)
+    unreadable: tuple = ()                # (source, ...)
 
 
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -264,8 +271,24 @@ def _hook_entries(doc: Any, reader: str, layout: str, event: str) -> list:
     return out
 
 
+_CONFIG_CACHE: dict = {}
+
+
 def _load_config(path: str, reader: str):
-    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan")."""
+    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan").
+    Cached on (path, reader, mtime, size): the timeout bound and the registered-surface read
+    parse each registration once per process, and a changed file is re-read."""
+    st = os.stat(path)
+    key = (path, reader, st.st_mtime_ns, st.st_size)
+    hit = _CONFIG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = _load_config_uncached(path, reader)
+    _CONFIG_CACHE[key] = out
+    return out
+
+
+def _load_config_uncached(path: str, reader: str):
     with open(path, "rb") as fh:
         raw = fh.read()
     if reader == "json-hook-commands":
@@ -287,7 +310,68 @@ def _scan_timeouts(path: str, base: str) -> Optional[list]:
     return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
 
 
+def _all_hook_commands(doc: Any, layout: str) -> list:
+    """Every hook command a parsed registration carries, on EVERY event (a witness is registered
+    on a different event from the gate)."""
+    out = []
+    hooks = doc.get("hooks") if isinstance(doc, dict) else None
+    if layout == "flat":
+        for tbl in hooks if isinstance(hooks, list) else []:
+            if isinstance(tbl, dict) and isinstance(tbl.get("command"), str):
+                out.append(tbl["command"])
+        return out
+    for groups in (hooks.values() if isinstance(hooks, dict) else ()):
+        for group in groups if isinstance(groups, list) else []:
+            for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                if isinstance(h, dict) and isinstance(h.get("command"), str):
+                    out.append(h["command"])
+    return out
+
+
+_SCAN_COMMAND = re.compile(r"""(?m)^\s*command\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')""")
+
+
+def registered_hooks(harness: dict, *, cwd: Optional[str] = None, env=None) -> tuple:
+    """(registered, unreadable): every absolute hook target the harness's registration sources
+    name, as ((source, target), ...), and the sources that exist but could not be read or
+    parsed. NEVER raises: a failure is reported as unreadable, which the caller treats as
+    "this source may register more than we saw" (fail closed)."""
+    env = os.environ if env is None else env
+    registered, unreadable = [], []
+    for reg in (harness or {}).get("registrations") or ():
+        try:
+            path = _expand(str(reg.get("path") or ""), env, cwd)
+            if not path or not os.path.isfile(path):
+                continue
+            reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
+            doc, how = _load_config(path, reader)
+            if how == "scan":
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    commands = [m.group(1) or m.group(2) or "" for m in _SCAN_COMMAND.finditer(fh.read())]
+            else:
+                commands = _all_hook_commands(doc, layout)
+            for command in commands:
+                for t in _command_targets(command, env):
+                    registered.append((path, t))
+        except Exception:  # noqa: BLE001 — an unreadable source: the caller fails closed
+            unreadable.append(str(reg.get("path") or "?"))
+    return tuple(registered), tuple(unreadable)
+
+
 def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
+                  env=None) -> HarnessBound:
+    """The harness bound (`_harness_bound`), carrying what the registration actually registers
+    (`registered_hooks`) and the running gate's own realpath. NEVER raises."""
+    b = _harness_bound(harness, self_path, start, cwd=cwd, env=env)
+    try:
+        registered, unreadable = registered_hooks(harness, cwd=cwd, env=env)
+        me = os.path.realpath(self_path) if self_path else ""
+        return replace(b, self_path=me, registered=registered, unreadable=unreadable)
+    except Exception:  # noqa: BLE001 — the bound itself stands; the surface fails closed later
+        return b
+
+
+def _harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
                   env=None) -> HarnessBound:
     """The deadline the harness's REAL registered timeout allows this hook process. NEVER raises.
 
@@ -374,6 +458,84 @@ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[
                             f"the registration reader failed ({type(exc).__name__}: {exc})")
 
 
+# ── the EXECUTED surface: what this seat's harness registration actually runs ─────────────────
+
+#: The closure marker for a write to a seat's REGISTERED gate entry that no declared location
+#: covers (a legacy or hand-placed install). The daemon prices it sovereign_plus_peer, like a
+#: declared entry (core `bar_for`). Caller-asserted, so it can only raise the asker's own bar.
+REGISTERED_ENTRY_MARKER = "registered-gate-entry"
+
+
+@dataclass(frozen=True)
+class RegisteredSurface:
+    """One seat's executed governance surface. `own_dirs`: where hestia's hooks run from on this
+    seat (the running gate's realpath dir, always; the member's declared dest). `targets`: every
+    registered hook whose realpath lies in an own dir (the reconciler's and the census's
+    ownership rule: a same-named hook registered from another plugin's dir is FOREIGN and not
+    governed by being registered). `entries`: the gate entries among them (the running gate,
+    and any owned target named like it). `unreadable`: registration sources that could not be
+    read. Fail closed: whatever the registration says, the gate's own realpath and dir are
+    governed."""
+
+    self_path: str
+    own_dirs: tuple = ()
+    targets: tuple = ()
+    entries: tuple = ()
+    unreadable: tuple = ()
+
+    def closure(self):
+        return closure.default_closure().union(
+            closure.registered_closure(self.own_dirs, self.targets + self.entries),
+            source="registered+registry+floor")
+
+
+def _degenerate_dir(d: str, home: str) -> bool:
+    """A dir too broad to govern wholesale: the filesystem root, a home, or shallower."""
+    real = d.rstrip("/") or "/"
+    return (real == "/" or (bool(home) and real == home.rstrip("/"))
+            or len([x for x in real.split("/") if x]) < 3)
+
+
+def registered_surface(bound: Optional[HarnessBound], profile: GateProfile,
+                       env=None) -> Optional[RegisteredSurface]:
+    """The executed surface for this invocation, or None when there is no gate path to anchor
+    it (a non-seat caller). NEVER raises; a failure yields the minimum (self file and dir)."""
+    env = os.environ if env is None else env
+    self_path = (getattr(bound, "self_path", "") or
+                 (os.path.realpath(profile.gate_path) if profile.gate_path else ""))
+    if not self_path:
+        return None
+    # The seat's home from its environment only (no default): without one, nothing can be judged
+    # a home-level anchor, so only the file itself and its non-degenerate dir are governed.
+    home = os.path.realpath(env["HOME"]) if env.get("HOME") else ""
+    own = []
+    try:
+        d = os.path.dirname(self_path)
+        if not _degenerate_dir(d, home):
+            own.append(d)
+        dest = closure.declared_dest(profile.member_id, env.get("HOME"))
+        if dest:
+            rd = os.path.realpath(dest)
+            if rd not in own and not _degenerate_dir(rd, home):
+                own.append(rd)
+        base = os.path.basename(self_path)
+        targets, entries = [], [self_path]
+        for _source, t in getattr(bound, "registered", ()) or ():
+            rp = os.path.realpath(t)
+            if os.path.dirname(rp) not in own:
+                continue                      # foreign: another plugin's hook, not hestia's
+            if rp not in targets:
+                targets.append(rp)
+            if os.path.basename(rp) == base and rp not in entries:
+                entries.append(rp)
+        return RegisteredSurface(self_path, tuple(own), tuple(targets), tuple(entries),
+                                 tuple(getattr(bound, "unreadable", ()) or ()))
+    except Exception:  # noqa: BLE001 — the minimum, never fewer
+        d = os.path.dirname(self_path)
+        return RegisteredSurface(self_path, (d,) if not _degenerate_dir(d, home) else (),
+                                 (), (self_path,), ("registered surface failed",))
+
+
 # ── invocation context ───────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -384,11 +546,21 @@ class _Invocation:
     deadline: float
     key: Optional[str]
     attempted: str = ""
+    #: The same act at RECORD depth (mechanism.attempted_for_record), sent on the scope-claim
+    #: path — the NOT-SAME peer ruling on the request reads the record, not the deny display
+    #: (#648). Empty until set; falls back to `attempted` when unset.
+    attempted_full: str = ""
     role: Optional[str] = None
     notices: list = field(default_factory=list)
     warnings: list = field(default_factory=list)   # [(rule, reason, verdict_available)]
+    #: Refused paths a scope escalation lifted, to be SPENT atomically only once society law has
+    #: permitted the act (Codex review of #1232, P2). Empty = nothing to spend.
+    scope_spend: list = field(default_factory=list)
+    scope_rule: str = ""
+    scope_act_digest: str = ""
 
     budget: float = DEFAULT_DEADLINE_SECONDS
+    registered: Optional[RegisteredSurface] = None
 
     @property
     def phase_deadline(self) -> float:
@@ -540,6 +712,17 @@ def attempted_of(event: GateEvent) -> str:
         targets=_patch_targets(event.tool, ti))
 
 
+def attempted_record_of(event: GateEvent) -> str:
+    """The same act at RECORD depth (`attempted_for_record`, #648): same masking as the
+    display summary, bounded wide with a visible cut marker. The scope-request record is
+    ruled on by a NOT-SAME peer who was never shown the deny display, so the record must
+    carry the act at the depth a ruling needs."""
+    ti = event.tool_input
+    return mechanism.attempted_for_record(
+        event.tool, ti, command=_command_text(ti) if isinstance(ti, dict) else None,
+        targets=_patch_targets(event.tool, ti))
+
+
 def _target(event: GateEvent) -> Optional[str]:
     try:
         return mechanism._extract_target(event.tool_input, event.tool)
@@ -680,27 +863,146 @@ def _closure_shape(event: GateEvent):
     return tool, ti, targets, False
 
 
-def _closure_view(event: GateEvent):
-    """The closure classifier's verdict on this act (the first governed target decides)."""
+def _closure_view(event: GateEvent, against=None):
+    """The closure classifier's verdict on this act (the first governed target decides).
+    `against`: the closure to classify with (default: the declared one)."""
     tool, ti, targets, is_patch = _closure_shape(event)
     if is_patch:
         found = None
         for p in targets:
-            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd)
+            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd, closure=against)
             if cv.classification == "write":
                 return cv
             if cv.classification == "read" and found is None:
                 found = cv
         return found
-    return closure.classify(tool, ti, cwd=event.cwd)
+    return closure.classify(tool, ti, cwd=event.cwd, closure=against)
 
 
-def _closure_write_set(event: GateEvent):
+def _closure_verdict(inv: _Invocation):
+    """The declared closure's verdict, then — when it does not already refuse — the seat's
+    EXECUTED surface (`registered_surface`): a write to where this seat's registration actually
+    runs hestia's hooks is a closure write even where no declaration names the place. A write
+    reaching a registered gate entry escalates under REGISTERED_ENTRY_MARKER, priced like a
+    declared entry."""
+    cv = _closure_view(inv.event)
+    reg = inv.registered
+    if reg is None or (cv is not None and cv.classification == "write"):
+        return cv
+    rv = _closure_view(inv.event, reg.closure())
+    if rv is None or rv.classification != "write":
+        return cv if cv is not None else rv
+    if _reaches_registered_entry(getattr(rv, "landing", None), reg.entries):
+        rv = replace(rv, marker=REGISTERED_ENTRY_MARKER)
+    return rv
+
+
+_GLOB_CHARS = frozenset("*?[")
+
+
+def _reaches_registered_entry(target, entries) -> bool:
+    """True when this resolved write target CAN land on one of the seat's registered gate
+    entries: the entry itself, or a wildcard whose expansion can include it (Codex review of
+    #1247 at 18f91db, P1: `touch <legacy>/before_*` reached the running gate yet carried no
+    entry token, and the daemon — which knows only DECLARED locations — could not recover it).
+    The match is `_glob_over_regex`, which can only over-match a Bash glob: an over-match prices
+    higher, never lower."""
+    if not isinstance(target, str) or not target:
+        return False
+    if target in entries:
+        return True
+    if not _GLOB_CHARS.intersection(target):
+        return False
+    rx = _glob_over_regex(target)
+    return any(rx.fullmatch(e) for e in entries)
+
+
+def _glob_over_regex(pattern: str):
+    """A regex matching AT LEAST every path the Bash glob `pattern` can expand to. Not
+    `fnmatch` (Codex re-review of #1247 at 6976edbd, notice 18830, P1): fnmatch reads `[^z]` as
+    "`^` or `z`" and `[[:alpha:]]` as a bracket then a literal `]`, so both missed an entry Bash
+    expands them onto, and the write priced one approver. Here every bracket expression —
+    negated, ranged, POSIX class, whatever its locale reading — stands for ANY one character;
+    `*` and `?` may cross `/`; a backslash is optional before the ordinary character it escapes,
+    and consumes it; a backslash before `*`, `?` or `[` makes the rest of the pattern match
+    anything; and a `[` with no close Bash would accept does the same. Each choice can only
+    widen the set.
+
+    The escaped wildcard falls back rather than reading `\\[` as a literal `[` (Codex review of
+    held 29ae13a6, notice 18931, P2): the backslash used not to consume what it escaped, so the
+    `[` of `x\\[ab]y*` opened a bracket and `[ab]` shrank to one character, missing the
+    `x[ab]yes` Bash expands it onto. A literal reading would fix that pattern, but whether this
+    backslash still escapes depends on quoting the producer may already have removed (a quoted
+    backslash before a live `[`), and the safe answer to an uncertain reading is the wider one.
+
+    A bracket holding a `[` falls back too. Bash's own reading forks there: 5.2 expands
+    `[[=b=]]*` onto `bx` AND onto `[b]x` and `[=]x`, reading the first `[` as a literal and
+    `[=b=]` as the bracket. That fork surfaced when notice 18931's literal-bracket names joined
+    the differential corpus; one character for the whole bracket missed it."""
+    out, i, n = [], 0, len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == "*":
+            out.append(".*")
+        elif c == "?":
+            out.append(".")
+        elif c == "\\":
+            if i + 1 < n and pattern[i + 1] in _GLOB_CHARS:
+                out.append(r"\\?.*")
+                break
+            out.append(r"\\?")
+            if i + 1 < n:
+                i += 1
+                out.append(re.escape(pattern[i]))
+        elif c == "[":
+            end = _bracket_end(pattern, i)
+            if end is None or "[" in pattern[i + 1:end]:
+                out.append(".*")
+                break
+            out.append(".")
+            i = end
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return re.compile("".join(out), re.DOTALL)
+
+
+def _bracket_end(pattern: str, start: int):
+    """Index of the `]` closing the bracket expression opened at `start`, read as Bash reads
+    it: a leading `!`/`^` negates, a `]` first in the list is literal, `[:…:]`, `[=…=]` and
+    `[.….]` are single items, a backslash escapes the next character. None when unclosed."""
+    i, n = start + 1, len(pattern)
+    if i < n and pattern[i] in "!^":
+        i += 1
+    if i < n and pattern[i] == "]":
+        i += 1
+    while i < n:
+        c = pattern[i]
+        if c == "]":
+            return i
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[" and i + 1 < n and pattern[i + 1] in ":=.":
+            close = pattern.find(pattern[i + 1] + "]", i + 2)
+            if close != -1:
+                i = close + 2
+                continue
+        i += 1
+    return None
+
+
+def _closure_write_set(event: GateEvent, against=None):
     """(targets, complete): EVERY governed write-position path this act resolves into the
     closure, in order — not only the first, which is all `_closure_view` reports (Codex review
     of #1239, P1-2: a later sovereign target beyond the bounded summary priced as nothing).
     Each target rides with the other spellings the closure matched it by (cwd-joined,
-    realpath'd), so an alias carries its destination (Codex review of #1239, P1-2).
+    realpath'd), so an alias carries its destination (Codex review of #1239, P1-2), and with
+    the LOCATION it lands at (`landing`, #1247) where that is not already among them: the
+    daemon prices a member's gate entry by where it is, and a relative or `cd`-qualified
+    spelling names no location.
+    `against`: the closure to enumerate with — the seat's registered surface when it has one, so
+    a write the executed surface governs is enumerated too (#1247).
     `complete` is False when the write set could not be enumerated: an opaque writer, an
     internal error, no target named, a command outside the grammar or unparseable (its
     targets are vocabulary that matched, not resolved write positions: `$TARGET` names no
@@ -710,17 +1012,26 @@ def _closure_write_set(event: GateEvent):
         tool, ti, targets, is_patch = _closure_shape(event)
         if is_patch:
             verdicts = [v for p in targets
-                        for v in closure.write_verdicts("Write", {"file_path": p}, cwd=event.cwd)]
+                        for v in closure.write_verdicts("Write", {"file_path": p}, cwd=event.cwd,
+                                                        closure=against)]
         else:
-            verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd)
+            verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd, closure=against)
         resolved = []
         for v in verdicts:
             if v.marker and v.resource:
                 resolved.append(v.resource)
                 resolved.extend(getattr(v, "resolved", ()))
+                landing = getattr(v, "landing", None)
+                if isinstance(landing, str) and landing and landing not in resolved:
+                    resolved.append(landing)
+        # COMPLETE: #1239's rule (every verdict a resolved write whose target is absolute or
+        # was pinned by a cwd-join / realpath), AND #1247's (its landing is an absolute
+        # location). Two conjuncts, so neither cleared rule can be the weaker reading: a write
+        # set either one calls incomplete rides the `unenumerated` sentinel, priced highest.
         complete = bool(resolved) and all(
             v.marker and v.rule == closure.RULE_WRITE
             and (os.path.isabs(v.resource) or getattr(v, "resolved", ()))
+            and isinstance(getattr(v, "landing", None), str) and os.path.isabs(v.landing)
             for v in verdicts)
         return resolved, complete
     except Exception:  # noqa: BLE001 — unenumerated is priced highest, never lowest
@@ -729,7 +1040,7 @@ def _closure_write_set(event: GateEvent):
 
 def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
     ev, prof = inv.event, inv.profile
-    cv = _closure_view(ev)
+    cv = _closure_verdict(inv)
     if cv is None or cv.classification not in ("read", "write"):
         return None
     marker = cv.marker or cv.rule or "governance"
@@ -744,7 +1055,13 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
         except Exception:  # noqa: BLE001
             pass
         return None
-    write_set = _closure_write_set(ev)
+    write_set = _closure_write_set(ev, inv.registered.closure() if inv.registered else None)
+    if inv.registered is not None and any(_reaches_registered_entry(t, inv.registered.entries)
+                                          for t in write_set[0]):
+        # A target is this seat's REGISTERED gate entry (one no declaration covers): say so
+        # in-band, so the daemon prices it like a declared entry even when it is not the target
+        # the closure reported first (`cv`'s marker covers only that one).
+        write_set = (write_set[0] + [REGISTERED_ENTRY_MARKER], write_set[1])
     try:
         claimed = _bounded(
             inv.phase_deadline, mechanism.claim_self_write,
@@ -756,11 +1073,11 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             supersession=mechanism.SUPERSESSION_HARD_STOP,
             deadline=inv.phase_deadline,
             # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
-            # path the closure resolved, not only the one `cv` reports. The daemon prices the bar
-            # over the marker, the act and all of them, highest wins — `inv.attempted` is a
-            # bounded, self-censoring summary that can cut a filename out (or withhold the whole
-            # command); these are carried independently of it. An unenumerable write set is
-            # said as such, and priced highest.
+            # path the closure resolved, not only the one `cv` reports — each with its other
+            # spellings and the LOCATION it lands at (#1247). The daemon prices the bar over the marker, the act and all of
+            # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
+            # cut a filename out (or withhold the whole command); these are carried
+            # independently of it. An unenumerable write set is said as such, and priced highest.
             resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
         if claimed is _LATE:
             # Unknown, not "nothing happened": the daemon may have opened or matched an
@@ -828,11 +1145,19 @@ def _local_law(inv: _Invocation, nev: core.NormalizedEvent,
         # its own (C10: gemini's MCP command scoping, now every seat's). Same law, same order.
         views = [nev] + [core.NormalizedEvent(tool=nev.tool, command=s, cwd=nev.cwd, raw=nev.raw)
                          for s in mcp_transport_reach(inv.event)]
-        for view in views:
+        for i, view in enumerate(views):
             v = core.evaluate(view, cprofile, workspace, policy=policy)
             if v.blocks:
                 # The rollout softens a TUNABLE policy disagreement, and only when there IS a policy.
                 if v.innate or inv.rollout == "enforce":
+                    # A scope refusal of the ACT ITSELF is an escalation (#1232): a request a
+                    # NOT-SAME peer rules. The MCP transport's own reach (views[1:]) is operator
+                    # configuration, not an act a peer could rule on, and stays a plain refusal.
+                    if i == 0 and v.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(v, "target", ""):
+                        d = _scope_escalation(inv, nev, cprofile, policy, v)
+                        if d is not None:
+                            return d, False
+                        continue
                     return _verdict_deny(v), False
                 inv.warnings.append((v.rule, v.reason, True))
         return None, False
@@ -851,6 +1176,127 @@ def _local_law(inv: _Invocation, nev: core.NormalizedEvent,
               f"(in every rollout mode)")
     return _verdict_deny(core._deny("gate.degraded", reason, innate=True),
                          verdict_available=False, anomaly=True), True
+
+
+#: How many distinct refused paths one act may carry into the scope escalation. Each is one local
+#: re-evaluation and at most two daemon round trips, all inside the phase deadline.
+SCOPE_CLAIM_MAX_PATHS = 8
+
+
+def _claimed_scope_entry(target: str) -> str:
+    """The `in_scope` entry a lifted refusal adds for THIS act's re-evaluation only. A glob reach
+    (`dir/*`, see the core's `_glob_probe`) needs the subtree; anything else exactly its path. An
+    unenumerated target (`core.UNPRICEABLE_PREFIX…`) is added as itself: the core reads it as the
+    once-only lift of what it could not enumerate, in this trial scope and nowhere else."""
+    if target.endswith("/*"):
+        return "path:" + (target[:-2] or "/") + core.RECURSIVE_SUFFIX
+    return "path:" + target
+
+
+def _scope_request_path(target: str, act_digest: str) -> str:
+    """The path the daemon's scope request is keyed on. A real path is itself. An UNENUMERATED
+    target names no path (dp, 2026-10-10: nothing an expansion produces is modelled), so its
+    request is keyed on the ACT: the sentinel plus the first 16 hex of the complete-act digest.
+    Two different unenumerated acts are two requests (the (member, path) dedup would otherwise
+    answer act B with act A's pending id), and the daemon grants such a request ONCE or not at
+    all — there is no path a session or standing grant could name."""
+    if target.startswith(core.UNPRICEABLE_PREFIX):
+        return f"{target}#{act_digest[:16]}"
+    return target
+
+
+def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
+                      cprofile: core.HarnessProfile, policy, v: core.Verdict) -> Optional[GateDecision]:
+    """A scope refusal becomes an ESCALATION (dp, 2026-10-05: "escalation should allow standing
+    grants"). Returns None when every refused path is lifted LOCALLY (the act then meets society
+    law, and only after society permits is anything spent — `_spend_scope`), else the refusal
+    naming the scope request(s) the operator now holds. NOTHING IS CONSUMED HERE.
+
+    1. Collect, LOCALLY, every path this act is refused on: re-evaluate with each refused path
+       provisionally added. If the act still has an unclaimed refused path at
+       SCOPE_CLAIM_MAX_PATHS, collection is INCOMPLETE: refuse before asking the daemon anything
+       (Codex review of #1232, P2 — the old shape spent four approvals, then denied on a fifth).
+    2. PEEK every path (`spend: false`): this opens or re-finds requests and reports approvals,
+       consuming none. The binding is `act_digest` over the COMPLETE act (P1-1), never the
+       masked summary, which travels only for display.
+    3. Lifted only if every path is `approved` or `in_force` AND the act, re-judged with all of
+       them added, passes. The one-time approvals are recorded on `inv.scope_spend` and spent in
+       ONE atomic call after society law permits the act — a denied act consumes nothing."""
+    import dataclasses
+    ws = core.detect_workspace(cprofile)
+    targets, cur = [], v
+    while cur.blocks and cur.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(cur, "target", ""):
+        if cur.target in targets:
+            break
+        if len(targets) >= SCOPE_CLAIM_MAX_PATHS:
+            return _verdict_deny(core._deny(
+                v.rule, v.reason + f" The act is refused on more than {SCOPE_CLAIM_MAX_PATHS} "
+                f"paths, so it was not escalated and nothing was claimed: split it.",
+                innate=bool(v.innate), target=v.target))
+        targets.append(cur.target)
+        trial = dataclasses.replace(policy, scope=tuple(policy.scope)
+                                    + tuple(_claimed_scope_entry(t) for t in targets))
+        cur = core.evaluate(nev, cprofile, ws, policy=trial)
+    if cur.blocks:
+        # Another rule refuses regardless (or a scope refusal with no target to escalate):
+        # nothing to escalate, nothing asked.
+        return _verdict_deny(cur if cur.rule not in mechanism.SCOPE_ESCALATING_RULES else v)
+
+    prof, ev = inv.profile, inv.event
+    digest = mechanism.scope_act_digest(ev.tool, ev.tool_input, ev.cwd, ev.session_id)
+
+    def ask(target: str):
+        try:
+            got = _bounded(inv.phase_deadline, mechanism.claim_scope,
+                           _scope_request_path(target, digest), ev.tool,
+                           inv.attempted_full or inv.attempted, v.rule,
+                           plugin_id=prof.member_id, role=_role(inv),
+                           client_name=_client_name(prof), host_session_id=ev.session_id,
+                           spend=False, act_digest=digest, deadline=inv.phase_deadline)
+        except Exception:  # noqa: BLE001 — an unusable mechanism opens nothing and lifts nothing
+            got = None
+        if got is _LATE or not isinstance(got, tuple):
+            return ("unknown", "the daemon did not answer inside the gate's deadline; re-issuing "
+                    "this identical act is safe — it finds the same request", None)
+        return got
+
+    answers = [(t,) + ask(t) for t in targets]
+    if all(a[1] in ("approved", "in_force") for a in answers):
+        inv.scope_spend = list(targets)
+        inv.scope_rule = v.rule
+        inv.scope_act_digest = digest
+        for t, verdict, detail, _rid in answers:
+            inv.notices.append(f"hestia: scope {verdict} for {t} — {detail}")
+        return None
+
+    notes, first_id = [], None
+    for t, verdict, detail, rid in answers:
+        if verdict in ("approved", "in_force"):
+            continue
+        if rid and first_id is None:
+            first_id = rid
+        if verdict in ("opened", "pending") and t.startswith(core.UNPRICEABLE_PREFIX):
+            notes.append(f"Scope request {rid} is {'open' if verdict == 'opened' else 'still pending'} "
+                         f"for THIS ACT — the gate cannot enumerate what it reaches, so a NOT-SAME "
+                         f"peer (or the operator) can approve it only ONCE, as written; no session "
+                         f"or standing grant can cover it. Watch it with hestia_scope_status and "
+                         f"re-issue this identical act afterwards, or rewrite it with every path "
+                         f"spelled out literally.")
+        elif verdict in ("opened", "pending"):
+            notes.append(f"Scope request {rid} is {'open' if verdict == 'opened' else 'still pending'} "
+                         f"for '{t}' — a NOT-SAME peer decides it (this act once, for the session, "
+                         f"or standing; exact or recursive), the operator may override, and you "
+                         f"cannot decide it yourself. Watch it with hestia_scope_status and "
+                         f"re-issue this identical act afterwards.")
+        elif verdict == "refused":
+            notes.append(f"Scope request {rid} for '{t}' was REFUSED ({detail}); "
+                         f"re-issuing does not re-open it inside its window.")
+        else:
+            notes.append(f"No scope request could be opened for '{t}' ({detail}); ask with "
+                         f"hestia_request_scope (one path, with a reason).")
+    reason = v.reason + " " + " ".join(notes)
+    return GateDecision("deny", v.rule, reason, v.remedy, innate=bool(v.innate),
+                        escalation_id=first_id)
 
 
 def _society(inv: _Invocation) -> GateDecision:
@@ -926,7 +1372,85 @@ def _sequence(inv: _Invocation, permitted_roles: str) -> GateDecision:
     # EVERY act asks the governor, reads included (dp 2026-10-01: align upward). A read-class
     # permit that fails to commit keeps the C11 read posture (allowed, anomaly surfaced); a
     # write/exec permit that fails to commit becomes gate.evidence_uncommitted.
-    return _finalize(inv, _society(inv), consequential=nev.tool not in core.READ_CLASS)
+    d = _society(inv)
+    consequential = nev.tool not in core.READ_CLASS
+    if inv.scope_spend and d.decision != "deny":
+        # Society permitted the act. The one-time scope approvals it needs are RESERVED now,
+        # the final verdict and its evidence are recorded, and only then are they COMMITTED
+        # (the act stands) or RELEASED (the act was denied after all) — Codex re-review of
+        # #1232, P2: a denied act consumes nothing, and an unknown outcome is reported as
+        # unknown, never as "nothing was consumed".
+        return _scope_reserve_finalize_settle(inv, d, consequential)
+    return _finalize(inv, d, consequential=consequential)
+
+
+def _scope_rpc(inv: _Invocation, op: str, key: str, paths=(), end: Optional[float] = None) -> tuple:
+    """One reserve/commit/release/lookup, bounded by `end` (an absolute monotonic deadline that
+    the mechanism also checks before EVERY request). Returns (state, detail); a call abandoned
+    in flight is `uncertain`."""
+    prof, ev = inv.profile, inv.event
+    end = inv.phase_deadline if end is None else end
+    try:
+        got = _bounded(end, mechanism.scope_batch, op, key, inv.scope_act_digest, tuple(paths),
+                       plugin_id=prof.member_id, role=_role(inv), client_name=_client_name(prof),
+                       host_session_id=ev.session_id, deadline=end)
+    except Exception:  # noqa: BLE001
+        got = None
+    if got is _LATE or not isinstance(got, tuple):
+        return mechanism.SCOPE_UNCERTAIN, "no answer inside the deadline"
+    return got
+
+
+def _scope_reserve_finalize_settle(inv: _Invocation, d: GateDecision, consequential: bool) -> GateDecision:
+    ev = inv.event
+    paths = [_scope_request_path(t, inv.scope_act_digest) for t in inv.scope_spend]
+    key = mechanism.scope_op_key(inv.scope_act_digest, inv.key, paths)
+    rule = inv.scope_rule or "mrh.command"
+    state, detail = _scope_rpc(inv, "reserve", key, paths)
+    if state == mechanism.SCOPE_UNCERTAIN:
+        # The reserve went out and no answer came: ask what became of this operation.
+        look, _ = _scope_rpc(inv, "lookup", key)
+        if look == "reserved":
+            state = "reserved"
+        elif look == "unknown":
+            state, detail = "not_reserved", "the reserve did not land (lookup: unknown)"
+    if state != "reserved":
+        if state == mechanism.SCOPE_UNCERTAIN:
+            # Withdraw whatever may have been reserved; say what is and is not known.
+            rel, _ = _scope_rpc(inv, "release", key)
+            consumed = ("nothing was consumed (the release confirmed it)"
+                        if rel in ("released", "unknown", "settled") else
+                        f"UNCERTAIN whether an approval was reserved — if it was, it lapses into "
+                        f"spent in at most {mechanism_reservation_secs()} s; look up operation "
+                        f"{key[:16]}… with hestia_scope_claim op=lookup")
+        else:
+            consumed = "nothing was consumed" if state in ("not_all", "not_sent", "not_reserved",
+                                                           "unknown") else \
+                f"the daemon answered '{state}' ({detail})"
+        refused = _verdict_deny(core._deny(
+            rule, f"'{ev.tool}' was lifted by one-time scope approvals that could not be "
+                  f"reserved ({state}: {detail}); {consumed}.", target=inv.scope_spend[0]))
+        return _finalize(inv, refused, consequential=False)
+    out = _finalize(inv, d, consequential=consequential)
+    if out.blocks:
+        # The act ended DENIED (e.g. its evidence did not commit): give the approvals back.
+        st, _ = _scope_rpc(inv, "release", key, end=inv.deadline)
+        note = ("hestia: scope approvals released — the act was denied, nothing consumed"
+                if st in ("released", "settled", "unknown") else
+                f"hestia: scope approval release UNCERTAIN ({st}) — if it did not land, the "
+                f"reservation lapses into spent; operation {key[:16]}…")
+    else:
+        st, _ = _scope_rpc(inv, "commit", key, end=inv.deadline)
+        note = (f"hestia: scope approvals spent for {', '.join(inv.scope_spend)}"
+                if st in ("committed", "settled") else
+                f"hestia: scope approval commit UNCERTAIN ({st}) — an unreported reservation "
+                f"lapses into spent, so the approval is consumed either way; operation {key[:16]}…")
+    return replace(out, notices=tuple(out.notices) + (note,))
+
+
+def mechanism_reservation_secs() -> int:
+    """The daemon's reservation window, as the deny text states it (`SCOPE_RESERVATION_SECS`)."""
+    return 120
 
 
 def _unbounded(bound: HarnessBound, profile: Any, event: Any, mode: str,
@@ -991,8 +1515,10 @@ def decide(event: GateEvent, profile: GateProfile, *, rollout: Optional[str] = N
         if not isinstance(profile, GateProfile):
             raise TypeError("decide requires a GateProfile")
         inv = _Invocation(event=event, profile=profile, rollout=mode, deadline=deadline,
+                          registered=registered_surface(bound, profile),
                           key=mechanism.correlation_key(event.raw), budget=budget)
         inv.attempted = attempted_of(event)
+        inv.attempted_full = attempted_record_of(event)
         return _sequence(inv, permitted_roles)
     except BaseException as exc:  # noqa: BLE001 — a gate that cannot decide must not allow
         detail = f"{type(exc).__name__}: {exc}"[:300]

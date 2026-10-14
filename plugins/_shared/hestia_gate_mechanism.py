@@ -311,6 +311,17 @@ _CREDENTIAL_SHAPES = (
 ATTEMPTED_MAX = 220
 ATTEMPTED_PATH_MAX = 140
 
+#: The bound for the act carried on a scope-request RECORD, and its marker. The 220 display
+#: summary is sized for a member mid-task (#185); the record's reader is a NOT-SAME peer
+#: ruling from the record alone, on another seat (dp 2026-10-05: scope escalations go to
+#: peers) — a peer cannot approve bytes it cannot see, and on 2026-10-13 codex refused five
+#: scope requests on exactly that ground (#648). A cut at this bound is rare and VISIBLE.
+#: The daemon's `SCOPE_ACT_MAX` (core/src/server/handler.rs) holds the same value and marker —
+#: change them together (the truncation-census lesson: same marker, same number, no shared
+#: constant is how the 220/400 split stayed invisible for five weeks).
+SCOPE_ACT_MAX = 4000
+SCOPE_ACT_MARK = "…[truncated]"
+
 
 def credential_shaped(text: str) -> bool:
     """Does this text plausibly carry a credential? One helper for the command AND the path
@@ -320,7 +331,8 @@ def credential_shaped(text: str) -> bool:
 
 
 def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str] = None,
-                      targets: Optional[list] = None) -> str:
+                      targets: Optional[list] = None,
+                      max_len: int = ATTEMPTED_MAX, mark: str = " …") -> str:
     """WHAT was attempted, in one bounded, self-censoring line, for the record and for the
     human who rules on an escalation (dp 2026-08-03: "they don't tell me what i'm approving").
 
@@ -330,7 +342,11 @@ def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str]
          with its length stated (`[REDACTED — ...; N chars withheld ...]`); otherwise the
          value after a credential-ish key is masked (`_mask_credential_values`).
       2. The daemon (`handler.rs`) masks `key=value` / `--key value` again on receipt.
-    Only layer 1 covers key files, ssh/gpg paths, PEM blocks and credential-shaped paths."""
+    Only layer 1 covers key files, ssh/gpg paths, PEM blocks and credential-shaped paths.
+
+    `max_len`/`mark` exist for the ONE second reader this summary was re-pointed at: the
+    scope-request record (`attempted_for_record`), whose reader is a NOT-SAME peer ruling
+    from the record alone, not the member mid-task the default 220 is sized for (#648)."""
     if not isinstance(tool_input, dict):
         return f"{tool_name} (no inspectable input)"
     if isinstance(command, str):
@@ -339,7 +355,7 @@ def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str]
             return (f"{tool_name} [REDACTED — names a credential-shaped token; "
                     f"{len(s)} chars withheld rather than copied into the record]")
         s = _mask_credential_values(s)
-        return f"{tool_name}: {s[:ATTEMPTED_MAX]}" + (" …" if len(s) > ATTEMPTED_MAX else "")
+        return f"{tool_name}: {s[:max_len]}" + (mark if len(s) > max_len else "")
     paths = [tool_input.get(k) for k in ("file_path", "path", "notebook_path", "url")]
     paths = [p for p in paths if isinstance(p, str) and p][:1] or [
         t for t in (targets or []) if isinstance(t, str) and t]
@@ -360,8 +376,18 @@ def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str]
             return (f"{tool_name} [REDACTED — names a credential-shaped token; "
                     f"{len(s)} chars withheld rather than copied into the record]")
         s = _mask_credential_values(s)
-        return f"{tool_name}: {s[:ATTEMPTED_MAX]}" + (" …" if len(s) > ATTEMPTED_MAX else "")
+        return f"{tool_name}: {s[:max_len]}" + (mark if len(s) > max_len else "")
     return f"{tool_name} (no command or path in input)"
+
+
+def attempted_for_record(tool_name: str, tool_input: Any, *, command: Optional[str] = None,
+                         targets: Optional[list] = None) -> str:
+    """The act at RECORD depth, for the scope-request record (#648): attempted_summary's
+    masking under SCOPE_ACT_MAX with a visible cut marker. The 220 display summary answers
+    the member mid-task ("what did the gate just refuse?"); this answers the NOT-SAME peer
+    ruling from the record alone ("exactly which bytes am I approving?")."""
+    return attempted_summary(tool_name, tool_input, command=command, targets=targets,
+                             max_len=SCOPE_ACT_MAX, mark=SCOPE_ACT_MARK)
 
 
 def _shell_target(command: str) -> str:
@@ -1643,6 +1669,212 @@ def claim_self_write(marker, tool_name, attempted, *,
         return "no-channel", f"refused, and NO escalation was opened — {why}", None, None
     return ("escalated", "refused; escalation opened for out-of-band decision",
             esc_id, r.get("how_to_decide") or f"hestia gate approve {esc_id}")
+
+
+#: Scope refusals that open (or re-find) a scope request on the operator's queue. `mrh.repo` is
+#: not here: it names a repository, not a path, and the scope store holds paths.
+SCOPE_ESCALATING_RULES = ("mrh.path", "mrh.command")
+
+
+def scope_request_key(plugin_id: str, path: str) -> str:
+    """THE SCOPE REQUEST KEY: member and resolved path. Re-issuing a refused act that reaches the
+    same path finds the same request instead of minting a new id each time (legion-being, #956:
+    nine ids for three paths in one night). The daemon recomputes it; this copy is for the deny
+    text and `hestia gate lookup`-style recovery, never for deciding."""
+    import hashlib
+    return hashlib.sha256("\x1f".join(["hestia:scope-request-key", plugin_id, path])
+                          .encode("utf-8")).hexdigest()
+
+
+def scope_act_digest(tool_name, tool_input, cwd, host_session_id) -> str:
+    """THE ACT BINDING for a one-time scope approval: sha256 over the canonical, COMPLETE act —
+    the whole tool input (Write/Edit contents, the unmasked command), the working directory and
+    the host session. Never over the masked/truncated display summary (Codex review of #1232,
+    P1-1; the #1229 / #627 class: a scrubbed preview must never be an authorisation preimage).
+    Only the digest leaves this process. `description` is dropped: it is the harness's prose
+    about the act, not the act, and an identical retry must redeem the approval. Invocation ids
+    are excluded for the same reason."""
+    import hashlib
+    ti = tool_input if isinstance(tool_input, dict) else {"_raw": tool_input}
+    ti = {k: v for k, v in ti.items() if k != "description"}
+    canon = json.dumps({"v": 1, "tool": tool_name, "input": ti, "cwd": cwd or "",
+                        "session": host_session_id or ""},
+                       sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+#: Outcome of a scope RPC whose answer did not arrive: the mutation MAY have landed.
+SCOPE_UNCERTAIN = "uncertain"
+
+
+def scope_call(tool, args, *, plugin_id, role, client_name, host_session_id=None, deadline=None):
+    """`gate_self_call` with an ABSOLUTE deadline threaded through every hop (Codex re-review of
+    #1232, P2): before each request the remaining budget is checked and each socket timeout is
+    capped by it, so a slow connect can never let the MUTATING call go out after the caller has
+    already decided. Returns the result dict, or None when nothing was sent (out of time before
+    the mutating call), or `SCOPE_UNCERTAIN` when the mutating call was SENT and no answer came —
+    the daemon may have applied it. Never raises."""
+    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+    end = deadline if deadline is not None else time.monotonic() + 3.0
+
+    def left(cap):
+        rem = end - time.monotonic()
+        if rem <= 0.02:
+            raise TimeoutError("deadline")
+        return min(cap, rem)
+
+    def post(payload, hdrs, cap):
+        req = urllib.request.Request(
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream", **hdrs})
+        with urllib.request.urlopen(req, timeout=left(cap)) as r:
+            return r.read(), r.headers.get("mcp-session-id")
+
+    def unwrap(raw):
+        for line in raw.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not (line.startswith("{") or line.startswith("data: {")):
+                continue
+            try:
+                pl = json.loads(line[line.index("{"):])
+            except Exception:
+                continue
+            res = pl.get("result")
+            if not isinstance(res, dict):
+                continue
+            sc = res.get("structuredContent")
+            if isinstance(sc, dict):
+                return sc
+            content = res.get("content") or []
+            if content and isinstance(content[0], dict):
+                try:
+                    d = json.loads(content[0].get("text") or "{}")
+                    return d if isinstance(d, dict) else None
+                except Exception:
+                    return None
+        return None
+
+    sent = False
+    try:
+        _, sid_hdr = post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                      "clientInfo": {"name": client_name, "version": "1"}}}, {}, 0.8)
+        h = {"mcp-session-id": sid_hdr} if sid_hdr else {}
+        post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}, h, 0.4)
+        connect_args = {"plugin_id": plugin_id, "host_agent": plugin_id, "role": role,
+                        "instance_name": "gate-self"}
+        if host_session_id:
+            connect_args["host_session_id"] = host_session_id
+        raw, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "hestia_connect", "arguments": connect_args}}, h, 0.8)
+        conn = unwrap(raw)
+        sess = conn.get("sessionId") if conn else None
+        if not sess:
+            return None
+        args = dict(args)
+        args.setdefault("session_id", sess)
+        payload = {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                   "params": {"name": tool, "arguments": args}}
+        cap = left(0.9)                    # checked BEFORE the mutating request goes out
+        sent = True
+        raw, _ = post(payload, h, cap)
+        out = unwrap(raw)
+        return out if isinstance(out, dict) else SCOPE_UNCERTAIN
+    except Exception:
+        return SCOPE_UNCERTAIN if sent else None
+
+
+def scope_op_key(act_digest, invocation_key, paths) -> str:
+    """The operation key of ONE reserve/commit cycle: the act digest, this invocation's
+    correlation key, and the paths. A retry of the same invocation reuses it (the daemon's
+    reserve is idempotent per key); a later re-issue of the act is a new invocation."""
+    import hashlib
+    return hashlib.sha256("\x1f".join(["hestia:scope-op", act_digest, invocation_key or "",
+                                       *sorted(paths)]).encode("utf-8")).hexdigest()
+
+
+def scope_batch(op, op_key, act_digest, paths=(), *, plugin_id, role, client_name,
+                host_session_id=None, deadline=None):
+    """One reserve / commit / release / lookup for `op_key`. Returns (state, detail) where state
+    is the daemon's verdict (`reserved`, `not_all`, `committed`, `released`, `lapsed`, `settled`,
+    `unknown`, …), `SCOPE_UNCERTAIN` when the request went out and no answer came, or
+    "not_sent" when the deadline ran out first (nothing was sent). Never raises."""
+    args = {"plugin_id": plugin_id, "role": role, "op": op, "op_key": op_key,
+            "act_digest": act_digest}
+    if paths:
+        args["paths"] = list(paths)
+    if host_session_id:
+        args["host_session_id"] = host_session_id
+    r = scope_call("hestia_scope_claim", args, plugin_id=plugin_id, role=role,
+                   client_name=client_name, host_session_id=host_session_id, deadline=deadline)
+    if r is None:
+        return "not_sent", "the deadline passed before the request was sent; nothing was sent"
+    if r == SCOPE_UNCERTAIN:
+        return SCOPE_UNCERTAIN, ("the request was sent and no answer arrived — the daemon may "
+                                 "have applied it")
+    if isinstance(r.get("_hestia_error"), dict):
+        return "error", str(r["_hestia_error"].get("message") or "refused")
+    return str(r.get("verdict") or "error"), str(r.get("detail") or "")
+
+
+def claim_scope(path, tool_name, attempted, rule, *, plugin_id, role, client_name,
+                host_session_id=None, spend=True, act_digest=None, deadline=None):
+    """After a SCOPE refusal (dp, 2026-10-05: "escalation should allow standing grants"), ask the
+    daemon ONCE what stands for this (member, path). Returns (verdict, detail, request_id).
+
+    Verdicts — the daemon owns every one; this function re-derives nothing:
+      * "approved"   — an operator granted THIS act once; spent now (single use, claim window).
+      * "in_force"   — a live or standing grant already covers the path (the snapshot raced).
+      * "opened"     — no request stood; one was opened on the operator's queue.
+      * "pending"    — the request for this path is still waiting; same id, no new record.
+      * "refused"    — the operator refused it; re-issuing does not re-open it inside the window.
+      * "not_opened" — the daemon declined to open one (its cap, or it predates the verb).
+      * "unknown"    — no answer inside the budget; the act stays refused.
+    Only "approved" and "in_force" lift the refusal, and the caller re-judges the act with that
+    one path added before anything proceeds. `spend=False` PEEKS: a one-time approval is reported
+    as "approved" but not spent (the caller has other refused paths to clear first). Never
+    raises, never waits."""
+    act = attempted or f"{tool_name} -> {path}"
+    if len(act) > SCOPE_ACT_MAX:
+        act = act[:SCOPE_ACT_MAX] + SCOPE_ACT_MARK
+    args = {
+        "plugin_id": plugin_id,
+        "role": role,
+        "path": path,
+        "rule": rule,
+        "tool_name": tool_name,
+        # The ATTEMPTED ACT at record depth — not a rationale, and not the 220 display summary:
+        # since dp's 2026-10-05 ruling the decider is a NOT-SAME PEER whose only view of the
+        # act is this record (#648), so the caller passes `attempted_for_record` output. The
+        # member did not choose to ask; the gate opened this on a refusal, and says so.
+        "act": act,
+        "request_key": scope_request_key(plugin_id, path),
+        "spend": bool(spend),
+        # The authorisation binding: a digest of the COMPLETE act (scope_act_digest). `act`
+        # above is evidence for the deciding peer; the digest, never the display text, is what
+        # an approval binds (P1-1).
+        "act_digest": act_digest or "",
+    }
+    if host_session_id:
+        args["host_session_id"] = host_session_id
+    r = scope_call("hestia_scope_claim", args, plugin_id=plugin_id, role=role,
+                   client_name=client_name, host_session_id=host_session_id, deadline=deadline)
+    if not isinstance(r, dict):
+        sent = r == SCOPE_UNCERTAIN
+        return ("unknown",
+                ("the daemon did not answer inside the deadline (uncertain whether a request "
+                 "was opened); " if sent else "the deadline passed before the daemon was asked; ")
+                + "the act stays refused, and re-issuing it is safe — it finds the same request "
+                  "rather than opening another", None)
+    verdict = r.get("verdict")
+    rid = r.get("request_id")
+    if verdict in ("approved", "in_force") and r.get("permits") is True:
+        return verdict, str(r.get("detail") or verdict), rid
+    if verdict in ("opened", "pending", "refused") and isinstance(rid, str) and rid:
+        return verdict, str(r.get("detail") or verdict), rid
+    why = r.get("detail") or r.get("error") or "this daemon has no scope-claim verb (is it upgraded?)"
+    return "not_opened", str(why), None
 
 
 def tally_scope(allowed, *, tally_dir, tally_path, attest_every, plugin_id, role_lct,

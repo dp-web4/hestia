@@ -725,7 +725,7 @@ fn deployment_update_trigger_for(os: &str, uid: Option<&str>) -> Option<Deployme
     }
 }
 
-fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, String), String> {
+fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, String, Option<String>), String> {
     let manifest_path = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| "deployment update unavailable: HESTIA_CURRENT_BUILD_FILE is not configured".to_string())?;
@@ -746,7 +746,10 @@ fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, Str
     let home = manifest_path
         .parent()
         .ok_or_else(|| "deployment update unavailable: deployment authority has no parent directory".to_string())?;
-    Ok((home.to_path_buf(), target.to_string()))
+    // The full commit the installer recorded (#1250): builds are compared by commit, not by the
+    // clone-dependent abbreviation in the describe string.
+    let head_sha = manifest.get("head_sha").and_then(serde_json::Value::as_str).map(str::to_string);
+    Ok((home.to_path_buf(), target.to_string(), head_sha))
 }
 
 fn create_deployment_update_request(
@@ -853,7 +856,7 @@ async fn operator_deployment_update(
         current_operator_context(&s, &headers, now)
     };
 
-    let (home, authority_build) = match deployment_update_authority() {
+    let (home, authority_build, authority_head_sha) = match deployment_update_authority() {
         Ok(value) => value,
         Err(error) => {
             return (
@@ -866,7 +869,7 @@ async fn operator_deployment_update(
         }
     };
 
-    if authority_build == env!("HESTIA_GIT_VERSION") {
+    if super::dashboard::same_deployed_build(&authority_build, authority_head_sha.as_deref(), env!("HESTIA_GIT_VERSION")) {
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1518,6 +1521,11 @@ pub async fn serve_with_callback(
         // an operator establishes a session; issuing a challenge grants nothing).
         .route("/api/operator/challenge", post(operator_challenge))
         .route("/api/operator/session", post(operator_session))
+        // The app/daemon handshake (web4#904): {version, build_id, api_compat}. Open for the
+        // same reason as the challenge — the app must learn whether it speaks this daemon's
+        // API before it can sign in — and it reveals only what `hestia --version` prints.
+        // Lock-free; see server/api_version.rs.
+        .route("/api/version", get(super::api_version::api_version))
         // OID4VCI issuance (EUDI Phase 2) — hestia as person-scale issuer.
         // /metadata + /nonce are legitimately unauthenticated (discovery + a freshness
         // nonce grant nothing). /credential — which mints an OWNER-SIGNED presentation —
@@ -2758,6 +2766,19 @@ async fn scope_list_requests(State(state): State<SharedState>) -> impl IntoRespo
                 "decided_by": r.decided_by,
                 "decided_at": r.decided_at,
                 "decision_reason": r.decision_reason,
+                // 2026-10-05: what the gate refused, when the gate opened it.
+                "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                "gate": r.ext.gate,
+                "once": r.ext.once,
+                "spent_at": r.ext.spent_at,
+                "grant_path": r.reach_path(),
+                "recursive": r.recursive,
+                "invited_peers": r.ext.invited_peers,
+                "peer_basis": r.ext.peer_basis,
+                // #1287 part 2: what a surface may offer, from the decide endpoint's own source.
+                "enumerable": !crate::server::state::is_unpriceable_scope_path(&r.path),
+                "allowed_decisions": crate::server::state::scope_allowed_decisions(
+                    &r.path, r.ext.gate.is_some()),
             })
         })
         .collect();
@@ -2784,6 +2805,38 @@ async fn scope_decide(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    scope_decide_as(state, body, ScopeDecider::operator()).await
+}
+
+/// WHO rules a scope request, carried into every record the ruling writes.
+///
+/// dp, 2026-10-05: *"scope escalations should go to peers not to me."* A gate-opened scope
+/// request is decided by a NOT-SAME PEER (`hestia_scope_peer_decide`, eligibility by
+/// `arbiter::eligibility_for`); the operator keeps the override through this HTTP surface. Both
+/// land through ONE decision function so the duration / breadth / once rules cannot drift
+/// between them, and the record names the decider, its channel and — for a peer — its NOT-SAME
+/// basis.
+#[derive(Debug, Clone)]
+pub(crate) struct ScopeDecider {
+    /// `operator`, or `peer:<member>`.
+    pub by: String,
+    /// `operator_session` | `peer_not_same`.
+    pub via: &'static str,
+    /// For a peer: `{"arbiter", "asker", "asker_basis", "independence"}`.
+    pub basis: Option<serde_json::Value>,
+}
+
+impl ScopeDecider {
+    pub(crate) fn operator() -> Self {
+        Self { by: "operator".into(), via: "operator_session", basis: None }
+    }
+}
+
+pub(crate) async fn scope_decide_as(
+    state: SharedState,
+    body: serde_json::Value,
+    decider: ScopeDecider,
+) -> (StatusCode, Json<serde_json::Value>) {
     use crate::server::state::SCOPE_REQUEST_TTL_SECS;
     let request_id = body
         .get("request_id")
@@ -2795,6 +2848,18 @@ async fn scope_decide(
     // Exact by default (dp, 2026-09-08). Recursion is the operator's explicit choice at
     // decide time, never something the asking member can set: a request names ONE path.
     let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    // ONE-TIME (2026-10-05; PRD_ALLOWLISTS §5's first duration): approve exactly the act the
+    // gate refused, once, inside the claim window. Not a grant of reach — never served as
+    // policy; only `hestia_scope_claim` spends it, and only for that act.
+    let once = body.get("once").and_then(|v| v.as_bool()).unwrap_or(false);
+    // BREADTH (2026-10-05, #1022's operator half): the path the grant reaches from — the asked
+    // path, or an ANCESTOR of it the operator chose (then necessarily recursive: an exact grant
+    // on an ancestor does not reach the asked path). Absent = exactly the asked path.
+    let grant_path_arg: Option<String> = body
+        .get("grant_path")
+        .and_then(|v| v.as_str())
+        .map(|p| crate::server::state::normalize_scope_path(p))
+        .filter(|p| !p.is_empty());
     let granted = match body.get("granted").and_then(|v| v.as_bool()) {
         Some(g) => g,
         // No default. An absent verdict is not a deny and not an approve — it is a malformed
@@ -2836,11 +2901,23 @@ async fn scope_decide(
             })),
         );
     }
+    if once && (!granted || standing || recursive || grant_path_arg.is_some()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "once:true approves ONE act exactly as it was refused — it is a grant, \
+                          never standing, never recursive, and has no breadth to choose"
+            })),
+        );
+    }
     let now = crate::server::gate_escalation::now_secs();
-    let window = body
-        .get("expires_in_secs")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(SCOPE_REQUEST_TTL_SECS);
+    let window = if once {
+        // The claim window is the gate escalations' own constant, so a one-time scope approval
+        // dies on the same clock a one-time governance approval does.
+        crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS
+    } else {
+        body.get("expires_in_secs").and_then(|v| v.as_u64()).unwrap_or(SCOPE_REQUEST_TTL_SECS)
+    };
     // The STANDING expiry is different on purpose: given a window, it is bounded by it;
     // absent one, it is durable until revoked — `None`, never a silent default TTL, because
     // "standing" with an invisible 8h fuse would teach operators the store lies.
@@ -2871,6 +2948,72 @@ async fn scope_decide(
         );
     }
     let (plugin_id, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
+    let gate_origin = req.ext.gate.clone();
+    // WHICH KINDS this request accepts comes from `scope_allowed_decisions` — the same function
+    // every operator surface reads its offer from (`allowed_decisions` on the snapshot, the
+    // request listing and the ledger), so a button the UI renders is one this check admits
+    // (#1287 part 2: dp clicked a plain grant on an unenumerated request and learnt the rule
+    // from this error).
+    let kind = crate::server::state::scope_decision_kind(granted, once, standing);
+    let allowed = crate::server::state::scope_allowed_decisions(&path, gate_origin.is_some());
+    if !allowed.contains(&kind) {
+        let error = if kind == "once" {
+            "a one-time approval binds to the act the gate refused, and this request was filed by \
+             the member — it names no act. Grant it for the session or standing instead"
+        } else {
+            // An UNENUMERATED act (dp, 2026-10-10, #1232 narrowed): the gate could not
+            // enumerate what it reaches, so the request names the act, not a path. ONCE (that
+            // act, exactly) or refuse — a session or standing grant would have to name a path
+            // nobody knows.
+            "the gate could not enumerate what this act reaches (an expansion decides it), so \
+             there is no path a session or standing grant could name: approve it ONCE (this \
+             act, exactly) or refuse it"
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error, "kind": kind, "allowed_decisions": allowed})),
+        );
+    }
+    // The breadth, validated against the ASKED path: equal, or an ancestor at a separator.
+    let reach_path: String = match grant_path_arg.as_deref() {
+        None => path.clone(),
+        Some(gp) if gp == path => path.clone(),
+        Some(gp) => {
+            let is_ancestor = gp.starts_with('/')
+                && gp != "/"
+                && crate::server::standing_scope::covers_path(gp, true, &path);
+            if !is_ancestor {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("grant_path must be the asked path ({path}) or a \
+                                          directory above it (and never the root); got {gp}")
+                    })),
+                );
+            }
+            if !recursive {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "a grant on a directory ABOVE the asked path must be recursive — \
+                                  an exact grant there would not reach what was asked"
+                    })),
+                );
+            }
+            gp.to_string()
+        }
+    };
+    // A glob reach (`dir/*`) is covered only by a recursive grant; an exact grant would be
+    // spent without ever admitting the act, so it is refused here with the reason.
+    if granted && !once && !recursive && gate_origin.as_ref().is_some_and(|g| g.subtree) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "the refused act was a glob over this directory; only a RECURSIVE grant \
+                          reaches it (or approve the act once)"
+            })),
+        );
+    }
     // A retired id is refused authority through THIS door too, live or standing. A phantom
     // cannot file a request, so this bites only on a retired live seat -- which is the arm the
     // guard exists for, and the one a reviewer probed (cbp, PR #1100).
@@ -2926,14 +3069,20 @@ async fn scope_decide(
             // the whole evidentiary value of the record.
             "requested_because": ask,
             "decision_reason": reason,
-            "granted_by": "operator",
-            "via": "operator_session",
+            "granted_by": decider.by,
+            "via": decider.via,
+            "peer_basis": decider.basis,
             "expires_at": expires_at,
             // The promotion is part of the record, not a separate act: the standing grant's
             // expiry and the generation it will mint travel with the ruling that made it.
             "standing": standing,
             "standing_expires_at": standing_expires_at,
             "recursive": recursive,
+            // 2026-10-05: the duration and breadth the operator chose, and what was asked.
+            "once": once,
+            "grant_path": reach_path,
+            "origin": if gate_origin.is_some() { "gate_deny" } else { "member_request" },
+            "act_digest": gate_origin.as_ref().map(|g| g.act_digest.clone()),
             "standing_generation": if standing {
                 serde_json::json!(s.standing_scope.generation + 1)
             } else {
@@ -2942,6 +3091,9 @@ async fn scope_decide(
             "durability": if standing {
                 "STANDING — written to the vault's standing-scope document; survives restart; \
                  revocable via /api/scope/standing/revoke; identity.json is untouched"
+            } else if once {
+                "ONE-TIME — this act, once, inside the claim window; never served as policy; \
+                 spent by the gate's hestia_scope_claim"
             } else {
                 "memory-only — a daemon restart revokes it; identity.json is untouched"
             },
@@ -2996,9 +3148,11 @@ async fn scope_decide(
         let standing_prior = s.standing_scope.clone();
         let grant = crate::server::standing_scope::StandingGrant {
             member: plugin_id.clone(),
-            path: path.clone(),
+            // The breadth the decider chose (the asked path or a directory above it).
+            path: reach_path.clone(),
             granted_at: now,
-            granted_by: "operator".to_string(),
+            // `operator`, or `peer:<member>` — the record names who ruled.
+            granted_by: decider.by.clone(),
             reason: reason.clone(),
             expires_at: standing_expires_at,
             request_id: Some(request_id.clone()),
@@ -3029,11 +3183,14 @@ async fn scope_decide(
                 "request_id": request_id,
                 "plugin_id": plugin_id,
                 "subject_instance_lct": s.member_lct(&plugin_id),
-                "path": path,
+                "path": reach_path,
+                "asked_path": path,
+                "recursive": recursive,
                 "decision_reason": reason,
-                "granted_by": "operator",
-                "via": "operator_session",
-                "origin": "member_request",
+                "granted_by": decider.by,
+                "via": decider.via,
+                "peer_basis": decider.basis,
+                "origin": if gate_origin.is_some() { "gate_deny" } else { "member_request" },
                 "standing": true,
                 "standing_expires_at": standing_expires_at,
                 "standing_generation": s.standing_scope.generation,
@@ -3085,7 +3242,8 @@ async fn scope_decide(
 
     if let Some(req) = s.scope_requests.get_mut(&request_id) {
         req.granted = Some(granted);
-        req.decided_by = Some("operator".to_string());
+        req.decided_by = Some(decider.by.clone());
+        req.ext.peer_basis = decider.basis.clone();
         req.decided_at = Some(now);
         req.decision_reason = if reason.is_empty() {
             None
@@ -3094,6 +3252,8 @@ async fn scope_decide(
         };
         req.expires_at = expires_at;
         req.recursive = recursive;
+        req.ext.once = granted && once;
+        req.ext.granted_path = (granted && reach_path != path).then(|| reach_path.clone());
     }
 
     // #459: the decision's RETURN EDGE. The requester filed through MCP and until
@@ -3116,6 +3276,9 @@ async fn scope_decide(
             "request_id": request_id,
             "granted": granted,
             "path": path,
+            "grant_path": reach_path,
+            "recursive": recursive,
+            "once": once,
             "expires_at": expires_at,
             "standing": standing,
             "standing_expires_at": standing_expires_at,
@@ -4968,7 +5131,7 @@ async fn scope_standing_promote(
     let Some(live) = s
         .scope_requests
         .values()
-        .find(|r| r.plugin_id == plugin_id && r.path == path && r.is_live(now))
+        .find(|r| r.plugin_id == plugin_id && r.reach_path() == path && r.is_live(now))
         .cloned()
     else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -5144,7 +5307,7 @@ async fn scope_standing_recursive(
         .find(|g| g.member == plugin_id && g.path == path && g.is_live(now))
         .map(|g| g.recursive);
     let live: Option<(String, bool)> = s.scope_requests.values()
-        .find(|r| r.plugin_id == plugin_id && r.path == path && r.is_live(now))
+        .find(|r| r.plugin_id == plugin_id && r.reach_path() == path && r.is_live(now))
         .map(|r| (r.id.clone(), r.recursive));
     if standing_now.is_none() && live.is_none() {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -6513,10 +6676,29 @@ fn refuse_if_retired(
 
 const RETIRE_ACTIVE_WINDOW_HOURS: i64 = 24;
 
+/// The operator principal for a retirement's act rows: `operator` is the authenticated
+/// principal for EVERY session kind (codex review of #1035, finding 1: reading
+/// provenance.principal alone wrote the office literal for a direct dashboard session);
+/// provenance.principal is the composed-session fallback. WHO retired is evidence — the
+/// literal "operator" this replaced named a role, not a party (#1036). A session always
+/// carries a principal, so the final fallback names the degradation (the dev-override
+/// path inserts no witness) rather than inventing an operator.
+fn gate_operator(gate: &Option<axum::Extension<super::operator_auth::GateWitness>>) -> String {
+    match gate {
+        Some(axum::Extension(w)) => w
+            .operator
+            .clone()
+            .or_else(|| w.provenance.as_ref().map(|p| p.principal.clone()))
+            .unwrap_or_else(|| "operator (direct session)".to_string()),
+        None => "operator (session not recorded on this path)".to_string(),
+    }
+}
+
 /// Retire an id on THIS seat: revoke its standing grants and take it out of the default view.
 /// Never deletion; see `server::retirement` for what it is and is deliberately not.
 async fn agent_retire(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -6550,6 +6732,7 @@ async fn agent_retire(
     let recent = measured.clone().unwrap_or(0);
 
     let now = crate::server::gate_escalation::now_secs();
+    let retired_by = gate_operator(&gate);
     let held: Vec<String> = s.standing_scope.grants.iter()
         .filter(|g| g.member == plugin_id).map(|g| g.path.clone()).collect();
     let record = serde_json::json!({
@@ -6562,14 +6745,14 @@ async fn agent_retire(
         "acts_measurable": measured.is_ok(),
         "window_hours": RETIRE_ACTIVE_WINDOW_HOURS,
         "confirmed_active": confirm_active,
-        "retired_by": "operator",
+        "retired_by": retired_by,
         "scope": "this seat only — a retirement is not published to the hub and does not reach \
                   another seat's registry",
     });
     // INTENT -> COMMIT -> SUCCESS, the ordering `witness_and_commit_standing_grant` exists to
     // keep: a failed commit must not leave the chain asserting an authority change that never
     // took effect.
-    let intent = match s.append_chain("member_retire_intent", record.clone()) {
+    let intent = match s.append_chain("member_retire_intent", stamp_gate(record.clone(), &gate)) {
         Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
@@ -6577,6 +6760,7 @@ async fn agent_retire(
     let rec = crate::server::retirement::RetiredMember {
         plugin_id: plugin_id.clone(), retired_at: now, reason: reason.clone(),
         evidence_ref: evidence_ref.clone(), revoked_paths: held.clone(), was_active: recent > 0,
+        retired_by: retired_by.clone(),
     };
     let revoked = match s.commit_retirement(&reason, |st| { st.retire(rec); Some(plugin_id.clone()) }) {
         Ok(v) => v,
@@ -6595,7 +6779,7 @@ async fn agent_retire(
         m.insert("revoked_delegations".into(), serde_json::json!(revoked.delegations));
         m.insert("intent".into(), serde_json::json!(intent.hash));
     }
-    let entry = s.append_chain("member_retired", done).ok();
+    let entry = s.append_chain("member_retired", stamp_gate(done, &gate)).ok();
     let gen = s.retired_members.generation;
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "retired": true,
@@ -6617,6 +6801,7 @@ async fn agent_retire(
 /// was revoked so the operator can re-grant deliberately.
 async fn agent_reinstate(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -6639,9 +6824,9 @@ async fn agent_reinstate(
         "was_retired_at": existing.retired_at,
         "was_retired_because": existing.reason,
         "paths_revoked_then_and_NOT_restored_now": existing.revoked_paths,
-        "reinstated_by": "operator",
+        "reinstated_by": gate_operator(&gate),
     });
-    let intent = match s.append_chain("member_reinstate_intent", record.clone()) {
+    let intent = match s.append_chain("member_reinstate_intent", stamp_gate(record.clone(), &gate)) {
         Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
@@ -6650,7 +6835,7 @@ async fn agent_reinstate(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": format!("still retired: {e}"), "intentEntryHash": intent.hash })));
     }
-    let entry = s.append_chain("member_reinstated", record).ok();
+    let entry = s.append_chain("member_reinstated", stamp_gate(record, &gate)).ok();
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "retired": false,
         "generation": s.retired_members.generation,
@@ -9253,7 +9438,7 @@ mod disposition_tests {
                     decided_at: None,
                     decision_reason: None,
                     recursive: false,
-                    revoked: None,
+                    revoked: None, ext: Default::default(),
                 },
             );
         }
@@ -9415,7 +9600,7 @@ mod disposition_tests {
             decided_at: Some(now),
             decision_reason: Some("watched it used well".into()),
             recursive: false,
-            revoked: None,
+            revoked: None, ext: Default::default(),
         }
     }
 
@@ -9900,14 +10085,35 @@ mod disposition_tests {
     }
 
     async fn retire(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let resp = agent_retire(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        retire_gated(state, id, body, None).await
+    }
+
+    /// The same call carrying the gate witness the `operator_gate` middleware inserts —
+    /// the shape the production route always runs with (tests calling a handler directly
+    /// must opt in; `None` is the dev-override / direct-call shape).
+    async fn retire_gated(
+        state: &SharedState,
+        id: &str,
+        body: serde_json::Value,
+        gate: Option<axum::Extension<crate::server::operator_auth::GateWitness>>,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = agent_retire(State(state.clone()), gate, Path(id.to_string()), Json(body)).await.into_response();
         let st = resp.status();
         let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (st, serde_json::from_slice(&b).unwrap())
     }
 
     async fn reinstate(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let resp = agent_reinstate(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        reinstate_gated(state, id, body, None).await
+    }
+
+    async fn reinstate_gated(
+        state: &SharedState,
+        id: &str,
+        body: serde_json::Value,
+        gate: Option<axum::Extension<crate::server::operator_auth::GateWitness>>,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = agent_reinstate(State(state.clone()), gate, Path(id.to_string()), Json(body)).await.into_response();
         let st = resp.status();
         let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (st, serde_json::from_slice(&b).unwrap())
@@ -10461,6 +10667,68 @@ mod disposition_tests {
                  decision rather than discovering an accident");
     }
 
+    /// WHO retired is evidence (#1036's review item 1, ported onto this route when the
+    /// duplicate `/api/operator/member/*` surface was dropped in favour of this one): the
+    /// record names the principal the gate middleware authenticated — never the literal
+    /// "operator", never a body field. The two session shapes carry the principal in
+    /// different places, so both are pinned: a direct dashboard session has `operator`
+    /// and NO provenance (codex review of #1035, finding 1), and a composed session has
+    /// both, with `operator` winning — the fixture below makes them disagree so the
+    /// precedence, not just the plumbing, is what the assert pins.
+    #[tokio::test]
+    async fn a_retirement_names_the_operator_the_gate_authenticated() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "caude-code").await;
+        // Shape 1: the dashboard's ordinary signed-in operator.
+        let direct = Some(axum::Extension(crate::server::operator_auth::GateWitness {
+            operator: Some("lct:web4:operator:dp".into()),
+            provenance: None,
+            gate_entry_hash: Some("gate-row-1".into()),
+        }));
+        let (st, b) = retire_gated(&state, "caude-code", serde_json::json!({
+            "reason": "typo", "ref": "dp 2026-09-08"}), direct).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        {
+            let s = state.lock().await;
+            let chain = s.recent_chain(20);
+            for t in ["member_retire_intent", "member_retired"] {
+                let rec = chain.iter().find(|e| e.event_type == t)
+                    .unwrap_or_else(|| panic!("{t} is witnessed"));
+                assert_eq!(rec.event_data["retired_by"], serde_json::json!("lct:web4:operator:dp"),
+                    "{t} names the authenticated operator, not the role literal");
+                assert_eq!(rec.event_data["authorized_by_gate"], serde_json::json!("gate-row-1"),
+                    "{t} binds the gate row that admitted the request");
+            }
+            assert_eq!(s.retired_members.get("caude-code").unwrap().retired_by,
+                "lct:web4:operator:dp", "the durable row carries the same WHO");
+        }
+        // Shape 2: composed session, with the two principals made to DISAGREE so the
+        // read order is what is pinned.
+        let composed = Some(axum::Extension(crate::server::operator_auth::GateWitness {
+            operator: Some("lct:web4:operator:dp".into()),
+            provenance: Some(crate::server::operator_auth::OperatorProvenance {
+                actor: "lct:web4:actor:app".into(),
+                principal: "lct:web4:operator:other".into(),
+                via_device: "lct:web4:device:cbp".into(),
+                office: "operator".into(),
+                authority: "session-ref-42".into(),
+            }),
+            gate_entry_hash: Some("gate-row-2".into()),
+        }));
+        let (st, b) = reinstate_gated(&state, "caude-code", serde_json::json!({
+            "reason": "restoring the typo for the test"}), composed).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        for t in ["member_reinstate_intent", "member_reinstated"] {
+            let rec = chain.iter().find(|e| e.event_type == t)
+                .unwrap_or_else(|| panic!("{t} is witnessed"));
+            assert_eq!(rec.event_data["reinstated_by"], serde_json::json!("lct:web4:operator:dp"),
+                "{t}: `operator` — the authenticated principal — wins over provenance.principal");
+            assert_eq!(rec.event_data["authorized_by_gate"], serde_json::json!("gate-row-2"));
+        }
+    }
+
     /// #1067, measured on McNugget: a grant to `Claude-code` succeeded, was witnessed, was
     /// durable, and reached nothing, three times, while `claude-code` stayed denied. The
     /// refusal must leave NOTHING behind -- no row, no generation move, no chain entry -- or
@@ -10887,6 +11155,604 @@ mod disposition_tests {
                 "no terminal record for a rewrite that is not in force");
     }
 
+    // ---- scope refusal → escalation with a standing option (dp, 2026-10-05) ----
+
+    /// The gate's complete-act digest, modelled in tests as sha256 of the act text (the real
+    /// gate hashes the canonical complete tool input + cwd + session; the daemon only compares).
+    fn digest_of(act: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(format!("complete-act\u{1f}{act}").as_bytes()))
+    }
+
+    async fn claim(state: &SharedState, member: &str, path: &str, act: &str, spend: bool)
+        -> serde_json::Value {
+        crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+            "plugin_id": member, "path": path, "rule": "mrh.command", "tool_name": "Bash",
+            "act": act, "act_digest": digest_of(act), "spend": spend,
+            "host_session_id": "sess-under-test",
+        })).await.expect("claim answers")
+    }
+
+    async fn batch(state: &SharedState, member: &str, op: &str, op_key: &str, paths: &[&str],
+                   act: &str) -> serde_json::Value {
+        crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+            "plugin_id": member, "op": op, "op_key": op_key, "paths": paths,
+            "act_digest": digest_of(act),
+        })).await.expect("batch answers")
+    }
+
+    /// Two paths, both once-approved for `act`; returns their request ids.
+    async fn two_once_approvals(state: &SharedState, act: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        for p in ["/srv/a", "/srv/b"] {
+            let id = claim(state, "codex", p, act, false).await["request_id"].as_str().unwrap().to_string();
+            assert_eq!(decide(state, serde_json::json!({
+                "request_id": &id, "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Codex review of #1232, P1-1: the binding is a digest of the COMPLETE act, required, and
+    /// two acts that share a display summary but differ in content do not share an approval.
+    #[tokio::test]
+    async fn scope_claim_requires_a_complete_act_digest_and_binds_to_it() {
+        let (_dir, state) = test_state().await;
+        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.command",
+            "tool_name": "Write", "act": "Write -> /etc/review-probe"})).await.unwrap();
+        assert_eq!(r["_hestia_error"]["code"], "hestia.scope_claim_act_digest_required", "{r}");
+        assert!(state.lock().await.scope_requests.is_empty(), "nothing opened without a digest");
+        // Same display summary, different complete act (Write contents): distinct digests.
+        let summary = "Write -> /etc/review-probe";
+        let id = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
+            "tool_name": "Write", "act": summary, "act_digest": digest_of("content: one"),
+            "spend": false})).await.unwrap()["request_id"].as_str().unwrap().to_string();
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "reason": "one write", "once": true})).await.0,
+            StatusCode::OK);
+        let other = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
+            "tool_name": "Write", "act": summary, "act_digest": digest_of("content: two"),
+            "spend": true})).await.unwrap();
+        assert_ne!(other["verdict"], "approved", "a different complete act cannot spend it: {other}");
+        let s = state.lock().await;
+        assert!(s.scope_requests[&id].ext.spent_at.is_none());
+        assert!(!serde_json::to_string(&s.scope_requests[&id]).unwrap().contains("content: one"),
+                "the complete act is never stored in clear");
+    }
+
+    // ---- dp, 2026-10-05: "scope escalations should go to peers not to me" ----
+
+    async fn connect(state: &SharedState, member: &str) -> String {
+        crate::server::handler::tool_connect(state, &serde_json::json!({
+            "plugin_id": member, "host_agent": member,
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// Open a gate request as a PROVEN asker (session) and return (id, invited peers, response).
+    async fn proven_claim(state: &SharedState, member: &str, sid: &str, path: &str)
+        -> (String, Vec<String>, serde_json::Value) {
+        let r = crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+            "plugin_id": member, "session_id": sid, "path": path, "rule": "mrh.command",
+            "tool_name": "Bash", "act": format!("cat {path}"), "act_digest": digest_of(&format!("cat {path}")),
+            "spend": false,
+        })).await.unwrap();
+        let invited = r["invited_peers"].as_array().cloned().unwrap_or_default().iter()
+            .map(|v| v.as_str().unwrap().to_string()).collect();
+        (r["request_id"].as_str().unwrap().to_string(), invited, r)
+    }
+
+    async fn peer(state: &SharedState, sid: &str, body: serde_json::Value) -> serde_json::Value {
+        let mut b = body;
+        b["session_id"] = serde_json::json!(sid);
+        crate::server::handler::tool_scope_peer_decide(state, &b).await.unwrap()
+    }
+
+    /// A gate-opened request from a PROVEN asker invites NOT-SAME peers over the mesh, never the
+    /// asker; the asker cannot decide its own request in either direction.
+    #[tokio::test]
+    async fn scope_peer_decide_invites_peers_and_refuses_the_asker() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "codex").await;
+        let _k = connect(&state, "kimi-code").await;
+        let _c = connect(&state, "claude-code").await;
+        let (id, invited, r) = proven_claim(&state, "codex", &asker, "/srv/peer/a.txt").await;
+        assert!(invited.contains(&"kimi-code".to_string()) && invited.contains(&"claude-code".to_string()),
+                "{r}");
+        assert!(!invited.contains(&"codex".to_string()), "never the asker: {invited:?}");
+        assert_eq!(r["invitations"].as_array().unwrap().len(), invited.len(), "{r}");
+        assert!(r["invitations"].as_array().unwrap().iter().all(|i| !i["queued_id"].is_null()),
+                "each invitation is queued on the mesh: {r}");
+        assert!(r["how_to_decide"].as_str().unwrap().contains("NOT-SAME peer"), "{r}");
+        for d in ["once", "refuse", "standing"] {
+            let own = peer(&state, &asker, serde_json::json!({
+                "request_id": &id, "decision": d, "reason": "my own request"})).await;
+            assert_eq!(own["_hestia_error"]["code"], "hestia.scope_peer_decide_self", "{d}: {own}");
+        }
+        assert_eq!(state.lock().await.scope_requests[&id].granted, None, "nothing decided");
+    }
+
+    /// A peer decides ONCE, SESSION and STANDING (at a chosen recursive directory); the record
+    /// names the peer and its NOT-SAME basis, on the request and on the standing grant.
+    #[tokio::test]
+    async fn scope_peer_decide_once_session_standing_records_peer_and_basis() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "codex").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let (once_id, _, _) = proven_claim(&state, "codex", &asker, "/srv/peer/once.txt").await;
+        let o = peer(&state, &kimi, serde_json::json!({
+            "request_id": &once_id, "decision": "once", "reason": "one read, reviewed"})).await;
+        assert_eq!(o["decided_by"], "peer:kimi-code", "{o}");
+        assert_eq!(o["peer_basis"]["independence"], "cross_vendor");
+        {
+            let s = state.lock().await;
+            let r = &s.scope_requests[&once_id];
+            assert!(r.ext.once && r.decided_by.as_deref() == Some("peer:kimi-code"));
+            assert_eq!(r.ext.peer_basis.as_ref().unwrap()["asker_basis"], "session");
+        }
+        let (sess_id, _, _) = proven_claim(&state, "codex", &asker, "/srv/peer/sess.txt").await;
+        let ss = peer(&state, &kimi, serde_json::json!({
+            "request_id": &sess_id, "decision": "session", "reason": "for this session"})).await;
+        assert_eq!(ss["granted"], true, "{ss}");
+        assert!(state.lock().await.has_scope_grant("codex", "/srv/peer/sess.txt"));
+        let (st_id, _, _) = proven_claim(&state, "codex", &asker, "/srv/peer/tree/x.log").await;
+        let st = peer(&state, &kimi, serde_json::json!({
+            "request_id": &st_id, "decision": "standing", "grant_path": "/srv/peer/tree",
+            "recursive": true, "reason": "the whole log tree"})).await;
+        assert_eq!(st["standing"], true, "{st}");
+        let s = state.lock().await;
+        let g = s.standing_scope.grants.iter().find(|g| g.member == "codex").expect("standing");
+        assert_eq!(g.path, "/srv/peer/tree");
+        assert!(g.recursive);
+        assert_eq!(g.granted_by, "peer:kimi-code", "the standing grant names the peer");
+        let granted = s.recent_chain(40).into_iter()
+            .find(|e| e.event_type == "scope_granted" && e.event_data["standing"] == true).unwrap();
+        assert_eq!(granted.event_data["via"], "peer_not_same");
+        assert_eq!(granted.event_data["peer_basis"]["arbiter"], "kimi-code");
+        // A breadth past the root is refused for a peer exactly as for the operator.
+        drop(s);
+        let (r_id, _, _) = proven_claim(&state, "codex", &asker, "/srv/peer/root.txt").await;
+        let bad = peer(&state, &kimi, serde_json::json!({
+            "request_id": &r_id, "decision": "standing", "grant_path": "/", "recursive": true,
+            "reason": "everything please"})).await;
+        assert_eq!(bad["_hestia_error"]["code"], "hestia.scope_peer_decide_refused", "{bad}");
+    }
+
+    /// An ASSERTED asker (no session) invites nobody and cannot be peer-cleared (clause 0); the
+    /// operator can still decide it — and can override and revoke a peer's grant.
+    #[tokio::test]
+    async fn scope_peer_decide_refuses_an_asserted_asker_and_the_operator_still_overrides() {
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let r = claim(&state, "codex", "/srv/asserted/a.txt", "cat /srv/asserted/a.txt", false).await;
+        let id = r["request_id"].as_str().unwrap().to_string();
+        assert_eq!(r["invited_peers"], serde_json::json!([]), "no peer can clear it: {r}");
+        assert!(r["how_to_decide"].as_str().unwrap().contains("the operator decides"), "{r}");
+        let p = peer(&state, &kimi, serde_json::json!({
+            "request_id": &id, "decision": "session", "reason": "looks fine to me"})).await;
+        assert_eq!(p["_hestia_error"]["code"], "hestia.scope_peer_decide_ineligible", "{p}");
+        // The operator decides it (override).
+        let (st, _) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "reason": "operator override"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(state.lock().await.scope_requests[&id].decided_by.as_deref(), Some("operator"));
+        // A peer-decided request the operator then overrides by REVOKING the live grant.
+        let asker = connect(&state, "codex").await;
+        let (pid, _, _) = proven_claim(&state, "codex", &asker, "/srv/asserted/b.txt").await;
+        let ok = peer(&state, &kimi, serde_json::json!({
+            "request_id": &pid, "decision": "session", "reason": "for this session"})).await;
+        assert_eq!(ok["granted"], true, "{ok}");
+        let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({
+            "request_id": &pid, "reason": "operator revokes"})))
+            .await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!state.lock().await.has_scope_grant("codex", "/srv/asserted/b.txt"),
+                "the operator's revoke ends the peer's grant");
+    }
+
+    /// Codex reviews of #1232, P2: RESERVE is all-or-none through the real handler's batch
+    /// branch, binds to the complete-act digest, opens nothing, and is idempotent per op_key;
+    /// COMMIT spends exactly the reserved approvals once, witnessed as one row.
+    #[tokio::test]
+    async fn scope_claim_reserve_is_all_or_none_and_commit_spends_once() {
+        let (_dir, state) = test_state().await;
+        let act = "cat /srv/a /srv/b";
+        // Only /srv/a approved: reserve takes NOTHING.
+        let a = claim(&state, "codex", "/srv/a", act, false).await["request_id"].as_str().unwrap().to_string();
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &a, "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
+        let b = claim(&state, "codex", "/srv/b", act, false).await["request_id"].as_str().unwrap().to_string();
+        let r = batch(&state, "codex", "reserve", "op-under-test-0001", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(r["verdict"], "not_all", "{r}");
+        assert_eq!(r["missing"], serde_json::json!(["/srv/b"]));
+        assert!(!state.lock().await.scope_requests[&a].ext.reservation_open(), "nothing reserved");
+        assert_eq!(state.lock().await.scope_requests.len(), 2, "a batch opens nothing");
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &b, "granted": true, "reason": "r", "once": true})).await.0, StatusCode::OK);
+        // The digest of a DIFFERENT complete act reserves nothing, even with the same paths.
+        let wrong = batch(&state, "codex", "reserve", "op-under-test-0002", &["/srv/a", "/srv/b"],
+                          "cat /srv/a /srv/b # different complete input").await;
+        assert_eq!(wrong["verdict"], "not_all", "{wrong}");
+        let ok = batch(&state, "codex", "reserve", "op-under-test-0003", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(ok["verdict"], "reserved", "{ok}");
+        assert_eq!(ok["reserved"].as_array().unwrap().len(), 2);
+        let retry = batch(&state, "codex", "reserve", "op-under-test-0003", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(retry["verdict"], "reserved", "an identical retry finds its own reservation");
+        let rival = batch(&state, "codex", "reserve", "op-under-test-0004", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(rival["verdict"], "not_all", "a reserved approval is not reservable twice: {rival}");
+        assert_eq!(state.lock().await.scope_requests[&a].status(crate::server::gate_escalation::now_secs()),
+                   "reserved");
+        let c = batch(&state, "codex", "commit", "op-under-test-0003", &[], act).await;
+        assert_eq!(c["verdict"], "committed", "{c}");
+        let again = batch(&state, "codex", "commit", "op-under-test-0003", &[], act).await;
+        assert_eq!(again["verdict"], "settled", "a second commit spends nothing more: {again}");
+        let look = batch(&state, "codex", "lookup", "op-under-test-0003", &[], act).await;
+        assert_eq!(look["verdict"], "committed");
+        assert_eq!(look["consumed"], true);
+        let s = state.lock().await;
+        let spent: Vec<_> = s.recent_chain(30).into_iter()
+            .filter(|e| e.event_type == "scope_once_spent").collect();
+        assert_eq!(spent.len(), 1, "one commit, one row");
+        assert_eq!(spent[0].event_data["request_ids"].as_array().unwrap().len(), 2);
+        assert!(s.scope_requests.values().all(|r| r.ext.spent_at.is_some()));
+    }
+
+    /// RELEASE returns a denied act's approvals; LOOKUP reports a lost answer honestly; an
+    /// unreported reservation LAPSES INTO SPENT (never spendable twice).
+    #[tokio::test]
+    async fn scope_claim_release_lookup_and_lapse() {
+        let (_dir, state) = test_state().await;
+        let act = "cat /srv/a /srv/b";
+        let ids = two_once_approvals(&state, act).await;
+        assert_eq!(batch(&state, "codex", "lookup", "op-never-dispatched-01", &[], act).await["verdict"],
+                   "unknown");
+        let r = batch(&state, "codex", "reserve", "op-release-test-0001", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(r["verdict"], "reserved", "{r}");
+        let rel = batch(&state, "codex", "release", "op-release-test-0001", &[], act).await;
+        assert_eq!(rel["verdict"], "released", "{rel}");
+        assert_eq!(batch(&state, "codex", "lookup", "op-release-test-0001", &[], act).await["consumed"], false);
+        {
+            let s = state.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            assert!(ids.iter().all(|id| s.scope_requests[id].once_spendable(now)),
+                    "released approvals are spendable again");
+        }
+        // Reserve again and go silent: past SCOPE_RESERVATION_SECS the reservation is consumed.
+        let r2 = batch(&state, "codex", "reserve", "op-lapse-test-00001", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(r2["verdict"], "reserved");
+        {
+            let mut s = state.lock().await;
+            for id in &ids {
+                s.scope_requests.get_mut(id).unwrap().ext.reserved_until = Some(1);
+            }
+        }
+        let look = batch(&state, "codex", "lookup", "op-lapse-test-00001", &[], act).await;
+        assert_eq!(look["verdict"], "lapsed", "{look}");
+        assert_eq!(look["consumed"], true);
+        let rival = batch(&state, "codex", "reserve", "op-lapse-test-00002", &["/srv/a", "/srv/b"], act).await;
+        assert_eq!(rival["verdict"], "not_all", "a lapsed reservation is spent, not free: {rival}");
+        let s = state.lock().await;
+        let now = crate::server::gate_escalation::now_secs();
+        assert!(ids.iter().all(|id| s.scope_requests[id].status(now) == "spent"));
+        assert!(s.recent_chain(30).iter().any(|e| e.event_type == "scope_once_released"));
+    }
+
+    /// The refusal OPENS a request in the existing store, carrying what was refused, and a
+    /// re-issue finds the SAME request (no second id, no second chain row) — #956's nine ids
+    /// for three paths cannot recur through the gate.
+    #[tokio::test]
+    async fn scope_claim_opens_once_and_a_reissue_finds_the_same_request() {
+        let (_dir, state) = test_state().await;
+        let a = claim(&state, "kimi-code", "/outside/mail/profile.ini", "cat /outside/mail/profile.ini", true).await;
+        assert_eq!(a["verdict"], "opened", "{a}");
+        let id = a["request_id"].as_str().unwrap().to_string();
+        let b = claim(&state, "kimi-code", "/outside/mail/profile.ini", "head /outside/mail/profile.ini", true).await;
+        assert_eq!(b["verdict"], "pending", "{b}");
+        assert_eq!(b["request_id"], id.as_str(), "a re-issue never mints a second ask");
+        let s = state.lock().await;
+        assert_eq!(s.scope_requests.len(), 1);
+        let r = &s.scope_requests[&id];
+        assert_eq!(r.granted, None, "a claim never decides");
+        let g = r.ext.gate.as_ref().expect("gate origin recorded");
+        assert_eq!(g.rule, "mrh.command");
+        assert_eq!(g.act, "cat /outside/mail/profile.ini", "the FIRST act is what the operator rules on");
+        assert_eq!(g.reissues, 1);
+        assert_eq!(g.request_key, crate::server::handler::scope_request_key("kimi-code", "/outside/mail/profile.ini"));
+        assert_eq!(g.host_session_id.as_deref(), Some("sess-under-test"));
+        let opened: Vec<_> = s.recent_chain(10).into_iter()
+            .filter(|e| e.event_type == "scope_requested").collect();
+        assert_eq!(opened.len(), 1, "one chain row for one ask");
+        assert_eq!(opened[0].event_data["origin"], "gate_deny");
+        assert!(!s.has_scope_grant("kimi-code", "/outside/mail/profile.ini"), "asking is not receiving");
+    }
+
+    /// ONE-TIME: spent only by the act that was refused, once, and never served as policy.
+    #[tokio::test]
+    async fn scope_claim_spends_a_one_time_approval_exactly_once_for_its_own_act() {
+        let (_dir, state) = test_state().await;
+        let act = "cat /etc/hostname";
+        let id = claim(&state, "codex", "/etc/hostname", act, true).await["request_id"]
+            .as_str().unwrap().to_string();
+        // once cannot be standing, recursive, or widened; and needs a reason like any grant.
+        for bad in [
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "once": true, "standing": true}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "once": true, "recursive": true}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "once": true, "grant_path": "/etc"}),
+            serde_json::json!({"request_id": &id, "granted": false, "once": true}),
+        ] {
+            assert_eq!(decide(&state, bad.clone()).await.0, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let resp = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "reason": "one hostname read", "once": true})).await;
+        assert_eq!(resp.0, StatusCode::OK, "{}", resp.1);
+        {
+            let s = state.lock().await;
+            assert!(!s.has_scope_grant("codex", "/etc/hostname"), "a one-time answer is never policy");
+            assert!(s.live_scope_grants("codex").is_empty(), "and never rides a snapshot");
+        }
+        // another member, or another act, cannot spend it
+        let other = claim(&state, "kimi-code", "/etc/hostname", act, true).await;
+        assert_ne!(other["verdict"], "approved", "{other}");
+        let other_act = claim(&state, "codex", "/etc/hostname", "cp /etc/hostname /tmp/h", true).await;
+        assert_ne!(other_act["verdict"], "approved", "{other_act}");
+        // a PEEK reports it and spends nothing
+        let peek = claim(&state, "codex", "/etc/hostname", act, false).await;
+        assert_eq!(peek["verdict"], "approved", "{peek}");
+        assert_eq!(peek["spent"], false);
+        let spent = claim(&state, "codex", "/etc/hostname", act, true).await;
+        assert_eq!(spent["verdict"], "approved", "{spent}");
+        assert_eq!(spent["spent"], true);
+        assert_eq!(spent["permits"], true);
+        let again = claim(&state, "codex", "/etc/hostname", act, true).await;
+        assert_ne!(again["verdict"], "approved", "single use: {again}");
+        let s = state.lock().await;
+        assert_eq!(s.scope_requests[&id].status(crate::server::gate_escalation::now_secs()), "spent");
+        assert!(s.recent_chain(20).iter().any(|e| e.event_type == "scope_once_spent"
+            && e.event_data["request_id"] == id.as_str()));
+    }
+
+    /// dp, 2026-10-10 (#1232 narrowed): an act whose reach the gate cannot ENUMERATE is asked for
+    /// as the act — #1274's sentinel keyed on its digest — and the only grant it can take is
+    /// "this act once". Session, standing, breadth: refused. In force: never. A malformed
+    /// sentinel opens nothing. Two acts are two requests.
+    #[tokio::test]
+    async fn scope_claim_an_unenumerated_act_is_once_only() {
+        let (_dir, state) = test_state().await;
+        let act = "cat \"$(date +/etc/hostname)\"";
+        let path = format!("hestia:unpriceable:unenumerated#{}", &digest_of(act)[..16]);
+        let opened = claim(&state, "codex", &path, act, false).await;
+        assert_eq!(opened["verdict"], "opened", "{opened}");
+        assert_eq!(opened["path"], path.as_str(), "kept verbatim, never normalised");
+        assert_eq!(opened["subtree"], false);
+        assert!(opened["how_to_decide"].as_str().unwrap().contains("ONCE"), "{opened}");
+        let id = opened["request_id"].as_str().unwrap().to_string();
+        assert!(state.lock().await.scope_requests[&id].reason.contains("cannot enumerate"));
+        for bad in [
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r"}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "standing": true}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "recursive": true}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "grant_path": "/etc"}),
+        ] {
+            let (code, body) = decide(&state, bad.clone()).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{bad} -> {body}");
+        }
+        // a second, different unenumerated act is its own request, not "pending" on the first
+        let act2 = "cat \"$(date +/etc/os-release)\"";
+        let path2 = format!("hestia:unpriceable:unenumerated#{}", &digest_of(act2)[..16]);
+        let second = claim(&state, "codex", &path2, act2, false).await;
+        assert_eq!(second["verdict"], "opened", "{second}");
+        assert_ne!(second["request_id"], id.as_str());
+        // once: spendable exactly by the act it was shown, once, through reserve/commit
+        let ok = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "reason": "read the one file", "once": true})).await;
+        assert_eq!(ok.0, StatusCode::OK, "{}", ok.1);
+        assert!(!state.lock().await.has_scope_grant("codex", &path), "never policy");
+        let r = batch(&state, "codex", "reserve", "op-unenumerated-0001", &[path.as_str()], act).await;
+        assert_eq!(r["verdict"], "reserved", "{r}");
+        let c = batch(&state, "codex", "commit", "op-unenumerated-0001", &[], act).await;
+        assert_eq!(c["verdict"], "committed", "{c}");
+        let again = claim(&state, "codex", &path, act, false).await;
+        assert_ne!(again["verdict"], "approved", "single use: {again}");
+        // a sentinel without the act key, a foreign class, or an uppercase key opens nothing
+        for bad in ["hestia:unpriceable:unenumerated", "hestia:unpriceable:malformed#0123456789abcdef",
+                    "hestia:unpriceable:unenumerated#0123456789ABCDEF",
+                    "hestia:unpriceable:unenumerated#0123"] {
+            let r = claim(&state, "codex", bad, act, false).await;
+            assert_eq!(r["verdict"], "not_opened", "{bad} -> {r}");
+        }
+    }
+
+    /// The dashboard says an unenumerated request is once-only, so the surfaces offer nothing
+    /// broader (spec decide-scope-request).
+    #[tokio::test]
+    async fn scope_snapshot_marks_an_unenumerated_request_once_only() {
+        let (_dir, state) = test_state().await;
+        let act = "for f in a b; do cat $f; done";
+        let path = format!("hestia:unpriceable:unenumerated#{}", &digest_of(act)[..16]);
+        claim(&state, "codex", &path, act, false).await;
+        claim(&state, "codex", "/srv/plain.txt", "cat /srv/plain.txt", false).await;
+        let rows = state.lock().await.dashboard_snapshot(10).pending_scope_requests;
+        let unenum = rows.iter().find(|r| r["path"] == path.as_str()).expect("listed");
+        let plain = rows.iter().find(|r| r["path"] == "/srv/plain.txt").expect("listed");
+        assert_eq!(unenum["once_only"], true, "{unenum}");
+        assert_eq!(plain["once_only"], false, "{plain}");
+    }
+
+    /// #1287 part 2 CONTRACT: for every request shape, the decisions the surfaces are TOLD they
+    /// may offer (`allowed_decisions` on the dashboard snapshot, the request listing and the
+    /// governance ledger) are EXACTLY the decisions the decide endpoint accepts — every listed
+    /// kind is admitted, every unlisted kind is refused. dp clicked a plain grant on
+    /// scope-1981a1b1f6e5 (unenumerated) and learnt the rule from the error; this pins that the
+    /// offer and the check read one source.
+    #[tokio::test]
+    async fn scope_allowed_decisions_are_exactly_what_decide_accepts() {
+        const KINDS: [&str; 4] = ["once", "session", "standing", "refuse"];
+        // BREADTH is a separate axis from the kind: a glob reach is offered recursive breadths
+        // only (scopeBreadthOptions), so its session/standing ruling is sent recursive.
+        let body_for = |id: &str, kind: &str, glob: bool| match kind {
+            "once" => serde_json::json!({"request_id": id, "granted": true, "reason": "r", "once": true}),
+            "session" => serde_json::json!({"request_id": id, "granted": true, "reason": "r", "recursive": glob}),
+            "standing" => serde_json::json!({"request_id": id, "granted": true, "reason": "r",
+                                             "standing": true, "recursive": glob}),
+            _ => serde_json::json!({"request_id": id, "granted": false}),
+        };
+        let unenum_act = "for f in a b; do cat $f; done";
+        let overflow_act = "cat /srv/a /srv/b /srv/c";
+        // (shape, path, gate-opened?, the kinds it must accept)
+        let shapes: Vec<(&str, String, bool, Vec<&str>)> = vec![
+            ("gate, a path", "/srv/plain.txt".into(), true, vec!["once", "session", "standing", "refuse"]),
+            ("gate, a glob dir", "/srv/logs/*".into(), true, vec!["once", "session", "standing", "refuse"]),
+            ("gate, unenumerated",
+             format!("hestia:unpriceable:unenumerated#{}", &digest_of(unenum_act)[..16]), true,
+             vec!["once", "refuse"]),
+            ("gate, overflow",
+             format!("hestia:unpriceable:overflow#{}", &digest_of(overflow_act)[..16]), true,
+             vec!["once", "refuse"]),
+            ("member-filed, a path", "/x/member.txt".into(), false, vec!["session", "standing", "refuse"]),
+        ];
+        for (shape, path, gate, expect) in &shapes {
+            for kind in KINDS {
+                let (_dir, state) = test_state().await;
+                let id = if *gate {
+                    let act = if path.contains("unenumerated") { unenum_act }
+                              else if path.contains("overflow") { overflow_act }
+                              else { "cat it" };
+                    let o = claim(&state, "codex", path, act, false).await;
+                    assert_eq!(o["verdict"], "opened", "{shape}: {o}");
+                    o["request_id"].as_str().unwrap().to_string()
+                } else {
+                    let now = crate::server::gate_escalation::now_secs();
+                    let mut req = live_req("scope-member-1", path, now);
+                    req.granted = None; req.decided_by = None; req.decided_at = None;
+                    req.decision_reason = None;
+                    state.lock().await.scope_requests.insert("scope-member-1".into(), req);
+                    "scope-member-1".to_string()
+                };
+                // What each surface is TOLD.
+                let snap = state.lock().await.dashboard_snapshot(10).pending_scope_requests;
+                let row = snap.iter().find(|r| r["request_id"] == id.as_str()).expect("on the snapshot");
+                let listed = {
+                    let resp = scope_list_requests(State(state.clone())).await.into_response();
+                    let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                    v["requests"].as_array().unwrap().iter()
+                        .find(|r| r["request_id"] == id.as_str()).cloned().expect("listed")
+                };
+                let offered: Vec<String> = serde_json::from_value(row["allowed_decisions"].clone()).unwrap();
+                assert_eq!(&offered, expect, "{shape}: snapshot offer");
+                assert_eq!(listed["allowed_decisions"], row["allowed_decisions"], "{shape}: listing agrees");
+                assert_eq!(row["enumerable"], !path.starts_with("hestia:unpriceable:"), "{shape}");
+                assert_eq!(listed["enumerable"], row["enumerable"], "{shape}");
+                if *gate {
+                    // The ledger reads the same two inputs off the chain row.
+                    let rows = crate::server::governance_ledger::project(
+                        &state.lock().await.recent_chain(50),
+                        crate::server::gate_escalation::now_secs());
+                    let lrow = rows.iter().find(|r| r.id == id).expect("on the ledger");
+                    assert_eq!(&lrow.allowed_decisions, expect, "{shape}: ledger offer");
+                }
+                // What the endpoint ACCEPTS.
+                let (code, out) = decide(&state, body_for(&id, kind, path.ends_with("/*"))).await;
+                if expect.contains(&kind) {
+                    assert_eq!(code, StatusCode::OK, "{shape}: {kind} is offered, so it must land: {out}");
+                } else {
+                    assert_eq!(code, StatusCode::BAD_REQUEST, "{shape}: {kind} is not offered: {out}");
+                    assert_eq!(out["allowed_decisions"], row["allowed_decisions"],
+                               "{shape}: the refusal names the same set the surface was told");
+                }
+            }
+        }
+    }
+
+    /// A refusal is not reopened by re-issuing inside its window, and a member-filed ask has no
+    /// act to bind a one-time approval to.
+    #[tokio::test]
+    async fn scope_claim_does_not_reopen_a_refusal_and_once_needs_a_gate_act() {
+        let (_dir, state) = test_state().await;
+        let id = claim(&state, "codex", "/srv/data/a.csv", "cat /srv/data/a.csv", true).await["request_id"]
+            .as_str().unwrap().to_string();
+        assert_eq!(decide(&state, serde_json::json!({"request_id": &id, "granted": false})).await.0,
+                   StatusCode::OK);
+        let r = claim(&state, "codex", "/srv/data/a.csv", "cat /srv/data/a.csv", true).await;
+        assert_eq!(r["verdict"], "refused", "{r}");
+        assert_eq!(r["request_id"], id.as_str());
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            let mut m = live_req("scope-member-ask", "/srv/notes.md", now);
+            m.granted = None; m.decided_by = None; m.decided_at = None; m.decision_reason = None;
+            s.scope_requests.insert("scope-member-ask".into(), m);
+        }
+        let resp = decide(&state, serde_json::json!({
+            "request_id": "scope-member-ask", "granted": true, "reason": "r", "once": true})).await;
+        assert_eq!(resp.0, StatusCode::BAD_REQUEST, "a member-filed ask names no act");
+    }
+
+    /// STANDING at the operator's chosen BREADTH, and it survives a restart: the vault holds it,
+    /// and the gate's re-issue after the restart is answered `in_force` without a new ask.
+    #[tokio::test]
+    async fn scope_claim_standing_grant_at_a_chosen_directory_survives_restart() {
+        let (dir, state) = test_state().await;
+        let asked = "/home/someone/.local/state/hestia-mesh/logs/x.log";
+        let id = claim(&state, "kimi-code", asked, &format!("tail {asked}"), true).await["request_id"]
+            .as_str().unwrap().to_string();
+        // An ancestor needs recursion; a non-ancestor and the root are refused.
+        for bad in [
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "standing": true,
+                               "grant_path": "/home/someone/.local/state/hestia-mesh"}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "standing": true,
+                               "recursive": true, "grant_path": "/home/someone/elsewhere"}),
+            serde_json::json!({"request_id": &id, "granted": true, "reason": "r", "standing": true,
+                               "recursive": true, "grant_path": "/"}),
+        ] {
+            assert_eq!(decide(&state, bad.clone()).await.0, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let resp = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "standing": true, "recursive": true,
+            "grant_path": "/home/someone/.local/state/hestia-mesh",
+            "reason": "the mesh's shared logs, read-only use"})).await;
+        assert_eq!(resp.0, StatusCode::OK, "{}", resp.1);
+        {
+            let s = state.lock().await;
+            let g = s.standing_scope.grants.iter().find(|g| g.member == "kimi-code").expect("standing");
+            assert_eq!(g.path, "/home/someone/.local/state/hestia-mesh", "the chosen breadth");
+            assert!(g.recursive);
+            assert_eq!(g.request_id.as_deref(), Some(id.as_str()));
+            assert!(s.has_scope_grant("kimi-code", "/home/someone/.local/state/hestia-mesh/sent/k.jsonl"));
+            assert!(!s.has_scope_grant("kimi-code", "/home/someone/.local/state/other"));
+        }
+        // RESTART: nothing in memory, everything from the vault.
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let again = claim(&state, "kimi-code", asked, &format!("tail {asked}"), true).await;
+        assert_eq!(again["verdict"], "in_force", "{again}");
+        assert_eq!(again["permits"], true);
+        let s = state.lock().await;
+        assert!(s.scope_requests.is_empty(), "no new ask after a restart: the grant answered");
+    }
+
+    /// A glob reach (`dir/*`) is filed for the directory and only a recursive grant covers it.
+    #[tokio::test]
+    async fn scope_claim_glob_reach_needs_a_recursive_grant() {
+        let (_dir, state) = test_state().await;
+        let a = claim(&state, "codex", "/var/log/app/*", "ls /var/log/app/*", true).await;
+        assert_eq!(a["verdict"], "opened", "{a}");
+        assert_eq!(a["path"], "/var/log/app");
+        assert_eq!(a["subtree"], true);
+        let id = a["request_id"].as_str().unwrap().to_string();
+        let exact = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "reason": "r"})).await;
+        assert_eq!(exact.0, StatusCode::BAD_REQUEST, "an exact grant cannot cover a glob");
+        let rec = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": true, "reason": "app logs", "recursive": true})).await;
+        assert_eq!(rec.0, StatusCode::OK, "{}", rec.1);
+        let b = claim(&state, "codex", "/var/log/app/*", "ls /var/log/app/*", true).await;
+        assert_eq!(b["verdict"], "in_force", "{b}");
+    }
+
     /// The operator may choose recursive AT decide time; the member never can.
     #[tokio::test]
     async fn decide_can_grant_recursive_and_the_ask_stays_one_path() {
@@ -10928,7 +11794,7 @@ mod disposition_tests {
                     decided_at: None,
                     decision_reason: None,
                     recursive: false,
-                    revoked: None,
+                    revoked: None, ext: Default::default(),
                 },
             );
         }

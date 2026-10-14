@@ -43,7 +43,14 @@ export async function ruleScopeRequest(
   requestId: string,
   granted: boolean,
   reason: string | null,
-  opts: { standing?: boolean; recursive?: boolean } = {},
+  opts: {
+    standing?: boolean;
+    recursive?: boolean;
+    once?: boolean;
+    grantPath?: string | null;
+    /** The asked path, so the breadth rule is checked before anything leaves the app. */
+    askedPath?: string;
+  } = {},
 ): Promise<DecideOutcome> {
   return invoke("rule_scope_request", {
     requestId,
@@ -51,6 +58,9 @@ export async function ruleScopeRequest(
     reason,
     standing: opts.standing ?? false,
     recursive: opts.recursive ?? false,
+    once: opts.once ?? false,
+    grantPath: opts.grantPath ?? null,
+    askedPath: opts.askedPath ?? null,
   });
 }
 

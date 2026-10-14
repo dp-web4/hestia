@@ -1,6 +1,6 @@
 [package]
 name = "hestia"
-version = "0.0.4"
+version = "0.3.0"
 edition = "2021"
 authors = ["dp-web4 <dp@metalinxx.io>"]
 description = "Hestia — local-first Web4 trust layer for AI agents. The core daemon: credential vault, MCP server, society state, witness chain."
@@ -72,7 +72,7 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 web4-core = { path = "../../web4/web4-core", version = "0.4" }
 # Wire formats shared byte-for-byte with the app (session transcript). One source
 # consumed twice — see wire/src/lib.rs for why this is not in web4-core.
-hestia-wire = { path = "../wire", version = "0.1" }
+hestia-wire = { path = "../wire", version = "=0.3.0" }
 # The generic plugin seam — shared with the hub (public open-core crate) instead
 # of maintaining a near-identical copy here. `crate::plugin` re-exports it.
 # `package =` because web4 renamed the PACKAGE for crates.io publishability

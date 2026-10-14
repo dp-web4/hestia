@@ -197,6 +197,16 @@ jobs:
           HESTIA_DECISION_CONTRACT_ENDPOINT: http://127.0.0.1:7799/mcp
         run: python3 tools/decision_witness_contract_test.py
 
+      # The RECORDED bar of a real escalation: every seat's real gate refuses a write to its own
+      # gate entry (relative, `cd`-qualified, summary-cut spellings), the daemon built from THIS
+      # commit opens the escalation, and the test reads the bar back. The seat-boundary suite
+      # stubs the escalation reply, so only this can see an underpriced approval.
+      - name: Escalation bar from the resolved location (real daemon)
+        working-directory: hestia
+        env:
+          HESTIA_ESCALATION_BAR_ENDPOINT: http://127.0.0.1:7799/mcp
+        run: python3 tools/escalation_bar_real_daemon_test.py
+
       # One-gate stage B: decide() against the daemon built from THIS commit — a committed
       # policy_allow, the daemon's own row for its deny, a recorded read, all inside the 3 s
       # invocation deadline (the first act may meet the cold daemon: an explicit
@@ -283,6 +293,87 @@ jobs:
       - name: Build frontend
         working-directory: hestia/app
         run: npm run build
+
+  # THE APP/DAEMON CONTRACT, from one commit (web4#904 phase 1). The daemon and the app release
+  # in lockstep, so the pairing a release ships is "both built from this commit", and that
+  # pairing had never been run: app/src-tauri/tests/operator_live.rs is #[ignore]d and no
+  # workflow invoked it. Here it runs against a daemon built from THIS commit, with a
+  # throwaway home on :7797 (never :7711), through the app's SHIPPING code paths: the
+  # /api/version handshake (same version, same api_compat), the operator challenge/session
+  # sign-in with the genesis credential that daemon minted, the gated routes, and a bad key's
+  # refusal. A daemon-side change that breaks a route the app parses fails here, not in the
+  # field.
+  app-daemon-contract:
+    name: app-daemon contract (live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            hestia/core
+            hestia/app/src-tauri -> target
+
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
+
+      - name: Build the daemon
+        working-directory: hestia/core
+        run: cargo build --locked --bin hestia
+
+      - name: Start an isolated daemon on :7797
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d)"
+          echo "SBX_HOME=$home" >> "$GITHUB_ENV"
+          export HESTIA_HOME="$home" HESTIA_PASSPHRASE="ci-$GITHUB_RUN_ID"
+          bin="$GITHUB_WORKSPACE/hestia/core/target/debug/hestia"
+          "$bin" --home "$home" init --ai
+          nohup "$bin" --home "$home" serve --bind 127.0.0.1:7797 >"$home/serve.log" 2>&1 &
+          # Ready means the handshake ANSWERS (and the genesis operator credential exists),
+          # not that the port is open.
+          for _ in $(seq 1 120); do
+            if curl -fsS --max-time 5 http://127.0.0.1:7797/api/version 2>/dev/null | grep -q '"api_compat"' \
+               && [ -s "$home/operator.key" ]; then
+              curl -fsS http://127.0.0.1:7797/api/version; echo
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "daemon never answered /api/version"; cat "$home/serve.log"; exit 1
+
+      # A fresh daemon has no trust grains, and the contract asserts the TrustView fields the
+      # app renders: give it one real witnessed member action so that check has something to read.
+      - name: Seed one witnessed member action
+        working-directory: hestia
+        run: python3 tools/app_contract_seed.py --endpoint http://127.0.0.1:7797/mcp
+
+      - name: Live contract tests (operator_live, incl. the handshake)
+        working-directory: hestia/app/src-tauri
+        env:
+          HESTIA_APP_LIVE_DAEMON: http://127.0.0.1:7797
+        run: |
+          export HESTIA_APP_LIVE_OPERATOR_KEY="$SBX_HOME/operator.key"
+          cargo test --locked --test operator_live -- --ignored --nocapture --test-threads=1
+
+      - name: Daemon log (on failure)
+        if: failure()
+        run: tail -100 "$SBX_HOME/serve.log" || true
 
   # ADDITION, 2026-07-29 (CBP): `cargo test` was the whole gate, and the Rust crate is
   # not the whole repo. Three plugin directories hold real behavioural tests — member-mesh

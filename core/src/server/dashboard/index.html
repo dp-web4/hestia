@@ -946,6 +946,10 @@
      guard (line ~640); this rule was omitted and the banner was in fact permanently visible —
      only noticeable once it had a reason to appear. */
   .esc-banner[hidden] { display: none; }
+  /* Peer-routed only: present, not alarming (the peers decide first). */
+  .esc-banner.esc-banner-quiet { background: transparent; border-color: var(--border); color: var(--fg-dim); }
+  .esc-banner.esc-banner-quiet .esc-dot { background: var(--fg-dim); animation: none; }
+  .esc-banner.esc-banner-quiet .esc-banner-btn { background: var(--border); color: var(--fg); }
   .esc-banner { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; padding: 0.5rem 0.8rem;
     background: #ff7a6618; border: 1px solid var(--coral); border-radius: 6px; color: var(--coral); font-size: 0.82rem; }
   .esc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--coral); flex: none; animation: escpulse 2s ease-in-out infinite; }
@@ -3501,7 +3505,13 @@
     .map(d => `<option value="${d}"${d===sel?' selected':''}>${d}</option>`).join('');
 
   function renderPolicy(p) {
-    $('pol-mode').textContent = `${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`;
+    {
+      const t = selectedOrch || null;
+      const g = t ? (lastData?.instance_grants ?? []).find(x => x.plugin_id === t) : null;
+      $('pol-mode').textContent = g
+        ? `${t}: ${g.preset} (live grant) · society: ${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`
+        : `${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`;
+    }
     // SAY WHAT THE BUTTONS WILL CHANGE. The scope was invisible, so a scoped-looking control
     // silently set the whole society twice in one session. The banner is loud when scoped,
     // because "this affects everyone" is the assumption that has to be defeated.
@@ -3513,9 +3523,21 @@
         : 'Presets below change the SOCIETY baseline — every member on this machine, including unattended ones. Select a member above to scope it.';
       scope.className = target ? 'pol-scope scoped' : 'pol-scope society';
     }
-    $('pol-presets').innerHTML = p.presets.map(pr =>
-      `<button class="filter-btn${pr.name===p.active_preset?' selected':''}" data-preset="${escapeHtml(pr.name)}" title="${escapeHtml(pr.description)}">${escapeHtml(pr.name)}</button>`
-    ).join('');
+    // HIGHLIGHT WHAT IS IN FORCE FOR WHAT THE BUTTONS TARGET (dp, 2026-10-13: "the permissive
+    // wasn't highlighted"). With a member selected, the buttons set THAT member's grant, so the
+    // lit button must be its effective preset -- its live grant if it has one, else the society
+    // baseline -- not always the society's. The society baseline stays marked when it differs.
+    const polTarget = selectedOrch || null;
+    const polGrant = polTarget ? (lastData?.instance_grants ?? []).find(g => g.plugin_id === polTarget) : null;
+    const inForce = polGrant ? polGrant.preset : p.active_preset;
+    $('pol-presets').innerHTML = p.presets.map(pr => {
+      const lit = pr.name === inForce;
+      const baseline = polGrant && pr.name === p.active_preset;
+      const why = lit && polGrant
+        ? ` — in force for ${polTarget} (live grant; dies with the daemon)`
+        : baseline ? ' — society baseline' : '';
+      return `<button class="filter-btn${lit ? ' selected' : ''}${baseline ? ' pol-baseline' : ''}" data-preset="${escapeHtml(pr.name)}" title="${escapeHtml(pr.description + why)}">${escapeHtml(pr.name)}${baseline ? ' <span class="pol-mode">(society)</span>' : ''}</button>`;
+    }).join('');
     $('pol-rules').innerHTML = p.preset_rules.map(r => `
       <div class="pol-rule">
         <div class="rinfo"><span class="rname">${escapeHtml(r.name)}</span><span class="rmatch">${escapeHtml(r.match)}</span></div>
@@ -3585,12 +3607,32 @@
 
   function renderScopeRequests(data) {
     const pend = data?.pending_scope_requests ?? [];
+    // dp, 2026-10-05: "scope escalations should go to peers not to me". Only requests NO peer
+    // can clear (an unproven asker, or no admissible peer) await the operator; the rest await a
+    // NOT-SAME peer and are shown here read-only with the operator's OVERRIDE.
+    const mine = pend.filter(r => scopeAwaitsOperator(r));
     const banner = $('scope-banner');
+    // THE BANNER IS THE ONLY DOOR TO THE DECIDE CONTROL ON THE MAIN VIEW (dp, 2026-10-13: "there is
+    // still no way to rule an escalation or scope request as standing/one time/live - that i can
+    // see"). It used to appear only for requests NO peer can clear; every gate-opened request
+    // invites peers, so on 10-13 every request was peer-routed, the banner never showed, and
+    // requests sat 8 h with no peer deciding and no sign to the operator. Routing is unchanged:
+    // peer-routed requests are still the peers to decide and the operator controls are an
+    // override -- but the operator is told they exist, quietly, with the age of the oldest.
     banner.hidden = pend.length === 0;
-    if (pend.length) {
-      const n = pend.length;
+    banner.classList?.toggle('esc-banner-quiet', mine.length === 0 && pend.length > 0);
+    if (mine.length) {
+      const n = mine.length;
+      const peer = pend.length - n;
       $('scope-banner-text').textContent =
-        `${n} scope request${n > 1 ? 's' : ''} awaiting your decision`;
+        `${n} scope request${n > 1 ? 's' : ''} awaiting your decision (no peer can clear it, or no peer ruled in time)`
+        + (peer ? ` (+${peer} with peers)` : '');
+    } else if (pend.length) {
+      const n = pend.length;
+      const oldest = Math.min(...pend.map(r => Number(r.requested_at) || Date.now() / 1000));
+      const age = escFmtAge(Math.max(0, Math.floor(Date.now() / 1000 - oldest)));
+      $('scope-banner-text').textContent =
+        `${n} scope request${n > 1 ? 's' : ''} with peers to decide (oldest ${age}) — you may override`;
     }
     $('scope-count').textContent = pend.length ? `${pend.length} pending` : '';
 
@@ -3625,20 +3667,64 @@
       row.className = 'esc-row';
       const path = String(r.path ?? '');
       const why = String(r.reason ?? '');
+      // A GATE-OPENED request (2026-10-05) is a refused act, not an ask: show the act the
+      // operator is ruling on, verbatim and labelled as the act — never as the member's reason,
+      // because the member did not choose to ask.
+      const fromGate = r.origin === 'gate_deny';
+      const basis = fromGate
+        ? `<div class="esc-why">refused act (${escapeHtml(String(r.rule ?? ''))}, ${
+            escapeHtml(String(r.tool ?? ''))}) — this is what you are ruling on:</div>
+           <pre class="esc-why scope-act">${escapeHtml(String(r.act ?? ''))}</pre>
+           <div class="esc-meta">opened by the gate; the member stated no reason${
+             (r.reissues ?? 0) > 0 ? ` · re-issued ${Number(r.reissues)}×` : ''}${
+             r.subtree ? ' · a glob over this directory: only a recursive grant covers it' : ''}</div>
+           <div class="esc-meta scope-route">${scopeRouteText(r)}</div>`
+        : `<div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>`;
       row.innerHTML = `
         <div class="esc-row-head">
-          <span class="esc-tool">read</span>
-          <span class="esc-who">claimed by ${memberName(r.claimed_by ?? '?')}${
+          <span class="esc-tool">${fromGate ? 'refused' : 'read'}</span>
+          <span class="esc-who">${fromGate ? 'member' : 'claimed by'} ${memberName(r.claimed_by ?? '?')}${
             r.role ? ' · ' + escapeHtml(String(r.role)) : ''}</span>
           <span class="esc-ttl" id="scope-ttl-${escapeHtml(String(r.request_id))}">${
             escapeHtml(`expires in ${escFmtAge(r.secs_remaining ?? 0)}`)}</span>
         </div>
-        <div class="esc-marker">${escapeHtml(path)}</div>
-        <div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>
-        <div class="esc-meta">id ${escapeHtml(String(r.request_id))} · grant is memory-only and expires</div>`;
+        <div class="esc-marker">${!scopeEnumerable(r)
+          ? 'no path: the gate cannot enumerate what this act reaches — approve it once, as written, or refuse'
+          : escapeHtml(path)}</div>
+        ${scopeOnceOnly(r) ? `<div class="esc-meta scope-once-why">${SCOPE_ONCE_ONLY_WHY}</div>` : ''}
+        ${basis}
+        <div class="esc-meta">id ${escapeHtml(String(r.request_id))}</div>`;
 
       const controls = document.createElement('div');
       controls.className = 'esc-controls';
+      // #1287 part 2: what this row may offer is the daemon's `allowed_decisions` — the set the
+      // decide endpoint accepts. A request with no session/standing ruling (an act the gate could
+      // not enumerate) renders exactly "Approve once" and "Refuse": no duration, no breadth, and
+      // no grant button whose click the endpoint would refuse.
+      const onceOnly = scopeOnceOnly(r);
+      const offersGrant = scopeDurationOptions(r).length > 0;
+      // DURATION, chosen at decide time (spec decide-scope-request): this act once — only when
+      // the gate recorded an act to bind (once_available) — for the session, or standing.
+      const duration = document.createElement('select');
+      duration.className = 'scope-duration';
+      for (const [v, label] of scopeDurationOptions(r)) {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = label;
+        duration.appendChild(o);
+      }
+      // BREADTH, for session and standing: the exact path, or a directory above it (always
+      // recursive, never the root). The option text IS the path the grant will reach.
+      const breadth = document.createElement('select');
+      breadth.className = 'scope-breadth';
+      for (const opt of scopeBreadthOptions(path, !!r.subtree)) {
+        const o = document.createElement('option');
+        o.value = JSON.stringify(opt); o.textContent = opt.label;
+        breadth.appendChild(o);
+      }
+      const syncBreadth = () => { breadth.disabled = duration.value === 'once'; };
+      const chosenDuration = () => (onceOnly ? 'once' : duration.value);
+      duration.addEventListener('change', syncBreadth);
+      syncBreadth();
       const note = document.createElement('input');
       note.type = 'text';
       note.placeholder = 'note (required to grant)';
@@ -3662,7 +3748,9 @@
 
       const grantBtn = document.createElement('button');
       grantBtn.className = 'esc-approve';
-      grantBtn.textContent = 'grant';
+      // A peer-routed request: the operator's control is an OVERRIDE, labelled as one.
+      const override = !scopeAwaitsOperator(r);
+      grantBtn.textContent = scopeGrantLabel(r, override);
       grantBtn.disabled = !note.value.trim();
       grantBtn.title = 'A note is required to grant — it is recorded as the reason.';
       note.addEventListener('input', () => {
@@ -3677,11 +3765,8 @@
           const res = await apiFetch('/api/scope/decide', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              request_id: r.request_id,
-              granted,
-              reason: note.value.trim() || null,
-            }),
+            body: JSON.stringify(scopeDecideBody(r, granted, note.value.trim(), chosenDuration(),
+                                                 breadth.value ? JSON.parse(breadth.value) : null)),
           });
           if (!res.ok) {
             let msg = `HTTP ${res.status}`;
@@ -3703,17 +3788,122 @@
 
       const refuseBtn = document.createElement('button');
       refuseBtn.className = 'esc-deny';
-      refuseBtn.textContent = 'refuse';
+      refuseBtn.textContent = scopeRefuseLabel(r, override);
       grantBtn.addEventListener('click', () => decide(grantBtn, true));
       refuseBtn.addEventListener('click', () => decide(refuseBtn, false));
 
+      if (!onceOnly) {
+        controls.appendChild(duration);
+        controls.appendChild(breadth);
+      }
       controls.appendChild(note);
-      controls.appendChild(grantBtn);
+      if (offersGrant) controls.appendChild(grantBtn);
       controls.appendChild(refuseBtn);
       row.appendChild(controls);
       row.appendChild(err);
       list.appendChild(row);
     }
+  }
+
+  // ---- scope decide: duration, breadth, body (pure; pinned by
+  // tools/dashboard_scope_decide_contract_test.py, which also runs them under node) ----
+  // dp, 2026-10-05: a gate-opened request from a proven asker is decided by a NOT-SAME PEER;
+  // only one no peer can clear (no invited peer) awaits the operator.
+  // dp, 2026-10-13: "escalate to me after a timeout". The daemon says whose queue a request is
+  // in (`decided_by_default`, which turns "operator" once the peer window lapses); an older
+  // daemon without the field falls back to the routing rule.
+  function scopeAwaitsOperator(r) {
+    if (r && typeof r.decided_by_default === 'string') return r.decided_by_default !== 'peer';
+    return !(r && r.origin === 'gate_deny' && Array.isArray(r.invited_peers)
+             && r.invited_peers.length > 0);
+  }
+
+  function scopeRouteText(r) {
+    if (r && r.peer_window_lapsed) {
+      const mins = Math.round(Number(r.peer_window_secs || 0) / 60);
+      return `no invited peer (${(r.invited_peers || []).map(p => escapeHtml(String(p))).join(', ')}) ruled within ${mins} min — ESCALATED to you; a peer may still decide`;
+    }
+    if (scopeAwaitsOperator(r)) {
+      return 'no NOT-SAME peer can clear this (unproven asker, or no admissible peer) — it is yours to decide';
+    }
+    return 'awaiting a NOT-SAME peer — invited: ' + r.invited_peers.map(p => escapeHtml(String(p))).join(', ')
+      + ' · the controls below are your OVERRIDE';
+  }
+
+  // #1287 part 2: the rulings the decide endpoint ACCEPTS for this request, as the daemon
+  // reports them (`allowed_decisions`, from the function its refusal reads). An older daemon
+  // without the field falls back to the flags it did send (once_available, once_only).
+  function scopeAllowedDecisions(r) {
+    if (r && Array.isArray(r.allowed_decisions)) return r.allowed_decisions.map(String);
+    const out = [];
+    if (r && r.once_available === true) out.push('once');
+    // dp, 2026-10-10 (#1232 narrowed): the gate could not enumerate what this act reaches, so
+    // the request names the act, not a path — "this act once" is the only grant there is.
+    if (!(r && r.once_only === true)) out.push('session', 'standing');
+    out.push('refuse');
+    return out;
+  }
+
+  function scopeEnumerable(r) {
+    if (r && typeof r.enumerable === 'boolean') return r.enumerable;
+    return !(r && r.once_only === true);
+  }
+
+  // No session and no standing ruling: the act's reach is decided by an expansion, so the only
+  // grant is this exact act. The row renders exactly "Approve once" and "Refuse".
+  function scopeOnceOnly(r) {
+    const a = scopeAllowedDecisions(r);
+    return !a.includes('session') && !a.includes('standing');
+  }
+
+  const SCOPE_ONCE_ONLY_WHY =
+    'what this act reaches is decided by an expansion, so only this exact act can be approved';
+
+  function scopeGrantLabel(r, override) {
+    const base = scopeOnceOnly(r) ? 'Approve once' : 'grant';
+    return override ? `override: ${base}` : base;
+  }
+
+  function scopeRefuseLabel(r, override) {
+    const base = scopeOnceOnly(r) ? 'Refuse' : 'refuse';
+    return override ? `override: ${base}` : base;
+  }
+
+  function scopeDurationOptions(r) {
+    const a = scopeAllowedDecisions(r);
+    const out = [];
+    if (a.includes('once')) {
+      out.push(['once', 'this act once (spent by the identical act, inside the claim window)']);
+    }
+    if (a.includes('session')) out.push(['session', 'for the session (memory-only, expires)']);
+    if (a.includes('standing')) out.push(['standing', 'standing (vault; survives restart until revoked)']);
+    return out;
+  }
+
+  // Every option reaches the asked path: the path itself (exact unless the reach was a glob),
+  // the path and everything below it, and each directory ABOVE it, recursive — never the root.
+  function scopeBreadthOptions(path, subtree) {
+    const p = String(path || '').replace(/\/+$/, '');
+    const out = [];
+    if (!p.startsWith('/') || p === '') return out;
+    if (!subtree) out.push({ grant_path: null, recursive: false, label: `exactly ${p}` });
+    out.push({ grant_path: null, recursive: true, label: `${p}/** (this path and everything below)` });
+    const parts = p.split('/').filter(Boolean);
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const anc = '/' + parts.slice(0, i).join('/');
+      out.push({ grant_path: anc, recursive: true, label: `${anc}/** (directory above, recursive)` });
+    }
+    return out;
+  }
+
+  function scopeDecideBody(r, granted, reason, duration, breadth) {
+    const body = { request_id: r.request_id, granted, reason: reason || null };
+    if (!granted) return body;              // a refusal carries no duration and no breadth
+    if (duration === 'once') { body.once = true; return body; }
+    body.standing = duration === 'standing';
+    body.recursive = !!(breadth && breadth.recursive);
+    if (breadth && breadth.grant_path) body.grant_path = breadth.grant_path;
+    return body;
   }
 
   // THE GOVERN CHIP BADGE — driven from the SNAPSHOT, on every tick.
@@ -3900,7 +4090,13 @@
       const when = live
         ? `dies on restart · ${escFmtAge(secs ?? 0)} left`
         : (secs === null || secs === undefined ? 'until revoked' : `${escFmtAge(secs)} left`);
-      const origin = g.origin === 'operator_initiated' ? 'you granted this directly' : 'answered a request';
+      // A PEER's ruling (dp, 2026-10-05) is shown read-only with who decided and on what NOT-SAME
+      // basis; revoke stays available to the operator like any grant.
+      const byPeer = typeof g.granted_by === 'string' && g.granted_by.startsWith('peer:');
+      const pb = g.peer_basis || {};
+      const origin = g.origin === 'operator_initiated' ? 'you granted this directly'
+        : byPeer ? `decided by ${g.granted_by.slice(5)} (NOT-SAME peer, ${pb.independence ?? 'basis unknown'}, asker ${pb.asker_basis ?? '?'})`
+        : 'answered a request';
       return `
         <div class="grant-row">
           <span class="grant-who">${memberName(g.plugin_id ?? '?')}</span>
@@ -4392,11 +4588,14 @@
         ${r.corroborations && r.corroborations.length
             ? `<div class="ledger-verdict">corroborated by ${escapeHtml(r.corroborations.join(', '))}</div>` : ''}
         ${verdict ? `<div class="ledger-verdict">${verdict}</div>` : ''}
+        ${decidable && ledgerOnceOnly(r) ? `
+          <div class="ledger-verdict scope-once-why">${SCOPE_ONCE_ONLY_WHY}</div>` : ''}
         ${decidable ? `
           <div class="esc-actions" style="margin-top:0.45rem;">
             <input class="esc-reason ledger-reason" type="text" placeholder="reason (required to approve)">
-            <button class="esc-approve ledger-approve" disabled>approve</button>
-            <button class="esc-deny ledger-deny">deny</button>
+            ${ledgerOffersGrant(r)
+              ? `<button class="esc-approve ledger-approve" disabled>${ledgerOnceOnly(r) ? 'Approve once' : 'approve'}</button>` : ''}
+            <button class="esc-deny ledger-deny">${ledgerOnceOnly(r) ? 'Refuse' : 'deny'}</button>
           </div>
           <div class="esc-err ledger-err" hidden></div>` : ''}
         ${renderLedgerIdentity(r)}
@@ -4427,21 +4626,45 @@
     </div>`;
   }
 
+  // #1287 part 2: a scope row carries the daemon's `allowed_decisions` (absent on an escalation
+  // and on an older daemon, which keeps the plain approve/deny). The ledger's approve is a plain
+  // exact grant; a request that accepts no session grant offers "Approve once" (once:true)
+  // instead, so the button sent is one the decide endpoint admits.
+  function ledgerOnceOnly(r) {
+    return r.kind === 'scope_request' && Array.isArray(r.allowed_decisions)
+      && r.allowed_decisions.length > 0 && !r.allowed_decisions.includes('session');
+  }
+
+  function ledgerOffersGrant(r) {
+    if (r.kind !== 'scope_request' || !Array.isArray(r.allowed_decisions)
+        || r.allowed_decisions.length === 0) return true;
+    return r.allowed_decisions.includes(ledgerOnceOnly(r) ? 'once' : 'session');
+  }
+
+  function ledgerScopeDecideBody(r, ok, reason) {
+    const body = { request_id: r.id, granted: ok, reason: reason || null };
+    if (ok && ledgerOnceOnly(r)) body.once = true;
+    return body;
+  }
+
   function wireLedgerRows(rows) {
+    const byId = new Map(rows.map(r => [String(r.id), r]));
     document.querySelectorAll('#ledger-list .ledger-row').forEach((el) => {
+      const deny0 = el.querySelector('.ledger-deny');
+      if (!deny0) return;
       const approve = el.querySelector('.ledger-approve');
-      if (!approve) return;
       const id = el.dataset.id, kind = el.dataset.kind;
+      const row = byId.get(String(id)) || { id, kind };
       const reason = el.querySelector('.ledger-reason');
       const deny = el.querySelector('.ledger-deny');
       const err = el.querySelector('.ledger-err');
       reason.value = ledgerDrafts.get(id) || '';
-      approve.disabled = !reason.value.trim();
+      if (approve) approve.disabled = !reason.value.trim();
       // Same asymmetry the daemon enforces and the escalation panel already uses: a deny needs
       // no justification, an approve does.
       reason.addEventListener('input', () => {
         ledgerDrafts.set(id, reason.value);
-        approve.disabled = !reason.value.trim();
+        if (approve) approve.disabled = !reason.value.trim();
       });
       const go = async (ok) => {
         err.hidden = true;
@@ -4449,7 +4672,7 @@
           const res = kind === 'scope_request'
             ? await apiFetch('/api/scope/decide', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ request_id: id, granted: ok, reason: reason.value.trim() || null }) })
+                body: JSON.stringify(ledgerScopeDecideBody(row, ok, reason.value.trim())) })
             : await apiFetch('/api/operator/gate-escalation', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ id, approve: ok, reason: reason.value.trim() || null }) });
@@ -4467,7 +4690,7 @@
           err.hidden = false;
         }
       };
-      approve.addEventListener('click', () => go(true));
+      if (approve) approve.addEventListener('click', () => go(true));
       deny.addEventListener('click', () => go(false));
     });
   }

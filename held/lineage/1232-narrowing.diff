@@ -1,0 +1,1365 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -672,6 +672,8 @@
+     for scope in scopes:
+         if not isinstance(scope, str) or not scope.startswith("path:"):
+             continue
++        if scope.startswith("path:" + UNPRICEABLE_PREFIX):
++            continue                              # a once-only trial lift, never a root
+         raw = os.path.expanduser(scope[len("path:"):]).replace("\\", "/")
+         recursive = raw.endswith(RECURSIVE_SUFFIX)
+         if recursive:
+@@ -699,6 +701,8 @@
+     for scope in scopes:
+         if not isinstance(scope, str):
+             continue
++        if scope.startswith("path:" + UNPRICEABLE_PREFIX):
++            continue                              # a once-only trial lift, never a root
+         if scope.startswith("path:"):
+             raw = os.path.expanduser(scope[len("path:"):]).replace("\\", "/")
+             if raw.endswith(RECURSIVE_SUFFIX):     # reach is `_scope_roots_with_reach`'s job
+@@ -1078,8 +1082,14 @@
+ 
+ class _Unmodelled(Exception):
+     """The parser met shell it does not model (an unbalanced quote or substitution, an unknown
+-    heredoc form, an expansion it cannot resolve inside a path). The caller treats this as
+-    INCOMPLETE classification — a refusal — never as a skip (Codex re-review of #1232)."""
++    heredoc form). The caller treats this as UNENUMERATED — a scope request for the act, never a
++    skip (Codex re-review of #1232; dp, 2026-10-10)."""
++
++
++class _Unenumerated(_Unmodelled):
++    """An expansion whose VALUE would be judged as a path (dp, 2026-10-10: nothing an expansion
++    produces is modelled). Collected, not raised past the scan: the literal candidates of the same
++    command are still judged first, so a concrete refusal names its path."""
+ 
+ 
+ def _balanced_end(text: str, open_idx: int) -> int:
+@@ -1191,12 +1201,20 @@
+ 
+ 
+ def _heredoc_head(before: str) -> str:
+-    """The command word that consumes a heredoc opened at the end of `before`."""
++    """The command word that consumes a heredoc opened at the end of `before`.
++
++    FAIL CLOSED toward code (kimi's review of #1232, F2 A04/A06): `sudo -u root bash <<EOF` used to
++    name `root` and `chroot /x bash <<EOF` named `chroot`, so a shell body was stripped as data.
++    An interpreter ANYWHERE among the consumer's words now decides it: the body is that
++    interpreter's (over-judging a remote or container shell is the narrow direction)."""
+     seg = re.split(r"\|\||&&|[|;&(]|\$\(|`", before)[-1]
+     try:
+         words = shlex.split(seg, posix=True)
+     except ValueError:
+         words = seg.split()
++    for w in words:
++        if _HEREDOC_INTERPRETER.match(os.path.basename(w)):
++            return os.path.basename(w)
+     for w in words:
+         if "=" in w and not w.startswith(("-", "/", ".")) and w.split("=", 1)[0].isidentifier():
+             continue                       # an env assignment prefix
+@@ -1276,6 +1294,10 @@
+     return "\n".join(out)
+ 
+ 
++#: A command that gives HOME a value of its own (assignment, export, read, a loop variable).
++_HOME_REASSIGNED = re.compile(
++    r"""(?:^|[\s;&|(`])(?:(?:export|declare|local|typeset|readonly)\s+(?:-\w+\s+)*)?HOME\+?="""
++    r"""|\b(?:read|unset|export)\b[^\n;&|]*\bHOME\b|\bfor\s+HOME\b""")
+ #: The shell's own home spellings at a word start: `~`, `~/x`, `$HOME/x`, `${HOME}/x`.
+ _HOME_WORD = re.compile(r"""(?:^|(?<=[\s=;|&(<>'"`:]))(?:~|\$HOME|\$\{HOME\})(?=/|$|[\s;|&)<>'"`:])""",
+                         re.MULTILINE)
+@@ -1303,8 +1325,10 @@
+ 
+ 
+ _SHELL_PUNCT = frozenset(";|&()<>")
+-#: Sentinels in a tokenised word: a `$` / backtick the shell will NOT expand (quoted or escaped).
+-_LIT_DOLLAR, _LIT_TICK = "\x00", "\x02"
++#: Sentinels in a tokenised word: a `$` / backtick the shell will NOT expand (quoted or escaped),
++#: and an UNQUOTED brace expansion (`{a,b}`, `{1..3}`) about to open.
++_LIT_DOLLAR, _LIT_TICK, _BRACE = "\x00", "\x02", "\x03"
++_BRACE_EXPANSION = re.compile(r"""\{[^\s{}'"]*(?:,|\.\.)[^\s{}'"]*\}""")
+ 
+ 
+ def _tokenize(text: str) -> list:
+@@ -1421,6 +1445,8 @@
+             continue
+         if c in "*?[":
+             uglob = True
++        if c == "{" and _BRACE_EXPANSION.match(text, i):
++            buf.append(_BRACE)                   # brace expansion: never modelled (dp, 2026-10-10)
+         buf.append(c)
+         in_word = True
+         i += 1
+@@ -1438,7 +1464,11 @@
+     extra = []
+     for kind, w, _g in toks:
+         if kind == "word" and ("$(" in w or "`" in w):
+-            for body in _substitution_bodies(w.replace(_LIT_TICK, "")):
++            # `quotes=False`: `_tokenize` already resolved quoting (a `$` or backtick that single
++            # quotes made literal is a sentinel now), so an apostrophe left in a dequoted word is an
++            # ordinary character. Re-reading it as a quote hid `"'$(cat /x)'"` (Codex review 17054,
++            # P1-quote-context).
++            for body in _substitution_bodies(w.replace(_LIT_TICK, ""), quotes=False):
+                 extra.append(("sep", ";", False))
+                 # A heredoc INSIDE a substitution (`-m "$(cat <<'EOF' … EOF)"`) is handled like
+                 # any other: the outer pass saw its `<<` inside quotes and left it as text.
+@@ -1487,6 +1517,24 @@
+     "git": {"string_opts": {"-m", "--message", "--grep", "--author", "--format", "--pretty", "-S", "-G"}},
+ }
+ _CMD_SPECS["gawk"] = _CMD_SPECS["mawk"] = _CMD_SPECS["awk"]
++#: Arguments that are SHELL CODE (judged as a command of their own, found writing the narrowed
++#: battery): `eval` and `watch` take code as positionals; `su`/`runuser`/`script`/`flock` take it
++#: as `-c`. (`sh -c` anywhere in argv — `find -exec sh -c`, `docker exec c bash -c` — is caught by
++#: position in `_outside_candidates`.)
++_CMD_SPECS["eval"] = {"positional": "code"}
++_CMD_SPECS["watch"] = {"positional": "code", "value_opts": {"-n", "--interval", "-d"}}
++for _h in ("su", "runuser"):
++    _CMD_SPECS[_h] = {"code_opts": {"-c", "--command"},
++                      "value_opts": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"}}
++_CMD_SPECS["script"] = {"code_opts": {"-c", "--command"}}
++_CMD_SPECS["flock"] = {"code_opts": {"-c", "--command"}, "value_opts": {"-w", "--timeout"}}
++#: Commands whose argv is built from STDIN: what they reach is another command's output.
++_STDIN_ARGV = frozenset(("xargs", "parallel"))
++#: Commands that resolve their relative arguments against a directory option (`-C D`).
++_DIR_OPT_HEADS = frozenset(("git", "make", "gmake", "tar"))
++#: How many composed directory bases relative paths are judged against before the gate stops
++#: following directory changes (and the reach is unenumerated).
++_MAX_DIR_BASES = 16
+ #: Assignments whose value is not a path being reached: a field separator, or a search path list
+ #: that only influences later lookups.
+ _NONPATH_ASSIGNMENTS = frozenset(("IFS", "PS1", "PS2", "PS4", "PATH", "MANPATH", "INFOPATH",
+@@ -1511,18 +1559,29 @@
+ _INCOMPLETE = "<incomplete: more distinct paths than the gate judges in one command — split it>"
+ _UNMODELLED_PREFIX = "<incomplete: the scope parser does not model "
+ 
+-
+-#: Commands whose OUTPUT is never a path the act then reaches (a number, a date, a hash, a name):
+-#: `$(date +%s)` inside `/tmp/run-$(date +%s)` is modelled as an opaque token.
+-_VALUE_COMMANDS = frozenset(("date", "seq", "wc", "pgrep", "nproc", "id", "whoami", "hostname",
+-                             "uname", "expr", "shuf", "sha256sum",
+-                             "md5sum", "cksum", "tput", "getconf"))
+-#: Commands whose OUTPUT is paths UNDER the roots they were given (judged as those roots'
+-#: subtrees): `$(find R …)`, `$(ls R)`, `$(grep -l … R)`, `$(git ls-files)`, `$(fd …)`.
+-_LISTER_COMMANDS = frozenset(("find", "ls", "grep", "egrep", "rg", "fd", "git", "realpath",
+-                              "readlink", "dirname"))
+-#: Values one word may expand to (loop items, combinations). Past it: unmodelled, refused.
+-_MAX_EXPANSIONS = 128
++#: #1274's sentinels (daemon `gate_escalation::UNPRICEABLE_PREFIX`, mechanism
++#: `UNPRICEABLE_PREFIX`). A scope refusal whose reach the gate cannot ENUMERATE carries one of these
++#: as its `target` instead of a path. The gate then opens a scope request for the ACT, and only a
++#: one-time approval of that exact act (its complete-act digest) lifts it: there is no path a
++#: session or standing grant could name, and the daemon refuses to make one. In a trial scope (the
++#: orchestrator re-judging an act it holds an approval for) `path:<sentinel>` lifts exactly that
++#: class for that one evaluation; no snapshot ever carries it.
++UNPRICEABLE_PREFIX = "hestia:unpriceable:"
++UNENUMERATED_TARGET = UNPRICEABLE_PREFIX + "unenumerated"
++OVERFLOW_TARGET = UNPRICEABLE_PREFIX + "overflow"
++
++
++#: NOTHING AN EXPANSION PRODUCES IS MODELLED (dp's ruling, 2026-10-10: "narrow and land").
++#: Patch 01e68a1c modelled substitution OUTPUT with tables keyed on the command NAME ("date
++#: prints a number", "head selects lines", "find prints paths under its roots"), and four Codex
++#: rounds kept finding the same defect in new members: soundness depends on argv SHAPE, and
++#: `date +/x`, `seq -f`, `shuf -e`, `expr`, `wc` / `sha256sum` (operand echo), `grep` / `sort` /
++#: `head FILE` and `find -printf` all print a path the model said they could not. Variables were
++#: modelled the same way, and a linear scan is not the shell's scoping (`D=/tmp cat $D`,
++#: `(D=/x); cat $D`), so they are not modelled either. What remains are expansions whose VALUE
++#: cannot contain `/` or be `..`: arithmetic (a number) and the special parameters `$?` `$#` `$$`
++#: `$!` (digits) and `$-` (flag letters), replaced by a placeholder of the same class.
++_PLACEHOLDER_PARAMS = {"$?": "0", "$#": "0", "$$": "0", "$!": "0", "$-": "x"}
+ 
+ 
+ def _expansion_spans(value: str) -> list:
+@@ -1564,175 +1623,38 @@
+     return spans
+ 
+ 
+-def _expand_one(ref: str, env: dict, depth: int) -> list:
+-    """Every value one expansion can take, as `(text, globbed)` — or `_Unmodelled`."""
+-    pwd = (env.get("PWD") or [("", False)])[0][0]
+-    if ref.startswith("$(("):
+-        return [("0", False)]                                  # arithmetic: a number
+-    if ref.startswith("$(") or ref.startswith("`"):
+-        body = (ref[2:-1] if ref.startswith("$(") else ref[1:-1]).strip()
+-        if body == "pwd":
+-            return [(pwd, False)]
+-        toks = _tokenize(body)
+-        if any(k != "word" for k, _w, _g in toks):
+-            piped = _expand_pipeline(toks, env, depth)
+-            if piped is not None:
+-                return piped
+-            # Otherwise only ONE simple command's output is modelled. `$(date >/dev/null; echo
+-            # /x)` is two commands — its output is the LAST one's, which the head-based model
+-            # would misread (Codex review 17029e). Unmodelled: refused.
+-            raise _Unmodelled("a substitution of more than one simple command used as a value")
+-        words = [w for _k, w, _g in toks]
+-        head = os.path.basename(words[0]) if words else ""
+-        flags = set(words[1:])
+-        if head == "echo":
+-            # echo's output IS its arguments: the value is their (resolved) text.
+-            args = [w for w in words[1:] if not (w.startswith("-") and len(w) <= 3)]
+-            out = [("", False)]
+-            for a in args:
+-                alts = _expand_word(a, env, depth + 1)
+-                out = [((c + " " + t).strip(), g1 or g2) for c, g1 in out for t, g2 in alts]
+-                if len(out) > _MAX_EXPANSIONS:
+-                    raise _Unmodelled("more expansion values than the parser follows")
+-            return out
+-        if head in _VALUE_COMMANDS:
+-            return [("0", False)]
+-        lister = head in ("find", "ls", "fd") \
+-            or (head in ("grep", "egrep", "rg") and flags & {"-l", "-L", "--files-with-matches",
+-                                                            "--files-without-match", "--files",
+-                                                            "-rl", "-lr", "-Rl", "-lR"}) \
+-            or (head == "git" and flags & {"ls-files", "--name-only", "--show-toplevel"}) \
+-            or head in ("dirname", "realpath", "readlink")
+-        if lister and depth < 3:
+-            roots = [(p if kind == "abs" else os.path.normpath(os.path.join(pwd, p)), g)
+-                     for p, kind, g in _outside_candidates(body, pwd, depth + 1)]
+-            if head == "dirname":
+-                return [(os.path.dirname(r.rstrip("/")) or "/", g) for r, g in roots] or [(pwd, False)]
+-            if head in ("realpath", "readlink"):
+-                return [(os.path.realpath(r), g) for r, g in roots] or [(pwd, False)]
+-            if head == "git" and "--show-toplevel" in flags:
+-                raise _Unmodelled("`git rev-parse --show-toplevel` used as a path")
+-            # paths UNDER each root: judged as the root's subtree (a glob over it)
+-            return [(r.rstrip("/") + "/*", True) for r, _g in roots] or [(pwd + "/*", True)]
+-        raise _Unmodelled(f"the output of `{head or body[:20]}` used as a path")
++def _expansion_kind(ref: str) -> str:
++    """What the refusal says an unenumerated expansion was."""
++    if ref.startswith("$("):
++        return "a command substitution"
++    if ref.startswith("`"):
++        return "a backtick substitution"
+     if ref.startswith("${"):
+-        inner = ref[2:-1]
+-        m = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-=])(.*))?", inner, re.S)
+-        if not m:
+-            raise _Unmodelled(f"the parameter expansion ${{{inner[:20]}}}")
+-        name, op, default = m.group(1), m.group(2), m.group(3)
+-        if name in env:
+-            vals = env[name]
+-            if op:
+-                # `${V:-d}`: d when V is unset OR EMPTY; `${V-d}`: d only when V is unset (it is
+-                # set here). A value that is empty in SOME branches yields both (Codex review
+-                # 17029b: `D=; cat ${D:-/x}` read as empty).
+-                if op.startswith(":") and any(v == "" for v, _g in vals):
+-                    rest = [(v, g) for v, g in vals if v != ""]
+-                    return rest + _expand_word(default, env, depth + 1)
+-            return vals
+-        got = os.getenv(name)
+-        if got is not None and not (op and op.startswith(":") and got == ""):
+-            return [(got, False)]
+-        if op:
+-            return _expand_word(default, env, depth + 1)
+-        raise _Unmodelled(f"an unknown variable ${name} inside a path")
++        return f"the parameter expansion {ref[:24]}"
+     name = ref[1:]
+-    if name in ("?", "#", "$", "!", "-"):
+-        return [("0", False)]
+-    if name in ("@", "*") or name.isdigit():
+-        raise _Unmodelled(f"the positional parameter ${name} inside a path")
+-    if name in env:
+-        return env[name]
+-    got = os.getenv(name)
+-    if got is None:
+-        raise _Unmodelled(f"an unknown variable ${name} inside a path")
+-    return [(got, False)]
+-
+-
+-#: Pipeline stages that only SELECT or REORDER whole input lines: their output is a subset of
+-#: the lister's output, so it names paths under the same roots.
+-_LINE_FILTERS = frozenset(("head", "tail", "sort", "uniq", "tac", "shuf", "grep", "egrep", "fgrep"))
+-#: Flags that make grep print something other than whole input lines.
+-_GREP_NON_LINE_FLAGS = frozenset(("-o", "--only-matching", "-c", "--count", "-b", "--byte-offset"))
+-
+-
+-def _expand_pipeline(toks: list, env: dict, depth: int):
+-    """The value of `$(LISTER … | FILTER … [| wc])`, soundly, or None when the shape is not one
+-    the parser models (the caller then refuses it as unmodelled).
+-
+-    Modelled: stages joined only by `|`; the only redirections are to `/dev/null`; the first
+-    stage is a lister (`_expand_one`'s model: paths under its roots); every later stage only
+-    selects or reorders whole lines (`_LINE_FILTERS`, grep without `-o`/`-c`), so the output is
+-    a SUBSET of the lister's; or the last stage is a bare `wc` (numbers). Anything else — a
+-    `;`/`&&`/`||` list, `cut`/`sed`/`awk` that rewrite lines, a redirection elsewhere — is None."""
+-    stages, cur, pending_redirect = [], [], False
+-    for kind, w, _g in toks:
+-        if kind == "sep":
+-            if w != "|":
+-                return None
+-            stages.append(cur)
+-            cur = []
+-            continue
+-        if kind == "op":
+-            if "<" in w and ">" not in w:
+-                return None                    # input from a file: not a lister's output
+-            pending_redirect = True
+-            continue
+-        if pending_redirect:
+-            if w != "/dev/null":
+-                return None
+-            pending_redirect = False
+-            continue
+-        cur.append(w)
+-    stages.append(cur)
+-    if len(stages) < 2 and not any(k == "op" for k, _w, _g in toks):
+-        return None
+-    if not stages[0]:
+-        return None
+-    last = stages[-1]
+-    numeric_tail = bool(last) and os.path.basename(last[0]) == "wc" \
+-        and all(a.startswith("-") for a in last[1:])
+-    middle = stages[1:-1] if numeric_tail else stages[1:]
+-    for st in middle:
+-        # `sed -n 'N[,M]p'` prints selected whole lines only — a line filter too.
+-        if st and os.path.basename(st[0]) == "sed" and len(st) == 3 and st[1] == "-n" \
+-                and re.fullmatch(r"(\d+|\$)(,(\d+|\$))?p", st[2]):
+-            continue
+-        if not st or os.path.basename(st[0]) not in _LINE_FILTERS:
+-            return None
+-        if os.path.basename(st[0]) in ("grep", "egrep", "fgrep") and set(st[1:]) & _GREP_NON_LINE_FLAGS:
+-            return None
+-    if numeric_tail:
+-        return [("0", False)]
+-    first = " ".join(shlex.quote(x.replace(_LIT_DOLLAR, "$")) for x in stages[0])
+-    try:
+-        return _expand_one("$(" + first + ")", env, depth + 1)
+-    except _Unmodelled:
+-        return None
+-
+-
+-def _expand_word(value: str, env: dict, depth: int = 0) -> list:
+-    """Every value a tokenised word can take, as `(text, globbed)`, with the expansions the parser
+-    MODELS substituted: assignments earlier in the same command and loop variables (`env`), the
+-    gate's environment, `$PWD` / `$(pwd)`, `${V:-default}`, special parameters and arithmetic
+-    (opaque tokens), value commands (`$(date …)`), and listers (`$(find R …)` → R's subtree).
+-    Raises `_Unmodelled` for anything else (an unknown variable, `$1`, `${x%/*}`, the output of
+-    an arbitrary command) — its value decides the path, and the parser does not know it."""
+-    if depth > 6:
+-        raise _Unmodelled("expansions nested deeper than the parser follows")
+-    spans = _expansion_spans(value)
+-    combos = [("", False)]
+-    last = 0
+-    for a, b in spans:
+-        lit = value[last:a]
+-        alts = _expand_one(value[a:b], env, depth)
+-        combos = [(c + lit + t, g1 or g2) for c, g1 in combos for t, g2 in alts]
+-        if len(combos) > _MAX_EXPANSIONS:
+-            raise _Unmodelled("more expansion values than the parser follows")
++    if name.isdigit() or name in ("@", "*"):
++        return f"the positional parameter {ref}"
++    return f"the variable {ref}"
++
++
++def _word_value(value: str) -> str:
++    """The text a tokenised word is judged as. Raises `_Unenumerated` when an expansion's value
++    would decide it (see `_PLACEHOLDER_PARAMS`): never a model, never a guess."""
++    if _BRACE in value:
++        raise _Unenumerated("brace expansion")
++    out, last = [], 0
++    for a, b in _expansion_spans(value):
++        ref = value[a:b]
++        out.append(value[last:a])
++        if ref.startswith("$(("):
++            out.append("0")                      # arithmetic: a number (its bodies are judged)
++        elif ref in _PLACEHOLDER_PARAMS:
++            out.append(_PLACEHOLDER_PARAMS[ref])
++        else:
++            raise _Unenumerated(_expansion_kind(ref))
+         last = b
+-    tail = value[last:]
+-    return [((c + tail).replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`"), g) for c, g in combos]
++    out.append(value[last:])
++    return "".join(out).replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`")
+ 
+ 
+ def _path_shaped(value: str, uglob: bool) -> bool:
+@@ -1740,84 +1662,121 @@
+     Substitution spans are removed first — their bodies are judged as commands; their OUTPUT is
+     only path-shaped if the word around it is."""
+     rest = re.sub(r"\$\((?:[^()]|\([^()]*\))*\)|`[^`]*`", "\x01", value)
+-    # A word whose value is (partly) an expansion the parser must resolve — a substitution's
+-    # output, `$VAR` — COULD be a path: it is judged, which means resolved or refused as
+-    # unmodelled (`_resolve_word`). Not skipped.
++    # A word whose value is (partly) an expansion — a substitution's output, `$VAR` — COULD be a
++    # path: it is judged, which now means UNENUMERATED (`_word_value`). Never skipped. A brace
++    # expansion is path-shaped when it can produce a separator or a `..`.
+     return ("/" in rest or rest.startswith(("~", ".")) or uglob or "\x01" in rest
+-            or "$" in rest)
+-
+-
+-def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0) -> list:
+-    """`(spelling, kind, globbed)` for every path-shaped word of `cmd`, kind "abs" | "rel".
++            or "$" in rest or (_BRACE in rest and ".." in rest))
++
++
++class _Found:
++    """What one scan found besides its literal candidates (shared by nested scans)."""
++
++    def __init__(self):
++        self.unenum = []            # why a value the gate would judge is unenumerated
++        self.dirs = []              # literal directories relative paths may resolve under
++        self.dirs_unknown = None    # why a directory change cannot be followed
++
++
++def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> list:
++    """`(spelling, kind, globbed)` for every literal path-shaped word of `cmd`, kind "abs" | "rel".
+ 
+     DEFAULT-JUDGE: every path-shaped word is a candidate unless a precise (command, position /
+     option) exception in `_CMD_SPECS` says that argument is a pattern, delimiter or string.
+-    Redirection targets are always candidates. Expansions are resolved where the parser models
+-    them (`_expand_word`), including `for V in …` loop variables. Raises `_Unmodelled` for shell
+-    the parser does not model, which the caller refuses as INCOMPLETE."""
++    Redirection targets are always candidates. NOTHING AN EXPANSION PRODUCES IS MODELLED: a word
++    whose value an expansion decides is recorded on `found.unenum` (the act is then a scope request,
++    `UNENUMERATED_TARGET`), as are argv built from stdin, a process substitution, an expansion used
++    as the program, and an expansion handed to a command in its environment. Directory changes
++    (`cd D`, `pushd D`, `git|make|tar -C D`) are recorded on `found.dirs` so relative paths are
++    also judged under them. Raises `_Unmodelled` only for shell the lexer cannot read."""
+     out = []
++    found = found if found is not None else _Found()
+     pwd = cwd or os.getcwd()
+-    env = {"PWD": [(pwd, False)]}
+ 
+     def emit(value, uglob):
+         if not _path_shaped(value, uglob):
+             return
+-        for v, g in _expand_word(value, env, depth):
+-            if v.startswith("~"):
+-                raise _Unmodelled("a ~user home the parser does not resolve")
+-            if v.startswith("//"):
+-                v = "/" + v.lstrip("/")
+-            if v.startswith("/"):
+-                out.append((v, "abs", uglob or g))
+-            elif v:
+-                out.append((v, "rel", uglob or g))
++        try:
++            v = _word_value(value)
++        except _Unenumerated as why:
++            found.unenum.append(str(why))
++            return
++        if v.startswith("~"):
++            found.unenum.append("a ~user home the gate does not resolve")
++            return
++        if v.startswith("//"):
++            v = "/" + v.lstrip("/")
++        if uglob:
++            comps = v.split("/")
++            g = next((k for k, c in enumerate(comps) if _GLOB_CHARS.search(c)), None)
++            if g is not None and ".." in comps[g + 1:]:
++                # `/tmp/*/../../x` is wherever the glob's match leads: not the glob's directory.
++                found.unenum.append("a glob followed by `..`")
++                return
++        if v.startswith("/"):
++            out.append((v, "abs", uglob))
++        elif v:
++            out.append((v, "rel", uglob))
++
++    def code(text):
++        # A string the command runs as shell (`eval`, `su -c`, `sh -c` in argv): a command of
++        # its own. A `$` single quotes kept literal here is live when the string runs.
++        out.extend(_outside_candidates(_strip_data_heredocs(
++            text.replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`")), pwd, depth + 1, found))
++
++    def chdir(value, uglob):
++        try:
++            v = _word_value(value)
++        except _Unenumerated as why:
++            found.dirs_unknown = f"a directory change to {why}"
++            return
++        if uglob or v.startswith("~") or v == "-" or not v:
++            found.dirs_unknown = f"a directory change to '{v[:40]}'"
++            return
++        found.dirs.append(v)
+ 
+     toks = _shell_words(cmd)
+-    head, spec, pending, redirect, positional, pattern_given, opts_done = (
+-        None, {}, None, False, 0, False, False)
+-    loop_var, loop_state, loop_vals = None, None, []
+-    seg_words, piped_from = [], None
++    state = {}
++
++    def new_segment():
++        # `cd` with no argument goes HOME; `pushd` with none swaps the stack (not followed).
++        if state.get("head") in ("cd", "pushd") and not state.get("chdir_seen"):
++            home = os.getenv("HOME")
++            if state["head"] == "cd" and home:
++                found.dirs.append(home)
++            else:
++                found.dirs_unknown = f"`{state['head']}` with no directory"
++        state.update(head=None, spec={}, pending=None, redirect=False, positional=0,
++                     pattern_given=False, opts_done=False, dirpending=False, chdir_seen=False,
++                     env_expansion=None)
++
++    new_segment()
++    loop_state = None
++    seg_words, prev = [], None
+     for kind, w, uglob in toks:
+-        # `for V in W…; do` — V takes each W's value(s); a globbed W is itself a reach.
++        p, prev = prev, (kind, w)
++        # `for V in W…; do` — V is a variable (unenumerated wherever it is used as a path); a
++        # globbed W is itself a reach.
+         if loop_state == "var" and kind == "word":
+-            loop_var, loop_state = w, "in"
++            loop_state = "in"
+             continue
+         if loop_state == "in" and kind == "word":
+             loop_state = "items" if w == "in" else None
+-            if w != "in":
+-                env[loop_var] = env.get("@", [])          # `for V; do` iterates "$@": unknown
+-                env.pop(loop_var, None)
+             continue
+         if loop_state == "items":
+             if kind == "word":
+                 if uglob:
+                     emit(w, uglob)
+-                try:
+-                    loop_vals.extend(_expand_word(w, env, depth) if ("$" in w or "`" in w)
+-                                     else [(w.replace(_LIT_DOLLAR, "$"), uglob)])
+-                except _Unmodelled:
+-                    loop_vals = None
+                 continue
+-            if loop_vals is None:
+-                env.pop(loop_var, None)
+-            else:
+-                # EVERY item, or the variable is unknown (refused at use) — never a truncated
+-                # list that silently drops item 33 onward (Codex review 17029a).
+-                if len(loop_vals) > _MAX_EXPANSIONS:
+-                    env.pop(loop_var, None)
+-                else:
+-                    env[loop_var] = loop_vals or [("", False)]
+-            loop_state, loop_vals = None, []
+-        if kind == "word" and head is None and w == "for":
+-            loop_state, loop_vals = "var", []
+-            continue
+-        if kind == "sep" or (kind == "word" and head is None and w in _SHELL_KEYWORDS):
+-            # `LISTER … | while read V` — remember what feeds the pipe (a keyword keeps it).
+-            if kind == "sep":
+-                piped_from = list(seg_words) if w in ("|", "|&") else None
++            loop_state = None
++        if kind == "word" and state["head"] is None and w == "for":
++            loop_state = "var"
++            continue
++        if kind == "sep" and w == "(" and p is not None and p[0] == "op" and p[1] in ("<", ">"):
++            found.unenum.append("a process substitution used as a path")
++        if kind == "sep" or (kind == "word" and state["head"] is None and w in _SHELL_KEYWORDS):
+             seg_words = []
+-            head, spec, pending, redirect, positional, pattern_given, opts_done = (
+-                None, {}, None, False, 0, False, False)
++            new_segment()
+             continue
+         if kind == "word":
+             seg_words.append(w)
+@@ -1825,85 +1784,125 @@
+             # `<` `>` `>>` `2>` `&>` `<>`: the next word is a file — always judged. `<<<`: the next
+             # word is a here-STRING (data; its substitutions were lifted out and are judged).
+             # `<<`: the next word is a heredoc delimiter (bodies are handled before tokenising).
+-            if w.startswith("<<"):
+-                redirect = "skip"
+-            else:
+-                redirect = True
+-            continue
+-        if redirect == "skip":
+-            redirect = False
+-            continue
+-        if redirect:                       # a redirection target: always judged
+-            redirect = False
++            state["redirect"] = "skip" if w.startswith("<<") else True
++            continue
++        if state["redirect"] == "skip":
++            state["redirect"] = False
++            continue
++        if state["redirect"]:                # a redirection target: always judged
++            state["redirect"] = False
+             emit(w, uglob)
+             continue
++        head, spec = state["head"], state["spec"]
+         if head is None:
+             name, eq, val = w.partition("=")
+-            if eq and name.isidentifier():                 # an assignment prefix
+-                # An assignment reaches nothing by itself; its value is judged where it is USED
+-                # as a path. A value the parser cannot resolve makes the NAME unknown, so a later
+-                # path use of it is refused as unmodelled — not this assignment.
++            if eq and name.isidentifier():                 # an assignment
++                # Reaches nothing by itself. A LITERAL path value is judged (a command it prefixes
++                # may read it: `CFG=/x tool`). A value an expansion decides makes the name unknown
++                # (unenumerated wherever it is used as a path), and is unenumerated at once if a
++                # command follows in this simple command and receives it in its environment.
+                 try:
+-                    vals = _expand_word(val, env, depth)
+-                    if name not in _NONPATH_ASSIGNMENTS:
++                    _word_value(val)
++                    literal = True
++                except _Unenumerated:
++                    literal = False
++                if name not in _NONPATH_ASSIGNMENTS:
++                    if literal:
+                         emit(val, uglob)
+-                    env[name] = [(v, g or uglob) for v, g in vals]
+-                except _Unmodelled:
+-                    env.pop(name, None)
++                    elif state["env_expansion"] is None:
++                        state["env_expansion"] = name
+                 continue
+             base = os.path.basename(w)
++            if base in _STDIN_ARGV:
++                found.unenum.append(f"argv built from stdin (`{base}`)")
+             if base in _HEREDOC_WRAPPERS or w.isdigit() or re.fullmatch(r"\d+[smhd]?", w) \
+                     or (w.startswith("-") and len(w) > 1):
+                 continue                                   # wrapper, its options and durations
+-            head, spec = base, _CMD_SPECS.get(base, {})
++            if _expansion_spans(w):
++                found.unenum.append("an expansion used as the program")
++            if state["env_expansion"] is not None:
++                found.unenum.append(f"an expansion handed to `{base}` in "
++                                    f"${state['env_expansion']}")
++            state["head"], state["spec"] = base, _CMD_SPECS.get(base, {})
+             if "/" in w or w.startswith("."):
+                 emit(w, uglob)                             # a program run by path is a reach
+             if base in ("export", "local", "declare", "typeset", "readonly"):
+-                spec = {"assign_args": True}
++                state["spec"] = {"assign_args": "export" if base == "export" else "local"}
++            if base == "popd":
++                found.dirs_unknown = "`popd`"
+             continue
+         # ---- an argument of `head` ----
+-        if pending is not None:
+-            opt, pending = pending, None
++        if (len(seg_words) >= 3 and seg_words[-2] == "-c" and not _HEREDOC_SHELL.match(head)
++                and _HEREDOC_SHELL.match(os.path.basename(seg_words[-3]))):
++            code(w)                         # `find … -exec sh -c '…'`, `docker exec c bash -c '…'`
++            continue
++        if state["dirpending"]:
++            state["dirpending"] = False
++            chdir(w, uglob)
++            emit(w, uglob)
++            continue
++        if state["pending"] is not None:
++            opt, state["pending"] = state["pending"], None
++            if opt in spec.get("code_opts", ()):
++                code(w)
++                continue
+             if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
+                     or opt in spec.get("string_opts", ())) and not uglob:
+                 if opt in spec.get("pattern_opts", ()):
+-                    pattern_given = True
++                    state["pattern_given"] = True
+                 continue
+-            if opt == "-c" and _HEREDOC_SHELL.match(head or ""):
+-                out.extend(_outside_candidates(_strip_data_heredocs(
+-                    w.replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`")), pwd, depth + 1))
++            if opt == "-c" and _HEREDOC_SHELL.match(head):
++                code(w)
+                 continue
+-            if opt in ("-c", "-e") and _CODE_ARG_HEADS.match(head or ""):
++            if opt in ("-c", "-e") and _CODE_ARG_HEADS.match(head):
+                 for lit in _code_path_literals(w.replace(_LIT_DOLLAR, "$")):
+                     emit(lit, False)
+                 continue
+             emit(w, uglob)
+             continue
+-        if w == "--" and not opts_done:
+-            opts_done = True
+-            continue
+-        if w.startswith("-") and len(w) > 1 and not opts_done:
++        if w == "--" and not state["opts_done"]:
++            state["opts_done"] = True
++            continue
++        if w.startswith("-") and len(w) > 1 and not state["opts_done"]:
+             name, eq, val = w.partition("=")
++            if head in _DIR_OPT_HEADS:
++                if w in ("-C", "--directory"):
++                    state["dirpending"] = True
++                    continue
++                if name == "--directory" and eq:
++                    chdir(val, uglob)
++                    emit(val, uglob)
++                    continue
++                if w.startswith("-C") and len(w) > 2:
++                    chdir(w[2:], uglob)
++                    emit(w[2:], uglob)
++                    continue
+             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
+                      | spec.get("string_opts", set()) | spec.get("file_opts", set())
+-                     | spec.get("value_opts", set()))
++                     | spec.get("value_opts", set()) | spec.get("code_opts", set()))
+             if eq:
++                if name in spec.get("code_opts", ()):
++                    code(val)
++                    continue
+                 if name in spec.get("pattern_opts", ()):
+-                    pattern_given = True
++                    state["pattern_given"] = True
+                 if uglob or not (name in spec.get("delim_opts", ())
+                                  or name in spec.get("pattern_opts", ())
+                                  or name in spec.get("string_opts", ())):
+                     emit(val, uglob)
+                 continue
+-            if w in takes or (w == "-c" and (_HEREDOC_SHELL.match(head or "")
+-                                             or _CODE_ARG_HEADS.match(head or ""))) \
+-                    or (w == "-e" and _CODE_ARG_HEADS.match(head or "")):
+-                pending = w
++            if w in takes or (w == "-c" and (_HEREDOC_SHELL.match(head)
++                                             or _CODE_ARG_HEADS.match(head))) \
++                    or (w == "-e" and _CODE_ARG_HEADS.match(head)):
++                state["pending"] = w
+                 continue
+             if not w.startswith("--") and len(w) > 2 and w[:2] in takes:
+                 # attached short-option value: `-d/`, `-F:`, `-e/x/`, `-fFILE`
++                if w[:2] in spec.get("code_opts", ()):
++                    code(w[2:])
++                    continue
+                 if w[:2] in spec.get("pattern_opts", ()):
+-                    pattern_given = True
++                    state["pattern_given"] = True
+                 if uglob or not (w[:2] in spec.get("delim_opts", ())
+                                  or w[:2] in spec.get("pattern_opts", ())
+                                  or w[:2] in spec.get("string_opts", ())):
+@@ -1913,45 +1912,66 @@
+             if m:
+                 emit(m.group(1), uglob)                    # `-I/usr/include`, `-C/elsewhere`
+             continue
+-        positional += 1
++        state["positional"] += 1
++        if head in ("cd", "pushd") and state["positional"] == 1:
++            state["chdir_seen"] = True
++            chdir(w, uglob)
++            emit(w, uglob)                                 # where it goes is a reach too
++            continue
+         if head == "read" and w.isidentifier():
+-            # `LISTER … | while read V`: V takes the lister's output (paths under its roots, as
+-            # `$(LISTER …)` would). Anything else feeding `read` — a file, a non-lister — leaves
+-            # V UNKNOWN, refused where it is used as a path. Never a skip.
+-            try:
+-                if piped_from:
+-                    src = " ".join(shlex.quote(x.replace(_LIT_DOLLAR, "$")) for x in piped_from)
+-                    env[w] = _expand_one("$(" + src + ")", env, depth)
+-                else:
+-                    env.pop(w, None)
+-            except _Unmodelled:
+-                env.pop(w, None)
+-            continue
++            continue                                       # a variable name, not a path
+         if spec.get("assign_args"):
+             name, eq, val = w.partition("=")
+             if eq and name.isidentifier():                 # `export D=/x` — as an assignment
+                 try:
+-                    vals = _expand_word(val, env, depth)
+-                    if name not in _NONPATH_ASSIGNMENTS:
++                    _word_value(val)
++                    literal = True
++                except _Unenumerated:
++                    literal = False
++                if name not in _NONPATH_ASSIGNMENTS:
++                    if literal:
+                         emit(val, uglob)
+-                    env[name] = [(v, g or uglob) for v, g in vals]
+-                except _Unmodelled:
+-                    env.pop(name, None)
++                    elif spec["assign_args"] == "export":
++                        found.unenum.append(f"an expansion exported in ${name}")
+                 continue
+         mode = spec.get("positional")
++        if mode == "code":
++            code(w)                                        # `eval "…"`, `watch '…'`
++            continue
+         # An UNQUOTED glob is expanded by the shell BEFORE the command sees its arguments, so no
+         # (command, position) exception can make it a string or a pattern: `tr /x/* y` and
+         # `grep /x/*` read /x (Codex review 17029c). Exceptions apply to glob-free words only.
+         if mode in ("strings", "strings_noglob") and not uglob:
+             continue
+-        if spec.get("pattern_first") and positional == 1 and not pattern_given and not uglob:
++        if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
++                and not uglob:
+             continue
+         name, eq, val = w.partition("=")
+         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
+             emit(val, uglob)
+             continue
+         emit(w, uglob)
++    new_segment()
+     return out
++
++
++def _dir_bases(dirs, cwd: str):
++    """Every directory a relative path may resolve under after the command's directory changes:
++    each literal `cd` / `-C` target, a relative one composed under every base known before it
++    (`cd a && cd b` reaches cwd/a/b). Over-approximates the shell's scoping (`(cd x)` leaks here),
++    which only adds judgments. None when there are more than `_MAX_DIR_BASES`."""
++    bases = []
++    for d in dirs:
++        if d.startswith("/"):
++            new = [os.path.normpath(d)]
++        else:
++            new = [os.path.normpath(os.path.join(b, d)) for b in [cwd] + bases]
++        for n in new:
++            if n not in bases:
++                bases.append(n)
++        if len(bases) > _MAX_DIR_BASES:
++            return None
++    return bases
+ 
+ 
+ def _is_reach(path: str) -> bool:
+@@ -2039,9 +2059,24 @@
+ 
+     Residual, documented and accepted: relative traversal that never names a path (`grep -r .`)
+     escapes string parsing entirely — the engine sandbox, not this check, is the fs boundary."""
++    # The workspace is NORMALISED before anything compares against it. Spelled with `.` / `..`
++    # (a caller's REPO.parent, a configured path), an inside path normalised against it looked
++    # like a traversal OUT and was judged by the outside rule — under a temp-root workspace that
++    # admitted the workspace's own ungranted repos (found by the staged contract run, 2026-10-10;
++    # main refused every traversal, so this is a regression 01e68a1c introduced, not main's).
++    workspace = os.path.normpath(workspace.replace("\\", "/")).replace("\\", "/")
+     ws = workspace.rstrip("/")
+     repo_scopes, _ = _scope_parts(scopes, workspace)
+     egress = _default_forbidden() if forbidden is None else forbidden
++    # The two once-only lifts (see UNENUMERATED_TARGET): present only in a trial scope the
++    # orchestrator builds for an act whose one-time approval it holds.
++    scopes = list(scopes)
++    lift_unenum = "path:" + UNENUMERATED_TARGET in scopes
++    lift_overflow = "path:" + OVERFLOW_TARGET in scopes
++    # A home spelling is expanded from the gate's HOME below; a command that REASSIGNS HOME
++    # (`HOME=/x; cat ~/y`) makes that expansion a guess, so it is unenumerated instead.
++    if not lift_unenum and _HOME_REASSIGNED.search(cmd) and _HOME_WORD.search(cmd):
++        return False, f"{_UNMODELLED_PREFIX}a home spelling after HOME is reassigned>", UNENUMERATED_TARGET
+     # Pass 0 — the shell's home spellings, expanded before anything reads the text, so a
+     # workspace path spelled `~/…` or `$HOME/…` meets pass 1 like its literal spelling does.
+     cmd = _expand_home_words(cmd)
+@@ -2101,7 +2136,10 @@
+             if probes >= SCOPE_JUDGE_BUDGET:
+                 # FAIL CLOSED (Codex review of #1232, P1-3): an unjudged token is not an
+                 # allowed one. The old bound `break`-ed and returned allow for everything after.
+-                return False, _INCOMPLETE, None
++                # Escalable as the act (OVERFLOW_TARGET): a one-time approval of it lifts this.
++                if lift_overflow:
++                    break
++                return False, _INCOMPLETE, OVERFLOW_TARGET
+             probes += 1
+             comps = tok.split("/")
+             k = 0
+@@ -2134,12 +2172,27 @@
+     # are removed first; the bound keeps filesystem probing inside the engine's hook clamp.
+     judged = 0
+     seen3 = set()
++    found = _Found()
+     try:
+-        candidates = _outside_candidates(_strip_data_heredocs(cmd), cwd)
++        candidates = _outside_candidates(_strip_data_heredocs(cmd), cwd, found=found)
+     except _Unmodelled as why:
+-        # Shell the parser does not model is INCOMPLETE classification: refused, never skipped
+-        # (Codex re-review of #1232). The reason travels in the refusal so the member can rewrite.
+-        return False, f"{_UNMODELLED_PREFIX}{why}>", None
++        # Shell the lexer cannot read is UNENUMERATED: a scope request for the act, never a skip
++        # (Codex re-review of #1232; dp, 2026-10-10). The reason travels in the refusal.
++        if lift_unenum:
++            return True, None, None
++        return False, f"{_UNMODELLED_PREFIX}{why}>", UNENUMERATED_TARGET
++    rels = [(s_, g_) for s_, k_, g_ in candidates if k_ == "rel"]
++    if found.dirs_unknown and rels:
++        found.unenum.append(f"a relative path after {found.dirs_unknown}")
++    dir_bases = _dir_bases(found.dirs, cwd) if rels else []
++    if dir_bases is None:
++        found.unenum.append(f"more than {_MAX_DIR_BASES} directory changes")
++        dir_bases = []
++    # A relative path after a directory change is ALSO judged where it lands under it, strictly
++    # (the Read rule, inside the workspace too): `cd /tmp && cat ../etc/x` reaches /etc/x.
++    candidates = list(candidates) + [
++        (os.path.normpath(os.path.join(b, s_)).replace("\\", "/"), "dir", g_)
++        for b in dir_bases for s_, g_ in rels]
+     for spelling, kind, globbed in candidates:
+         if (spelling, kind, globbed) in seen3:
+             continue                          # a repeated spelling is judged once
+@@ -2147,7 +2200,19 @@
+         if judged >= SCOPE_JUDGE_BUDGET:
+             # FAIL CLOSED (Codex review of #1232, P1-3): past the budget the classification is
+             # INCOMPLETE, and incomplete is a refusal — never an allow of the unjudged rest.
+-            return False, _INCOMPLETE, None
++            if lift_overflow:
++                break
++            return False, _INCOMPLETE, OVERFLOW_TARGET
++        if kind == "dir":
++            probe = _glob_probe(spelling) if globbed else spelling
++            if _device_sink(spelling) or not _is_reach(probe.rstrip("*").rstrip("/") or "/"
++                                                       if globbed else probe):
++                continue
++            judged += 1
++            refused = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
++            if refused is not None:
++                return (False,) + refused
++            continue
+         if kind == "abs":
+             cand = os.path.normpath(spelling).replace("\\", "/")
+             if cand == ws or cand.startswith(ws + "/"):
+@@ -2187,6 +2252,10 @@
+             refused = refused or r
+         if refused is not None and not in_scope:
+             return (False,) + refused
++    # Every literal candidate passed. What could not be enumerated is a scope REQUEST for the act
++    # (never a silent allow): a blanket refusal, load-bearing, priced in the PR's measurement.
++    if found.unenum and not lift_unenum:
++        return False, f"{_UNMODELLED_PREFIX}{found.unenum[0]}>", UNENUMERATED_TARGET
+     return True, None, None
+ 
+ 
+@@ -2362,17 +2431,20 @@
+             # judged on the path the checker actually refused — carried out of the check,
+             # not rebuilt from the display token, which has the right repo and the wrong
+             # depth (GPT review of #1003).
+-            hint = _exact_grant_hint(refused, scopes, ws) if refused else ""
++            unpriceable = bool(refused) and refused.startswith(UNPRICEABLE_PREFIX)
++            hint = _exact_grant_hint(refused, scopes, ws) if refused and not unpriceable else ""
+             wsn = ws.replace("\\", "/").rstrip("/")
+-            outside = bool(refused) and not (refused == wsn or refused.startswith(wsn + "/"))
++            outside = bool(refused) and not unpriceable and not (refused == wsn or
++                                                                  refused.startswith(wsn + "/"))
+             if offending == _INCOMPLETE:
+                 what = (f"the command names more than {SCOPE_JUDGE_BUDGET} distinct paths, so it "
+                         f"could not be judged completely, and an incompletely judged command is "
+-                        f"refused — split it")
++                        f"refused — split it, or the act can be approved once as written")
+             elif offending and offending.startswith(_UNMODELLED_PREFIX):
+-                what = (f"it could not be judged completely ({offending[len(_UNMODELLED_PREFIX):-1]}), "
+-                        f"and an incompletely judged command is refused — rewrite it with the "
+-                        f"paths spelled out (a literal or an assignment in the same command)")
++                what = (f"the gate cannot enumerate what it reaches "
++                        f"({offending[len(_UNMODELLED_PREFIX):-1]}): nothing an expansion produces is "
++                        f"modelled, so this act can only be approved ONCE, as written — or rewritten "
++                        f"with every path spelled out literally")
+             elif outside:
+                 what = f"'{offending}' is outside the workspace and no grant reaches it"
+             else:
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -873,10 +873,24 @@
+ 
+ def _claimed_scope_entry(target: str) -> str:
+     """The `in_scope` entry a lifted refusal adds for THIS act's re-evaluation only. A glob reach
+-    (`dir/*`, see the core's `_glob_probe`) needs the subtree; anything else exactly its path."""
++    (`dir/*`, see the core's `_glob_probe`) needs the subtree; anything else exactly its path. An
++    unenumerated target (`core.UNPRICEABLE_PREFIX…`) is added as itself: the core reads it as the
++    once-only lift of what it could not enumerate, in this trial scope and nowhere else."""
+     if target.endswith("/*"):
+         return "path:" + (target[:-2] or "/") + core.RECURSIVE_SUFFIX
+     return "path:" + target
++
++
++def _scope_request_path(target: str, act_digest: str) -> str:
++    """The path the daemon's scope request is keyed on. A real path is itself. An UNENUMERATED
++    target names no path (dp, 2026-10-10: nothing an expansion produces is modelled), so its
++    request is keyed on the ACT: the sentinel plus the first 16 hex of the complete-act digest.
++    Two different unenumerated acts are two requests (the (member, path) dedup would otherwise
++    answer act B with act A's pending id), and the daemon grants such a request ONCE or not at
++    all — there is no path a session or standing grant could name."""
++    if target.startswith(core.UNPRICEABLE_PREFIX):
++        return f"{target}#{act_digest[:16]}"
++    return target
+ 
+ 
+ def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
+@@ -921,7 +935,8 @@
+ 
+     def ask(target: str):
+         try:
+-            got = _bounded(inv.phase_deadline, mechanism.claim_scope, target, ev.tool,
++            got = _bounded(inv.phase_deadline, mechanism.claim_scope,
++                           _scope_request_path(target, digest), ev.tool,
+                            inv.attempted, v.rule, plugin_id=prof.member_id, role=_role(inv),
+                            client_name=_client_name(prof), host_session_id=ev.session_id,
+                            spend=False, act_digest=digest, deadline=inv.phase_deadline)
+@@ -947,7 +962,14 @@
+             continue
+         if rid and first_id is None:
+             first_id = rid
+-        if verdict in ("opened", "pending"):
++        if verdict in ("opened", "pending") and t.startswith(core.UNPRICEABLE_PREFIX):
++            notes.append(f"Scope request {rid} is {'open' if verdict == 'opened' else 'still pending'} "
++                         f"for THIS ACT — the gate cannot enumerate what it reaches, so a NOT-SAME "
++                         f"peer (or the operator) can approve it only ONCE, as written; no session "
++                         f"or standing grant can cover it. Watch it with hestia_scope_status and "
++                         f"re-issue this identical act afterwards, or rewrite it with every path "
++                         f"spelled out literally.")
++        elif verdict in ("opened", "pending"):
+             notes.append(f"Scope request {rid} is {'open' if verdict == 'opened' else 'still pending'} "
+                          f"for '{t}' — a NOT-SAME peer decides it (this act once, for the session, "
+                          f"or standing; exact or recursive), the operator may override, and you "
+@@ -1068,9 +1090,10 @@
+ 
+ def _scope_reserve_finalize_settle(inv: _Invocation, d: GateDecision, consequential: bool) -> GateDecision:
+     ev = inv.event
+-    key = mechanism.scope_op_key(inv.scope_act_digest, inv.key, inv.scope_spend)
++    paths = [_scope_request_path(t, inv.scope_act_digest) for t in inv.scope_spend]
++    key = mechanism.scope_op_key(inv.scope_act_digest, inv.key, paths)
+     rule = inv.scope_rule or "mrh.command"
+-    state, detail = _scope_rpc(inv, "reserve", key, inv.scope_spend)
++    state, detail = _scope_rpc(inv, "reserve", key, paths)
+     if state == mechanism.SCOPE_UNCERTAIN:
+         # The reserve went out and no answer came: ask what became of this operation.
+         look, _ = _scope_rpc(inv, "lookup", key)
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -1041,6 +1041,68 @@
+         stub.close()
+ 
+ 
++def test_an_unenumerated_reach_is_a_once_only_request(m, g, wc, home):
++    """dp, 2026-10-10 ("narrow and land"): nothing an expansion produces is modelled. A command
++    whose reach depends on one is refused with the UNENUMERATED target, and the refusal is a scope
++    REQUEST for the act — keyed on the act's complete digest, decidable only as "this act once" —
++    never a silent allow (Codex 17054 P1-output-model: `cat "$(date +/x)"` was allowed)."""
++    unenum = g.core.UNENUMERATED_TARGET
++    act = 'cat "$(date +/etc/hostname)"'
++    stub = Stub(Policy())
++    try:
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "codex", "Bash", {"command": act}, home)
++        claims = [a for a, _ in stub.named("hestia_scope_claim")]
++        c = claims[0] if claims else {}
++        dg = c.get("act_digest") or ""
++        check("unenum-17054-date-format-is-refused", d.decision == "deny" and d.rule == "mrh.command", d)
++        check("unenum-opens-one-request", len(claims) == 1 and c.get("spend") is False, claims)
++        check("unenum-request-keyed-on-the-act",
++              len(dg) == 64 and c.get("path") == f"{unenum}#{dg[:16]}", c)
++        check("unenum-deny-names-the-request", d.escalation_id and d.escalation_id in d.reason, d)
++        check("unenum-deny-says-once-only", "only ONCE" in d.reason and "no session" in d.reason, d.reason)
++        with _Env(m, stub.url, home):
++            d2, _ = _decide(g, "codex", "Bash", {"command": 'cat "$(date +/etc/os-release)"'}, home)
++        claims = [a for a, _ in stub.named("hestia_scope_claim")]
++        check("unenum-two-acts-two-requests",
++              d2.decision == "deny" and len({a.get("path") for a in claims}) == 2, claims)
++    finally:
++        stub.close()
++    # A one-time approval of the act lifts it: reserved after society, committed after evidence,
++    # under the same act-keyed path.
++    stub = Stub(Policy(scope_claim=lambda p: "approved" if p.startswith(unenum) else "opened"))
++    try:
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "codex", "Bash", {"command": "cat /tmp/run-$(date +%s)/../x"}, home)
++        calls = [a for a, _ in stub.named("hestia_scope_claim")]
++        ops = [a.get("op") for a in calls if "op" in a]
++        reserve = [a for a in calls if a.get("op") == "reserve"]
++        check("unenum-once-approval-lifts", d.decision == "allow", d)
++        check("unenum-once-reserve-then-commit", ops == ["reserve", "commit"]
++              and reserve and all(p.startswith(unenum + "#") for p in reserve[0]["paths"]), calls)
++    finally:
++        stub.close()
++    # A concrete refusal in the same act is collected too, and is its own request.
++    stub = Stub(Policy(scope_claim=lambda p: "approved"))
++    try:
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D"}, home)
++        peeks = [a.get("path") for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
++        check("unenum-mixed-collects-both", d.decision == "allow" and len(peeks) == 2
++              and "/etc/hostname" in peeks and any(p.startswith(unenum + "#") for p in peeks), (d, peeks))
++    finally:
++        stub.close()
++    # Codex 17054 P1-quote-context, through decide(): the live substitution is found and judged.
++    stub = Stub(Policy())
++    try:
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "codex", "Bash", {"command": "printf '%s\\n' \"'$(cat /etc/hostname)'\""}, home)
++        check("unenum-17054-quote-context-refused", d.decision == "deny" and d.rule == "mrh.command"
++              and "/etc/hostname" in d.reason, d)
++    finally:
++        stub.close()
++
++
+ def test_degraded_posture(m, g, wc, home):
+     dead = closed_port_url()
+     with _Env(m, dead, home):
+@@ -1465,6 +1527,7 @@
+     test_superseded_is_denied_in_every_mode,
+     test_daemon_verdicts_and_the_warn_rollout,
+     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
++    test_an_unenumerated_reach_is_a_once_only_request,
+     test_degraded_posture,
+     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
+     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
+@@ -1772,13 +1835,11 @@
+ #: C8 (cross-seat verdict parity) after the cutover: the cases where the SAME act still gets a
+ #: different verdict class on different seats, each with its reason. The test fails on a cell
+ #: that differs undeclared and on a declaration that no longer differs.
+-DECLARED_SEAT_DIFFERENCES = {
+-    "scope-read-etc": (
+-        "LAW GAP, pinned and reported to dp (stage B): codex reads only through its shell tool "
+-        "(`cat /etc/hostname`), and the core's command scope judges only tokens under the "
+-        "workspace, so the shell read is unscoped while the Read tool's path is scoped (mrh.path) "
+-        "on the other three seats. Same law, two act shapes; the fix is a law change."),
+-}
++#: `scope-read-etc` was declared here (stage B: codex reads through `cat`, and the core judged
++#: only shell tokens under the workspace). CLOSED by #1232: a shell path outside the workspace is
++#: judged like a Read path, so all four seats refuse it (mrh.path / mrh.command) and the cell no
++#: longer differs. Kept as a comment so the stale-declaration check stays honest about why.
++DECLARED_SEAT_DIFFERENCES = {}
+ 
+ 
+ def _legacy_tree(ref: str, root: pathlib.Path) -> pathlib.Path:
+@@ -1956,6 +2017,16 @@
+         check("real-scope-reissue-finds-the-same-request", again.escalation_id == d.escalation_id,
+               (d.escalation_id, again.escalation_id))
+         check("real-scope-reissue-says-pending", "still pending" in again.reason, again.reason)
++        # dp, 2026-10-10 (narrowed): an act whose reach an expansion decides is a request for THE
++        # ACT against the real handler too — the daemon accepts the act-keyed sentinel, and a
++        # re-issue of the identical act finds the same request.
++        u = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 7)
++        check("real-unenumerated-is-mrh-command", u.decision == "deny" and u.rule == "mrh.command", u)
++        check("real-unenumerated-opens-a-request", bool(u.escalation_id)
++              and str(u.escalation_id).startswith("scope-") and "only ONCE" in u.reason, u)
++        u2 = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 8)
++        check("real-unenumerated-reissue-finds-it", u2.escalation_id == u.escalation_id,
++              (u.escalation_id, u2.escalation_id))
+ 
+ 
+ def teardown_module(module=None):
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -13,6 +13,18 @@
+ 
+ Written BEFORE the fix (write-the-adversarial-battery-first): every DENY row below passed on main.
+ `--against-main` prints how many of them main let through.
++
++NARROWED (dp's ruling, 2026-10-10: "narrow and land"). Four Codex rounds found false-allows in the
++attempt to MODEL what a substitution or variable expands to (name-keyed output tables: "head prints
++lines, date never prints paths"), and the class is unsound: `date +/x`, `seq -f`, `shuf -e`,
++`expr`, `wc`/`sha256sum` operand echo, `grep`/`sort`/`head FILE` all print paths. So nothing an
++expansion produces is modelled any more. A command substitution, a process substitution, a
++variable (quoted or not), brace expansion, argv built from stdin (`xargs`), or an expansion used as
++the program, wherever its value would be judged as a path, is UNENUMERATED. The act is refused
++with the `hestia:unpriceable:unenumerated` target (#1274's sentinel), which the gate turns into a
++scope REQUEST that only a one-time approval of that exact act can lift. `request` rows below pin
++exactly that: refused, AND refused as the sentinel (never a silent allow, never a dead end).
++`--classify` prints every row's verdict under the given core (battery-first evidence).
+ 
+     python3 tools/shell_scope_reach_battery_test.py
+     HESTIA_SCOPE_BATTERY_CORE=/path/to/core.py python3 tools/shell_scope_reach_battery_test.py
+@@ -98,7 +110,7 @@
+     o, ws = fx.out, fx.ws
+     old_home = os.environ.get("HOME")
+     os.environ["HOME"] = fx.base
+-    deny, allow = [], []
++    deny, allow, request = [], [], []
+     try:
+         deny += [
+             # plain, quoted, and the Read-parity target
+@@ -234,6 +246,86 @@
+             ("budget-repeat-then-outside", "cat " + " ".join(["/tmp/review-probe"] * 70 + [f"{o}/secret.txt"])),
+             ("budget-distinct-overflow", "cat " + " ".join(f"/tmp/review-probe-{i}" for i in range(140))),
+             ("find-root-after-newline", "echo start\nfind / -maxdepth 1"),
++            # Codex review 17054 (notice 17068), P1-quote-context: a dequoted apostrophe must not
++            # hide a live substitution from the body lifter.
++            ("17054-printf-apostrophe-subst", f"printf '%s\\n' \"'$(cat {o}/secret.txt)'\""),
++            ("17054-echo-apostrophe-subst", f"echo \"'$(cat {o}/secret.txt)'\""),
++            # Codex review 17054, P1-output-model, and the class the author's probes widened it to
++            # (notice-17068-response.md): an output model keyed on the command NAME is unsound.
++            ("17054-date-format-path", f"cat \"$(date +{o}/secret.txt)\""),
++            ("17054-find-printf-path", f"cat \"$(find . -maxdepth 0 -printf {o}/secret.txt)\""),
++            ("17054-head-file-operand", "cat \"$(find . -maxdepth 0 | head -n1 paths.txt)\""),
++            ("class-seq-f", f"cat \"$(seq -f '{o}/secret%g.txt' 1 1)\""),
++            ("class-shuf-e", f"cat $(shuf -e {o}/secret.txt)"),
++            ("class-expr", f"cat $(expr {o}/secret.txt)"),
++            ("class-sha256sum-operand", "cat $(sha256sum paths.txt | cut -d' ' -f3)"),
++            ("class-wc-operand", "cat $(wc -l paths.txt)"),
++            ("class-grep-file", "cat $(grep -h . paths.txt)"),
++            ("class-sort-file", "cat $(sort paths.txt)"),
++            ("class-head-file", "cat \"$(head -n1 paths.txt)\""),
++            ("class-date-plain-format", "cat /tmp/run-$(date +%s)/../../..$HOME/notes.txt"),
++            # kimi-code adversarial review of #1232 (F2): expansion-time structure and heredoc heads.
++            ("kimi-A01-unset-var-prefix", "cat $SCOPE_BATTERY_UNSET_VAR/etc/hostname"),
++            ("kimi-A02-ifs-glue-in-subst", "echo $(cat${IFS}/etc/hostname)"),
++            ("kimi-A03-ifs-glue", "cat$IFS/etc/hostname"),
++            ("kimi-A04-sudo-u-bash-heredoc", f"sudo -u root bash <<EOF\ncat {o}/secret.txt\nEOF"),
++            ("kimi-A06-chroot-bash-heredoc", f"chroot / bash <<EOF\ncat {o}/secret.txt\nEOF"),
++            ("kimi-A08-default-dir", "cat ${SCOPE_BATTERY_UNSET_VAR:-/etc}/hostname"),
++            # Found writing this battery (2026-10-10), in 01e68a1c as well as main: a relative path
++            # after a directory change, shell code in a string argument, a reassigned HOME, brace
++            # expansion and a glob followed by `..`, and argv built from stdin.
++            ("cd-temp-then-dotdot", f"cd {fx.tmp} && cat {os.path.relpath(o + '/secret.txt', fx.tmp)}"),
++            ("git-C-temp-then-dotdot",
++             f"git -C {fx.tmp} diff --no-index {os.path.relpath(o + '/secret.txt', fx.tmp)} x"),
++            ("eval-string", f"eval \"cat {o}/secret.txt\""),
++            ("find-exec-sh-c", f"find . -exec sh -c 'cat {o}/secret.txt' \\;"),
++            ("su-c-string", f"su -c 'cat {o}/secret.txt'"),
++            ("home-reassigned-then-tilde", f"HOME={o}; cat ~/secret.txt"),
++            ("brace-dotdot", f"cat /tmp/{{..,x}}{o}/secret.txt"),
++            ("glob-then-dotdot", f"cat /tmp/*/../..{o}/secret.txt"),
++            ("xargs-from-echo", f"echo {o}/secret.txt | xargs cat"),
++            ("procsub-reads-outside", f"diff <(cat {o}/secret.txt) a.txt"),
++        ]
++        # REQUESTS: refused AS the unenumerated sentinel. The gate opens a scope request that a
++        # one-time approval of this exact act lifts. The first block ALLOWED on 01e68a1c.
++        request += [
++            ("17054-date-format-path", f"cat \"$(date +{o}/secret.txt)\""),
++            ("17054-find-printf-path", f"cat \"$(find . -maxdepth 0 -printf {o}/secret.txt)\""),
++            ("17054-head-file-operand", "cat \"$(find . -maxdepth 0 | head -n1 paths.txt)\""),
++            ("class-seq-f", "cat \"$(seq -f '/tmp/review-probe%g' 1 1)\""),
++            ("class-shuf-e", "cat $(shuf -e /tmp/review-probe)"),
++            ("class-expr", "cat $(expr /tmp/review-probe)"),
++            ("class-wc-operand", "cat $(wc -l paths.txt)"),
++            ("class-grep-file", "cat $(grep -h . paths.txt)"),
++            ("class-sort-file", "cat $(sort paths.txt)"),
++            ("class-head-file", "cat \"$(head -n1 paths.txt)\""),
++            ("kimi-A01-unset-var-prefix", "cat $SCOPE_BATTERY_UNSET_VAR/etc/hostname"),
++            ("kimi-A03-ifs-glue", "cat$IFS/etc/hostname"),
++            ("kimi-A08-default-dir", "cat ${SCOPE_BATTERY_UNSET_VAR:-/etc}/hostname"),
++            ("home-reassigned-then-tilde", "HOME=/tmp/review-probe; cat ~/x"),
++            ("brace-dotdot", "cat /tmp/{..,x}/etc/hostname"),
++            ("glob-then-dotdot", "cat /tmp/*/../../etc/hostname"),
++            ("xargs-from-echo", "echo /tmp/review-probe | xargs cat"),
++            ("procsub-as-path", "diff <(sort a.txt) a.txt"),
++            ("expansion-as-program", "$(command -v cat) a.txt"),
++            ("quoted-var", "cat \"$SCOPE_BATTERY_UNSET_VAR/x\""),
++            ("subshell-assignment-leak", "D=/tmp/review-probe-a; (D=/tmp/review-probe-b); cat $D/x"),
++            ("prefix-assignment-not-in-scope-of-expansion", "D=/tmp cat $D/hostname"),
++            ("cd-unknown-then-relative", "cd \"$SCOPE_BATTERY_UNSET_VAR\" && cat ../x/y"),
++            # formerly MODELLED (allowed on 01e68a1c): now unenumerated, and priced honestly
++            ("was-for-literal-list", "for f in a.txt b.txt; do cat $f; done"),
++            ("was-for-relative-glob", "for f in *.txt; do cat $f; done"),
++            ("was-lister-subst-relative", "cat $(find . -name '*.txt')"),
++            ("was-date-in-temp-path", "x=$(date +%s); cat /tmp/review-probe-$x"),
++            ("was-default-param-under-temp", "cat ${SCOPE_BATTERY_UNSET_VAR:-/tmp/review-probe}"),
++            ("was-while-read-from-relative-find",
++             "find . -name '*.txt' | while read f; do cat \"$f\"; done"),
++            ("was-while-read-from-ls", "ls | while read -r f; do wc -l \"$f\"; done"),
++            ("was-lister-pipeline-head", "cat $(find . -name '*.txt' 2>/dev/null | head -1)"),
++            ("was-lister-pipeline-sort-grep", "cat $(ls | sort | grep txt | tail -1)"),
++            ("was-lister-pipeline-sed-n-line", "f=$(ls -t *.txt | sed -n 2p); cat \"$f\""),
++            ("was-assigned-var-under-temp", "D=/tmp/review-probe; cat $D/x"),
++            ("was-pwd-subst", "cat \"$(pwd)/a.txt\""),
+         ]
+         allow += [
+             # device sinks stay reachable
+@@ -275,25 +367,22 @@
+              "python3 - <<'EOF'\nimport re\nt = re.search(r'<table.*?</table>', h)\n"
+              "parts = p.split('/')\nif s.startswith('//'): pass\nx = 'a' + \"/\" + 'b'\nEOF"),
+             ("here-string-literal-is-data", f"cat <<< {o}/secret.txt"),
+-            # modelled expansions resolve instead of refusing
+-            ("for-literal-list", "for f in a.txt b.txt; do cat $f; done"),
+-            ("for-relative-glob", "for f in *.txt; do cat $f; done"),
+-            ("lister-subst-relative", "cat $(find . -name '*.txt')"),
++            # an expansion whose value is never judged as a path stays allowed (its body is
++            # still judged as a command)
+             ("value-subst-assigned", "n=$(grep -c x a.txt); echo $n"),
+-            ("date-in-temp-path", "x=$(date +%s); cat /tmp/review-probe-$x"),
+-            ("default-param-under-temp", "cat ${SCOPE_BATTERY_UNSET_VAR:-/tmp/review-probe}"),
+             ("exit-status", "echo done-$?"),
+-            ("while-read-from-relative-find", "find . -name '*.txt' | while read f; do cat \"$f\"; done"),
+-            ("while-read-from-ls", "ls | while read -r f; do wc -l \"$f\"; done"),
+-            ("lister-pipeline-head", "cat $(find . -name '*.txt' 2>/dev/null | head -1)"),
+-            ("lister-pipeline-sort-grep", "cat $(ls | sort | grep txt | tail -1)"),
+             ("count-pipeline", "n=$(cat a.txt | wc -l); echo $n"),
+-            ("lister-pipeline-sed-n-line", "f=$(ls -t *.txt | sed -n 2p); cat \"$f\""),
++            ("special-param-in-temp-path", "cat /tmp/review-probe-$$"),
++            ("arith-in-temp-path", "cat /tmp/review-probe-$((1+2))"),
++            ("subst-body-in-echo-is-judged-not-modelled", "echo \"$(cat a.txt)\""),
++            ("for-loop-var-in-echo", "for f in a b; do echo $f; done"),
++            ("brace-in-quotes-is-literal", "echo '{a,b}'"),
++            ("cd-temp-then-relative-inside", f"cd {fx.tmp} && ls sub/x"),
++            ("eval-of-inscope", "eval \"cat a.txt\""),
++            ("sh-c-in-find-exec-inscope", "find . -exec sh -c 'cat a.txt' \\;"),
+             ("commit-message-heredoc-apostrophe",
+              "git commit -m \"$(cat <<'EOF'\nit's fine (really\nEOF\n)\""),
+             ("comment-is-not-run", f"ls  # {o}/secret.txt"),
+-            ("assigned-var-under-temp", "D=/tmp/review-probe; cat $D/x"),
+-            ("pwd-subst", "cat \"$(pwd)/a.txt\""),
+             ("arithmetic-shift", "echo $(( 1 << 2 ))"),
+             ("grep-pattern-path-shaped-only", "grep -rn '/etc/' a.txt"),
+             ("sed-script-path-shaped", "sed 's|/usr/|/opt/|' a.txt"),
+@@ -320,6 +409,16 @@
+         for name, cmd in allow:
+             ok, tok, resolved = fx.reach(cmd)
+             check(f"allow:{name}", ok is True, f"{cmd!r} -> {(ok, tok, resolved)}")
++        UNENUM = getattr(G, "UNENUMERATED_TARGET", "hestia:unpriceable:unenumerated")
++        for name, cmd in request:
++            ok, tok, resolved = fx.reach(cmd)
++            check(f"request:{name}", ok is False and resolved == UNENUM,
++                  f"{cmd!r} -> {(ok, tok, resolved)}")
++            # Lifted by a one-time approval of the act (the sentinel in this act's trial scope),
++            # after which only a concrete path the act also names can still refuse it.
++            lifted = fx.reach(cmd, scopes=("granted", "path:" + UNENUM))
++            check(f"request-lifted-by-once:{name}", lifted[0] is True or lifted[2] not in (None, UNENUM),
++                  f"{cmd!r} lifted -> {lifted}")
+ 
+         # GRANTS: the existing forms reach, at exactly their breadth.
+         exact = ("granted", f"path:{o}/secret.txt")
+@@ -367,6 +466,22 @@
+         r = fx.reach("cat ~/notes.txt")
+         check("home-populated-is-used", r[0] is False and r[2] == f"{fx.base}/notes.txt", r)
+ 
++        # A WORKSPACE SPELLED WITH `..` (found by the staged contract run, 2026-10-10): pass 1
++        # normalised the candidate but not the workspace, so an inside path looked like a
++        # traversal OUT and was judged by the outside rule; under a temp-root workspace that
++        # admitted the workspace's own ungranted repo. Main refused it; so must this.
++        dotted = f"{fx.ws}/granted/.."
++        tws = fx.tmp + "/tws"
++        os.makedirs(tws + "/granted", exist_ok=True)
++        os.makedirs(tws + "/notgranted", exist_ok=True)
++        for w, label in ((dotted, "dotted"), (tws + "/granted/..", "temp-dotted")):
++            r = G.command_scope_reach(f"cat {w}/notgranted/b.txt", ["granted"], w, fx.cwd,
++                                      home_markers=(fx.marker,))
++            check(f"workspace-spelled-with-dotdot-{label}", r[0] is False, r)
++        r = G.command_scope_reach(f"cat {tws}/notgranted/b.txt", ["granted"], tws + "/granted/..",
++                                  tws + "/granted", home_markers=(fx.marker,))
++        check("workspace-dotted-normalised-path-refused", r[0] is False, r)
++
+         # HOME MARKERS come from the caller: a caller passing none gets none (narrow direction).
+         check("no-markers-no-home-allowance", fx.reach(f"cat {fx.marker}/own.txt", markers=())[0] is False)
+ 
+@@ -400,6 +515,11 @@
+             ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
+             check(f"evaluate-denies:{name}", ve.blocks and ve.rule in ("mrh.command", "egress.secret"),
+                   f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}")
++        for name, cmd in request:
++            ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
++            check(f"evaluate-requests:{name}",
++                  ve.blocks and ve.rule == "mrh.command" and getattr(ve, "target", "") == UNENUM,
++                  f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}/{getattr(ve, 'target', None)}")
+         # Parity on the deny side: every absolute deny target is also refused to Read.
+         for name, cmd in deny:
+             ok, tok, resolved = fx.reach(cmd)
+@@ -416,7 +536,7 @@
+             os.environ.pop("HOME", None)
+         else:
+             os.environ["HOME"] = old_home
+-    return {"deny": deny, "allow": allow}
++    return {"deny": deny, "allow": allow, "request": request}
+ 
+ 
+ def against_main(fx: Fixture) -> int:
+@@ -427,10 +547,32 @@
+     return 0
+ 
+ 
++def classify(fx: Fixture) -> int:
++    """Each row's verdict under the given core: ALLOW, REFUSE (a path), REQUEST (the sentinel)."""
++    rows = run(fx)
++    home = fx.base
++    unenum = getattr(G, "UNENUMERATED_TARGET", "hestia:unpriceable:unenumerated")
++    saved = os.environ.get("HOME")
++    os.environ["HOME"] = home
++    try:
++        for group in ("deny", "request", "allow"):
++            for name, cmd in rows[group]:
++                ok, tok, resolved = fx.reach(cmd)
++                v = "ALLOW" if ok else ("REQUEST" if resolved == unenum else
++                                        "INCOMPLETE" if not resolved else "REFUSE")
++                print(f"{group:8} {v:10} {name}")
++    finally:
++        if saved is not None:
++            os.environ["HOME"] = saved
++    return 0
++
++
+ def main() -> int:
+     fx = Fixture()
+     if "--against-main" in sys.argv:
+         return against_main(fx)
++    if "--classify" in sys.argv:
++        return classify(fx)
+     run(fx)
+     print(f"shell-scope battery: {PASSES} passed, {len(FAILS)} failed (core: {CORE_PATH})")
+     return 1 if FAILS else 0

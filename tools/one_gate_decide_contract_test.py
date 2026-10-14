@@ -105,10 +105,15 @@ class Policy:
     """What the stub answers. `query(begin_args) -> allow|warn|deny`; the rest are switches."""
 
     def __init__(self, query=None, *, superseded=False, claim="escalate", witness="receipt",
-                 delays=None, snapshot=True, cold_connect=0.0):
+                 delays=None, snapshot=True, cold_connect=0.0, scope_claim=None,
+                 scope_spend_fails=False, scope_lost=None):
         self.query = query or (lambda a: "allow")
         self.superseded = superseded
         self.claim = claim                 # escalate | approve
+        # hestia_scope_claim: path -> opened | pending | approved | in_force | refused | absent
+        self.scope_claim = scope_claim or (lambda path: "opened")
+        self.scope_spend_fails = scope_spend_fails   # the atomic reserve refuses (a race)
+        self.scope_lost = scope_lost or {}           # {op: seconds}: apply, then answer too late
         self.witness = witness             # receipt | refuse-allow | refuse-all | old
         self.delays = delays or {}         # {tool name: seconds, "*": seconds}
         self.snapshot = snapshot           # False: the snapshot connect is refused
@@ -121,6 +126,7 @@ class Stub:
         self.calls: list = []              # (tool, args, plugin_id-of-session)
         self.sessions: dict = {}
         self.decided: dict = {}            # action_id -> decision
+        self.scope_ops: dict = {}          # op_key -> reserved | committed | released
         self.lock = threading.Lock()
         stub = self
 
@@ -211,6 +217,39 @@ class Stub:
             return _ok(rid, {"claimed": False, "permits_write": False,
                              "escalation_id": "stub-esc-" + uuid.uuid4().hex[:8],
                              "how_to_decide": "stub: nobody decides"})
+        if name == "hestia_scope_claim" and "op" in args:
+            # RESERVE / COMMIT / RELEASE / LOOKUP, like the daemon's scope_claim_spend_all.
+            op, key = args.get("op"), args.get("op_key")
+            with self.lock:
+                if op == "reserve":
+                    verdicts = [p.scope_claim(x) for x in args.get("paths") or []]
+                    if p.scope_spend_fails or not all(v in ("approved", "in_force") for v in verdicts):
+                        out = {"verdict": "not_all", "permits": False, "reserved": [],
+                               "detail": "stub: not every path covered; nothing reserved"}
+                    else:
+                        self.scope_ops[key] = "reserved"
+                        out = {"verdict": "reserved", "permits": True, "op_key": key}
+                elif op in ("commit", "release"):
+                    if self.scope_ops.get(key) == "reserved":
+                        self.scope_ops[key] = "committed" if op == "commit" else "released"
+                        out = {"verdict": self.scope_ops[key], "op_key": key}
+                    else:
+                        out = {"verdict": "unknown" if key not in self.scope_ops else "settled"}
+                else:
+                    out = {"verdict": self.scope_ops.get(key, "unknown")}
+            lost = p.scope_lost.get(op)
+            if lost:
+                time.sleep(lost)               # the mutation LANDED; the answer arrives too late
+            return _ok(rid, out)
+        if name == "hestia_scope_claim":
+            path = args.get("path") or ""
+            verdict = p.scope_claim(path)
+            if verdict == "absent":            # an older daemon: no such verb
+                return _ok(rid, {"ok": True})
+            rid_ = "scope-stub" + str(abs(hash(path)) % 10**6)
+            permits = verdict in ("in_force", "approved")
+            return _ok(rid, {"verdict": verdict, "request_id": rid_, "permits": permits,
+                             "detail": f"stub {verdict}", "path": path})
         if name == "hestia_request_witness":
             return _ok(rid, {"ok": True, "witnessEntryHash": "c" * 64})
         if name == "hestia_witness_decision":
@@ -648,14 +687,12 @@ def test_reads_meet_the_same_local_law_on_every_seat(m, g, wc, home):
                 d, _ = _decide(g, seat, "Read", {"file_path": cred}, home)
                 check(f"{seat}-credential-read-up", d.decision == "deny" and d.rule == "egress.secret", d)
                 d, _ = _decide(g, seat, "Read", {"file_path": outside}, home)
+                # The LAW GAP stage B pinned here is CLOSED (2026-10-05, dp: "yes on gate gap,
+                # let's fix it"): codex reads by `cat`, and the core's command scope now judges a
+                # shell path outside the workspace exactly like a Read path. Every seat agrees.
+                check(f"{seat}-out-of-scope-read-up", d.decision == "deny" and d.rule.startswith("mrh."), d)
                 if seat == "codex":
-                    # LAW GAP, pinned (reported to dp, not fixed in B): codex reads by `cat`, and the
-                    # core's command scope judges only tokens UNDER the workspace, so a shell read of
-                    # an absolute path outside it is unscoped — on every seat, today and in decide().
-                    check(f"{seat}-out-of-scope-SHELL-read-up-is-the-known-law-gap",
-                          d.decision == "allow", d)
-                else:
-                    check(f"{seat}-out-of-scope-read-up", d.decision == "deny" and d.rule.startswith("mrh."), d)
+                    check(f"{seat}-out-of-scope-SHELL-read-is-mrh-command", d.rule == "mrh.command", d)
             with _Env(m, closed_port_url(), home):
                 d, _ = _decide(g, seat, "Read", {"file_path": cred}, home)
                 check(f"{seat}-credential-read-down", d.decision == "deny" and d.rule == "egress.secret", d)
@@ -779,6 +816,328 @@ def test_daemon_verdicts_and_the_warn_rollout(m, g, wc, home):
         check("daemon-warn", d.decision == "warn" and d.rule == "society.safety.warn" and d.evidence_committed, d)
     finally:
         stub.close()
+
+
+def hashlib_sha(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home):
+    """dp, 2026-10-05: "escalation should allow standing grants". An `mrh.path` / `mrh.command`
+    refusal asks the daemon ONCE (`hestia_scope_claim`): a request is opened (or re-found) on the
+    operator's queue and the deny names its id; an operator's one-time approval or a grant in
+    force lifts exactly the refused path for this act; a refusal stays refused."""
+    one, two = "/etc/hostname", "/etc/os-release"
+    # (1) opened: the deny names the request, carries it as escalation_id, and the claim carried
+    # the resolved path, the act, the rule and the request key.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {one}"}, home)
+        claims = [a for a, _ in stub.named("hestia_scope_claim")]
+        check("scope-opened-denies", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("scope-opened-one-claim", len(claims) == 1, claims)
+        c = claims[0] if claims else {}
+        check("scope-claim-carries-path", c.get("path") == one, c)
+        check("scope-claim-carries-act", one in (c.get("act") or ""), c)
+        check("scope-claim-carries-rule", c.get("rule") == "mrh.command", c)
+        check("scope-claim-carries-key", c.get("request_key") == m.scope_request_key("claude-code", one), c)
+        check("scope-claim-only-peeks", c.get("spend") is False, c)
+        dg = c.get("act_digest") or ""
+        check("scope-claim-carries-a-complete-act-digest", len(dg) == 64 and dg != hashlib_sha(
+            "Bash\x1f" + (c.get("act") or "")), c)
+        check("scope-claim-no-batch-spend-on-a-refusal", not [a for a in claims if "paths" in a], claims)
+        check("scope-deny-names-the-request", d.escalation_id and d.escalation_id in d.reason, d)
+        check("scope-deny-says-reissue", "re-issue this identical act" in d.reason, d.reason)
+        # dp, 2026-10-05: peers decide; the deny says so and says the asker cannot.
+        check("scope-deny-routes-to-peers", "NOT-SAME peer decides" in d.reason
+              and "cannot decide it yourself" in d.reason, d.reason)
+        # A Read refusal escalates the same way (mrh.path).
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Read", {"file_path": one}, home)
+        check("scope-read-escalates", d.decision == "deny" and d.rule == "mrh.path" and d.escalation_id, d)
+    finally:
+        stub.close()
+    # (2) approved once / in force: lifted, and the act goes on to society law.
+    for verdict in ("approved", "in_force"):
+        stub = Stub(Policy(scope_claim=lambda p, v=verdict: v))
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+            check(f"scope-{verdict}-lifts", d.decision == "allow", d)
+            check(f"scope-{verdict}-asks-society", len(stub.named("hestia_begin_action")) == 1)
+            check(f"scope-{verdict}-notice", any("scope " + verdict in n for n in d.notices), d.notices)
+        finally:
+            stub.close()
+    # (3) refused: stays refused and says so.
+    stub = Stub(Policy(scope_claim=lambda p: "refused"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-refused-denies", d.decision == "deny" and "REFUSED" in d.reason, d)
+        check("scope-refused-no-society", not stub.named("hestia_begin_action"))
+    finally:
+        stub.close()
+    # (4) an older daemon without the verb: still refused, and the remedy door is named.
+    stub = Stub(Policy(scope_claim=lambda p: "absent"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-old-daemon-denies", d.decision == "deny" and "hestia_request_scope" in d.reason, d)
+        check("scope-old-daemon-no-id", d.escalation_id is None, d)
+    finally:
+        stub.close()
+    # (5) two refused paths: PEEK both first, spend only when both lift; one un-approved path
+    # spends nothing (a one-time approval is not burned on an act that is still refused).
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one} {two}"}, home)
+        calls = [a for a, _ in stub.named("hestia_scope_claim")]
+        peeks = [a.get("spend") for a in calls if "op" not in a]
+        ops = [a.get("op") for a in calls if "op" in a]
+        check("scope-two-paths-lift", d.decision == "allow", d)
+        check("scope-two-paths-peek-only", peeks == [False, False], peeks)
+        reserve = [a for a in calls if a.get("op") == "reserve"]
+        check("scope-two-paths-one-reserve-then-commit",
+              ops == ["reserve", "commit"] and sorted(reserve[0]["paths"]) == sorted([one, two])
+              and len(reserve[0].get("act_digest") or "") == 64, calls)
+        order = [t if t != "hestia_scope_claim" else "claim:" + str(a.get("op"))
+                 for t, a, _p in stub.calls
+                 if t in ("hestia_begin_action", "hestia_witness_decision", "hestia_scope_claim")]
+        check("scope-reserve-after-society-commit-after-evidence",
+              order.index("claim:reserve") > order.index("hestia_begin_action")
+              and order.index("claim:commit") > order.index("hestia_witness_decision"), order)
+        check("scope-committed-in-stub", list(stub.scope_ops.values()) == ["committed"], stub.scope_ops)
+    finally:
+        stub.close()
+    # (5b) Codex P2 regressions: a denied act consumes NOTHING.
+    #   - society denies after every scope path was approved: nothing reserved at all;
+    stub = Stub(Policy(scope_claim=lambda p: "approved", query=lambda a: "deny"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        ops = [a for a, _ in stub.named("hestia_scope_claim") if "op" in a]
+        check("scope-society-deny-reserves-nothing", d.decision == "deny" and d.rule == "society.safety"
+              and not ops, (d, ops))
+    finally:
+        stub.close()
+    #   - the act's FINAL EVIDENCE fails to commit (gate.evidence_uncommitted): the reservation
+    #     is RELEASED, never committed;
+    stub = Stub(Policy(scope_claim=lambda p: "approved", witness="refuse-allow"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-failed-final-witness-releases", d.decision == "deny"
+              and d.rule == "gate.evidence_uncommitted"
+              and list(stub.scope_ops.values()) == ["released"]
+              and any("released" in n for n in d.notices), (d, stub.scope_ops))
+    finally:
+        stub.close()
+    #   - LOST RESPONSE on reserve (it landed; the answer came too late): the gate looks the
+    #     operation up — the stub answers slowly too, so the outcome stays UNCERTAIN, the act is
+    #     denied, a release is attempted, and the text says uncertain, never "nothing consumed";
+    stub = Stub(Policy(scope_claim=lambda p: "approved", scope_lost={"reserve": 6.0, "lookup": 6.0,
+                                                                     "release": 6.0}))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-lost-reserve-is-uncertain", d.decision == "deny"
+              and "UNCERTAIN" in d.reason and "nothing was consumed" not in d.reason, d)
+    finally:
+        stub.close()
+    #   - lost reserve answer but a prompt LOOKUP: the gate learns it reserved and proceeds;
+    stub = Stub(Policy(scope_claim=lambda p: "approved", scope_lost={"reserve": 6.0}))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home, budget_seconds=12)
+        ops = [a.get("op") for a, _ in stub.named("hestia_scope_claim") if "op" in a]
+        check("scope-lost-reserve-recovered-by-lookup", d.decision == "allow"
+              and ops[:2] == ["reserve", "lookup"] and "commit" in ops, (d, ops))
+    finally:
+        stub.close()
+    #   - DELAYED TRANSPORT before anything is sent: a deadline that runs out during the peeks
+    #     never lets a reserve go out after the gate has decided.
+    stub = Stub(Policy(scope_claim=lambda p: "approved", delays={"hestia_connect": 0.0,
+                                                                 "hestia_scope_claim": 2.5}))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home, budget_seconds=2.0)
+        time.sleep(3.0)                     # let any abandoned worker finish whatever it would do
+        ops = [a.get("op") for a, _ in stub.named("hestia_scope_claim") if "op" in a]
+        check("scope-delayed-transport-sends-no-late-reserve", d.decision == "deny" and not ops,
+              (d, ops))
+    finally:
+        stub.close()
+    #   - more refused paths than the gate collects: refused before ANY claim;
+    many = [f"/etc/review-probe-{i}" for i in range(g.SCOPE_CLAIM_MAX_PATHS + 1)]
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "cat " + " ".join(many)}, home)
+        check("scope-incomplete-collection-claims-nothing",
+              d.decision == "deny" and not stub.named("hestia_scope_claim"), (d, stub.calls[-3:]))
+    finally:
+        stub.close()
+    #   - the atomic reserve itself refuses (a race): denied, and it CAN say nothing was consumed.
+    stub = Stub(Policy(scope_claim=lambda p: "approved", scope_spend_fails=True))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-failed-reserve-denies", d.decision == "deny"
+              and "could not be reserved" in d.reason and "nothing was consumed" in d.reason
+              and not stub.scope_ops, d)
+    finally:
+        stub.close()
+    # (5c) Codex P1-1 regressions: the act digest covers the COMPLETE act, so acts that share a
+    # display summary never share a binding.
+    pairs = [
+        ("Write", {"file_path": one, "content": "one"}, {"file_path": one, "content": "two"}),
+        ("Edit", {"file_path": one, "old_string": "a", "new_string": "one"},
+         {"file_path": one, "old_string": "a", "new_string": "two"}),
+        ("Bash", {"command": f"TOKEN=one cat {one}"}, {"command": f"TOKEN=two cat {one}"}),
+        ("Bash", {"command": ": " + "x" * 410 + f"; cat {one}"},
+         {"command": ": " + "x" * 410 + f"; echo changed > {one}"}),
+        ("Bash", {"command": f"printf 'a  b' > {one}"}, {"command": f"printf 'a b' > {one}"}),
+    ]
+    for i, (tool, a, b) in enumerate(pairs):
+        check(f"scope-digest-distinguishes-{i}-{tool}",
+              m.scope_act_digest(tool, a, "/w", "s") != m.scope_act_digest(tool, b, "/w", "s"))
+    check("scope-digest-binds-cwd", m.scope_act_digest("Bash", {"command": "cat x"}, "/a", "s")
+          != m.scope_act_digest("Bash", {"command": "cat x"}, "/b", "s"))
+    check("scope-digest-binds-session", m.scope_act_digest("Bash", {"command": "cat x"}, "/a", "s1")
+          != m.scope_act_digest("Bash", {"command": "cat x"}, "/a", "s2"))
+    check("scope-digest-ignores-description",
+          m.scope_act_digest("Bash", {"command": "cat x", "description": "one"}, "/a", "s")
+          == m.scope_act_digest("Bash", {"command": "cat x", "description": "two"}, "/a", "s"))
+    stub = Stub(Policy(scope_claim=lambda p: "approved" if p == one else "opened"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one} {two}"}, home)
+        spends = [a.get("spend") for a, _ in stub.named("hestia_scope_claim")]
+        check("scope-partial-denies", d.decision == "deny" and d.escalation_id, d)
+        check("scope-partial-spends-nothing", True not in spends, spends)
+        check("scope-partial-names-the-open-path", two in d.reason, d.reason)
+    finally:
+        stub.close()
+    # (6) the warn rollout softens the scope refusal into a warning and opens nothing.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home, rollout="warn")
+        check("scope-warn-rollout-warns", d.decision == "warn" and d.rule.startswith("mrh."), d)
+        check("scope-warn-rollout-opens-nothing", not stub.named("hestia_scope_claim"))
+    finally:
+        stub.close()
+    # (7) device sinks and temp roots are never escalated.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "ls 2>/dev/null >/tmp/x"}, home)
+        check("scope-sinks-allowed", d.decision == "allow", d)
+        check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
+    finally:
+        stub.close()
+
+
+def test_an_unenumerated_reach_is_a_once_only_request(m, g, wc, home):
+    """dp, 2026-10-10 ("narrow and land"): nothing an expansion produces is modelled. A command
+    whose reach depends on one is refused with the UNENUMERATED target, and the refusal is a scope
+    REQUEST for the act — keyed on the act's complete digest, decidable only as "this act once" —
+    never a silent allow (Codex 17054 P1-output-model: `cat "$(date +/x)"` was allowed)."""
+    unenum = g.core.UNENUMERATED_TARGET
+    act = 'cat "$(date +/etc/hostname)"'
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": act}, home)
+        claims = [a for a, _ in stub.named("hestia_scope_claim")]
+        c = claims[0] if claims else {}
+        dg = c.get("act_digest") or ""
+        check("unenum-17054-date-format-is-refused", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("unenum-opens-one-request", len(claims) == 1 and c.get("spend") is False, claims)
+        check("unenum-request-keyed-on-the-act",
+              len(dg) == 64 and c.get("path") == f"{unenum}#{dg[:16]}", c)
+        check("unenum-deny-names-the-request", d.escalation_id and d.escalation_id in d.reason, d)
+        check("unenum-deny-says-once-only", "only ONCE" in d.reason and "no session" in d.reason, d.reason)
+        with _Env(m, stub.url, home):
+            d2, _ = _decide(g, "codex", "Bash", {"command": 'cat "$(date +/etc/os-release)"'}, home)
+        claims = [a for a, _ in stub.named("hestia_scope_claim")]
+        check("unenum-two-acts-two-requests",
+              d2.decision == "deny" and len({a.get("path") for a in claims}) == 2, claims)
+    finally:
+        stub.close()
+    # A one-time approval of the act lifts it: reserved after society, committed after evidence,
+    # under the same act-keyed path.
+    stub = Stub(Policy(scope_claim=lambda p: "approved" if p.startswith(unenum) else "opened"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "cat /tmp/run-$(date +%s)/../x"}, home)
+        calls = [a for a, _ in stub.named("hestia_scope_claim")]
+        ops = [a.get("op") for a in calls if "op" in a]
+        reserve = [a for a in calls if a.get("op") == "reserve"]
+        check("unenum-once-approval-lifts", d.decision == "allow", d)
+        check("unenum-once-reserve-then-commit", ops == ["reserve", "commit"]
+              and reserve and all(p.startswith(unenum + "#") for p in reserve[0]["paths"]), calls)
+    finally:
+        stub.close()
+    # A concrete refusal in the same act is collected too, and is its own request.
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            # `$D` alone would now resolve (dp, 2026-10-11: one literal binds); `$E` does not.
+            d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D $E"}, home)
+        peeks = [a.get("path") for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
+        check("unenum-mixed-collects-both", d.decision == "allow" and len(peeks) == 2
+              and "/etc/hostname" in peeks and any(p.startswith(unenum + "#") for p in peeks), (d, peeks))
+    finally:
+        stub.close()
+    # Codex 17054 P1-quote-context, through decide(): the live substitution is found and judged.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "printf '%s\\n' \"'$(cat /etc/hostname)'\""}, home)
+        check("unenum-17054-quote-context-refused", d.decision == "deny" and d.rule == "mrh.command"
+              and "/etc/hostname" in d.reason, d)
+    finally:
+        stub.close()
+
+
+def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
+    """#1287 part 1 (2026-10-13): a seat put prose with `*` and quotes in R and passed "$R" as
+    `--reason`; the literal rule made the act a once-only scope request although nothing in it is a
+    path. A value that cannot bind is unenumerated only where its use is judged as a PATH. Every
+    seat: the exact shape is allowed (and asks society law); a glob-valued name in a path position
+    is still a request; an UNQUOTED glob-valued name in the message position is still a request, and
+    so is an unquoted value that field splitting breaks into more arguments (Codex HOLD 21675)."""
+    prose = ("Refused: no seat asked for this. The act is the deploy preflight's advisory hold probe "
+             "(deploy/from-main/hestia-deploy.sh ~L605, plugins/*/expects.json 'evaluate deploy hold'), "
+             "fired for ever …")
+    exact = f'cd {REPO}; R="{prose}"; hestia gate deny 0123abcd --as claude-code --reason "$R"'
+    unenum = g.core.UNENUMERATED_TARGET
+    for seat in SEATS:
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, seat, "Bash", {"command": exact}, home)
+                check(f"1287-{seat}-prose-reason-allowed", d.decision == "allow", d)
+                check(f"1287-{seat}-prose-reason-asks-society", len(stub.named("hestia_begin_action")) == 1)
+                d, _ = _decide(g, seat, "Bash", {"command": 'F="a*"; cat $F'}, home)
+                check(f"1287-{seat}-glob-var-path-is-a-request", d.decision == "deny"
+                      and d.rule == "mrh.command" and "only ONCE" in d.reason, d)
+                d, _ = _decide(g, seat, "Bash", {"command": 'R="/tmp/review-probe/*"; hestia gate deny X --reason $R'}, home)
+                check(f"1287-{seat}-unquoted-glob-reason-is-a-request", d.decision == "deny"
+                      and d.rule == "mrh.command", d)
+                # Codex HOLD 21675: unquoted, the value splits and `--body-file` becomes gh's argument.
+                d, _ = _decide(g, seat, "Bash", {"command": 'R="hi --body-file /etc/hostname"; gh pr create --title $R'}, home)
+                check(f"1289-{seat}-unquoted-split-title-is-a-request", d.decision == "deny"
+                      and d.rule == "mrh.command" and "only ONCE" in d.reason, d)
+            claims = [a for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
+            check(f"1287-{seat}-requests-are-unenumerated",
+                  claims and all(str(c.get("path", "")).startswith(unenum) for c in claims), claims)
+        finally:
+            stub.close()
 
 
 def test_degraded_posture(m, g, wc, home):
@@ -1204,6 +1563,9 @@ CONTRACT_TESTS = [
     test_reads_meet_the_same_local_law_on_every_seat,
     test_superseded_is_denied_in_every_mode,
     test_daemon_verdicts_and_the_warn_rollout,
+    test_a_scope_refusal_is_an_escalation_with_a_standing_option,
+    test_an_unenumerated_reach_is_a_once_only_request,
+    test_prose_in_a_message_position_is_data_on_every_seat,
     test_degraded_posture,
     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
@@ -1511,13 +1873,11 @@ def _probe_pair(stub, pol, seat, raw, env, rollout, gate_argv):
 #: C8 (cross-seat verdict parity) after the cutover: the cases where the SAME act still gets a
 #: different verdict class on different seats, each with its reason. The test fails on a cell
 #: that differs undeclared and on a declaration that no longer differs.
-DECLARED_SEAT_DIFFERENCES = {
-    "scope-read-etc": (
-        "LAW GAP, pinned and reported to dp (stage B): codex reads only through its shell tool "
-        "(`cat /etc/hostname`), and the core's command scope judges only tokens under the "
-        "workspace, so the shell read is unscoped while the Read tool's path is scoped (mrh.path) "
-        "on the other three seats. Same law, two act shapes; the fix is a law change."),
-}
+#: `scope-read-etc` was declared here (stage B: codex reads through `cat`, and the core judged
+#: only shell tokens under the workspace). CLOSED by #1232: a shell path outside the workspace is
+#: judged like a Read path, so all four seats refuse it (mrh.path / mrh.command) and the cell no
+#: longer differs. Kept as a comment so the stale-declaration check stays honest about why.
+DECLARED_SEAT_DIFFERENCES = {}
 
 
 def _legacy_tree(ref: str, root: pathlib.Path) -> pathlib.Path:
@@ -1677,11 +2037,34 @@ def test_against_an_isolated_real_daemon(m, g, wc, home):
         d = run("Bash", {"command": "ls -la"}, 2)
         check("real-allow-committed-as-policy_allow", d.decision == "allow" and d.evidence_committed
               and d.action_id, d)
-        d = run("Bash", {"command": "rm -rf /home/user/data"}, 3)
+        # A relative target that exists nowhere: SCOPE has nothing to judge and the daemon's law
+        # refuses it (safety preset `rm -rf v21out`). Since 2026-10-05 the old
+        # `rm -rf /home/user/data` is refused by scope first, before the law is asked.
+        d = run("Bash", {"command": "rm -rf decide-contract-probe-out"}, 3)
         check("real-daemon-deny", d.decision == "deny" and d.rule == "society.safety", d)
         check("real-daemon-deny-one-row", d.evidence_committed, d)
         d = run("Read", {"file_path": str(REPO / "README.md")}, 4)
         check("real-read-allowed-and-recorded", d.decision == "allow" and d.evidence_committed, d)
+        # A scope refusal against the REAL daemon opens a request, and a re-issue finds it
+        # (hestia_scope_claim, 2026-10-05). An older daemon answers no-channel; say so.
+        d = run("Bash", {"command": "cat /etc/hostname"}, 5)
+        check("real-scope-refusal-is-mrh-command", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("real-scope-refusal-opens-a-request", bool(d.escalation_id)
+              and str(d.escalation_id).startswith("scope-"), d)
+        again = run("Bash", {"command": "cat /etc/hostname"}, 6)
+        check("real-scope-reissue-finds-the-same-request", again.escalation_id == d.escalation_id,
+              (d.escalation_id, again.escalation_id))
+        check("real-scope-reissue-says-pending", "still pending" in again.reason, again.reason)
+        # dp, 2026-10-10 (narrowed): an act whose reach an expansion decides is a request for THE
+        # ACT against the real handler too — the daemon accepts the act-keyed sentinel, and a
+        # re-issue of the identical act finds the same request.
+        u = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 7)
+        check("real-unenumerated-is-mrh-command", u.decision == "deny" and u.rule == "mrh.command", u)
+        check("real-unenumerated-opens-a-request", bool(u.escalation_id)
+              and str(u.escalation_id).startswith("scope-") and "only ONCE" in u.reason, u)
+        u2 = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 8)
+        check("real-unenumerated-reissue-finds-it", u2.escalation_id == u.escalation_id,
+              (u.escalation_id, u2.escalation_id))
 
 
 def teardown_module(module=None):

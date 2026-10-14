@@ -10,6 +10,11 @@ name: upgrade path
 # install-members.sh, register-members.py, the seat seeder) with redirected roots, against an
 # isolated daemon built from this commit.
 #
+# A second arm (#1250) installs this commit on a FRESH host through the timer path the README
+# documents (clone, install the script, arm the timer) and fails unless the first cycle deploys
+# (preflight passes, seat projections and identity seeds present) and the next is a no-op, also
+# when the checkout spells the commit at a different abbreviation length.
+#
 # NON-BLOCKING ON PURPOSE, FOR NOW. This is its own workflow, and "upgrade path" is not among the
 # required status checks (cargo test / hook tests / plugin tests), so a red here does not block a
 # merge. It is red on main the day it lands: main's gates refuse `config.unbacked` under the

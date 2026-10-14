@@ -314,8 +314,8 @@ impl Default for ReadBasis {
 /// Deployment identity as observed by the daemon.
 ///
 /// `HESTIA_CURRENT_BUILD_FILE` points at a small supervisor-owned JSON manifest,
-/// for example `{ "build_id": "app-v0.1.2-607-ge720d0a" }` — the exact
-/// `git describe` provenance string the deployed binary reports in
+/// for example `{ "build_id": "v0.3.0-12-ge720d0a" }` — the exact
+/// `git describe --tags --match 'v[0-9]*'` provenance string the deployed binary reports in
 /// `hestia --version` (see docs/DASHBOARD.md; a short hash never matches).
 /// Missing or unreadable authority is
 /// deliberately `unknown`, not green: a daemon cannot claim freshness from its
@@ -456,6 +456,38 @@ fn deployment_update_status(
     }
 }
 
+/// The abbreviated sha a `git describe` string ends in (`v0.0.4-968-ga7e33bc4` -> `a7e33bc4`),
+/// or the whole string when it is a bare sha (a clone without tags). None for an exact tag,
+/// `unknown`, or anything shorter than git's minimum abbreviation.
+fn describe_hex(build: &str) -> Option<&str> {
+    let s = build.strip_suffix("-dirty").unwrap_or(build);
+    let hex = s.rsplit_once("-g").map(|(_, h)| h).unwrap_or(s);
+    (hex.len() >= 7 && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))).then_some(hex)
+}
+
+/// Whether the deployment authority names the build this daemon is running (#1250).
+///
+/// `git describe` sizes its abbreviated sha by the object count of the clone it runs in, so one
+/// commit is `-g588684d` in one clone and `-g588684d6` in another (measured by the upgrade-path
+/// harness, twice in one night). A string compare called the same build stale. So: equal strings;
+/// else the same `-dirty` state and the SAME COMMIT -- the running abbreviation a prefix of the
+/// manifest's full `head_sha` when it carries one (install-members.sh writes it), else the two
+/// abbreviations agreeing on the shorter one's length.
+pub(crate) fn same_deployed_build(manifest_build: &str, manifest_head_sha: Option<&str>, running: &str) -> bool {
+    if manifest_build == running {
+        return true;
+    }
+    if manifest_build.ends_with("-dirty") != running.ends_with("-dirty") {
+        return false;
+    }
+    let Some(run) = describe_hex(running) else { return false };
+    if let Some(full) = manifest_head_sha.filter(|h| h.len() == 40 && h.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))) {
+        return full.starts_with(run);
+    }
+    let Some(man) = describe_hex(manifest_build) else { return false };
+    man.starts_with(run) || run.starts_with(man)
+}
+
 fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
     let running_build = env!("HESTIA_GIT_VERSION").to_string();
     let Some(path) = path else {
@@ -522,7 +554,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             gate_engine: GateEngineHealth::default(),
         };
     };
-    let current = current_build == running_build;
+    let head_sha = manifest.get("head_sha").and_then(serde_json::Value::as_str);
+    let current = same_deployed_build(&current_build, head_sha, &running_build);
     let (update_capable, update_state, update_request_id, update_note) =
         deployment_update_status(path, current);
     DeploymentHealth {
@@ -1514,6 +1547,40 @@ impl ServerState {
                             "requested_at": r.requested_at,
                             "expires_at": r.expires_at,
                             "secs_remaining": r.expires_at.saturating_sub(now),
+                            // 2026-10-05 — a GATE-OPENED request carries the refusal it
+                            // answers: the act the operator rules on, the rule, the tool, how
+                            // often the member re-issued it, and whether only a recursive grant
+                            // can cover it (a glob). `once_available` says whether "this act
+                            // once" is a choice: a member-filed ask names no act to bind.
+                            "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                            "rule": r.ext.gate.as_ref().map(|g| g.rule.clone()),
+                            "tool": r.ext.gate.as_ref().map(|g| g.tool.clone()),
+                            "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
+                            "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
+                            "subtree": r.ext.gate.as_ref().is_some_and(|g| g.subtree),
+                            "once_available": r.ext.gate.is_some(),
+                            // dp, 2026-10-10 (#1232 narrowed): an act the gate could not
+                            // enumerate names no path — "this act once" is the ONLY grant.
+                            "once_only": crate::server::state::is_unpriceable_scope_path(&r.path),
+                            // #1287 part 2: the decisions the decide endpoint ACCEPTS for this
+                            // request, from the function its refusal reads — the surfaces render
+                            // exactly these, so no button is refused after the click.
+                            "enumerable": !crate::server::state::is_unpriceable_scope_path(&r.path),
+                            "allowed_decisions": crate::server::state::scope_allowed_decisions(
+                                &r.path, r.ext.gate.is_some()),
+                            // dp, 2026-10-05: NOT-SAME peers decide gate-opened requests; the
+                            // operator surfaces show who was invited and offer the OVERRIDE.
+                            "invited_peers": r.ext.invited_peers,
+                            "asker_basis": r.ext.gate.as_ref().map(|g| g.asker_basis),
+                            // dp, 2026-10-13: a peer-routed request ESCALATES to the operator
+                            // when no peer has ruled within the window (scope_decided_by).
+                            "decided_by_default": crate::server::state::scope_decided_by(
+                                r.ext.gate.is_some(), r.ext.invited_peers.len(),
+                                r.requested_at, now, crate::server::state::scope_peer_window_secs()).0,
+                            "peer_window_lapsed": crate::server::state::scope_decided_by(
+                                r.ext.gate.is_some(), r.ext.invited_peers.len(),
+                                r.requested_at, now, crate::server::state::scope_peer_window_secs()).1,
+                            "peer_window_secs": crate::server::state::scope_peer_window_secs(),
                         })
                     })
                     .collect();
@@ -1538,12 +1605,17 @@ impl ServerState {
                         serde_json::json!({
                             "lifetime": "live",
                             "plugin_id": r.plugin_id,
-                            "path": r.path,
+                            // The breadth in force (the operator may have granted an ancestor
+                            // of the asked path, recursively); the asked path rides beside it.
+                            "path": r.reach_path(),
+                            "asked_path": r.path,
                             "reason": r.decision_reason,
                             "requested_because": r.reason,
                             "granted_by": r.decided_by,
                             "request_id": r.id,
-                            "origin": "member_request",
+                            "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                            // A PEER's ruling shows who and on what NOT-SAME basis (read-only).
+                            "peer_basis": r.ext.peer_basis,
                             "expires_at": r.expires_at,
                             "secs_remaining": r.expires_at.saturating_sub(now),
                             "recursive": r.recursive,
@@ -1579,6 +1651,11 @@ impl ServerState {
                             "granted_by": g.granted_by,
                             "request_id": g.request_id,
                             "recursive": g.recursive,
+                            // A peer's standing grant shows its NOT-SAME basis while the request
+                            // it answered is still in memory (the chain row keeps it for good).
+                            "peer_basis": g.request_id.as_ref()
+                                .and_then(|id| self.scope_requests.get(id))
+                                .and_then(|r| r.ext.peer_basis.clone()),
                             // The distinction the route table argues for: a grant that
                             // ratified a member's ask carries that ask's id; one the operator
                             // originated carries none. Derived, never stored twice.
@@ -1775,6 +1852,28 @@ mod tests {
     }
 
     #[test]
+    fn deployment_build_is_compared_by_commit_not_by_abbreviation() {
+        // #1250: the same commit spelled at two abbreviation lengths is one build.
+        assert!(same_deployed_build("v0.0.4-965-g588684d6", None, "v0.0.4-965-g588684d"));
+        assert!(same_deployed_build("v0.0.4-965-g588684d", None, "v0.0.4-965-g588684d6"));
+        // A moved tag renames the count, not the commit.
+        assert!(same_deployed_build("v0.0.4-492-g588684d6", None, "v0.0.4-485-g588684d"));
+        let full = "588684d6aaaabbbbccccddddeeeeffff00001111";
+        assert!(same_deployed_build("v0.0.4-965-g588684d6", Some(full), "v0.0.4-965-g588684d"));
+        // The full sha decides when the manifest carries one.
+        assert!(!same_deployed_build("v0.0.4-965-g588684d6", Some("9c880def0000000000000000000000000000000a"), "v0.0.4-965-g588684d"));
+        // Different commits, dirty vs clean, exact tags and unknowns are not the same build.
+        assert!(!same_deployed_build("v0.0.4-966-g9c880de", None, "v0.0.4-965-g588684d"));
+        assert!(!same_deployed_build("v0.0.4-965-g588684d6-dirty", None, "v0.0.4-965-g588684d"));
+        assert!(!same_deployed_build("v0.0.5", None, "v0.0.4-965-g588684d"));
+        assert!(!same_deployed_build("unknown", None, "v0.0.4-965-g588684d"));
+        assert!(!same_deployed_build("v0.0.4-965-g5886", None, "v0.0.4-965-g588684d"));
+        assert!(same_deployed_build("v0.0.5", None, "v0.0.5"));
+        // A clone without tags names the commit by a bare sha.
+        assert!(same_deployed_build("588684d6", None, "v0.0.4-965-g588684d"));
+    }
+
+    #[test]
     fn deployment_update_status_projects_supervisor_states_without_inventing_success() {
         if !(cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
             return;
@@ -1863,7 +1962,7 @@ mod tests {
             decided_at: granted.map(|_| now),
             decision_reason: None,
             recursive: false,
-            revoked: None,
+            revoked: None, ext: Default::default(),
         };
 
         state.scope_requests.insert(

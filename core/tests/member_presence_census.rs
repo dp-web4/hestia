@@ -563,10 +563,50 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // Both remain Naming. Neither derived lct is compared to anything — the decision keys on
     // `request_id` and the `(plugin_id, path)` strings, and these values are serialised into
     // witness entries and read by nothing.
-    ("server/http.rs::scope_decide", &[
+    //
+    // RENAMED 2026-10-05 (#1232): the body moved into `scope_decide_as`, which the operator's
+    // HTTP route AND a NOT-SAME peer (`hestia_scope_peer_decide`) both call, so the duration /
+    // breadth / once rules cannot drift between them. Lines byte-identical; reading unchanged.
+    ("server/http.rs::scope_decide_as", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-10-11 (#1232, the gate-opened scope request). The census was red on the branch
+    // from the daemon commits on; registered here with the reading it schedules.
+    //
+    // READING for `tool_scope_claim` (two lines: `scope_once_spent`, `scope_requested`),
+    // `scope_claim_spend_all` (`scope_once_reserved`) and `scope_claim_settle`
+    // (`scope_once_spent` / `scope_once_released`). (1) Who gets named? The member a scope
+    // request is FOR, in the witness entry that opens, reserves, spends or releases it — the
+    // same subject `tool_request_scope` names for a member-filed ask. A session-resolved
+    // `plugin_id` when the gate presented one, else the asserted id (HST-005 / A1: a name, not
+    // attendance). (2) Compared to decide control flow? No — every decision keys on
+    // `(plugin_id, path)` strings, the request id and the act digest; the derived LCT is
+    // serialised into the entry and read by nothing. Naming.
+    ("server/handler.rs::tool_scope_claim", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    ("server/handler.rs::scope_claim_spend_all", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    ("server/handler.rs::scope_claim_settle", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    // READING for `scope_peer_pool` and `tool_scope_peer_decide` (dp, 2026-10-05: "scope
+    // escalations should go to peers not to me"). Both COMPARE names, so both are Predicate.
+    // `scope_peer_pool` is `resolve_invitation`'s arm for a scope request: a candidate who is the
+    // asker under another name is not invited (true EXCLUDES — the safe direction; a false
+    // "same" withholds an invitation and the operator's override remains). `tool_scope_peer_decide`
+    // REFUSES a peer that is the asker under any name (`hestia.scope_peer_decide_self`): a false
+    // "different" there would let a member rule its own request, so it fails toward refusal,
+    // and `arbiter::eligibility_for` runs after it as the second check.
+    ("server/handler.rs::scope_peer_pool", &[
+        ".filter(|id| id != asker && !s.same_entity(asker, id))",
+    ], SiteClass::Predicate),
+    ("server/handler.rs::tool_scope_peer_decide", &[
+        "if arb.plugin_id == req.plugin_id || s.same_entity(&arb.plugin_id, &req.plugin_id) {",
+    ], SiteClass::Predicate),
     // ADDED 2026-08-14 (claude-code, Sprint F R1 — the standing-scope surface). The census
     // went red the moment the site was written — the instrument working.
     //
@@ -723,6 +763,14 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
 /// asserts the two agree, so a new Predicate site without a pinned
 /// comparison — or a pinned comparison at a Naming site — is red on arrival.
 const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
+    // #1232 (2026-10-11): the scope-request peer pool (excludes the asker's aliases) and the
+    // peer decide's self-refusal. See their readings in the line census.
+    ("server/handler.rs::scope_peer_pool", &[
+        ".filter(|id| id != asker && !s.same_entity(asker, id))",
+    ]),
+    ("server/handler.rs::tool_scope_peer_decide", &[
+        "if arb.plugin_id == req.plugin_id || s.same_entity(&arb.plugin_id, &req.plugin_id) {",
+    ]),
     // The arbiter pool filter: a candidate whose member LCT equals the
     // appellant's is dropped. Documents its own reach in `handler.rs`
     // (whitespace only — `the_member_lct_alias_guard_reaches_only_whitespace`).
@@ -1105,13 +1153,105 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     // check that prevents it. The unclosed half: nothing distinguishes "registry holds
     // no other member" from "registry failed to load", because `state::open` fails open
     // to an empty registry. If that distinction ever matters, it is measured HERE.
+    //
+    // AMENDED 2026-09-15 (kimi-code, #990 — the registry's one administrative REMOVE).
+    // The census went red the moment the two filter lines were written — the instrument
+    // working again, on the integration binary `cargo test --lib` never runs.
+    //
+    // RE-AMENDED 2026-10-13 (kimi-code, claude-code's #1036 re-review): the retired
+    // half of the exclusion moved OFF the registry. The pool now reads
+    // `s.retired_members.is_retired(id)` — the store the ONE retire verb writes
+    // (`POST /api/agents/:id/retire`, #1100, the dashboard's surface) — instead of a
+    // registry tombstone this PR had added beside it; two stores could disagree, and
+    // each covered half the job. CONSEQUENCE FOR THIS TABLE: the retired line names
+    // no REGISTRY_SYMBOLS symbol, so this census no longer sees it — the line is
+    // pinned instead by the pool tests (`a_retired_member_holds_no_invitation_slot_…`,
+    // `a_retired_recognised_prefix_name_is_live_and_still_not_routed`, control
+    // included). A `retired_members` consumer sweep of the whole tree belongs to a
+    // follow-up: #1100's own routes predate any census of that store, and a half-
+    // sweep here would read as coverage it is not.
+    //
+    // READING of the remaining site, against the question this table schedules — **is
+    // this a safety use of presence?** The `is_filler` line is the first site in this
+    // entry that EXCLUDES rather than enumerates: until now every line here built a
+    // candidate list and the only subtraction was the asker itself. It gates on a
+    // registry TYPE mark set at mint (never-a-member) — a SELECTION gate on a
+    // rivalrous slot, and the direction the record has always wanted said out loud:
+    // the names it drops are the ones that could never answer.
+    //
+    // Why this does not violate the rule recorded above ("presence decides WHO IS
+    // ASKED" is fail-open, never an exclusion): the rule governs EVIDENCE (liveness,
+    // mailbox rows — dp: *"it reorders routing, it never excludes"*), and this line
+    // reads no evidence. A filler mark is a TYPE decided at mint; the retirement row
+    // beside it is an administrative ACT — witnessed with who/when/why, reversible by
+    // reinstate. The narrowing the reading above warns about was dangerous because it
+    // was SILENT; both narrowings are witnessed and undoable, which is precisely the
+    // property that makes an exclusion admissible where a silent shrink was not. The
+    // `probe_residue_no_longer_evicts...` test one module over pins the evidence half
+    // and passes unmodified.
+    //
+    // DEGRADATION DIRECTION, the question this table really asks: a WRONG mark or
+    // retirement excludes a real seat — visible, attributable (`retired_by` names the
+    // principal the gate authenticated), and undone by one operator command; a
+    // registry that fails to load still yields the empty pool the reading above
+    // already measures. Neither failure is silent, and neither can mint an
+    // invitation to a name that cannot receive.
     ("server/handler.rs::resolve_invitation", &[
+        ".filter(|id| !s.member_registry.is_filler(id))",
         ".iter_sorted()",
         ".member_registry",
     ]),
+    // AMENDED 2026-09-17 (kimi-code, #1036 NOT-SAME review by claude-code, item 3).
+    // The census went red the moment the two filter lines were written — the
+    // instrument working, on the integration binary `cargo test --lib` never runs.
+    // RE-AMENDED 2026-10-13 with the single-store reconciliation: the retired half
+    // reads `retired_members` and so left this census's symbol set — see the
+    // `resolve_invitation` entry above for why, and for where the line is pinned.
+    //
+    // READING of the remaining site, against the question this table schedules —
+    // **is this a safety use of presence?** The reading recorded at
+    // `resolve_invitation` carries over with ONE difference: this pool is MORE
+    // rivalrous, not less. Invitations spend up to `MAX_INVITED_PEERS` slots;
+    // this pool spends exactly ONE, on `select_arbiter`'s pick. The review found
+    // the gap: `is_recognised_reasoner` is a lineage PREFIX match, so residue
+    // names (`codex-cli`, `claudecode`) pass it, and act-liveness can rank one
+    // first — codex acting as `codex` while its gate witnessed as `codex-cli` is
+    // the measured case this file already records. An operator retiring such a
+    // name reasonably reads it as out of EVERY selection path, and the open pool
+    // routed the appeal to a mailbox nobody reads. The exclusion lines gate on
+    // recorded STATE (the retirement row, the mint-time type mark), never on
+    // evidence — dp's reorder-never-exclude rule stands beside them, exactly as
+    // at `resolve_invitation`.
+    //
+    // DEGRADATION DIRECTION: a WRONG mark or retirement excludes a real arbiter —
+    // visible, attributable (`retired_by`), undoable by one operator command, and
+    // the appeal then routes to the next candidate rather than to silence; a
+    // registry that fails to load yields the empty pool the tool already renders
+    // as "no admissible arbiter is known". The pre-filter failure was the opposite
+    // direction: a routed appeal that LOOKED answered and was not.
     ("server/handler.rs::tool_appeal", &[
+        ".filter(|id| !s.member_registry.is_filler(id))",
         ".iter_sorted()",
         ".member_registry",
+    ]),
+    // READING for `scope_peer_pool` (#1232, 2026-10-11): presence decides WHO IS ASKED to rule a
+    // gate-opened scope request — the `resolve_invitation` shape exactly, and the same fail-open
+    // direction: a member absent from the registry is never invited and the pool silently
+    // narrows. NOT a gate: an empty pool sends the request to the operator (the record says
+    // `decided_by_default: operator`), so nothing is granted or refused by this read.
+    //
+    // AMENDED 2026-10-13 (kimi-code, claude-code's #1036 re-review finding): the pool now also
+    // EXCLUDES by type, like the two sibling pools — the filler mark (this line) and the
+    // retirement row (on `retired_members`, outside this census's symbol set; pinned by
+    // `a_retired_name_holds_no_scope_peer_slot`, control included). The review's measurement:
+    // with `take(3)` over the registry's ALPHABETICAL order and no liveness ranking, this was
+    // the most rivalrous pool of the three — residue took two of three live slots within the
+    // hour the review landed. The reading above stands: the exclusion is a witnessed,
+    // undoable administrative act, never an evidence read.
+    ("server/handler.rs::scope_peer_pool", &[
+        ".filter(|id| !s.member_registry.is_filler(id))",
+        ".iter_sorted()",
+        "s.member_registry",
     ]),
     // READING for `tool_scope_arbitrate` (#952): presence, and SAFETY-BEARING — this is the
     // strongest use of the registry in the tree, so it is logged rather than waved through.
