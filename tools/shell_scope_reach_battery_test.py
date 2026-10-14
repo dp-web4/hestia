@@ -318,7 +318,6 @@ def run(fx: Fixture) -> dict:
             ("prefix-assignment-not-in-scope-of-expansion", "D=/tmp cat $D/hostname"),
             ("cd-unknown-then-relative", "cd \"$SCOPE_BATTERY_UNSET_VAR\" && cat ../x/y"),
             # formerly MODELLED (allowed on 01e68a1c): now unenumerated, and priced honestly
-            ("was-for-literal-list", "for f in a.txt b.txt; do cat $f; done"),
             ("was-for-relative-glob", "for f in *.txt; do cat $f; done"),
             ("was-lister-subst-relative", "cat $(find . -name '*.txt')"),
             ("was-date-in-temp-path", "x=$(date +%s); cat /tmp/review-probe-$x"),
@@ -332,6 +331,32 @@ def run(fx: Fixture) -> dict:
             ("was-pwd-subst", "cat \"$(pwd)/a.txt\""),
             # dp, 2026-10-11: the single-literal-assignment rule is scoped exactly this tightly.
             # Each row is an exclusion that must stay UNENUMERATED (a scope request).
+            # The literal-list loop rule's exclusions that stay UNENUMERATED (scope requests).
+            ("litfor-glob-list", "for f in *.txt; do cat $f; done"),
+            ("litfor-dotdot-item", "for d in a ..; do ls $d/x; done"),
+            ("litfor-rebound-in-body", "for r in a b; do r=$(pwd); cat $r/x; done"),
+            ("litfor-read-rebinds", "for r in a b; do read r; cat $r/x; done"),
+            ("litfor-eval-body", "for r in a b; do eval \"cat $r\"; done"),
+            ("litfor-quoted-item", "for r in 'a b' c; do cat $r/x; done"),
+            ("litfor-var-item", "for r in a $SCOPE_BATTERY_UNSET_VAR; do cat $r/x; done"),
+            ("litfor-subst-item", "for r in a $(pwd); do cat $r/x; done"),
+            ("litfor-ifs-var", "for IFS in a b; do cat $IFS/x; done"),
+            ("litfor-piped-out", "for r in a b; do cat $r/x; done | sort"),
+            ("litfor-over-budget", "for r in " + " ".join(f"i{k}" for k in range(40)) + "; do cat $r/x; done"),
+            # Codex HOLD 23938: a body whose state persists into the next iteration, or that holds a
+            # second loop keyword, is judged as before (V unenumerated), not per iteration.
+            ("litfor-body-cd", "for f in a.txt b.txt; do cat $f; cd sub; done"),
+            ("litfor-body-command-cd", "for f in a.txt b.txt; do cat $f; command cd sub; done"),
+            ("litfor-body-pushd", "for f in a.txt b.txt; do pushd sub; cat $f; done"),
+            ("litfor-body-assigns", "for f in a.txt b.txt; do cat $f; Z=sub; done"),
+            ("litfor-body-default-assign", "for f in a.txt b.txt; do cat ${Z:=sub}/$f; done"),
+            ("litfor-body-printf-v", "for f in a.txt b.txt; do printf -v Z %s sub; cat $Z/$f; done"),
+            ("litfor-body-function-def", "for f in a.txt b.txt; do g(){ cat $f; }; g; done"),
+            ("litfor-body-dot-source", "for f in a.txt b.txt; do . ./x; cat $f; done"),
+            ("litfor-body-done-word", "for f in a.txt b.txt; do cat $f; echo done; done"),
+            ("litfor-body-comment", "for f in a.txt b.txt; do cat $f # ; done\ndone"),
+            ("litfor-trailing-semicolon", "for f in a.txt b.txt; do cat $f; done;"),
+            ("litfor-done-without-separator", "for f in a.txt b.txt; do cat $f &done"),
             ("lit-use-before-assignment", "cat $S/x; S=/tmp/review-probe"),
             ("lit-assignment-is-a-pipeline-stage", "S=/tmp/review-probe | cat $S/x"),
             ("lit-assignment-entered-from-a-pipe", "true | S=/tmp/review-probe; cat $S/x"),
@@ -358,7 +383,6 @@ def run(fx: Fixture) -> dict:
             ("lit-IFS", "IFS=/tmp/review-probe; cat $IFS/x"),
             ("lit-PATH", "PATH=/tmp/review-probe; cat $PATH/x"),
             ("lit-name-in-the-environment", "SCOPE_BATTERY_ENV_SET=/tmp/review-probe; cat $SCOPE_BATTERY_ENV_SET/x"),
-            ("lit-for-loop", "for S in /tmp/review-probe; do cat $S/x; done"),
             ("lit-read", "read S; cat $S/x"),
             ("lit-read-after", "S=/tmp/review-probe; read S; cat $S/x"),
             ("lit-unset", "S=/tmp/review-probe; unset S; cat $S/x"),
@@ -425,7 +449,6 @@ def run(fx: Fixture) -> dict:
             ('1289-split-cmdsub-unquoted-pattern', 'grep $(cat a.txt) a.txt'),
             ('1289-split-cmdsub-unquoted-git-m', 'git commit -m $(cat a.txt)'),
             ('1289-split-backtick-unquoted-reason', 'hestia gate deny X --reason `cat a.txt`'),
-            ('1289-split-loop-var-in-sed-program', 'for r in 1,2 3,4; do sed -n ${r}p a.txt; done'),
             # Codex HOLD 21718: quoted, `${A[@]}` is still one argument PER ELEMENT. Its six
             # shapes, then the supplementary ones and main's own positions.
             ('1289-array-pr-title-body-file', 'A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; gh pr create --title "${A[@]}"'),
@@ -603,6 +626,14 @@ def run(fx: Fixture) -> dict:
             ('codex-lit-spaced-printf-variable', 'S=/tmp/review-probe; printf -v S %s /etc; cat $S/hostname'),
             ('codex-lit-spaced-read-array', 'S=/tmp/review-probe; read -a S <<< /etc; cat $S/hostname'),
             ('codex-lit-direct-forbidden', 'S=/etc; cat $S/hostname'),
+            # The literal-list loop rule's exclusions: each must still refuse.
+            ('litfor-outside-item', f"for r in granted {o}; do ls $r; done"),
+            ('litfor-outside-in-body', f"for r in a b; do cat {o}/secret.txt; done"),
+            ('litfor-then-outside', f"for f in a.txt; do cat $f; done; cat {o}/secret.txt"),
+            ('litfor-and-then-outside', f"for f in a.txt; do cat $f; done && cat {o}/secret.txt"),
+            ('litfor-item-builds-outside', f"for r in secret.txt; do cat {o}/$r; done"),
+            ('litfor-nested-outside', f"for r in a; do for s in {o}; do ls $s; done; done"),
+            ('litfor-ungranted-repo-item', f"for r in granted notgranted; do ls {ws}/$r; done"),
         ]
         allow += [
             ('codex-shell-allowed-temp-path', 'cat /tmp/hestia-scope-review-nonexistent'),
@@ -675,6 +706,21 @@ def run(fx: Fixture) -> dict:
             ("lit-newline", "S=/tmp/review-probe\ncat $S/x"),
             ("lit-relative-in-repo", "S=a.txt; cat $S"),
             ("lit-used-inside-a-later-substitution", "S=/tmp/review-probe; echo \"$(cat $S/x)\""),
+            # THE LITERAL-LIST LOOP RULE (proposal, cbp-claude 2026-10-14; #1205 L-b): a whole
+            # command that is one `for V in <literals>; do BODY; done` is judged as `V=item; BODY`
+            # per item, and allowed only if every iteration is. Formerly `was-for-literal-list`,
+            # a request.
+            ("litfor-literal-list", "for f in a.txt b.txt; do cat $f; done"),
+            ("litfor-quoted-use", "for f in a.txt b.txt; do wc -l \"$f\"; done"),
+            ("litfor-newline-form", "for f in a.txt b.txt\ndo\n  cat \"$f\"\ndone"),
+            ("litfor-temp-items", "for n in 1 2 3; do cat /tmp/review-probe-$n; done"),
+            # Formerly request `lit-for-loop` (dp's 2026-10-11 ruling listed `for` among the
+            # binders that stay unenumerated; this proposal admits only a LITERAL list).
+            ("litfor-was-lit-for-loop", "for S in /tmp/review-probe; do cat $S/x; done"),
+            # Formerly request `1289-split-loop-var-in-sed-program` (Codex HOLD 21675: an unquoted
+            # value can split into extra arguments). A literal item has no whitespace and no glob
+            # character, so it is one field; the IFS-touched case stays refused by `_literal_names`.
+            ("litfor-was-1289-split-sed-program", "for r in 1,2 3,4; do sed -n ${r}p a.txt; done"),
             ("commit-message-heredoc-apostrophe",
              "git commit -m \"$(cat <<'EOF'\nit's fine (really\nEOF\n)\""),
             ("comment-is-not-run", f"ls  # {o}/secret.txt"),
@@ -714,6 +760,114 @@ def run(fx: Fixture) -> dict:
             lifted = fx.reach(cmd, scopes=("granted", "path:" + UNENUM))
             check(f"request-lifted-by-once:{name}", lifted[0] is True or lifted[2] not in (None, UNENUM),
                   f"{cmd!r} lifted -> {lifted}")
+
+        # #1296 (live case scope-55faf36cae2d, 2026-10-13): a variable the single-literal rule
+        # resolves is judged by its VALUE's shape, as its literal spelling would be. Run from a
+        # cwd OUTSIDE the workspace, where judging it as a relative path is a false deny.
+        # The issue's repro needs the fleet's grant shape and an EXISTING cwd outside it.
+        out_cwd = f"{o}/sub"
+        ws_tree = (f"path:{ws}/**",)
+        for name, cmd in (
+            ("1296-header-value", 'S=aa0fd2f4; curl -s -X POST http://127.0.0.1:8010/mcp -H "mcp-session-id: $S"'),
+            ("1296-header-braced-suffix", 'S=abc; curl -s http://h/mcp -H "id: ${S}x"'),
+            ("1296-bare-token", "S=abc; echo x | grep -c $S"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree, cwd=out_cwd)
+            check(f"allow-outside-cwd:{name}", r[0] is True, f"{cmd!r} -> {r}")
+        # The literal-list loop under the fleet's real grant shape (`path:<ws>/**`; #1205 L-b).
+        # Under a repo-NAME grant, pass 1 reads `<ws>/$r` lexically, as it does for the
+        # single-literal rule; that stricter residual is unchanged here.
+        ws_tree = (f"path:{ws}/**",)
+        for name, cmd in (
+            ("litfor-abs-under-path-grant", f"for r in granted notgranted; do ls {ws}/$r; done"),
+            ("litfor-git-C-under-path-grant", f"for r in granted; do git -C {ws}/$r status --short; done"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree)
+            check(f"allow-path-grant:{name}", r[0] is True, f"{cmd!r} -> {r}")
+        r = fx.reach(f"for r in granted {o}; do ls $r; done", scopes=ws_tree)
+        check("deny-path-grant:litfor-outside-item", r[0] is False, r)
+        for name, cmd in (
+            ("1296-control-literal-path-value", f"S={o}/secret.txt; cat $S"),
+            ("1296-control-slash-built", "S=etc; cat /$S/hostname"),
+            ("1296-control-relative-escape", "S=../secret.txt; cat $S"),
+            ("1296-control-relative-dotted", "S=./deep.txt; cat $S"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree, cwd=out_cwd)
+            check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
+        # Codex HOLD 23938 (P1 a): a `done` that ends a FILENAME after an already-closed loop is
+        # not the loop's end. Stripping it judged `<o>/granted-` (granted) for `<o>/granted-done`.
+        gd = pathlib.Path(o) / "granted-done"
+        gd.write_text("ungranted\n")
+        (pathlib.Path(o) / "granted-").write_text("granted\n")
+        r = fx.reach(f"for f in a; do :; done; cat {gd}", scopes=("granted", f"path:{o}/granted-"))
+        check("deny-1312-done-suffix-is-a-filename", r[0] is False and r[2] == str(gd), r)
+        # (P1 b): `cd` persists across iterations; judged one iteration at a time, the third pass
+        # of `cd sub` through a `sub/sub -> <o>` link was never examined.
+        cdl = pathlib.Path(ws) / "cdloop"
+        (cdl / "sub").mkdir(parents=True)
+        (cdl / "sub" / "sub").symlink_to(o, target_is_directory=True)
+        r = fx.reach("for f in secret.txt secret.txt secret.txt; do cat $f; cd sub; done",
+                     scopes=ws_tree, cwd=str(cdl))
+        check("refuse-1312-cd-persists-across-iterations", r[0] is False, r)
+        # Codex HOLD 23996: bash forms the command word AFTER quote removal and expansion, so a
+        # raw-text `cd` match misses `c''d`, `c\\d`, a line continuation, `pu''shd`, an item that
+        # is `cd`, `c$f`, `$(echo c)d`, `$'\\x63d'` and a glob that could match `cd`. Each must be
+        # refused AND must not take the loop rule (a refusal for another reason would hide it).
+        lfi = getattr(G, "_literal_for_iterations", lambda _c: None)
+        l3 = "for f in secret.txt secret.txt secret.txt; do cat $f; "
+        for name, cmd in (
+            ("empty-single", l3 + "c''d sub; done"), ("empty-double", l3 + 'c""d sub; done'),
+            ("inner-double", l3 + 'c"d" sub; done'), ("backslash", l3 + "c\\d sub; done"),
+            ("continuation", l3 + "c\\\nd sub; done"), ("pushd-split", l3 + "pu''shd sub; done"),
+            ("ansi-c-hex", l3 + "$'\\x63d' sub; done"), ("subst-joined", l3 + "$(echo c)d sub; done"),
+            ("glob-q", l3 + "c? sub; done"), ("glob-class", l3 + "c[d] sub; done"),
+            ("glob-star", l3 + "c* sub; done"), ("dot-escaped", l3 + "\\. sub/x; done"),
+            ("item-is-cd", "for f in cd cd cd; do cat secret.txt; $f sub; done"),
+            ("item-braced-cd", "for f in cd cd cd; do cat secret.txt; ${f} sub; done"),
+            ("item-completes-cd", "for f in d d d; do cat secret.txt; c$f sub; done"),
+            ("item-sliced", "for f in cdx cdx cdx; do cat secret.txt; ${f:0:2} sub; done"),
+            ("item-is-dot", "for f in . . .; do $f sub/x; done"),
+            ("other-var-head", "for f in a a a; do cat secret.txt; $Z sub; done"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))
+            check(f"refuse-1312-stateful-spelling:{name}", r[0] is False and lfi(cmd) is None,
+                  f"{cmd!r} -> {r}, rule={lfi(cmd) is not None}")
+        # ...and quoting or globbing an ARGUMENT keeps the rule.
+        for name, cmd in (
+            ("quoted-arg", "for f in a.txt b.txt; do grep -n 'foo bar' $f; done"),
+            ("quoted-var", 'for f in a.txt b.txt; do wc -l "$f"; done'),
+            ("glob-arg", "for f in a.txt b.txt; do ls *.txt; cat ${f}; done"),
+        ):
+            check(f"allow-1312-quoted-or-globbed-argument:{name}",
+                  fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))[0] is True, cmd)
+        # Codex review 24029: fnmatch has no POSIX classes or `[^x]`, so `c[[:alpha:]]` beside a
+        # file named `cd` runs `cd` while fnmatch says it cannot (an end-to-end false allow on
+        # 28148979); and `.` (source) is a command after `!`, `if`, `time` or a redirection, not
+        # only after a separator (refused there by the ordinary judge, but not by the rule).
+        (cdl / "cd").write_text("")
+        (cdl / "move").write_text("cd sub\n")
+        for name, cmd in (
+            ("posix-class", l3 + "c[[:alpha:]] sub; done"), ("posix-head", l3 + "[[:lower:]]d sub; done"),
+            ("posix-alnum", l3 + "c[[:alnum:]] sub; done"), ("caret-negation", l3 + "c[^x] sub; done"),
+            ("posix-pushd", l3 + "pu[[:alpha:]]hd sub; done"),
+            ("extglob", l3 + "@(c?) sub; done"),
+            ("dot-after-bang", l3 + "! . ./move; done"), ("dot-after-if", l3 + "if . ./move; then :; fi; done"),
+            ("dot-after-time", l3 + "time . ./move; done"), ("dot-after-redirect", l3 + ">/dev/null . ./move; done"),
+            ("dot-after-then", l3 + "if true; then . ./move; fi; done"),
+            ("dot-after-else", l3 + "if false; then :; else . ./move; fi; done"),
+        ):
+            check(f"refuse-1312-stateful-spelling:{name}", lfi(cmd) is None
+                  and fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))[0] is False,
+                  f"{cmd!r}, rule={lfi(cmd) is not None}")
+        # ...and the test words `[`/`[[` keep the rule. (A `.` argument never had it: the
+        # single-literal rule does not resolve V in a statement holding a bare `.` word.)
+        for name, cmd in (
+            ("test-bracket", "for f in a.txt b.txt; do [ -f $f ] && cat $f; done"),
+            ("test-double-bracket", "for f in a.txt b.txt; do [[ -f $f ]] && cat $f; done"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))
+            check(f"allow-1312-test-word:{name}", lfi(cmd) is not None and r[0] is True,
+                  f"{cmd!r} -> {r}")
 
         # GRANTS: the existing forms reach, at exactly their breadth.
         exact = ("granted", f"path:{o}/secret.txt")

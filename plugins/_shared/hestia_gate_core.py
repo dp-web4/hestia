@@ -108,6 +108,7 @@ over to evaluate() — decided from a policy snapshot fetched LIVE from the daem
 """
 from __future__ import annotations
 
+import fnmatch as _fnmatch
 import glob as _glob
 import json
 import os
@@ -1930,6 +1931,12 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
         except _Unenumerated as why:
             found.unenum.append(str(why))
             return
+        if v != value and not _path_shaped(v, uglob):
+            # #1296: the word was path-shaped only because it held a `$` the single-literal
+            # rule then resolved. Its VALUE is judged as its literal spelling would be: a header
+            # (`-H "id: $S"`) or a bare token is not a path when written out, so it is not one
+            # when bound either.
+            return
         if v.startswith("~"):
             found.unenum.append("a ~user home the gate does not resolve")
             return
@@ -2389,8 +2396,130 @@ def _outside_reach_refused(resolved: str, scopes, workspace: str, cwd: Optional[
     return None
 
 
+#: A whole command that is ONE `for V in <literals>; do BODY; done` (L-b in the #1205 corpus
+#: proposal; #1232 field reports, 2026-10-13). Items are limited to characters that can never
+#: expand, quote or glob; anything else falls through to the ordinary judge, where V stays
+#: unenumerated. The closing `done` must follow a `;` or newline and end the command: Codex
+#: HOLD 23938 showed a `\bdone` suffix strips `done` from `.../granted-done` after an
+#: already-closed loop, judging a different path.
+_LITERAL_FOR = re.compile(
+    r"\A\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in((?:[ \t]+[A-Za-z0-9_./:@+,%=-]+)+)[ \t]*[;\n]\s*"
+    r"do[ \t\n](.*)[;\n][ \t\n]*done[ \t\n]*\Z", re.S)
+LITERAL_FOR_BUDGET = 32
+#: A body word that could close or open a loop. Matched ANYWHERE in the body, quoted or not:
+#: `echo done` is refused the rule (judged as before) so that no `done` but the last one can be
+#: the loop's end.
+_LITERAL_FOR_KEYWORD = re.compile(r"(?<![A-Za-z0-9_./-])(?:done|do|for|while|until|select)(?![A-Za-z0-9_./-])")
+#: Body state that persists from one iteration into the next, which an independent per-iteration
+#: judgement cannot see (Codex HOLD 23938: `cd sub` repeated walks a symlink out of the grant on
+#: the third pass). Matched anywhere in the body as a word: directory changes, every builtin
+#: that binds, unbinds or re-shapes expansion, function definitions, assignments (bare, array,
+#: `+=`, `${X:=}`), and comments/heredocs that could hide the structure. Source (`.`) is a
+#: standalone `.` word followed by an argument, in ANY position: Codex review 24029 showed a
+#: separator-anchored match misses `! . f`, `if . f`, `time . f` and `>/dev/null . f`. The
+#: cost is that `find . -name x` in a body loses the new allow.
+_LITERAL_FOR_STATEFUL = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?:cd|pushd|popd|export|unset|set|shopt|alias|unalias|source|eval|exec|"
+    r"declare|typeset|local|readonly|read|mapfile|readarray|let|getopts|umask|hash|enable|builtin|"
+    r"command|trap|ulimit|function|printf)(?![A-Za-z0-9_./-])"
+    r"|(?<![^\s;&|(){}`<>!])\.[ \t]+(?=[^\s;&|)])"
+    r"|(?:\A|[\s;&|(){}`])[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?="
+    r"|\$\{[^}]*=|\(\s*\)|#|<<")
+
+
+def _literal_for_iterations(cmd: str):
+    """`["V=item; BODY", ...]` when `cmd` is a single loop over literal items, else None.
+
+    THE LITERAL-LIST LOOP RULE extends the single-literal-assignment rule (dp, 2026-10-11) to a
+    loop whose list is literal: inside iteration i, V holds item i and nothing else, so the
+    iteration reaches exactly what `V=item; BODY` reaches, and that statement is judged by the
+    ordinary rule, which still refuses a body that re-binds V, runs a string as shell, and so
+    on. The loop is allowed only if EVERY iteration is. What is dropped from the judged text is
+    the loop header (a name and literals) and the closing `done`; every executable word of the
+    body is still judged. A list with a glob, a quote, a `$`, a `..` component, or more than
+    LITERAL_FOR_BUDGET items is not literal, and the loop is judged as before.
+
+    Judging iterations independently is sound only if no iteration changes what the next one
+    reaches, so a body with any word `_LITERAL_FOR_STATEFUL` names (a `cd`, an assignment, a
+    builtin that binds) is judged as before, as is a body holding a second loop keyword
+    (`_LITERAL_FOR_KEYWORD`), which could mean the loop closed earlier. Both are deliberately
+    coarse: a body they wrongly exclude loses only the new allow, never a refusal."""
+    m = _LITERAL_FOR.match(cmd)
+    if not m:
+        return None
+    var, items, body = m.group(1), m.group(2).split(), m.group(3)
+    if not body.strip() or len(items) > LITERAL_FOR_BUDGET or var in _SHELL_OWNED_NAMES:
+        return None
+    if _LITERAL_FOR_KEYWORD.search(body) or _LITERAL_FOR_STATEFUL.search(body):
+        return None
+    if any(not _is_bindable_literal(it, False) for it in items):
+        return None
+    if any(_literal_for_body_uncertain(body, var, it) for it in items):
+        return None
+    return [f"{var}={it}; {body}" for it in items]
+
+
+#: Builtin names `_LITERAL_FOR_STATEFUL` refuses as words, plus `.` (source), for the glob check.
+_LITERAL_FOR_STATEFUL_NAMES = (
+    "cd", "pushd", "popd", "export", "unset", "set", "shopt", "alias", "unalias", "source", "eval",
+    "exec", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "let",
+    "getopts", "umask", "hash", "enable", "builtin", "command", "trap", "ulimit", "function",
+    "printf", ".")
+
+
+def _literal_for_body_uncertain(body: str, var: str, item: str) -> bool:
+    r"""True when iteration `var=item` of `body` could run a stateful word the raw text hides.
+
+    `_LITERAL_FOR_STATEFUL` reads raw text, but bash forms command words AFTER expansion and quote
+    removal: `c''d`, `c"d"`, `c\d`, a line continuation inside the word, `pu''shd`, an item that is
+    itself `cd` (`$f sub`), `c$f`, `$(echo c)d`, `$'\x63d'`, or a glob such as `c?` beside a file
+    named `cd` all run `cd` (Codex HOLD 23996). This check does not decode those forms; it refuses
+    the ones it cannot read exactly (Codex: "a conservative refusal of uncertain forms is
+    preferable to extending the raw-text spelling list"):
+    - V is substituted (`$V`, `${V}`) with the item, which is a bindable literal; then any `$`,
+      backtick or brace left means an expansion whose result the text does not show;
+    - quote characters and backslashes are deleted (a backslash-newline pair first), which yields
+      every word quote removal could produce, over-approximately, and the stateful pattern is
+      run again on that text;
+    - any word still holding a glob character that could match a stateful name is refused;
+    - any word holding a bracket expression, and any extglob opener (`?(`, `*(`, `+(`, `@(`,
+      `!(`), is refused outright: Python's fnmatch does not implement POSIX classes
+      (`c[[:alpha:]]`) or `[^x]` negation, so it cannot show such a word misses a stateful
+      name (Codex review 24029). Only the test words `[` and `[[` are kept.
+    A body this refuses loses only the new allow and is judged as before."""
+    text = re.sub(r"\$\{" + var + r"\}|\$" + var + r"(?![A-Za-z0-9_])", lambda _m: item, body)
+    if re.search(r"[$`{}]", text):
+        return True
+    decoded = re.sub(r"['\"\\]", "", text.replace("\\\n", ""))
+    if _LITERAL_FOR_KEYWORD.search(decoded) or _LITERAL_FOR_STATEFUL.search(decoded):
+        return True
+    if re.search(r"[?*+@!]\(", decoded):
+        return True
+    for word in re.split(r"[\s;&|()<>]+", decoded):
+        if "[" in word and word not in ("[", "[["):
+            return True
+        if re.search(r"[*?]", word) and any(
+                _fnmatch.fnmatchcase(name, word) for name in _LITERAL_FOR_STATEFUL_NAMES):
+            return True
+    return False
+
+
 def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
                         forbidden=None, home_markers=None):
+    """Returns (ok, offending_token, resolved_path). See `_command_scope_reach_one`; a command
+    that is one literal-list loop is judged per iteration (`_literal_for_iterations`)."""
+    its = _literal_for_iterations(cmd)
+    if its is not None:
+        for it in its:
+            res = _command_scope_reach_one(it, scopes, workspace, cwd, forbidden, home_markers)
+            if not res[0]:
+                return res
+        return res
+    return _command_scope_reach_one(cmd, scopes, workspace, cwd, forbidden, home_markers)
+
+
+def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
+                             forbidden=None, home_markers=None):
     """Returns (ok, offending_token, resolved_path).
 
     OUTSIDE THE WORKSPACE (2026-10-05, dp: "yes on gate gap, let's fix it"). Until this pass the

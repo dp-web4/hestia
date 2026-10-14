@@ -1,0 +1,594 @@
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 5b6a7ea2be098e18941d328a0224c529121c076bcd5873cafb1dd460828e23cd  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -109,6 +109,7 @@
+ """
+ from __future__ import annotations
+ 
++import fnmatch as _fnmatch
+ import glob as _glob
+ import json
+ import os
+@@ -1931,6 +1932,12 @@
+         except _Unenumerated as why:
+             found.unenum.append(str(why))
+             return
++        if v != value and not _path_shaped(v, uglob):
++            # #1296: the word was path-shaped only because it held a `$` the single-literal
++            # rule then resolved. Its VALUE is judged as its literal spelling would be: a header
++            # (`-H "id: $S"`) or a bare token is not a path when written out, so it is not one
++            # when bound either.
++            return
+         if v.startswith("~"):
+             found.unenum.append("a ~user home the gate does not resolve")
+             return
+@@ -2390,8 +2397,119 @@
+     return None
+ 
+ 
++#: A whole command that is ONE `for V in <literals>; do BODY; done` (L-b in the #1205 corpus
++#: proposal; #1232 field reports, 2026-10-13). Items are limited to characters that can never
++#: expand, quote or glob; anything else falls through to the ordinary judge, where V stays
++#: unenumerated. The closing `done` must follow a `;` or newline and end the command: Codex
++#: HOLD 23938 showed a `\bdone` suffix strips `done` from `.../granted-done` after an
++#: already-closed loop, judging a different path.
++_LITERAL_FOR = re.compile(
++    r"\A\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in((?:[ \t]+[A-Za-z0-9_./:@+,%=-]+)+)[ \t]*[;\n]\s*"
++    r"do[ \t\n](.*)[;\n][ \t\n]*done[ \t\n]*\Z", re.S)
++LITERAL_FOR_BUDGET = 32
++#: A body word that could close or open a loop. Matched ANYWHERE in the body, quoted or not:
++#: `echo done` is refused the rule (judged as before) so that no `done` but the last one can be
++#: the loop's end.
++_LITERAL_FOR_KEYWORD = re.compile(r"(?<![A-Za-z0-9_./-])(?:done|do|for|while|until|select)(?![A-Za-z0-9_./-])")
++#: Body state that persists from one iteration into the next, which an independent per-iteration
++#: judgement cannot see (Codex HOLD 23938: `cd sub` repeated walks a symlink out of the grant on
++#: the third pass). Matched anywhere in the body as a word: directory changes, every builtin
++#: that binds, unbinds or re-shapes expansion, function definitions, assignments (bare, array,
++#: `+=`, `${X:=}`), and comments/heredocs that could hide the structure.
++_LITERAL_FOR_STATEFUL = re.compile(
++    r"(?<![A-Za-z0-9_./-])(?:cd|pushd|popd|export|unset|set|shopt|alias|unalias|source|eval|exec|"
++    r"declare|typeset|local|readonly|read|mapfile|readarray|let|getopts|umask|hash|enable|builtin|"
++    r"command|trap|ulimit|function|printf)(?![A-Za-z0-9_./-])"
++    r"|(?:\A|[;&|(){}`\n])\s*\.[ \t]"
++    r"|(?:\A|[\s;&|(){}`])[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?="
++    r"|\$\{[^}]*=|\(\s*\)|#|<<")
++
++
++def _literal_for_iterations(cmd: str):
++    """`["V=item; BODY", ...]` when `cmd` is a single loop over literal items, else None.
++
++    THE LITERAL-LIST LOOP RULE extends the single-literal-assignment rule (dp, 2026-10-11) to a
++    loop whose list is literal: inside iteration i, V holds item i and nothing else, so the
++    iteration reaches exactly what `V=item; BODY` reaches, and that statement is judged by the
++    ordinary rule, which still refuses a body that re-binds V, runs a string as shell, and so
++    on. The loop is allowed only if EVERY iteration is. What is dropped from the judged text is
++    the loop header (a name and literals) and the closing `done`; every executable word of the
++    body is still judged. A list with a glob, a quote, a `$`, a `..` component, or more than
++    LITERAL_FOR_BUDGET items is not literal, and the loop is judged as before.
++
++    Judging iterations independently is sound only if no iteration changes what the next one
++    reaches, so a body with any word `_LITERAL_FOR_STATEFUL` names (a `cd`, an assignment, a
++    builtin that binds) is judged as before, as is a body holding a second loop keyword
++    (`_LITERAL_FOR_KEYWORD`), which could mean the loop closed earlier. Both are deliberately
++    coarse: a body they wrongly exclude loses only the new allow, never a refusal."""
++    m = _LITERAL_FOR.match(cmd)
++    if not m:
++        return None
++    var, items, body = m.group(1), m.group(2).split(), m.group(3)
++    if not body.strip() or len(items) > LITERAL_FOR_BUDGET or var in _SHELL_OWNED_NAMES:
++        return None
++    if _LITERAL_FOR_KEYWORD.search(body) or _LITERAL_FOR_STATEFUL.search(body):
++        return None
++    if any(not _is_bindable_literal(it, False) for it in items):
++        return None
++    if any(_literal_for_body_uncertain(body, var, it) for it in items):
++        return None
++    return [f"{var}={it}; {body}" for it in items]
++
++
++#: Builtin names `_LITERAL_FOR_STATEFUL` refuses as words, plus `.` (source), for the glob check.
++_LITERAL_FOR_STATEFUL_NAMES = (
++    "cd", "pushd", "popd", "export", "unset", "set", "shopt", "alias", "unalias", "source", "eval",
++    "exec", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "let",
++    "getopts", "umask", "hash", "enable", "builtin", "command", "trap", "ulimit", "function",
++    "printf", ".")
++
++
++def _literal_for_body_uncertain(body: str, var: str, item: str) -> bool:
++    r"""True when iteration `var=item` of `body` could run a stateful word the raw text hides.
++
++    `_LITERAL_FOR_STATEFUL` reads raw text, but bash forms command words AFTER expansion and quote
++    removal: `c''d`, `c"d"`, `c\d`, a line continuation inside the word, `pu''shd`, an item that is
++    itself `cd` (`$f sub`), `c$f`, `$(echo c)d`, `$'\x63d'`, or a glob such as `c?` beside a file
++    named `cd` all run `cd` (Codex HOLD 23996). This check does not decode those forms; it refuses
++    the ones it cannot read exactly (Codex: "a conservative refusal of uncertain forms is
++    preferable to extending the raw-text spelling list"):
++    - V is substituted (`$V`, `${V}`) with the item, which is a bindable literal; then any `$`,
++      backtick or brace left means an expansion whose result the text does not show;
++    - quote characters and backslashes are deleted (a backslash-newline pair first), which yields
++      every word quote removal could produce, over-approximately, and the stateful pattern is
++      run again on that text;
++    - any word still holding a glob character that could match a stateful name is refused.
++    A body this refuses loses only the new allow and is judged as before."""
++    text = re.sub(r"\$\{" + var + r"\}|\$" + var + r"(?![A-Za-z0-9_])", lambda _m: item, body)
++    if re.search(r"[$`{}]", text):
++        return True
++    decoded = re.sub(r"['\"\\]", "", text.replace("\\\n", ""))
++    if _LITERAL_FOR_KEYWORD.search(decoded) or _LITERAL_FOR_STATEFUL.search(decoded):
++        return True
++    for word in re.split(r"[\s;&|()<>]+", decoded):
++        if re.search(r"[*?\[]", word) and any(
++                _fnmatch.fnmatchcase(name, word) for name in _LITERAL_FOR_STATEFUL_NAMES):
++            return True
++    return False
++
++
+ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
+                         forbidden=None, home_markers=None):
++    """Returns (ok, offending_token, resolved_path). See `_command_scope_reach_one`; a command
++    that is one literal-list loop is judged per iteration (`_literal_for_iterations`)."""
++    its = _literal_for_iterations(cmd)
++    if its is not None:
++        for it in its:
++            res = _command_scope_reach_one(it, scopes, workspace, cwd, forbidden, home_markers)
++            if not res[0]:
++                return res
++        return res
++    return _command_scope_reach_one(cmd, scopes, workspace, cwd, forbidden, home_markers)
++
++
++def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
++                             forbidden=None, home_markers=None):
+     """Returns (ok, offending_token, resolved_path).
+ 
+     OUTSIDE THE WORKSPACE (2026-10-05, dp: "yes on gate gap, let's fix it"). Until this pass the
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d",
++      "sha256": "5b6a7ea2be098e18941d328a0224c529121c076bcd5873cafb1dd460828e23cd",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7"
++  "gt_version": "e79ae3d61b04809a5b44f2c5fb4710a569c0debde51b4b4cd1204b556cf477d2"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7",
++    "gt_version": "e79ae3d61b04809a5b44f2c5fb4710a569c0debde51b4b4cd1204b556cf477d2",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "5b6a7ea2be098e18941d328a0224c529121c076bcd5873cafb1dd460828e23cd"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "c8b7e3b04f5344001aec1625f03a3c8b727f909ec09aeeb5e600d12fbf8c7a08"
++  "gt_version": "d2cbca3635254fcbda96c3d9662a2a6f816b21d0251727f8afe45d3cecbb92cf"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7",
++    "gt_version": "e79ae3d61b04809a5b44f2c5fb4710a569c0debde51b4b4cd1204b556cf477d2",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "5b6a7ea2be098e18941d328a0224c529121c076bcd5873cafb1dd460828e23cd"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "5024e8b7e6d4b6e40279050f36dea4b79bd21074e77e86a6d498b56f55afa287"
++  "gt_version": "d1485d20fd4cf6ef8fc82ed83d39949174fc90d1d05c3616a99c44b3977f138e"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7",
++    "gt_version": "e79ae3d61b04809a5b44f2c5fb4710a569c0debde51b4b4cd1204b556cf477d2",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "5b6a7ea2be098e18941d328a0224c529121c076bcd5873cafb1dd460828e23cd"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "69dc3c1346dc1dbf691ca2643024ab0e092a56c3c067f18021ae48b8c9f0011d"
++  "gt_version": "452ae53f7d37d44f5ef0a787ddedc786aa262a08f10ff2c153f1aadfe0b71aa8"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "da639509d9a9abb23e43019e0869961e4a69c0acb840c0a61320187a2d7d44b7",
++    "gt_version": "e79ae3d61b04809a5b44f2c5fb4710a569c0debde51b4b4cd1204b556cf477d2",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "77d7fe9a18ed4cceae8c6bc06aed4ff114d9952184e7b3e2c695d053a2b2b53d"
++        "sha256": "5b6a7ea2be098e18941d328a0224c529121c076bcd5873cafb1dd460828e23cd"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "a36254f041bc1d714fb3981654f76eb83e08d27ee492f30f26d5847eb12a29ef"
++  "gt_version": "64da7b47cff23870901380a25299c5d017640f3d4db668e1fe07bcc4c5af2cbf"
+ }
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -108,6 +108,7 @@
+ """
+ from __future__ import annotations
+ 
++import fnmatch as _fnmatch
+ import glob as _glob
+ import json
+ import os
+@@ -1930,6 +1931,12 @@
+         except _Unenumerated as why:
+             found.unenum.append(str(why))
+             return
++        if v != value and not _path_shaped(v, uglob):
++            # #1296: the word was path-shaped only because it held a `$` the single-literal
++            # rule then resolved. Its VALUE is judged as its literal spelling would be: a header
++            # (`-H "id: $S"`) or a bare token is not a path when written out, so it is not one
++            # when bound either.
++            return
+         if v.startswith("~"):
+             found.unenum.append("a ~user home the gate does not resolve")
+             return
+@@ -2389,8 +2396,119 @@
+     return None
+ 
+ 
++#: A whole command that is ONE `for V in <literals>; do BODY; done` (L-b in the #1205 corpus
++#: proposal; #1232 field reports, 2026-10-13). Items are limited to characters that can never
++#: expand, quote or glob; anything else falls through to the ordinary judge, where V stays
++#: unenumerated. The closing `done` must follow a `;` or newline and end the command: Codex
++#: HOLD 23938 showed a `\bdone` suffix strips `done` from `.../granted-done` after an
++#: already-closed loop, judging a different path.
++_LITERAL_FOR = re.compile(
++    r"\A\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in((?:[ \t]+[A-Za-z0-9_./:@+,%=-]+)+)[ \t]*[;\n]\s*"
++    r"do[ \t\n](.*)[;\n][ \t\n]*done[ \t\n]*\Z", re.S)
++LITERAL_FOR_BUDGET = 32
++#: A body word that could close or open a loop. Matched ANYWHERE in the body, quoted or not:
++#: `echo done` is refused the rule (judged as before) so that no `done` but the last one can be
++#: the loop's end.
++_LITERAL_FOR_KEYWORD = re.compile(r"(?<![A-Za-z0-9_./-])(?:done|do|for|while|until|select)(?![A-Za-z0-9_./-])")
++#: Body state that persists from one iteration into the next, which an independent per-iteration
++#: judgement cannot see (Codex HOLD 23938: `cd sub` repeated walks a symlink out of the grant on
++#: the third pass). Matched anywhere in the body as a word: directory changes, every builtin
++#: that binds, unbinds or re-shapes expansion, function definitions, assignments (bare, array,
++#: `+=`, `${X:=}`), and comments/heredocs that could hide the structure.
++_LITERAL_FOR_STATEFUL = re.compile(
++    r"(?<![A-Za-z0-9_./-])(?:cd|pushd|popd|export|unset|set|shopt|alias|unalias|source|eval|exec|"
++    r"declare|typeset|local|readonly|read|mapfile|readarray|let|getopts|umask|hash|enable|builtin|"
++    r"command|trap|ulimit|function|printf)(?![A-Za-z0-9_./-])"
++    r"|(?:\A|[;&|(){}`\n])\s*\.[ \t]"
++    r"|(?:\A|[\s;&|(){}`])[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?="
++    r"|\$\{[^}]*=|\(\s*\)|#|<<")
++
++
++def _literal_for_iterations(cmd: str):
++    """`["V=item; BODY", ...]` when `cmd` is a single loop over literal items, else None.
++
++    THE LITERAL-LIST LOOP RULE extends the single-literal-assignment rule (dp, 2026-10-11) to a
++    loop whose list is literal: inside iteration i, V holds item i and nothing else, so the
++    iteration reaches exactly what `V=item; BODY` reaches, and that statement is judged by the
++    ordinary rule, which still refuses a body that re-binds V, runs a string as shell, and so
++    on. The loop is allowed only if EVERY iteration is. What is dropped from the judged text is
++    the loop header (a name and literals) and the closing `done`; every executable word of the
++    body is still judged. A list with a glob, a quote, a `$`, a `..` component, or more than
++    LITERAL_FOR_BUDGET items is not literal, and the loop is judged as before.
++
++    Judging iterations independently is sound only if no iteration changes what the next one
++    reaches, so a body with any word `_LITERAL_FOR_STATEFUL` names (a `cd`, an assignment, a
++    builtin that binds) is judged as before, as is a body holding a second loop keyword
++    (`_LITERAL_FOR_KEYWORD`), which could mean the loop closed earlier. Both are deliberately
++    coarse: a body they wrongly exclude loses only the new allow, never a refusal."""
++    m = _LITERAL_FOR.match(cmd)
++    if not m:
++        return None
++    var, items, body = m.group(1), m.group(2).split(), m.group(3)
++    if not body.strip() or len(items) > LITERAL_FOR_BUDGET or var in _SHELL_OWNED_NAMES:
++        return None
++    if _LITERAL_FOR_KEYWORD.search(body) or _LITERAL_FOR_STATEFUL.search(body):
++        return None
++    if any(not _is_bindable_literal(it, False) for it in items):
++        return None
++    if any(_literal_for_body_uncertain(body, var, it) for it in items):
++        return None
++    return [f"{var}={it}; {body}" for it in items]
++
++
++#: Builtin names `_LITERAL_FOR_STATEFUL` refuses as words, plus `.` (source), for the glob check.
++_LITERAL_FOR_STATEFUL_NAMES = (
++    "cd", "pushd", "popd", "export", "unset", "set", "shopt", "alias", "unalias", "source", "eval",
++    "exec", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "let",
++    "getopts", "umask", "hash", "enable", "builtin", "command", "trap", "ulimit", "function",
++    "printf", ".")
++
++
++def _literal_for_body_uncertain(body: str, var: str, item: str) -> bool:
++    r"""True when iteration `var=item` of `body` could run a stateful word the raw text hides.
++
++    `_LITERAL_FOR_STATEFUL` reads raw text, but bash forms command words AFTER expansion and quote
++    removal: `c''d`, `c"d"`, `c\d`, a line continuation inside the word, `pu''shd`, an item that is
++    itself `cd` (`$f sub`), `c$f`, `$(echo c)d`, `$'\x63d'`, or a glob such as `c?` beside a file
++    named `cd` all run `cd` (Codex HOLD 23996). This check does not decode those forms; it refuses
++    the ones it cannot read exactly (Codex: "a conservative refusal of uncertain forms is
++    preferable to extending the raw-text spelling list"):
++    - V is substituted (`$V`, `${V}`) with the item, which is a bindable literal; then any `$`,
++      backtick or brace left means an expansion whose result the text does not show;
++    - quote characters and backslashes are deleted (a backslash-newline pair first), which yields
++      every word quote removal could produce, over-approximately, and the stateful pattern is
++      run again on that text;
++    - any word still holding a glob character that could match a stateful name is refused.
++    A body this refuses loses only the new allow and is judged as before."""
++    text = re.sub(r"\$\{" + var + r"\}|\$" + var + r"(?![A-Za-z0-9_])", lambda _m: item, body)
++    if re.search(r"[$`{}]", text):
++        return True
++    decoded = re.sub(r"['\"\\]", "", text.replace("\\\n", ""))
++    if _LITERAL_FOR_KEYWORD.search(decoded) or _LITERAL_FOR_STATEFUL.search(decoded):
++        return True
++    for word in re.split(r"[\s;&|()<>]+", decoded):
++        if re.search(r"[*?\[]", word) and any(
++                _fnmatch.fnmatchcase(name, word) for name in _LITERAL_FOR_STATEFUL_NAMES):
++            return True
++    return False
++
++
+ def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
+                         forbidden=None, home_markers=None):
++    """Returns (ok, offending_token, resolved_path). See `_command_scope_reach_one`; a command
++    that is one literal-list loop is judged per iteration (`_literal_for_iterations`)."""
++    its = _literal_for_iterations(cmd)
++    if its is not None:
++        for it in its:
++            res = _command_scope_reach_one(it, scopes, workspace, cwd, forbidden, home_markers)
++            if not res[0]:
++                return res
++        return res
++    return _command_scope_reach_one(cmd, scopes, workspace, cwd, forbidden, home_markers)
++
++
++def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
++                             forbidden=None, home_markers=None):
+     """Returns (ok, offending_token, resolved_path).
+ 
+     OUTSIDE THE WORKSPACE (2026-10-05, dp: "yes on gate gap, let's fix it"). Until this pass the
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -318,7 +318,6 @@
+             ("prefix-assignment-not-in-scope-of-expansion", "D=/tmp cat $D/hostname"),
+             ("cd-unknown-then-relative", "cd \"$SCOPE_BATTERY_UNSET_VAR\" && cat ../x/y"),
+             # formerly MODELLED (allowed on 01e68a1c): now unenumerated, and priced honestly
+-            ("was-for-literal-list", "for f in a.txt b.txt; do cat $f; done"),
+             ("was-for-relative-glob", "for f in *.txt; do cat $f; done"),
+             ("was-lister-subst-relative", "cat $(find . -name '*.txt')"),
+             ("was-date-in-temp-path", "x=$(date +%s); cat /tmp/review-probe-$x"),
+@@ -332,6 +331,32 @@
+             ("was-pwd-subst", "cat \"$(pwd)/a.txt\""),
+             # dp, 2026-10-11: the single-literal-assignment rule is scoped exactly this tightly.
+             # Each row is an exclusion that must stay UNENUMERATED (a scope request).
++            # The literal-list loop rule's exclusions that stay UNENUMERATED (scope requests).
++            ("litfor-glob-list", "for f in *.txt; do cat $f; done"),
++            ("litfor-dotdot-item", "for d in a ..; do ls $d/x; done"),
++            ("litfor-rebound-in-body", "for r in a b; do r=$(pwd); cat $r/x; done"),
++            ("litfor-read-rebinds", "for r in a b; do read r; cat $r/x; done"),
++            ("litfor-eval-body", "for r in a b; do eval \"cat $r\"; done"),
++            ("litfor-quoted-item", "for r in 'a b' c; do cat $r/x; done"),
++            ("litfor-var-item", "for r in a $SCOPE_BATTERY_UNSET_VAR; do cat $r/x; done"),
++            ("litfor-subst-item", "for r in a $(pwd); do cat $r/x; done"),
++            ("litfor-ifs-var", "for IFS in a b; do cat $IFS/x; done"),
++            ("litfor-piped-out", "for r in a b; do cat $r/x; done | sort"),
++            ("litfor-over-budget", "for r in " + " ".join(f"i{k}" for k in range(40)) + "; do cat $r/x; done"),
++            # Codex HOLD 23938: a body whose state persists into the next iteration, or that holds a
++            # second loop keyword, is judged as before (V unenumerated), not per iteration.
++            ("litfor-body-cd", "for f in a.txt b.txt; do cat $f; cd sub; done"),
++            ("litfor-body-command-cd", "for f in a.txt b.txt; do cat $f; command cd sub; done"),
++            ("litfor-body-pushd", "for f in a.txt b.txt; do pushd sub; cat $f; done"),
++            ("litfor-body-assigns", "for f in a.txt b.txt; do cat $f; Z=sub; done"),
++            ("litfor-body-default-assign", "for f in a.txt b.txt; do cat ${Z:=sub}/$f; done"),
++            ("litfor-body-printf-v", "for f in a.txt b.txt; do printf -v Z %s sub; cat $Z/$f; done"),
++            ("litfor-body-function-def", "for f in a.txt b.txt; do g(){ cat $f; }; g; done"),
++            ("litfor-body-dot-source", "for f in a.txt b.txt; do . ./x; cat $f; done"),
++            ("litfor-body-done-word", "for f in a.txt b.txt; do cat $f; echo done; done"),
++            ("litfor-body-comment", "for f in a.txt b.txt; do cat $f # ; done\ndone"),
++            ("litfor-trailing-semicolon", "for f in a.txt b.txt; do cat $f; done;"),
++            ("litfor-done-without-separator", "for f in a.txt b.txt; do cat $f &done"),
+             ("lit-use-before-assignment", "cat $S/x; S=/tmp/review-probe"),
+             ("lit-assignment-is-a-pipeline-stage", "S=/tmp/review-probe | cat $S/x"),
+             ("lit-assignment-entered-from-a-pipe", "true | S=/tmp/review-probe; cat $S/x"),
+@@ -358,7 +383,6 @@
+             ("lit-IFS", "IFS=/tmp/review-probe; cat $IFS/x"),
+             ("lit-PATH", "PATH=/tmp/review-probe; cat $PATH/x"),
+             ("lit-name-in-the-environment", "SCOPE_BATTERY_ENV_SET=/tmp/review-probe; cat $SCOPE_BATTERY_ENV_SET/x"),
+-            ("lit-for-loop", "for S in /tmp/review-probe; do cat $S/x; done"),
+             ("lit-read", "read S; cat $S/x"),
+             ("lit-read-after", "S=/tmp/review-probe; read S; cat $S/x"),
+             ("lit-unset", "S=/tmp/review-probe; unset S; cat $S/x"),
+@@ -425,7 +449,6 @@
+             ('1289-split-cmdsub-unquoted-pattern', 'grep $(cat a.txt) a.txt'),
+             ('1289-split-cmdsub-unquoted-git-m', 'git commit -m $(cat a.txt)'),
+             ('1289-split-backtick-unquoted-reason', 'hestia gate deny X --reason `cat a.txt`'),
+-            ('1289-split-loop-var-in-sed-program', 'for r in 1,2 3,4; do sed -n ${r}p a.txt; done'),
+             # Codex HOLD 21718: quoted, `${A[@]}` is still one argument PER ELEMENT. Its six
+             # shapes, then the supplementary ones and main's own positions.
+             ('1289-array-pr-title-body-file', 'A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; gh pr create --title "${A[@]}"'),
+@@ -603,6 +626,14 @@
+             ('codex-lit-spaced-printf-variable', 'S=/tmp/review-probe; printf -v S %s /etc; cat $S/hostname'),
+             ('codex-lit-spaced-read-array', 'S=/tmp/review-probe; read -a S <<< /etc; cat $S/hostname'),
+             ('codex-lit-direct-forbidden', 'S=/etc; cat $S/hostname'),
++            # The literal-list loop rule's exclusions: each must still refuse.
++            ('litfor-outside-item', f"for r in granted {o}; do ls $r; done"),
++            ('litfor-outside-in-body', f"for r in a b; do cat {o}/secret.txt; done"),
++            ('litfor-then-outside', f"for f in a.txt; do cat $f; done; cat {o}/secret.txt"),
++            ('litfor-and-then-outside', f"for f in a.txt; do cat $f; done && cat {o}/secret.txt"),
++            ('litfor-item-builds-outside', f"for r in secret.txt; do cat {o}/$r; done"),
++            ('litfor-nested-outside', f"for r in a; do for s in {o}; do ls $s; done; done"),
++            ('litfor-ungranted-repo-item', f"for r in granted notgranted; do ls {ws}/$r; done"),
+         ]
+         allow += [
+             ('codex-shell-allowed-temp-path', 'cat /tmp/hestia-scope-review-nonexistent'),
+@@ -675,6 +706,21 @@
+             ("lit-newline", "S=/tmp/review-probe\ncat $S/x"),
+             ("lit-relative-in-repo", "S=a.txt; cat $S"),
+             ("lit-used-inside-a-later-substitution", "S=/tmp/review-probe; echo \"$(cat $S/x)\""),
++            # THE LITERAL-LIST LOOP RULE (proposal, cbp-claude 2026-10-14; #1205 L-b): a whole
++            # command that is one `for V in <literals>; do BODY; done` is judged as `V=item; BODY`
++            # per item, and allowed only if every iteration is. Formerly `was-for-literal-list`,
++            # a request.
++            ("litfor-literal-list", "for f in a.txt b.txt; do cat $f; done"),
++            ("litfor-quoted-use", "for f in a.txt b.txt; do wc -l \"$f\"; done"),
++            ("litfor-newline-form", "for f in a.txt b.txt\ndo\n  cat \"$f\"\ndone"),
++            ("litfor-temp-items", "for n in 1 2 3; do cat /tmp/review-probe-$n; done"),
++            # Formerly request `lit-for-loop` (dp's 2026-10-11 ruling listed `for` among the
++            # binders that stay unenumerated; this proposal admits only a LITERAL list).
++            ("litfor-was-lit-for-loop", "for S in /tmp/review-probe; do cat $S/x; done"),
++            # Formerly request `1289-split-loop-var-in-sed-program` (Codex HOLD 21675: an unquoted
++            # value can split into extra arguments). A literal item has no whitespace and no glob
++            # character, so it is one field; the IFS-touched case stays refused by `_literal_names`.
++            ("litfor-was-1289-split-sed-program", "for r in 1,2 3,4; do sed -n ${r}p a.txt; done"),
+             ("commit-message-heredoc-apostrophe",
+              "git commit -m \"$(cat <<'EOF'\nit's fine (really\nEOF\n)\""),
+             ("comment-is-not-run", f"ls  # {o}/secret.txt"),
+@@ -714,6 +760,86 @@
+             lifted = fx.reach(cmd, scopes=("granted", "path:" + UNENUM))
+             check(f"request-lifted-by-once:{name}", lifted[0] is True or lifted[2] not in (None, UNENUM),
+                   f"{cmd!r} lifted -> {lifted}")
++
++        # #1296 (live case scope-55faf36cae2d, 2026-10-13): a variable the single-literal rule
++        # resolves is judged by its VALUE's shape, as its literal spelling would be. Run from a
++        # cwd OUTSIDE the workspace, where judging it as a relative path is a false deny.
++        # The issue's repro needs the fleet's grant shape and an EXISTING cwd outside it.
++        out_cwd = f"{o}/sub"
++        ws_tree = (f"path:{ws}/**",)
++        for name, cmd in (
++            ("1296-header-value", 'S=aa0fd2f4; curl -s -X POST http://127.0.0.1:8010/mcp -H "mcp-session-id: $S"'),
++            ("1296-header-braced-suffix", 'S=abc; curl -s http://h/mcp -H "id: ${S}x"'),
++            ("1296-bare-token", "S=abc; echo x | grep -c $S"),
++        ):
++            r = fx.reach(cmd, scopes=ws_tree, cwd=out_cwd)
++            check(f"allow-outside-cwd:{name}", r[0] is True, f"{cmd!r} -> {r}")
++        # The literal-list loop under the fleet's real grant shape (`path:<ws>/**`; #1205 L-b).
++        # Under a repo-NAME grant, pass 1 reads `<ws>/$r` lexically, as it does for the
++        # single-literal rule; that stricter residual is unchanged here.
++        ws_tree = (f"path:{ws}/**",)
++        for name, cmd in (
++            ("litfor-abs-under-path-grant", f"for r in granted notgranted; do ls {ws}/$r; done"),
++            ("litfor-git-C-under-path-grant", f"for r in granted; do git -C {ws}/$r status --short; done"),
++        ):
++            r = fx.reach(cmd, scopes=ws_tree)
++            check(f"allow-path-grant:{name}", r[0] is True, f"{cmd!r} -> {r}")
++        r = fx.reach(f"for r in granted {o}; do ls $r; done", scopes=ws_tree)
++        check("deny-path-grant:litfor-outside-item", r[0] is False, r)
++        for name, cmd in (
++            ("1296-control-literal-path-value", f"S={o}/secret.txt; cat $S"),
++            ("1296-control-slash-built", "S=etc; cat /$S/hostname"),
++            ("1296-control-relative-escape", "S=../secret.txt; cat $S"),
++            ("1296-control-relative-dotted", "S=./deep.txt; cat $S"),
++        ):
++            r = fx.reach(cmd, scopes=ws_tree, cwd=out_cwd)
++            check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
++        # Codex HOLD 23938 (P1 a): a `done` that ends a FILENAME after an already-closed loop is
++        # not the loop's end. Stripping it judged `<o>/granted-` (granted) for `<o>/granted-done`.
++        gd = pathlib.Path(o) / "granted-done"
++        gd.write_text("ungranted\n")
++        (pathlib.Path(o) / "granted-").write_text("granted\n")
++        r = fx.reach(f"for f in a; do :; done; cat {gd}", scopes=("granted", f"path:{o}/granted-"))
++        check("deny-1312-done-suffix-is-a-filename", r[0] is False and r[2] == str(gd), r)
++        # (P1 b): `cd` persists across iterations; judged one iteration at a time, the third pass
++        # of `cd sub` through a `sub/sub -> <o>` link was never examined.
++        cdl = pathlib.Path(ws) / "cdloop"
++        (cdl / "sub").mkdir(parents=True)
++        (cdl / "sub" / "sub").symlink_to(o, target_is_directory=True)
++        r = fx.reach("for f in secret.txt secret.txt secret.txt; do cat $f; cd sub; done",
++                     scopes=ws_tree, cwd=str(cdl))
++        check("refuse-1312-cd-persists-across-iterations", r[0] is False, r)
++        # Codex HOLD 23996: bash forms the command word AFTER quote removal and expansion, so a
++        # raw-text `cd` match misses `c''d`, `c\\d`, a line continuation, `pu''shd`, an item that
++        # is `cd`, `c$f`, `$(echo c)d`, `$'\\x63d'` and a glob that could match `cd`. Each must be
++        # refused AND must not take the loop rule (a refusal for another reason would hide it).
++        lfi = getattr(G, "_literal_for_iterations", lambda _c: None)
++        l3 = "for f in secret.txt secret.txt secret.txt; do cat $f; "
++        for name, cmd in (
++            ("empty-single", l3 + "c''d sub; done"), ("empty-double", l3 + 'c""d sub; done'),
++            ("inner-double", l3 + 'c"d" sub; done'), ("backslash", l3 + "c\\d sub; done"),
++            ("continuation", l3 + "c\\\nd sub; done"), ("pushd-split", l3 + "pu''shd sub; done"),
++            ("ansi-c-hex", l3 + "$'\\x63d' sub; done"), ("subst-joined", l3 + "$(echo c)d sub; done"),
++            ("glob-q", l3 + "c? sub; done"), ("glob-class", l3 + "c[d] sub; done"),
++            ("glob-star", l3 + "c* sub; done"), ("dot-escaped", l3 + "\\. sub/x; done"),
++            ("item-is-cd", "for f in cd cd cd; do cat secret.txt; $f sub; done"),
++            ("item-braced-cd", "for f in cd cd cd; do cat secret.txt; ${f} sub; done"),
++            ("item-completes-cd", "for f in d d d; do cat secret.txt; c$f sub; done"),
++            ("item-sliced", "for f in cdx cdx cdx; do cat secret.txt; ${f:0:2} sub; done"),
++            ("item-is-dot", "for f in . . .; do $f sub/x; done"),
++            ("other-var-head", "for f in a a a; do cat secret.txt; $Z sub; done"),
++        ):
++            r = fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))
++            check(f"refuse-1312-stateful-spelling:{name}", r[0] is False and lfi(cmd) is None,
++                  f"{cmd!r} -> {r}, rule={lfi(cmd) is not None}")
++        # ...and quoting or globbing an ARGUMENT keeps the rule.
++        for name, cmd in (
++            ("quoted-arg", "for f in a.txt b.txt; do grep -n 'foo bar' $f; done"),
++            ("quoted-var", 'for f in a.txt b.txt; do wc -l "$f"; done'),
++            ("glob-arg", "for f in a.txt b.txt; do ls *.txt; cat ${f}; done"),
++        ):
++            check(f"allow-1312-quoted-or-globbed-argument:{name}",
++                  fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))[0] is True, cmd)
+ 
+         # GRANTS: the existing forms reach, at exactly their breadth.
+         exact = ("granted", f"path:{o}/secret.txt")
