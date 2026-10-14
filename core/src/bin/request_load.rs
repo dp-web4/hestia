@@ -96,6 +96,41 @@ fn classify_path(path: &str, workspaces: &[String], home: &str) -> &'static str 
     "other"
 }
 
+/// The FIRST path component under `home` when it is a dotdir (`.claude`, `.hestia`, ...): a
+/// directory name only, nothing deeper. None for anything else.
+fn home_dotdir_name(path: &str, home: &str) -> Option<String> {
+    let home = home.trim_end_matches('/');
+    if home.is_empty() || !under(path, home) {
+        return None;
+    }
+    let first = path[home.len()..].trim_start_matches('/').split('/').next().unwrap_or("");
+    first.starts_with('.').then(|| first.to_string())
+}
+
+/// Governance file and directory names the gate itself publishes (`hestia_governance_closure`'s
+/// `LITERAL_FLOOR`: `files_anywhere`, `files_hooks_only`, the basenames of `exact_paths`, and the
+/// `dir_markers` as the closure spells them). A marker in the `other` class is broken down by its
+/// basename ONLY when it is one of these; anything else stays `other`, so no member-chosen name
+/// can reach the report.
+const PUBLISHED_GOVERNANCE_NAMES: &[&str] = &[
+    "hestia_gate_core.py", "hestia_gate_mechanism.py", "hestia_governance_closure.py",
+    "gate_self_protection_test.py", "hestia_single_gate.py", "web4-hub.service",
+    "ratified-build.json", "ratify-build.sh", "pre_tool_use.py", "society_pre_tool_use.py",
+    "post_tool_use.py", "witness.py", "law_inject.py", "before_tool.py", "hub",
+    "install-members.sh", "settings.json", "settings.local.json", "config.toml",
+    "plugins/*/hooks", "plugins/_shared", "hestia/hooks",
+];
+
+/// The published name a marker matches, or `other`.
+fn published_marker_name(marker: &str) -> &'static str {
+    let m = marker.trim_end_matches('/');
+    if let Some(n) = PUBLISHED_GOVERNANCE_NAMES.iter().find(|n| n.contains('/') && (m == **n || m.ends_with(&format!("/{n}")))) {
+        return n;
+    }
+    let base = m.rsplit('/').next().unwrap_or(m);
+    PUBLISHED_GOVERNANCE_NAMES.iter().find(|n| !n.contains('/') && base == **n).copied().unwrap_or("other")
+}
+
 /// The coarse class of a governance escalation's marker (a file name the gate protects).
 fn classify_marker(marker: &str) -> &'static str {
     let m = marker.to_ascii_lowercase();
@@ -147,6 +182,8 @@ struct Req {
     rule: String,  // scope: rule (gate-opened) or "member_asked"; escalation: marker class
     path_class: &'static str,
     path_key: String, // only for the re-ask join; never printed
+    home_dotdir: Option<String>, // first component under $HOME, for the home_dotdir class only
+    other_marker: Option<&'static str>, // published name, for the escalation `other` class only
     gate_opened: bool,
     no_peer: bool,
     opened: Option<DateTime<Utc>>,
@@ -224,6 +261,10 @@ fn main() -> Result<()> {
     let now = Utc::now();
     let since = now - chrono::Duration::days(days);
     let mut reqs: HashMap<String, Req> = HashMap::new();
+    // Chain-wide (not windowed): every event type whose NAME contains "scope", or is the
+    // escalation-opened event, with its count and first/last timestamp. Answers "did the event
+    // start then, or change name" — event type names are schema, not content.
+    let mut type_census: BTreeMap<String, (u64, DateTime<Utc>, DateTime<Utc>)> = BTreeMap::new();
     let mut scanned = 0u64;
     let page = 50_000u64;
     let mut cursor = 0u64;
@@ -235,6 +276,12 @@ fn main() -> Result<()> {
         cursor = batch.last().expect("non-empty batch").chain_position;
         for e in &batch {
             scanned += 1;
+            if e.event_type.contains("scope") || e.event_type == "gate_escalation_opened" {
+                let c = type_census.entry(e.event_type.clone()).or_insert((0, e.timestamp, e.timestamp));
+                c.0 += 1;
+                c.1 = c.1.min(e.timestamp);
+                c.2 = c.2.max(e.timestamp);
+            }
             let d = &e.event_data;
             match e.event_type.as_str() {
                 "scope_requested" if e.timestamp >= since => {
@@ -250,6 +297,8 @@ fn main() -> Result<()> {
                         member,
                         rule: if gate_opened { s(d, "rule").unwrap_or("?").to_string() } else { "member_asked".into() },
                         path_class: classify_path(path, &workspaces, &home_dir),
+                        home_dotdir: home_dotdir_name(path, &home_dir),
+                        other_marker: None,
                         gate_opened,
                         no_peer,
                         opened: Some(e.timestamp),
@@ -272,10 +321,13 @@ fn main() -> Result<()> {
                 }
                 "gate_escalation_opened" if e.timestamp >= since => {
                     let Some(id) = s(d, "escalation_id") else { continue };
+                    let marker = s(d, "marker").unwrap_or("");
+                    let class = classify_marker(marker);
                     reqs.entry(format!("e:{id}")).or_insert(Req {
                         kind: "escalation",
                         member: s(d, "plugin_id").unwrap_or("?").to_string(),
-                        rule: classify_marker(s(d, "marker").unwrap_or("")).to_string(),
+                        rule: class.to_string(),
+                        other_marker: (class == "other").then(|| published_marker_name(marker)),
                         opened: Some(e.timestamp),
                         expires_at: d.get("expires_at").and_then(Value::as_i64),
                         outcome: "open",
@@ -320,7 +372,10 @@ fn main() -> Result<()> {
             r.outcome = "lapsed";
         }
     }
-    let report = summarize(&reqs, days, scanned, &now, &workspaces);
+    let mut report = summarize(&reqs, days, scanned, &now, &workspaces);
+    report["chain_wide_event_types"] = json!(type_census.iter().map(|(k, (n, a, b))| {
+        (k.clone(), json!({"count": n, "first": a.to_rfc3339(), "last": b.to_rfc3339()}))
+    }).collect::<serde_json::Map<_, _>>());
     print_markdown(&report);
     if let Some(p) = json_path {
         std::fs::write(&p, serde_json::to_string_pretty(&report)?).with_context(|| format!("writing {}", p.display()))?;
@@ -340,9 +395,12 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
          peer: 'peer:*', via 'peer_not_same', or another member id; asker: an escalation ruled by its own asker (a withdrawal); \
          other: anything else"));
     let mut path_key_counts: HashMap<&str, u64> = HashMap::new();
+    let mut groups: HashMap<&str, Vec<&Req>> = HashMap::new();
     for r in reqs.values().filter(|r| r.kind == "scope") {
         *path_key_counts.entry(r.path_key.as_str()).or_default() += 1;
+        groups.entry(r.path_key.as_str()).or_default().push(r);
     }
+    let reasks = reask_split(groups.into_values().collect());
     for kind in ["scope", "escalation"] {
         let rs: Vec<&Req> = reqs.values().filter(|r| r.kind == kind).collect();
         let mut by_member = BTreeMap::new();
@@ -352,6 +410,7 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
         let mut by_ruler = BTreeMap::new();
         let mut by_path = BTreeMap::new();
         let mut by_outcome_ruler = BTreeMap::new();
+        let mut by_sub = BTreeMap::new();
         let mut latencies: Vec<i64> = Vec::new();
         let (mut gate_opened, mut no_peer, mut reasked) = (0u64, 0u64, 0u64);
         for r in &rs {
@@ -364,6 +423,12 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
             if !r.ruler.is_empty() {
                 bump(&mut by_ruler, r.ruler);
                 bump(&mut by_outcome_ruler, &format!("{}/{}", r.outcome, r.ruler));
+            }
+            if let Some(h) = r.home_dotdir.as_deref().filter(|_| r.path_class == "home_dotdir") {
+                bump(&mut by_sub, h);
+            }
+            if let Some(n) = r.other_marker {
+                bump(&mut by_sub, n);
             }
             if kind == "scope" {
                 bump(&mut by_path, r.path_class);
@@ -385,6 +450,10 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
             k.insert("gate_opened_with_no_admissible_peer".into(), json!(no_peer));
             k.insert("by_path_class".into(), json!(by_path));
             k.insert("reasked_same_member_and_path".into(), json!(reasked));
+            k.insert("home_dotdir_by_first_component".into(), json!(by_sub));
+            k.insert("reasks".into(), reasks.clone());
+        } else {
+            k.insert("marker_other_by_published_name".into(), json!(by_sub));
         }
         k.insert("by_member".into(), json!(by_member));
         k.insert(if kind == "scope" { "by_rule" } else { "by_marker_class" }.into(), json!(by_rule));
@@ -401,6 +470,38 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
     Value::Object(out)
 }
 
+/// Re-asks: within each (member, path) group of two or more requests, ordered by when they were
+/// opened, every request after the first is a re-ask. Counted by the outcome of the FIRST ask, and
+/// by whether it came within 10 minutes of the previous request's ruling (a re-ask after an
+/// unruled previous request is counted separately).
+fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
+    let mut by_first = BTreeMap::new();
+    let (mut total, mut within_10m, mut after_unruled) = (0u64, 0u64, 0u64);
+    for mut g in groups.into_iter().filter(|g| g.len() > 1) {
+        g.sort_by_key(|r| r.opened);
+        let first = g[0].outcome;
+        for w in g.windows(2) {
+            total += 1;
+            *by_first.entry(first.to_string()).or_insert(0u64) += 1;
+            match (w[0].ruled_at, w[1].opened) {
+                (Some(ruled), Some(next)) => {
+                    let gap = (next - ruled).num_seconds();
+                    if (0..=600).contains(&gap) {
+                        within_10m += 1;
+                    }
+                }
+                _ => after_unruled += 1,
+            }
+        }
+    }
+    json!({
+        "reasks": total,
+        "by_outcome_of_first_ask": by_first,
+        "within_10_min_of_previous_ruling": within_10m,
+        "previous_request_unruled": after_unruled,
+    })
+}
+
 fn print_markdown(r: &Value) {
     println!("## Request load — last {} days (aggregate only)\n", r["window_days"]);
     println!("- generated {}; {} chain entries scanned\n", r["generated_at"].as_str().unwrap_or(""), r["chain_entries_scanned"]);
@@ -411,13 +512,16 @@ fn print_markdown(r: &Value) {
         if kind == "scope" {
             println!("- gate-opened with no admissible peer (operator only): {}", k["gate_opened_with_no_admissible_peer"]);
             println!("- re-asked (same member and path more than once): {}", k["reasked_same_member_and_path"]);
+            let ra = &k["reasks"];
+            println!("- re-asks after the first: {}; by outcome of the first ask: {}; within 10 min of the previous ruling: {}; previous unruled: {}",
+                     ra["reasks"], ra["by_outcome_of_first_ask"], ra["within_10_min_of_previous_ruling"], ra["previous_request_unruled"]);
         }
         let t = &k["time_to_ruling_secs"];
         println!("- ruled: {}; time to ruling median {} s, p90 {} s", k["ruled_count"], t["median"], t["p90"]);
         let facets: &[&str] = if kind == "scope" {
-            &["by_outcome", "by_ruler", "by_outcome_and_ruler", "by_path_class", "by_rule", "by_member", "by_day"]
+            &["by_outcome", "by_ruler", "by_outcome_and_ruler", "by_path_class", "home_dotdir_by_first_component", "by_rule", "by_member", "by_day"]
         } else {
-            &["by_outcome", "by_ruler", "by_outcome_and_ruler", "by_marker_class", "by_member", "by_day"]
+            &["by_outcome", "by_ruler", "by_outcome_and_ruler", "by_marker_class", "marker_other_by_published_name", "by_member", "by_day"]
         };
         for f in facets {
             let parts: Vec<String> = k[*f].as_object().map(|m| m.iter().map(|(a, b)| format!("{a} {b}")).collect()).unwrap_or_default();
@@ -425,6 +529,13 @@ fn print_markdown(r: &Value) {
         }
         println!();
     }
+    println!("### Chain-wide event types (whole chain, not the window)\n");
+    if let Some(m) = r["chain_wide_event_types"].as_object() {
+        for (k, v) in m {
+            println!("- {k}: {} (first {}, last {})", v["count"], v["first"].as_str().unwrap_or(""), v["last"].as_str().unwrap_or(""));
+        }
+    }
+    println!();
     println!("Who ruled: {}", r["ruler_classification"].as_str().unwrap_or(""));
 }
 
@@ -499,6 +610,44 @@ mod tests {
         assert_eq!(classify_marker("config.toml"), "harness_registration");
         assert_eq!(classify_marker("CLAUDE.md"), "instructions_or_memory");
         assert_eq!(classify_marker("whatever.bin"), "other");
+    }
+
+    #[test]
+    fn a_home_dotdir_is_named_by_its_first_component_only() {
+        assert_eq!(home_dotdir_name("/home/u/.claude/projects/x/y.jsonl", HOME).as_deref(), Some(".claude"));
+        assert_eq!(home_dotdir_name("/home/u/.hestia", HOME).as_deref(), Some(".hestia"));
+        assert_eq!(home_dotdir_name("/home/u/notes/.x", HOME), None);
+        assert_eq!(home_dotdir_name("/home/user2/.x", HOME), None);
+        assert_eq!(home_dotdir_name("/etc/x", HOME), None);
+    }
+
+    #[test]
+    fn only_published_governance_names_leave_the_other_class() {
+        assert_eq!(published_marker_name("/home/u/.hestia/hooks/law_inject.py"), "law_inject.py");
+        assert_eq!(published_marker_name(".claude/settings.json"), "settings.json");
+        assert_eq!(published_marker_name("plugins/_shared"), "plugins/_shared");
+        assert_eq!(published_marker_name("/w/hestia/plugins/_shared/"), "plugins/_shared");
+        assert_eq!(published_marker_name("my-secret-project.txt"), "other");
+        assert_eq!(published_marker_name("hubcap"), "other");
+    }
+
+    fn req(key: &str, opened: i64, outcome: &'static str, ruled: Option<i64>) -> Req {
+        let t = |x: i64| DateTime::<Utc>::from_timestamp(x, 0);
+        Req { kind: "scope", path_key: key.into(), opened: t(opened), outcome, ruled_at: ruled.and_then(t), ..Default::default() }
+    }
+
+    #[test]
+    fn reasks_split_by_the_first_outcome_and_the_gap() {
+        let a = [req("a", 100, "refused", Some(200)), req("a", 500, "granted", Some(600)), req("a", 2000, "lapsed", None)];
+        let b = [req("b", 0, "lapsed", None), req("b", 50, "open", None)];
+        let c = [req("c", 0, "granted", Some(10))];
+        let v = reask_split(vec![a.iter().collect(), b.iter().collect(), c.iter().collect()]);
+        assert_eq!(v["reasks"], 3);
+        assert_eq!(v["by_outcome_of_first_ask"]["refused"], 2);
+        assert_eq!(v["by_outcome_of_first_ask"]["lapsed"], 1);
+        // a2 came 300 s after a1's ruling (within); a3 came 1400 s after a2's (not); b2 followed an unruled b1.
+        assert_eq!(v["within_10_min_of_previous_ruling"], 1);
+        assert_eq!(v["previous_request_unruled"], 1);
     }
 
     #[test]
