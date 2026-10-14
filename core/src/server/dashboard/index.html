@@ -3505,7 +3505,13 @@
     .map(d => `<option value="${d}"${d===sel?' selected':''}>${d}</option>`).join('');
 
   function renderPolicy(p) {
-    $('pol-mode').textContent = `${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`;
+    {
+      const t = selectedOrch || null;
+      const g = t ? (lastData?.instance_grants ?? []).find(x => x.plugin_id === t) : null;
+      $('pol-mode').textContent = g
+        ? `${t}: ${g.preset} (live grant) · society: ${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`
+        : `${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`;
+    }
     // SAY WHAT THE BUTTONS WILL CHANGE. The scope was invisible, so a scoped-looking control
     // silently set the whole society twice in one session. The banner is loud when scoped,
     // because "this affects everyone" is the assumption that has to be defeated.
@@ -3517,9 +3523,21 @@
         : 'Presets below change the SOCIETY baseline — every member on this machine, including unattended ones. Select a member above to scope it.';
       scope.className = target ? 'pol-scope scoped' : 'pol-scope society';
     }
-    $('pol-presets').innerHTML = p.presets.map(pr =>
-      `<button class="filter-btn${pr.name===p.active_preset?' selected':''}" data-preset="${escapeHtml(pr.name)}" title="${escapeHtml(pr.description)}">${escapeHtml(pr.name)}</button>`
-    ).join('');
+    // HIGHLIGHT WHAT IS IN FORCE FOR WHAT THE BUTTONS TARGET (dp, 2026-10-13: "the permissive
+    // wasn't highlighted"). With a member selected, the buttons set THAT member's grant, so the
+    // lit button must be its effective preset -- its live grant if it has one, else the society
+    // baseline -- not always the society's. The society baseline stays marked when it differs.
+    const polTarget = selectedOrch || null;
+    const polGrant = polTarget ? (lastData?.instance_grants ?? []).find(g => g.plugin_id === polTarget) : null;
+    const inForce = polGrant ? polGrant.preset : p.active_preset;
+    $('pol-presets').innerHTML = p.presets.map(pr => {
+      const lit = pr.name === inForce;
+      const baseline = polGrant && pr.name === p.active_preset;
+      const why = lit && polGrant
+        ? ` — in force for ${polTarget} (live grant; dies with the daemon)`
+        : baseline ? ' — society baseline' : '';
+      return `<button class="filter-btn${lit ? ' selected' : ''}${baseline ? ' pol-baseline' : ''}" data-preset="${escapeHtml(pr.name)}" title="${escapeHtml(pr.description + why)}">${escapeHtml(pr.name)}${baseline ? ' <span class="pol-mode">(society)</span>' : ''}</button>`;
+    }).join('');
     $('pol-rules').innerHTML = p.preset_rules.map(r => `
       <div class="pol-rule">
         <div class="rinfo"><span class="rname">${escapeHtml(r.name)}</span><span class="rmatch">${escapeHtml(r.match)}</span></div>
