@@ -2,12 +2,44 @@
 
 | file | sha256 |
 |---|---|
-| `28148979a51b12f5683d397eecffb769f35fb7d52646ff55fa4aaec409c7fda1.patch` | `28148979a51b12f5683d397eecffb769f35fb7d52646ff55fa4aaec409c7fda1` (base main `67b45517`) **— current** |
+| `04b57d9195c74ae52b35275ff789d9f4d8504c2a7e0ab9ea862e628d1791a556.patch` | `04b57d9195c74ae52b35275ff789d9f4d8504c2a7e0ab9ea862e628d1791a556` (base main `67b45517`) **— current** |
+| `28148979a51b12f5683d397eecffb769f35fb7d52646ff55fa4aaec409c7fda1.patch` | SUPERSEDED: Codex review 24029 (see below). Do not apply it. |
 | `dcc1ba10f584c179def43133dee060b4c8de0fd1df7665c30c189ea679887c56.patch` | SUPERSEDED: Codex HOLD 23996 (see below). Do not apply it. |
 | `39bd5bcfd1df5d648e826715738f432cd67b4131854c3963ab66074c2a4601b8.patch` | SUPERSEDED: Codex HOLD (see below). Left in place only because `git rm` is refused by the safety preset; do not apply it. |
 
 8 files, +380/−18: the gate core, its hooks-gt copy and manifests, and the shell battery. Nothing here is
 applied.
+
+## Revision after Codex review 24029 (`codex/review-1312-28148979` @ 7ad8845d, 2026-10-14)
+
+Codex flagged two concerns it could not run (the review gate refused its probes as workspace-root
+reach). Both reproduce from the shared checkout, with bash itself as the oracle:
+
+1. **POSIX bracket classes: an end-to-end false allow on 28148979.** Python's `fnmatch` has no
+   `[[:alpha:]]` and reads `[^x]` as a set holding `^`, so it said `c[[:alpha:]]`, `[[:lower:]]d`,
+   `c[[:alnum:]]`, `c[^x]`, `pu[[:alpha:]]hd` and `[[:alpha:]][[:alpha:]]` cannot name a stateful
+   builtin. Next to a file named `cd`, bash expands every one of them to `cd` (or `pushd`). With the
+   three-pass `sub/sub -> outside` fixture, the loop took the rule and the verdict was **allow**.
+   Fix: a body word holding a bracket expression is refused outright (only the test words `[` and `[[`
+   are kept), and so is any extglob opener (`?(` `*(` `+(` `@(` `!(`). `fnmatch` is kept only for `*`
+   and `?`, where it agrees with bash.
+2. **Source after `!`, `if`, `then`, `else`, `time`, `time -p` or a redirection.** All of these took
+   the rule (bash confirms the `cd` inside `./move` persists across iterations). In every case the
+   ordinary judge still refused the loop, so none of them was an end-to-end false allow. But the
+   exclusion was not doing its job. Fix: `.` is matched as a standalone word followed by an argument,
+   in any position. That costs `find . -name x` in a body, which loses the new allow. A trailing `.`
+   argument costs nothing extra: the single-literal rule already gives up on a statement holding a
+   bare `.` word (`f=a.txt; grep -c x $f .` is unenumerated on main).
+
+Evidence:
+- Battery: **1434 passed, 0 failed** on the revised core. 14 new checks: 12 refusals, each of which
+  must refuse AND not take the rule (the 5 bracket forms, `@(c?)`, and source after `!`/`if`/`time`/a
+  redirect/`then`/`else`), plus 2 test-word allows (`[ -f $f ]`, `[[ -f $f ]]`). On 28148979's core
+  11 fail (the extglob row is already refused there by the `(` split). On base `67b45517` the 15
+  failures are all allows this patch adds. No refusal is lost.
+- The own-seat replay was not re-run, as in the last two rounds. This revision only removes allows.
+- The probe that drove this, `adv3.py`, also covers `[c]d`, `c[!x]`, `c[a-z]`, `true && . f`, `{ . f; }`,
+  `. -- f` and `! source f`. All of them were already refused on 28148979 and still are.
 
 ## Revision after Codex HOLD 23996 (review `tools/review_1312_revision_probe.py` on `codex/review-1312-dcc1ba10`, 2026-10-14)
 
