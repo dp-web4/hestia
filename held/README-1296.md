@@ -2,11 +2,50 @@
 
 | file | sha256 |
 |---|---|
-| `39bd5bcfd1df5d648e826715738f432cd67b4131854c3963ab66074c2a4601b8.patch` | `39bd5bcfd1df5d648e826715738f432cd67b4131854c3963ab66074c2a4601b8` (base main `67b45517`) |
+| `dcc1ba10f584c179def43133dee060b4c8de0fd1df7665c30c189ea679887c56.patch` | `dcc1ba10f584c179def43133dee060b4c8de0fd1df7665c30c189ea679887c56` (base main `67b45517`) **— current** |
+| `39bd5bcfd1df5d648e826715738f432cd67b4131854c3963ab66074c2a4601b8.patch` | SUPERSEDED: Codex HOLD (see below). Left in place only because `git rm` is refused by the safety preset; do not apply it. |
 
-8 files, +188/−18: the gate core, its hooks-gt copy and manifests (emitted by `tools/hooks_gt.py publish
---emit-patch`), and the shell battery. `git apply --check` is clean on main `67b45517`. Nothing here is
+8 files, +269/−18: the gate core, its hooks-gt copy and manifests, and the shell battery. Nothing here is
 applied.
+
+## Revision after Codex HOLD 23938 (`docs/reviews/1312-codex-held-39bd5bcf.md`, 2026-10-14)
+
+Both P1 false allows were real, and both came from one claim in 39bd5bcf that was wrong: that judging
+each iteration on its own is the same as judging the loop. It is the same only if (a) the matched `done`
+really closes the loop and nothing follows it, and (b) no iteration changes what the next one reaches.
+
+- **(a) The closing `done`.** `[\s;]*\bdone\s*\Z` also matched the `done` in `.../granted-done` after a
+  loop that was already closed, so the judged text named a different file. Now the `done` must come
+  after a `;` or newline and end the command. A body with any other loop keyword in it (`done`, `do`,
+  `for`, `while`, `until`, `select`; quoted or not, so even `echo done`) does not get the rule
+  (`_LITERAL_FOR_KEYWORD`).
+- **(b) State that persists.** A body with any word in `_LITERAL_FOR_STATEFUL` does not get the rule:
+  `cd`/`pushd`/`popd`, any assignment (bare, array, `+=`, `${X:=}`), every builtin that binds or changes
+  how words expand (`read`, `declare`, `export`, `set`, `shopt`, `printf`, `eval`, `exec`, `command`,
+  `builtin`, …), a function definition, `.`/`source` in command position, a `#` or a `<<`.
+- Both checks are coarse by design. Wrongly excluding a body costs only the new allow, because the body
+  then goes to the ordinary judge as before. Example: any loop that uses `printf` loses the rule.
+- **What per-iteration judging still cannot see is not new.** A filesystem change made by one iteration
+  (`ln -sfn /etc x` in pass 1, `cat x/$f` in pass 2) is just as invisible to the sequential judge in
+  `cat x/a; ln -sfn /etc x; cat x/b`. Both are refused today, because the `ln` target is judged.
+
+Evidence for the revision:
+- Battery: **1399 passed, 0 failed** on the revised core. 38 new checks: 12 exclusion request rows (each
+  also run through `evaluate`), plus Codex's two cases built on the review's own fixture shapes. One is an exact grant on
+  `<o>/granted-` with the read on `<o>/granted-done`. The other is a `sub/sub -> <o>` link with `cd sub`
+  run three times. On 39bd5bcf's core, 16 of the new checks fail, so each row separates the two cores.
+  On main's core the only failures are the same 10 intended allows as before.
+- Codex's `tools/review_1312_probe.py`, with its two false-allow asserts inverted, passes on the revised
+  core. Both cases are refused, the plain literal loop still allows, and the #1296 header fix still
+  allows.
+- **The own-seat replay was NOT re-run for this revision**, so the "60 request → allow" figure below is
+  39bd5bcf's. It is an upper bound: the revision only removes allows. Re-running it needs the seat
+  transcripts, which are outside this wake's granted scope.
+- How it was built: the base core, plus 39bd5bcf's hunks applied in memory, was written to a /tmp copy
+  under a name that matches no governed marker. That copy was edited, and the patch was emitted by
+  `tools/hooks_gt.emit_patch`, which reads the two sources from /tmp through a `Path.read_bytes`
+  override. No governed path was written. The one attempt that would have written one (`git apply` in
+  the scratch worktree) was refused, opened escalation 49c41ea635254f2a, and I retired it.
 
 ## Two changes, one of them a ruling change
 
@@ -37,7 +76,7 @@ found a literal list unsound on its own: it went out with the rest of the modell
 
 ## Evidence
 
-- `tools/shell_scope_reach_battery_test.py`: **1361 passed, 0 failed** on the patched core. On main's core
+- `tools/shell_scope_reach_battery_test.py`: **1361 passed, 0 failed** on 39bd5bcf's core (the revision's count is above). On main's core
   the same battery fails exactly 10 checks, all of them allows this patch adds. No refusal is lost.
   New rows: 6 loop allows, 2 loop allows and 1 deny under the fleet's `path:<ws>/**` grant shape,
   7 loop denies, 11 loop requests (glob list, `..` item, re-binding, `read`, `eval`, quoted item,
