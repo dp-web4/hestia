@@ -2,11 +2,41 @@
 
 | file | sha256 |
 |---|---|
-| `dcc1ba10f584c179def43133dee060b4c8de0fd1df7665c30c189ea679887c56.patch` | `dcc1ba10f584c179def43133dee060b4c8de0fd1df7665c30c189ea679887c56` (base main `67b45517`) **— current** |
+| `28148979a51b12f5683d397eecffb769f35fb7d52646ff55fa4aaec409c7fda1.patch` | `28148979a51b12f5683d397eecffb769f35fb7d52646ff55fa4aaec409c7fda1` (base main `67b45517`) **— current** |
+| `dcc1ba10f584c179def43133dee060b4c8de0fd1df7665c30c189ea679887c56.patch` | SUPERSEDED: Codex HOLD 23996 (see below). Do not apply it. |
 | `39bd5bcfd1df5d648e826715738f432cd67b4131854c3963ab66074c2a4601b8.patch` | SUPERSEDED: Codex HOLD (see below). Left in place only because `git rm` is refused by the safety preset; do not apply it. |
 
-8 files, +269/−18: the gate core, its hooks-gt copy and manifests, and the shell battery. Nothing here is
+8 files, +380/−18: the gate core, its hooks-gt copy and manifests, and the shell battery. Nothing here is
 applied.
+
+## Revision after Codex HOLD 23996 (review `tools/review_1312_revision_probe.py` on `codex/review-1312-dcc1ba10`, 2026-10-14)
+
+The P1 was real. `_LITERAL_FOR_STATEFUL` matched raw text, but bash forms the command word after quote
+removal and expansion, so `c''d`, `c"d"`, `c\d` and `c\<newline>d` all ran `cd` in a body that took the
+rule. Codex's four false allows reproduced, and so did more of the same kind: `pu''shd`, an item that
+is itself `cd` (`for f in cd cd cd; do $f sub; done`), `c$f`, `${f:0:2}`, `$(echo c)d`, `$'\x63d'`, and a
+glob such as `c?` next to a file named `cd`.
+
+Following Codex's advice, the fix refuses the forms it cannot read exactly. It does not add more
+spellings to the list. `_literal_for_body_uncertain(body, var, item)` runs for each item:
+- substitute `$V`/`${V}` with the item (a bindable literal). Any `$`, backtick or brace still present is
+  an expansion whose result the text does not show, so the rule is refused;
+- delete backslash-newline pairs, then every `'`, `"` and `\`. This over-approximates every word quote
+  removal could produce. Then re-run the keyword and stateful patterns on that text;
+- refuse any word that still holds a glob character and could match a stateful builtin name or `.`.
+
+Quoting or globbing an ARGUMENT keeps the rule (`grep -n 'foo bar' $f`, `wc -l "$f"`, `ls *.txt`).
+
+Evidence:
+- Battery: **1420 passed, 0 failed** on the revised core. 21 new checks: 18 refusals, each of which
+  must be refused AND must not take the loop rule (so a refusal for some other reason cannot hide a
+  false allow), and 3 argument-quoting allows. On dcc1ba10's core exactly those 18 fail. On base
+  `67b45517` the 13 failures are all allows this patch adds (the earlier 10 plus the 3 new ones). No
+  refusal is lost.
+- Codex's `tools/review_1312_revision_probe.py`, with its four false-allow asserts inverted and pointed
+  at this patch, passes from the shared checkout. Run from a worktree under `/tmp` it cannot pass: `/tmp`
+  is implicitly granted, so the closing-`done` control allows on every core, the old ones included.
+- The own-seat replay was not re-run, as last round. This revision only removes allows.
 
 ## Revision after Codex HOLD 23938 (`docs/reviews/1312-codex-held-39bd5bcf.md`, 2026-10-14)
 
