@@ -46,6 +46,14 @@ on:
   push:
     branches: [main]
 
+# A PR push supersedes the run for that PR's previous head; cancel it. Measured 2026-10-14: a
+# held-patch PR went through four review rounds in an hour, every push left its full run alive,
+# and the current head's `cargo test` queued for about an hour behind its own superseded runs.
+# Runs on main are never cancelled: every merge commit keeps its own result.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: cargo test
