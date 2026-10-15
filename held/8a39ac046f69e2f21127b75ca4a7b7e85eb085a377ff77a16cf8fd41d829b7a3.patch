@@ -1,0 +1,771 @@
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 7c8e4c9c4ed81c7d2e24a11e7f3ef01c3f028c3f6c410fdc30e3ddd07675d6c2  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -1575,6 +1575,17 @@
+                               "-regex", "-iregex", "-lname", "-ilname"},
+              "string_opts": {"-printf"}},
+     "git": {"string_opts": {"-m", "--message", "--grep", "--author", "--format", "--pretty", "-S", "-G"}},
++    # #1314: the first positional is the jq PROGRAM (`jq '.[-1].body' f`), unless `-f FILE` /
++    # `--from-file FILE` names a program file, after which every positional is an input file.
++    # `program_file_opts` marks that, and a short cluster holding `f` or `L` (`-rf F`, `-nL D`)
++    # judges the next word as a file and gives up the program exception for the command. A
++    # two-value option (`--arg N V`, `--rawfile N F`) can only move the exception onto its NAME,
++    # an earlier word; the file after it is still judged.
++    # `no_program_flags`: a flag after which there is no positional program either (`jq
++    # --run-tests [FILE]` reads FILE, or stdin, as a test file; Codex HOLD on 19952a05).
++    "jq": {"pattern_first": True, "program_file_opts": {"-f", "--from-file"},
++           "file_opts": {"-f", "--from-file"}, "value_opts": {"-L", "--library-path", "--indent"},
++           "cluster_file_letters": "fL", "no_program_flags": {"--run-tests"}},
+ }
+ _CMD_SPECS["gawk"] = _CMD_SPECS["mawk"] = _CMD_SPECS["awk"]
+ #: Heads whose `-c` value is shell code (they also disqualify the literal rule).
+@@ -1613,6 +1624,20 @@
+     ("gh", "pr", "merge"): {"--subject", "-t", "--body", "-b"},
+     ("gh", "release", "create"): {"--title", "-t", "--notes", "-n"},
+     ("gh", "release", "edit"): {"--title", "-t", "--notes", "-n"},
++    # #1314 (live 2026-10-15, scope-10c87b5a5372): `--jq` is a jq program and `--template` a Go
++    # template, never a file. Each checked against `gh <sub> --help` (gh 2.x): `-q, --jq
++    # expression|string` and `-t, --template string` on exactly these subcommands.
++    ("gh", "api"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "checks"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "issue", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "issue", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "run", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "run", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "release", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "release", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "repo", "view"): {"--jq", "-q", "--template", "-t"},
+ }
+ 
+ 
+@@ -1824,6 +1849,71 @@
+             or "$" in rest or (_BRACE in rest and ".." in rest))
+ 
+ 
++#: hestia#1314 (live on McNugget, 2026-10-14): non-path text judged as a path. Every case below
++#: was a false deny of read-only work that opened peer scope requests nobody should decide.
++#:
++#: URL CLIENTS: commands whose positional arguments are URLs. For these, `host:port[/…]` is a URL
++#: too (curl and wget assume http when no scheme is given), not a relative path.
++_URL_HEADS = frozenset(("curl", "wget", "http", "https", "xh", "xhs", "curlie"))
++_HOSTPORT = re.compile(r"^(?:localhost|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
++                       r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]+\])"
++                       r":\d{1,5}(?:[/?#]|$)")
++_URL_WITH_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
++_FILE_URL = re.compile(r"^file:(?://([^/]*))?(/.*)$", re.IGNORECASE)
++
++
++def _file_url_path(value: str) -> Optional[str]:
++    """The path a `file:` URL names (`file:///x`, `file://localhost/x`, `file:/x` -> `/x`), with
++    `%XX` decoded and any `?query` / `#fragment` dropped, as curl and sqlite3 open it; else None.
++    #1314: main judged `curl file:///etc/passwd` only as the relative `file:/etc/passwd` and
++    allowed it. The URL is ALSO an ordinary relative spelling (`cat file:///x` reads the directory
++    `file:` under the cwd), so `emit` judges both, never the target alone (Codex HOLD on 19952a05)."""
++    m = _FILE_URL.match(value)
++    if not m:
++        return None
++    path = re.split(r"[?#]", m.group(2), maxsplit=1)[0]
++    return re.sub(r"%([0-9A-Fa-f]{2})", lambda h: chr(int(h.group(1), 16)), path)
++
++
++def _network_url(value: str, head: Optional[str]) -> bool:
++    """#1314: is this literal argument a network URL rather than a path? A scheme other than
++    `file:` (`http://127.0.0.1:8760/health`), or, as the argument of a URL client, `host:port[/…]`
++    (`curl localhost:8760/health`). A `..` component disqualifies it: if a directory named `http:`
++    existed, `http://../x` would be a real escape. (Whether such a directory exists is checked
++    where the bases are known, in `_command_scope_reach_one`.)"""
++    if ".." in value.split("/"):
++        return False
++    m = _URL_WITH_SCHEME.match(value)
++    if m:
++        return m.group(1).lower() != "file"
++    return head in _URL_HEADS and bool(_HOSTPORT.match(value))
++
++
++def _leading_absolute_cd(cmd: str) -> Optional[str]:
++    """#1314 part 4: `cd /abs && …` sets the directory for everything after it. If the `cd` fails,
++    `&&` runs nothing more, so no later word can resolve under the event cwd. Returns the
++    directory (resolved, so a later `..` is judged physically, as the kernel resolves it) only
++    when the WHOLE command is `cd <literal absolute dir> && …` and every later separator is `&&`
++    or a pipe. Any `;`, newline, `||`, `&`, subshell, group or command substitution (a body runs
++    as a separate statement here) keeps the event cwd as a base, as before."""
++    try:
++        toks = _shell_words(_strip_data_heredocs(cmd))
++    except _Unmodelled:
++        return None
++    if len(toks) < 4 or toks[0] != ("word", "cd", False) or toks[1][0] != "word" \
++            or toks[2] != ("sep", "&&", False):
++        return None
++    d = toks[1][1]
++    if toks[1][2] or not d.startswith("/") or any(c in d for c in "$`*?[]{}\\") \
++            or any(ord(c) < 32 for c in d):
++        return None
++    for k, w, _g in toks[3:]:
++        if k == "mark" or (k == "sep" and w not in ("&&", "|", "|&")) \
++                or (k == "word" and w in ("{", "}")):
++            return None
++    return os.path.realpath(d).replace("\\", "/")
++
++
+ class _Found:
+     """What one scan found besides its literal candidates (shared by nested scans)."""
+ 
+@@ -1941,7 +2031,10 @@
+     found = found if found is not None else _Found()
+     pwd = cwd or os.getcwd()
+ 
+-    def emit(value, uglob):
++    def emit(value, uglob, uri="both"):
++        # `uri`: how a `file:` URL is judged. "both" (any argument): as the path it names AND as
++        # its literal relative spelling, since only the command knows which it opens. "literal"
++        # (a redirection target, a program word): the shell never reads a URL there.
+         if not _path_shaped(value, uglob):
+             return
+         try:
+@@ -1958,6 +2051,12 @@
+         if v.startswith("~"):
+             found.unenum.append("a ~user home the gate does not resolve")
+             return
++        fp = _file_url_path(v) if uri == "both" else None
++        if fp is not None:
++            # #1314: `curl file:///etc/passwd` reads /etc/passwd; main judged only the relative
++            # `file:/etc/passwd` and allowed it. Judge the literal spelling too (`cat file:///x`).
++            emit(value, uglob, uri="literal")
++            v = fp
+         if v.startswith("//"):
+             v = "/" + v.lstrip("/")
+         if uglob:
+@@ -1978,6 +2077,19 @@
+         out.extend(_outside_candidates(_strip_data_heredocs(
+             text.replace(_DQ_REF, "").replace(_BRACE, "").replace(_LIT_DOLLAR, "$")
+             .replace(_LIT_TICK, "`")), pwd, depth + 1, found))
++
++    def url_argument(word, head):
++        # #1314: a positional that is a network URL (`_network_url`) is recorded as kind "url",
++        # not judged as a path. `_command_scope_reach_one` turns it back into a relative path
++        # if its first component (`http:`, `localhost:8760`) exists under any base.
++        try:
++            v = _word_value(word, in_force())
++        except _Unenumerated:
++            return False                    # `emit` records why
++        if not _network_url(v, head):
++            return False
++        out.append((v, "url", False))
++        return True
+ 
+     def in_force():
+         cut = body_origin
+@@ -2148,7 +2260,7 @@
+             continue
+         if state["redirect"]:                # a redirection target: always judged
+             state["redirect"] = False
+-            emit(w, uglob)
++            emit(w, uglob, uri="literal")
+             continue
+         head, spec = state["head"], state["spec"]
+         if head is None:
+@@ -2188,7 +2300,7 @@
+                                     f"${state['env_expansion']}")
+             state["head"], state["spec"] = base, _CMD_SPECS.get(base, {})
+             if "/" in w or w.startswith("."):
+-                emit(w, uglob)                             # a program run by path is a reach
++                emit(w, uglob, uri="literal")             # a program run by path is a reach
+             if base in ("export", "local", "declare", "typeset", "readonly"):
+                 state["spec"] = {"assign_args": "export" if base == "export" else "local"}
+             if base == "popd":
+@@ -2206,6 +2318,8 @@
+             continue
+         if state["pending"] is not None:
+             opt, state["pending"] = state["pending"], None
++            if opt in spec.get("program_file_opts", ()):
++                state["pattern_given"] = True               # #1314: `jq -f PROG`: no positional program
+             if opt in spec.get("code_opts", ()):
+                 code(w)
+                 continue
+@@ -2241,6 +2355,12 @@
+                     chdir(w[2:], uglob)
+                     emit(w[2:], uglob)
+                     continue
++            if name in spec.get("no_program_flags", ()):
++                # #1314: `jq --run-tests F`: F is a file, judged as a positional.
++                state["pattern_given"] = True
++                if eq:
++                    emit(val, uglob)
++                continue
+             strs = _string_opts(head, spec, state["subs"])
+             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
+                      | strs | spec.get("file_opts", set())
+@@ -2249,7 +2369,7 @@
+                 if name in spec.get("code_opts", ()):
+                     code(val)
+                     continue
+-                if name in spec.get("pattern_opts", ()):
++                if name in spec.get("pattern_opts", ()) or name in spec.get("program_file_opts", ()):
+                     state["pattern_given"] = True
+                 if uglob or not (name in spec.get("delim_opts", ())
+                                  or name in spec.get("pattern_opts", ())
+@@ -2257,6 +2377,13 @@
+                     emit(val, uglob)
+                 else:
+                     data(val)
++                continue
++            letters = spec.get("cluster_file_letters", "")
++            if letters and re.fullmatch(r"-[A-Za-z]{2,}", w) and any(c in w[1:] for c in letters):
++                # #1314: `jq -rf PROG`, `jq -nL DIR`: the next word is a file (judged), and no
++                # positional program is assumed for the rest of the command.
++                state["pattern_given"] = True
++                state["pending"] = next(iter(sorted(spec.get("file_opts", ()))))
+                 continue
+             if (_HEREDOC_SHELL.match(head) or _CODE_ARG_HEADS.match(head)) and not w.startswith("--") \
+                     and re.fullmatch(r"-[A-Za-z]*[ce][A-Za-z]*", w) \
+@@ -2332,6 +2459,8 @@
+         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
+                 and not uglob:
+             data(w)
++            continue
++        if not uglob and url_argument(w, head):
+             continue
+         name, eq, val = w.partition("=")
+         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
+@@ -2625,6 +2754,11 @@
+     # out-of-scope one with no in-scope alternative denies; a token that exists nowhere is not
+     # a reach.
+     cwd = (cwd or os.getcwd()).replace("\\", "/")
++    # #1314 part 4: after a leading `cd /abs &&` nothing later runs in the event cwd, so it is no
++    # longer a plausible base (main judged `cd <granted> && cat ./x` under an ungranted cwd).
++    pinned = _leading_absolute_cd(cmd)
++    if pinned is not None:
++        cwd = pinned
+     bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
+     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
+     probes = 0
+@@ -2690,6 +2824,18 @@
+         if lift_unenum:
+             return True, None, None
+         return False, f"{_UNMODELLED_PREFIX}{why}>", UNENUMERATED_TARGET
++    urls = [(s_, g_) for s_, k_, g_ in candidates if k_ == "url"]
++    if urls:
++        # #1314: a network URL is not a path, UNLESS its first component (`http:`,
++        # `localhost:8760`) exists under a base it could resolve from: then it is judged as the
++        # relative path it would also be. Unknown bases (a directory change the gate cannot
++        # follow, too many of them) judge every URL as a path, as before.
++        ub = None if found.dirs_unknown else _dir_bases(found.dirs, cwd)
++        look = None if ub is None else bases + ub
++        candidates = [c for c in candidates if c[1] != "url"] + [
++            (s_, "rel", g_) for s_, g_ in urls
++            if look is None or any(os.path.lexists(os.path.join(b, s_.split("/", 1)[0]))
++                                   for b in look)]
+     rels = [(s_, g_) for s_, k_, g_ in candidates if k_ == "rel"]
+     if found.dirs_unknown and rels:
+         found.unenum.append(f"a relative path after {found.dirs_unknown}")
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e",
++      "sha256": "7c8e4c9c4ed81c7d2e24a11e7f3ef01c3f028c3f6c410fdc30e3ddd07675d6c2",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8"
++  "gt_version": "96f36f40f64bdfb2b1a67b70ced0d2de2fa499f9543407b24362c46c41d4858c"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "96f36f40f64bdfb2b1a67b70ced0d2de2fa499f9543407b24362c46c41d4858c",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "7c8e4c9c4ed81c7d2e24a11e7f3ef01c3f028c3f6c410fdc30e3ddd07675d6c2"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "f59762b4e42ac450427412ef251889b8f5edca7ef587fe6ff95f3a8973684431"
++  "gt_version": "b40d01c3e48d979a051706e61b75cc01f796abea41eaca20890656f9ae430895"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "96f36f40f64bdfb2b1a67b70ced0d2de2fa499f9543407b24362c46c41d4858c",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "7c8e4c9c4ed81c7d2e24a11e7f3ef01c3f028c3f6c410fdc30e3ddd07675d6c2"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "d4571479d33aad6d4b67a745b9c23b1d815cadbcb8963e412eb6af53b10dbcec"
++  "gt_version": "2d0e50f9c3a62f5fa2083c9bfa2c27409ad9921e241f2fa643ae639455e44cef"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "96f36f40f64bdfb2b1a67b70ced0d2de2fa499f9543407b24362c46c41d4858c",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "7c8e4c9c4ed81c7d2e24a11e7f3ef01c3f028c3f6c410fdc30e3ddd07675d6c2"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "00068fc9ec4a345487b9b1567deb156cfc21dcc6890692e20fd2eb4345ecd29f"
++  "gt_version": "d15c980fa3bcb7ff1e46b65a955dfdc25a9ab9f613c53dc870359798f9b947ea"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "96f36f40f64bdfb2b1a67b70ced0d2de2fa499f9543407b24362c46c41d4858c",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "7c8e4c9c4ed81c7d2e24a11e7f3ef01c3f028c3f6c410fdc30e3ddd07675d6c2"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "6fa3feda4cf14ab1c5348a7c57a625a63e35924d27cfdf7a3780687ab1174016"
++  "gt_version": "494cfaa13d2984252b8e90edac40b80cce9c480257391fc2eb3192c719c31292"
+ }
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1574,6 +1574,17 @@
+                               "-regex", "-iregex", "-lname", "-ilname"},
+              "string_opts": {"-printf"}},
+     "git": {"string_opts": {"-m", "--message", "--grep", "--author", "--format", "--pretty", "-S", "-G"}},
++    # #1314: the first positional is the jq PROGRAM (`jq '.[-1].body' f`), unless `-f FILE` /
++    # `--from-file FILE` names a program file, after which every positional is an input file.
++    # `program_file_opts` marks that, and a short cluster holding `f` or `L` (`-rf F`, `-nL D`)
++    # judges the next word as a file and gives up the program exception for the command. A
++    # two-value option (`--arg N V`, `--rawfile N F`) can only move the exception onto its NAME,
++    # an earlier word; the file after it is still judged.
++    # `no_program_flags`: a flag after which there is no positional program either (`jq
++    # --run-tests [FILE]` reads FILE, or stdin, as a test file; Codex HOLD on 19952a05).
++    "jq": {"pattern_first": True, "program_file_opts": {"-f", "--from-file"},
++           "file_opts": {"-f", "--from-file"}, "value_opts": {"-L", "--library-path", "--indent"},
++           "cluster_file_letters": "fL", "no_program_flags": {"--run-tests"}},
+ }
+ _CMD_SPECS["gawk"] = _CMD_SPECS["mawk"] = _CMD_SPECS["awk"]
+ #: Heads whose `-c` value is shell code (they also disqualify the literal rule).
+@@ -1612,6 +1623,20 @@
+     ("gh", "pr", "merge"): {"--subject", "-t", "--body", "-b"},
+     ("gh", "release", "create"): {"--title", "-t", "--notes", "-n"},
+     ("gh", "release", "edit"): {"--title", "-t", "--notes", "-n"},
++    # #1314 (live 2026-10-15, scope-10c87b5a5372): `--jq` is a jq program and `--template` a Go
++    # template, never a file. Each checked against `gh <sub> --help` (gh 2.x): `-q, --jq
++    # expression|string` and `-t, --template string` on exactly these subcommands.
++    ("gh", "api"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "checks"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "issue", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "issue", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "run", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "run", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "release", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "release", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "repo", "view"): {"--jq", "-q", "--template", "-t"},
+ }
+ 
+ 
+@@ -1823,6 +1848,71 @@
+             or "$" in rest or (_BRACE in rest and ".." in rest))
+ 
+ 
++#: hestia#1314 (live on McNugget, 2026-10-14): non-path text judged as a path. Every case below
++#: was a false deny of read-only work that opened peer scope requests nobody should decide.
++#:
++#: URL CLIENTS: commands whose positional arguments are URLs. For these, `host:port[/…]` is a URL
++#: too (curl and wget assume http when no scheme is given), not a relative path.
++_URL_HEADS = frozenset(("curl", "wget", "http", "https", "xh", "xhs", "curlie"))
++_HOSTPORT = re.compile(r"^(?:localhost|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
++                       r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]+\])"
++                       r":\d{1,5}(?:[/?#]|$)")
++_URL_WITH_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
++_FILE_URL = re.compile(r"^file:(?://([^/]*))?(/.*)$", re.IGNORECASE)
++
++
++def _file_url_path(value: str) -> Optional[str]:
++    """The path a `file:` URL names (`file:///x`, `file://localhost/x`, `file:/x` -> `/x`), with
++    `%XX` decoded and any `?query` / `#fragment` dropped, as curl and sqlite3 open it; else None.
++    #1314: main judged `curl file:///etc/passwd` only as the relative `file:/etc/passwd` and
++    allowed it. The URL is ALSO an ordinary relative spelling (`cat file:///x` reads the directory
++    `file:` under the cwd), so `emit` judges both, never the target alone (Codex HOLD on 19952a05)."""
++    m = _FILE_URL.match(value)
++    if not m:
++        return None
++    path = re.split(r"[?#]", m.group(2), maxsplit=1)[0]
++    return re.sub(r"%([0-9A-Fa-f]{2})", lambda h: chr(int(h.group(1), 16)), path)
++
++
++def _network_url(value: str, head: Optional[str]) -> bool:
++    """#1314: is this literal argument a network URL rather than a path? A scheme other than
++    `file:` (`http://127.0.0.1:8760/health`), or, as the argument of a URL client, `host:port[/…]`
++    (`curl localhost:8760/health`). A `..` component disqualifies it: if a directory named `http:`
++    existed, `http://../x` would be a real escape. (Whether such a directory exists is checked
++    where the bases are known, in `_command_scope_reach_one`.)"""
++    if ".." in value.split("/"):
++        return False
++    m = _URL_WITH_SCHEME.match(value)
++    if m:
++        return m.group(1).lower() != "file"
++    return head in _URL_HEADS and bool(_HOSTPORT.match(value))
++
++
++def _leading_absolute_cd(cmd: str) -> Optional[str]:
++    """#1314 part 4: `cd /abs && …` sets the directory for everything after it. If the `cd` fails,
++    `&&` runs nothing more, so no later word can resolve under the event cwd. Returns the
++    directory (resolved, so a later `..` is judged physically, as the kernel resolves it) only
++    when the WHOLE command is `cd <literal absolute dir> && …` and every later separator is `&&`
++    or a pipe. Any `;`, newline, `||`, `&`, subshell, group or command substitution (a body runs
++    as a separate statement here) keeps the event cwd as a base, as before."""
++    try:
++        toks = _shell_words(_strip_data_heredocs(cmd))
++    except _Unmodelled:
++        return None
++    if len(toks) < 4 or toks[0] != ("word", "cd", False) or toks[1][0] != "word" \
++            or toks[2] != ("sep", "&&", False):
++        return None
++    d = toks[1][1]
++    if toks[1][2] or not d.startswith("/") or any(c in d for c in "$`*?[]{}\\") \
++            or any(ord(c) < 32 for c in d):
++        return None
++    for k, w, _g in toks[3:]:
++        if k == "mark" or (k == "sep" and w not in ("&&", "|", "|&")) \
++                or (k == "word" and w in ("{", "}")):
++            return None
++    return os.path.realpath(d).replace("\\", "/")
++
++
+ class _Found:
+     """What one scan found besides its literal candidates (shared by nested scans)."""
+ 
+@@ -1940,7 +2030,10 @@
+     found = found if found is not None else _Found()
+     pwd = cwd or os.getcwd()
+ 
+-    def emit(value, uglob):
++    def emit(value, uglob, uri="both"):
++        # `uri`: how a `file:` URL is judged. "both" (any argument): as the path it names AND as
++        # its literal relative spelling, since only the command knows which it opens. "literal"
++        # (a redirection target, a program word): the shell never reads a URL there.
+         if not _path_shaped(value, uglob):
+             return
+         try:
+@@ -1957,6 +2050,12 @@
+         if v.startswith("~"):
+             found.unenum.append("a ~user home the gate does not resolve")
+             return
++        fp = _file_url_path(v) if uri == "both" else None
++        if fp is not None:
++            # #1314: `curl file:///etc/passwd` reads /etc/passwd; main judged only the relative
++            # `file:/etc/passwd` and allowed it. Judge the literal spelling too (`cat file:///x`).
++            emit(value, uglob, uri="literal")
++            v = fp
+         if v.startswith("//"):
+             v = "/" + v.lstrip("/")
+         if uglob:
+@@ -1977,6 +2076,19 @@
+         out.extend(_outside_candidates(_strip_data_heredocs(
+             text.replace(_DQ_REF, "").replace(_BRACE, "").replace(_LIT_DOLLAR, "$")
+             .replace(_LIT_TICK, "`")), pwd, depth + 1, found))
++
++    def url_argument(word, head):
++        # #1314: a positional that is a network URL (`_network_url`) is recorded as kind "url",
++        # not judged as a path. `_command_scope_reach_one` turns it back into a relative path
++        # if its first component (`http:`, `localhost:8760`) exists under any base.
++        try:
++            v = _word_value(word, in_force())
++        except _Unenumerated:
++            return False                    # `emit` records why
++        if not _network_url(v, head):
++            return False
++        out.append((v, "url", False))
++        return True
+ 
+     def in_force():
+         cut = body_origin
+@@ -2147,7 +2259,7 @@
+             continue
+         if state["redirect"]:                # a redirection target: always judged
+             state["redirect"] = False
+-            emit(w, uglob)
++            emit(w, uglob, uri="literal")
+             continue
+         head, spec = state["head"], state["spec"]
+         if head is None:
+@@ -2187,7 +2299,7 @@
+                                     f"${state['env_expansion']}")
+             state["head"], state["spec"] = base, _CMD_SPECS.get(base, {})
+             if "/" in w or w.startswith("."):
+-                emit(w, uglob)                             # a program run by path is a reach
++                emit(w, uglob, uri="literal")             # a program run by path is a reach
+             if base in ("export", "local", "declare", "typeset", "readonly"):
+                 state["spec"] = {"assign_args": "export" if base == "export" else "local"}
+             if base == "popd":
+@@ -2205,6 +2317,8 @@
+             continue
+         if state["pending"] is not None:
+             opt, state["pending"] = state["pending"], None
++            if opt in spec.get("program_file_opts", ()):
++                state["pattern_given"] = True               # #1314: `jq -f PROG`: no positional program
+             if opt in spec.get("code_opts", ()):
+                 code(w)
+                 continue
+@@ -2240,6 +2354,12 @@
+                     chdir(w[2:], uglob)
+                     emit(w[2:], uglob)
+                     continue
++            if name in spec.get("no_program_flags", ()):
++                # #1314: `jq --run-tests F`: F is a file, judged as a positional.
++                state["pattern_given"] = True
++                if eq:
++                    emit(val, uglob)
++                continue
+             strs = _string_opts(head, spec, state["subs"])
+             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
+                      | strs | spec.get("file_opts", set())
+@@ -2248,7 +2368,7 @@
+                 if name in spec.get("code_opts", ()):
+                     code(val)
+                     continue
+-                if name in spec.get("pattern_opts", ()):
++                if name in spec.get("pattern_opts", ()) or name in spec.get("program_file_opts", ()):
+                     state["pattern_given"] = True
+                 if uglob or not (name in spec.get("delim_opts", ())
+                                  or name in spec.get("pattern_opts", ())
+@@ -2256,6 +2376,13 @@
+                     emit(val, uglob)
+                 else:
+                     data(val)
++                continue
++            letters = spec.get("cluster_file_letters", "")
++            if letters and re.fullmatch(r"-[A-Za-z]{2,}", w) and any(c in w[1:] for c in letters):
++                # #1314: `jq -rf PROG`, `jq -nL DIR`: the next word is a file (judged), and no
++                # positional program is assumed for the rest of the command.
++                state["pattern_given"] = True
++                state["pending"] = next(iter(sorted(spec.get("file_opts", ()))))
+                 continue
+             if (_HEREDOC_SHELL.match(head) or _CODE_ARG_HEADS.match(head)) and not w.startswith("--") \
+                     and re.fullmatch(r"-[A-Za-z]*[ce][A-Za-z]*", w) \
+@@ -2331,6 +2458,8 @@
+         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
+                 and not uglob:
+             data(w)
++            continue
++        if not uglob and url_argument(w, head):
+             continue
+         name, eq, val = w.partition("=")
+         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
+@@ -2624,6 +2753,11 @@
+     # out-of-scope one with no in-scope alternative denies; a token that exists nowhere is not
+     # a reach.
+     cwd = (cwd or os.getcwd()).replace("\\", "/")
++    # #1314 part 4: after a leading `cd /abs &&` nothing later runs in the event cwd, so it is no
++    # longer a plausible base (main judged `cd <granted> && cat ./x` under an ungranted cwd).
++    pinned = _leading_absolute_cd(cmd)
++    if pinned is not None:
++        cwd = pinned
+     bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
+     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
+     probes = 0
+@@ -2689,6 +2823,18 @@
+         if lift_unenum:
+             return True, None, None
+         return False, f"{_UNMODELLED_PREFIX}{why}>", UNENUMERATED_TARGET
++    urls = [(s_, g_) for s_, k_, g_ in candidates if k_ == "url"]
++    if urls:
++        # #1314: a network URL is not a path, UNLESS its first component (`http:`,
++        # `localhost:8760`) exists under a base it could resolve from: then it is judged as the
++        # relative path it would also be. Unknown bases (a directory change the gate cannot
++        # follow, too many of them) judge every URL as a path, as before.
++        ub = None if found.dirs_unknown else _dir_bases(found.dirs, cwd)
++        look = None if ub is None else bases + ub
++        candidates = [c for c in candidates if c[1] != "url"] + [
++            (s_, "rel", g_) for s_, g_ in urls
++            if look is None or any(os.path.lexists(os.path.join(b, s_.split("/", 1)[0]))
++                                   for b in look)]
+     rels = [(s_, g_) for s_, k_, g_ in candidates if k_ == "rel"]
+     if found.dirs_unknown and rels:
+         found.unenum.append(f"a relative path after {found.dirs_unknown}")
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -794,6 +794,87 @@
+         ):
+             r = fx.reach(cmd, scopes=ws_tree, cwd=out_cwd)
+             check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
++        # hestia#1314 (live on McNugget, 2026-10-14/15; no variable involved): non-path text was
++        # judged as a path. From the same ungranted cwd outside the workspace, under the fleet's
++        # grant shape plus an EXACT grant on that cwd (so `cd`/`git -C` into it is allowed while
++        # `<it>/<word>` is not): a URL after a directory change, a relative path after a leading
++        # `cd /abs &&`, and a jq program. Each is a must-allow row that main refuses (and on a
++        # live seat, a peer scope request nobody should decide). A `file:` URL to a granted file
++        # is allowed: no `<cwd>/file:` directory exists, so its literal spelling reaches nothing.
++        cwd_exact = ws_tree + (f"path:{out_cwd}",)
++        for name, cmd in (
++            ("1314-url-hostport-after-cd", f"cd {out_cwd} && curl -s -m 3 localhost:8760/health"),
++            ("1314-url-scheme-after-cd", f"cd {out_cwd} && curl -s -m 3 http://127.0.0.1:8760/health"),
++            ("1314-url-after-git-C", f"git -C {out_cwd} status && curl -s https://api.github.com/x"),
++            ("1314-cd-abs-then-dot-relative", f"cd {ws}/granted && cat ./a.txt"),
++            ("1314-cd-abs-then-pipe", f"cd {ws}/granted && cat ./a.txt | wc -l"),
++            ("1314-gh-api-jq", "gh api repos/o/r/issues/432/comments --jq '.[-1].body'"),
++            ("1314-gh-pr-list-jq", "gh pr list --json number -q '.[].number'"),
++            ("1314-jq-program", "echo '[]' | jq '.[-1].body'"),
++            ("1314-jq-dot", f"jq . {ws}/granted/a.txt"),
++            ("1314-jq-run-tests-granted", f"jq --run-tests {ws}/granted/a.txt"),
++            ("1314-file-url-granted", f"curl -s file://{ws}/granted/a.txt"),
++        ):
++            r = fx.reach(cmd, scopes=cwd_exact, cwd=out_cwd)
++            check(f"allow-outside-cwd:{name}", r[0] is True, f"{cmd!r} -> {r}")
++        # ...and what must still be refused. A `file:` URL IS a path (main judged
++        # `file:///etc/hostname` as the relative `file:/etc/hostname` and allowed it). The pinned
++        # cwd needs `cd <abs>` FIRST and only `&&` / `|` after it: after `;` or `||` the next
++        # command may run in the event cwd. A program run by a system-directory path is still a
++        # reach (the 2026-10-05 pin in test_gate_core.py stands; Codex HOLD on 19952a05 asked for
++        # an explicit policy ruling before reversing it), and so are its arguments. `jq -f F` /
++        # `-rf F` name a program FILE, and `jq --run-tests F` a test file, so the first
++        # positional is an input file again (Codex HOLD on 19952a05, P1 a).
++        (pathlib.Path(o) / "urltrap").mkdir()
++        os.symlink(o, f"{o}/urltrap/http:")       # a directory named like a scheme: a real path
++        for name, cmd, cwd_ in (
++            ("1314-control-file-url", "curl -s file:///etc/hostname", out_cwd),
++            ("1314-control-file-url-localhost", f"curl -s file://localhost{o}/secret.txt", out_cwd),
++            ("1314-control-file-url-option", f"curl -s --url file://{o}/secret.txt", out_cwd),
++            ("1314-control-dot-relative-in-ungranted-cwd", "cat ./deep.txt", out_cwd),
++            ("1314-control-cd-semicolon", f"cd {ws}/granted; cat ./deep.txt", out_cwd),
++            ("1314-control-cd-or", f"cd {ws}/granted || cat ./deep.txt", out_cwd),
++            ("1314-control-cd-background", f"cd {ws}/granted && true & cat ./deep.txt", out_cwd),
++            ("1314-control-cd-relative-first", f"cd granted && cat ./deep.txt", out_cwd),
++            ("1314-control-cd-abs-then-escape", f"cd {ws}/granted && cat ../../outside/secret.txt", out_cwd),
++            ("1314-control-system-program-pin", f"tail -n 3 {ws}/granted/a.txt | /usr/bin/python3 -c 'print(1)'", out_cwd),
++            ("1314-control-system-program-argument", f"/usr/bin/cat {o}/secret.txt", out_cwd),
++            ("1314-control-system-dir-dotdot", f"/usr/bin/../..{o}/bin/python -c pass", out_cwd),
++            ("1314-control-outside-program", f"{o}/bin/python -c pass", out_cwd),
++            ("1314-control-url-with-dotdot", f"cd {out_cwd} && curl -s http://../secret.txt", out_cwd),
++            ("1314-control-scheme-named-dir", "cat http://secret.txt", f"{o}/urltrap"),
++            ("1314-control-jq-program-file", f"jq -f {o}/secret.txt {ws}/granted/a.txt", out_cwd),
++            ("1314-control-jq-clustered-program-file", f"jq -rf ./deep.txt {ws}/granted/a.txt", out_cwd),
++            ("1314-control-jq-from-file-eq", f"jq --from-file=./deep.txt {ws}/granted/a.txt", out_cwd),
++            ("1314-control-jq-library-dir", f"jq -L {o} '.x' {ws}/granted/a.txt", out_cwd),
++            ("1314-control-jq-input-file", f"jq . {o}/secret.txt", out_cwd),
++            ("1314-control-gh-input-file", f"gh api x --jq . --input {o}/secret.txt", out_cwd),
++            ("1314-control-jq-run-tests", f"jq --run-tests {o}/secret.txt", out_cwd),
++            ("1314-control-jq-run-tests-relative", "jq --run-tests ./deep.txt", out_cwd),
++            ("1314-control-jq-run-tests-after-options", f"jq -r --arg n v --run-tests {o}/secret.txt", out_cwd),
++            ("1314-control-jq-options-after-run-tests", f"jq --run-tests -r {o}/secret.txt", out_cwd),
++            ("1314-control-file-url-query", f"curl -s 'file://{o}/secret.txt?x=1'", out_cwd),
++            ("1314-control-file-url-percent", f"curl -s file://{o}/secre%74.txt", out_cwd),
++        ):
++            r = fx.reach(cmd, scopes=cwd_exact, cwd=cwd_)
++            check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
++        # Codex HOLD on 19952a05 (P1 b): `cat` and the shell do not read a `file:` URL. A word
++        # `file://<granted>/a.txt` is ALSO the relative path `<cwd>/file:/<granted>/a.txt`, and
++        # judging only the URL's target allowed a read of that ungranted file. Both are judged.
++        lit = pathlib.Path(out_cwd + "/file:" + ws + "/granted")
++        lit.mkdir(parents=True)
++        (lit / "a.txt").write_text("outside marker\n")
++        for name, cmd in (
++            ("1314-control-file-url-literal-cat", f"cat file://{ws}/granted/a.txt"),
++            ("1314-control-file-url-literal-redirect-in", f"wc -l < file://{ws}/granted/a.txt"),
++            ("1314-control-file-url-literal-redirect-out", f"echo x > file://{ws}/granted/a.txt"),
++        ):
++            r = fx.reach(cmd, scopes=cwd_exact, cwd=out_cwd)
++            check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
++        # An expansion inside a URL is still unenumerated (no URL model of `$X`).
++        r = fx.reach("curl -s http://h/$X", scopes=cwd_exact, cwd=out_cwd)
++        check("request-outside-cwd:1314-url-with-expansion",
++              r[0] is False and r[2] == getattr(G, "UNENUMERATED_TARGET", "hestia:unpriceable:unenumerated"), r)
+         # Codex HOLD 23938 (P1 a): a `done` that ends a FILENAME after an already-closed loop is
+         # not the loop's end. Stripping it judged `<o>/granted-` (granted) for `<o>/granted-done`.
+         gd = pathlib.Path(o) / "granted-done"
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -1097,6 +1097,22 @@
+         stub.close()
+ 
+ 
++def test_a_file_url_is_judged_as_the_path_it_names_on_every_seat(m, g, wc, home):
++    """hestia#1314: `curl file:///etc/hostname` reads /etc/hostname. Main judged it only as the
++    relative `file:/etc/hostname` under the cwd and allowed it. Refused, and the scope request
++    names the path the URL opens."""
++    for seat in SEATS:
++        stub = Stub(Policy())
++        try:
++            with _Env(m, stub.url, home):
++                d, _ = _decide(g, seat, "Bash", {"command": "curl -s file:///etc/hostname"}, home)
++                claims = [a.get("path") for a, _ in stub.named("hestia_scope_claim")]
++                check(f"1314-{seat}-file-url-is-a-path", d.decision == "deny" and d.rule == "mrh.command"
++                      and claims == ["/etc/hostname"], (d, claims))
++        finally:
++            stub.close()
++
++
+ def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
+     """#1287 part 1 (2026-10-13): a seat put prose with `*` and quotes in R and passed "$R" as
+     `--reason`; the literal rule made the act a once-only scope request although nothing in it is a
+@@ -1559,6 +1575,7 @@
+     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
+     test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
+     test_prose_in_a_message_position_is_data_on_every_seat,
++    test_a_file_url_is_judged_as_the_path_it_names_on_every_seat,
+     test_degraded_posture,
+     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
+     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
