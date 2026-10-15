@@ -112,6 +112,19 @@ with tempfile.TemporaryDirectory() as tmp:
     check("H2. a sprout wake is not told it is on CBP", " on CBP," not in prompt,
           f"prompt={prompt[:120]!r}")
 
+# hestia#1310: "the installed member-mesh CLI" named no file, so wakes went looking in the
+# user bin dir and each look opened a scope request. The prompt must name the script by a
+# path that exists.
+with tempfile.TemporaryDirectory() as tmp:
+    r, argv = fire(tmp)
+    prompt = (argv or [""])[-1]
+    cli = os.path.join(MESH, "hestia-mesh.py")
+    check("C1. the prompt no longer says 'installed member-mesh CLI'",
+          "installed member-mesh CLI" not in prompt)
+    check("C2. the prompt names the mesh CLI by its real path",
+          f"python3 {cli} send" in prompt and os.path.isfile(cli),
+          f"cli={cli!r} tail={prompt[-500:]!r}")
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: " + ", ".join(failures))
