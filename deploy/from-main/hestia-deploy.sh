@@ -572,7 +572,7 @@ preflight_gate() {
     printf '%s' "$2" | (cd "$DEPLOY_ROOT/hestia" && env HESTIA_PRE_FAIL_CLOSED=1 CLAUDECODE=1 \
       HESTIA_HOME="$probe_home" \
       HESTIA_SHARED_DIR="$DEPLOY_ROOT/hestia/plugins/_shared" \
-      HESTIA_HOOK_TIMEOUT_S="$PROBE_TIMEOUT_S" \
+      HESTIA_HOOK_TIMEOUT_S="$PROBE_TIMEOUT_S" HESTIA_GATE_NO_ESCALATE=1 \
       HESTIA_ENDPOINT="$EP" ${_bound[@]+"${_bound[@]}"} python3 "$gate") >"$tmp/out" 2>"$tmp/err"
     rc=$?
     [ "$rc" = 0 ] && return 0
