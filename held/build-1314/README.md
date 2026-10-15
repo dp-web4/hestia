@@ -10,3 +10,7 @@ These scripts are kept here because the scratch copies of earlier rounds were wi
 6. `verify.py`: applies the new patch in memory and checks that every file reproduces.
 
 None of these writes a governed path.
+
+570f6e82 round: the 68e951fc outputs (`core_rev.py`, `battery_rev.py`) were copied to `core_held.py` /
+`battery_held.py`. Then `edit_core2.py` and `edit_battery2.py` were applied to the `*_rev.py` copies, and steps
+3 to 6 were rerun.

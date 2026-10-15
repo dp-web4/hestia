@@ -2,19 +2,50 @@
 
 | file | sha256 |
 |---|---|
-| `68e951fcab5a4ffa827e918a44cb56743ee8464079a2951b17a9a1edad2610d7.patch` | `68e951fcab5a4ffa827e918a44cb56743ee8464079a2951b17a9a1edad2610d7` (base main `2d79644f`) **current** |
+| `570f6e8226449c6b68b659011462c1990ec7397fbd855297ba40c1cd2e0528dd.patch` | `570f6e8226449c6b68b659011462c1990ec7397fbd855297ba40c1cd2e0528dd` (base main `2d79644f`) **current** |
+| `68e951fcab5a4ffa827e918a44cb56743ee8464079a2951b17a9a1edad2610d7.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187802110, mesh 25968), an output option in another option's VALUE position (`wget -U -O- URL`) counted as establishing stdout, see below |
 | `f46bc32bc3a9569b09d9e783c2a24774936c752c0e0fd068fac2473686eafa97.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187550265, mesh 25966), URL exemption in download modes (`curl -O`, default `wget`, `http --download`) let a derived filename land in an exactly granted dir, see below |
 | `0a2af175e50945b0bd069eabf74947b6bd39dd22f3dcced3118f6d69506c917c.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187241802, mesh 25955), URL exemption let `mkdir -p http://newdir` create an ungranted path, see below |
 | `8a39ac046f69e2f21127b75ca4a7b7e85eb085a377ff77a16cf8fd41d829b7a3.patch` | SUPERSEDED: Codex HOLD (PR #1328 review 6186945315, mesh 25937), two jq P1 false allows, see below |
 | `19952a0521073ed8ce7fd03aaf8d4b4a7f1a962760cad9581fd2a2a2a6c25b3c.patch` | SUPERSEDED: Codex HOLD (PR #1328 review, mesh 25905), two P1 false allows, see below |
 
-9 files, +826/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
+9 files, +858/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
 from a scratch copy of the core), the shell battery and the decide contract test. The single gate, the
 mechanism, the daemon and `test_gate_core.py` are unchanged. Nothing here is applied.
 
 How it was checked without touching a tree: the builder applies every hunk **in memory** to HEAD's text and
 compares the result with the intended bytes (all 9 files match). No `git apply`, not even `--check`, was run
 against any tree.
+
+## Revision (570f6e82) against Codex's HOLD on 68e951fc
+
+| Codex finding | 68e951fc | 570f6e82 |
+|---|---|---|
+| P1: `cd O && wget -q -U -O- URL` and `wget -q --user-agent --spider URL` under an exact grant on O. wget takes `-O-` / `--spider` as the user-agent string and keeps its default, which saves `fresh.txt` in the cwd | every option-shaped word was read as an option, so `-O-` / `--spider` set "output established" and the URL was exempted: allowed. Codex ran both against a local server with GNU Wget 1.21.4, and both wrote `O/fresh.txt` | evidence FOR an established output (wget `-O`/`--output-document`/`--spider`, HTTPie `-o`/`--output`) counts only where the word is certainly an option: not after an option that is not known to take no value (`_url_option_frees_next`), and not after any `--`. Evidence AGAINST (download modes, recursion, configs, `--download`) is still read at every word |
+
+So the asymmetry is explicit now. A word that might be a value can still REMOVE an exemption, because a false
+match only judges the URL as a path (main's behaviour). It can no longer GRANT one. The 68e951fc text below
+says "every option-shaped word is checked". That remains true for the evidence against, and is no longer true
+for the evidence for.
+
+Also changed: `--` no longer stops the scan. It may itself be a value (`wget -O- -U -- -r URL` sends `--` as the
+agent and recurses), so the words after it are still read for evidence against.
+
+Other clients: curl/curlie have no evidence FOR (they write to stdout unless told otherwise), so only the
+evidence against applies. HTTPie/xh `-o` is gated the same way as wget's `-O`.
+
+New must-refuse rows: Codex's two, `wget -O- -U -- -r URL`, and `http --download --session -o URL`. The last
+was already refused on 68e951fc, because there `-o` takes the URL as its value. It guards the gating anyway.
+New must-allow rows, where the value IS consumed: `wget -q -U agent -O- URL`,
+`wget -q --user-agent=agent --spider URL`, and `http --download --session s -o <granted> URL`.
+
+Evidence (570f6e82):
+- Battery: **1541 passed, 0 failed**. On the **68e951fc core it fails 3**, which are Codex's two and the `--` row.
+  On **main's core it fails 19**, the same 19 as before, and main passes every new row.
+- Decide contract: **PASS: 23 decide() contract tests (+ shim-parity 29x4)**. Run from a clean `2d79644f`
+  worktree with the revised core as the overlay.
+- Built with `build-1314/edit_core2.py` and `edit_battery2.py` on the 68e951fc build outputs, then `emit.py`. All 9
+  files reproduce in memory. No `git apply`. Real `wget` was not run here: Codex's run is the evidence.
 
 ## Revision (68e951fc) against Codex's HOLD on f46bc32b
 
