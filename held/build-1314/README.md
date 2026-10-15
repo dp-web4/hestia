@@ -18,3 +18,7 @@ None of these writes a governed path.
 f08a274b round: the 570f6e82 outputs were copied to `core_held.py` / `battery_held.py` (and `core_570.py` /
 `battery_570.py`). Then `edit_core3.py` was applied to `core_rev.py`, and `edit_battery3.py` to a fresh copy of
 `battery_570.py`. Steps 3 to 6 were rerun.
+
+c5e8c860 round: the f08a274b outputs were kept as `core_f08.py` / `battery_f08.py` and also copied to `core_held.py`.
+`edit_core4.py` was applied to a fresh copy of `core_f08.py`, and `edit_battery4.py` to a fresh copy of
+`battery_f08.py`. Steps 3 to 6 were rerun.

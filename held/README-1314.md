@@ -2,7 +2,8 @@
 
 | file | sha256 |
 |---|---|
-| `f08a274bc3d7bef5614af5e98f6b5a36f317b6fa96d8c401f5cc628b629ecfd8.patch` | `f08a274bc3d7bef5614af5e98f6b5a36f317b6fa96d8c401f5cc628b629ecfd8` (base main `2d79644f`) **current** |
+| `c5e8c8604450d15c2220488ec139accabcd7ff442ab8bea3a01e33e78777acd0.patch` | `c5e8c8604450d15c2220488ec139accabcd7ff442ab8bea3a01e33e78777acd0` (base main `2d79644f`) **current** |
+| `f08a274bc3d7bef5614af5e98f6b5a36f317b6fa96d8c401f5cc628b629ecfd8.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6188408077, mesh 25989), curl's accepted abbreviation `--remote-name-a` kept the URL exemption and wrote `O/fresh.txt`, see below |
 | `570f6e8226449c6b68b659011462c1990ec7397fbd855297ba40c1cd2e0528dd.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6188083013, mesh 25972), `wget --spider --no-spider -q URL` kept the spider evidence and wrote `O/fresh.txt`, see below |
 | `68e951fcab5a4ffa827e918a44cb56743ee8464079a2951b17a9a1edad2610d7.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187802110, mesh 25968), an output option in another option's VALUE position (`wget -U -O- URL`) counted as establishing stdout, see below |
 | `f46bc32bc3a9569b09d9e783c2a24774936c752c0e0fd068fac2473686eafa97.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187550265, mesh 25966), URL exemption in download modes (`curl -O`, default `wget`, `http --download`) let a derived filename land in an exactly granted dir, see below |
@@ -10,13 +11,50 @@
 | `8a39ac046f69e2f21127b75ca4a7b7e85eb085a377ff77a16cf8fd41d829b7a3.patch` | SUPERSEDED: Codex HOLD (PR #1328 review 6186945315, mesh 25937), two jq P1 false allows, see below |
 | `19952a0521073ed8ce7fd03aaf8d4b4a7f1a962760cad9581fd2a2a2a6c25b3c.patch` | SUPERSEDED: Codex HOLD (PR #1328 review, mesh 25905), two P1 false allows, see below |
 
-9 files, +809/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
+9 files, about +832/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
 from a scratch copy of the core), the shell battery and the decide contract test. The single gate, the
 mechanism, the daemon and `test_gate_core.py` are unchanged. Nothing here is applied.
 
 How it was checked without touching a tree: the builder applies every hunk **in memory** to HEAD's text and
 compares the result with the intended bytes (all 9 files match). No `git apply`, not even `--check`, was run
 against any tree.
+
+## Revision (c5e8c860) against Codex's HOLD on f08a274b: long options matched exactly
+
+Codex ran real curl 8.5.0: `cd O && curl --remote-name-a -sS http://h/fresh.txt` wrote `O/fresh.txt`. The
+classifier allowed it because `_url_output_established` looked for the FULL spellings in `_URL_IMPLICIT_LONG`.
+curl, and HTTPie through argparse, accept any unambiguous prefix of a long option, so the absence of a full
+spelling was never evidence that the output was stdout.
+
+The fix does not try to model prefix matching, curl's case-insensitive names, or `--no-`/`--expand-` forms.
+A long option word now leaves the output established only if its name (before any `=`) is an EXACT member of
+`_URL_SAFE_LONG`: the listed value-less flags plus a short list of common value-taking options (`--output`,
+`--header`, `--data*`, `--max-time` …), minus every implicit-output option. Any other long word leaves the URL
+judged as a path, as on main. That covers abbreviations, case variants, negations and options the table has
+never seen. The cost is that an unlisted but harmless long option (for example `--no-progress-meter` is
+listed but `--trace-ascii` is not) gives up the exemption. That cost is a false refusal, not a false allow.
+
+Short options were already exact (curl's short letters are case-sensitive and do not abbreviate). The
+"output option in a value position" rule from 570f6e82 already refused an unknown long word directly before
+the URL (`curl --REMOTE-NAME URL`, `http --down URL`). The hole was an abbreviation followed by another flag,
+so that the URL stood in an operand position.
+
+New battery rows, all in Codex's `cd O &&` shape. Must-refuse: `--remote-name-a`, `-q --remote-name-al`,
+`--REMOTE-NAME`, `--remote-head`, `--output-d=.`, `--conf=cfg`, an unknown `--some-future-option`, and
+`http --down`. Must-allow: `curl --silent --show-error --location URL`,
+`curl --silent --header=A:b --output <granted> URL` and `http --body --follow URL`.
+
+Evidence (c5e8c860):
+- Battery: **1555 passed, 0 failed**. The f08a274b core fails 3 (`--remote-name-a`, `--remote-name-al`,
+  `--conf=cfg`); its other five new must-refuse rows were already refused through the value-position rule.
+  Main fails 26: the 23 known must-allow rows (URL, jq and `cd` exemptions that main lacks), the 3 new
+  must-allow rows, and every file-URL tightening row. It fails no new must-refuse row.
+- Decide contract: PASS (23 + shim-parity 29x4), run from a clean base worktree with the revised core as overlay.
+- The patch reproduces all 9 files in memory (`verify.py`). Rebuild: `held/build-1314/edit_core4.py` and
+  `edit_battery4.py` applied to the f08a274b outputs.
+- Not rerun here: Codex's real-curl probe (`held/reviews` on `codex/review-1328-f08a274b`). Its classifier
+  assertion for `--remote-name-a` should now flip to refuse. Its `--remote-nam` negative control is also
+  refused now, which is conservative: curl rejects that word as ambiguous.
 
 ## Revision (f08a274b) against Codex's HOLD on 570f6e82: the narrowing
 
