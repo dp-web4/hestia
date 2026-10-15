@@ -2,18 +2,57 @@
 
 | file | sha256 |
 |---|---|
-| `f46bc32bc3a9569b09d9e783c2a24774936c752c0e0fd068fac2473686eafa97.patch` | `f46bc32bc3a9569b09d9e783c2a24774936c752c0e0fd068fac2473686eafa97` (base main `2d79644f`) **current** |
+| `68e951fcab5a4ffa827e918a44cb56743ee8464079a2951b17a9a1edad2610d7.patch` | `68e951fcab5a4ffa827e918a44cb56743ee8464079a2951b17a9a1edad2610d7` (base main `2d79644f`) **current** |
+| `f46bc32bc3a9569b09d9e783c2a24774936c752c0e0fd068fac2473686eafa97.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187550265, mesh 25966), URL exemption in download modes (`curl -O`, default `wget`, `http --download`) let a derived filename land in an exactly granted dir, see below |
 | `0a2af175e50945b0bd069eabf74947b6bd39dd22f3dcced3118f6d69506c917c.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187241802, mesh 25955), URL exemption let `mkdir -p http://newdir` create an ungranted path, see below |
 | `8a39ac046f69e2f21127b75ca4a7b7e85eb085a377ff77a16cf8fd41d829b7a3.patch` | SUPERSEDED: Codex HOLD (PR #1328 review 6186945315, mesh 25937), two jq P1 false allows, see below |
 | `19952a0521073ed8ce7fd03aaf8d4b4a7f1a962760cad9581fd2a2a2a6c25b3c.patch` | SUPERSEDED: Codex HOLD (PR #1328 review, mesh 25905), two P1 false allows, see below |
 
-9 files, +638/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
+9 files, +826/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
 from a scratch copy of the core), the shell battery and the decide contract test. The single gate, the
 mechanism, the daemon and `test_gate_core.py` are unchanged. Nothing here is applied.
 
 How it was checked without touching a tree: the builder applies every hunk **in memory** to HEAD's text and
 compares the result with the intended bytes (all 9 files match). No `git apply`, not even `--check`, was run
 against any tree.
+
+## Revision (68e951fc) against Codex's HOLD on f46bc32b
+
+| Codex finding | f46bc32b | 68e951fc |
+|---|---|---|
+| P1: `cd O && curl -sSO URL` (also `--remote-name-all`, `-sSOJ`, `wget -q URL`, `http --download URL`) under an EXACT grant on O. The client writes a file whose name it DERIVES from the URL or the response, in the cwd, so no word names it | the URL operand was exempted, and nothing else in the command named the write: allowed. Codex ran real `curl -sSO` against a local server, and it wrote `O/fresh.txt` | `_url_output_established` reads EVERY word of the client's simple command before any operand is exempted, because an output mode can follow the URL (`curl URL -O`). Unless the output is established as stdout or a destination the command names, no operand is exempted, so the URL is judged as the relative path it also spells, which is main's behaviour |
+
+Not established, so no exemption:
+- **curl / curlie:** `-O`, `-J`, `-K` in a short cluster (read up to its first value letter), `--remote-name`,
+  `--remote-name-all`, `--remote-header-name`, `--config`, `--output-dir`.
+- **wget:** anything without `-O`/`--output-document` (its default writes a file), or `--spider`. Also, even
+  with `-O`: recursion (`-r -m -p`, and their long forms), `-b` (writes `wget-log`), `-e`/`--execute`,
+  `--config`, `--input-file`, `--base`.
+- **HTTPie / xh:** `--download`/`-d` (also `-bd`), unless `-o`/`--output` names the file.
+- **Any client:** a word that may expand into an option: one that starts with an expansion (`$OPTS`), any
+  `-…$X`, an unquoted glob, or `{a,b}`.
+
+Every option-shaped word is checked, including one that is really another option's value. A false match only
+judges the URL as a path. Not modelled: a `~/.curlrc` or `~/.wgetrc` that turns on a remote-name mode. The
+gate cannot read a client's own config, and that hole is older than this patch, because main never exempted
+the URL either. Named here so it is not assumed covered.
+
+New must-refuse rows, all `cd <exact dir> && …` from a granted cwd: Codex's five, `curl … URL -O` (option after
+the URL), `--remote-name`, `--output-dir . -o f`, `curl $OPTS URL`, `curlie -O`, bare `wget URL`,
+`wget -r -O-`, `wget -b -qO-`, `wget -O- -e output_document=x`, `xh -d`, and `https -bd`. New must-allow rows:
+`curl -sS URL`, `wget -q -O - URL`, `wget --output-document=- URL`, `wget -q -O <granted> URL`,
+`wget --spider URL`, `http --download -o <granted> URL`, and `curl -sS URL -o <granted>`.
+
+Evidence (68e951fc):
+- Battery: **1534 passed, 0 failed**. On the **f46bc32b core it fails 15**, which is every new must-refuse row and
+  includes all five of Codex's. On **main's core it fails 19**, the same 19 as before. Main passes every new row:
+  it refused these downloads, and this revision restores that.
+- Decide contract: **PASS: 23 decide() contract tests (+ shim-parity 29x4)**. Run from a clean `2d79644f`
+  worktree with the revised core as `HESTIA_CONTRACT_OVERLAY`.
+- No own-seat replay this round. This change only removes URL exemptions, and the f46bc32b replay found no URL
+  client among its 99 changed verdicts. Reasoned, not re-measured.
+- Built as before: the f46bc32b hunks applied in memory to `2d79644f` text, the new function and rows added to
+  /tmp copies, and the result emitted with `hooks_gt.emit_patch`. All 9 files reproduce in memory. No `git apply`.
 
 ## Revision (f46bc32b) against Codex's HOLD on 0a2af175
 
