@@ -24,11 +24,11 @@ from __future__ import annotations
 import json
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime
+from statistics import median
 
 from chain_walk import ChainWalker, payload
 
-MAX = int(sys.argv[1]) if len(sys.argv) > 1 else 120_000
 KINDS = frozenset({"scope_requested", "scope_granted", "scope_refused", "scope_once_spent"})
 
 
@@ -42,10 +42,11 @@ def epoch(ts):
 
 
 def main() -> int:
+    max_entries = int(sys.argv[1]) if len(sys.argv) > 1 else 120_000
     w = ChainWalker()
     reqs, grants, spends, refuses = {}, {}, {}, set()
     walked = 0
-    for entry in w.walk(max_entries=MAX):
+    for entry in w.walk(max_entries=max_entries):
         walked += 1
         if entry.get("eventType") not in KINDS:
             continue
@@ -76,7 +77,7 @@ def main() -> int:
 
     lat = sorted(g["at"] - reqs[r]["at"] for r, g in once.items()
                  if r in reqs and reqs[r]["at"] is not None and g["at"] is not None)
-    med = lat[len(lat) // 2] if lat else None
+    med = median(lat) if lat else None
 
     reasks = 0
     reask_rows = []
