@@ -2,20 +2,53 @@
 
 | file | sha256 |
 |---|---|
-| `570f6e8226449c6b68b659011462c1990ec7397fbd855297ba40c1cd2e0528dd.patch` | `570f6e8226449c6b68b659011462c1990ec7397fbd855297ba40c1cd2e0528dd` (base main `2d79644f`) **current** |
+| `f08a274bc3d7bef5614af5e98f6b5a36f317b6fa96d8c401f5cc628b629ecfd8.patch` | `f08a274bc3d7bef5614af5e98f6b5a36f317b6fa96d8c401f5cc628b629ecfd8` (base main `2d79644f`) **current** |
+| `570f6e8226449c6b68b659011462c1990ec7397fbd855297ba40c1cd2e0528dd.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6188083013, mesh 25972), `wget --spider --no-spider -q URL` kept the spider evidence and wrote `O/fresh.txt`, see below |
 | `68e951fcab5a4ffa827e918a44cb56743ee8464079a2951b17a9a1edad2610d7.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187802110, mesh 25968), an output option in another option's VALUE position (`wget -U -O- URL`) counted as establishing stdout, see below |
 | `f46bc32bc3a9569b09d9e783c2a24774936c752c0e0fd068fac2473686eafa97.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187550265, mesh 25966), URL exemption in download modes (`curl -O`, default `wget`, `http --download`) let a derived filename land in an exactly granted dir, see below |
 | `0a2af175e50945b0bd069eabf74947b6bd39dd22f3dcced3118f6d69506c917c.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187241802, mesh 25955), URL exemption let `mkdir -p http://newdir` create an ungranted path, see below |
 | `8a39ac046f69e2f21127b75ca4a7b7e85eb085a377ff77a16cf8fd41d829b7a3.patch` | SUPERSEDED: Codex HOLD (PR #1328 review 6186945315, mesh 25937), two jq P1 false allows, see below |
 | `19952a0521073ed8ce7fd03aaf8d4b4a7f1a962760cad9581fd2a2a2a6c25b3c.patch` | SUPERSEDED: Codex HOLD (PR #1328 review, mesh 25905), two P1 false allows, see below |
 
-9 files, +858/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
+9 files, +809/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
 from a scratch copy of the core), the shell battery and the decide contract test. The single gate, the
 mechanism, the daemon and `test_gate_core.py` are unchanged. Nothing here is applied.
 
 How it was checked without touching a tree: the builder applies every hunk **in memory** to HEAD's text and
 compares the result with the intended bytes (all 9 files match). No `git apply`, not even `--check`, was run
 against any tree.
+
+## Revision (f08a274b) against Codex's HOLD on 570f6e82: the narrowing
+
+| Codex finding | 570f6e82 | f08a274b |
+|---|---|---|
+| P1: `cd O && wget --spider --no-spider -q URL` under an exact grant on O. `--no-spider` cancels `--spider`, and real GNU Wget 1.21.4 wrote `O/fresh.txt` | `--spider` set the evidence and nothing cleared it, so the URL was exempted: allowed | **wget is no longer a URL client** (`_URL_HEADS`). Its operands are judged as on main. HTTPie / xh `--download` is never established, **with or without `-o`** |
+
+This is the narrowing Codex recommended, and the one proposed after the sixth hold. It is not a seventh special
+case. Holds 5 to 7 all came from **positive evidence**: a word that grants the exemption (`-O-`, `--spider`,
+`-o`). That kind of evidence has to describe the client's final option state, including value positions,
+negations and later overrides. Evidence against only has to be sometimes right, because a false match falls
+back to main. So this revision has **no evidence FOR** anywhere. curl and HTTPie (not downloading) write to
+stdout unless told otherwise, so only evidence against is read for them. A client whose default writes a file
+(wget, `http --download`) is never exempted. Removed: `named_output`, `spider`, the option-position tracking
+from 570f6e82, and the wget tables (`_URL_FLAGS`, `_URL_IMPLICIT_*`).
+
+What is given up: `cd O && wget -qO- URL` and `cd O && http --download -o <granted> URL` are refused again, as
+on main. They are now must-refuse rows, in Codex's `cd O &&` shape. The earlier must-allow rows for them had no
+`cd`, so they never separated the cores, because no core judges a bare relative word under the event cwd.
+
+Not established by this revision, and still Codex's open caveat: the curl and HTTPie non-download exemptions
+rest on the evidence-against model reviewed on f46bc32b and 68e951fc, not on a fresh audit. New must-allow rows
+in the `cd O &&` shape, which main refuses: curl stdout, curl `-o <granted>`, `http -b`, and
+`http -o <granted>`. These are the real stdout and granted-destination controls for what stays exempted.
+
+Evidence (f08a274b):
+- Battery: **1544 passed, 0 failed**. On the **570f6e82 core it fails 8**: Codex's row, plus the 7 withdrawn
+  wget and `--download` exemptions. On **main's core it fails 23**: the same 19 as before, plus the 4 new
+  `cd O &&` must-allow rows. Main passes every new must-refuse row.
+- Decide contract: **PASS: 23 decide() contract tests (+ shim-parity 29x4)**. Run from a clean `2d79644f` worktree.
+- Built with `build-1314/edit_core3.py` and `edit_battery3.py` on the 570f6e82 outputs, then `emit.py`. All 9
+  files reproduce in memory. No `git apply`. Real wget was not run here; Codex's run is the evidence.
 
 ## Revision (570f6e82) against Codex's HOLD on 68e951fc
 
