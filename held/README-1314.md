@@ -2,17 +2,52 @@
 
 | file | sha256 |
 |---|---|
-| `0a2af175e50945b0bd069eabf74947b6bd39dd22f3dcced3118f6d69506c917c.patch` | `0a2af175e50945b0bd069eabf74947b6bd39dd22f3dcced3118f6d69506c917c` (base main `2d79644f`) **current** |
+| `f46bc32bc3a9569b09d9e783c2a24774936c752c0e0fd068fac2473686eafa97.patch` | `f46bc32bc3a9569b09d9e783c2a24774936c752c0e0fd068fac2473686eafa97` (base main `2d79644f`) **current** |
+| `0a2af175e50945b0bd069eabf74947b6bd39dd22f3dcced3118f6d69506c917c.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187241802, mesh 25955), URL exemption let `mkdir -p http://newdir` create an ungranted path, see below |
 | `8a39ac046f69e2f21127b75ca4a7b7e85eb085a377ff77a16cf8fd41d829b7a3.patch` | SUPERSEDED: Codex HOLD (PR #1328 review 6186945315, mesh 25937), two jq P1 false allows, see below |
 | `19952a0521073ed8ce7fd03aaf8d4b4a7f1a962760cad9581fd2a2a2a6c25b3c.patch` | SUPERSEDED: Codex HOLD (PR #1328 review, mesh 25905), two P1 false allows, see below |
 
-9 files, +514/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
+9 files, +638/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
 from a scratch copy of the core), the shell battery and the decide contract test. The single gate, the
 mechanism, the daemon and `test_gate_core.py` are unchanged. Nothing here is applied.
 
 How it was checked without touching a tree: the builder applies every hunk **in memory** to HEAD's text and
 compares the result with the intended bytes (all 9 files match). No `git apply`, not even `--check`, was run
 against any tree.
+
+## Revision (f46bc32b) against Codex's HOLD on 0a2af175
+
+| Codex finding | 0a2af175 | f46bc32b |
+|---|---|---|
+| P1: `cd O && mkdir -p http://newdir` under an EXACT grant on O. `mkdir` makes the ordinary directory `O/http:/newdir` | any command's `scheme://` word was a URL, and it was dropped because `O/http:` did not exist yet. Nonexistence proves nothing when the command creates it, or an earlier `mkdir http:` does | `_network_url` is true only for an operand of a URL client (`curl wget http https xh xhs curlie`). Every other command's URL-shaped word is judged as the relative path it is, as on main |
+
+The same hole was inside the URL clients: `curl --create-dirs -o http://newdir/f URL` writes `./http:/newdir/f`.
+An operand is now exempt only when the previous word leaves it an operand: the command word, another operand, or an
+option on the client's list of value-less flags (`_URL_FLAGS`, from curl 8, wget 1.21 and httpie 3 / xh `--help`), or
+an option whose value is attached (`-qO-`, `--output=x`). After any other option word, whether value-taking
+(`-o`, `--output`, `-K`, `-x`), unknown, or a cluster ending in a value letter (`-sSo`), the next word is judged
+as a path. That fails closed for `curl -x http://proxy:8080 URL` from an ungranted directory.
+
+New must-refuse rows, all after `cd` into the exactly granted directory (Codex's shape): `mkdir -p http://newdir`,
+`mkdir http: && touch http://newfile`, `pip download https://h/x` (an unknown consumer), `curl --create-dirs -o`,
+`--output`, `-sSo`, `-K`, `-o localhost:1/f`, `wget -O`, `wget --some-future-opt`, `xh -o`. New must-allow rows:
+`curl --silent --fail -sSL URL`, `curl -H 'a: b' -X POST URL`, `curl -sS -o <granted> URL`, `wget -qO- URL`,
+`xh -b -F URL`.
+
+**Not in this patch, found while writing the rows:** with the EVENT cwd itself exactly granted, main judges no
+bare relative word, `./`-less, at all: `touch newfile/x` and `mkdir -p http://newdir` are allowed on main and on
+every #1314 core. That is the same descendant-under-an-exact-grant class as Codex's finding, but older. The new
+rows use `cd` first so they separate the cores. It needs its own issue.
+
+Evidence (f46bc32b):
+- Battery: **1511 passed, 0 failed**. On the **0a2af175 core it fails 11**, which is every new must-refuse row. On
+  **main's core it fails 19**, the same 19 as before, and main passes every new row.
+- Decide contract: **PASS: 23 decide() contract tests (+ shim-parity 29x4)**. `test_gate_core.py` (unchanged): only
+  the 2 checks that need the test inside the tree fail from a scratch copy, as before.
+- Own-seat replay (54,667 commands): **the same 99 changed verdicts as 0a2af175, none different**. None of the 99
+  involves a URL client. On this seat's corpus the URL exemption never fires, so the replay cannot measure what this
+  revision costs. The URL rows are McNugget's live case (#1314), and nothing here measures them against a corpus.
+- Built as before: hunks applied in memory to HEAD's text, all 9 files byte-identical. No `git apply`.
 
 ## Revision (0a2af175) against Codex's HOLD on 8a39ac04
 

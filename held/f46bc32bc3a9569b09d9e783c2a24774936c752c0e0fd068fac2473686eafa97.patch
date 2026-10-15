@@ -1,0 +1,978 @@
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 5389a5b294d88effff839da089a00fc7f4dc08403ea4132495e4828eba1fb306  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -1613,7 +1613,81 @@
+     ("gh", "pr", "merge"): {"--subject", "-t", "--body", "-b"},
+     ("gh", "release", "create"): {"--title", "-t", "--notes", "-n"},
+     ("gh", "release", "edit"): {"--title", "-t", "--notes", "-n"},
++    # #1314 (live 2026-10-15, scope-10c87b5a5372): `--jq` is a jq program and `--template` a Go
++    # template, never a file. Each checked against `gh <sub> --help` (gh 2.x): `-q, --jq
++    # expression|string` and `-t, --template string` on exactly these subcommands.
++    ("gh", "api"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "checks"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "issue", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "issue", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "run", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "run", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "release", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "release", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "repo", "view"): {"--jq", "-q", "--template", "-t"},
+ }
++
++
++#: #1314: jq's own argv grammar (jq 1.7.1 `src/main.c`), as an ALLOWLIST. Value-less options,
++#: alone or as a short cluster of these letters; `--indent N` takes one word, `--arg`/`--argjson
++#: NAME VALUE` take two, whatever they look like (jq does not check NAME). Any other option word
++#: (`-f`/`--from-file` anywhere, even after the program, or inside a cluster; `-L`; `--rawfile`,
++#: `--slurpfile`; `--run-tests`; `--`; an unknown one) leaves every word judged.
++_JQ_FLAGS = frozenset((
++    "--slurp", "--raw-output", "--raw-output0", "--join-output", "--compact-output",
++    "--color-output", "--monochrome-output", "--ascii-output", "--unbuffered", "--sort-keys",
++    "--raw-input", "--null-input", "--tab", "--seq", "--stream", "--stream-errors",
++    "--exit-status", "--args", "--jsonargs"))
++_JQ_SHORT = "srjcCMaSRne"
++_JQ_ARITY = {"--indent": 1, "--arg": 2, "--argjson": 2}
++
++
++def _jq_data_words(toks, at) -> set:
++    """Token indexes of `jq`'s words that are NOT files, for the jq whose command word is
++    `toks[at]`: its program (the first non-option word) and the values of `--indent`/`--arg`/
++    `--argjson`. Empty unless every option word of the simple command is on the allowlist above,
++    so the program is known to be text (Codex HOLD on 8a39ac04: jq applies `-f` to the program
++    wherever it appears, `-n O/p.jq -f`, and `--rawfile --name O/f` binds `--name` as a NAME).
++    Any word that can expand into more or other words (`$X`, `$(…)`, a glob, `{a,b}`) could be
++    `-f`, so it disqualifies the whole command."""
++    words, skip = [], False
++    for i in range(at + 1, len(toks)):
++        kind, w, uglob = toks[i]
++        if kind in ("sep", "mark"):
++            break
++        if kind == "op":
++            skip = True                                    # a redirection's target is not argv
++            continue
++        if skip:
++            skip = False
++            continue
++        try:
++            if uglob or _BRACE in w or _expansion_spans(w):
++                return set()
++        except _Unmodelled:
++            return set()
++        words.append((i, w))
++    data, program, k = set(), None, 0
++    while k < len(words):
++        i, w = words[k]
++        k += 1
++        if not (w[:1] == "-" and (w[1:2] == "-" or w[1:2].isalpha())):
++            if program is None:
++                program = i
++                data.add(i)
++            continue                                       # an input file (or a --args string)
++        if w in _JQ_FLAGS or re.fullmatch(f"-[{_JQ_SHORT}]+", w):
++            continue
++        n = _JQ_ARITY.get(w)
++        if n is None or k + n > len(words):
++            return set()
++        data.update(j for j, _w in words[k:k + n])
++        k += n
++    if program is None:
++        return set()
++    return data
+ 
+ 
+ def _string_opts(head, spec, subs=()) -> set:
+@@ -1824,6 +1898,118 @@
+             or "$" in rest or (_BRACE in rest and ".." in rest))
+ 
+ 
++#: hestia#1314 (live on McNugget, 2026-10-14): non-path text judged as a path. Every case below
++#: was a false deny of read-only work that opened peer scope requests nobody should decide.
++#:
++#: URL CLIENTS: commands whose positional arguments are URLs. For these, `host:port[/…]` is a URL
++#: too (curl and wget assume http when no scheme is given), not a relative path.
++_URL_HEADS = frozenset(("curl", "wget", "http", "https", "xh", "xhs", "curlie"))
++_HOSTPORT = re.compile(r"^(?:localhost|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
++                       r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]+\])"
++                       r":\d{1,5}(?:[/?#]|$)")
++_URL_WITH_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
++_FILE_URL = re.compile(r"^file:(?://([^/]*))?(/.*)$", re.IGNORECASE)
++
++
++def _file_url_path(value: str) -> Optional[str]:
++    """The path a `file:` URL names (`file:///x`, `file://localhost/x`, `file:/x` -> `/x`), with
++    `%XX` decoded and any `?query` / `#fragment` dropped, as curl and sqlite3 open it; else None.
++    #1314: main judged `curl file:///etc/passwd` only as the relative `file:/etc/passwd` and
++    allowed it. The URL is ALSO an ordinary relative spelling (`cat file:///x` reads the directory
++    `file:` under the cwd), so `emit` judges both, never the target alone (Codex HOLD on 19952a05)."""
++    m = _FILE_URL.match(value)
++    if not m:
++        return None
++    path = re.split(r"[?#]", m.group(2), maxsplit=1)[0]
++    return re.sub(r"%([0-9A-Fa-f]{2})", lambda h: chr(int(h.group(1), 16)), path)
++
++
++def _network_url(value: str, head: Optional[str]) -> bool:
++    """#1314: is this literal operand of a URL client a network URL rather than a path? A scheme
++    other than `file:` (`http://127.0.0.1:8760/health`) or `host:port[/…]` (`curl
++    localhost:8760/health`). ONLY a URL client's operand: any other command may treat the word as
++    the relative path it also is, and may create it (`mkdir -p http://newdir` makes `./http:/newdir`,
++    Codex HOLD on 0a2af175). A `..` component disqualifies it: if a directory named `http:`
++    existed, `http://../x` would be a real escape. (Whether such a directory exists is checked
++    where the bases are known, in `_command_scope_reach_one`.)"""
++    if head not in _URL_HEADS or ".." in value.split("/"):
++        return False
++    m = _URL_WITH_SCHEME.match(value)
++    if m:
++        return m.group(1).lower() != "file"
++    return bool(_HOSTPORT.match(value))
++
++
++#: #1314: the options of each URL client that take NO value, so the word after one is an operand.
++#: Every other option word (`-o`, `--output`, `-K`, `-T`, `-x`, an unknown one, a cluster that
++#: ends in a value-taking letter) may consume the next word as a file, so a URL-shaped word there
++#: is judged as a path: `curl --create-dirs -o http://newdir/f URL` writes `./http:/newdir/f`.
++#: An ATTACHED value (`-ofile`, `-qO-`, `--output=x`) consumes nothing more. Letters per curl 8,
++#: wget 1.21 and httpie 3 / xh `--help`.
++_CURL_FLAGS = ("0123456#:aBfgGiIjJklLMnNOpqRsSvVZ", frozenset((
++    "--silent", "--show-error", "--fail", "--fail-with-body", "--fail-early", "--location",
++    "--location-trusted", "--include", "--head", "--verbose", "--insecure", "--compressed",
++    "--globoff", "--get", "--no-buffer", "--remote-name", "--remote-name-all",
++    "--remote-header-name", "--http0.9", "--http1.0", "--http1.1", "--http2", "--http3",
++    "--ipv4", "--ipv6", "--no-progress-meter", "--progress-bar", "--create-dirs", "--raw",
++    "--path-as-is", "--parallel", "--no-keepalive", "--tcp-nodelay", "--list-only", "--append",
++    "--netrc", "--remote-time", "--junk-session-cookies", "--ssl", "--ssl-reqd", "--disable")))
++_URL_FLAGS = {
++    "curl": _CURL_FLAGS, "curlie": _CURL_FLAGS,
++    "wget": ("46bcdEFhHkKLmNpqrSvVx", frozenset((
++        "--quiet", "--verbose", "--no-verbose", "--server-response", "--spider", "--continue",
++        "--timestamping", "--recursive", "--no-parent", "--no-clobber", "--no-directories",
++        "--no-host-directories", "--no-check-certificate", "--show-progress", "--mirror",
++        "--page-requisites", "--convert-links", "--adjust-extension", "--content-disposition",
++        "-nv", "-nc", "-nd", "-nH", "-np"))),
++}
++_HTTPIE_FLAGS = ("bcdfFhIjqSvx", frozenset((
++    "--verbose", "--headers", "--body", "--download", "--continue", "--form", "--json",
++    "--follow", "--ignore-stdin", "--quiet", "--stream", "--check-status", "--offline",
++    "--compress", "--multipart", "--all")))
++for _h in ("http", "https", "xh", "xhs"):
++    _URL_FLAGS[_h] = _HTTPIE_FLAGS
++
++
++def _url_option_frees_next(head: Optional[str], word: str) -> bool:
++    """#1314: after this option word of a URL client, is the next word an operand (True) or
++    possibly the option's value (False)? See `_URL_FLAGS`; anything not listed is a value."""
++    letters, longs = _URL_FLAGS.get(head, ("", frozenset()))
++    if word == "--" or "=" in word or word in longs:
++        return True
++    if word.startswith("--"):
++        return False
++    for i, ch in enumerate(word[1:], 1):
++        if ch not in letters:
++            return i < len(word) - 1             # a value letter: attached rest, or the next word
++    return True
++
++
++def _leading_absolute_cd(cmd: str) -> Optional[str]:
++    """#1314 part 4: `cd /abs && …` sets the directory for everything after it. If the `cd` fails,
++    `&&` runs nothing more, so no later word can resolve under the event cwd. Returns the
++    directory (resolved, so a later `..` is judged physically, as the kernel resolves it) only
++    when the WHOLE command is `cd <literal absolute dir> && …` and every later separator is `&&`
++    or a pipe. Any `;`, newline, `||`, `&`, subshell, group or command substitution (a body runs
++    as a separate statement here) keeps the event cwd as a base, as before."""
++    try:
++        toks = _shell_words(_strip_data_heredocs(cmd))
++    except _Unmodelled:
++        return None
++    if len(toks) < 4 or toks[0] != ("word", "cd", False) or toks[1][0] != "word" \
++            or toks[2] != ("sep", "&&", False):
++        return None
++    d = toks[1][1]
++    if toks[1][2] or not d.startswith("/") or any(c in d for c in "$`*?[]{}\\") \
++            or any(ord(c) < 32 for c in d):
++        return None
++    for k, w, _g in toks[3:]:
++        if k == "mark" or (k == "sep" and w not in ("&&", "|", "|&")) \
++                or (k == "word" and w in ("{", "}")):
++            return None
++    return os.path.realpath(d).replace("\\", "/")
++
++
+ class _Found:
+     """What one scan found besides its literal candidates (shared by nested scans)."""
+ 
+@@ -1941,7 +2127,10 @@
+     found = found if found is not None else _Found()
+     pwd = cwd or os.getcwd()
+ 
+-    def emit(value, uglob):
++    def emit(value, uglob, uri="both"):
++        # `uri`: how a `file:` URL is judged. "both" (any argument): as the path it names AND as
++        # its literal relative spelling, since only the command knows which it opens. "literal"
++        # (a redirection target, a program word): the shell never reads a URL there.
+         if not _path_shaped(value, uglob):
+             return
+         try:
+@@ -1958,6 +2147,12 @@
+         if v.startswith("~"):
+             found.unenum.append("a ~user home the gate does not resolve")
+             return
++        fp = _file_url_path(v) if uri == "both" else None
++        if fp is not None:
++            # #1314: `curl file:///etc/passwd` reads /etc/passwd; main judged only the relative
++            # `file:/etc/passwd` and allowed it. Judge the literal spelling too (`cat file:///x`).
++            emit(value, uglob, uri="literal")
++            v = fp
+         if v.startswith("//"):
+             v = "/" + v.lstrip("/")
+         if uglob:
+@@ -1978,6 +2173,19 @@
+         out.extend(_outside_candidates(_strip_data_heredocs(
+             text.replace(_DQ_REF, "").replace(_BRACE, "").replace(_LIT_DOLLAR, "$")
+             .replace(_LIT_TICK, "`")), pwd, depth + 1, found))
++
++    def url_argument(word, head):
++        # #1314: a positional that is a network URL (`_network_url`) is recorded as kind "url",
++        # not judged as a path. `_command_scope_reach_one` turns it back into a relative path
++        # if its first component (`http:`, `localhost:8760`) exists under any base.
++        try:
++            v = _word_value(word, in_force())
++        except _Unenumerated:
++            return False                    # `emit` records why
++        if not _network_url(v, head):
++            return False
++        out.append((v, "url", False))
++        return True
+ 
+     def in_force():
+         cut = body_origin
+@@ -2078,7 +2286,8 @@
+         state.update(head=None, spec={}, pending=None, redirect=False, positional=0, subs=[],
+                      pattern_given=False, opts_done=False, dirpending=False, chdir_seen=False,
+                      env_expansion=None, code_opt=False, stdin_prog=False, herestring=False,
+-                     script_arg=False, heredoc=False, piped_in=sep in ("|", "|&"))
++                     script_arg=False, heredoc=False, piped_in=sep in ("|", "|&"),
++                     jq_data=set(), url_operand=True)
+ 
+     new_segment()
+     loop_state = None
+@@ -2148,7 +2357,7 @@
+             continue
+         if state["redirect"]:                # a redirection target: always judged
+             state["redirect"] = False
+-            emit(w, uglob)
++            emit(w, uglob, uri="literal")
+             continue
+         head, spec = state["head"], state["spec"]
+         if head is None:
+@@ -2187,8 +2396,10 @@
+                 found.unenum.append(f"an expansion handed to `{base}` in "
+                                     f"${state['env_expansion']}")
+             state["head"], state["spec"] = base, _CMD_SPECS.get(base, {})
++            if base == "jq":
++                state["jq_data"] = _jq_data_words(toks, idx)   # #1314: its program is text
+             if "/" in w or w.startswith("."):
+-                emit(w, uglob)                             # a program run by path is a reach
++                emit(w, uglob, uri="literal")             # a program run by path is a reach
+             if base in ("export", "local", "declare", "typeset", "readonly"):
+                 state["spec"] = {"assign_args": "export" if base == "export" else "local"}
+             if base == "popd":
+@@ -2228,6 +2439,7 @@
+             state["opts_done"] = True
+             continue
+         if w.startswith("-") and len(w) > 1 and not state["opts_done"]:
++            state["url_operand"] = _url_option_frees_next(head, w)
+             name, eq, val = w.partition("=")
+             if head in _DIR_OPT_HEADS:
+                 if w in ("-C", "--directory"):
+@@ -2289,6 +2501,7 @@
+             if m:
+                 emit(m.group(1), uglob)                    # `-I/usr/include`, `-C/elsewhere`
+             continue
++        url_operand, state["url_operand"] = state["url_operand"], True
+         state["positional"] += 1
+         if len(state["subs"]) < 3:
+             state["subs"].append(w)
+@@ -2329,9 +2542,14 @@
+         if mode in ("strings", "strings_noglob") and not uglob:
+             data(w, fields=False)
+             continue
++        if idx in state["jq_data"]:
++            data(w)
++            continue
+         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
+                 and not uglob:
+             data(w)
++            continue
++        if not uglob and url_operand and url_argument(w, head):
+             continue
+         name, eq, val = w.partition("=")
+         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
+@@ -2625,6 +2843,11 @@
+     # out-of-scope one with no in-scope alternative denies; a token that exists nowhere is not
+     # a reach.
+     cwd = (cwd or os.getcwd()).replace("\\", "/")
++    # #1314 part 4: after a leading `cd /abs &&` nothing later runs in the event cwd, so it is no
++    # longer a plausible base (main judged `cd <granted> && cat ./x` under an ungranted cwd).
++    pinned = _leading_absolute_cd(cmd)
++    if pinned is not None:
++        cwd = pinned
+     bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
+     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
+     probes = 0
+@@ -2690,6 +2913,18 @@
+         if lift_unenum:
+             return True, None, None
+         return False, f"{_UNMODELLED_PREFIX}{why}>", UNENUMERATED_TARGET
++    urls = [(s_, g_) for s_, k_, g_ in candidates if k_ == "url"]
++    if urls:
++        # #1314: a network URL is not a path, UNLESS its first component (`http:`,
++        # `localhost:8760`) exists under a base it could resolve from: then it is judged as the
++        # relative path it would also be. Unknown bases (a directory change the gate cannot
++        # follow, too many of them) judge every URL as a path, as before.
++        ub = None if found.dirs_unknown else _dir_bases(found.dirs, cwd)
++        look = None if ub is None else bases + ub
++        candidates = [c for c in candidates if c[1] != "url"] + [
++            (s_, "rel", g_) for s_, g_ in urls
++            if look is None or any(os.path.lexists(os.path.join(b, s_.split("/", 1)[0]))
++                                   for b in look)]
+     rels = [(s_, g_) for s_, k_, g_ in candidates if k_ == "rel"]
+     if found.dirs_unknown and rels:
+         found.unenum.append(f"a relative path after {found.dirs_unknown}")
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e",
++      "sha256": "5389a5b294d88effff839da089a00fc7f4dc08403ea4132495e4828eba1fb306",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8"
++  "gt_version": "94a953cbc94185e48627c7e81fcf4305c4f37d453bba87650a08ea289782859a"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "94a953cbc94185e48627c7e81fcf4305c4f37d453bba87650a08ea289782859a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "5389a5b294d88effff839da089a00fc7f4dc08403ea4132495e4828eba1fb306"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "f59762b4e42ac450427412ef251889b8f5edca7ef587fe6ff95f3a8973684431"
++  "gt_version": "48524d9269d1d80aa0306c0da27115cf03c5b839cad5eda222a48d9e5e66b9cf"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "94a953cbc94185e48627c7e81fcf4305c4f37d453bba87650a08ea289782859a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "5389a5b294d88effff839da089a00fc7f4dc08403ea4132495e4828eba1fb306"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "d4571479d33aad6d4b67a745b9c23b1d815cadbcb8963e412eb6af53b10dbcec"
++  "gt_version": "358d52ae572b2e78cd4b585833dd17dd22e92f385712863d97620616ff1c4396"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "94a953cbc94185e48627c7e81fcf4305c4f37d453bba87650a08ea289782859a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "5389a5b294d88effff839da089a00fc7f4dc08403ea4132495e4828eba1fb306"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "00068fc9ec4a345487b9b1567deb156cfc21dcc6890692e20fd2eb4345ecd29f"
++  "gt_version": "10f98db4ff76d2b017e8e60b14a31c6417e090803d441ee5ffc819f0b1bad887"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "94a953cbc94185e48627c7e81fcf4305c4f37d453bba87650a08ea289782859a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "5389a5b294d88effff839da089a00fc7f4dc08403ea4132495e4828eba1fb306"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "6fa3feda4cf14ab1c5348a7c57a625a63e35924d27cfdf7a3780687ab1174016"
++  "gt_version": "e107a84f5396df283da78fb7d38ade4742d30126a0769a6b8b508ad8edcb8631"
+ }
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1612,7 +1612,81 @@
+     ("gh", "pr", "merge"): {"--subject", "-t", "--body", "-b"},
+     ("gh", "release", "create"): {"--title", "-t", "--notes", "-n"},
+     ("gh", "release", "edit"): {"--title", "-t", "--notes", "-n"},
++    # #1314 (live 2026-10-15, scope-10c87b5a5372): `--jq` is a jq program and `--template` a Go
++    # template, never a file. Each checked against `gh <sub> --help` (gh 2.x): `-q, --jq
++    # expression|string` and `-t, --template string` on exactly these subcommands.
++    ("gh", "api"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "pr", "checks"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "issue", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "issue", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "run", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "run", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "release", "list"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "release", "view"): {"--jq", "-q", "--template", "-t"},
++    ("gh", "repo", "view"): {"--jq", "-q", "--template", "-t"},
+ }
++
++
++#: #1314: jq's own argv grammar (jq 1.7.1 `src/main.c`), as an ALLOWLIST. Value-less options,
++#: alone or as a short cluster of these letters; `--indent N` takes one word, `--arg`/`--argjson
++#: NAME VALUE` take two, whatever they look like (jq does not check NAME). Any other option word
++#: (`-f`/`--from-file` anywhere, even after the program, or inside a cluster; `-L`; `--rawfile`,
++#: `--slurpfile`; `--run-tests`; `--`; an unknown one) leaves every word judged.
++_JQ_FLAGS = frozenset((
++    "--slurp", "--raw-output", "--raw-output0", "--join-output", "--compact-output",
++    "--color-output", "--monochrome-output", "--ascii-output", "--unbuffered", "--sort-keys",
++    "--raw-input", "--null-input", "--tab", "--seq", "--stream", "--stream-errors",
++    "--exit-status", "--args", "--jsonargs"))
++_JQ_SHORT = "srjcCMaSRne"
++_JQ_ARITY = {"--indent": 1, "--arg": 2, "--argjson": 2}
++
++
++def _jq_data_words(toks, at) -> set:
++    """Token indexes of `jq`'s words that are NOT files, for the jq whose command word is
++    `toks[at]`: its program (the first non-option word) and the values of `--indent`/`--arg`/
++    `--argjson`. Empty unless every option word of the simple command is on the allowlist above,
++    so the program is known to be text (Codex HOLD on 8a39ac04: jq applies `-f` to the program
++    wherever it appears, `-n O/p.jq -f`, and `--rawfile --name O/f` binds `--name` as a NAME).
++    Any word that can expand into more or other words (`$X`, `$(…)`, a glob, `{a,b}`) could be
++    `-f`, so it disqualifies the whole command."""
++    words, skip = [], False
++    for i in range(at + 1, len(toks)):
++        kind, w, uglob = toks[i]
++        if kind in ("sep", "mark"):
++            break
++        if kind == "op":
++            skip = True                                    # a redirection's target is not argv
++            continue
++        if skip:
++            skip = False
++            continue
++        try:
++            if uglob or _BRACE in w or _expansion_spans(w):
++                return set()
++        except _Unmodelled:
++            return set()
++        words.append((i, w))
++    data, program, k = set(), None, 0
++    while k < len(words):
++        i, w = words[k]
++        k += 1
++        if not (w[:1] == "-" and (w[1:2] == "-" or w[1:2].isalpha())):
++            if program is None:
++                program = i
++                data.add(i)
++            continue                                       # an input file (or a --args string)
++        if w in _JQ_FLAGS or re.fullmatch(f"-[{_JQ_SHORT}]+", w):
++            continue
++        n = _JQ_ARITY.get(w)
++        if n is None or k + n > len(words):
++            return set()
++        data.update(j for j, _w in words[k:k + n])
++        k += n
++    if program is None:
++        return set()
++    return data
+ 
+ 
+ def _string_opts(head, spec, subs=()) -> set:
+@@ -1823,6 +1897,118 @@
+             or "$" in rest or (_BRACE in rest and ".." in rest))
+ 
+ 
++#: hestia#1314 (live on McNugget, 2026-10-14): non-path text judged as a path. Every case below
++#: was a false deny of read-only work that opened peer scope requests nobody should decide.
++#:
++#: URL CLIENTS: commands whose positional arguments are URLs. For these, `host:port[/…]` is a URL
++#: too (curl and wget assume http when no scheme is given), not a relative path.
++_URL_HEADS = frozenset(("curl", "wget", "http", "https", "xh", "xhs", "curlie"))
++_HOSTPORT = re.compile(r"^(?:localhost|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
++                       r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]+\])"
++                       r":\d{1,5}(?:[/?#]|$)")
++_URL_WITH_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
++_FILE_URL = re.compile(r"^file:(?://([^/]*))?(/.*)$", re.IGNORECASE)
++
++
++def _file_url_path(value: str) -> Optional[str]:
++    """The path a `file:` URL names (`file:///x`, `file://localhost/x`, `file:/x` -> `/x`), with
++    `%XX` decoded and any `?query` / `#fragment` dropped, as curl and sqlite3 open it; else None.
++    #1314: main judged `curl file:///etc/passwd` only as the relative `file:/etc/passwd` and
++    allowed it. The URL is ALSO an ordinary relative spelling (`cat file:///x` reads the directory
++    `file:` under the cwd), so `emit` judges both, never the target alone (Codex HOLD on 19952a05)."""
++    m = _FILE_URL.match(value)
++    if not m:
++        return None
++    path = re.split(r"[?#]", m.group(2), maxsplit=1)[0]
++    return re.sub(r"%([0-9A-Fa-f]{2})", lambda h: chr(int(h.group(1), 16)), path)
++
++
++def _network_url(value: str, head: Optional[str]) -> bool:
++    """#1314: is this literal operand of a URL client a network URL rather than a path? A scheme
++    other than `file:` (`http://127.0.0.1:8760/health`) or `host:port[/…]` (`curl
++    localhost:8760/health`). ONLY a URL client's operand: any other command may treat the word as
++    the relative path it also is, and may create it (`mkdir -p http://newdir` makes `./http:/newdir`,
++    Codex HOLD on 0a2af175). A `..` component disqualifies it: if a directory named `http:`
++    existed, `http://../x` would be a real escape. (Whether such a directory exists is checked
++    where the bases are known, in `_command_scope_reach_one`.)"""
++    if head not in _URL_HEADS or ".." in value.split("/"):
++        return False
++    m = _URL_WITH_SCHEME.match(value)
++    if m:
++        return m.group(1).lower() != "file"
++    return bool(_HOSTPORT.match(value))
++
++
++#: #1314: the options of each URL client that take NO value, so the word after one is an operand.
++#: Every other option word (`-o`, `--output`, `-K`, `-T`, `-x`, an unknown one, a cluster that
++#: ends in a value-taking letter) may consume the next word as a file, so a URL-shaped word there
++#: is judged as a path: `curl --create-dirs -o http://newdir/f URL` writes `./http:/newdir/f`.
++#: An ATTACHED value (`-ofile`, `-qO-`, `--output=x`) consumes nothing more. Letters per curl 8,
++#: wget 1.21 and httpie 3 / xh `--help`.
++_CURL_FLAGS = ("0123456#:aBfgGiIjJklLMnNOpqRsSvVZ", frozenset((
++    "--silent", "--show-error", "--fail", "--fail-with-body", "--fail-early", "--location",
++    "--location-trusted", "--include", "--head", "--verbose", "--insecure", "--compressed",
++    "--globoff", "--get", "--no-buffer", "--remote-name", "--remote-name-all",
++    "--remote-header-name", "--http0.9", "--http1.0", "--http1.1", "--http2", "--http3",
++    "--ipv4", "--ipv6", "--no-progress-meter", "--progress-bar", "--create-dirs", "--raw",
++    "--path-as-is", "--parallel", "--no-keepalive", "--tcp-nodelay", "--list-only", "--append",
++    "--netrc", "--remote-time", "--junk-session-cookies", "--ssl", "--ssl-reqd", "--disable")))
++_URL_FLAGS = {
++    "curl": _CURL_FLAGS, "curlie": _CURL_FLAGS,
++    "wget": ("46bcdEFhHkKLmNpqrSvVx", frozenset((
++        "--quiet", "--verbose", "--no-verbose", "--server-response", "--spider", "--continue",
++        "--timestamping", "--recursive", "--no-parent", "--no-clobber", "--no-directories",
++        "--no-host-directories", "--no-check-certificate", "--show-progress", "--mirror",
++        "--page-requisites", "--convert-links", "--adjust-extension", "--content-disposition",
++        "-nv", "-nc", "-nd", "-nH", "-np"))),
++}
++_HTTPIE_FLAGS = ("bcdfFhIjqSvx", frozenset((
++    "--verbose", "--headers", "--body", "--download", "--continue", "--form", "--json",
++    "--follow", "--ignore-stdin", "--quiet", "--stream", "--check-status", "--offline",
++    "--compress", "--multipart", "--all")))
++for _h in ("http", "https", "xh", "xhs"):
++    _URL_FLAGS[_h] = _HTTPIE_FLAGS
++
++
++def _url_option_frees_next(head: Optional[str], word: str) -> bool:
++    """#1314: after this option word of a URL client, is the next word an operand (True) or
++    possibly the option's value (False)? See `_URL_FLAGS`; anything not listed is a value."""
++    letters, longs = _URL_FLAGS.get(head, ("", frozenset()))
++    if word == "--" or "=" in word or word in longs:
++        return True
++    if word.startswith("--"):
++        return False
++    for i, ch in enumerate(word[1:], 1):
++        if ch not in letters:
++            return i < len(word) - 1             # a value letter: attached rest, or the next word
++    return True
++
++
++def _leading_absolute_cd(cmd: str) -> Optional[str]:
++    """#1314 part 4: `cd /abs && …` sets the directory for everything after it. If the `cd` fails,
++    `&&` runs nothing more, so no later word can resolve under the event cwd. Returns the
++    directory (resolved, so a later `..` is judged physically, as the kernel resolves it) only
++    when the WHOLE command is `cd <literal absolute dir> && …` and every later separator is `&&`
++    or a pipe. Any `;`, newline, `||`, `&`, subshell, group or command substitution (a body runs
++    as a separate statement here) keeps the event cwd as a base, as before."""
++    try:
++        toks = _shell_words(_strip_data_heredocs(cmd))
++    except _Unmodelled:
++        return None
++    if len(toks) < 4 or toks[0] != ("word", "cd", False) or toks[1][0] != "word" \
++            or toks[2] != ("sep", "&&", False):
++        return None
++    d = toks[1][1]
++    if toks[1][2] or not d.startswith("/") or any(c in d for c in "$`*?[]{}\\") \
++            or any(ord(c) < 32 for c in d):
++        return None
++    for k, w, _g in toks[3:]:
++        if k == "mark" or (k == "sep" and w not in ("&&", "|", "|&")) \
++                or (k == "word" and w in ("{", "}")):
++            return None
++    return os.path.realpath(d).replace("\\", "/")
++
++
+ class _Found:
+     """What one scan found besides its literal candidates (shared by nested scans)."""
+ 
+@@ -1940,7 +2126,10 @@
+     found = found if found is not None else _Found()
+     pwd = cwd or os.getcwd()
+ 
+-    def emit(value, uglob):
++    def emit(value, uglob, uri="both"):
++        # `uri`: how a `file:` URL is judged. "both" (any argument): as the path it names AND as
++        # its literal relative spelling, since only the command knows which it opens. "literal"
++        # (a redirection target, a program word): the shell never reads a URL there.
+         if not _path_shaped(value, uglob):
+             return
+         try:
+@@ -1957,6 +2146,12 @@
+         if v.startswith("~"):
+             found.unenum.append("a ~user home the gate does not resolve")
+             return
++        fp = _file_url_path(v) if uri == "both" else None
++        if fp is not None:
++            # #1314: `curl file:///etc/passwd` reads /etc/passwd; main judged only the relative
++            # `file:/etc/passwd` and allowed it. Judge the literal spelling too (`cat file:///x`).
++            emit(value, uglob, uri="literal")
++            v = fp
+         if v.startswith("//"):
+             v = "/" + v.lstrip("/")
+         if uglob:
+@@ -1977,6 +2172,19 @@
+         out.extend(_outside_candidates(_strip_data_heredocs(
+             text.replace(_DQ_REF, "").replace(_BRACE, "").replace(_LIT_DOLLAR, "$")
+             .replace(_LIT_TICK, "`")), pwd, depth + 1, found))
++
++    def url_argument(word, head):
++        # #1314: a positional that is a network URL (`_network_url`) is recorded as kind "url",
++        # not judged as a path. `_command_scope_reach_one` turns it back into a relative path
++        # if its first component (`http:`, `localhost:8760`) exists under any base.
++        try:
++            v = _word_value(word, in_force())
++        except _Unenumerated:
++            return False                    # `emit` records why
++        if not _network_url(v, head):
++            return False
++        out.append((v, "url", False))
++        return True
+ 
+     def in_force():
+         cut = body_origin
+@@ -2077,7 +2285,8 @@
+         state.update(head=None, spec={}, pending=None, redirect=False, positional=0, subs=[],
+                      pattern_given=False, opts_done=False, dirpending=False, chdir_seen=False,
+                      env_expansion=None, code_opt=False, stdin_prog=False, herestring=False,
+-                     script_arg=False, heredoc=False, piped_in=sep in ("|", "|&"))
++                     script_arg=False, heredoc=False, piped_in=sep in ("|", "|&"),
++                     jq_data=set(), url_operand=True)
+ 
+     new_segment()
+     loop_state = None
+@@ -2147,7 +2356,7 @@
+             continue
+         if state["redirect"]:                # a redirection target: always judged
+             state["redirect"] = False
+-            emit(w, uglob)
++            emit(w, uglob, uri="literal")
+             continue
+         head, spec = state["head"], state["spec"]
+         if head is None:
+@@ -2186,8 +2395,10 @@
+                 found.unenum.append(f"an expansion handed to `{base}` in "
+                                     f"${state['env_expansion']}")
+             state["head"], state["spec"] = base, _CMD_SPECS.get(base, {})
++            if base == "jq":
++                state["jq_data"] = _jq_data_words(toks, idx)   # #1314: its program is text
+             if "/" in w or w.startswith("."):
+-                emit(w, uglob)                             # a program run by path is a reach
++                emit(w, uglob, uri="literal")             # a program run by path is a reach
+             if base in ("export", "local", "declare", "typeset", "readonly"):
+                 state["spec"] = {"assign_args": "export" if base == "export" else "local"}
+             if base == "popd":
+@@ -2227,6 +2438,7 @@
+             state["opts_done"] = True
+             continue
+         if w.startswith("-") and len(w) > 1 and not state["opts_done"]:
++            state["url_operand"] = _url_option_frees_next(head, w)
+             name, eq, val = w.partition("=")
+             if head in _DIR_OPT_HEADS:
+                 if w in ("-C", "--directory"):
+@@ -2288,6 +2500,7 @@
+             if m:
+                 emit(m.group(1), uglob)                    # `-I/usr/include`, `-C/elsewhere`
+             continue
++        url_operand, state["url_operand"] = state["url_operand"], True
+         state["positional"] += 1
+         if len(state["subs"]) < 3:
+             state["subs"].append(w)
+@@ -2328,9 +2541,14 @@
+         if mode in ("strings", "strings_noglob") and not uglob:
+             data(w, fields=False)
+             continue
++        if idx in state["jq_data"]:
++            data(w)
++            continue
+         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
+                 and not uglob:
+             data(w)
++            continue
++        if not uglob and url_operand and url_argument(w, head):
+             continue
+         name, eq, val = w.partition("=")
+         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
+@@ -2624,6 +2842,11 @@
+     # out-of-scope one with no in-scope alternative denies; a token that exists nowhere is not
+     # a reach.
+     cwd = (cwd or os.getcwd()).replace("\\", "/")
++    # #1314 part 4: after a leading `cd /abs &&` nothing later runs in the event cwd, so it is no
++    # longer a plausible base (main judged `cd <granted> && cat ./x` under an ungranted cwd).
++    pinned = _leading_absolute_cd(cmd)
++    if pinned is not None:
++        cwd = pinned
+     bases = [cwd] + [f"{ws}/{s}" for s in repo_scopes]
+     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
+     probes = 0
+@@ -2689,6 +2912,18 @@
+         if lift_unenum:
+             return True, None, None
+         return False, f"{_UNMODELLED_PREFIX}{why}>", UNENUMERATED_TARGET
++    urls = [(s_, g_) for s_, k_, g_ in candidates if k_ == "url"]
++    if urls:
++        # #1314: a network URL is not a path, UNLESS its first component (`http:`,
++        # `localhost:8760`) exists under a base it could resolve from: then it is judged as the
++        # relative path it would also be. Unknown bases (a directory change the gate cannot
++        # follow, too many of them) judge every URL as a path, as before.
++        ub = None if found.dirs_unknown else _dir_bases(found.dirs, cwd)
++        look = None if ub is None else bases + ub
++        candidates = [c for c in candidates if c[1] != "url"] + [
++            (s_, "rel", g_) for s_, g_ in urls
++            if look is None or any(os.path.lexists(os.path.join(b, s_.split("/", 1)[0]))
++                                   for b in look)]
+     rels = [(s_, g_) for s_, k_, g_ in candidates if k_ == "rel"]
+     if found.dirs_unknown and rels:
+         found.unenum.append(f"a relative path after {found.dirs_unknown}")
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -794,6 +794,134 @@
+         ):
+             r = fx.reach(cmd, scopes=ws_tree, cwd=out_cwd)
+             check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
++        # hestia#1314 (live on McNugget, 2026-10-14/15; no variable involved): non-path text was
++        # judged as a path. From the same ungranted cwd outside the workspace, under the fleet's
++        # grant shape plus an EXACT grant on that cwd (so `cd`/`git -C` into it is allowed while
++        # `<it>/<word>` is not): a URL after a directory change, a relative path after a leading
++        # `cd /abs &&`, and a jq program. Each is a must-allow row that main refuses (and on a
++        # live seat, a peer scope request nobody should decide). A `file:` URL to a granted file
++        # is allowed: no `<cwd>/file:` directory exists, so its literal spelling reaches nothing.
++        cwd_exact = ws_tree + (f"path:{out_cwd}",)
++        for name, cmd in (
++            ("1314-url-hostport-after-cd", f"cd {out_cwd} && curl -s -m 3 localhost:8760/health"),
++            ("1314-url-scheme-after-cd", f"cd {out_cwd} && curl -s -m 3 http://127.0.0.1:8760/health"),
++            ("1314-url-after-git-C", f"git -C {out_cwd} status && curl -s https://api.github.com/x"),
++            ("1314-cd-abs-then-dot-relative", f"cd {ws}/granted && cat ./a.txt"),
++            ("1314-cd-abs-then-pipe", f"cd {ws}/granted && cat ./a.txt | wc -l"),
++            ("1314-gh-api-jq", "gh api repos/o/r/issues/432/comments --jq '.[-1].body'"),
++            ("1314-gh-pr-list-jq", "gh pr list --json number -q '.[].number'"),
++            ("1314-jq-program", "echo '[]' | jq '.[-1].body'"),
++            ("1314-jq-dot", f"jq . {ws}/granted/a.txt"),
++            ("1314-jq-run-tests-granted", f"jq --run-tests {ws}/granted/a.txt"),
++            ("1314-jq-arg-values", f"jq --arg n ./v --argjson m 1 '.x' {ws}/granted/a.txt"),
++            ("1314-jq-option-shaped-arg-name", "jq -n --arg --name ./v '$ARGS.named'"),
++            ("1314-jq-arg-name-is-dash-f", "jq -n --arg -f ./v '$ARGS.named'"),
++            ("1314-jq-indent", f"jq --indent 2 '.[-1].body' {ws}/granted/a.txt"),
++            ("1314-jq-cluster", "jq -nr '.a'"),
++            ("1314-jq-flag-after-program", f"jq '.x' {ws}/granted/a.txt -r"),
++            ("1314-file-url-granted", f"curl -s file://{ws}/granted/a.txt"),
++            # A URL operand after value-less flags, after an option's separate value, and after an
++            # option with an ATTACHED value (Codex HOLD on 0a2af175 restricted the exemption to
++            # URL clients' operands, so these are the must-allow side of that).
++            ("1314-url-after-flags", "curl --silent --fail -sSL http://h/x"),
++            ("1314-url-after-option-value", "curl -H 'a: b' -X POST http://h/x"),
++            ("1314-url-after-output-to-granted", f"curl -sS -o {ws}/granted/out.txt http://h/x"),
++            ("1314-url-wget-attached-output", "wget -qO- http://h/x"),
++            ("1314-url-xh-after-flags", "xh -b -F https://h/x"),
++        ):
++            r = fx.reach(cmd, scopes=cwd_exact, cwd=out_cwd)
++            check(f"allow-outside-cwd:{name}", r[0] is True, f"{cmd!r} -> {r}")
++        # ...and what must still be refused. A `file:` URL IS a path (main judged
++        # `file:///etc/hostname` as the relative `file:/etc/hostname` and allowed it). The pinned
++        # cwd needs `cd <abs>` FIRST and only `&&` / `|` after it: after `;` or `||` the next
++        # command may run in the event cwd. A program run by a system-directory path is still a
++        # reach (the 2026-10-05 pin in test_gate_core.py stands; Codex HOLD on 19952a05 asked for
++        # an explicit policy ruling before reversing it), and so are its arguments. `jq -f F` /
++        # `-rf F` name a program FILE, and `jq --run-tests F` a test file, so the first
++        # positional is an input file again (Codex HOLD on 19952a05, P1 a).
++        (pathlib.Path(o) / "urltrap").mkdir()
++        os.symlink(o, f"{o}/urltrap/http:")       # a directory named like a scheme: a real path
++        for name, cmd, cwd_ in (
++            ("1314-control-file-url", "curl -s file:///etc/hostname", out_cwd),
++            ("1314-control-file-url-localhost", f"curl -s file://localhost{o}/secret.txt", out_cwd),
++            ("1314-control-file-url-option", f"curl -s --url file://{o}/secret.txt", out_cwd),
++            ("1314-control-dot-relative-in-ungranted-cwd", "cat ./deep.txt", out_cwd),
++            ("1314-control-cd-semicolon", f"cd {ws}/granted; cat ./deep.txt", out_cwd),
++            ("1314-control-cd-or", f"cd {ws}/granted || cat ./deep.txt", out_cwd),
++            ("1314-control-cd-background", f"cd {ws}/granted && true & cat ./deep.txt", out_cwd),
++            ("1314-control-cd-relative-first", f"cd granted && cat ./deep.txt", out_cwd),
++            ("1314-control-cd-abs-then-escape", f"cd {ws}/granted && cat ../../outside/secret.txt", out_cwd),
++            ("1314-control-system-program-pin", f"tail -n 3 {ws}/granted/a.txt | /usr/bin/python3 -c 'print(1)'", out_cwd),
++            ("1314-control-system-program-argument", f"/usr/bin/cat {o}/secret.txt", out_cwd),
++            ("1314-control-system-dir-dotdot", f"/usr/bin/../..{o}/bin/python -c pass", out_cwd),
++            ("1314-control-outside-program", f"{o}/bin/python -c pass", out_cwd),
++            ("1314-control-url-with-dotdot", f"cd {out_cwd} && curl -s http://../secret.txt", out_cwd),
++            ("1314-control-scheme-named-dir", "cat http://secret.txt", f"{o}/urltrap"),
++            ("1314-control-jq-program-file", f"jq -f {o}/secret.txt {ws}/granted/a.txt", out_cwd),
++            ("1314-control-jq-clustered-program-file", f"jq -rf ./deep.txt {ws}/granted/a.txt", out_cwd),
++            ("1314-control-jq-from-file-eq", f"jq --from-file=./deep.txt {ws}/granted/a.txt", out_cwd),
++            ("1314-control-jq-library-dir", f"jq -L {o} '.x' {ws}/granted/a.txt", out_cwd),
++            ("1314-control-jq-input-file", f"jq . {o}/secret.txt", out_cwd),
++            ("1314-control-gh-input-file", f"gh api x --jq . --input {o}/secret.txt", out_cwd),
++            ("1314-control-jq-run-tests", f"jq --run-tests {o}/secret.txt", out_cwd),
++            ("1314-control-jq-run-tests-relative", "jq --run-tests ./deep.txt", out_cwd),
++            ("1314-control-jq-run-tests-after-options", f"jq -r --arg n v --run-tests {o}/secret.txt", out_cwd),
++            ("1314-control-jq-options-after-run-tests", f"jq --run-tests -r {o}/secret.txt", out_cwd),
++            # Codex HOLD on 8a39ac04: jq applies `-f` to its program WHEREVER `-f` stands, and
++            # `--rawfile`/`--slurpfile` take NAME and FILE whatever NAME looks like.
++            ("1314-control-jq-from-file-after-program", f"jq -n {o}/secret.txt -f", out_cwd),
++            ("1314-control-jq-from-file-long-after-program", f"jq -n {o}/secret.txt --from-file", out_cwd),
++            ("1314-control-jq-from-file-cluster-after-program", f"jq -n {o}/secret.txt -rf", out_cwd),
++            ("1314-control-jq-from-file-after-relative", "jq -n ./deep.txt -f", out_cwd),
++            ("1314-control-jq-from-file-before-program", f"jq -f -n {o}/secret.txt", out_cwd),
++            ("1314-control-jq-rawfile-option-shaped-name", f"jq -n --rawfile --name {o}/secret.txt '$ARGS.named'", out_cwd),
++            ("1314-control-jq-slurpfile-option-shaped-name", f"jq -n --slurpfile --name {o}/secret.txt '$ARGS.named'", out_cwd),
++            ("1314-control-jq-rawfile", f"jq -n --rawfile n {o}/secret.txt '$n'", out_cwd),
++            ("1314-control-jq-slurpfile", f"jq -n --slurpfile n {o}/secret.txt '$n'", out_cwd),
++            ("1314-control-jq-expansion-may-be-f", f"jq -n {o}/secret.txt \"$F\"", out_cwd),
++            ("1314-control-jq-brace-may-be-f", f"jq -n {o}/secret.txt -{{n,f}}", out_cwd),
++            ("1314-control-jq-double-dash", f"jq -n -- {o}/secret.txt", out_cwd),
++            ("1314-control-jq-unknown-option", f"jq --debug-dump-disasm {o}/secret.txt", out_cwd),
++            ("1314-control-file-url-query", f"curl -s 'file://{o}/secret.txt?x=1'", out_cwd),
++            ("1314-control-file-url-percent", f"curl -s file://{o}/secre%74.txt", out_cwd),
++            # Codex HOLD on 0a2af175: a URL-looking word is a relative path to any command that is
++            # not a URL client, and such a command can CREATE it (`mkdir -p http://newdir` makes
++            # `./http:/newdir`), so "its first component does not exist" proves nothing. A URL
++            # client's option may also take the word as a file (`-o`, `-K`, an unknown option).
++            # Each runs after `cd` into the EXACTLY granted directory, Codex's shape: a bare relative
++            # word under the EVENT cwd is not judged on main either (`touch newfile/x`), so these
++            # rows would not separate the cores there.
++            ("1314-control-mkdir-scheme-word-after-cd", f"cd {out_cwd} && mkdir -p http://newdir", f"{ws}/granted"),
++            ("1314-control-scheme-dir-made-first", f"cd {out_cwd} && mkdir http: && touch http://newfile", f"{ws}/granted"),
++            ("1314-control-unknown-consumer-scheme-word", f"cd {out_cwd} && pip download https://h/x", f"{ws}/granted"),
++            ("1314-control-curl-output-scheme-word", f"cd {out_cwd} && curl --create-dirs -o http://newdir/f http://h/x", f"{ws}/granted"),
++            ("1314-control-curl-output-long", f"cd {out_cwd} && curl --output http://newdir/f http://h/x", f"{ws}/granted"),
++            ("1314-control-curl-cluster-ends-in-output", f"cd {out_cwd} && curl -sSo http://newdir/f http://h/x", f"{ws}/granted"),
++            ("1314-control-curl-config-scheme-word", f"cd {out_cwd} && curl -K http://cfg http://h/x", f"{ws}/granted"),
++            ("1314-control-curl-hostport-as-output", f"cd {out_cwd} && curl -o localhost:1/f http://h/x", f"{ws}/granted"),
++            ("1314-control-wget-output-scheme-word", f"cd {out_cwd} && wget -O http://newdir/f http://h/x", f"{ws}/granted"),
++            ("1314-control-wget-unknown-option", f"cd {out_cwd} && wget --some-future-opt http://newdir/f", f"{ws}/granted"),
++            ("1314-control-xh-output-scheme-word", f"cd {out_cwd} && xh -o http://newdir/f http://h/x", f"{ws}/granted"),
++        ):
++            r = fx.reach(cmd, scopes=cwd_exact, cwd=cwd_)
++            check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
++        # Codex HOLD on 19952a05 (P1 b): `cat` and the shell do not read a `file:` URL. A word
++        # `file://<granted>/a.txt` is ALSO the relative path `<cwd>/file:/<granted>/a.txt`, and
++        # judging only the URL's target allowed a read of that ungranted file. Both are judged.
++        lit = pathlib.Path(out_cwd + "/file:" + ws + "/granted")
++        lit.mkdir(parents=True)
++        (lit / "a.txt").write_text("outside marker\n")
++        for name, cmd in (
++            ("1314-control-file-url-literal-cat", f"cat file://{ws}/granted/a.txt"),
++            ("1314-control-file-url-literal-redirect-in", f"wc -l < file://{ws}/granted/a.txt"),
++            ("1314-control-file-url-literal-redirect-out", f"echo x > file://{ws}/granted/a.txt"),
++        ):
++            r = fx.reach(cmd, scopes=cwd_exact, cwd=out_cwd)
++            check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
++        # An expansion inside a URL is still unenumerated (no URL model of `$X`).
++        r = fx.reach("curl -s http://h/$X", scopes=cwd_exact, cwd=out_cwd)
++        check("request-outside-cwd:1314-url-with-expansion",
++              r[0] is False and r[2] == getattr(G, "UNENUMERATED_TARGET", "hestia:unpriceable:unenumerated"), r)
+         # Codex HOLD 23938 (P1 a): a `done` that ends a FILENAME after an already-closed loop is
+         # not the loop's end. Stripping it judged `<o>/granted-` (granted) for `<o>/granted-done`.
+         gd = pathlib.Path(o) / "granted-done"
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -1097,6 +1097,22 @@
+         stub.close()
+ 
+ 
++def test_a_file_url_is_judged_as_the_path_it_names_on_every_seat(m, g, wc, home):
++    """hestia#1314: `curl file:///etc/hostname` reads /etc/hostname. Main judged it only as the
++    relative `file:/etc/hostname` under the cwd and allowed it. Refused, and the scope request
++    names the path the URL opens."""
++    for seat in SEATS:
++        stub = Stub(Policy())
++        try:
++            with _Env(m, stub.url, home):
++                d, _ = _decide(g, seat, "Bash", {"command": "curl -s file:///etc/hostname"}, home)
++                claims = [a.get("path") for a, _ in stub.named("hestia_scope_claim")]
++                check(f"1314-{seat}-file-url-is-a-path", d.decision == "deny" and d.rule == "mrh.command"
++                      and claims == ["/etc/hostname"], (d, claims))
++        finally:
++            stub.close()
++
++
+ def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
+     """#1287 part 1 (2026-10-13): a seat put prose with `*` and quotes in R and passed "$R" as
+     `--reason`; the literal rule made the act a once-only scope request although nothing in it is a
+@@ -1559,6 +1575,7 @@
+     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
+     test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
+     test_prose_in_a_message_position_is_data_on_every_seat,
++    test_a_file_url_is_judged_as_the_path_it_names_on_every_seat,
+     test_degraded_posture,
+     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
+     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
