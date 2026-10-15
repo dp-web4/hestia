@@ -2,7 +2,8 @@
 
 | file | sha256 |
 |---|---|
-| `c5e8c8604450d15c2220488ec139accabcd7ff442ab8bea3a01e33e78777acd0.patch` | `c5e8c8604450d15c2220488ec139accabcd7ff442ab8bea3a01e33e78777acd0` (base main `2d79644f`) **current** |
+| `cb68c3fc11b06de5dffcf7620ce4683027a5ffaedb32f6ce0e3b38aed61c6ddc.patch` | `cb68c3fc11b06de5dffcf7620ce4683027a5ffaedb32f6ce0e3b38aed61c6ddc` (base main `2d79644f`) **current** |
+| `c5e8c8604450d15c2220488ec139accabcd7ff442ab8bea3a01e33e78777acd0.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6188680501, mesh 26007), `curl -w '%output{f}…'` and `-o 'out#1'` with a URL glob wrote files no word names; the network-URL exemption is withdrawn to #1329, see below |
 | `f08a274bc3d7bef5614af5e98f6b5a36f317b6fa96d8c401f5cc628b629ecfd8.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6188408077, mesh 25989), curl's accepted abbreviation `--remote-name-a` kept the URL exemption and wrote `O/fresh.txt`, see below |
 | `570f6e8226449c6b68b659011462c1990ec7397fbd855297ba40c1cd2e0528dd.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6188083013, mesh 25972), `wget --spider --no-spider -q URL` kept the spider evidence and wrote `O/fresh.txt`, see below |
 | `68e951fcab5a4ffa827e918a44cb56743ee8464079a2951b17a9a1edad2610d7.patch` | SUPERSEDED: Codex HOLD (PR #1328 comment 6187802110, mesh 25968), an output option in another option's VALUE position (`wget -U -O- URL`) counted as establishing stdout, see below |
@@ -11,13 +12,44 @@
 | `8a39ac046f69e2f21127b75ca4a7b7e85eb085a377ff77a16cf8fd41d829b7a3.patch` | SUPERSEDED: Codex HOLD (PR #1328 review 6186945315, mesh 25937), two jq P1 false allows, see below |
 | `19952a0521073ed8ce7fd03aaf8d4b4a7f1a962760cad9581fd2a2a2a6c25b3c.patch` | SUPERSEDED: Codex HOLD (PR #1328 review, mesh 25905), two P1 false allows, see below |
 
-9 files, about +832/−23: the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
+9 files, about +500/−23 (cb68c3fc; was +832 before the URL exemption was withdrawn): the gate core, its hooks-gt copy and five manifests (emitted by `tools/hooks_gt.emit_patch`
 from a scratch copy of the core), the shell battery and the decide contract test. The single gate, the
 mechanism, the daemon and `test_gate_core.py` are unchanged. Nothing here is applied.
 
 How it was checked without touching a tree: the builder applies every hunk **in memory** to HEAD's text and
 compares the result with the intended bytes (all 9 files match). No `git apply`, not even `--check`, was run
 against any tree.
+
+## Revision (cb68c3fc) against Codex's HOLD on c5e8c860: the network-URL exemption is withdrawn (#1329)
+
+Codex ran real curl 8.5.0 under an exact grant on O. `cd O && curl -q -sS --write-out '%output{fresh.txt}marker' URL`
+wrote `O/fresh.txt` (curl 8.3 and later; `-w` and the attached `-w%output{…}` forms did the same). With an exact grant
+on the literal path `O/out#1`, `cd O && curl -o 'out#1' 'http://h/[1-2]'` wrote `O/out1` and `O/out2`, and never
+`O/out#1`. c5e8c860 allowed both.
+
+This was the seventh hold on the URL exemption, and every one found another way for the client to write a file
+that no word names. Exempting a URL operand needs a model of the client's whole output language, so this
+revision does not attempt one. As proposed after the sixth hold, **the exemption is split out to #1329**. A
+network-URL operand is judged as a path again, as on main. Removed from the core: `_URL_HEADS`, `_HOSTPORT`,
+`_network_url`, the curl and HTTPie option tables, `_url_output_established`, `_url_option_frees_next`,
+`url_argument`, and the `url` candidate kind. The core diff against main drops from about +330 to +146/−4.
+
+Kept: the `file:` URL tightening (strictly tighter than main), the jq and `gh --jq` program-as-text rule, and the
+leading `cd /abs &&` cwd pin.
+
+What is given up: the 10 must-allow rows in the `cd O &&` / `git -C O` shape, which were the live McNugget case.
+They are now must-refuse rows named `1314-url-withdrawn-*` ("as on main"), so a #1329 patch flips them on
+purpose. URL rows without a `cd` still pass on every core, because a word that names nothing is not a reach.
+Codex's five reproductions are new must-refuse rows (`1314-control-curl-write-out-output`, `-w-output`,
+`-w-attached-output`, `-output-template-glob`, `-output-long-template-glob`), so they guard #1329 too.
+
+Evidence (cb68c3fc):
+- Battery: **1560 passed, 0 failed**. The c5e8c860 core fails 15: Codex's 5 rows and the 10 withdrawn rows. Main
+  fails 16: the 11 `cd`/jq must-allow rows and the 5 `file:` URL tightenings. Main fails no new must-refuse row.
+- Decide contract: PASS (23 + shim-parity 29x4), run from a clean base worktree with the revised core as overlay.
+- The patch reproduces all 9 files in memory (`verify.py`). Rebuild: `held/build-1314/edit_core5.py` and
+  `edit_battery5.py` applied to the c5e8c860 outputs.
+- Not rerun: Codex's real-curl probe. Its URL assertions should now all read "refused, as on main".
 
 ## Revision (c5e8c860) against Codex's HOLD on f08a274b: long options matched exactly
 

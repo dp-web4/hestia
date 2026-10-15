@@ -22,3 +22,8 @@ f08a274b round: the 570f6e82 outputs were copied to `core_held.py` / `battery_he
 c5e8c860 round: the f08a274b outputs were kept as `core_f08.py` / `battery_f08.py` and also copied to `core_held.py`.
 `edit_core4.py` was applied to a fresh copy of `core_f08.py`, and `edit_battery4.py` to a fresh copy of
 `battery_f08.py`. Steps 3 to 6 were rerun.
+
+cb68c3fc round: the c5e8c860 outputs were kept as `core_c5e.py` / `battery_c5e.py`. `edit_core5.py` was applied
+to a copy of `core_c5e.py`, and `edit_battery5.py` to a copy of `battery_c5e.py`. Steps 3 to 6 were rerun; step 3
+used `core_c5e.py` as the held core. Before step 5, the previous `*.patch` was moved out of `/tmp/s1314e`,
+because `verify.py` takes the first 64-hex patch it finds there.
