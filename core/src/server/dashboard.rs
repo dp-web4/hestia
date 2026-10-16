@@ -331,6 +331,18 @@ pub struct GateEngineHealth {
     pub note: String,
 }
 
+/// One deploy-supervisor run as its own log line reports it, e.g.
+/// `2026-10-16T20:24:18Z CURRENT v0.3.0-rc.3-3-g7da0cc70 manifest-repair hooks=ok`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeployCycle {
+    /// The line's own UTC timestamp, as written (RFC 3339).
+    pub at: String,
+    /// CURRENT, DEPLOYED, HALF-DEPLOYED, FAIL, SKIP, STALE, PREFLIGHT or BUILD-ONLY.
+    pub result: String,
+    /// The rest of the line, bounded.
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeploymentHealth {
     /// `current`, `stale`, or `unknown`.
@@ -357,6 +369,12 @@ pub struct DeploymentHealth {
     /// spawning systemctl, so the dashboard poll stays process-free (#1183).
     #[serde(default)]
     pub auto_update: String,
+    /// The last terminal line the deploy supervisor wrote to `$HESTIA_HOME/deploy.log`:
+    /// when the last scheduled run, dashboard update or check ran, and how it ended. None when
+    /// there is no log (supervisor never ran here). Covers timer runs too, which
+    /// `deploy-status.tsv` does not (it only tracks dashboard-originated requests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cycle: Option<DeployCycle>,
     /// The last gate-capability self-report accepted during this daemon run, distinct from
     /// the daemon build above. This is A1 historical runtime evidence with no freshness,
     /// session, identity, or build binding — not installed-byte attestation. #481 owns that
@@ -532,6 +550,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             update_note: Some("deployment authority is not configured".into()),
             gate_engine: GateEngineHealth::default(),
             auto_update: String::new(),
+            last_cycle: None,
         };
     };
     let raw = match std::fs::read_to_string(path) {
@@ -548,6 +567,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 update_note: Some(format!("cannot read deployment authority: {error}")),
                 gate_engine: GateEngineHealth::default(),
                 auto_update: String::new(),
+                last_cycle: None,
             };
         }
     };
@@ -565,6 +585,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 update_note: Some(format!("deployment authority is invalid JSON: {error}")),
                 gate_engine: GateEngineHealth::default(),
                 auto_update: String::new(),
+                last_cycle: None,
             };
         }
     };
@@ -586,6 +607,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             update_note: Some("deployment authority has no build_id".into()),
             gate_engine: GateEngineHealth::default(),
             auto_update: String::new(),
+            last_cycle: None,
         };
     };
     let head_sha = manifest.get("head_sha").and_then(serde_json::Value::as_str);
@@ -613,6 +635,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
         update_note,
         gate_engine: GateEngineHealth::default(),
         auto_update: String::new(),
+        last_cycle: None,
     }
 }
 
@@ -676,6 +699,37 @@ pub(crate) fn auto_update_state() -> &'static str {
     }
 }
 
+/// The words hestia-deploy.sh starts a run's terminal line with (its `log`/`die` calls).
+const DEPLOY_RESULTS: [&str; 8] =
+    ["CURRENT", "DEPLOYED", "HALF-DEPLOYED", "FAIL", "SKIP", "STALE", "PREFLIGHT", "BUILD-ONLY"];
+
+/// The last terminal run line in a deploy.log excerpt. Progress lines (`target=…`, `build …`,
+/// `WARN …`) are skipped; only a line whose first word after the timestamp is a result counts.
+pub(crate) fn last_deploy_cycle_in(log: &str) -> Option<DeployCycle> {
+    log.lines().rev().find_map(|line| {
+        let (at, rest) = line.split_once(' ')?;
+        chrono::DateTime::parse_from_rfc3339(at).ok()?;
+        let (word, detail) = rest.split_once(' ').unwrap_or((rest, ""));
+        DEPLOY_RESULTS.contains(&word).then(|| DeployCycle {
+            at: at.to_string(),
+            result: word.to_string(),
+            detail: detail.chars().take(240).collect(),
+        })
+    })
+}
+
+/// Read only the log's tail: the poll runs every few seconds and the log only grows.
+fn last_deploy_cycle(log_path: &Path) -> Option<DeployCycle> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 32 * 1024;
+    let mut file = std::fs::File::open(log_path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    last_deploy_cycle_in(&String::from_utf8_lossy(&bytes))
+}
+
 fn deployment_health(state: &ServerState) -> DeploymentHealth {
     let mut health = deployment_health_from_path(
         std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
@@ -726,6 +780,9 @@ fn deployment_health(state: &ServerState) -> DeploymentHealth {
             .into(),
     };
     health.auto_update = auto_update_state().into();
+    health.last_cycle = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
+        .and_then(|p| Path::new(&p).parent().map(|d| d.join("deploy.log")))
+        .and_then(|log| last_deploy_cycle(&log));
     if health.update_capable && !deploy_supervisor_installed() {
         health.update_capable = false;
         health.update_state = "unavailable".into();
@@ -1994,6 +2051,27 @@ mod tests {
         // A stale record does not keep a current box looking busy.
         std::fs::write(&status, format!("running\treq-3\ttarget-build\t{}\n", (now - chrono::Duration::hours(2)).to_rfc3339())).unwrap();
         assert_eq!(deployment_health_from_path(Some(&manifest)).update_state, "idle");
+    }
+
+    #[test]
+    fn last_deploy_cycle_is_the_last_result_line_not_the_last_line() {
+        let log = "\
+2026-10-16T20:24:13Z WARN preflight probe 'touch the deploy hold' -> rc=2: hestia: deny
+2026-10-16T20:24:13Z PREFLIGHT ok
+2026-10-16T20:24:14Z target=v0.3.0-rc.3-3-g7da0cc70 (7da0cc70, web4 38f1f321) running=v0.3.0-rc.3-3
+2026-10-16T20:24:18Z CURRENT v0.3.0-rc.3-3-g7da0cc70 manifest-repair hooks=ok
+              --brief       one line        --no-witness   skip the chain write
+  next fire:  -       - Fri 2026-10-16 13:24:17 PDT
+2026-10-16T20:25:00Z build v0.3.0-rc.4 (release, target dir /x)
+";
+        let c = last_deploy_cycle_in(log).unwrap();
+        assert_eq!(c.at, "2026-10-16T20:24:18Z");
+        assert_eq!(c.result, "CURRENT");
+        assert!(c.detail.starts_with("v0.3.0-rc.3-3-g7da0cc70 manifest-repair"));
+        assert!(last_deploy_cycle_in("no timestamps here\n").is_none());
+        assert!(last_deploy_cycle_in("").is_none());
+        let fail = last_deploy_cycle_in("2026-10-17T00:17:02Z FAIL cargo build\n").unwrap();
+        assert_eq!((fail.result.as_str(), fail.detail.as_str()), ("FAIL", "cargo build"));
     }
 
     #[test]

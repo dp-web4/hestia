@@ -96,6 +96,7 @@
   .deployment-update:disabled { cursor: default; opacity: 0.7; }
   .deployment-update.failed { border-color: var(--failure); color: var(--failure); }
   .deployment-update.quiet { border-color: var(--fg-faint); color: var(--fg-dim); }
+  #generated-at.stale-stamp { color: var(--warning); font-weight: 600; }
   .deployment-update.quiet:hover:not(:disabled) { background: color-mix(in srgb, var(--fg-faint) 12%, transparent); }
   .deployment-auto {
     appearance: none; border: 1px solid var(--fg-faint); border-radius: 999px;
@@ -2102,6 +2103,16 @@
       const t = new Date(iso);
       return t.toLocaleTimeString();
     },
+    // Time alone when it is today, date + time otherwise: a stamp from three days ago must
+    // not read like one from this afternoon.
+    stamp: iso => {
+      if (!iso) return '—';
+      const t = new Date(iso);
+      if (Number.isNaN(t.getTime())) return '—';
+      return t.toDateString() === new Date().toDateString()
+        ? t.toLocaleTimeString()
+        : t.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+    },
     relTime: iso => {
       if (!iso) return '';
       const then = new Date(iso).getTime();
@@ -3380,8 +3391,28 @@
     renderFeed(data.recent);
     renderDeployment(data.deployment);
     $('sov-lct').textContent = data.society.sovereign_lct;
-    $('generated-at').textContent = `updated ${fmt.time(data.generated_at)}`;
+    lastGeneratedAt = data.generated_at;
+    renderGeneratedAt();
   }
+
+  // The footer's "updated" stamp is when the daemon last produced dashboard data. The page
+  // polls every few seconds, so a stamp minutes old means data has stopped arriving: the daemon
+  // is down, or up and no longer refreshing (the header can still read "live" then). It is
+  // re-rendered on a timer of its own, so it keeps ageing while every poll is failing.
+  let lastGeneratedAt = null;
+  const GENERATED_STALE_SECS = 120;
+  function renderGeneratedAt() {
+    const el = $('generated-at');
+    if (!el || !lastGeneratedAt) return;
+    const ageSecs = (Date.now() - new Date(lastGeneratedAt).getTime()) / 1000;
+    const stale = ageSecs > GENERATED_STALE_SECS;
+    el.textContent = `updated ${fmt.stamp(lastGeneratedAt)}` + (stale ? ` (${fmt.relTime(lastGeneratedAt)} ago)` : '');
+    el.classList.toggle('stale-stamp', stale);
+    el.title = stale
+      ? 'No fresh data from the hestia daemon since then. Check that the service is running (the header shows offline when it cannot be reached).'
+      : 'when the hestia daemon last produced this data';
+  }
+  setInterval(renderGeneratedAt, 30000);
 
   function renderDeployment(deployment) {
     const d = deployment || { state: 'unknown', note: 'deployment status unavailable' };
@@ -3395,6 +3426,11 @@
       ? '● deployment current'
       : state === 'stale' ? '! deployment stale' : '● deployment unknown';
     el.title = `${d.note || 'deployment status unavailable'}${d.running_build ? ` (running ${d.running_build})` : ''}${d.current_build ? `; current ${d.current_build}` : ''}${d.update_note ? `; ${d.update_note}` : ''}`;
+    if (d.last_cycle) {
+      // When the deploy supervisor last ran (timer, update or check) and how that run ended.
+      el.title += `\nlast deploy run ${fmt.stamp(d.last_cycle.at)}: ${d.last_cycle.result}`
+        + (d.last_cycle.detail ? ` ${d.last_cycle.detail}` : '');
+    }
 
     if (!btn) return;
     // Stale: the local install is half-updated, so the button says "update". Current: the box
