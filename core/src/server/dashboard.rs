@@ -350,6 +350,13 @@ pub struct DeploymentHealth {
     pub update_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_note: Option<String>,
+    /// Scheduled auto-update, i.e. whether the hestia-deploy TIMER is armed: `on`, `off`,
+    /// `absent` (no timer unit installed on this box) or `unavailable` (no supported toggle on
+    /// this platform). The update button above is independent of it: with the timer off, the
+    /// box updates only when the operator asks. Read from the unit files on disk, never by
+    /// spawning systemctl, so the dashboard poll stays process-free (#1183).
+    #[serde(default)]
+    pub auto_update: String,
     /// The last gate-capability self-report accepted during this daemon run, distinct from
     /// the daemon build above. This is A1 historical runtime evidence with no freshness,
     /// session, identity, or build binding — not installed-byte attestation. #481 owns that
@@ -501,6 +508,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             update_request_id: None,
             update_note: Some("deployment authority is not configured".into()),
             gate_engine: GateEngineHealth::default(),
+            auto_update: String::new(),
         };
     };
     let raw = match std::fs::read_to_string(path) {
@@ -516,6 +524,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 update_request_id: None,
                 update_note: Some(format!("cannot read deployment authority: {error}")),
                 gate_engine: GateEngineHealth::default(),
+                auto_update: String::new(),
             };
         }
     };
@@ -532,6 +541,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 update_request_id: None,
                 update_note: Some(format!("deployment authority is invalid JSON: {error}")),
                 gate_engine: GateEngineHealth::default(),
+                auto_update: String::new(),
             };
         }
     };
@@ -552,6 +562,7 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             update_request_id: None,
             update_note: Some("deployment authority has no build_id".into()),
             gate_engine: GateEngineHealth::default(),
+            auto_update: String::new(),
         };
     };
     let head_sha = manifest.get("head_sha").and_then(serde_json::Value::as_str);
@@ -578,6 +589,43 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
         update_request_id,
         update_note,
         gate_engine: GateEngineHealth::default(),
+        auto_update: String::new(),
+    }
+}
+
+/// This user's systemd unit directory: `$XDG_CONFIG_HOME/systemd/user`, else
+/// `$HOME/.config/systemd/user`. The deploy README installs the timer there.
+fn systemd_user_unit_dir() -> Option<std::path::PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(config.join("systemd/user"))
+}
+
+/// `on` when hestia-deploy.timer is installed and enabled (wanted by timers.target), `off`
+/// when installed but not enabled, `absent` when it was never installed. "Enabled" is what
+/// survives a reboot; the dashboard toggle changes enabled and active together.
+pub(crate) fn auto_update_state_in(unit_dir: &Path) -> &'static str {
+    if !unit_dir.join("hestia-deploy.timer").exists() {
+        return "absent";
+    }
+    if unit_dir.join("timers.target.wants/hestia-deploy.timer").exists() {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// The auto-update state for this box. Linux (user systemd) only for now: the macOS deploy
+/// agent is a launchd plist whose schedule is not a separate unit to switch.
+pub(crate) fn auto_update_state() -> &'static str {
+    if !cfg!(target_os = "linux") {
+        return "unavailable";
+    }
+    match systemd_user_unit_dir() {
+        Some(dir) => auto_update_state_in(&dir),
+        None => "unavailable",
     }
 }
 
@@ -630,6 +678,7 @@ fn deployment_health(state: &ServerState) -> DeploymentHealth {
                or installed; see #481"
             .into(),
     };
+    health.auto_update = auto_update_state().into();
     health
 }
 
@@ -1871,6 +1920,20 @@ mod tests {
         assert!(same_deployed_build("v0.0.5", None, "v0.0.5"));
         // A clone without tags names the commit by a bare sha.
         assert!(same_deployed_build("588684d6", None, "v0.0.4-965-g588684d"));
+    }
+
+    #[test]
+    fn auto_update_state_reads_the_timer_unit_files() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(auto_update_state_in(dir.path()), "absent");
+        std::fs::write(dir.path().join("hestia-deploy.timer"), "[Timer]\n").unwrap();
+        assert_eq!(auto_update_state_in(dir.path()), "off");
+        std::fs::create_dir(dir.path().join("timers.target.wants")).unwrap();
+        std::fs::write(dir.path().join("timers.target.wants/hestia-deploy.timer"), "").unwrap();
+        assert_eq!(auto_update_state_in(dir.path()), "on");
+        // An enable link left behind after the unit itself was removed is not "on".
+        std::fs::remove_file(dir.path().join("hestia-deploy.timer")).unwrap();
+        assert_eq!(auto_update_state_in(dir.path()), "absent");
     }
 
     #[test]

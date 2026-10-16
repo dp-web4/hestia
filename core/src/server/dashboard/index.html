@@ -95,6 +95,15 @@
   .deployment-update:hover:not(:disabled) { background: color-mix(in srgb, var(--warning) 12%, transparent); }
   .deployment-update:disabled { cursor: default; opacity: 0.7; }
   .deployment-update.failed { border-color: var(--failure); color: var(--failure); }
+  .deployment-auto {
+    appearance: none; border: 1px solid var(--fg-faint); border-radius: 999px;
+    background: transparent; color: var(--fg-dim); font: inherit; font-size: 0.68rem;
+    letter-spacing: 0.05em; text-transform: uppercase; padding: 0.2rem 0.55rem;
+    cursor: pointer;
+  }
+  .deployment-auto.on { border-color: var(--success); color: var(--success); }
+  .deployment-auto:hover:not(:disabled) { background: color-mix(in srgb, var(--fg-faint) 12%, transparent); }
+  .deployment-auto:disabled { cursor: default; opacity: 0.7; }
 
   /* Top-level view switch (agents | hubs), in the masthead by the Hestia mark. The content
      area below is one view or the other — see the HTML note at #agents-view. A segmented
@@ -1112,6 +1121,7 @@
     <div class="live">
       <span class="deployment-health unknown" id="deployment-health" title="Deployment freshness">● deployment unknown</span>
       <button class="deployment-update" id="deployment-update" type="button" hidden>update</button>
+      <button class="deployment-auto" id="deployment-auto" type="button" hidden aria-pressed="false">auto-update off</button>
       <span class="dot"></span>
       <span id="live-status">connecting…</span>
     </div>
@@ -3373,6 +3383,7 @@
 
   function renderDeployment(deployment) {
     const d = deployment || { state: 'unknown', note: 'deployment status unavailable' };
+    renderAutoUpdate(d.auto_update);
     const el = $('deployment-health');
     const btn = $('deployment-update');
     const state = ['current', 'stale', 'unknown'].includes(d.state) ? d.state : 'unknown';
@@ -3395,6 +3406,49 @@
       : failed ? (d.update_note || 'last update failed; retry')
       : 'bring this deployment current through the registered supervisor';
   }
+
+  // Scheduled auto-update (the hestia-deploy timer). Shown only where the timer is installed
+  // and the platform has a toggle; the update button works either way.
+  function renderAutoUpdate(autoUpdate) {
+    const btn = $('deployment-auto');
+    if (!btn || btn.dataset.busy) return;
+    const on = autoUpdate === 'on';
+    btn.hidden = !(on || autoUpdate === 'off');
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.textContent = on ? 'auto-update on' : 'auto-update off';
+    btn.title = on
+      ? 'This box deploys hestia main on a schedule (every 4h). Click to turn the schedule off; the update button still works.'
+      : 'Updates happen only when you click update. Click to deploy hestia main on a schedule (every 4h).';
+  }
+
+  (function wireAutoUpdate() {
+    const btn = $('deployment-auto');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      const turnOn = btn.getAttribute('aria-pressed') !== 'true';
+      if (turnOn && !confirm('Turn on scheduled auto-update?\n\nThis box will build and deploy hestia main every 4 hours, restarting the daemon and reinstalling the hooks when main has moved. If a scheduled run was missed, one may start right away.')) return;
+      btn.disabled = true;
+      btn.dataset.busy = '1';
+      btn.textContent = turnOn ? 'turning on…' : 'turning off…';
+      try {
+        const res = await apiFetch('/api/operator/deployment/auto-update', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled: turnOn }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      } catch (error) {
+        $('live-status').textContent = `auto-update change failed (${error.message})`;
+      } finally {
+        btn.disabled = false;
+        delete btn.dataset.busy;
+        await tick();
+      }
+    });
+  })();
 
   (function wireDeploymentUpdate() {
     const btn = $('deployment-update');
