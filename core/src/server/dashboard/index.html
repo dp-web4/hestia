@@ -95,6 +95,8 @@
   .deployment-update:hover:not(:disabled) { background: color-mix(in srgb, var(--warning) 12%, transparent); }
   .deployment-update:disabled { cursor: default; opacity: 0.7; }
   .deployment-update.failed { border-color: var(--failure); color: var(--failure); }
+  .deployment-update.quiet { border-color: var(--fg-faint); color: var(--fg-dim); }
+  .deployment-update.quiet:hover:not(:disabled) { background: color-mix(in srgb, var(--fg-faint) 12%, transparent); }
   .deployment-auto {
     appearance: none; border: 1px solid var(--fg-faint); border-radius: 999px;
     background: transparent; color: var(--fg-dim); font: inherit; font-size: 0.68rem;
@@ -3395,16 +3397,25 @@
     el.title = `${d.note || 'deployment status unavailable'}${d.running_build ? ` (running ${d.running_build})` : ''}${d.current_build ? `; current ${d.current_build}` : ''}${d.update_note ? `; ${d.update_note}` : ''}`;
 
     if (!btn) return;
-    const active = state === 'stale' && ['requested', 'held', 'running'].includes(updateState);
-    const failed = state === 'stale' && updateState === 'failed';
-    btn.hidden = state !== 'stale' || !d.update_capable;
+    // Stale: the local install is half-updated, so the button says "update". Current: the box
+    // matches its own manifest, but only the supervisor can see whether origin/main has moved,
+    // so the same request is offered as "check for updates" (with the timer off it is the only
+    // way to find out). Unknown: no supervisor to ask, so no button.
+    const stale = state === 'stale';
+    const active = ['requested', 'held', 'running'].includes(updateState);
+    const failed = updateState === 'failed';
+    btn.hidden = !d.update_capable || !(stale || state === 'current');
     btn.disabled = active;
     btn.classList.toggle('failed', failed);
-    btn.textContent = updateState === 'held' ? 'update held' : active ? 'updating…' : failed ? 'retry update' : 'update';
-    btn.title = active
-      ? (d.update_note || 'deployment supervisor is updating this installation')
-      : failed ? (d.update_note || 'last update failed; retry')
-      : 'bring this deployment current through the registered supervisor';
+    btn.classList.toggle('quiet', !stale && !failed);
+    btn.textContent = updateState === 'held' ? (stale ? 'update held' : 'check held')
+      : active ? (stale ? 'updating…' : 'checking…')
+      : failed ? (stale ? 'retry update' : 'retry check')
+      : stale ? 'update' : 'check for updates';
+    btn.title = active || failed
+      ? (d.update_note || (failed ? 'last update failed; retry' : 'deployment supervisor is working'))
+      : stale ? 'bring this deployment current through the registered supervisor'
+      : 'ask the deployment supervisor to fetch hestia main and update if it has moved (builds only when there is something new)';
   }
 
   // Scheduled auto-update (the hestia-deploy timer). Shown only where the timer is installed
@@ -3456,7 +3467,8 @@
     btn.addEventListener('click', async () => {
       if (btn.disabled) return;
       btn.disabled = true;
-      btn.textContent = 'requesting…';
+      const checking = btn.classList.contains('quiet');
+      btn.textContent = checking ? 'checking…' : 'requesting…';
       btn.classList.remove('failed');
       try {
         const res = await apiFetch('/api/operator/deployment/update', { method: 'POST' });
@@ -3466,8 +3478,8 @@
           await tick();
           return;
         }
-        btn.textContent = 'updating…';
-        $('live-status').textContent = 'updating…';
+        btn.textContent = checking ? 'checking…' : 'updating…';
+        $('live-status').textContent = checking ? 'checking for updates…' : 'updating…';
         // Re-read authoritative supervisor state rather than inventing a client-side success.
         // The daemon may disappear during restart; the ordinary poll will reconnect and only
         // deployment.state=current clears the stale badge.

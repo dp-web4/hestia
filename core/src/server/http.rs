@@ -869,16 +869,15 @@ async fn operator_deployment_update(
         }
     };
 
-    if super::dashboard::same_deployed_build(&authority_build, authority_head_sha.as_deref(), env!("HESTIA_GIT_VERSION")) {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "current",
-                "message": "deployment is already current",
-                "running_build": env!("HESTIA_GIT_VERSION"),
-            })),
-        );
-    }
+    // A box that is current against its OWN manifest can still be behind origin/main: the
+    // daemon never fetches, so only the supervisor knows. With the timer off, this request is
+    // the box's only way to find out, so it is not short-circuited here ("check for updates").
+    // The supervisor syncs, compares, and logs CURRENT without building when nothing moved.
+    let locally_current = super::dashboard::same_deployed_build(
+        &authority_build,
+        authority_head_sha.as_deref(),
+        env!("HESTIA_GIT_VERSION"),
+    );
 
     let request_path = home.join("deploy-update.request");
     let status_path = home.join("deploy-status.tsv");
@@ -943,6 +942,7 @@ async fn operator_deployment_update(
                 "authority_build": authority_build,
                 "platform": std::env::consts::OS,
                 "mechanism": "registered-deployment-supervisor",
+                "locally_current": locally_current,
             }),
             provenance.as_ref(),
         );

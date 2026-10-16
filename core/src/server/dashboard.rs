@@ -378,9 +378,6 @@ fn deployment_update_status(
             Some(format!("dashboard update is unsupported on {}", std::env::consts::OS)),
         );
     }
-    if current {
-        return (true, "idle".into(), None, None);
-    }
     let Some(parent) = authority_path.parent() else {
         return (false, "unavailable".into(), None, Some("deployment authority has no parent directory".into()));
     };
@@ -422,6 +419,32 @@ fn deployment_update_status(
     } else {
         format!(" toward {supervisor_target}")
     };
+    if current {
+        // Current against the local manifest, but an operator "check for updates" may be in
+        // flight (the supervisor is syncing origin/main) or may have just failed (e.g. main no
+        // longer builds). Show those; anything else, including "succeeded", is plain idle.
+        return match state {
+            "requested" | "held" if (0..=420 * 60).contains(&age_secs) => (
+                true,
+                state.into(),
+                request_id,
+                Some("checking origin/main for an update".into()),
+            ),
+            "running" if (0..=60 * 60).contains(&age_secs) => (
+                true,
+                "running".into(),
+                request_id,
+                Some(format!("deployment supervisor is checking for an update{target_note}")),
+            ),
+            "failed" if (0..=420 * 60).contains(&age_secs) => (
+                true,
+                "failed".into(),
+                request_id,
+                Some("last update check failed; the running deployment remains in force (see ~/.hestia/deploy.log)".into()),
+            ),
+            _ => (true, "idle".into(), None, None),
+        };
+    }
     match state {
         "requested" if (0..=420 * 60).contains(&age_secs) => (
             true,
@@ -1920,6 +1943,27 @@ mod tests {
         assert!(same_deployed_build("v0.0.5", None, "v0.0.5"));
         // A clone without tags names the commit by a bare sha.
         assert!(same_deployed_build("588684d6", None, "v0.0.4-965-g588684d"));
+    }
+
+    #[test]
+    fn a_current_box_still_shows_an_operator_update_check_in_flight() {
+        if !(cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, format!(r#"{{"build_id":"{}"}}"#, env!("HESTIA_GIT_VERSION"))).unwrap();
+        let status = dir.path().join("deploy-status.tsv");
+        let now = chrono::Utc::now();
+        for (wire, expected) in [("requested", "requested"), ("held", "held"), ("running", "running"), ("failed", "failed"), ("succeeded", "idle")] {
+            std::fs::write(&status, format!("{wire}\treq-2\ttarget-build\t{}\n", now.to_rfc3339())).unwrap();
+            let health = deployment_health_from_path(Some(&manifest));
+            assert_eq!(health.state, "current");
+            assert_eq!(health.update_state, expected, "wire state {wire}");
+        }
+        // A stale record does not keep a current box looking busy.
+        std::fs::write(&status, format!("running\treq-3\ttarget-build\t{}\n", (now - chrono::Duration::hours(2)).to_rfc3339())).unwrap();
+        assert_eq!(deployment_health_from_path(Some(&manifest)).update_state, "idle");
     }
 
     #[test]
