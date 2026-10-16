@@ -19,6 +19,8 @@
 #   HESTIA_HOME      override install location for state (default: ~/.hestia)
 #   HESTIA_BIND      bind address for the daemon (default: 127.0.0.1:7711)
 #   HESTIA_SKIP_HOOK if set, do NOT wire ~/.claude/settings.json hooks
+#   HESTIA_SKIP_DEPLOY   if set, do NOT install the deploy supervisor (dashboard update button)
+#   HESTIA_AUTO_UPDATE   =1 also arms the 4-hourly deploy timer (default: installed but OFF)
 #
 set -euo pipefail
 
@@ -789,6 +791,89 @@ step_workspace_marker() {
   fi
 }
 
+# The deploy supervisor (deploy/from-main): what the dashboard's update / "check for updates"
+# button starts, and what its auto-update toggle schedules.
+#
+# WHY HERE. Until this step the supervisor was a separate once-per-box install in
+# deploy/from-main/README.md that no installer ran, so on every box set up from this script the
+# dashboard offered an update button that could only fail with "Unit hestia-deploy.service not
+# found" (#791, Nomad 2026-09-01; tl-dell 2026-10-16). An operator should not need a README of
+# shell lines to get a working update button.
+#
+# WHAT IT INSTALLS, AND WHAT IT LEAVES OFF. The two deploy clones under $HESTIA_HOME/deploy, the
+# hestia-deploy script, and the service + timer units, with HESTIA_WORKSPACE rendered. The
+# TIMER STAYS OFF unless HESTIA_AUTO_UPDATE=1: nothing builds or restarts until the operator
+# clicks update or switches auto-update on in the dashboard. A re-run never turns an armed
+# timer off and never touches the deploy clones' history.
+#
+# WHEN IT SKIPS (and says so). The supervisor builds hestia main from source, so it needs a
+# checkout install (a resolved HESTIA_WORKSPACE) with git and cargo. A release install
+# (`curl | sh`) tracks releases, not main, and is updated by re-running this script; converting
+# it to main-tracking is a choice this step does not make for it. macOS: the launchd agent's
+# binary path must be derived from the daemon's registration (README), so it is not automated
+# here yet.
+step_deploy_supervisor() {
+  if [ -n "${HESTIA_SKIP_DEPLOY:-}" ]; then
+    c_dim "deploy supervisor skipped (HESTIA_SKIP_DEPLOY set)"
+    return
+  fi
+  c_hdr "deploy supervisor (dashboard update button)"
+  if [ "$(uname -s)" != Linux ]; then
+    c_dim "not automated on $(uname -s) yet: see deploy/from-main/README.md (launchd)"
+    return
+  fi
+  if [ -z "${HESTIA_WORKSPACE:-}" ]; then
+    c_dim "release install (no checkout): update by re-running this installer."
+    c_dim "  the deploy supervisor builds hestia main from source; to opt in, run this script"
+    c_dim "  from a checkout, or see deploy/from-main/README.md"
+    return
+  fi
+  local missing=""
+  command -v git >/dev/null 2>&1   || missing="$missing git"
+  command -v cargo >/dev/null 2>&1 || missing="$missing cargo"
+  if [ -n "$missing" ]; then
+    c_warn "deploy supervisor not installed: needs$missing (it builds hestia main from source)"
+    c_warn "  install the missing tool(s) and re-run this installer"
+    return
+  fi
+  local deploy_root="$HESTIA_HOME/deploy" unit_dir="$HOME/.config/systemd/user"
+  local src="$deploy_root/hestia/deploy/from-main"
+  mkdir -p "$deploy_root" "$unit_dir" "$BIN_DIR"
+  # https, not ssh: the units run without an agent or a key, and both repos are public.
+  local name
+  for name in hestia web4; do
+    if [ ! -d "$deploy_root/$name/.git" ]; then
+      git clone -q "https://github.com/dp-web4/$name.git" "$deploy_root/$name" \
+        || { c_err "clone of $name into $deploy_root failed"; return 1; }
+    fi
+  done
+  if [ ! -f "$src/hestia-deploy.sh" ]; then
+    c_err "deploy checkout has no deploy/from-main/hestia-deploy.sh: $deploy_root/hestia"
+    return 1
+  fi
+  install -m 0755 "$src/hestia-deploy.sh" "$BIN_DIR/hestia-deploy"
+  # The shipped unit leaves HESTIA_WORKSPACE empty on purpose ("render it from explicit operator
+  # configuration"); this installer's resolved workspace is that configuration.
+  sed "s|^Environment=HESTIA_WORKSPACE=\$|Environment=HESTIA_WORKSPACE=$HESTIA_WORKSPACE|" \
+    "$src/hestia-deploy.service" > "$unit_dir/hestia-deploy.service"
+  install -m 0644 "$src/hestia-deploy.timer" "$unit_dir/hestia-deploy.timer"
+  # Read back, as the other steps do: a zero exit is not evidence the bytes landed.
+  if ! grep -qx "Environment=HESTIA_WORKSPACE=$HESTIA_WORKSPACE" "$unit_dir/hestia-deploy.service"; then
+    c_err "hestia-deploy.service was written without HESTIA_WORKSPACE: $unit_dir/hestia-deploy.service"
+    return 1
+  fi
+  systemctl --user daemon-reload
+  c_ok "deploy supervisor installed: the dashboard update button works"
+  if [ "${HESTIA_AUTO_UPDATE:-}" = 1 ]; then
+    systemctl --user enable --now hestia-deploy.timer
+    c_ok "auto-update ON (HESTIA_AUTO_UPDATE=1): deploys hestia main every 4h"
+  elif systemctl --user is-enabled --quiet hestia-deploy.timer 2>/dev/null; then
+    c_ok "auto-update already ON: left as it is"
+  else
+    c_dim "auto-update OFF: updates happen when you click update; switch it on in the dashboard"
+  fi
+}
+
 step_claude_hooks() {
   if [ -n "${HESTIA_SKIP_HOOK:-}" ]; then
     c_dim "claude-code hooks skipped (HESTIA_SKIP_HOOK set)"
@@ -915,6 +1000,7 @@ main() {
     *) c_err "unsupported OS"; exit 1 ;;
   esac
   step_workspace_marker
+  step_deploy_supervisor
   step_claude_hooks
   step_smoketest
   c_hdr "done"
