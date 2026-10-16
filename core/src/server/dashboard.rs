@@ -640,6 +640,30 @@ pub(crate) fn auto_update_state_in(unit_dir: &Path) -> &'static str {
     }
 }
 
+/// Whether this box has the deploy supervisor the update button triggers: the user-systemd
+/// `hestia-deploy.service` on Linux, the `com.web4.hestia.deploy` launchd agent on macOS. A
+/// normal install does not set it up (deploy/from-main/README.md is a separate, once-per-box
+/// step), and without it the button can only fail with "Unit hestia-deploy.service not found"
+/// (#791). Read from the files on disk, like `auto_update_state`, so the poll spawns nothing.
+pub(crate) fn deploy_supervisor_installed() -> bool {
+    if cfg!(target_os = "linux") {
+        systemd_user_unit_dir().is_some_and(|d| d.join("hestia-deploy.service").exists())
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").is_some_and(|h| {
+            std::path::PathBuf::from(h)
+                .join("Library/LaunchAgents/com.web4.hestia.deploy.plist")
+                .exists()
+        })
+    } else {
+        false
+    }
+}
+
+/// The remedy a missing supervisor names, shared by the dashboard note and the endpoint.
+pub(crate) const DEPLOY_SUPERVISOR_MISSING: &str =
+    "the deploy supervisor (hestia-deploy) is not installed on this box; install it once per \
+     box as described in deploy/from-main/README.md";
+
 /// The auto-update state for this box. Linux (user systemd) only for now: the macOS deploy
 /// agent is a launchd plist whose schedule is not a separate unit to switch.
 pub(crate) fn auto_update_state() -> &'static str {
@@ -702,6 +726,12 @@ fn deployment_health(state: &ServerState) -> DeploymentHealth {
             .into(),
     };
     health.auto_update = auto_update_state().into();
+    if health.update_capable && !deploy_supervisor_installed() {
+        health.update_capable = false;
+        health.update_state = "unavailable".into();
+        health.update_request_id = None;
+        health.update_note = Some(DEPLOY_SUPERVISOR_MISSING.into());
+    }
     health
 }
 

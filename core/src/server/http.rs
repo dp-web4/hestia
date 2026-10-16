@@ -879,6 +879,18 @@ async fn operator_deployment_update(
         env!("HESTIA_GIT_VERSION"),
     );
 
+    // Refuse before witnessing or publishing anything when there is no supervisor to start:
+    // the trigger could only fail, and the old failure text named no remedy (#791).
+    if !super::dashboard::deploy_supervisor_installed() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "update_unavailable",
+                "error": super::dashboard::DEPLOY_SUPERVISOR_MISSING,
+            })),
+        );
+    }
+
     let request_path = home.join("deploy-update.request");
     let status_path = home.join("deploy-status.tsv");
     if let Some((status, existing_id)) = active_deployment_update(&status_path) {
