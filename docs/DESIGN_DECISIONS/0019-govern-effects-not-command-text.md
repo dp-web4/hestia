@@ -193,3 +193,14 @@ This decision sharpens the meaning of Hestia's assurance ladder:
 
 The moat is not a better refusal classifier. It is **identity + role + provenance + witnessed
 history + enforceable authority at the machine that can actually cause the effect**.
+
+
+## 2026-10-17 scope clarification — separate governance decisions from optional execution control
+
+**dp ruling:** the Web4/Hestia governance function checks a proposed action for compliance with applicable law and returns YES/NO, recording who asked, when, and under what authority. The agent presents that decision as evidence to the *recipient*, which makes its own acceptance decision. The issuing gate **does not own downstream execution** and cannot 'recall the bullet.' A recipient may operate its own sandbox, resource checks, controls or refusal policy.
+
+Read this document's A2+ capability-envelope requirements as requirements **for a Hestia-provided execution service that expressly claims A2+ containment**, not requirements for every A1 authorization or a universal Web4 grant. The local gate must not imply that inspection of command text guarantees subsequent side effects. Conversely, it need not guarantee full runtime effects to issue a legitimate law decision. Hestia may optionally be both issuer and recipient on a single machine, but those are distinct accountable roles.
+
+Present priorities: trustworthy law/identity/scope decisions, unambiguous portable authorization evidence, recipient-side ability to verify and refuse, and accurate audit/provenance. Explicitly distinguish authorized, presented, accepted, executor-reported and independently witnessed when these data exist; **do not require** all stages or claim observation of unobserved effects. Abuse may presently be addressed through T3/V3 trust reduction and future refusals. ATP/ADP/BDA telemetry can provide a deeper feedback loop later, but reliable observation/control requires independent bandwidth and resilience engineering and is **not top priority**.
+
+Atomic single-use redemption, deterministic file swaps, post-authorization execution integrity, and crash/outcome reconciliation remain valid *conditional executor assurance tests* where such a guarantee is advertised; they are not blanket conformance criteria for the governance gate. A single-use grant records at most one redemption, not necessarily one external effect.
