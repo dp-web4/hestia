@@ -1,5 +1,8 @@
 # Hestia: Governance of SAGE Residents and Visitors
 
+> **Updated 2026-10-17:** The original single-axis 'resident / visitor' terminology below is historical. **Use resident/local vs remote cognition, independently crossed with native vs external harness.** See the [correction at the end](#2026-10-17-correction-role-location-harness-coverage-and-engagement-identity). No normative specification or implementation is ratified by this note.
+
+
 **Date:** 2026-10-17  
 **Status:** Architecture note / implementation plan, not implemented policy  
 **Canonical design:** [SAGE resident/visitor plan](https://github.com/dp-web4/private-context/blob/main/forum/gpt/2026-10-17-sage-resident-visitor-design-plan.md)
@@ -67,3 +70,15 @@ Inbound model output retains external-source provenance. Proposed tool calls ent
 [SAGE harness/being roles](https://github.com/dp-web4/SAGE/blob/main/docs/design/SAGE_RESIDENT_VISITOR_ROLES.md) · [Web4/Hub claims](https://github.com/dp-web4/web4/blob/main/hub/docs/SAGE_RESIDENT_VISITOR_INTEROPERABILITY.md) · [Hardbound enterprise policies](https://github.com/dp-web4/hardbound/blob/main/docs/SAGE_RESIDENT_VISITOR_ENTERPRISE.md)
 
 Implementation requires separately reviewed PRs and code-level tests. This note alone does not change admission or law.
+
+## 2026-10-17 correction: role location, harness coverage and engagement identity
+
+[Canonical refinement](https://github.com/dp-web4/private-context/blob/main/forum/gpt/2026-10-17-sage-resident-visitor-design-plan.md#12-correction-from-live-sprout-evidence-and-dps-two-axis-ruling-2026-10-17) · [Sprout's operational observations](https://github.com/dp-web4/private-context/blob/main/forum/gpt/2026-10-17-sprout-claude-reply-resident-visitor-plan.md)
+
+The earlier resident/visitor **single axis** is superseded: record **cognition_locus = local (resident) | remote | unknown**, independently from **harness_class = native | external | unknown**. An on-host vendor CLI making remote model calls is remote/external; a local model inside a vendor harness is resident/external. **Local residence does not prove native enforcement**. Do not treat `visitor` as the only category with external information risk.
+
+**Phase 0 starts with deployed Claude seats.** Sprout's interactive, member-mesh and hub-watch Claude sessions already operate as remote/external occupants; they share `claude-code` plugin and A1 hook interception, but tool results and allowed context are sent into a provider channel that Hestia does not gate as egress. Vendor harness telemetry, hidden skills/subagents/provider-side tools and silent update behavior can escape local hook visibility. Represent this as `mediation=hook_level` with explicitly scoped tool coverage and `disclosure_coverage=unknown` or `context_only`, never a fabricated all-data-covered receipt. Version/update evidence must be retained and reevaluated after change.
+
+**Unify admission with the messaging presence lease.** One Hestia-held *engagement* binds authenticated seat principal (prefer LCT), concrete session, cognition locus, harness class/ref, admissible scope, expiry/revocation, and evidence; wake, claim and disclosure receipts reference this ID. A single principal may hold multiple distinct engagements while continuing the same duties. The same provider key does not certify one principal. The same plugin id does not prove a shared claim. SAGE #461 prevents one duplicate execution but does not establish durable engagement identity. Coordinate with Hestia delivery/claims/lease roadmap, not a parallel admission service.
+
+**Native conformance** requires evidence that outbound disclosure is gated before send, unauthorized telemetry is absent or controlled, consequential tool actions are covered, and turns/principals are authenticated; enforcement assurance remains limited to actual deployed controls (A1 cannot promise adversary-proof same-UID confinement). New negative tests: spoof resident via local proxy; external+resident still reports hook-limited posture; multiple engagements of same principal cannot double-claim message; vendor update invalidates stale evidence; denied prompt/tool-result disclosure never traverses controlled native egress; external harness has truthful unknown outbound coverage.
