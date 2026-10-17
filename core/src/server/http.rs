@@ -869,13 +869,24 @@ async fn operator_deployment_update(
         }
     };
 
-    if super::dashboard::same_deployed_build(&authority_build, authority_head_sha.as_deref(), env!("HESTIA_GIT_VERSION")) {
+    // A box that is current against its OWN manifest can still be behind origin/main: the
+    // daemon never fetches, so only the supervisor knows. With the timer off, this request is
+    // the box's only way to find out, so it is not short-circuited here ("check for updates").
+    // The supervisor syncs, compares, and logs CURRENT without building when nothing moved.
+    let locally_current = super::dashboard::same_deployed_build(
+        &authority_build,
+        authority_head_sha.as_deref(),
+        env!("HESTIA_GIT_VERSION"),
+    );
+
+    // Refuse before witnessing or publishing anything when there is no supervisor to start:
+    // the trigger could only fail, and the old failure text named no remedy (#791).
+    if !super::dashboard::deploy_supervisor_installed() {
         return (
-            StatusCode::OK,
+            StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "status": "current",
-                "message": "deployment is already current",
-                "running_build": env!("HESTIA_GIT_VERSION"),
+                "status": "update_unavailable",
+                "error": super::dashboard::DEPLOY_SUPERVISOR_MISSING,
             })),
         );
     }
@@ -943,6 +954,7 @@ async fn operator_deployment_update(
                 "authority_build": authority_build,
                 "platform": std::env::consts::OS,
                 "mechanism": "registered-deployment-supervisor",
+                "locally_current": locally_current,
             }),
             provenance.as_ref(),
         );
@@ -1085,6 +1097,144 @@ async fn operator_deployment_update(
     }
 }
 
+/// Body of `POST /api/operator/deployment/auto-update`: on or off, nothing else. No unit,
+/// path or schedule is taken from the browser.
+#[derive(serde::Deserialize)]
+struct AutoUpdateToggle {
+    enabled: bool,
+}
+
+/// Fixed timer toggle. `--now` makes enabled and active move together, so what the dashboard
+/// reads from the unit files (`auto_update_state`) is also what is scheduled.
+fn auto_update_trigger_for(os: &str, enabled: bool) -> Option<DeploymentUpdateTrigger> {
+    match os {
+        "linux" => Some(DeploymentUpdateTrigger {
+            program: "systemctl",
+            args: vec![
+                "--user".into(),
+                if enabled { "enable" } else { "disable" }.into(),
+                "--now".into(),
+                "hestia-deploy.timer".into(),
+            ],
+        }),
+        _ => None,
+    }
+}
+
+/// `POST /api/operator/deployment/auto-update` - switch scheduled deploys (hestia-deploy.timer)
+/// on or off. The update button is unaffected: with the timer off the box still updates, but
+/// only when the operator asks.
+///
+/// Turning it ON can start a deploy straight away: the timer is `Persistent=true`, so a missed
+/// fire time runs as soon as it is armed. The dashboard says so before it asks.
+async fn operator_deployment_auto_update(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(toggle): Json<AutoUpdateToggle>,
+) -> impl IntoResponse {
+    let now = super::state::unix_now();
+    let (operator, provenance) = {
+        let s = state.lock().await;
+        current_operator_context(&s, &headers, now)
+    };
+    let before = super::dashboard::auto_update_state();
+    let wanted = if toggle.enabled { "on" } else { "off" };
+    match before {
+        "absent" => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "absent",
+                    "error": "hestia-deploy.timer is not installed on this box; see deploy/from-main/README.md",
+                })),
+            );
+        }
+        "unavailable" => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({
+                    "status": "unavailable",
+                    "error": format!("no auto-update toggle for {}", std::env::consts::OS),
+                })),
+            );
+        }
+        _ if before == wanted => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": wanted,
+                    "message": format!("auto-update is already {wanted}"),
+                })),
+            );
+        }
+        _ => {}
+    }
+    let Some(trigger) = auto_update_trigger_for(std::env::consts::OS, toggle.enabled) else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "unavailable",
+                "error": format!("no auto-update toggle for {}", std::env::consts::OS),
+            })),
+        );
+    };
+
+    // SELF-WITNESS BEFORE SIDE EFFECT, as for the update request: no chain record, no toggle.
+    {
+        let mut s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "before": before,
+                "requested": wanted,
+                "platform": std::env::consts::OS,
+                "trigger_program": trigger.program,
+                "trigger_args": trigger.args,
+            }),
+            provenance.as_ref(),
+        );
+        if let Err(error) = s.append_chain("deployment_auto_update_intent", record) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": format!("cannot witness auto-update change: {error}"),
+                })),
+            );
+        }
+    }
+
+    let trigger_for_run = trigger.clone();
+    let trigger_result = match tokio::task::spawn_blocking(move || deployment_trigger_output(&trigger_for_run)).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("auto-update toggle task failed: {error}")),
+    };
+    let after = super::dashboard::auto_update_state();
+    let mut s = state.lock().await;
+    let record = super::operator_auth::attach_operator_provenance(
+        serde_json::json!({
+            "operator": operator,
+            "before": before,
+            "requested": wanted,
+            "after": after,
+            "outcome": if trigger_result.is_ok() { "changed" } else { "trigger-failed" },
+            "error": trigger_result.as_ref().err(),
+        }),
+        provenance.as_ref(),
+    );
+    let _ = s.append_chain("deployment_auto_update_changed", record);
+    match trigger_result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": after })),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": after, "error": error })),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod deployment_update_tests {
     use super::*;
@@ -1097,6 +1247,17 @@ mod deployment_update_tests {
             trigger.args,
             ["--user", "--no-block", "start", "hestia-deploy.service"]
         );
+    }
+
+    #[test]
+    fn auto_update_toggle_is_fixed_on_linux_and_absent_elsewhere() {
+        let on = auto_update_trigger_for("linux", true).unwrap();
+        assert_eq!(on.program, "systemctl");
+        assert_eq!(on.args, ["--user", "enable", "--now", "hestia-deploy.timer"]);
+        let off = auto_update_trigger_for("linux", false).unwrap();
+        assert_eq!(off.args, ["--user", "disable", "--now", "hestia-deploy.timer"]);
+        assert!(auto_update_trigger_for("macos", true).is_none());
+        assert!(auto_update_trigger_for("windows", false).is_none());
     }
 
     #[test]
@@ -1210,6 +1371,10 @@ pub async fn serve_with_callback(
         .route(
             "/api/operator/deployment/update",
             post(operator_deployment_update),
+        )
+        .route(
+            "/api/operator/deployment/auto-update",
+            post(operator_deployment_auto_update),
         )
         .route(
             "/api/operator/gate-escalation",

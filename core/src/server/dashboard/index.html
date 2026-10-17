@@ -95,6 +95,18 @@
   .deployment-update:hover:not(:disabled) { background: color-mix(in srgb, var(--warning) 12%, transparent); }
   .deployment-update:disabled { cursor: default; opacity: 0.7; }
   .deployment-update.failed { border-color: var(--failure); color: var(--failure); }
+  .deployment-update.quiet { border-color: var(--fg-faint); color: var(--fg-dim); }
+  #generated-at.stale-stamp { color: var(--warning); font-weight: 600; }
+  .deployment-update.quiet:hover:not(:disabled) { background: color-mix(in srgb, var(--fg-faint) 12%, transparent); }
+  .deployment-auto {
+    appearance: none; border: 1px solid var(--fg-faint); border-radius: 999px;
+    background: transparent; color: var(--fg-dim); font: inherit; font-size: 0.68rem;
+    letter-spacing: 0.05em; text-transform: uppercase; padding: 0.2rem 0.55rem;
+    cursor: pointer;
+  }
+  .deployment-auto.on { border-color: var(--success); color: var(--success); }
+  .deployment-auto:hover:not(:disabled) { background: color-mix(in srgb, var(--fg-faint) 12%, transparent); }
+  .deployment-auto:disabled { cursor: default; opacity: 0.7; }
 
   /* Top-level view switch (agents | hubs), in the masthead by the Hestia mark. The content
      area below is one view or the other — see the HTML note at #agents-view. A segmented
@@ -1112,6 +1124,7 @@
     <div class="live">
       <span class="deployment-health unknown" id="deployment-health" title="Deployment freshness">● deployment unknown</span>
       <button class="deployment-update" id="deployment-update" type="button" hidden>update</button>
+      <button class="deployment-auto" id="deployment-auto" type="button" hidden aria-pressed="false">auto-update off</button>
       <span class="dot"></span>
       <span id="live-status">connecting…</span>
     </div>
@@ -2089,6 +2102,16 @@
       if (!iso) return '—';
       const t = new Date(iso);
       return t.toLocaleTimeString();
+    },
+    // Time alone when it is today, date + time otherwise: a stamp from three days ago must
+    // not read like one from this afternoon.
+    stamp: iso => {
+      if (!iso) return '—';
+      const t = new Date(iso);
+      if (Number.isNaN(t.getTime())) return '—';
+      return t.toDateString() === new Date().toDateString()
+        ? t.toLocaleTimeString()
+        : t.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
     },
     relTime: iso => {
       if (!iso) return '';
@@ -3368,11 +3391,32 @@
     renderFeed(data.recent);
     renderDeployment(data.deployment);
     $('sov-lct').textContent = data.society.sovereign_lct;
-    $('generated-at').textContent = `updated ${fmt.time(data.generated_at)}`;
+    lastGeneratedAt = data.generated_at;
+    renderGeneratedAt();
   }
+
+  // The footer's "updated" stamp is when the daemon last produced dashboard data. The page
+  // polls every few seconds, so a stamp minutes old means data has stopped arriving: the daemon
+  // is down, or up and no longer refreshing (the header can still read "live" then). It is
+  // re-rendered on a timer of its own, so it keeps ageing while every poll is failing.
+  let lastGeneratedAt = null;
+  const GENERATED_STALE_SECS = 120;
+  function renderGeneratedAt() {
+    const el = $('generated-at');
+    if (!el || !lastGeneratedAt) return;
+    const ageSecs = (Date.now() - new Date(lastGeneratedAt).getTime()) / 1000;
+    const stale = ageSecs > GENERATED_STALE_SECS;
+    el.textContent = `updated ${fmt.stamp(lastGeneratedAt)}` + (stale ? ` (${fmt.relTime(lastGeneratedAt)} ago)` : '');
+    el.classList.toggle('stale-stamp', stale);
+    el.title = stale
+      ? 'No fresh data from the hestia daemon since then. Check that the service is running (the header shows offline when it cannot be reached).'
+      : 'when the hestia daemon last produced this data';
+  }
+  setInterval(renderGeneratedAt, 30000);
 
   function renderDeployment(deployment) {
     const d = deployment || { state: 'unknown', note: 'deployment status unavailable' };
+    renderAutoUpdate(d.auto_update);
     const el = $('deployment-health');
     const btn = $('deployment-update');
     const state = ['current', 'stale', 'unknown'].includes(d.state) ? d.state : 'unknown';
@@ -3382,19 +3426,76 @@
       ? '● deployment current'
       : state === 'stale' ? '! deployment stale' : '● deployment unknown';
     el.title = `${d.note || 'deployment status unavailable'}${d.running_build ? ` (running ${d.running_build})` : ''}${d.current_build ? `; current ${d.current_build}` : ''}${d.update_note ? `; ${d.update_note}` : ''}`;
+    if (d.last_cycle) {
+      // When the deploy supervisor last ran (timer, update or check) and how that run ended.
+      el.title += `\nlast deploy run ${fmt.stamp(d.last_cycle.at)}: ${d.last_cycle.result}`
+        + (d.last_cycle.detail ? ` ${d.last_cycle.detail}` : '');
+    }
 
     if (!btn) return;
-    const active = state === 'stale' && ['requested', 'held', 'running'].includes(updateState);
-    const failed = state === 'stale' && updateState === 'failed';
-    btn.hidden = state !== 'stale' || !d.update_capable;
+    // Stale: the local install is half-updated, so the button says "update". Current: the box
+    // matches its own manifest, but only the supervisor can see whether origin/main has moved,
+    // so the same request is offered as "check for updates" (with the timer off it is the only
+    // way to find out). Unknown: no supervisor to ask, so no button.
+    const stale = state === 'stale';
+    const active = ['requested', 'held', 'running'].includes(updateState);
+    const failed = updateState === 'failed';
+    btn.hidden = !d.update_capable || !(stale || state === 'current');
     btn.disabled = active;
     btn.classList.toggle('failed', failed);
-    btn.textContent = updateState === 'held' ? 'update held' : active ? 'updating…' : failed ? 'retry update' : 'update';
-    btn.title = active
-      ? (d.update_note || 'deployment supervisor is updating this installation')
-      : failed ? (d.update_note || 'last update failed; retry')
-      : 'bring this deployment current through the registered supervisor';
+    btn.classList.toggle('quiet', !stale && !failed);
+    btn.textContent = updateState === 'held' ? (stale ? 'update held' : 'check held')
+      : active ? (stale ? 'updating…' : 'checking…')
+      : failed ? (stale ? 'retry update' : 'retry check')
+      : stale ? 'update' : 'check for updates';
+    btn.title = active || failed
+      ? (d.update_note || (failed ? 'last update failed; retry' : 'deployment supervisor is working'))
+      : stale ? 'bring this deployment current through the registered supervisor'
+      : 'ask the deployment supervisor to fetch hestia main and update if it has moved (builds only when there is something new)';
   }
+
+  // Scheduled auto-update (the hestia-deploy timer). Shown only where the timer is installed
+  // and the platform has a toggle; the update button works either way.
+  function renderAutoUpdate(autoUpdate) {
+    const btn = $('deployment-auto');
+    if (!btn || btn.dataset.busy) return;
+    const on = autoUpdate === 'on';
+    btn.hidden = !(on || autoUpdate === 'off');
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.textContent = on ? 'auto-update on' : 'auto-update off';
+    btn.title = on
+      ? 'This box deploys hestia main on a schedule (every 4h). Click to turn the schedule off; the update button still works.'
+      : 'Updates happen only when you click update. Click to deploy hestia main on a schedule (every 4h).';
+  }
+
+  (function wireAutoUpdate() {
+    const btn = $('deployment-auto');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      const turnOn = btn.getAttribute('aria-pressed') !== 'true';
+      if (turnOn && !confirm('Turn on scheduled auto-update?\n\nThis box will build and deploy hestia main every 4 hours, restarting the daemon and reinstalling the hooks when main has moved. If a scheduled run was missed, one may start right away.')) return;
+      btn.disabled = true;
+      btn.dataset.busy = '1';
+      btn.textContent = turnOn ? 'turning on…' : 'turning off…';
+      try {
+        const res = await apiFetch('/api/operator/deployment/auto-update', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled: turnOn }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      } catch (error) {
+        $('live-status').textContent = `auto-update change failed (${error.message})`;
+      } finally {
+        btn.disabled = false;
+        delete btn.dataset.busy;
+        await tick();
+      }
+    });
+  })();
 
   (function wireDeploymentUpdate() {
     const btn = $('deployment-update');
@@ -3402,7 +3503,8 @@
     btn.addEventListener('click', async () => {
       if (btn.disabled) return;
       btn.disabled = true;
-      btn.textContent = 'requesting…';
+      const checking = btn.classList.contains('quiet');
+      btn.textContent = checking ? 'checking…' : 'requesting…';
       btn.classList.remove('failed');
       try {
         const res = await apiFetch('/api/operator/deployment/update', { method: 'POST' });
@@ -3412,8 +3514,8 @@
           await tick();
           return;
         }
-        btn.textContent = 'updating…';
-        $('live-status').textContent = 'updating…';
+        btn.textContent = checking ? 'checking…' : 'updating…';
+        $('live-status').textContent = checking ? 'checking for updates…' : 'updating…';
         // Re-read authoritative supervisor state rather than inventing a client-side success.
         // The daemon may disappear during restart; the ordinary poll will reconnect and only
         // deployment.state=current clears the stale badge.
