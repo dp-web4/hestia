@@ -823,6 +823,34 @@ def hashlib_sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def test_a_declared_probe_opens_no_scope_request(m, g, wc, home):
+    """dp, 2026-10-14 ("needless frictions are bad"): the deploy preflight's hold probe opened a
+    peer scope request per member every cycle. A non-harness invoker that declares
+    HESTIA_GATE_NO_ESCALATE=1 gets the refusal the law gives and the daemon is asked nothing;
+    any other value keeps today's escalation."""
+    stub = Stub(Policy())
+    saved = os.environ.get("HESTIA_GATE_NO_ESCALATE")
+    try:
+        os.environ["HESTIA_GATE_NO_ESCALATE"] = "1"
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Bash", {"command": "touch /etc/hostname"}, home)
+        check("probe-refused-as-law-judged", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("probe-asks-no-scope-claim", not stub.named("hestia_scope_claim"), stub.calls[-3:])
+        check("probe-carries-no-escalation-id", not getattr(d, "escalation_id", None), d)
+        check("probe-says-why", "HESTIA_GATE_NO_ESCALATE" in (d.reason or ""), d.reason)
+        os.environ["HESTIA_GATE_NO_ESCALATE"] = "0"
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Bash", {"command": "touch /etc/hostname"}, home)
+        check("probe-flag-other-value-still-escalates", len(stub.named("hestia_scope_claim")) == 1,
+              stub.calls[-3:])
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_GATE_NO_ESCALATE", None)
+        else:
+            os.environ["HESTIA_GATE_NO_ESCALATE"] = saved
+        stub.close()
+
+
 def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home):
     """dp, 2026-10-05: "escalation should allow standing grants". An `mrh.path` / `mrh.command`
     refusal asks the daemon ONCE (`hestia_scope_claim`): a request is opened (or re-found) on the
@@ -1556,6 +1584,7 @@ CONTRACT_TESTS = [
     test_reads_meet_the_same_local_law_on_every_seat,
     test_superseded_is_denied_in_every_mode,
     test_daemon_verdicts_and_the_warn_rollout,
+    test_a_declared_probe_opens_no_scope_request,
     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
     test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
     test_prose_in_a_message_position_is_data_on_every_seat,
