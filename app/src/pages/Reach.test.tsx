@@ -6,12 +6,18 @@ const getDashboard = vi.fn();
 const operatorStatus = vi.fn();
 const grantReach = vi.fn();
 const revokeReach = vi.fn();
+const promoteGrant = vi.fn();
+const setReach = vi.fn();
+const reassignGrant = vi.fn();
 
 vi.mock("../lib/tauri", () => ({
   getDashboard: () => getDashboard(),
   operatorStatus: () => operatorStatus(),
   grantReach: (...a: unknown[]) => grantReach(...a),
   revokeReach: (...a: unknown[]) => revokeReach(...a),
+  promoteGrant: (...a: unknown[]) => promoteGrant(...a),
+  setReach: (...a: unknown[]) => setReach(...a),
+  reassignGrant: (...a: unknown[]) => reassignGrant(...a),
 }));
 
 const { Reach, replacedBy } = await import("./Reach");
@@ -151,5 +157,84 @@ describe("Reach", () => {
     expect(replacedBy([live, standing], "hub-being", " /w/./home/ ")).toEqual(standing);
     expect(replacedBy([live, standing], "hub-being", "/w/notes")).toBeNull(); // live is not replaced
     expect(replacedBy([live, standing], "claude-code", "/w/home")).toBeNull();
+  });
+
+  describe("Sprint 4b — make standing, reach, reassign", () => {
+    const row = (sel: string) => document.querySelector(`[data-grant="${sel}"]`) as HTMLElement;
+    const within = (sel: string, name: string | RegExp) =>
+      [...row(sel).querySelectorAll("button")].find((b) =>
+        typeof name === "string" ? b.textContent === name : name.test(b.textContent ?? ""),
+      ) as HTMLButtonElement | undefined;
+
+    it("offers each act only on the rows it applies to", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      getDashboard.mockResolvedValue(snapshot());
+      render(<Reach />);
+      await screen.findByText(/dies at the next restart/);
+      expect(within("live:hub-being:/w/notes", "Make standing…")).toBeTruthy();
+      expect(within("live:hub-being:/w/notes", "Reassign…")).toBeUndefined();
+      expect(within("standing:hub-being:/w/home", "Reassign…")).toBeTruthy();
+      expect(within("standing:hub-being:/w/home", "Make standing…")).toBeUndefined();
+      expect(within("standing:hub-being:/w/home", "Make exact…")).toBeTruthy(); // it is recursive
+      expect(within("live:hub-being:/w/notes", "Include below…")).toBeTruthy(); // it is exact
+    });
+
+    it("make standing shows the standing grant it replaces and is bound to it", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      const liveHome: ScopeGrantRow = { ...live, path: "/w/home", request_id: "r2", recursive: true };
+      getDashboard.mockResolvedValue(snapshot({ scope_grants: [live, liveHome, standing] }));
+      promoteGrant.mockResolvedValue({ outcome: "done", result: { ok: true } });
+      render(<Reach />);
+      await screen.findAllByText(/dies at the next restart/);
+      fireEvent.click(within("live:hub-being:/w/home", "Make standing…")!);
+      expect(await screen.findByText(/This REPLACES the standing grant on this path/)).toBeTruthy();
+      fireEvent.click(within("live:hub-being:/w/home", /^Make standing \(replaces/)!);
+      await waitFor(() => expect(promoteGrant).toHaveBeenCalled());
+      expect(promoteGrant.mock.calls[0][2]).toEqual(standing);
+      expect(await screen.findByText(/now standing — it survives restarts/)).toBeTruthy();
+    });
+
+    it("widening needs a reason; narrowing is sent without one", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      getDashboard.mockResolvedValue(snapshot());
+      setReach.mockResolvedValue({ outcome: "done", result: {} });
+      render(<Reach />);
+      await screen.findByText(/dies at the next restart/);
+      fireEvent.click(within("live:hub-being:/w/notes", "Include below…")!);
+      fireEvent.click(within("live:hub-being:/w/notes", "Include everything below")!);
+      expect(await screen.findByText(/requires a reason: it widens one path into a tree/)).toBeTruthy();
+      expect(setReach).not.toHaveBeenCalled();
+      fireEvent.click(within("standing:hub-being:/w/home", "Make exact…")!);
+      fireEvent.click(within("standing:hub-being:/w/home", "Make exact")!);
+      await waitFor(() => expect(setReach).toHaveBeenCalledWith(standing, false, null));
+    });
+
+    it("reassign chooses a recorded, unretired other member, needs a reason, and reports a moved row", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      getDashboard.mockResolvedValue(snapshot());
+      reassignGrant.mockResolvedValue({ outcome: "moved", current: { ...standing, reason: "edited elsewhere" } });
+      render(<Reach />);
+      await screen.findByText(/dies at the next restart/);
+      fireEvent.click(within("standing:hub-being:/w/home", "Reassign…")!);
+      const select = row("standing:hub-being:/w/home").querySelector("select") as HTMLSelectElement;
+      expect([...select.options].map((o) => o.value)).toEqual(["", "claude-code"]); // not itself, not retired
+      fireEvent.change(select, { target: { value: "claude-code" } });
+      fireEvent.click(within("standing:hub-being:/w/home", "Move to claude-code")!);
+      expect(await screen.findByText(/requires a reason/)).toBeTruthy();
+      expect(reassignGrant).not.toHaveBeenCalled();
+      const input = row("standing:hub-being:/w/home").querySelector("input[type=text]") as HTMLInputElement;
+      fireEvent.change(input, { target: { value: "granted to the wrong seat" } });
+      fireEvent.click(within("standing:hub-being:/w/home", "Move to claude-code")!);
+      await waitFor(() => expect(reassignGrant).toHaveBeenCalledWith(standing, "claude-code", "granted to the wrong seat"));
+      expect(await screen.findByText(/nothing was done — the standing grant changed since you looked \(it now reads "edited elsewhere"\)/)).toBeTruthy();
+    });
+
+    it("signed out: no act on any row", async () => {
+      operatorStatus.mockResolvedValue({ signed_in: false, lct_id: null });
+      getDashboard.mockResolvedValue(snapshot());
+      render(<Reach />);
+      await screen.findByText(/only readable here/);
+      expect(screen.queryByRole("button", { name: /Make standing|Include below|Make exact|Reassign/ })).toBeNull();
+    });
   });
 });
