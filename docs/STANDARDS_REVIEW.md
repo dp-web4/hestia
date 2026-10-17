@@ -11,10 +11,23 @@ Hestia is the local runtime-governance reference layer for Web4. Reviewers worki
 
 ## Hestia's role
 
-In standards vocabulary, Hestia supplies the local control and evidence plane:
+In standards vocabulary, Hestia supplies the local control and evidence plane. Status of
+each item against code was re-checked 2026-10-14; the first two are narrower than the
+vocabulary suggests:
 
-- authenticated member / agent identity;
-- role and delegation checks;
+- member / agent identity: **asserted, not authenticated**. Hestia mints and custodies
+  member LCTs, but on the tool-call path the caller supplies its own `plugin_id` over an
+  unauthenticated local MCP transport (`core/src/server/handler.rs` `tool_connect`).
+  Transport-established identity is
+  [PRD_ASSURANCE FR-1](PRD_ASSURANCE.md), state *not started*. Stronger, key-bound proof
+  exists only on specific doors: operator HTTP sessions (Ed25519 challenge), delegated scope
+  arbitration (seat registry key signature) and signed mesh envelopes;
+- role checks, and delegation for **scope arbitration only**: the launch role is checked
+  against the vault projection's permitted roles on every call; signed, revocable
+  delegation objects (`core/src/delegation.rs`) are consulted when a seat decides a scope
+  request inside a delegated prefix, and are not consulted on the tool-call (PreToolUse)
+  decision as of this date. Work in progress may change the second half; check the README
+  status table for the current state;
 - scoped authority;
 - allow / deny decisions;
 - human escalation;
