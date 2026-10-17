@@ -98,6 +98,12 @@ WITNESS_RESERVE_SECONDS = 1.0
 #: enforces on this process. A harness invocation is bounded by its registration; when both are
 #: known the smaller wins, so this can only shorten a registered bound.
 HOOK_TIMEOUT_ENV = "HESTIA_HOOK_TIMEOUT_S"
+#: The declaration a NON-harness invoker (the deploy preflight) makes that its event is a PROBE,
+#: not an act: a scope refusal is returned as a plain refusal and the daemon is asked nothing, so
+#: no peer scope request is opened for an act nobody will re-issue (dp, 2026-10-14: every deploy
+#: cycle's hold probe opened one per member). It can only withhold a request, never lift one:
+#: exactly "1" withholds, anything else is today's behaviour.
+NO_ESCALATE_ENV = "HESTIA_GATE_NO_ESCALATE"
 
 #: The rollout knob. ONE name for every seat, projected per seat by the vault as
 #: `<SEAT_TOKEN>__HESTIA_GATE_MODE` (the per-seat HESTIA_<SEAT>_GATE_MODE names are retired).
@@ -1223,6 +1229,12 @@ def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
        them added, passes. The one-time approvals are recorded on `inv.scope_spend` and spent in
        ONE atomic call after society law permits the act — a denied act consumes nothing."""
     import dataclasses
+    if os.environ.get(NO_ESCALATE_ENV) == "1":
+        # A declared probe: refuse as the law judged it and ask the daemon nothing.
+        return _verdict_deny(core._deny(
+            v.rule, v.reason + f" Not escalated: the invoker declared {NO_ESCALATE_ENV}=1 (a probe, "
+            "not an act), so no scope request was opened.",
+            innate=bool(v.innate), target=v.target))
     ws = core.detect_workspace(cprofile)
     targets, cur = [], v
     while cur.blocks and cur.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(cur, "target", ""):
