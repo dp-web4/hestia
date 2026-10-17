@@ -103,6 +103,14 @@ preflight and refuses identically, so there is nothing for the seat to retry.
 
 ## Install — Linux, user systemd (once per box)
 
+**On a checkout install, `deploy/fleet/install.sh` now does this for you** (`step_deploy_supervisor`):
+it clones the two deploy checkouts over https, installs `hestia-deploy` and both units with
+`HESTIA_WORKSPACE` rendered, and leaves the **timer off**. The dashboard's update button works
+straight away. Scheduled deploys stay off until the operator switches them on, either with the
+dashboard toggle (#1334) or with `HESTIA_AUTO_UPDATE=1` at install time. A release (`curl | sh`) install is
+skipped on purpose: it tracks releases, not main. The manual lines below remain the reference,
+and they are how a release install opts in to main-tracking.
+
     mkdir -p ~/.hestia/deploy
     git clone git@github.com:dp-web4/hestia.git ~/.hestia/deploy/hestia
     git clone git@github.com:dp-web4/web4.git   ~/.hestia/deploy/web4
