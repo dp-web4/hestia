@@ -287,6 +287,28 @@ impl Society {
             ))
     }
 
+    /// The chain witness for this society's witness chain (#339): the persisted Society key,
+    /// signing as the Society's key-derived LCT, with the legacy `anchor` string recorded as
+    /// an alias so rows the daemon appends "as the sovereign" name the real LCT. Read-only
+    /// like [`Self::persisted_signing_keypair`]: a missing or mismatched persisted identity is
+    /// an error, never a freshly minted key.
+    pub fn chain_witness_signer(
+        vault: &crate::vault::Vault,
+    ) -> anyhow::Result<crate::storage::ChainWitnessSigner> {
+        let persisted = crate::vault::load_doc::<Option<PersistedSociety>>(
+            vault,
+            SOVEREIGN_NAMESPACE,
+            SOVEREIGN_DOC,
+            SOVEREIGN_LEGACY_FILE,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("no persisted Society identity to witness the chain"))?;
+        let kp = recover_kp(&persisted.keypair_secret_hex, &persisted.lct).ok_or_else(|| {
+            anyhow::anyhow!("persisted Society key does not match its LCT public key")
+        })?;
+        Ok(crate::storage::ChainWitnessSigner::new(kp, &persisted.lct.lct_id())?
+            .with_signer_alias(&persisted.anchor))
+    }
+
     /// The society's canonical, key-derived LCT id (`lct:web4:mb32:…`).
     pub fn lct_id(&self) -> String {
         self.lct.lct_id()
