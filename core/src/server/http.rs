@@ -1329,6 +1329,10 @@ pub async fn serve_with_callback(
         // the registry, never typed. The three verbs of `hestia delegate`, on the operator plane.
         .route("/api/agents/:id/delegations", get(agent_delegations_list).post(agent_delegation_grant))
         .route("/api/agents/:id/delegations/:deleg/revoke", post(agent_delegation_revoke))
+        // How delegation participates in tool-call decisions (off | record | enforce, #1320).
+        // Operator plane only: no MCP tool reaches it. The live-daemon door; the CLI
+        // (`hestia delegate mode`) writes the vault and so works only while the daemon is down.
+        .route("/api/delegation/mode", get(delegation_mode_get).put(delegation_mode_set))
         .route("/api/agents/:id/retire", post(agent_retire))
         .route("/api/agents/:id/reinstate", post(agent_reinstate))
         .route("/api/agents/:id/bypass", post(agent_gate_bypass))
@@ -6549,6 +6553,55 @@ async fn agent_delegation_grant(
     })))
 }
 
+async fn delegation_mode_get(State(state): State<SharedState>) -> (StatusCode, Json<serde_json::Value>) {
+    let s = state.lock().await;
+    match crate::server::delegation_gate::load_mode(&s.vault) {
+        Ok(doc) => (StatusCode::OK, Json(serde_json::json!({
+            "mode": doc.as_ref().map(|d| d.mode.clone()).unwrap_or_else(|| "record".into()),
+            "explicit": doc.is_some(),
+            "set_at": doc.as_ref().map(|d| d.set_at),
+            "reason": doc.and_then(|d| d.reason),
+        }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e:#}")}))),
+    }
+}
+
+/// Set the delegation gate's mode. Witnessed: the row names the old and new mode and the reason,
+/// so "when did this society start refusing unauthorised acts, and who said so" is on the chain.
+async fn delegation_mode_set(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::server::delegation_gate::{load_mode, save_mode, GateMode};
+    let raw = body.get("mode").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let Some(mode) = GateMode::parse(&raw) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("unknown mode '{raw}': expected off, record or enforce")})));
+    };
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "reason is required"})));
+    }
+    let mut s = state.lock().await;
+    let from = load_mode(&s.vault).ok().flatten().map(|d| d.mode).unwrap_or_else(|| "record".into());
+    if let Err(e) = save_mode(&mut s.vault, mode, Some(reason.clone())) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("nothing changed: {e:#}")})));
+    }
+    s.delegation_gate.note_witnessed(mode);
+    let entry = s.append_chain("delegation_gate_mode", stamp_gate(serde_json::json!({
+        "from": from, "to": mode.as_str(), "reason": reason, "explicit": true,
+        "set_by": "operator-http",
+    }), &gate));
+    match entry {
+        Ok(e) => (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "mode": mode.as_str(), "from": from, "witnessEntryHash": e.hash}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("the mode IS now {} but its witness row failed: {e:#}", mode.as_str())}))),
+    }
+}
+
 async fn agent_delegation_revoke(
     State(state): State<SharedState>, Path((id, deleg)): Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
@@ -10478,6 +10531,30 @@ mod disposition_tests {
             Some(body) => agent_delegation_grant(State(state.clone()), Path(id.to_string()), Json(body)).await,
         };
         (st, b.0)
+    }
+
+    /// #1320: the live-daemon door for the delegation gate's mode. Validated, reasoned,
+    /// witnessed, and visible to the decision path's lock-free snapshot at once.
+    #[tokio::test]
+    async fn delegation_mode_is_set_on_the_operator_plane_and_witnessed() {
+        let (_dir, state) = test_state().await;
+        let (st, b) = delegation_mode_get(State(state.clone())).await;
+        assert_eq!((st, b.0["mode"].as_str(), b.0["explicit"].as_bool()), (StatusCode::OK, Some("record"), Some(false)));
+        let set = |body: serde_json::Value| {
+            let state = state.clone();
+            async move { delegation_mode_set(State(state), None, Json(body)).await }
+        };
+        assert_eq!(set(serde_json::json!({"mode": "enforced", "reason": "x"})).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(set(serde_json::json!({"mode": "enforce"})).await.0, StatusCode::BAD_REQUEST, "reason required");
+        let (st, b) = set(serde_json::json!({"mode": "enforce", "reason": "coverage granted"})).await;
+        assert_eq!(st, StatusCode::OK, "{}", b.0);
+        assert_eq!((b.0["from"].as_str(), b.0["mode"].as_str()), (Some("record"), Some("enforce")));
+        assert!(b.0["witnessEntryHash"].is_string());
+        // The lock-free snapshot the decision path reads already says so.
+        let snap = state.published().delegation_gate.snapshot();
+        assert_eq!(snap.effective_mode(), crate::server::delegation_gate::GateMode::Enforce);
+        let (_, b) = delegation_mode_get(State(state.clone())).await;
+        assert_eq!((b.0["mode"].as_str(), b.0["reason"].as_str()), (Some("enforce"), Some("coverage granted")));
     }
 
     /// dp's fourth ask, the half #1079 left: manage an agent's delegated authority from the

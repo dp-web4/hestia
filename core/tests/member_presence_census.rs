@@ -1084,6 +1084,32 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/state.rs::commit_retirement", &[
         "if let Some(lct) = self.member_registry.get(member).map(|l| l.lct_id()) {",
     ]),
+    // ADDED 2026-10-14 (#1320, delegation on the tool-call decision path). READING: presence
+    // used to DERIVE the delegation key (registry LCT -> `agent_key_for_lct`), the same use as
+    // `delegation_key_for` above, copied into a lock-free snapshot at lock release so the
+    // decision path can read it without the state lock. `refresh` reads only the COUNT, as a
+    // change fingerprint (a member minted on connect must reach the snapshot).
+    //
+    // IS IT A GATE: in the default `record` mode, no — the finding (`unkeyed` for a member with
+    // no registry LCT) is recorded on the decision row and changes no verdict. In the
+    // operator-set `enforce` mode, yes, and deliberately: an unregistered member has no key a
+    // delegation can bind to, so no delegation can cover its act and it is denied
+    // `delegation.absent` — the same fail-closed rule `tool_scope_arbitrate` applies to an
+    // unregistered arbiter (#952). DEGRADATION DIRECTION: an empty or stale registry denies
+    // (enforce) or records `unkeyed` (record); it never manufactures authority, because a
+    // delegation must still name the derived key AND verify against the operator key.
+    ("server/delegation_gate.rs::build", &[
+        "for (id, lct) in members.iter_sorted() {",
+    ]),
+    ("server/delegation_gate.rs::refresh", &[
+        "members: members.iter_sorted().len(),",
+    ]),
+    ("server/state.rs::initial_snapshot", &[
+        "self.delegation_gate.refresh(&self.vault, &self.member_registry, &self.role_registry);",
+    ]),
+    ("server/state.rs::on_release", &[
+        "self.delegation_gate.refresh(&self.vault, &self.member_registry, &self.role_registry);",
+    ]),
     // ADDED 2026-09-09 (cbp, the atomic `reassign`). READING: presence, used as a GATE, not
     // an advisory — the one thing the `scope_grant` reading above said would need its own
     // reading if it ever happened. An unknown destination is refused with 400 before any
