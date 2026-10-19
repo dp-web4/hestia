@@ -812,6 +812,21 @@ step_workspace_marker() {
 # it to main-tracking is a choice this step does not make for it. macOS: the launchd agent's
 # binary path must be derived from the daemon's registration (README), so it is not automated
 # here yet.
+# One systemd `Environment=` line for VAR=VALUE that survives systemd's own parser. Unquoted,
+# the value is split at whitespace (a workspace under "/home/x/My Projects" became two
+# assignments, one of them invalid and dropped: measured with systemd-analyze verify), `%` is
+# a specifier, and backslash and quote are special. So: double-quote the whole assignment,
+# escape backslash and quote, and double every `%` (systemd.exec(5), systemd.unit(5)
+# "Specifiers"). A newline cannot be expressed in a unit file at all: refuse it.
+systemd_env_line() {
+  local var="$1" val="$2" nl=$'\n'
+  case "$val" in *"$nl"*) return 1 ;; esac
+  val="${val//\\/\\\\}"
+  val="${val//\"/\\\"}"
+  val="${val//%/%%}"
+  printf 'Environment="%s=%s"\n' "$var" "$val"
+}
+
 step_deploy_supervisor() {
   if [ -n "${HESTIA_SKIP_DEPLOY:-}" ]; then
     c_dim "deploy supervisor skipped (HESTIA_SKIP_DEPLOY set)"
@@ -826,6 +841,17 @@ step_deploy_supervisor() {
     c_dim "release install (no checkout): update by re-running this installer."
     c_dim "  the deploy supervisor builds hestia main from source; to opt in, run this script"
     c_dim "  from a checkout, or see deploy/from-main/README.md"
+    return
+  fi
+  # The shipped units are bound to ~/.hestia (HESTIA_HOME=%h/.hestia here, and the same in the
+  # daemon unit this script installs), and hestia-deploy defaults its clones to
+  # ~/.hestia/deploy. Installing for another HESTIA_HOME would put the clones where the
+  # supervisor never looks and deploy into a home the daemon does not read. Until the units
+  # take HESTIA_HOME from configuration, say so instead of installing a half-wired supervisor.
+  if [ "$HESTIA_HOME" != "$HOME/.hestia" ]; then
+    c_warn "deploy supervisor not installed: HESTIA_HOME is $HESTIA_HOME, but the deploy units"
+    c_warn "  run against ~/.hestia. Install it by hand (deploy/from-main/README.md) if this box"
+    c_warn "  should deploy from main, with HESTIA_HOME and HESTIA_DEPLOY_ROOT set in the unit."
     return
   fi
   local missing=""
@@ -853,14 +879,38 @@ step_deploy_supervisor() {
   fi
   install -m 0755 "$src/hestia-deploy.sh" "$BIN_DIR/hestia-deploy"
   # The shipped unit leaves HESTIA_WORKSPACE empty on purpose ("render it from explicit operator
-  # configuration"); this installer's resolved workspace is that configuration.
-  sed "s|^Environment=HESTIA_WORKSPACE=\$|Environment=HESTIA_WORKSPACE=$HESTIA_WORKSPACE|" \
-    "$src/hestia-deploy.service" > "$unit_dir/hestia-deploy.service"
+  # configuration"); this installer's resolved workspace is that configuration. The line is
+  # replaced by awk reading it from the environment, not by sed: a workspace path containing
+  # `|`, `&` or `\` would otherwise be read as sed syntax.
+  local env_line
+  if ! env_line="$(systemd_env_line HESTIA_WORKSPACE "$HESTIA_WORKSPACE")"; then
+    c_err "HESTIA_WORKSPACE contains a newline; a systemd unit cannot carry it"
+    return 1
+  fi
+  if ! ENV_LINE="$env_line" awk '
+      $0 == "Environment=HESTIA_WORKSPACE=" { print ENVIRON["ENV_LINE"]; n++; next }
+      { print }
+      END { exit n == 1 ? 0 : 1 }' \
+      "$src/hestia-deploy.service" > "$unit_dir/hestia-deploy.service"; then
+    c_err "hestia-deploy.service no longer has exactly one empty HESTIA_WORKSPACE= line: $src"
+    return 1
+  fi
   install -m 0644 "$src/hestia-deploy.timer" "$unit_dir/hestia-deploy.timer"
   # Read back, as the other steps do: a zero exit is not evidence the bytes landed.
-  if ! grep -qx "Environment=HESTIA_WORKSPACE=$HESTIA_WORKSPACE" "$unit_dir/hestia-deploy.service"; then
+  if ! grep -qxF -- "$env_line" "$unit_dir/hestia-deploy.service"; then
     c_err "hestia-deploy.service was written without HESTIA_WORKSPACE: $unit_dir/hestia-deploy.service"
     return 1
+  fi
+  # And have systemd itself parse it, where it can: an assignment it splits or rejects is a
+  # warning on stderr with exit 0, so the warning is what is checked.
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    local verify
+    verify="$(systemd-analyze verify "$unit_dir/hestia-deploy.service" 2>&1 || true)"
+    case "$verify" in
+      *"nvalid environment"*|*"Failed to resolve"*)
+        c_err "systemd does not parse the rendered unit: $verify"
+        return 1 ;;
+    esac
   fi
   systemctl --user daemon-reload
   c_ok "deploy supervisor installed: the dashboard update button works"
