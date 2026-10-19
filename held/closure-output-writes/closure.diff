@@ -1,6 +1,6 @@
 --- /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_main_base.py	2026-10-19 16:32:06.996594805 -0700
-+++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_rev.py	2026-10-19 16:32:07.066692635 -0700
-@@ -933,6 +933,382 @@
++++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_rev.py	2026-10-19 16:44:50.342086920 -0700
+@@ -933,6 +933,387 @@
      return None
  
  
@@ -368,9 +368,14 @@
 +            progs = pos[:1]
 +        if any(_AWK_WRITE.search(p) for p in progs):
 +            raise _OutOfGrammar()
-+        # -d / -p / -o with no file write awkvars.out / awkprof.out in the cwd
-+        if seen & {"-d", "-p", "-o", "--dump-variables", "--profile", "--pretty-print"} and not w:
-+            w = ["."]
++        # Each of -d / -p / -o given WITHOUT a file writes its default (awkvars.out /
++        # awkprof.out) in the cwd -- per option: an explicit file for one does not stand in for
++        # another given bare (`gawk -d -p/tmp/prof` still writes ./awkvars.out; Codex, #1349).
++        for short_k, long_k in (("-d", "--dump-variables"), ("-p", "--profile"),
++                                ("-o", "--pretty-print")):
++            for k in (short_k, long_k):
++                if k in seen and not vals.get(k):
++                    w.append(".")
 +        return w
 +    if name in ("perl", "ruby"):
 +        if any(a.startswith("-") and not a.startswith("--")
@@ -383,7 +388,7 @@
  def _command_write_targets(words: list, stdin_src=None) -> list:
      """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
      their file args are read positions by default (the anti-FP stance; the daemon's
-@@ -968,20 +1344,18 @@
+@@ -968,20 +1349,18 @@
              raise _OpaqueWriter()
          return _patch_write_targets(pin)
      if name == "sed":
@@ -416,7 +421,7 @@
      if name in ("chmod", "chown", "chgrp"):
          pos = _positionals(args, opts_with_value=("--reference",))
          return pos[1:]
-@@ -997,6 +1371,9 @@
+@@ -997,6 +1376,9 @@
          return _positionals(args)
      if name == "touch":
          return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
@@ -426,7 +431,7 @@
      if name == "git":
          # Skip global options to find the subcommand.
          i = 0
-@@ -1078,7 +1455,24 @@
+@@ -1078,7 +1460,24 @@
              return _positionals(rest, opts_with_value=("-s", "--source"))
          if sub == "clean":
              return _positionals(rest)
@@ -452,7 +457,7 @@
      return []
  
  
-@@ -1171,14 +1565,31 @@
+@@ -1171,14 +1570,31 @@
      any out-of-grammar construct (caller -> out-of-grammar posture)."""
      toks = _tokenize(_strip_heredoc_bodies(command))
      targets, cur = [], []
@@ -485,7 +490,7 @@
                  cur = []
              stdin_src = None
              i += 1
-@@ -1209,7 +1620,12 @@
+@@ -1209,7 +1625,12 @@
          cur.append(t)
          i += 1
      if cur:

@@ -121,6 +121,13 @@ PAIRS = [
     ("uniq --group bare", f"uniq --group /tmp/in {T}", f"uniq --group {T}"),
     ("split --numeric-suffixes bare", f"split --numeric-suffixes /tmp/in {D}/x",
      f"split --numeric-suffixes {T} /tmp/x"),
+    # Codex dissent 28240 (round 5): a bare output option's cwd default is per option
+    ("gawk -d bare + -p file", f"cd {D} && gawk -d -p/tmp/profile 'BEGIN {{print 1}}'",
+     f"cd /tmp && gawk -d -p/tmp/profile 'BEGIN {{print 1}}'"),
+    ("gawk -p bare + -d file", f"cd {D} && gawk -p -d/tmp/vars 'BEGIN {{print 1}}'",
+     f"cd /tmp && gawk -p -d/tmp/vars 'BEGIN {{print 1}}'"),
+    ("gawk --profile bare + --dump-variables=", f"cd {D} && gawk --profile --dump-variables=/tmp/v 'BEGIN {{}}'",
+     f"gawk --profile=/tmp/p --dump-variables=/tmp/v '{{print}}' {T}"),
     # a verb that runs another verb
     ("xargs rm", f"echo {T} | xargs rm", f"grep -l deny {T}"),
     ("find -exec", f"find {D} -name '*.py' -exec rm {{}} +", f"find {D} -name '*.py'"),
