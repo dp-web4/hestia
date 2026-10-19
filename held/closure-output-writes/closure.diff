@@ -1,6 +1,6 @@
 --- /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_main_base.py	2026-10-19 16:32:06.996594805 -0700
-+++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_rev.py	2026-10-19 16:44:50.342086920 -0700
-@@ -933,6 +933,387 @@
++++ plugins/_shared/hestia_governance_closure.py	2026-10-19 16:56:05.752510131 -0700
+@@ -933,6 +933,391 @@
      return None
  
  
@@ -61,9 +61,9 @@
 +                values.setdefault("--" + key, []).append(val)
 +                if kind == _WR:
 +                    writes.append(val)
-+            elif eq:  # optional value, attached only
-+                values.setdefault("--" + key, []).append(val)
-+                if kind == _OPT_WR:
++            else:  # optional value, attached only; a bare occurrence is recorded as None
++                values.setdefault("--" + key, []).append(val if eq else None)
++                if eq and kind == _OPT_WR:
 +                    writes.append(val)
 +            i += 1
 +            continue
@@ -82,10 +82,11 @@
 +                    continue
 +                val = body[j + 1:]
 +                if kind in (_OPT_RD, _OPT_WR):
-+                    if val:
-+                        values.setdefault("-" + ch, []).append(val)
-+                        if kind == _OPT_WR:
-+                            writes.append(val)
++                    # Per occurrence: a bare one is recorded as None, so a repeat that names a
++                    # file cannot hide it (`gawk -p/tmp/p -p`; Codex, #1349 round 6).
++                    values.setdefault("-" + ch, []).append(val or None)
++                    if val and kind == _OPT_WR:
++                        writes.append(val)
 +                    break
 +                if not val:
 +                    if i + 1 >= len(args):
@@ -374,7 +375,10 @@
 +        for short_k, long_k in (("-d", "--dump-variables"), ("-p", "--profile"),
 +                                ("-o", "--pretty-print")):
 +            for k in (short_k, long_k):
-+                if k in seen and not vals.get(k):
++                # Any BARE occurrence writes the default, even if another occurrence names a
++                # file. (gawk honours that for -p/-o; for -d the last one wins, so counting a
++                # bare -d errs toward refusing -- the safe direction.)
++                if None in vals.get(k, []):
 +                    w.append(".")
 +        return w
 +    if name in ("perl", "ruby"):
@@ -388,7 +392,7 @@
  def _command_write_targets(words: list, stdin_src=None) -> list:
      """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
      their file args are read positions by default (the anti-FP stance; the daemon's
-@@ -968,20 +1349,18 @@
+@@ -968,20 +1353,18 @@
              raise _OpaqueWriter()
          return _patch_write_targets(pin)
      if name == "sed":
@@ -421,7 +425,7 @@
      if name in ("chmod", "chown", "chgrp"):
          pos = _positionals(args, opts_with_value=("--reference",))
          return pos[1:]
-@@ -997,6 +1376,9 @@
+@@ -997,6 +1380,9 @@
          return _positionals(args)
      if name == "touch":
          return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
@@ -431,7 +435,7 @@
      if name == "git":
          # Skip global options to find the subcommand.
          i = 0
-@@ -1078,7 +1460,24 @@
+@@ -1078,7 +1464,24 @@
              return _positionals(rest, opts_with_value=("-s", "--source"))
          if sub == "clean":
              return _positionals(rest)
@@ -457,7 +461,7 @@
      return []
  
  
-@@ -1171,14 +1570,31 @@
+@@ -1171,14 +1574,31 @@
      any out-of-grammar construct (caller -> out-of-grammar posture)."""
      toks = _tokenize(_strip_heredoc_bodies(command))
      targets, cur = [], []
@@ -490,7 +494,7 @@
                  cur = []
              stdin_src = None
              i += 1
-@@ -1209,7 +1625,12 @@
+@@ -1209,7 +1629,12 @@
          cur.append(t)
          i += 1
      if cur:

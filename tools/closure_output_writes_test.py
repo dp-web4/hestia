@@ -128,6 +128,15 @@ PAIRS = [
      f"cd /tmp && gawk -p -d/tmp/vars 'BEGIN {{print 1}}'"),
     ("gawk --profile bare + --dump-variables=", f"cd {D} && gawk --profile --dump-variables=/tmp/v 'BEGIN {{}}'",
      f"gawk --profile=/tmp/p --dump-variables=/tmp/v '{{print}}' {T}"),
+    # Codex round 6 (28252): the same optional output option repeated, with and without a file
+    ("gawk -p file then -p bare", f"cd {D} && gawk -p/tmp/profile -p 'BEGIN{{print 1}}'",
+     f"cd /tmp && gawk -p/tmp/profile -p 'BEGIN{{print 1}}'"),
+    ("gawk -p bare then -p file", f"cd {D} && gawk -p -p/tmp/profile 'BEGIN{{print 1}}'",
+     f"cd /tmp && gawk -p -p/tmp/profile 'BEGIN{{print 1}}'"),
+    ("gawk --profile= then --profile", f"cd {D} && gawk --profile=/tmp/p --profile 'BEGIN{{}}'",
+     f"gawk --profile=/tmp/p --profile=/tmp/q '{{print}}' {T}"),
+    ("gawk -o file then -o bare", f"cd {D} && gawk -o/tmp/pp -o 'BEGIN{{}}'",
+     f"gawk -o/tmp/pp -o/tmp/qq '{{print}}' {T}"),
     # a verb that runs another verb
     ("xargs rm", f"echo {T} | xargs rm", f"grep -l deny {T}"),
     ("find -exec", f"find {D} -name '*.py' -exec rm {{}} +", f"find {D} -name '*.py'"),

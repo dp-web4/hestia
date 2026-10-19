@@ -990,9 +990,9 @@ def _parse_opts(args: list, short: dict, long: dict):
                 values.setdefault("--" + key, []).append(val)
                 if kind == _WR:
                     writes.append(val)
-            elif eq:  # optional value, attached only
-                values.setdefault("--" + key, []).append(val)
-                if kind == _OPT_WR:
+            else:  # optional value, attached only; a bare occurrence is recorded as None
+                values.setdefault("--" + key, []).append(val if eq else None)
+                if eq and kind == _OPT_WR:
                     writes.append(val)
             i += 1
             continue
@@ -1011,10 +1011,11 @@ def _parse_opts(args: list, short: dict, long: dict):
                     continue
                 val = body[j + 1:]
                 if kind in (_OPT_RD, _OPT_WR):
-                    if val:
-                        values.setdefault("-" + ch, []).append(val)
-                        if kind == _OPT_WR:
-                            writes.append(val)
+                    # Per occurrence: a bare one is recorded as None, so a repeat that names a
+                    # file cannot hide it (`gawk -p/tmp/p -p`; Codex, #1349 round 6).
+                    values.setdefault("-" + ch, []).append(val or None)
+                    if val and kind == _OPT_WR:
+                        writes.append(val)
                     break
                 if not val:
                     if i + 1 >= len(args):
@@ -1084,13 +1085,14 @@ _CURL = (_table("sSLfkiIvGNqgjlnBZMVhJRp0123456#O", rd="XHduAebmErTwxUCFyYzQtP",
                  "limit-rate speed-limit speed-time max-redirs",
                  wr="output dump-header cookie-jar trace trace-ascii stderr libcurl etag-save "
                  "hsts alt-svc output-dir", ex="config"))
-_WGET = (_table("qvSNcxkpEKnrmb", rd="tTwUeiQlARDIX", wr="Ooa P".replace(" ", "")),
+_WGET = (_table("qvSNcxkpEKnrmb", rd="tTwUiQlARDIX", wr="OoaP", ex="e"),
          _ltable("quiet verbose no-verbose server-response spider timestamping continue "
                  "no-clobber recursive mirror page-requisites convert-links adjust-extension "
                  "no-check-certificate no-parent no-directories force-directories "
                  "no-host-directories content-disposition https-only inet4-only inet6-only "
                  "background " + _COMMON_LONG,
-                 rd="tries timeout wait user-agent execute input-file quota level accept reject "
+                 ex="execute config",
+                 rd="tries timeout wait user-agent input-file quota level accept reject "
                  "domains header user password post-data post-file method body-data limit-rate "
                  "referer max-redirect load-cookies",
                  wr="output-document output-file append-output directory-prefix save-cookies "
@@ -1133,7 +1135,9 @@ _SED_WRITE = re.compile(r"(?:^|[;{}\n]|\d|\$|/)\s*[wW]\s*\S|s(.).*?\1.*?\1[gpiIm
 #: A bare `>` elsewhere is a comparison (`NR>5`) and does not write.
 _AWK_WRITE = re.compile(r"\bprintf?\b[^;{}]*?(?:>|\|)|\|\s*getline|\bsystem\s*\(")
 #: Verbs that only read or print, safe to run from xargs / find -exec on governed paths.
-_PASSIVE_VERBS = frozenset({"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc", "ls",
+#: (rg is NOT here: `--pre CMD` runs a program on every input -- Codex, #1349. Each verb kept has
+#: no option that executes or writes, so its arguments cannot add an effect.)
+_PASSIVE_VERBS = frozenset({"grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls",
                             "stat", "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum",
                             "echo", "printf", "basename", "dirname", "realpath", "readlink",
                             "du", "test", "[", "true", "diff", "cmp"})
@@ -1156,6 +1160,20 @@ def _inner_is_passive(words: list) -> bool:
     """For xargs / find -exec: is the command they run one that only reads?"""
     words = _strip_wrappers(words)
     return bool(words) and os.path.basename(words[0]) in _PASSIVE_VERBS
+
+
+def _find_exec_open(cur: list) -> bool:
+    """Is `cur` a find command with an -exec/-execdir/-ok/-okdir not yet terminated?"""
+    words = _strip_wrappers(cur) if cur else []
+    if not words or os.path.basename(words[0]) != "find":
+        return False
+    open_ = False
+    for w in words[1:]:
+        if w in ("-exec", "-execdir", "-ok", "-okdir"):
+            open_ = True
+        elif open_ and w in (";", "+"):
+            open_ = False
+    return open_
 
 
 def _expand_old_tar(args: list) -> list:
@@ -1188,8 +1206,8 @@ def _find_write_targets(args: list) -> list:
     while i < len(args):
         p = args[i]
         if p in ("-exec", "-execdir", "-ok", "-okdir"):
-            # The terminator: `+`, or `;` -- which the tokenizer usually takes as a command
-            # separator, ending this simple command at the inner command's last word.
+            # The terminator is `+` or `;`. The walker keeps an escaped `\;` inside this simple
+            # command (see _bash_write_targets); none at all means the shell would reject it.
             end = next((k for k in range(i + 1, len(args)) if args[k] in (";", "+")), len(args))
             if not _inner_is_passive(args[i + 1:end]):
                 raise _OutOfGrammar()  # runs a command that may write
@@ -1230,6 +1248,11 @@ def _output_verb_write_targets(name: str, args: list):
         return pos[:1] if name == "mknod" else pos
     if name == "curl":
         w, _, seen, vals = _parse_opts(args, *_CURL)
+        # --write-out is a small program: `%output{F}` / `%output{>>F}` open F for writing, and
+        # `@F` reads the program from a file this classifier does not read (Codex, #1349).
+        for fmt in vals.get("-w", []) + vals.get("--write-out", []):
+            if fmt.startswith("@") or "%output{" in fmt or "%{output" in fmt:
+                raise _OutOfGrammar()
         w = [v for v in w if v != "-"]
         if seen & {"-O", "--remote-name", "--remote-name-all"}:
             w += vals.get("--output-dir", []) or ["."]       # named by the URL, in the cwd
@@ -1275,9 +1298,17 @@ def _output_verb_write_targets(name: str, args: list):
             progs = pos[:1]
         if any(_AWK_WRITE.search(p) for p in progs):
             raise _OutOfGrammar()
-        # -d / -p / -o with no file write awkvars.out / awkprof.out in the cwd
-        if seen & {"-d", "-p", "-o", "--dump-variables", "--profile", "--pretty-print"} and not w:
-            w = ["."]
+        # Each of -d / -p / -o given WITHOUT a file writes its default (awkvars.out /
+        # awkprof.out) in the cwd -- per option: an explicit file for one does not stand in for
+        # another given bare (`gawk -d -p/tmp/prof` still writes ./awkvars.out; Codex, #1349).
+        for short_k, long_k in (("-d", "--dump-variables"), ("-p", "--profile"),
+                                ("-o", "--pretty-print")):
+            for k in (short_k, long_k):
+                # Any BARE occurrence writes the default, even if another occurrence names a
+                # file. (gawk honours that for -p/-o; for -d the last one wins, so counting a
+                # bare -d errs toward refusing -- the safe direction.)
+                if None in vals.get(k, []):
+                    w.append(".")
         return w
     if name in ("perl", "ruby"):
         if any(a.startswith("-") and not a.startswith("--")
@@ -1553,6 +1584,15 @@ def _bash_write_targets(command: str) -> list:
     i = 0
     while i < len(toks):
         t = toks[i]
+        if t == ";" and _find_exec_open(cur):
+            # `find ... -exec CMD {} \;`: the tokenizer cannot tell an escaped `\;` from a
+            # separator, and treating it as one ended `find` here and turned what follows
+            # (`-fprint F`, `-delete`) into a "command" of its own that writes nothing (#1349
+            # round 4). Keep it as find's terminator. For an unescaped `;` this over-reads
+            # (bash would end the command there and fail), which errs toward refusing.
+            cur.append(t)
+            i += 1
+            continue
         if t in _SEPARATORS:
             if cur:
                 try:
