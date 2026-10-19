@@ -2,9 +2,48 @@
 
 | file | sha256 |
 |---|---|
-| `6641c07133390027d7a276de08d6cb516b3d9c7756746c1344c358defd1edf93.patch` | `6641c07133390027d7a276de08d6cb516b3d9c7756746c1344c358defd1edf93` (base main `9b4147bc`) **current** |
+| `7d2566b39572740f600516825aefb960d65e58846e75fe251028dda5a7a35093.patch` | `7d2566b39572740f600516825aefb960d65e58846e75fe251028dda5a7a35093` (base main `ee7f00d8`) **current** |
+| `6641c071…patch` (base `9b4147bc`) | superseded: NOVA HOLD at 7a6e410b, and its manifest hunks no longer apply after #1343 |
 
-**Files:** the gate core and the single gate, their hooks-gt copies and manifests, and the decide contract test. 10 files, +158 −37.
+**Files:** the gate core and the single gate, their hooks-gt copies and manifests, and the decide contract test. 10 files, +336 −37.
+
+## v2: the NOVA HOLD at 7a6e410b
+
+**The hold:** `egress_surfaces()` / `egress_blobs()` ran `list(...)` over the declared value. A bare string naming an ssh
+key became one-character blobs that match no token, so the act was **allowed**.
+
+**The fix: one normalizer, in the core, used by both files.**
+- `hestia_gate_core.egress_items(value)`: a string is ONE blob. A list or tuple contributes its strings, flattened
+  through nested lists and tuples, and `None` entries are skipped. Anything else (a dict, bytes, a number, a set, a
+  generator, or a list holding one) returns `None`: it cannot be swept.
+- **Fail closed:** `egress_unsweepable_deny(event)` returns the innate `egress.secret` deny for unsweepable egress,
+  with its type named in the reason. It runs before the token sweep at both Gate 1a sites (`evaluate`,
+  `degraded_verdict`) and in the single gate's `_egress_precheck`.
+- **The single gate** takes its declared part from `core.egress_items`. Unsweepable egress is handed to the core
+  **whole**, so the core refuses it on its own, in degraded mode too.
+
+**New contract cells (in `test_declared_egress_is_swept_and_never_scoped`):**
+- A secret as a bare `str`, as a nested list and as a tuple, run through 4 seats' `decide`, through the handoff to the
+  core (which must receive it whole), and through the core's `evaluate` and `degraded_verdict`. Every case is denied.
+- A benign bare `str`: allowed and never scoped, in 4 seats and in both core sites.
+- Unsweepable, with benign text inside (dict, bytes, int, set, generator, list-with-dict): fails closed in 4 seats'
+  `decide`, in both core sites, and in the core alone after the single gate's handoff.
+
+**v2 evidence (on main `ee7f00d8`, scratch copies through `HESTIA_CONTRACT_OVERLAY`):**
+
+| check | result |
+|---|---|
+| decide contract test | every cell passes except `scope-sinks-allowed`/`-open-nothing`, which **unpatched main fails identically in the same `/tmp` worktree** (the test treats `/tmp/x` as an outside path, and the worktree is itself under `/tmp`) |
+| M4: a string is iterated by character (the original bug) | 43 red |
+| M5: unsweepable egress is dropped instead of refused | 42 red |
+| M6: `degraded_verdict` skips the fail-closed check | 6 red (all the degraded unsweepable cells) |
+| M7: the single gate keeps `_leaves(list(...))` | 11 red + the test raises TypeError |
+| `tools/shell_scope_reach_battery_test.py` | 1434 passed, 0 failed |
+| `plugins/_shared/test_gate_core.py` (scratch core preloaded) | all checks pass |
+| `tools/hooks_gt.py check` on the post-patch tree (in memory) | no findings |
+| `git apply --check` on a pristine `ee7f00d8` worktree | clean |
+
+The sections below describe v1 and still hold, apart from the normalizer above.
 The hooks-gt half was emitted by `tools/hooks_gt.emit_patch`, which read the two scratch sources through
 `Path.read_bytes`. The scratch copies lived under `/tmp` with names that match no governed marker, so no governed file was written.
 Nothing here is applied.
@@ -68,6 +107,6 @@ All checks ran from the live repo, with `HESTIA_CONTRACT_OVERLAY` / `HESTIA_SCOP
 
 - **SAGE #335:** pass `egress=[query]` on the `GateEvent` (or on `NormalizedEvent` in the local-law path), then delete the client-local `forbidden_tokens()` sweep and its `egress.unswept` refusal.
 - **#1338:** build the remote-cognition pre-egress gate on this field.
-- **Housekeeping:** delete `held/6641c071…patch` and this README in the commit that applies it.
+- **Housekeeping:** delete `held/7d2566b3…patch` and this README in the commit that applies it.
 
 — legion-claude
