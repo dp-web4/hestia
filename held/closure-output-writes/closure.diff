@@ -1,6 +1,6 @@
---- plugins/_shared/hestia_governance_closure.py	2026-10-19 15:41:52.715685691 -0700
-+++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_rev.py	2026-10-19 16:15:35.798285502 -0700
-@@ -933,6 +933,360 @@
+--- /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_main_base.py	2026-10-19 16:32:06.996594805 -0700
++++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_rev.py	2026-10-19 16:32:07.066692635 -0700
+@@ -933,6 +933,382 @@
      return None
  
  
@@ -155,13 +155,14 @@
 +                 "limit-rate speed-limit speed-time max-redirs",
 +                 wr="output dump-header cookie-jar trace trace-ascii stderr libcurl etag-save "
 +                 "hsts alt-svc output-dir", ex="config"))
-+_WGET = (_table("qvSNcxkpEKnrmb", rd="tTwUeiQlARDIX", wr="Ooa P".replace(" ", "")),
++_WGET = (_table("qvSNcxkpEKnrmb", rd="tTwUiQlARDIX", wr="OoaP", ex="e"),
 +         _ltable("quiet verbose no-verbose server-response spider timestamping continue "
 +                 "no-clobber recursive mirror page-requisites convert-links adjust-extension "
 +                 "no-check-certificate no-parent no-directories force-directories "
 +                 "no-host-directories content-disposition https-only inet4-only inet6-only "
 +                 "background " + _COMMON_LONG,
-+                 rd="tries timeout wait user-agent execute input-file quota level accept reject "
++                 ex="execute config",
++                 rd="tries timeout wait user-agent input-file quota level accept reject "
 +                 "domains header user password post-data post-file method body-data limit-rate "
 +                 "referer max-redirect load-cookies",
 +                 wr="output-document output-file append-output directory-prefix save-cookies "
@@ -204,7 +205,9 @@
 +#: A bare `>` elsewhere is a comparison (`NR>5`) and does not write.
 +_AWK_WRITE = re.compile(r"\bprintf?\b[^;{}]*?(?:>|\|)|\|\s*getline|\bsystem\s*\(")
 +#: Verbs that only read or print, safe to run from xargs / find -exec on governed paths.
-+_PASSIVE_VERBS = frozenset({"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc", "ls",
++#: (rg is NOT here: `--pre CMD` runs a program on every input -- Codex, #1349. Each verb kept has
++#: no option that executes or writes, so its arguments cannot add an effect.)
++_PASSIVE_VERBS = frozenset({"grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls",
 +                            "stat", "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum",
 +                            "echo", "printf", "basename", "dirname", "realpath", "readlink",
 +                            "du", "test", "[", "true", "diff", "cmp"})
@@ -227,6 +230,20 @@
 +    """For xargs / find -exec: is the command they run one that only reads?"""
 +    words = _strip_wrappers(words)
 +    return bool(words) and os.path.basename(words[0]) in _PASSIVE_VERBS
++
++
++def _find_exec_open(cur: list) -> bool:
++    """Is `cur` a find command with an -exec/-execdir/-ok/-okdir not yet terminated?"""
++    words = _strip_wrappers(cur) if cur else []
++    if not words or os.path.basename(words[0]) != "find":
++        return False
++    open_ = False
++    for w in words[1:]:
++        if w in ("-exec", "-execdir", "-ok", "-okdir"):
++            open_ = True
++        elif open_ and w in (";", "+"):
++            open_ = False
++    return open_
 +
 +
 +def _expand_old_tar(args: list) -> list:
@@ -259,8 +276,8 @@
 +    while i < len(args):
 +        p = args[i]
 +        if p in ("-exec", "-execdir", "-ok", "-okdir"):
-+            # The terminator: `+`, or `;` -- which the tokenizer usually takes as a command
-+            # separator, ending this simple command at the inner command's last word.
++            # The terminator is `+` or `;`. The walker keeps an escaped `\;` inside this simple
++            # command (see _bash_write_targets); none at all means the shell would reject it.
 +            end = next((k for k in range(i + 1, len(args)) if args[k] in (";", "+")), len(args))
 +            if not _inner_is_passive(args[i + 1:end]):
 +                raise _OutOfGrammar()  # runs a command that may write
@@ -301,6 +318,11 @@
 +        return pos[:1] if name == "mknod" else pos
 +    if name == "curl":
 +        w, _, seen, vals = _parse_opts(args, *_CURL)
++        # --write-out is a small program: `%output{F}` / `%output{>>F}` open F for writing, and
++        # `@F` reads the program from a file this classifier does not read (Codex, #1349).
++        for fmt in vals.get("-w", []) + vals.get("--write-out", []):
++            if fmt.startswith("@") or "%output{" in fmt or "%{output" in fmt:
++                raise _OutOfGrammar()
 +        w = [v for v in w if v != "-"]
 +        if seen & {"-O", "--remote-name", "--remote-name-all"}:
 +            w += vals.get("--output-dir", []) or ["."]       # named by the URL, in the cwd
@@ -361,7 +383,7 @@
  def _command_write_targets(words: list, stdin_src=None) -> list:
      """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
      their file args are read positions by default (the anti-FP stance; the daemon's
-@@ -968,20 +1322,18 @@
+@@ -968,20 +1344,18 @@
              raise _OpaqueWriter()
          return _patch_write_targets(pin)
      if name == "sed":
@@ -394,7 +416,7 @@
      if name in ("chmod", "chown", "chgrp"):
          pos = _positionals(args, opts_with_value=("--reference",))
          return pos[1:]
-@@ -997,6 +1349,9 @@
+@@ -997,6 +1371,9 @@
          return _positionals(args)
      if name == "touch":
          return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
@@ -404,7 +426,7 @@
      if name == "git":
          # Skip global options to find the subcommand.
          i = 0
-@@ -1078,7 +1433,24 @@
+@@ -1078,7 +1455,24 @@
              return _positionals(rest, opts_with_value=("-s", "--source"))
          if sub == "clean":
              return _positionals(rest)
@@ -430,7 +452,7 @@
      return []
  
  
-@@ -1171,6 +1543,11 @@
+@@ -1171,14 +1565,31 @@
      any out-of-grammar construct (caller -> out-of-grammar posture)."""
      toks = _tokenize(_strip_heredoc_bodies(command))
      targets, cur = [], []
@@ -442,8 +464,17 @@
      stdin_src = None  # `< file` source for the current simple command (patch input)
      eff = ""  # relative cwd accumulator; cd within this command line adjusts it
      i = 0
-@@ -1178,7 +1555,10 @@
+     while i < len(toks):
          t = toks[i]
++        if t == ";" and _find_exec_open(cur):
++            # `find ... -exec CMD {} \;`: the tokenizer cannot tell an escaped `\;` from a
++            # separator, and treating it as one ended `find` here and turned what follows
++            # (`-fprint F`, `-delete`) into a "command" of its own that writes nothing (#1349
++            # round 4). Keep it as find's terminator. For an unescaped `;` this over-reads
++            # (bash would end the command there and fail), which errs toward refusing.
++            cur.append(t)
++            i += 1
++            continue
          if t in _SEPARATORS:
              if cur:
 -                eff = _flush_simple_command(cur, eff, targets, stdin_src)
@@ -454,7 +485,7 @@
                  cur = []
              stdin_src = None
              i += 1
-@@ -1209,7 +1589,12 @@
+@@ -1209,7 +1620,12 @@
          cur.append(t)
          i += 1
      if cur:
