@@ -194,7 +194,7 @@ PINNED_BASELINE: dict | None = {
     "deploy/from-main/hestia-deploy.service":       {"unit-home-hestia": 2},
     "deploy/from-main/hestia-deploy.timer":         {},
     "deploy/from-main/hestia-deploy.sh":            {"shell-home-default": 3, "shell-home-hestia": 2},
-    "deploy/fleet/install.sh":                      {"shell-home-default": 1, "shell-home-hestia": 5, "unit-home-hestia": 4},
+    "deploy/fleet/install.sh":                      {"shell-home-hestia": 5, "unit-home-hestia": 4},
     "deploy/install-members.sh":                    {"expanduser-tilde": 1, "shell-home-default": 1, "shell-home-hestia": 1},
 }
 

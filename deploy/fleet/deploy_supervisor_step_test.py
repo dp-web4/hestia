@@ -116,6 +116,7 @@ exit 0
             "PATH": f"{bin_stubs}:/usr/bin:/bin",  # /usr/bin keeps systemd-analyze when installed
             "HOME": str(home),
             "HESTIA_HOME": str(home / ".hestia"),
+            "HESTIA_HOME_DEFAULT": str(home / ".hestia"),
             "HESTIA_WORKSPACE": ws,
             "BIN_DIR": str(home / ".local/bin"),
         }
@@ -190,7 +191,7 @@ for name in ("My Projects", 'a "q" b', "back\\slash", "100% ws", "pipe|amp&x", "
 r = run(env_extra={"HESTIA_HOME": "/srv/elsewhere/hestia"})
 check("non-default HESTIA_HOME skips", r["rc"] == 0 and r["unit"] is None and not r["script"]
       and r["calls"] == [], r["out"])
-check("non-default HESTIA_HOME says why", "~/.hestia" in r["out"] and "/srv/elsewhere/hestia" in r["out"],
+check("non-default HESTIA_HOME says why", str(pathlib.Path("home")) in r["out"] and "/srv/elsewhere/hestia" in r["out"],
       r["out"])
 
 # 9. The model above agrees with systemd where systemd is installed.

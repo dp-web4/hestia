@@ -31,7 +31,9 @@ REPO="dp-web4/hestia"
 # falls back to this floor only when the API cannot be reached (offline, rate-limited).
 FALLBACK_VERSION="v0.0.4"
 VERSION="${HESTIA_VERSION:-}"
-HESTIA_HOME="${HESTIA_HOME:-$HOME/.hestia}"
+# The default home, named once: the deploy units are bound to it (step_deploy_supervisor).
+HESTIA_HOME_DEFAULT="$HOME/.hestia"
+HESTIA_HOME="${HESTIA_HOME:-$HESTIA_HOME_DEFAULT}"
 HESTIA_BIND="${HESTIA_BIND:-127.0.0.1:7711}"
 # DERIVE, do not enumerate. The first draft of this block listed the workspace roots of
 # the machines in this fleet, which is wrong twice: it is a guess on any machine not on
@@ -848,9 +850,9 @@ step_deploy_supervisor() {
   # ~/.hestia/deploy. Installing for another HESTIA_HOME would put the clones where the
   # supervisor never looks and deploy into a home the daemon does not read. Until the units
   # take HESTIA_HOME from configuration, say so instead of installing a half-wired supervisor.
-  if [ "$HESTIA_HOME" != "$HOME/.hestia" ]; then
+  if [ "$HESTIA_HOME" != "${HESTIA_HOME_DEFAULT:?}" ]; then
     c_warn "deploy supervisor not installed: HESTIA_HOME is $HESTIA_HOME, but the deploy units"
-    c_warn "  run against ~/.hestia. Install it by hand (deploy/from-main/README.md) if this box"
+    c_warn "  run against $HESTIA_HOME_DEFAULT. Install it by hand (deploy/from-main/README.md) if this box"
     c_warn "  should deploy from main, with HESTIA_HOME and HESTIA_DEPLOY_ROOT set in the unit."
     return
   fi
