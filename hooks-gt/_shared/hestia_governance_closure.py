@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: e2d6fc7a1d56c388b4429d908d4b2db5b45116f274fdb34b3b94a33068ad11d3  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 7b543d86c0fd6128c3e744d785a77e033588a05bc34f0edde5ce3a4aece89cc5  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1219,8 +1219,12 @@ _PATH_KEYS = ("file_path", "path", "notebook_path")
 _BASH_TOOLS = frozenset({"Bash", "Shell"})
 # Tools whose path argument is a READ position. Anything not listed here and not Bash is
 # treated conservatively: its path keys are write positions (an unknown tool might mutate).
+# The lower-case names are the gemini/being spellings of the same reads (the gemini shim's
+# lineage map; a SAGE being's memory_read reaches the gate as `read_file` unmapped, #1342).
 _READ_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite",
-                              "TodoList", "WebFetch", "WebSearch", "GetGoal"})
+                              "TodoList", "WebFetch", "WebSearch", "GetGoal",
+                              "read_file", "read_many_files", "glob", "search_file_content",
+                              "list_directory", "web_fetch", "google_web_search"})
 
 
 def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
