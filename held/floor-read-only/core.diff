@@ -1,5 +1,5 @@
 --- plugins/_shared/hestia_gate_core.py	2026-10-19 14:53:36.779411049 -0700
-+++ ../p-floor/core_rev.py	2026-10-19 15:01:55.342234815 -0700
++++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p-floor/core_rev.py	2026-10-19 15:14:48.100770959 -0700
 @@ -442,6 +442,10 @@
      member_id: str
      #: Repo names and `path:` grants. `["*"]` = deliberately unscoped, and must be declared.
@@ -30,7 +30,7 @@
                      )
  
      # 2. Local replica — fail-closed fallback, marked stale.
-@@ -2828,6 +2841,23 @@
+@@ -2828,6 +2841,52 @@
  
  
  # ── The decision ─────────────────────────────────────────────────────────────────────────
@@ -41,6 +41,35 @@
 +READ_ONLY_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead",
 +                                  "read_file", "read_many_files", "glob",
 +                                  "search_file_content", "list_directory"})
++
++
++#: Shell verbs that only read: no option and no operand of theirs names a file they write.
++#: Deliberately tiny. The degraded mode's read grammar is NOT reused here: it admits verbs that
++#: write through an option or an operand (`uniq IN OUT`, `sort -oFILE`, `git diff
++#: --output=FILE`; Codex HOLD 28057 on this change, and the closure's copy of the hole is #1348).
++#: Excluded on purpose: sed (its `w` command writes), awk, find (-fprint, -delete), sort, uniq,
++#: git, tee, xargs, and every interpreter.
++READ_ONLY_ROOT_VERBS = frozenset({"cat", "head", "tail", "grep", "wc", "ls", "stat"})
++
++
++def _read_only_root_command(command: str) -> bool:
++    """True iff every simple command in the line is a bare READ_ONLY_ROOT_VERBS verb, joined
++    only by pipes or && / || / ;. Any redirect, substitution, heredoc, newline, background `&`,
++    environment prefix or path-qualified verb makes it False: a miss refuses, never leaks."""
++    if any(tok in command for tok in (">", "<", "$(", "`", "\n", "\r")):
++        return False
++    if "&" in command.replace("&&", ""):
++        return False
++    for chunk_or in command.split("||"):
++        for chunk_and in chunk_or.split("&&"):
++            for chunk_semi in chunk_and.split(";"):
++                for seg in chunk_semi.split("|"):
++                    words = seg.strip().split()
++                    if not words:
++                        continue
++                    if words[0] not in READ_ONLY_ROOT_VERBS:
++                        return False
++    return True
 +
 +
 +def _read_only_admits(event: NormalizedEvent, p: str, read_scopes: list, ws: str,
@@ -54,7 +83,7 @@
  def evaluate(event: NormalizedEvent, profile: HarnessProfile,
               workspace: Optional[str] = None,
               policy: Optional[AgentPolicy] = None) -> Verdict:
-@@ -2846,6 +2876,7 @@
+@@ -2846,6 +2905,7 @@
      # ONE object rather than three stores and an absence.
      pol = policy if policy is not None else resolve_agent_policy(profile)
      scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
@@ -62,7 +91,7 @@
      forbidden = forbidden_tokens(profile)
  
      # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
-@@ -2910,7 +2941,8 @@
+@@ -2910,7 +2970,8 @@
                      f"scope (granted: {'+'.join(scopes)})",
                  )
      for p in ([] if event.repos else event.paths):
@@ -72,14 +101,13 @@
              # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
              # on any long path truncates away the very component that tripped the gate — the
              # member is handed a string that does not contain its own reason. That is the
-@@ -2933,6 +2965,13 @@
+@@ -2933,6 +2994,12 @@
          ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd,
                                                       forbidden=forbidden,
                                                       home_markers=profile.home_markers)
-+        # A command that only READS may also reach the read-only roots. The read test is the
-+        # degraded mode's conservative grammar: any redirect, substitution or unknown verb
-+        # makes it not a read, so a miss refuses rather than leaks.
-+        if not ok and read_scopes and _degraded_command_is_read(event.command):
++        # A command that only READS may also reach the read-only roots, by a strict verb
++        # allowlist (READ_ONLY_ROOT_VERBS): anything outside it refuses rather than leaks.
++        if not ok and read_scopes and _read_only_root_command(event.command):
 +            ok, offending, refused = command_scope_reach(
 +                event.command, scopes + read_scopes, ws, event.cwd,
 +                forbidden=forbidden, home_markers=profile.home_markers)

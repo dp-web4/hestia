@@ -110,6 +110,35 @@ def test_every_reader_may_read_the_law_and_no_writer_may_write_it():
             check(f"bash_write_refused:{cmd.split()[0]}", v.blocks, str(v))
 
 
+def test_a_verb_that_writes_through_an_option_or_operand_is_not_a_read():
+    """Codex HOLD 28057: the first cut reused the degraded mode's read grammar, which admits
+    verbs that write through an option or an output operand. Each of these writes a file
+    under the read-only root and must be refused there."""
+    with _Workspace() as ws:
+        snap = _snapshot(ws, floor_read=[{"path": _law(ws), "recursive": True}])
+        prof, pol = _policy(snap)
+        f = _law(ws) + "/plugins/_shared/hestia_single_gate.py"
+        # Input AND output both inside the read-only root, so only the write can refuse.
+        out = _law(ws) + "/plugins/_shared/out.txt"
+        for cmd in (f"uniq {f} {out}",                  # output operand  (Codex)
+                    f"sort -o{out} {f}",                # fused output option (Codex)
+                    f"sort -o {out} {f}",
+                    f"git diff --output={out}",          # long output option (Codex)
+                    f"sed -n 'w {out}' {f}",            # sed script writes
+                    f"find {_law(ws)} -fprint {out}",    # find action writes
+                    f"awk '{{print > \"{out}\"}}' {f}",
+                    f"python3 -c pass {f}",              # interpreter
+                    f"LC_ALL=C cat {f}",                 # environment prefix
+                    f"/bin/cat {f}",                     # path-qualified verb
+                    f"cat {f} &"):                       # background
+            v = _verdict(prof, pol, ws, "Bash", command=cmd)
+            check(f"refused:{cmd[:40]}", v.blocks, str(v))
+        for cmd in (f"cat {f}", f"head -n 40 {f}", f"grep -rn gate.degraded {_law(ws)}",
+                    f"grep -n deny {f} | head -n 5", f"wc -l {f} && ls {_law(ws)}"):
+            v = _verdict(prof, pol, ws, "Bash", command=cmd)
+            check(f"admitted:{cmd[:40]}", not v.blocks, str(v))
+
+
 def test_the_read_only_root_has_a_boundary():
     with _Workspace() as ws:
         snap = _snapshot(ws, floor_read=[{"path": _law(ws), "recursive": True}])
@@ -160,6 +189,7 @@ def test_read_only_readers_are_closure_readers():
 ALL = [
     test_a_read_only_floor_entry_reaches_the_snapshot_as_read_scope_only,
     test_every_reader_may_read_the_law_and_no_writer_may_write_it,
+    test_a_verb_that_writes_through_an_option_or_operand_is_not_a_read,
     test_the_read_only_root_has_a_boundary,
     test_an_exact_read_only_entry_does_not_reach_its_children,
     test_an_older_daemon_admits_nothing_extra,

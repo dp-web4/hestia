@@ -285,18 +285,28 @@ impl FloorEntry {
         covers_path(&self.path, self.recursive, path)
     }
 
-    /// The reach-bearing spelling: the path, `/**` when recursive, ` (read)` when read-only.
-    /// An entry with neither spells exactly its path, which keeps the floor digest of a floor
-    /// written before these fields byte-identical.
+    /// The reach-bearing spelling, keyed by the digests and the divergence report.
+    ///
+    /// LEGACY (exact, all): exactly the path, so a floor written before `recursive`/`access`
+    /// existed digests byte-identically after the upgrade.
+    ///
+    /// ANY OTHER entry: `\x1f<len>:<path>\x1f<recursive>\x1f<access>`. It cannot collide with
+    /// a legacy spelling, because an admitted floor path is absolute and starts with `/`, never
+    /// `\x1f`; and two such spellings cannot collide with each other, because the length
+    /// prefix fixes where the path ends whatever characters it contains. (The first cut
+    /// appended ` (read)` to the path, which made read-only `/w/law` and an all-access path
+    /// literally named `/w/law (read)` one string: Codex HOLD on #1347, P2.)
     pub fn spelling(&self) -> String {
-        let mut s = self.path.clone();
-        if self.recursive {
-            s.push_str("/**");
+        if !self.recursive && self.access == FloorAccess::All {
+            return self.path.clone();
         }
-        if self.access == FloorAccess::Read {
-            s.push_str(" (read)");
-        }
-        s
+        format!(
+            "\u{1f}{}:{}\u{1f}{}\u{1f}{}",
+            self.path.len(),
+            self.path,
+            if self.recursive { "recursive" } else { "exact" },
+            self.access.as_str()
+        )
     }
 }
 
@@ -934,6 +944,45 @@ mod tests {
         // And the divergence report can name the difference the digest sees.
         assert!(!rec.divergence_from(&legacy).is_empty());
         assert!(!ro.divergence_from(&legacy).is_empty());
+    }
+
+    /// Codex HOLD on #1347, P2: the first spelling appended " (read)" to the path, so a
+    /// read-only `/w/law` and an all-access path literally named `/w/law (read)` digested as
+    /// one floor. Every pair of distinct (path, recursive, access) must spell differently.
+    #[test]
+    fn floor_spellings_never_collide_across_path_recursion_and_access() {
+        let e = |p: &str, recursive: bool, access: FloorAccess| FloorEntry {
+            path: p.into(),
+            recursive,
+            access,
+            ..Default::default()
+        };
+        let entries = [
+            e("/w/law", false, FloorAccess::All),
+            e("/w/law", false, FloorAccess::Read),
+            e("/w/law", true, FloorAccess::All),
+            e("/w/law", true, FloorAccess::Read),
+            e("/w/law (read)", false, FloorAccess::All),
+            e("/w/law/**", false, FloorAccess::All),
+            e("/w/law/** (read)", false, FloorAccess::All),
+            e("/w/law\u{1f}exact\u{1f}read", false, FloorAccess::All),
+            e("/w/law\u{1f}exact\u{1f}read", true, FloorAccess::All),
+            e("/w", true, FloorAccess::Read),
+        ];
+        let spelt: std::collections::BTreeSet<String> =
+            entries.iter().map(FloorEntry::spelling).collect();
+        assert_eq!(spelt.len(), entries.len(), "two distinct entries spelt alike: {spelt:?}");
+        for pair in [(1usize, 4usize), (2, 5), (3, 6)] {
+            let mut a = StandingScopeStore::default();
+            a.floor_add(entries[pair.0].clone());
+            let mut b = StandingScopeStore::default();
+            b.floor_add(entries[pair.1].clone());
+            assert_ne!(a.floor_digest(), b.floor_digest(), "{pair:?}");
+            assert_ne!(a.authority_digest(), b.authority_digest(), "{pair:?}");
+            assert!(!a.divergence_from(&b).is_empty(), "{pair:?}");
+        }
+        // Legacy stays the bare path, explicitly.
+        assert_eq!(entries[0].spelling(), "/w/law");
     }
 
     #[test]
