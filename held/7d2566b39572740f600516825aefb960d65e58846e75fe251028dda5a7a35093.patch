@@ -1,0 +1,635 @@
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 2b946d537ebbebd68fa8f38289edfcad101eebd30232a9ec35068b26b0beeed0  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -492,6 +492,65 @@
+     command: Optional[str] = None               # shell command, if any
+     cwd: Optional[str] = None
+     raw: dict = field(default_factory=dict)     # kept for witnessing, never for deciding
++    #: Text that LEAVES THE MACHINE: a web query, a url, a prompt or context handed to a remote
++    #: model (#1201). Gate 1a sweeps it with the same innate `egress.secret` rule as paths, repos
++    #: and the command. Gate 1b NEVER reads it: natural language is not a path, and scoping its
++    #: words is the false-deny SAGE #335 measured ("'models' is not granted"). The field can
++    #: only ADD a deny. Default empty: an event that declares no egress is judged as before.
++    egress: list = field(default_factory=list)
++
++
++def egress_items(value: object) -> Optional[list]:
++    """Declared egress as the strings Gate 1a sweeps, or None when it cannot be swept.
++
++    A string is ONE blob. `list("~/.ssh/id_rsa")` is fourteen one-character blobs that match no
++    token, which is how a bare string slipped past the first #1201 patch (NOVA HOLD at 7a6e410b).
++    A list or tuple contributes its strings, flattened through nested lists/tuples, and None
++    entries are skipped. Anything else (a dict, bytes, a number, a set, a generator) is not text
++    this gate can read whole, so it returns None and the caller fails closed."""
++    if value is None:
++        return []
++    if isinstance(value, str):
++        return [value]
++    if not isinstance(value, (list, tuple)):
++        return None
++    out: list = []
++    for x in value:
++        if x is None:
++            continue
++        sub = egress_items(x)
++        if sub is None:
++            return None
++        out.extend(sub)
++    return out
++
++
++def egress_unsweepable(event: "NormalizedEvent") -> str:
++    """The type name of declared egress that `egress_items` cannot sweep; "" when it can."""
++    raw = getattr(event, "egress", None)
++    return type(raw).__name__ if egress_items(raw) is None else ""
++
++
++def egress_unsweepable_deny(event: "NormalizedEvent") -> Optional["Verdict"]:
++    """Gate 1a's fail-closed half: egress the gate cannot read whole is denied, never passed
++    unread. Both Gate 1a sites call it before the token sweep, so the degraded mode does too."""
++    bad = egress_unsweepable(event)
++    if not bad:
++        return None
++    return _deny("egress.secret",
++                 f"'{event.tool}' declares egress the gate cannot sweep ({bad}): egress must be "
++                 f"a string or a list of strings, so it is denied rather than sent unread",
++                 innate=True)
++
++
++def egress_blobs(event: "NormalizedEvent") -> list:
++    """Every string Gate 1a sweeps for the innate forbidden tokens: paths, repos, declared
++    egress text, and the command. `getattr`, not attribute access: a caller's own event
++    shape (SAGE's test fakes) may predate the `egress` field, and that must read as none.
++    Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
++    return (list(event.paths) + list(event.repos)
++            + (egress_items(getattr(event, "egress", None)) or [])
++            + ([event.command] if event.command else []))
+ 
+ 
+ @dataclass(frozen=True)
+@@ -2850,9 +2909,13 @@
+     forbidden = forbidden_tokens(profile)
+ 
+     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
+-    # Repo names are scanned too: an MCP call naming a forbidden token is still egress.
+-    for blob in (list(event.paths) + list(event.repos)
+-                 + ([event.command] if event.command else [])):
++    # Repo names are scanned too: an MCP call naming a forbidden token is still egress. So is
++    # declared egress text (#1201), which Gate 1b below never scopes; egress it cannot read
++    # whole is refused first, never passed unread.
++    unswept = egress_unsweepable_deny(event)
++    if unswept is not None:
++        return unswept
++    for blob in egress_blobs(event):
+         low = blob.lower()
+         for f in forbidden:
+             if f in low:
+@@ -3088,8 +3151,10 @@
+     read-allows are recorded on the gate-availability telemetry instead (they are an infra
+     series, not refusals, and the deny log's readers expect denies)."""
+     forbidden = forbidden_tokens(profile) if profile is not None else FORBIDDEN_DEFAULT
+-    for blob in (list(event.paths) + list(event.repos)
+-                 + ([event.command] if event.command else [])):
++    unswept = egress_unsweepable_deny(event)
++    if unswept is not None:
++        return unswept
++    for blob in egress_blobs(event):
+         low = blob.lower()
+         for f in forbidden:
+             if f in low:
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 3e9c9f9f38d05629d0a16597e7a2de1c8a4974039d65d0491ba7a323d9841780  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -161,6 +161,12 @@
+     session_id: Optional[str] = None
+     tool_use_id: Optional[str] = None
+     raw: dict = field(default_factory=dict)
++    #: Text the INVOKER declares will leave the machine (#1201): a being's web_search query, a
++    #: prompt for a remote model. Swept with the innate `egress.secret` rule, never scoped. It can
++    #: only add a deny, so an invoker that declares it cannot lift anything; one that declares
++    #: nothing is judged exactly as before. Harness tools are still found by name in
++    #: `egress_surfaces`; this field is for acts no harness tool name describes.
++    egress: list = field(default_factory=list)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -664,6 +670,7 @@
+         else _command_text(ti),
+         cwd=event.cwd,
+         raw=event.raw if isinstance(event.raw, dict) else {},
++        egress=egress_surfaces(event),
+     )
+ 
+ 
+@@ -683,10 +690,17 @@
+ 
+ 
+ def egress_surfaces(event: GateEvent) -> list:
+-    """Egress strings the core's paths/command do not carry: a web tool's url/prompt/query and
+-    the MCP transport context a shim lifts into `tool_input["_hestia_mcp_context"]`."""
++    """Egress strings the core's paths/command do not carry: the invoker's declared `egress`
++    (#1201), a web tool's url/prompt/query and the MCP transport context a shim lifts into
++    `tool_input["_hestia_mcp_context"]`. `normalized_event` hands the same list to the core as
++    `NormalizedEvent.egress`, so the core's Gate 1a (and its degraded mode) sweeps it too."""
+     ti = event.tool_input if isinstance(event.tool_input, dict) else {}
+-    out: list = []
++    # The declared part goes through the core's one normalizer: a string is ONE blob, never its
++    # characters (NOVA HOLD at 7a6e410b). Egress it cannot sweep is handed to the core WHOLE, so
++    # the core's Gate 1a (and its degraded mode) refuses it too. `_egress_precheck` refuses it here.
++    raw = getattr(event, "egress", None)
++    declared = core.egress_items(raw)
++    out: list = list(declared) if declared is not None else [raw]
+     if isinstance(event.tool, str) and event.tool.lower() in _WEB_TOOLS:
+         for key in ("url", "urls", "prompt", "query"):
+             out.extend(_leaves(ti.get(key)))
+@@ -1117,7 +1131,12 @@
+ 
+ def _egress_precheck(inv: _Invocation, cprofile: core.HarnessProfile) -> Optional[GateDecision]:
+     forbidden = core.forbidden_tokens(cprofile)
++    unswept = core.egress_unsweepable_deny(inv.event)
++    if unswept is not None:
++        return _verdict_deny(unswept)
+     for blob in egress_surfaces(inv.event):
++        if not isinstance(blob, str):
++            continue  # only unsweepable declared egress, refused just above
+         low = blob.lower()
+         for token in forbidden:
+             if token in low:
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e",
++      "sha256": "2b946d537ebbebd68fa8f38289edfcad101eebd30232a9ec35068b26b0beeed0",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2",
++      "sha256": "3e9c9f9f38d05629d0a16597e7a2de1c8a4974039d65d0491ba7a323d9841780",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "1ca443117c15b82d8368f38ed99d9727c197b9aa0c13c27d293c53532d06f8c7"
++  "gt_version": "9bdf2e6508cb8bc3b1340f61b02948d107c323766fc199422fbcb326530661fe"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "1ca443117c15b82d8368f38ed99d9727c197b9aa0c13c27d293c53532d06f8c7",
++    "gt_version": "9bdf2e6508cb8bc3b1340f61b02948d107c323766fc199422fbcb326530661fe",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "2b946d537ebbebd68fa8f38289edfcad101eebd30232a9ec35068b26b0beeed0"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2"
++        "sha256": "3e9c9f9f38d05629d0a16597e7a2de1c8a4974039d65d0491ba7a323d9841780"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "d60cd920f11054e6837654b5d4e2afbe5cf0f5fce2060ffcda29ed5ec43ed483"
++  "gt_version": "ec85c5d60ff8a65bf0bab89b6e3b8517fa78ee71324aae451d915d144feca7d4"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "1ca443117c15b82d8368f38ed99d9727c197b9aa0c13c27d293c53532d06f8c7",
++    "gt_version": "9bdf2e6508cb8bc3b1340f61b02948d107c323766fc199422fbcb326530661fe",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "2b946d537ebbebd68fa8f38289edfcad101eebd30232a9ec35068b26b0beeed0"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2"
++        "sha256": "3e9c9f9f38d05629d0a16597e7a2de1c8a4974039d65d0491ba7a323d9841780"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "e1d2eb44fedc6dea11ca97e7354fac28c6bbb3873f92be82b4945d1aa876d2fe"
++  "gt_version": "cc43a53b41f3242acf0c81445e29da6ff3c23c01182f5602f856392a7e333778"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "1ca443117c15b82d8368f38ed99d9727c197b9aa0c13c27d293c53532d06f8c7",
++    "gt_version": "9bdf2e6508cb8bc3b1340f61b02948d107c323766fc199422fbcb326530661fe",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "2b946d537ebbebd68fa8f38289edfcad101eebd30232a9ec35068b26b0beeed0"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2"
++        "sha256": "3e9c9f9f38d05629d0a16597e7a2de1c8a4974039d65d0491ba7a323d9841780"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "acd9eb6301d5053ed6ea334c906b19bc3b95a74e6616647c5d8fb69af6f1e25a"
++  "gt_version": "5c0a6461a415b51b3b661a110fe0611d0f4d3439efa127ce71fb70fe2ea79fff"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "1ca443117c15b82d8368f38ed99d9727c197b9aa0c13c27d293c53532d06f8c7",
++    "gt_version": "9bdf2e6508cb8bc3b1340f61b02948d107c323766fc199422fbcb326530661fe",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
++        "sha256": "2b946d537ebbebd68fa8f38289edfcad101eebd30232a9ec35068b26b0beeed0"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2"
++        "sha256": "3e9c9f9f38d05629d0a16597e7a2de1c8a4974039d65d0491ba7a323d9841780"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "6dc3374c58906091eb6048f7fa75c3c205e7b6b1c649fd71d305545bb5c1e2ae"
++  "gt_version": "87b3b79987aaaa55bd901e9f2f930bb51183df4e99e0c776018df42241ea33fa"
+ }
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -491,6 +491,65 @@
+     command: Optional[str] = None               # shell command, if any
+     cwd: Optional[str] = None
+     raw: dict = field(default_factory=dict)     # kept for witnessing, never for deciding
++    #: Text that LEAVES THE MACHINE: a web query, a url, a prompt or context handed to a remote
++    #: model (#1201). Gate 1a sweeps it with the same innate `egress.secret` rule as paths, repos
++    #: and the command. Gate 1b NEVER reads it: natural language is not a path, and scoping its
++    #: words is the false-deny SAGE #335 measured ("'models' is not granted"). The field can
++    #: only ADD a deny. Default empty: an event that declares no egress is judged as before.
++    egress: list = field(default_factory=list)
++
++
++def egress_items(value: object) -> Optional[list]:
++    """Declared egress as the strings Gate 1a sweeps, or None when it cannot be swept.
++
++    A string is ONE blob. `list("~/.ssh/id_rsa")` is fourteen one-character blobs that match no
++    token, which is how a bare string slipped past the first #1201 patch (NOVA HOLD at 7a6e410b).
++    A list or tuple contributes its strings, flattened through nested lists/tuples, and None
++    entries are skipped. Anything else (a dict, bytes, a number, a set, a generator) is not text
++    this gate can read whole, so it returns None and the caller fails closed."""
++    if value is None:
++        return []
++    if isinstance(value, str):
++        return [value]
++    if not isinstance(value, (list, tuple)):
++        return None
++    out: list = []
++    for x in value:
++        if x is None:
++            continue
++        sub = egress_items(x)
++        if sub is None:
++            return None
++        out.extend(sub)
++    return out
++
++
++def egress_unsweepable(event: "NormalizedEvent") -> str:
++    """The type name of declared egress that `egress_items` cannot sweep; "" when it can."""
++    raw = getattr(event, "egress", None)
++    return type(raw).__name__ if egress_items(raw) is None else ""
++
++
++def egress_unsweepable_deny(event: "NormalizedEvent") -> Optional["Verdict"]:
++    """Gate 1a's fail-closed half: egress the gate cannot read whole is denied, never passed
++    unread. Both Gate 1a sites call it before the token sweep, so the degraded mode does too."""
++    bad = egress_unsweepable(event)
++    if not bad:
++        return None
++    return _deny("egress.secret",
++                 f"'{event.tool}' declares egress the gate cannot sweep ({bad}): egress must be "
++                 f"a string or a list of strings, so it is denied rather than sent unread",
++                 innate=True)
++
++
++def egress_blobs(event: "NormalizedEvent") -> list:
++    """Every string Gate 1a sweeps for the innate forbidden tokens: paths, repos, declared
++    egress text, and the command. `getattr`, not attribute access: a caller's own event
++    shape (SAGE's test fakes) may predate the `egress` field, and that must read as none.
++    Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
++    return (list(event.paths) + list(event.repos)
++            + (egress_items(getattr(event, "egress", None)) or [])
++            + ([event.command] if event.command else []))
+ 
+ 
+ @dataclass(frozen=True)
+@@ -2849,9 +2908,13 @@
+     forbidden = forbidden_tokens(profile)
+ 
+     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
+-    # Repo names are scanned too: an MCP call naming a forbidden token is still egress.
+-    for blob in (list(event.paths) + list(event.repos)
+-                 + ([event.command] if event.command else [])):
++    # Repo names are scanned too: an MCP call naming a forbidden token is still egress. So is
++    # declared egress text (#1201), which Gate 1b below never scopes; egress it cannot read
++    # whole is refused first, never passed unread.
++    unswept = egress_unsweepable_deny(event)
++    if unswept is not None:
++        return unswept
++    for blob in egress_blobs(event):
+         low = blob.lower()
+         for f in forbidden:
+             if f in low:
+@@ -3087,8 +3150,10 @@
+     read-allows are recorded on the gate-availability telemetry instead (they are an infra
+     series, not refusals, and the deny log's readers expect denies)."""
+     forbidden = forbidden_tokens(profile) if profile is not None else FORBIDDEN_DEFAULT
+-    for blob in (list(event.paths) + list(event.repos)
+-                 + ([event.command] if event.command else [])):
++    unswept = egress_unsweepable_deny(event)
++    if unswept is not None:
++        return unswept
++    for blob in egress_blobs(event):
+         low = blob.lower()
+         for f in forbidden:
+             if f in low:
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -160,6 +160,12 @@
+     session_id: Optional[str] = None
+     tool_use_id: Optional[str] = None
+     raw: dict = field(default_factory=dict)
++    #: Text the INVOKER declares will leave the machine (#1201): a being's web_search query, a
++    #: prompt for a remote model. Swept with the innate `egress.secret` rule, never scoped. It can
++    #: only add a deny, so an invoker that declares it cannot lift anything; one that declares
++    #: nothing is judged exactly as before. Harness tools are still found by name in
++    #: `egress_surfaces`; this field is for acts no harness tool name describes.
++    egress: list = field(default_factory=list)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -663,6 +669,7 @@
+         else _command_text(ti),
+         cwd=event.cwd,
+         raw=event.raw if isinstance(event.raw, dict) else {},
++        egress=egress_surfaces(event),
+     )
+ 
+ 
+@@ -682,10 +689,17 @@
+ 
+ 
+ def egress_surfaces(event: GateEvent) -> list:
+-    """Egress strings the core's paths/command do not carry: a web tool's url/prompt/query and
+-    the MCP transport context a shim lifts into `tool_input["_hestia_mcp_context"]`."""
++    """Egress strings the core's paths/command do not carry: the invoker's declared `egress`
++    (#1201), a web tool's url/prompt/query and the MCP transport context a shim lifts into
++    `tool_input["_hestia_mcp_context"]`. `normalized_event` hands the same list to the core as
++    `NormalizedEvent.egress`, so the core's Gate 1a (and its degraded mode) sweeps it too."""
+     ti = event.tool_input if isinstance(event.tool_input, dict) else {}
+-    out: list = []
++    # The declared part goes through the core's one normalizer: a string is ONE blob, never its
++    # characters (NOVA HOLD at 7a6e410b). Egress it cannot sweep is handed to the core WHOLE, so
++    # the core's Gate 1a (and its degraded mode) refuses it too. `_egress_precheck` refuses it here.
++    raw = getattr(event, "egress", None)
++    declared = core.egress_items(raw)
++    out: list = list(declared) if declared is not None else [raw]
+     if isinstance(event.tool, str) and event.tool.lower() in _WEB_TOOLS:
+         for key in ("url", "urls", "prompt", "query"):
+             out.extend(_leaves(ti.get(key)))
+@@ -1116,7 +1130,12 @@
+ 
+ def _egress_precheck(inv: _Invocation, cprofile: core.HarnessProfile) -> Optional[GateDecision]:
+     forbidden = core.forbidden_tokens(cprofile)
++    unswept = core.egress_unsweepable_deny(inv.event)
++    if unswept is not None:
++        return _verdict_deny(unswept)
+     for blob in egress_surfaces(inv.event):
++        if not isinstance(blob, str):
++            continue  # only unsweepable declared egress, refused just above
+         low = blob.lower()
+         for token in forbidden:
+             if token in low:
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -851,6 +851,136 @@
+         stub.close()
+ 
+ 
++def test_declared_egress_is_swept_and_never_scoped(m, g, wc, home):
++    """#1201 (NOVA's 10-03 acceptance contract): `egress` is text that LEAVES the machine (a
++    being's web_search query, SAGE #335; a remote model's prompt, #1338). Gate 1a sweeps it with
++    the innate `egress.secret` rule; Gate 1b never path- or command-scopes it; natural language
++    with path-like words stays allowed; an event that declares none is judged exactly as before;
++    and the web-tool surfaces the gate already finds by name reach the core through the same
++    field, so its separate precheck could go without moving a verdict."""
++    core = g.core
++    # Assembled from parts, like CRED_PATH: the literal never has to be typed.
++    secret_q = "how do i rotate " + "~/." + "ssh/id_" + "rsa safely"
++    # Starts with an absolute path outside every scope: if any stage read egress as a path, this
++    # would be refused mrh.* (measured: a repo-relative-looking query resolves in scope and hides it).
++    benign_q = "/etc/ollama models config and ~/projects layout for qwen weights"
++    stub = Stub(Policy())
++    try:
++        with _Env(m, stub.url, home):
++            for seat in SEATS:
++                prof = profile_for(g, seat, home)
++                ev = to_event(g, seat, native_event(seat, "web_search", {"query": secret_q}, str(REPO), 1))
++                ev.egress = [secret_q]
++                d = g.decide(ev, prof)
++                check(f"{seat}-declared-egress-secret-denied",
++                      d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
++                check(f"{seat}-declared-egress-reaches-the-core",
++                      secret_q in g.normalized_event(ev).egress, g.normalized_event(ev))
++                ev = to_event(g, seat, native_event(seat, "web_search", {"query": benign_q}, str(REPO), 2))
++                ev.egress = [benign_q]
++                d = g.decide(ev, prof)
++                check(f"{seat}-benign-egress-never-scoped",
++                      d.decision == "allow" and not d.rule.startswith("mrh.")
++                      and d.rule != "egress.secret", d)
++
++            # The core alone, in its full law and in its degraded mode (egress is the one rule no
++            # mode relaxes), with no path, repo or command for the old sweep to see.
++            cprof = profile_for(g, "kimi", home).core_profile()
++            for q, want in ((secret_q, True), (benign_q, False)):
++                nev = core.NormalizedEvent(tool="web_search", egress=[q], cwd=str(REPO))
++                for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
++                                ("degraded", core.degraded_verdict(nev, cprof))):
++                    tag = f"core-{name}-{'secret' if want else 'benign'}"
++                    check(tag, (v.decision == "deny" and v.rule == "egress.secret" and v.innate) if want
++                          else v.rule != "egress.secret", v)
++
++            # NOVA HOLD at 7a6e410b: a BARE STRING is one blob, never its characters. The first
++            # patch ran `list(...)` over it, so `~/.ssh/id_rsa` became one-character blobs that
++            # matched no token and the act was allowed. Nested lists flatten to their strings.
++            for shape, val in (("str", secret_q), ("nested", [[secret_q]]), ("tuple", (secret_q,))):
++                for seat in SEATS:
++                    prof = profile_for(g, seat, home)
++                    ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 40))
++                    ev.egress = val
++                    d = g.decide(ev, prof)
++                    check(f"{seat}-direct-{shape}-egress-secret-denied",
++                          d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
++                    check(f"{seat}-direct-{shape}-egress-reaches-the-core-whole",
++                          secret_q in g.normalized_event(ev).egress, g.normalized_event(ev))
++                nev = core.NormalizedEvent(tool="web_search", egress=val, cwd=str(REPO))
++                for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
++                                ("degraded", core.degraded_verdict(nev, cprof))):
++                    check(f"core-{name}-direct-{shape}-secret",
++                          v.decision == "deny" and v.rule == "egress.secret" and v.innate, v)
++            for seat in SEATS:
++                prof = profile_for(g, seat, home)
++                ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 41))
++                ev.egress = benign_q
++                d = g.decide(ev, prof)
++                check(f"{seat}-direct-str-benign-allowed-and-unscoped",
++                      d.decision == "allow" and not d.rule.startswith("mrh.") and d.rule != "egress.secret", d)
++            nev = core.NormalizedEvent(tool="web_search", egress=benign_q, cwd=str(REPO))
++            for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
++                            ("degraded", core.degraded_verdict(nev, cprof))):
++                check(f"core-{name}-direct-str-benign", v.rule != "egress.secret", v)
++
++            # Egress the gate cannot read whole FAILS CLOSED, even when its text is benign:
++            # a dict, bytes, a number, a set, a generator, or a list holding one of them.
++            unsweepable = (("dict", lambda: {"q": benign_q}), ("bytes", lambda: benign_q.encode()),
++                           ("int", lambda: 7), ("set", lambda: {benign_q}),
++                           ("generator", lambda: (q for q in [benign_q])),
++                           ("list-with-dict", lambda: [benign_q, {"q": benign_q}]))
++            for shape, make in unsweepable:
++                for seat in SEATS:
++                    prof = profile_for(g, seat, home)
++                    ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 42))
++                    ev.egress = make()
++                    d = g.decide(ev, prof)
++                    check(f"{seat}-unsweepable-{shape}-fails-closed",
++                          d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
++                for name, fn in (("evaluate", lambda n: core.evaluate(n, cprof, workspace=str(REPO))),
++                                 ("degraded", lambda n: core.degraded_verdict(n, cprof))):
++                    v = fn(core.NormalizedEvent(tool="web_search", egress=make(), cwd=str(REPO)))
++                    check(f"core-{name}-unsweepable-{shape}-fails-closed",
++                          v.decision == "deny" and v.rule == "egress.secret" and v.innate, v)
++                # The single gate hands it to the core whole, so the core refuses it on its own.
++                ev = to_event(g, "kimi", native_event("kimi", "web_search", {"query": "x"}, str(REPO), 43))
++                ev.egress = make()
++                v = core.evaluate(g.normalized_event(ev), cprof, workspace=str(REPO))
++                check(f"handoff-unsweepable-{shape}-core-alone-denies",
++                      v.decision == "deny" and v.rule == "egress.secret", v)
++
++            # Default-empty parity: declaring nothing and declaring [] are judged identically,
++            # across a write, a shell read, an innate deny and a web tool.
++            for i, (seat, tool, ti) in enumerate((
++                    ("codex", *_act(IN_SCOPE_EDIT)),
++                    ("claude-code", "Bash", {"command": "cat /etc/hostname"}),
++                    ("kimi", "Bash", {"command": "cat ~/." + "ssh/id_rsa"}),
++                    ("gemini", "WebFetch", {"url": "https://x.example/?q=." + "env"}))):
++                prof = profile_for(g, seat, home)
++                a = g.decide(to_event(g, seat, native_event(seat, tool, ti, str(REPO), 10 + i)), prof)
++                ev = to_event(g, seat, native_event(seat, tool, ti, str(REPO), 20 + i))
++                ev.egress = []
++                b = g.decide(ev, prof)
++                check(f"default-empty-parity-{seat}-{tool}", (a.decision, a.rule) == (b.decision, b.rule),
++                      (a, b))
++
++            # The Gemini migration pin: every web-tool surface `egress_surfaces` finds by name now
++            # rides `NormalizedEvent.egress`, and the core denies it ON ITS OWN, so deleting the
++            # shim-era precheck would not move these verdicts.
++            for i, (tool, ti) in enumerate((
++                    ("WebFetch", {"url": "https://x.example/?q=." + "env"}),
++                    ("WebFetch", {"url": "https://x.example/", "prompt": "summarise ~/." + "ssh/id_rsa"}),
++                    ("WebSearch", {"query": "where is ~/." + "ssh/id_rsa"}))):
++                ev = to_event(g, "gemini", native_event("gemini", tool, ti, str(REPO), 30 + i))
++                nev = g.normalized_event(ev)
++                v = core.evaluate(nev, profile_for(g, "gemini", home).core_profile(), workspace=str(REPO))
++                check(f"migration-core-alone-denies-{tool}-{i}",
++                      v.decision == "deny" and v.rule == "egress.secret", (nev.egress, v))
++    finally:
++        stub.close()
++
++
+ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home):
+     """dp, 2026-10-05: "escalation should allow standing grants". An `mrh.path` / `mrh.command`
+     refusal asks the daemon ONCE (`hestia_scope_claim`): a request is opened (or re-found) on the
+@@ -1585,6 +1715,7 @@
+     test_superseded_is_denied_in_every_mode,
+     test_daemon_verdicts_and_the_warn_rollout,
+     test_a_declared_probe_opens_no_scope_request,
++    test_declared_egress_is_swept_and_never_scoped,
+     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
+     test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
+     test_prose_in_a_message_position_is_data_on_every_seat,
