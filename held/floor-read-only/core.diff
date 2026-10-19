@@ -1,0 +1,88 @@
+--- plugins/_shared/hestia_gate_core.py	2026-10-19 14:53:36.779411049 -0700
++++ ../p-floor/core_rev.py	2026-10-19 15:01:55.342234815 -0700
+@@ -442,6 +442,10 @@
+     member_id: str
+     #: Repo names and `path:` grants. `["*"]` = deliberately unscoped, and must be declared.
+     scope: tuple = ()
++    #: Roots this member may READ and nothing more: the read-only society floor (dp,
++    #: 2026-10-19, "the governed see the law" — every member reads the governance snapshot).
++    #: Consulted by evaluate() only for an act that is a read; never widens a write.
++    read_scope: tuple = ()
+     #: Where this policy was resolved from, carried so a reader never has to guess which store
+     #: won. A policy that cannot say where it came from is not auditable.
+     source: str = "unresolved"
+@@ -837,9 +841,18 @@
+                         return AgentPolicy(member_id=profile.member_id, scope=(),
+                                            source="vault-expired", stale=True,
+                                            generation=gen, expires_at=exp)
++                    # Read-only roots, parsed inside the same guard: bad data here reads
++                    # as no read-only roots, never as a traceback and never as reach.
++                    read_raw = got.get("in_scope_read")
++                    try:
++                        read_parsed = (_parse_scope_entries(read_raw)
++                                       if isinstance(read_raw, list) else ())
++                    except Exception:
++                        read_parsed = ()
+                     return AgentPolicy(
+                         member_id=profile.member_id, scope=parsed, source="vault",
+                         generation=gen, expires_at=exp,
++                        read_scope=tuple(read_parsed or ()),
+                     )
+ 
+     # 2. Local replica — fail-closed fallback, marked stale.
+@@ -2828,6 +2841,23 @@
+ 
+ 
+ # ── The decision ─────────────────────────────────────────────────────────────────────────
++#: Tools whose path is only READ. The read-only floor admits these and nothing else. Each is
++#: also a reader in the governance closure (`_READ_PATH_TOOLS`), which
++#: tools/closure_read_tool_names_test.py pins: a tool the scope layer lets read a root must
++#: not be one the closure treats as writing it.
++READ_ONLY_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead",
++                                  "read_file", "read_many_files", "glob",
++                                  "search_file_content", "list_directory"})
++
++
++def _read_only_admits(event: NormalizedEvent, p: str, read_scopes: list, ws: str,
++                      profile: HarnessProfile) -> bool:
++    """Does the read-only floor admit this path for this act? Only a reader tool, only
++    inside a read-only root. No read-only roots means no."""
++    return (bool(read_scopes) and event.tool in READ_ONLY_PATH_TOOLS
++            and path_in_scope(p, read_scopes, ws, profile, event.cwd))
++
++
+ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
+              workspace: Optional[str] = None,
+              policy: Optional[AgentPolicy] = None) -> Verdict:
+@@ -2846,6 +2876,7 @@
+     # ONE object rather than three stores and an absence.
+     pol = policy if policy is not None else resolve_agent_policy(profile)
+     scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
++    read_scopes = list(getattr(pol, "read_scope", ()) or ())
+     forbidden = forbidden_tokens(profile)
+ 
+     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
+@@ -2910,7 +2941,8 @@
+                     f"scope (granted: {'+'.join(scopes)})",
+                 )
+     for p in ([] if event.repos else event.paths):
+-        if not path_in_scope(p, scopes, ws, profile, event.cwd):
++        if (not path_in_scope(p, scopes, ws, profile, event.cwd)
++                and not _read_only_admits(event, p, read_scopes, ws, profile)):
+             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
+             # on any long path truncates away the very component that tripped the gate — the
+             # member is handed a string that does not contain its own reason. That is the
+@@ -2933,6 +2965,13 @@
+         ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd,
+                                                      forbidden=forbidden,
+                                                      home_markers=profile.home_markers)
++        # A command that only READS may also reach the read-only roots. The read test is the
++        # degraded mode's conservative grammar: any redirect, substitution or unknown verb
++        # makes it not a read, so a miss refuses rather than leaks.
++        if not ok and read_scopes and _degraded_command_is_read(event.command):
++            ok, offending, refused = command_scope_reach(
++                event.command, scopes + read_scopes, ws, event.cwd,
++                forbidden=forbidden, home_markers=profile.home_markers)
+         if not ok:
+             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
+             # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is

@@ -227,7 +227,7 @@ pub enum ReassignRefused {
 /// It carries its own provenance for the same reason a standing grant does — a widening whose
 /// rationale is not recorded is indistinguishable afterwards from a misconfiguration, and this
 /// one is wider than any single grant because it binds every seat at once.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FloorEntry {
     /// Normalised absolute path (see `state::normalize_scope_path`).
     pub path: String,
@@ -236,6 +236,68 @@ pub struct FloorEntry {
     pub added_by: String,
     #[serde(default)]
     pub reason: String,
+    /// The subtree as well as the path itself, by the same `covers_path` rule a standing grant
+    /// uses. Absent on entries written before this field existed, which read as exact — the
+    /// narrower meaning, so no stored floor widens on upgrade.
+    #[serde(default)]
+    pub recursive: bool,
+    /// What the entry admits. `All` is every floor entry written before this field existed.
+    #[serde(default)]
+    pub access: FloorAccess,
+}
+
+/// What a floor entry admits.
+///
+/// `Read` exists for dp's 2026-10-19 directive, "the governed see the law": every member may
+/// READ the governance snapshot (the read-only copy of hestia's source this machine runs), and
+/// no member may write it. A grant otherwise carries reach and no mode (#1098 §2, #1345), so
+/// until grants grow modes a read-only floor entry is served APART from the reach entries
+/// (`society_floor_read`): a gate that predates it ignores the key and admits nothing, rather
+/// than reading it as a read-write grant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FloorAccess {
+    #[default]
+    All,
+    Read,
+}
+
+impl FloorAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FloorAccess::All => "all",
+            FloorAccess::Read => "read",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "all" => Some(FloorAccess::All),
+            "read" => Some(FloorAccess::Read),
+            _ => None,
+        }
+    }
+}
+
+impl FloorEntry {
+    /// Does this entry reach `path`, by its own rule? Says nothing about mode.
+    pub fn covers(&self, path: &str) -> bool {
+        covers_path(&self.path, self.recursive, path)
+    }
+
+    /// The reach-bearing spelling: the path, `/**` when recursive, ` (read)` when read-only.
+    /// An entry with neither spells exactly its path, which keeps the floor digest of a floor
+    /// written before these fields byte-identical.
+    pub fn spelling(&self) -> String {
+        let mut s = self.path.clone();
+        if self.recursive {
+            s.push_str("/**");
+        }
+        if self.access == FloorAccess::Read {
+            s.push_str(" (read)");
+        }
+        s
+    }
 }
 
 impl StandingScopeStore {
@@ -272,8 +334,14 @@ impl StandingScopeStore {
     /// reach, full stop. A path that should lapse is a per-member grant, not a floor entry —
     /// keeping the floor unconditional is what lets a reader answer "may members reach X"
     /// without knowing who is asking or what time it is.
+    ///
+    /// Only `All` entries answer here: this is the reach question ("is X granted"), and a
+    /// read-only entry does not grant reach. A read-only entry is admitted by the gate, for
+    /// read acts only, from `society_floor_read`.
     pub fn floor_allows(&self, path: &str) -> bool {
-        self.floor.iter().any(|f| f.path == path)
+        self.floor
+            .iter()
+            .any(|f| f.access == FloorAccess::All && f.covers(path))
     }
 
     /// A canonical digest of the EFFECTIVE society-wide path set.
@@ -282,7 +350,10 @@ impl StandingScopeStore {
     /// members received the same enforcing floor, while `generation` answers which complete
     /// policy revision they received. Length-prefixing prevents concatenation ambiguity.
     pub fn floor_digest(&self) -> String {
-        let mut paths: Vec<&str> = self.floor.iter().map(|f| f.path.as_str()).collect();
+        // Keyed on the reach-bearing spelling, so a floor that differs only in recursion or
+        // access digests differently. An entry with neither spells its bare path, so a floor
+        // written before those fields digests exactly as it did.
+        let mut paths: Vec<String> = self.floor.iter().map(FloorEntry::spelling).collect();
         paths.sort_unstable();
         let mut hasher = Sha256::new();
         for path in paths {
@@ -319,7 +390,7 @@ impl StandingScopeStore {
         let mut rows: Vec<String> = self
             .floor
             .iter()
-            .map(|f| format!("floor\u{1f}{}", f.path))
+            .map(|f| format!("floor\u{1f}{}", f.spelling()))
             .chain(self.grants.iter().map(Self::grant_row))
             .collect();
         rows.sort_unstable();
@@ -402,10 +473,10 @@ impl StandingScopeStore {
                 ));
             }
         }
-        let runtime_floor: std::collections::BTreeSet<&str> =
-            self.floor.iter().map(|f| f.path.as_str()).collect();
-        let vault_floor: std::collections::BTreeSet<&str> =
-            vault.floor.iter().map(|f| f.path.as_str()).collect();
+        let runtime_floor: std::collections::BTreeSet<String> =
+            self.floor.iter().map(FloorEntry::spelling).collect();
+        let vault_floor: std::collections::BTreeSet<String> =
+            vault.floor.iter().map(FloorEntry::spelling).collect();
         for phantom in runtime_floor.difference(&vault_floor) {
             out.push(format!("PHANTOM floor path in runtime: {phantom}"));
         }
@@ -807,7 +878,71 @@ mod tests {
             added_at: at,
             added_by: "operator".into(),
             reason: "society baseline".into(),
+            ..Default::default()
         }
+    }
+
+    /// dp, 2026-10-19: every member may READ the governance snapshot. A read-only floor entry
+    /// is not reach: `floor_allows` (the "is X granted" question) must not answer yes for it,
+    /// or the daemon would report a path as granted for writes that the floor only lets be read.
+    #[test]
+    fn a_read_only_floor_entry_is_not_reach() {
+        let mut s = StandingScopeStore::default();
+        s.floor_add(FloorEntry {
+            path: "/w/governance/hestia".into(),
+            recursive: true,
+            access: FloorAccess::Read,
+            ..floor("/w/governance/hestia", 1)
+        });
+        assert!(!s.floor_allows("/w/governance/hestia"));
+        assert!(!s.floor_allows("/w/governance/hestia/core/src/lib.rs"));
+        assert!(!s.has_live("anyone", "/w/governance/hestia/core/src/lib.rs", 2));
+    }
+
+    #[test]
+    fn a_recursive_floor_entry_covers_its_subtree_at_the_separator() {
+        let mut s = StandingScopeStore::default();
+        s.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        assert!(s.floor_allows("/w/shared"));
+        assert!(s.floor_allows("/w/shared/a/b.md"));
+        assert!(!s.floor_allows("/w/shared-not"), "containment is at the separator");
+        // And an exact entry stays exact: the field defaults to the narrower meaning.
+        let mut e = StandingScopeStore::default();
+        e.floor_add(floor("/w/shared", 1));
+        assert!(!e.floor_allows("/w/shared/a/b.md"));
+    }
+
+    /// Upgrading must not move the digest of a floor written before `recursive`/`access`
+    /// existed (a moved digest reads as a changed society baseline), while a floor that
+    /// differs only in recursion or access must digest differently.
+    #[test]
+    fn floor_digest_is_unchanged_for_legacy_entries_and_sees_reach_and_access() {
+        let mut legacy = StandingScopeStore::default();
+        legacy.floor_add(floor("/w/shared", 1));
+        let mut hasher = Sha256::new();
+        hasher.update(("/w/shared".len() as u64).to_be_bytes());
+        hasher.update(b"/w/shared");
+        assert_eq!(legacy.floor_digest(), hex::encode(hasher.finalize()));
+
+        let mut rec = StandingScopeStore::default();
+        rec.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        let mut ro = StandingScopeStore::default();
+        ro.floor_add(FloorEntry { access: FloorAccess::Read, ..floor("/w/shared", 1) });
+        assert_ne!(legacy.floor_digest(), rec.floor_digest());
+        assert_ne!(legacy.floor_digest(), ro.floor_digest());
+        assert_ne!(rec.floor_digest(), ro.floor_digest());
+        // And the divergence report can name the difference the digest sees.
+        assert!(!rec.divergence_from(&legacy).is_empty());
+        assert!(!ro.divergence_from(&legacy).is_empty());
+    }
+
+    #[test]
+    fn a_stored_floor_without_the_new_fields_reads_as_exact_and_all() {
+        let e: FloorEntry =
+            serde_json::from_str(r#"{"path":"/w/x","added_at":1,"added_by":"operator","reason":"r"}"#)
+                .unwrap();
+        assert!(!e.recursive);
+        assert_eq!(e.access, FloorAccess::All);
     }
 
     #[test]
