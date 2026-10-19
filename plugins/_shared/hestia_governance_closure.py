@@ -1218,8 +1218,12 @@ _PATH_KEYS = ("file_path", "path", "notebook_path")
 _BASH_TOOLS = frozenset({"Bash", "Shell"})
 # Tools whose path argument is a READ position. Anything not listed here and not Bash is
 # treated conservatively: its path keys are write positions (an unknown tool might mutate).
+# The lower-case names are the gemini/being spellings of the same reads (the gemini shim's
+# lineage map; a SAGE being's memory_read reaches the gate as `read_file` unmapped, #1342).
 _READ_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite",
-                              "TodoList", "WebFetch", "WebSearch", "GetGoal"})
+                              "TodoList", "WebFetch", "WebSearch", "GetGoal",
+                              "read_file", "read_many_files", "glob", "search_file_content",
+                              "list_directory", "web_fetch", "google_web_search"})
 
 
 def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
