@@ -1810,6 +1810,9 @@ pub async fn serve_with_callback(
         loop {
             tick.tick().await;
             let now = super::gate_escalation::now_secs();
+            // The gate set, discovered BEFORE the lock below: the inventory child takes about a
+            // second, and under the lock that second was a stall for every member (#1183).
+            let discovered = discovered_gate_paths_off_lock().await;
             // DURABLE READS: the pass runs in a durability scope (its outward writes also flush
             // the chain first: inbox barrier, lane, status file, vault barrier).
             let (lapsed, durable) = crate::storage::durability::durable_scope(async {
@@ -1834,7 +1837,7 @@ pub async fn serve_with_callback(
                 // Gate bytes on the same cadence, and at startup (an interval's first tick is
                 // immediate). Before this the daemon checked its gates only when an operator
                 // asked (#1085); dp, 2026-09-21: the daemon verifies, the installer reads.
-                let gates = super::gate_watch::check(&mut s);
+                let gates = super::gate_watch::check(&mut s, discovered);
                 if gates["status"] != "VERIFIED" {
                     tracing::warn!(status = %gates["status"], "gate integrity: not verified");
                 }
@@ -6417,7 +6420,7 @@ async fn orchestrator_connect(
 /// adapter for, and what is actually governed. Read-only; the write half is
 /// `/api/orchestrators/:id/connect` (govern) and `/api/agents/:id/ungovern`.
 async fn agents_inventory(State(state): State<SharedState>) -> impl IntoResponse {
-    match crate::server::agents::inventory() {
+    match crate::server::agents::inventory_off_thread().await {
         // `bypassed`: the operator's active gate bypasses, beside -- never merged into -- the
         // inventory's own verdicts. The inventory is not told; whether it reads a bypassed member
         // as miswired is its finding (dp, 2026-09-28: the bypass is the test of that detection).
@@ -6497,7 +6500,7 @@ async fn agent_gate_bypass(
                              r.bypassed_at, r.reason),
         })));
     }
-    let inv = match crate::server::agents::inventory() {
+    let inv = match crate::server::agents::inventory_off_thread().await {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": format!("the inventory could not run ({e}); refusing to edit a registration it cannot see"),
@@ -6649,7 +6652,7 @@ async fn agent_register(
             })),
         );
     }
-    let report = match crate::server::agents::inventory() {
+    let report = match crate::server::agents::inventory_off_thread().await {
         Ok(v) => v,
         Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
             "error": format!("cannot register what was not discovered: the inventory did not run ({e})")}))),
@@ -7314,8 +7317,13 @@ fn ungovern_ordered(
 /// So coverage now comes from the inventory, which already stats every hook target on the
 /// machine across the full scope chain and simply kept the list to itself. One discovery
 /// path, measured once, consumed by both surfaces.
-pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
-    let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
+///
+/// The inventory runs on the blocking pool. Call this BEFORE taking the state lock (#1183):
+/// the child takes about a second, and under the lock that second stalls every member's gate
+/// round-trip. Holding the lock does not freeze the filesystem, so discovering first gives up
+/// no guarantee. The hashes a verdict or a ratification rests on are still taken under the lock.
+pub(crate) async fn discovered_gate_paths_off_lock() -> Result<Vec<(String, String)>, String> {
+    let inv = crate::server::agents::inventory_off_thread().await.map_err(|e| e.to_string())?;
     discovered_gate_paths_from(&inv)
 }
 
@@ -7323,8 +7331,9 @@ pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
 /// inventory read. The second list is what separates a stale expectation from a de-registered
 /// gate (#1156): a member that still declares a gate but has none registered was bypassed or
 /// miswired, and its ratified expectation is the only record that a gate belongs there.
-fn gate_inventory() -> Result<(Vec<(String, String)>, Vec<String>), String> {
-    let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
+/// Off the lock and off the async workers, as above.
+async fn gate_inventory_off_lock() -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let inv = crate::server::agents::inventory_off_thread().await.map_err(|e| e.to_string())?;
     Ok((discovered_gate_paths_from(&inv)?, members_declaring_a_gate(&inv)))
 }
 
@@ -7894,10 +7903,12 @@ fn annotate_gate_verdicts(
 /// `GET /api/gates/verify` — hash every known gate and compare to the vault's ratified
 /// expectation. The DAEMON hashes the file; it never asks a gate about itself.
 async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
+    // Discovered before the lock (#1183); the hashes below are still taken under it.
+    let inventory = gate_inventory_off_lock().await;
     let s = state.lock().await;
     let exp = s.vault.gate_expectations();
     // An unmeasurable denominator is UNKNOWN, never VERIFIED.
-    let (discovered, declaring) = match gate_inventory() {
+    let (discovered, declaring) = match inventory {
         Ok((d, decl)) => (d, not_retired(decl, &s.retired_members)),
         Err(reason) => {
             return (
@@ -7996,10 +8007,13 @@ async fn gates_ratify(
                 .into_response()
         }
     };
-    let mut s = state.lock().await;
     // Ratify from the DISCOVERED set, for the same reason verify checks it: a hardcoded list
     // would bless whichever gates it happened to name and leave the rest unmentioned.
-    let discovered = match discovered_gate_paths() {
+    // Discovered before the lock (#1183). What gets recorded is still hashed under the lock
+    // and re-hashed just before the vault write, so a gate that changes in between is refused.
+    let discovered = discovered_gate_paths_off_lock().await;
+    let mut s = state.lock().await;
+    let discovered = match discovered {
         Ok(d) => d,
         Err(reason) => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -8054,8 +8068,9 @@ async fn gates_forget(
             }))).into_response()
         }
     };
+    let inventory = gate_inventory_off_lock().await; // before the lock (#1183)
     let mut s = state.lock().await;
-    let (discovered, declaring) = match gate_inventory() {
+    let (discovered, declaring) = match inventory {
         Ok((d, decl)) => (d, not_retired(decl, &s.retired_members)),
         Err(reason) => {
             // Without the discovered set this cannot tell a stale expectation from a live gate.

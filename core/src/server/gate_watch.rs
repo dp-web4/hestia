@@ -339,11 +339,14 @@ pub fn rehydrate(chain: &crate::storage::chain::SqliteChainStore) -> HashMap<Str
 /// Open-set state changes only for rows that LANDED (#972's invariant): a failed witness leaves
 /// the prior state, so the next pass retries the same transition instead of treating an
 /// unrecorded finding as reported.
-pub fn check(s: &mut super::state::ServerState) -> Value {
+/// `discovered` is the gate set from [`super::http::discovered_gate_paths_off_lock`], taken
+/// BEFORE the caller locked `s`. It is a parameter, not a call made in here, so this function
+/// (which only ever runs under the state lock) cannot start the inventory child while holding
+/// that lock (#1183: about 0.8 to 1.1 s of whole-daemon stall every 300 s).
+pub fn check(s: &mut super::state::ServerState, discovered: Result<Vec<(String, String)>, String>) -> Value {
     let now = super::gate_escalation::now_secs();
     let exp = s.vault.gate_expectations();
-    let discovered = super::http::discovered_gate_paths()
-        .map(|d| d.into_iter().map(|(_, p)| p).collect::<Vec<_>>());
+    let discovered = discovered.map(|d| d.into_iter().map(|(_, p)| p).collect::<Vec<_>>());
     let seen = observe(&exp, discovered);
     let mut failures = 0usize;
     for t in transitions(&s.gate_findings_open, &seen, now) {
