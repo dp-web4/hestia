@@ -4973,6 +4973,18 @@ async fn scope_floor_add(
 ) -> impl IntoResponse {
     let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    // Both default to the pre-existing meaning (exact, all), so a caller that sends neither
+    // gets exactly the entry it got before these fields existed.
+    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    let access_raw = body.get("access").and_then(|v| v.as_str()).unwrap_or("all");
+    let Some(access) = crate::server::standing_scope::FloorAccess::parse(access_raw) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("access must be \"all\" or \"read\", not {access_raw:?}")
+            })),
+        );
+    };
     if raw_path.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -5001,7 +5013,7 @@ async fn scope_floor_add(
     let now = crate::server::gate_escalation::now_secs();
 
     let mut s = state.lock().await;
-    let replaces = s.standing_scope.floor_allows(&path);
+    let replaces = s.standing_scope.floor.iter().any(|f| f.path == path);
     let members_affected = s.member_registry.len();
 
     // ORDER: WITNESS, THEN WIDEN — and the intent/success split, for the same reason the
@@ -5012,6 +5024,8 @@ async fn scope_floor_add(
         serde_json::json!({
             "path": path,
             "path_as_asked": raw_path,
+            "recursive": recursive,
+            "access": access.as_str(),
             "reason": reason,
             "added_by": "operator",
             "via": "operator_session",
@@ -5038,6 +5052,8 @@ async fn scope_floor_add(
         added_at: now,
         added_by: "operator".to_string(),
         reason: reason.clone(),
+        recursive,
+        access,
     };
     // The terminal success witness is part of finality. Preserve the exact prior store so
     // a failed terminal append can restore both memory and vault, including a predecessor
@@ -5059,6 +5075,7 @@ async fn scope_floor_add(
         "society_floor_added",
         serde_json::json!({
             "path": path, "reason": reason, "added_by": "operator",
+            "recursive": recursive, "access": access.as_str(),
             "intent": entry.hash, "standing_generation": generation,
         }),
     ) {
@@ -12268,6 +12285,7 @@ mod disposition_tests {
                     added_at: 1,
                     added_by: "operator".into(),
                     reason: "predecessor".into(),
+                    ..Default::default()
                 })
             })
             .unwrap();
@@ -12340,6 +12358,7 @@ mod disposition_tests {
                     added_at: 1,
                     added_by: "operator".into(),
                     reason: "restart invariant".into(),
+                    ..Default::default()
                 })
             })
             .unwrap();
@@ -12404,6 +12423,7 @@ mod disposition_tests {
                     added_at: 1,
                     added_by: "operator".into(),
                     reason: "terminal invariant".into(),
+                    ..Default::default()
                 })
             })
             .unwrap();

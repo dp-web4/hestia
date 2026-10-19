@@ -1400,6 +1400,22 @@
             <div class="pol-section-label">In force now</div>
             <div id="scope-grant-list"><div class="empty">loading…</div></div>
 
+            <div class="pol-section-label">Society floor — every member, present and future</div>
+            <div class="grant-note">
+              What <strong>every</strong> member may reach without asking. <strong>r</strong> is
+              read, <strong>w</strong> is write (unticked = read-only), <strong>/**</strong>
+              reaches everything under the path. Every change is witnessed and asks for a reason.
+            </div>
+            <div id="scope-floor-list"><div class="empty">loading…</div></div>
+            <div class="grant-row floor-add">
+              <input id="floor-add-path" type="text" placeholder="/absolute/path" spellcheck="false">
+              <label title="read: always on for a floor entry"><input type="checkbox" checked disabled> r</label>
+              <label title="write: untick for a read-only entry"><input id="floor-add-w" type="checkbox"> w</label>
+              <label title="reach everything under the path"><input id="floor-add-rec" type="checkbox" checked> /**</label>
+              <input id="floor-add-reason" type="text" placeholder="reason (required)">
+              <button class="grant-act" id="floor-add-btn">add to floor</button>
+            </div>
+
             <div class="pol-section-label">Grant scope directly — no member request needed</div>
             <div class="grant-note">
               This is the <strong>operator-originated</strong> grant. Until 2026-08-15 the only
@@ -4141,6 +4157,31 @@
   // have a grant" and "you have a grant until someone restarts the daemon" are different
   // facts and only one of them is what the operator thinks they bought. Standing renders
   // plain. There is no state in which a grant that is about to evaporate renders as calm.
+  // THE SOCIETY FLOOR (dp, 2026-08-16; modes 2026-10-19). One row per entry, its mode and
+  // reach as checkboxes, so "every member may READ the governance snapshot" is one ticked row.
+  // A toggle re-posts the entry (the daemon replaces by path); nothing changes until it answers.
+  function renderSocietyFloor(data) {
+    const fl = $('scope-floor-list');
+    if (!fl) return;
+    if (!data) { fl.innerHTML = '<div class="empty">loading…</div>'; return; }
+    const rows = data.society_floor ?? [];
+    fl.innerHTML = rows.length ? rows.map(f => {
+      const p = escapeHtml(String(f.path ?? ''));
+      const w = f.access !== 'read';
+      return `
+        <div class="grant-row">
+          <span class="grant-who">everyone</span>
+          <span class="grant-preset scope-standing">FLOOR</span>
+          <code>${p}${f.recursive ? '<span class="grant-reach" title="reaches the whole subtree">/**</span>' : ''}</code>
+          <label title="read: always on for a floor entry"><input type="checkbox" checked disabled> r</label>
+          <label title="${w ? 'untick to make this entry read-only' : 'tick to let every member write here'}"><input type="checkbox" data-floor-path="${p}" data-floor-field="w"${w ? ' checked' : ''}> w</label>
+          <label title="${f.recursive ? 'untick to reach exactly this path' : 'tick to reach everything under it'}"><input type="checkbox" data-floor-path="${p}" data-floor-field="rec"${f.recursive ? ' checked' : ''}> /**</label>
+          <span class="grant-why">${escapeHtml(String(f.reason ?? ''))}</span>
+          <button class="grant-revoke" data-floor-remove="${p}">remove</button>
+        </div>`;
+    }).join('') : '<div class="empty">The floor is empty: no path is reachable by every member without a grant.</div>';
+  }
+
   function renderScopeGrants(data) {
     const gen = $('scope-gen');
     if (gen) {
@@ -4165,6 +4206,8 @@
             </div>`).join('')
         : '<div class="empty">No member is waiting on a scope decision.</div>';
     }
+
+    renderSocietyFloor(data);
 
     const list = $('scope-grant-list');
     if (!list) return;
@@ -6118,6 +6161,58 @@
     pane.addEventListener('click', async (e) => {
       const open = e.target.closest('[data-open-scope]');
       if (open) { $('scope-modal').hidden = false; return; }
+      // SOCIETY FLOOR — POST /api/scope/floor {path, reason, recursive, access} (replaces by
+      // path), POST /api/scope/floor/remove {path, reason}.
+      const floorPost = async (url, body, what) => {
+        err.hidden = true;
+        try {
+          const res = await apiFetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const out = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+          await tick(); renderScopeGrants(lastData);
+          return true;
+        } catch (e2) { err.textContent = `${what} failed: ${e2.message}`; err.hidden = false; return false; }
+      };
+      const tog = e.target.closest('[data-floor-field]');
+      if (tog) {
+        const p = tog.dataset.floorPath;
+        const cur = (lastData?.society_floor ?? []).find(f => f.path === p);
+        if (!cur) return;
+        const next = { recursive: !!cur.recursive, access: cur.access === 'read' ? 'read' : 'all' };
+        if (tog.dataset.floorField === 'w') next.access = tog.checked ? 'all' : 'read';
+        else next.recursive = tog.checked;
+        const why = prompt(`Change the society floor entry for EVERY member?\n\n${p}\n\nnow: ${next.access === 'read' ? 'read-only' : 'read + write'}, ${next.recursive ? 'whole subtree' : 'exactly this path'}\n\nReason (required):`);
+        if (why === null || !why.trim()) { tog.checked = !tog.checked; return; }
+        tog.disabled = true;
+        if (!await floorPost('/api/scope/floor', { path: p, reason: why, ...next }, 'floor change')) {
+          tog.checked = !tog.checked; tog.disabled = false;
+        }
+        return;
+      }
+      const rm = e.target.closest('[data-floor-remove]');
+      if (rm) {
+        const p = rm.dataset.floorRemove;
+        const why = prompt(`Remove ${p} from the society floor?\n\nThis narrows EVERY member at once. Reason:`);
+        if (why === null) return;
+        rm.disabled = true;
+        if (!await floorPost('/api/scope/floor/remove', { path: p, reason: why }, 'floor remove')) rm.disabled = false;
+        return;
+      }
+      if (e.target.closest('#floor-add-btn')) {
+        const p = ($('floor-add-path')?.value ?? '').trim();
+        const why = ($('floor-add-reason')?.value ?? '').trim();
+        if (!p || !why) { err.textContent = 'a floor entry needs an absolute path and a reason'; err.hidden = false; return; }
+        const body = { path: p, reason: why, recursive: !!$('floor-add-rec')?.checked,
+                       access: $('floor-add-w')?.checked ? 'all' : 'read' };
+        if (!confirm(`Add to the society floor, for EVERY member?\n\n${p}${body.recursive ? '/**' : ''}\n${body.access === 'read' ? 'read-only' : 'read + write'}`)) return;
+        if (await floorPost('/api/scope/floor', body, 'floor add')) {
+          $('floor-add-path').value = ''; $('floor-add-reason').value = '';
+        }
+        return;
+      }
       // make standing — POST /api/scope/standing/promote
       const pro = e.target.closest('[data-promote-member]');
       if (pro) {
