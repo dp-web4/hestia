@@ -1,0 +1,245 @@
+--- plugins/_shared/hestia_governance_closure.py	2026-10-19 15:41:52.715685691 -0700
++++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_rev.py	2026-10-19 15:51:26.694331543 -0700
+@@ -933,6 +933,70 @@
+     return None
+ 
+ 
++def _short_cluster_value(args: list, letter: str, takes_value: str) -> list:
++    """Values of a short option `letter` that may sit in a bundled cluster (`-ro F`, `-oF`).
++    `takes_value` lists every letter of this verb that consumes a value: scanning stops at the
++    first of them, whose value is the cluster's remainder or, if none, the next argument.
++    Returns the values `letter` received (it may be given more than once)."""
++    out, i = [], 0
++    while i < len(args):
++        a = args[i]
++        if a == "--":
++            break
++        if a.startswith("-") and not a.startswith("--") and len(a) > 1:
++            body = a[1:]
++            for j, ch in enumerate(body):
++                if ch in takes_value:
++                    val = body[j + 1:]
++                    if not val and i + 1 < len(args):
++                        val = args[i + 1]
++                        i += 1
++                    if ch == letter and val:
++                        out.append(val)
++                    break
++        i += 1
++    return out
++
++
++def _long_values(args: list, *names: str) -> list:
++    """Every value given to these long options, as `--name=V` or `--name V`."""
++    out = []
++    for i, a in enumerate(args):
++        for n in names:
++            if a == n and i + 1 < len(args):
++                out.append(args[i + 1])
++            elif a.startswith(n + "="):
++                out.append(a[len(n) + 1:])
++    return out
++
++
++#: sed: a `w`/`W` command, or the `w` flag of `s///`, names a file the script WRITES. Matched
++#: on the script text; a match makes the whole command out of grammar (fail closed iff closure
++#: vocabulary appears), because a sed script's file operands are not positional (#1348).
++_SED_WRITE = re.compile(r"(?:^|[;{}\n]|\d|\$|/)\s*[wW]\s*\S|s(.).*?\1.*?\1[gpiImMeE0-9]*w")
++#: awk: output redirection inside a print/printf statement (`print > F`, `>> F`, `| "cmd"`),
++#: a command piped into getline (`"cmd" | getline`), or system(). A bare `>` elsewhere is a
++#: comparison (`NR>5`, `c>=3`) and does not write: the transcript replay measured those as
++#: the main false-write source of a cruder pattern.
++_AWK_WRITE = re.compile(r"\bprintf?\b[^;{}]*?(?:>|\|)|\|\s*getline|\bsystem\s*\(")
++#: Verbs that only read or print, safe to run from xargs / find -exec on governed paths.
++_PASSIVE_VERBS = frozenset({"grep", "egrep", "fgrep", "rg", "cat", "head", "tail", "wc", "ls",
++                            "stat", "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum",
++                            "echo", "printf", "basename", "dirname", "realpath", "readlink",
++                            "du", "test", "[", "true", "diff", "cmp"})
++
++
++def _inner_is_passive(words: list) -> bool:
++    """For xargs / find -exec: is the command they run one that only reads?"""
++    words = _strip_wrappers(words)
++    return bool(words) and os.path.basename(words[0]) in _PASSIVE_VERBS
++_COMPRESSORS = frozenset({"gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "lzma", "unlzma",
++                          "zstd", "unzstd", "lz4", "compress", "uncompress"})
++#: Compressor flags that leave the input in place and write only to stdout / nowhere.
++_COMPRESS_KEEP = frozenset({"-c", "--stdout", "--to-stdout", "-t", "--test", "-l", "--list",
++                            "-k", "--keep"})
++
++
+ def _command_write_targets(words: list, stdin_src=None) -> list:
+     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
+     their file args are read positions by default (the anti-FP stance; the daemon's
+@@ -968,6 +1032,15 @@
+             raise _OpaqueWriter()
+         return _patch_write_targets(pin)
+     if name == "sed":
++        scripts = [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-e", "--expression")]
++        scripts += [a.split("=", 1)[1] for a in args if a.startswith("--expression=")]
++        if any(a in ("-f", "--file") or a.startswith("--file=") for a in args):
++            raise _OutOfGrammar()  # the script is in a file this classifier does not read
++        if not scripts:
++            pos = _positionals(args, opts_with_value=("-l", "--line-length"))
++            scripts = pos[:1]
++        if any(_SED_WRITE.search(sc) for sc in scripts):
++            raise _OutOfGrammar()
+         # In-place: `--in-place[=SUFFIX]`, `-i`, `-i.bak`, AND bundled short clusters that
+         # contain `i` (`-Ei`, `-nEi`, ...). A short cluster is `-<letters>` (not `--`); the
+         # regex fires when an `i` appears anywhere in that letter run before an attached suffix.
+@@ -997,6 +1070,102 @@
+         return _positionals(args)
+     if name == "touch":
+         return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
++    # ── #1348: verbs whose output hides in an option, an operand, a script, or the input ──
++    if name == "sort":
++        return (_short_cluster_value(args, "o", "oktST") + _long_values(args, "--output"))
++    if name == "uniq":
++        pos = _positionals(args, opts_with_value=("-f", "-s", "-w", "--skip-fields",
++                                                  "--skip-chars", "--check-chars"))
++        return pos[1:2]
++    if name == "split":
++        pos = _positionals(args, opts_with_value=("-a", "-b", "-C", "-l", "-n", "-t",
++                                                  "--additional-suffix", "--filter"))
++        if any(a == "--filter" or a.startswith("--filter=") for a in args):
++            raise _OutOfGrammar()  # runs a shell command per chunk
++        return pos[1:2]
++    if name == "csplit":
++        return (_short_cluster_value(args, "f", "fbn") + _long_values(args, "--prefix"))
++    if name in ("mkdir", "mkfifo", "mknod"):
++        return _positionals(args, opts_with_value=("-m", "--mode", "-Z", "--context"))[:1] \
++            if name == "mknod" else _positionals(args, opts_with_value=("-m", "--mode"))
++    if name in ("curl",):
++        return (_short_cluster_value(args, "o", "oHdXuAeEbcKrTxwmFC")
++                + _long_values(args, "--output", "--dump-header", "--cookie-jar", "--trace",
++                               "--trace-ascii", "--stderr", "--libcurl", "--etag-save"))
++    if name == "wget":
++        return (_short_cluster_value(args, "O", "OoaPe") + _short_cluster_value(args, "o", "OoaPe")
++                + _short_cluster_value(args, "P", "OoaPe")
++                + _long_values(args, "--output-document", "--output-file", "--append-output",
++                               "--directory-prefix"))
++    if name in ("tar", "bsdtar", "gtar"):
++        first = args[0] if args else ""
++        letters = first.lstrip("-") if first and not first.startswith("--") else ""
++        flags = set(letters) | {a[1] for a in args if len(a) == 2 and a.startswith("-")}
++        long_modes = {a for a in args if a.startswith("--")}
++        if "x" in flags or "--extract" in long_modes or "--get" in long_modes:
++            raise _OutOfGrammar()  # extraction writes the archive's members wherever they say
++        if flags & set("cruA") or long_modes & {"--create", "--append", "--update",
++                                                "--concatenate"}:
++            vals = _long_values(args, "--file")
++            if letters and "f" in letters:
++                # old-style `tar czf ARCHIVE ...`: f's value is the next free argument
++                rest = letters[letters.index("f") + 1:]
++                vals.append(rest if rest else (args[1] if len(args) > 1 else ""))
++            vals += _short_cluster_value(args[1:] if letters else args, "f", "fCTXbN")
++            return [v for v in vals if v]
++        return []
++    if name in ("awk", "gawk", "mawk", "nawk", "busybox-awk"):
++        if any(a in ("-f", "--file") or a.startswith("--file=") for a in args):
++            raise _OutOfGrammar()
++        prog = _positionals(args, opts_with_value=("-v", "-F", "--assign", "--field-separator"))
++        if prog and _AWK_WRITE.search(prog[0]):
++            raise _OutOfGrammar()
++        return []
++    if name in ("perl", "ruby"):
++        in_place = any(a.startswith("-") and not a.startswith("--")
++                       and re.match(r"^-[A-Za-z]*i", a) is not None for a in args)
++        if in_place:
++            raise _OutOfGrammar()  # rewrites every file operand; the script is opaque
++        return []
++    if name in _COMPRESSORS:
++        if any(a in _COMPRESS_KEEP for a in args) or any(
++                a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("ctlk")
++                for a in args):
++            if "--rm" not in args:
++                return []
++        # Without -c/-k the input is replaced (written, then removed): every operand is a write.
++        return _positionals(args, opts_with_value=("-S", "--suffix", "-T", "--threads",
++                                                   "-o", "--output"))
++    if name == "find":
++        out = []
++        for i, a in enumerate(args):
++            if a in ("-fprint", "-fprint0", "-fls") and i + 1 < len(args):
++                out.append(args[i + 1])
++            elif a == "-fprintf" and i + 1 < len(args):
++                out.append(args[i + 1])
++            elif a in ("-exec", "-execdir", "-ok", "-okdir"):
++                # Runs a command on what it finds: fine when that command only reads.
++                if not _inner_is_passive(args[i + 1:]):
++                    raise _OutOfGrammar()
++        if "-delete" in args:
++            # -delete removes what it matches, under every start point.
++            starts = []
++            for a in args:
++                if a.startswith("-") or a in ("!", "(", ")", ","):
++                    break
++                starts.append(a)
++            out.extend(starts or ["."])
++        return out
++    if name == "xargs":
++        # Runs a command on its input: fine when that command only reads.
++        inner = _positionals(args, opts_with_value=(
++            "-I", "-i", "-n", "-L", "-l", "-P", "-d", "-E", "-e", "-s", "-a", "--arg-file",
++            "--delimiter", "--max-args", "--max-lines", "--max-procs", "--replace", "--eof",
++            "--max-chars"))
++        first = next((k for k, a in enumerate(args) if a == (inner[0] if inner else None)), None)
++        if first is None or not _inner_is_passive(args[first:]):
++            raise _OutOfGrammar()
++        return []
+     if name == "git":
+         # Skip global options to find the subcommand.
+         i = 0
+@@ -1078,7 +1247,13 @@
+             return _positionals(rest, opts_with_value=("-s", "--source"))
+         if sub == "clean":
+             return _positionals(rest)
+-        return []
++        # #1348: read-looking subcommands that write through an option.
++        out = _long_values(rest, "--output", "--output-directory")
++        if sub in ("format-patch", "archive", "bundle"):
++            out += _short_cluster_value(rest, "o", "ov")
++        if sub == "bundle" and rest[:1] == ["create"] and len(rest) > 1:
++            out.append(rest[1])
++        return out
+     return []
+ 
+ 
+@@ -1171,6 +1346,11 @@
+     any out-of-grammar construct (caller -> out-of-grammar posture)."""
+     toks = _tokenize(_strip_heredoc_bodies(command))
+     targets, cur = [], []
++    # An out-of-grammar SIMPLE command is remembered, not raised on the spot: the walk goes on,
++    # so a later opaque writer (an unreadable `git apply` / `patch`, which refuses
++    # unconditionally) still decides. Raising at the first one let `tar -x ... && git apply
++    # <unreadable>` resolve to the weaker, vocabulary-conditional posture (#1348 replay).
++    deferred_oog = False
+     stdin_src = None  # `< file` source for the current simple command (patch input)
+     eff = ""  # relative cwd accumulator; cd within this command line adjusts it
+     i = 0
+@@ -1178,7 +1358,10 @@
+         t = toks[i]
+         if t in _SEPARATORS:
+             if cur:
+-                eff = _flush_simple_command(cur, eff, targets, stdin_src)
++                try:
++                    eff = _flush_simple_command(cur, eff, targets, stdin_src)
++                except _OutOfGrammar:
++                    deferred_oog = True
+                 cur = []
+             stdin_src = None
+             i += 1
+@@ -1209,7 +1392,12 @@
+         cur.append(t)
+         i += 1
+     if cur:
+-        eff = _flush_simple_command(cur, eff, targets, stdin_src)
++        try:
++            eff = _flush_simple_command(cur, eff, targets, stdin_src)
++        except _OutOfGrammar:
++            deferred_oog = True
++    if deferred_oog:
++        raise _OutOfGrammar()
+     return targets
+ 
+ 
