@@ -1,5 +1,5 @@
 --- plugins/_shared/hestia_governance_closure.py	2026-10-19 15:41:52.715685691 -0700
-+++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_rev.py	2026-10-19 15:51:26.694331543 -0700
++++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_rev.py	2026-10-19 16:01:00.097452789 -0700
 @@ -933,6 +933,70 @@
      return None
  
@@ -64,30 +64,32 @@
 +_COMPRESSORS = frozenset({"gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "lzma", "unlzma",
 +                          "zstd", "unzstd", "lz4", "compress", "uncompress"})
 +#: Compressor flags that leave the input in place and write only to stdout / nowhere.
-+_COMPRESS_KEEP = frozenset({"-c", "--stdout", "--to-stdout", "-t", "--test", "-l", "--list",
-+                            "-k", "--keep"})
++#: (-k/--keep is NOT here: it keeps the input but still writes F.gz beside it — Codex, #1349.)
++_COMPRESS_KEEP = frozenset({"-c", "--stdout", "--to-stdout", "-t", "--test", "-l", "--list"})
 +
 +
  def _command_write_targets(words: list, stdin_src=None) -> list:
      """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
      their file args are read positions by default (the anti-FP stance; the daemon's
-@@ -968,6 +1032,15 @@
+@@ -968,6 +1032,17 @@
              raise _OpaqueWriter()
          return _patch_write_targets(pin)
      if name == "sed":
-+        scripts = [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-e", "--expression")]
-+        scripts += [a.split("=", 1)[1] for a in args if a.startswith("--expression=")]
-+        if any(a in ("-f", "--file") or a.startswith("--file=") for a in args):
++        # Every spelling: `-e S`, `-eS`, `-ne S`, `--expression S`, `--expression=S` (Codex,
++        # #1349: an attached `-e'w F'` was missed). `l` takes a value too (line length).
++        scripts = _short_cluster_value(args, "e", "efl") + _long_values(args, "--expression")
++        if _short_cluster_value(args, "f", "efl") or _long_values(args, "--file"):
 +            raise _OutOfGrammar()  # the script is in a file this classifier does not read
 +        if not scripts:
-+            pos = _positionals(args, opts_with_value=("-l", "--line-length"))
++            pos = _positionals(args, opts_with_value=("-l", "--line-length", "-e", "-f",
++                                                      "--expression", "--file"))
 +            scripts = pos[:1]
 +        if any(_SED_WRITE.search(sc) for sc in scripts):
 +            raise _OutOfGrammar()
          # In-place: `--in-place[=SUFFIX]`, `-i`, `-i.bak`, AND bundled short clusters that
          # contain `i` (`-Ei`, `-nEi`, ...). A short cluster is `-<letters>` (not `--`); the
          # regex fires when an `i` appears anywhere in that letter run before an attached suffix.
-@@ -997,6 +1070,102 @@
+@@ -997,6 +1072,120 @@
          return _positionals(args)
      if name == "touch":
          return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
@@ -96,11 +98,14 @@
 +        return (_short_cluster_value(args, "o", "oktST") + _long_values(args, "--output"))
 +    if name == "uniq":
 +        pos = _positionals(args, opts_with_value=("-f", "-s", "-w", "--skip-fields",
-+                                                  "--skip-chars", "--check-chars"))
++                                                  "--skip-chars", "--check-chars",
++                                                  "--group", "--all-repeated"))
 +        return pos[1:2]
 +    if name == "split":
-+        pos = _positionals(args, opts_with_value=("-a", "-b", "-C", "-l", "-n", "-t",
-+                                                  "--additional-suffix", "--filter"))
++        pos = _positionals(args, opts_with_value=(
++            "-a", "-b", "-C", "-l", "-n", "-t", "--additional-suffix", "--filter",
++            "--suffix-length", "--bytes", "--line-bytes", "--lines", "--number",
++            "--separator", "--numeric-suffixes", "--hex-suffixes"))
 +        if any(a == "--filter" or a.startswith("--filter=") for a in args):
 +            raise _OutOfGrammar()  # runs a shell command per chunk
 +        return pos[1:2]
@@ -119,24 +124,37 @@
 +                + _long_values(args, "--output-document", "--output-file", "--append-output",
 +                               "--directory-prefix"))
 +    if name in ("tar", "bsdtar", "gtar"):
-+        first = args[0] if args else ""
-+        letters = first.lstrip("-") if first and not first.startswith("--") else ""
-+        flags = set(letters) | {a[1] for a in args if len(a) == 2 and a.startswith("-")}
-+        long_modes = {a for a in args if a.startswith("--")}
-+        if "x" in flags or "--extract" in long_modes or "--get" in long_modes:
++        # Old style: the first word is a bare letter cluster (`tar czf A ...`); its value
++        # letters take the following words in order. Otherwise options sit in ANY dashed
++        # cluster (`tar -v -cf A`; Codex, #1349, the first cut read only the first cluster).
++        old = args[0] if args and args[0] and not args[0].startswith("-") \
++            and re.fullmatch(r"[A-Za-z]+", args[0]) else ""
++        flags = set(old)
++        for a in args:
++            if a.startswith("-") and not a.startswith("--"):
++                body = a[1:]
++                for k, ch in enumerate(body):
++                    flags.add(ch)
++                    if ch in "fCTXbNgHKV":
++                        break  # the rest of the cluster is this option's value
++        long_modes = {a.split("=", 1)[0] for a in args if a.startswith("--")}
++        if "x" in flags or long_modes & {"--extract", "--get"}:
 +            raise _OutOfGrammar()  # extraction writes the archive's members wherever they say
 +        if flags & set("cruA") or long_modes & {"--create", "--append", "--update",
-+                                                "--concatenate"}:
++                                                "--concatenate", "--catenate"}:
 +            vals = _long_values(args, "--file")
-+            if letters and "f" in letters:
-+                # old-style `tar czf ARCHIVE ...`: f's value is the next free argument
-+                rest = letters[letters.index("f") + 1:]
-+                vals.append(rest if rest else (args[1] if len(args) > 1 else ""))
-+            vals += _short_cluster_value(args[1:] if letters else args, "f", "fCTXbN")
++            if old and "f" in old:
++                k = 1 + sum(1 for ch in old[:old.index("f")] if ch in "CTXbNgHKV")
++                vals.append(args[k] if k < len(args) else "")
++            vals += _short_cluster_value(args[1:] if old else args, "f", "fCTXbNgHKV")
 +            return [v for v in vals if v]
 +        return []
 +    if name in ("awk", "gawk", "mawk", "nawk", "busybox-awk"):
-+        if any(a in ("-f", "--file") or a.startswith("--file=") for a in args):
++        # A program in a file (`-f F`, `-fF`, `--file`), gawk's `-E F`, or an include
++        # (`-i inplace` edits every operand in place) is not readable here (Codex, #1349).
++        if (_short_cluster_value(args, "f", "fvFEil") or _short_cluster_value(args, "E", "fvFEil")
++                or _short_cluster_value(args, "i", "fvFEil")
++                or _long_values(args, "--file", "--exec", "--include", "--load")):
 +            raise _OutOfGrammar()
 +        prog = _positionals(args, opts_with_value=("-v", "-F", "--assign", "--field-separator"))
 +        if prog and _AWK_WRITE.search(prog[0]):
@@ -149,14 +167,16 @@
 +            raise _OutOfGrammar()  # rewrites every file operand; the script is opaque
 +        return []
 +    if name in _COMPRESSORS:
-+        if any(a in _COMPRESS_KEEP for a in args) or any(
-+                a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("ctlk")
-+                for a in args):
-+            if "--rm" not in args:
-+                return []
-+        # Without -c/-k the input is replaced (written, then removed): every operand is a write.
-+        return _positionals(args, opts_with_value=("-S", "--suffix", "-T", "--threads",
-+                                                   "-o", "--output"))
++        outs = _short_cluster_value(args, "o", "oST") + _long_values(args, "--output")
++        to_stdout = any(a in _COMPRESS_KEEP for a in args) or any(
++            a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("ctl")
++            for a in args)
++        if to_stdout and "--rm" not in args:
++            return outs
++        # Otherwise every operand is written (replaced, or a sibling output created beside it
++        # under -k), and an explicit -o names one more.
++        return outs + _positionals(args, opts_with_value=("-S", "--suffix", "-T", "--threads",
++                                                          "-o", "--output"))
 +    if name == "find":
 +        out = []
 +        for i, a in enumerate(args):
@@ -190,7 +210,7 @@
      if name == "git":
          # Skip global options to find the subcommand.
          i = 0
-@@ -1078,7 +1247,13 @@
+@@ -1078,7 +1267,13 @@
              return _positionals(rest, opts_with_value=("-s", "--source"))
          if sub == "clean":
              return _positionals(rest)
@@ -205,7 +225,7 @@
      return []
  
  
-@@ -1171,6 +1346,11 @@
+@@ -1171,6 +1366,11 @@
      any out-of-grammar construct (caller -> out-of-grammar posture)."""
      toks = _tokenize(_strip_heredoc_bodies(command))
      targets, cur = [], []
@@ -217,7 +237,7 @@
      stdin_src = None  # `< file` source for the current simple command (patch input)
      eff = ""  # relative cwd accumulator; cd within this command line adjusts it
      i = 0
-@@ -1178,7 +1358,10 @@
+@@ -1178,7 +1378,10 @@
          t = toks[i]
          if t in _SEPARATORS:
              if cur:
@@ -229,7 +249,7 @@
                  cur = []
              stdin_src = None
              i += 1
-@@ -1209,7 +1392,12 @@
+@@ -1209,7 +1412,12 @@
          cur.append(t)
          i += 1
      if cur:
