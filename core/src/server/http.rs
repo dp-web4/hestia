@@ -869,13 +869,24 @@ async fn operator_deployment_update(
         }
     };
 
-    if super::dashboard::same_deployed_build(&authority_build, authority_head_sha.as_deref(), env!("HESTIA_GIT_VERSION")) {
+    // A box that is current against its OWN manifest can still be behind origin/main: the
+    // daemon never fetches, so only the supervisor knows. With the timer off, this request is
+    // the box's only way to find out, so it is not short-circuited here ("check for updates").
+    // The supervisor syncs, compares, and logs CURRENT without building when nothing moved.
+    let locally_current = super::dashboard::same_deployed_build(
+        &authority_build,
+        authority_head_sha.as_deref(),
+        env!("HESTIA_GIT_VERSION"),
+    );
+
+    // Refuse before witnessing or publishing anything when there is no supervisor to start:
+    // the trigger could only fail, and the old failure text named no remedy (#791).
+    if !super::dashboard::deploy_supervisor_installed() {
         return (
-            StatusCode::OK,
+            StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "status": "current",
-                "message": "deployment is already current",
-                "running_build": env!("HESTIA_GIT_VERSION"),
+                "status": "update_unavailable",
+                "error": super::dashboard::DEPLOY_SUPERVISOR_MISSING,
             })),
         );
     }
@@ -943,6 +954,7 @@ async fn operator_deployment_update(
                 "authority_build": authority_build,
                 "platform": std::env::consts::OS,
                 "mechanism": "registered-deployment-supervisor",
+                "locally_current": locally_current,
             }),
             provenance.as_ref(),
         );
@@ -1085,6 +1097,230 @@ async fn operator_deployment_update(
     }
 }
 
+/// Body of `POST /api/operator/deployment/auto-update`: on or off, nothing else. No unit,
+/// path or schedule is taken from the browser.
+#[derive(serde::Deserialize)]
+struct AutoUpdateToggle {
+    enabled: bool,
+}
+
+/// Fixed timer toggle. `--now` makes enabled and active move together, so what the dashboard
+/// reads from the unit files (`auto_update_state`) is also what is scheduled.
+fn auto_update_trigger_for(os: &str, enabled: bool) -> Option<DeploymentUpdateTrigger> {
+    match os {
+        "linux" => Some(DeploymentUpdateTrigger {
+            program: "systemctl",
+            args: vec![
+                "--user".into(),
+                if enabled { "enable" } else { "disable" }.into(),
+                "--now".into(),
+                "hestia-deploy.timer".into(),
+            ],
+        }),
+        _ => None,
+    }
+}
+
+/// `POST /api/operator/deployment/auto-update` - switch scheduled deploys (hestia-deploy.timer)
+/// on or off. The update button is unaffected: with the timer off the box still updates, but
+/// only when the operator asks.
+///
+/// Turning it ON can start a deploy straight away: the timer is `Persistent=true`, so a missed
+/// fire time runs as soon as it is armed. The dashboard says so before it asks.
+async fn operator_deployment_auto_update(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(toggle): Json<AutoUpdateToggle>,
+) -> impl IntoResponse {
+    let now = super::state::unix_now();
+    let (operator, provenance) = {
+        let s = state.lock().await;
+        current_operator_context(&s, &headers, now)
+    };
+    let Some(unit_dir) = super::dashboard::auto_update_unit_dir() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "unavailable",
+                "error": format!("no auto-update toggle for {}", std::env::consts::OS),
+            })),
+        );
+    };
+    let Some(trigger) = auto_update_trigger_for(std::env::consts::OS, toggle.enabled) else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "unavailable",
+                "error": format!("no auto-update toggle for {}", std::env::consts::OS),
+            })),
+        );
+    };
+    let (code, body) = toggle_auto_update(
+        &state,
+        operator,
+        provenance,
+        toggle.enabled,
+        &unit_dir,
+        trigger,
+        deployment_trigger_output,
+    )
+    .await;
+    (code, Json(body))
+}
+
+/// One auto-update change at a time. Two opposing clicks (two tabs, a double click) would
+/// otherwise both read the same `before`, both witness an intent against it and race their
+/// systemctl calls, leaving a chain whose before/after pairs describe no real sequence.
+static AUTO_UPDATE_TOGGLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The toggle itself, with the unit directory and the systemctl runner passed in so tests can
+/// drive it without a real user systemd. Holds [`AUTO_UPDATE_TOGGLE`] from the first read of the
+/// timer state to the outcome record.
+async fn toggle_auto_update<F>(
+    state: &SharedState,
+    operator: Option<String>,
+    provenance: Option<super::operator_auth::OperatorProvenance>,
+    enabled: bool,
+    unit_dir: &std::path::Path,
+    trigger: DeploymentUpdateTrigger,
+    run: F,
+) -> (StatusCode, serde_json::Value)
+where
+    F: FnOnce(&DeploymentUpdateTrigger) -> std::result::Result<(), String> + Send + 'static,
+{
+    let _one_at_a_time = AUTO_UPDATE_TOGGLE.lock().await;
+    let before = super::dashboard::auto_update_state_in(unit_dir);
+    let wanted = if enabled { "on" } else { "off" };
+    if before == "absent" {
+        return (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "status": "absent",
+                "error": "hestia-deploy.timer is not installed on this box; see deploy/from-main/README.md",
+            }),
+        );
+    }
+    if before == wanted {
+        return (
+            StatusCode::OK,
+            serde_json::json!({ "status": wanted, "message": format!("auto-update is already {wanted}") }),
+        );
+    }
+
+    // SELF-WITNESS BEFORE SIDE EFFECT, as for the update request: no chain record, no toggle.
+    {
+        let s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "before": before,
+                "requested": wanted,
+                "platform": std::env::consts::OS,
+                "trigger_program": trigger.program,
+                "trigger_args": trigger.args,
+            }),
+            provenance.as_ref(),
+        );
+        if let Err(error) = s.append_chain("deployment_auto_update_intent", record) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "status": "failed",
+                    "error": format!("cannot witness auto-update change: {error}"),
+                }),
+            );
+        }
+    }
+
+    let trigger_for_run = trigger.clone();
+    let trigger_result = match tokio::task::spawn_blocking(move || run(&trigger_for_run)).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("auto-update toggle task failed: {error}")),
+    };
+    let after = super::dashboard::auto_update_state_in(unit_dir);
+    let outcome = auto_update_outcome(wanted, after, &trigger_result);
+    let witness = {
+        let s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "before": before,
+                "requested": wanted,
+                "after": after,
+                "outcome": outcome,
+                "error": trigger_result.as_ref().err(),
+            }),
+            provenance.as_ref(),
+        );
+        s.append_chain("deployment_auto_update_changed", record)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
+    auto_update_reply(wanted, after, outcome, &trigger_result, witness)
+}
+
+/// How a toggle ended, judged by the unit files afterwards, not by systemctl's exit alone:
+/// `changed` (asked for and now in force), `not-applied` (systemctl said yes but the timer
+/// still reads otherwise) or `trigger-failed`.
+fn auto_update_outcome(
+    wanted: &str,
+    after: &str,
+    trigger: &std::result::Result<(), String>,
+) -> &'static str {
+    match trigger {
+        Err(_) => "trigger-failed",
+        Ok(()) if after == wanted => "changed",
+        Ok(()) => "not-applied",
+    }
+}
+
+/// The caller's answer. A change that took effect but whose outcome record did not land is
+/// still an error, and it says the change happened: the operator must not retry a toggle that
+/// already took, and must know the chain is one record short.
+fn auto_update_reply(
+    wanted: &str,
+    after: &str,
+    outcome: &str,
+    trigger: &std::result::Result<(), String>,
+    witness: std::result::Result<(), String>,
+) -> (StatusCode, serde_json::Value) {
+    let witness_error = witness.err().map(|e| format!("the outcome record was not written: {e}"));
+    let (code, error) = match (outcome, trigger) {
+        ("changed", _) => match &witness_error {
+            None => (StatusCode::OK, None),
+            Some(w) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some(format!("auto-update is now {after}, but {w}")),
+            ),
+        },
+        ("not-applied", _) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(format!(
+                "systemctl reported success but the timer reads {after}, not {wanted}{}",
+                witness_error.as_ref().map(|w| format!("; {w}")).unwrap_or_default()
+            )),
+        ),
+        (_, Err(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(format!(
+                "{e}{}",
+                witness_error.as_ref().map(|w| format!("; {w}")).unwrap_or_default()
+            )),
+        ),
+        (_, Ok(())) => (StatusCode::INTERNAL_SERVER_ERROR, Some(format!("unexpected outcome {outcome}"))),
+    };
+    let mut body = serde_json::json!({
+        "status": after,
+        "requested": wanted,
+        "outcome": outcome,
+        "witnessed": witness_error.is_none(),
+    });
+    if let Some(e) = error {
+        body["error"] = e.into();
+    }
+    (code, body)
+}
+
 #[cfg(test)]
 mod deployment_update_tests {
     use super::*;
@@ -1097,6 +1333,146 @@ mod deployment_update_tests {
             trigger.args,
             ["--user", "--no-block", "start", "hestia-deploy.service"]
         );
+    }
+
+    #[test]
+    fn auto_update_toggle_is_fixed_on_linux_and_absent_elsewhere() {
+        let on = auto_update_trigger_for("linux", true).unwrap();
+        assert_eq!(on.program, "systemctl");
+        assert_eq!(on.args, ["--user", "enable", "--now", "hestia-deploy.timer"]);
+        let off = auto_update_trigger_for("linux", false).unwrap();
+        assert_eq!(off.args, ["--user", "disable", "--now", "hestia-deploy.timer"]);
+        assert!(auto_update_trigger_for("macos", true).is_none());
+        assert!(auto_update_trigger_for("windows", false).is_none());
+    }
+
+    #[test]
+    fn auto_update_reply_reports_what_happened_not_what_was_asked() {
+        let ok: std::result::Result<(), String> = Ok(());
+        let failed: std::result::Result<(), String> = Err("systemctl exited 1".into());
+        // Asked, done, witnessed.
+        let (code, body) = auto_update_reply("on", "on", auto_update_outcome("on", "on", &ok), &ok, Ok(()));
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!((body["outcome"].as_str(), body["witnessed"].as_bool()), (Some("changed"), Some(true)));
+        assert!(body.get("error").is_none());
+        // Done but the outcome record failed: an error that says the change took.
+        let (code, body) = auto_update_reply("on", "on", "changed", &ok, Err("chain poisoned".into()));
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["witnessed"], false);
+        let e = body["error"].as_str().unwrap();
+        assert!(e.contains("auto-update is now on") && e.contains("chain poisoned"), "{e}");
+        // systemctl exit 0, timer unchanged: not reported as success.
+        assert_eq!(auto_update_outcome("off", "on", &ok), "not-applied");
+        let (code, body) = auto_update_reply("off", "on", "not-applied", &ok, Ok(()));
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["status"], "on");
+        assert!(body["error"].as_str().unwrap().contains("reads on, not off"));
+        // Trigger failed, and the record of that failed too: both named.
+        let (code, body) = auto_update_reply("on", "off", "trigger-failed", &failed, Err("disk full".into()));
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let e = body["error"].as_str().unwrap();
+        assert!(e.contains("systemctl exited 1") && e.contains("disk full"), "{e}");
+    }
+
+    async fn toggle_test_state() -> (tempfile::TempDir, SharedState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    /// A stand-in for `systemctl --user enable|disable --now`: moves the timers.target.wants
+    /// link the dashboard reads, after a pause so concurrent toggles would overlap.
+    fn fake_systemctl(
+        unit_dir: std::path::PathBuf,
+        apply: bool,
+    ) -> impl FnOnce(&DeploymentUpdateTrigger) -> std::result::Result<(), String> + Send + 'static {
+        move |t| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if apply {
+                let wants = unit_dir.join("timers.target.wants");
+                std::fs::create_dir_all(&wants).unwrap();
+                let link = wants.join("hestia-deploy.timer");
+                if t.args.iter().any(|a| a == "enable") {
+                    std::fs::write(&link, "").unwrap();
+                } else {
+                    let _ = std::fs::remove_file(&link);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_update_toggle_reports_a_change_systemctl_did_not_make() {
+        let (dir, state) = toggle_test_state().await;
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(units.join("hestia-deploy.timer"), "[Timer]\n").unwrap();
+        let trigger = auto_update_trigger_for("linux", true).unwrap();
+        let (code, body) = toggle_auto_update(
+            &state, Some("op".into()), None, true, &units, trigger, fake_systemctl(units.clone(), false),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["outcome"], "not-applied");
+        let s = state.lock().await;
+        let changed = s
+            .recent_chain(50)
+            .into_iter()
+            .find(|e| e.event_type == "deployment_auto_update_changed")
+            .expect("outcome record");
+        assert_eq!(changed.event_data["outcome"], "not-applied");
+        assert_eq!(changed.event_data["after"], "off");
+    }
+
+    #[tokio::test]
+    async fn opposing_auto_update_toggles_are_serialized() {
+        let (dir, state) = toggle_test_state().await;
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(units.join("hestia-deploy.timer"), "[Timer]\n").unwrap();
+        let on = {
+            let (state, units) = (state.clone(), units.clone());
+            tokio::spawn(async move {
+                let t = auto_update_trigger_for("linux", true).unwrap();
+                toggle_auto_update(&state, Some("a".into()), None, true, &units, t, fake_systemctl(units.clone(), true)).await
+            })
+        };
+        let off = {
+            let (state, units) = (state.clone(), units.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let t = auto_update_trigger_for("linux", false).unwrap();
+                toggle_auto_update(&state, Some("b".into()), None, false, &units, t, fake_systemctl(units.clone(), true)).await
+            })
+        };
+        let (on, off) = (on.await.unwrap(), off.await.unwrap());
+        assert_eq!(on.0, StatusCode::OK, "{}", on.1);
+        assert_eq!(off.0, StatusCode::OK, "{}", off.1);
+        assert_eq!(super::super::dashboard::auto_update_state_in(&units), "off");
+        // Chain order: each intent is followed by its own outcome, and the second toggle's
+        // `before` is the first one's `after`.
+        let s = state.lock().await;
+        let mut recs: Vec<_> = s
+            .recent_chain(200)
+            .into_iter()
+            .filter(|e| e.event_type.starts_with("deployment_auto_update_"))
+            .collect();
+        recs.sort_by_key(|e| e.chain_position);
+        let kinds: Vec<_> = recs.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "deployment_auto_update_intent",
+                "deployment_auto_update_changed",
+                "deployment_auto_update_intent",
+                "deployment_auto_update_changed"
+            ]
+        );
+        assert_eq!(recs[1].event_data["after"], "on");
+        assert_eq!(recs[2].event_data["before"], "on");
+        assert_eq!(recs[3].event_data["after"], "off");
     }
 
     #[test]
@@ -1210,6 +1586,10 @@ pub async fn serve_with_callback(
         .route(
             "/api/operator/deployment/update",
             post(operator_deployment_update),
+        )
+        .route(
+            "/api/operator/deployment/auto-update",
+            post(operator_deployment_auto_update),
         )
         .route(
             "/api/operator/gate-escalation",

@@ -331,6 +331,18 @@ pub struct GateEngineHealth {
     pub note: String,
 }
 
+/// One deploy-supervisor run as its own log line reports it, e.g.
+/// `2026-10-16T20:24:18Z CURRENT v0.3.0-rc.3-3-g7da0cc70 manifest-repair hooks=ok`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeployCycle {
+    /// The line's own UTC timestamp, as written (RFC 3339).
+    pub at: String,
+    /// CURRENT, DEPLOYED, HALF-DEPLOYED, FAIL, SKIP, STALE, PREFLIGHT or BUILD-ONLY.
+    pub result: String,
+    /// The rest of the line, bounded.
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeploymentHealth {
     /// `current`, `stale`, or `unknown`.
@@ -350,6 +362,19 @@ pub struct DeploymentHealth {
     pub update_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_note: Option<String>,
+    /// Scheduled auto-update, i.e. whether the hestia-deploy TIMER is armed: `on`, `off`,
+    /// `absent` (no timer unit installed on this box) or `unavailable` (no supported toggle on
+    /// this platform). The update button above is independent of it: with the timer off, the
+    /// box updates only when the operator asks. Read from the unit files on disk, never by
+    /// spawning systemctl, so the dashboard poll stays process-free (#1183).
+    #[serde(default)]
+    pub auto_update: String,
+    /// The last terminal line the deploy supervisor wrote to `$HESTIA_HOME/deploy.log`:
+    /// when the last scheduled run, dashboard update or check ran, and how it ended. None when
+    /// there is no log (supervisor never ran here). Covers timer runs too, which
+    /// `deploy-status.tsv` does not (it only tracks dashboard-originated requests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_cycle: Option<DeployCycle>,
     /// The last gate-capability self-report accepted during this daemon run, distinct from
     /// the daemon build above. This is A1 historical runtime evidence with no freshness,
     /// session, identity, or build binding — not installed-byte attestation. #481 owns that
@@ -370,9 +395,6 @@ fn deployment_update_status(
             None,
             Some(format!("dashboard update is unsupported on {}", std::env::consts::OS)),
         );
-    }
-    if current {
-        return (true, "idle".into(), None, None);
     }
     let Some(parent) = authority_path.parent() else {
         return (false, "unavailable".into(), None, Some("deployment authority has no parent directory".into()));
@@ -415,6 +437,32 @@ fn deployment_update_status(
     } else {
         format!(" toward {supervisor_target}")
     };
+    if current {
+        // Current against the local manifest, but an operator "check for updates" may be in
+        // flight (the supervisor is syncing origin/main) or may have just failed (e.g. main no
+        // longer builds). Show those; anything else, including "succeeded", is plain idle.
+        return match state {
+            "requested" | "held" if (0..=420 * 60).contains(&age_secs) => (
+                true,
+                state.into(),
+                request_id,
+                Some("checking origin/main for an update".into()),
+            ),
+            "running" if (0..=60 * 60).contains(&age_secs) => (
+                true,
+                "running".into(),
+                request_id,
+                Some(format!("deployment supervisor is checking for an update{target_note}")),
+            ),
+            "failed" if (0..=420 * 60).contains(&age_secs) => (
+                true,
+                "failed".into(),
+                request_id,
+                Some("last update check failed; the running deployment remains in force (see ~/.hestia/deploy.log)".into()),
+            ),
+            _ => (true, "idle".into(), None, None),
+        };
+    }
     match state {
         "requested" if (0..=420 * 60).contains(&age_secs) => (
             true,
@@ -501,6 +549,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             update_request_id: None,
             update_note: Some("deployment authority is not configured".into()),
             gate_engine: GateEngineHealth::default(),
+            auto_update: String::new(),
+            last_cycle: None,
         };
     };
     let raw = match std::fs::read_to_string(path) {
@@ -516,6 +566,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 update_request_id: None,
                 update_note: Some(format!("cannot read deployment authority: {error}")),
                 gate_engine: GateEngineHealth::default(),
+                auto_update: String::new(),
+                last_cycle: None,
             };
         }
     };
@@ -532,6 +584,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 update_request_id: None,
                 update_note: Some(format!("deployment authority is invalid JSON: {error}")),
                 gate_engine: GateEngineHealth::default(),
+                auto_update: String::new(),
+                last_cycle: None,
             };
         }
     };
@@ -552,6 +606,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             update_request_id: None,
             update_note: Some("deployment authority has no build_id".into()),
             gate_engine: GateEngineHealth::default(),
+            auto_update: String::new(),
+            last_cycle: None,
         };
     };
     let head_sha = manifest.get("head_sha").and_then(serde_json::Value::as_str);
@@ -578,7 +634,105 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
         update_request_id,
         update_note,
         gate_engine: GateEngineHealth::default(),
+        auto_update: String::new(),
+        last_cycle: None,
     }
+}
+
+/// This user's systemd unit directory: `$XDG_CONFIG_HOME/systemd/user`, else
+/// `$HOME/.config/systemd/user`. The deploy README installs the timer there.
+fn systemd_user_unit_dir() -> Option<std::path::PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(config.join("systemd/user"))
+}
+
+/// `on` when hestia-deploy.timer is installed and enabled (wanted by timers.target), `off`
+/// when installed but not enabled, `absent` when it was never installed. "Enabled" is what
+/// survives a reboot; the dashboard toggle changes enabled and active together.
+pub(crate) fn auto_update_state_in(unit_dir: &Path) -> &'static str {
+    if !unit_dir.join("hestia-deploy.timer").exists() {
+        return "absent";
+    }
+    if unit_dir.join("timers.target.wants/hestia-deploy.timer").exists() {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// Whether this box has the deploy supervisor the update button triggers: the user-systemd
+/// `hestia-deploy.service` on Linux, the `com.web4.hestia.deploy` launchd agent on macOS. A
+/// normal install does not set it up (deploy/from-main/README.md is a separate, once-per-box
+/// step), and without it the button can only fail with "Unit hestia-deploy.service not found"
+/// (#791). Read from the files on disk, like `auto_update_state`, so the poll spawns nothing.
+pub(crate) fn deploy_supervisor_installed() -> bool {
+    if cfg!(target_os = "linux") {
+        systemd_user_unit_dir().is_some_and(|d| d.join("hestia-deploy.service").exists())
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").is_some_and(|h| {
+            std::path::PathBuf::from(h)
+                .join("Library/LaunchAgents/com.web4.hestia.deploy.plist")
+                .exists()
+        })
+    } else {
+        false
+    }
+}
+
+/// The remedy a missing supervisor names, shared by the dashboard note and the endpoint.
+pub(crate) const DEPLOY_SUPERVISOR_MISSING: &str =
+    "the deploy supervisor (hestia-deploy) is not installed on this box; install it once per \
+     box as described in deploy/from-main/README.md";
+
+/// The auto-update state for this box. Linux (user systemd) only for now: the macOS deploy
+/// agent is a launchd plist whose schedule is not a separate unit to switch.
+pub(crate) fn auto_update_state() -> &'static str {
+    match auto_update_unit_dir() {
+        Some(dir) => auto_update_state_in(&dir),
+        None => "unavailable",
+    }
+}
+
+/// Where the toggle reads and moves the timer, or None where there is no toggle.
+pub(crate) fn auto_update_unit_dir() -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    systemd_user_unit_dir()
+}
+
+/// The words hestia-deploy.sh starts a run's terminal line with (its `log`/`die` calls).
+const DEPLOY_RESULTS: [&str; 8] =
+    ["CURRENT", "DEPLOYED", "HALF-DEPLOYED", "FAIL", "SKIP", "STALE", "PREFLIGHT", "BUILD-ONLY"];
+
+/// The last terminal run line in a deploy.log excerpt. Progress lines (`target=…`, `build …`,
+/// `WARN …`) are skipped; only a line whose first word after the timestamp is a result counts.
+pub(crate) fn last_deploy_cycle_in(log: &str) -> Option<DeployCycle> {
+    log.lines().rev().find_map(|line| {
+        let (at, rest) = line.split_once(' ')?;
+        chrono::DateTime::parse_from_rfc3339(at).ok()?;
+        let (word, detail) = rest.split_once(' ').unwrap_or((rest, ""));
+        DEPLOY_RESULTS.contains(&word).then(|| DeployCycle {
+            at: at.to_string(),
+            result: word.to_string(),
+            detail: detail.chars().take(240).collect(),
+        })
+    })
+}
+
+/// Read only the log's tail: the poll runs every few seconds and the log only grows.
+fn last_deploy_cycle(log_path: &Path) -> Option<DeployCycle> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 32 * 1024;
+    let mut file = std::fs::File::open(log_path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    last_deploy_cycle_in(&String::from_utf8_lossy(&bytes))
 }
 
 fn deployment_health(state: &ServerState) -> DeploymentHealth {
@@ -630,6 +784,16 @@ fn deployment_health(state: &ServerState) -> DeploymentHealth {
                or installed; see #481"
             .into(),
     };
+    health.auto_update = auto_update_state().into();
+    health.last_cycle = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
+        .and_then(|p| Path::new(&p).parent().map(|d| d.join("deploy.log")))
+        .and_then(|log| last_deploy_cycle(&log));
+    if health.update_capable && !deploy_supervisor_installed() {
+        health.update_capable = false;
+        health.update_state = "unavailable".into();
+        health.update_request_id = None;
+        health.update_note = Some(DEPLOY_SUPERVISOR_MISSING.into());
+    }
     health
 }
 
@@ -1871,6 +2035,62 @@ mod tests {
         assert!(same_deployed_build("v0.0.5", None, "v0.0.5"));
         // A clone without tags names the commit by a bare sha.
         assert!(same_deployed_build("588684d6", None, "v0.0.4-965-g588684d"));
+    }
+
+    #[test]
+    fn a_current_box_still_shows_an_operator_update_check_in_flight() {
+        if !(cfg!(target_os = "linux") || cfg!(target_os = "macos")) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, format!(r#"{{"build_id":"{}"}}"#, env!("HESTIA_GIT_VERSION"))).unwrap();
+        let status = dir.path().join("deploy-status.tsv");
+        let now = chrono::Utc::now();
+        for (wire, expected) in [("requested", "requested"), ("held", "held"), ("running", "running"), ("failed", "failed"), ("succeeded", "idle")] {
+            std::fs::write(&status, format!("{wire}\treq-2\ttarget-build\t{}\n", now.to_rfc3339())).unwrap();
+            let health = deployment_health_from_path(Some(&manifest));
+            assert_eq!(health.state, "current");
+            assert_eq!(health.update_state, expected, "wire state {wire}");
+        }
+        // A stale record does not keep a current box looking busy.
+        std::fs::write(&status, format!("running\treq-3\ttarget-build\t{}\n", (now - chrono::Duration::hours(2)).to_rfc3339())).unwrap();
+        assert_eq!(deployment_health_from_path(Some(&manifest)).update_state, "idle");
+    }
+
+    #[test]
+    fn last_deploy_cycle_is_the_last_result_line_not_the_last_line() {
+        let log = "\
+2026-10-16T20:24:13Z WARN preflight probe 'touch the deploy hold' -> rc=2: hestia: deny
+2026-10-16T20:24:13Z PREFLIGHT ok
+2026-10-16T20:24:14Z target=v0.3.0-rc.3-3-g7da0cc70 (7da0cc70, web4 38f1f321) running=v0.3.0-rc.3-3
+2026-10-16T20:24:18Z CURRENT v0.3.0-rc.3-3-g7da0cc70 manifest-repair hooks=ok
+              --brief       one line        --no-witness   skip the chain write
+  next fire:  -       - Fri 2026-10-16 13:24:17 PDT
+2026-10-16T20:25:00Z build v0.3.0-rc.4 (release, target dir /x)
+";
+        let c = last_deploy_cycle_in(log).unwrap();
+        assert_eq!(c.at, "2026-10-16T20:24:18Z");
+        assert_eq!(c.result, "CURRENT");
+        assert!(c.detail.starts_with("v0.3.0-rc.3-3-g7da0cc70 manifest-repair"));
+        assert!(last_deploy_cycle_in("no timestamps here\n").is_none());
+        assert!(last_deploy_cycle_in("").is_none());
+        let fail = last_deploy_cycle_in("2026-10-17T00:17:02Z FAIL cargo build\n").unwrap();
+        assert_eq!((fail.result.as_str(), fail.detail.as_str()), ("FAIL", "cargo build"));
+    }
+
+    #[test]
+    fn auto_update_state_reads_the_timer_unit_files() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(auto_update_state_in(dir.path()), "absent");
+        std::fs::write(dir.path().join("hestia-deploy.timer"), "[Timer]\n").unwrap();
+        assert_eq!(auto_update_state_in(dir.path()), "off");
+        std::fs::create_dir(dir.path().join("timers.target.wants")).unwrap();
+        std::fs::write(dir.path().join("timers.target.wants/hestia-deploy.timer"), "").unwrap();
+        assert_eq!(auto_update_state_in(dir.path()), "on");
+        // An enable link left behind after the unit itself was removed is not "on".
+        std::fs::remove_file(dir.path().join("hestia-deploy.timer")).unwrap();
+        assert_eq!(auto_update_state_in(dir.path()), "absent");
     }
 
     #[test]
