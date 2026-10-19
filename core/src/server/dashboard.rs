@@ -690,13 +690,18 @@ pub(crate) const DEPLOY_SUPERVISOR_MISSING: &str =
 /// The auto-update state for this box. Linux (user systemd) only for now: the macOS deploy
 /// agent is a launchd plist whose schedule is not a separate unit to switch.
 pub(crate) fn auto_update_state() -> &'static str {
-    if !cfg!(target_os = "linux") {
-        return "unavailable";
-    }
-    match systemd_user_unit_dir() {
+    match auto_update_unit_dir() {
         Some(dir) => auto_update_state_in(&dir),
         None => "unavailable",
     }
+}
+
+/// Where the toggle reads and moves the timer, or None where there is no toggle.
+pub(crate) fn auto_update_unit_dir() -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    systemd_user_unit_dir()
 }
 
 /// The words hestia-deploy.sh starts a run's terminal line with (its `log`/`die` calls).

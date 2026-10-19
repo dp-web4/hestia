@@ -3486,6 +3486,12 @@
           body: JSON.stringify({ enabled: turnOn }),
         });
         const body = await res.json().catch(() => ({}));
+        // The change can take effect and still be an error (its chain record failed): say
+        // what is now in force instead of "failed", so it is not clicked again.
+        if (!res.ok && body.outcome === 'changed') {
+          $('live-status').textContent = `auto-update is now ${body.status}; ${body.error}`;
+          return;
+        }
         if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
       } catch (error) {
         $('live-status').textContent = `auto-update change failed (${error.message})`;
