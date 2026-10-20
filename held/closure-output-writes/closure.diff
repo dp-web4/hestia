@@ -1,6 +1,6 @@
 --- /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_main_base.py	2026-10-19 16:32:06.996594805 -0700
-+++ plugins/_shared/hestia_governance_closure.py	2026-10-19 16:56:05.752510131 -0700
-@@ -933,6 +933,391 @@
++++ /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/p1348/closure_rev.py	2026-10-19 17:05:23.556307262 -0700
+@@ -933,6 +933,396 @@
      return None
  
  
@@ -380,7 +380,12 @@
 +                # bare -d errs toward refusing -- the safe direction.)
 +                if None in vals.get(k, []):
 +                    w.append(".")
-+        return w
++        # An EMPTY `--dump-variables=` also writes the default awkvars.out in the cwd (gawk
++        # treats it as no file given). Not so for `--profile=` / `--pretty-print=`, which
++        # create nothing and print to stderr (Codex's probes, #1349 round 7).
++        if "" in vals.get("--dump-variables", []):
++            w.append(".")
++        return [x for x in w if x != ""]
 +    if name in ("perl", "ruby"):
 +        if any(a.startswith("-") and not a.startswith("--")
 +               and re.match(r"^-[A-Za-z]*i", a) is not None for a in args):
@@ -392,7 +397,7 @@
  def _command_write_targets(words: list, stdin_src=None) -> list:
      """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
      their file args are read positions by default (the anti-FP stance; the daemon's
-@@ -968,20 +1353,18 @@
+@@ -968,20 +1358,18 @@
              raise _OpaqueWriter()
          return _patch_write_targets(pin)
      if name == "sed":
@@ -425,7 +430,7 @@
      if name in ("chmod", "chown", "chgrp"):
          pos = _positionals(args, opts_with_value=("--reference",))
          return pos[1:]
-@@ -997,6 +1380,9 @@
+@@ -997,6 +1385,9 @@
          return _positionals(args)
      if name == "touch":
          return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
@@ -435,7 +440,7 @@
      if name == "git":
          # Skip global options to find the subcommand.
          i = 0
-@@ -1078,7 +1464,24 @@
+@@ -1078,7 +1469,24 @@
              return _positionals(rest, opts_with_value=("-s", "--source"))
          if sub == "clean":
              return _positionals(rest)
@@ -461,7 +466,7 @@
      return []
  
  
-@@ -1171,14 +1574,31 @@
+@@ -1171,14 +1579,31 @@
      any out-of-grammar construct (caller -> out-of-grammar posture)."""
      toks = _tokenize(_strip_heredoc_bodies(command))
      targets, cur = [], []
@@ -494,7 +499,7 @@
                  cur = []
              stdin_src = None
              i += 1
-@@ -1209,7 +1629,12 @@
+@@ -1209,7 +1634,12 @@
          cur.append(t)
          i += 1
      if cur:

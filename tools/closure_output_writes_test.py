@@ -137,6 +137,9 @@ PAIRS = [
      f"gawk --profile=/tmp/p --profile=/tmp/q '{{print}}' {T}"),
     ("gawk -o file then -o bare", f"cd {D} && gawk -o/tmp/pp -o 'BEGIN{{}}'",
      f"gawk -o/tmp/pp -o/tmp/qq '{{print}}' {T}"),
+    # Codex round 7 (28256): an EMPTY --dump-variables= writes the default file in the cwd
+    ("gawk --dump-variables= empty", f"cd {D} && gawk --dump-variables= 'BEGIN {{print 1}}'",
+     "cd /tmp && gawk --dump-variables= 'BEGIN {print 1}'"),
     # a verb that runs another verb
     ("xargs rm", f"echo {T} | xargs rm", f"grep -l deny {T}"),
     ("find -exec", f"find {D} -name '*.py' -exec rm {{}} +", f"find {D} -name '*.py'"),
