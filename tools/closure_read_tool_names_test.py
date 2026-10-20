@@ -59,6 +59,15 @@ def test_every_lowercase_reader_is_a_read():
         check(f"{tool}_is_read", v.classification == "read", str(v))
 
 
+def test_a_scope_request_naming_a_gate_file_is_not_a_write():
+    # A being's request_scope carries the path it ASKS for. Asking writes nothing; the grant,
+    # if any, is decided elsewhere. Before this it was refused as a governance WRITE and
+    # opened escalations nobody could usefully rule (cbp-being, 2026-10-19: d5a5e68420fc21c3).
+    v = g.classify("request_scope", {"path": GATE_FILE, "reason": "read the gate"},
+                   cwd=NEUTRAL_CWD)
+    check("request_scope_is_not_write", v.classification != "write", str(v))
+
+
 def test_writers_and_unknown_tools_still_write():
     # Controls: the fix must not widen into the write names, and an unknown tool keeps the
     # conservative default (its path keys are destinations).
@@ -87,6 +96,7 @@ def test_witness_read_names_are_closure_readers():
 ALL = [
     test_a_being_read_of_a_gate_file_is_a_read,
     test_every_lowercase_reader_is_a_read,
+    test_a_scope_request_naming_a_gate_file_is_not_a_write,
     test_writers_and_unknown_tools_still_write,
     test_gemini_readers_are_closure_readers,
     test_witness_read_names_are_closure_readers,

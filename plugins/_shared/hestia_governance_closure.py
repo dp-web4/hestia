@@ -1223,7 +1223,11 @@ _BASH_TOOLS = frozenset({"Bash", "Shell"})
 _READ_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite",
                               "TodoList", "WebFetch", "WebSearch", "GetGoal",
                               "read_file", "read_many_files", "glob", "search_file_content",
-                              "list_directory", "web_fetch", "google_web_search"})
+                              "list_directory", "web_fetch", "google_web_search",
+                              # A being's scope ASK: its path is what it asks for, not a
+                              # destination. Filing records a petition; it does not write the
+                              # requested file (cbp-being, 2026-10-19).
+                              "request_scope"})
 
 
 def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:

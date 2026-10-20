@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 7b543d86c0fd6128c3e744d785a77e033588a05bc34f0edde5ce3a4aece89cc5  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 57c5d57ed063fd09961ce29cd5b8665f0ae7e425b38e504c8d908acfbdfd2f28  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1224,7 +1224,11 @@ _BASH_TOOLS = frozenset({"Bash", "Shell"})
 _READ_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite",
                               "TodoList", "WebFetch", "WebSearch", "GetGoal",
                               "read_file", "read_many_files", "glob", "search_file_content",
-                              "list_directory", "web_fetch", "google_web_search"})
+                              "list_directory", "web_fetch", "google_web_search",
+                              # A being's scope ASK: its path is what it asks for, not a
+                              # destination. Filing records a petition; it does not write the
+                              # requested file (cbp-being, 2026-10-19).
+                              "request_scope"})
 
 
 def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
