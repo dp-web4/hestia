@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 7b543d86c0fd6128c3e744d785a77e033588a05bc34f0edde5ce3a4aece89cc5  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: cefc986178e7e0289f1b971bcab7462beec38e068f43d3e3456a4f16825f7136  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -934,6 +934,396 @@ def _opt_value(args: list, *names: str) -> Optional[str]:
     return None
 
 
+# ── #1348: verbs that write through an option, an output operand, a script, or their input ──
+#
+# The model above knew the classic writers by their operands. Verbs that hide their output in
+# an OPTION (`sort -o F`), an OUTPUT OPERAND (`uniq IN OUT`), their own SCRIPT (`sed 'w F'`)
+# or by REPLACING THE INPUT (`gzip F`) were read positions, so they wrote gate files as reads.
+#
+# Two review rounds (Codex, #1349) showed that patching option SPELLINGS one at a time keeps
+# missing variants: attached values, later clusters, optional `=ARG`s, GNU's unique-prefix
+# abbreviations. So each modelled verb now has an OPTION TABLE and a real parser, and anything
+# the parser cannot account for is OUT OF GRAMMAR. A table is the whole statement of what we
+# understand about that verb; what is not in it is not guessed at.
+
+_FLAG, _RD, _WR, _EXEC, _OPT_RD, _OPT_WR = "flag", "read", "write", "exec", "opt-read", "opt-write"
+
+
+def _parse_opts(args: list, short: dict, long: dict):
+    """GNU getopt_long-style parse of `args` against a verb's table.
+
+    short: {letter: kind}; long: {name-without-dashes: kind}. Kinds: _FLAG (no value),
+    _RD / _WR (required value, read / written), _OPT_RD / _OPT_WR (optional value, only when
+    attached: `-iSUF`, `--name=V`), _EXEC (runs something: out of grammar).
+    Long names match exactly or by UNIQUE prefix, as getopt_long does (`--out=F` is
+    `--output=F`). Returns (writes, positionals, seen, values): written values, operands,
+    canonical option keys present, and {key: [values]} for every valued option.
+    Raises _OutOfGrammar on an unknown or ambiguous option, a missing value, or an _EXEC one."""
+    writes, pos, seen, values = [], [], set(), {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos.extend(args[i + 1:])
+            break
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if name in long:
+                key = name
+            else:
+                cands = [n for n in long if name and n.startswith(name)]
+                if len(cands) != 1:
+                    raise _OutOfGrammar()
+                key = cands[0]
+            kind = long[key]
+            seen.add("--" + key)
+            if kind == _EXEC:
+                raise _OutOfGrammar()
+            if kind == _FLAG:
+                if eq:
+                    raise _OutOfGrammar()
+            elif kind in (_RD, _WR):
+                if not eq:
+                    if i + 1 >= len(args):
+                        raise _OutOfGrammar()
+                    val = args[i + 1]
+                    i += 1
+                values.setdefault("--" + key, []).append(val)
+                if kind == _WR:
+                    writes.append(val)
+            else:  # optional value, attached only; a bare occurrence is recorded as None
+                values.setdefault("--" + key, []).append(val if eq else None)
+                if eq and kind == _OPT_WR:
+                    writes.append(val)
+            i += 1
+            continue
+        if a.startswith("-") and len(a) > 1:
+            body, j = a[1:], 0
+            while j < len(body):
+                ch = body[j]
+                kind = short.get(ch)
+                if kind is None:
+                    raise _OutOfGrammar()
+                seen.add("-" + ch)
+                if kind == _EXEC:
+                    raise _OutOfGrammar()
+                if kind == _FLAG:
+                    j += 1
+                    continue
+                val = body[j + 1:]
+                if kind in (_OPT_RD, _OPT_WR):
+                    # Per occurrence: a bare one is recorded as None, so a repeat that names a
+                    # file cannot hide it (`gawk -p/tmp/p -p`; Codex, #1349 round 6).
+                    values.setdefault("-" + ch, []).append(val or None)
+                    if val and kind == _OPT_WR:
+                        writes.append(val)
+                    break
+                if not val:
+                    if i + 1 >= len(args):
+                        raise _OutOfGrammar()
+                    val = args[i + 1]
+                    i += 1
+                values.setdefault("-" + ch, []).append(val)
+                if kind == _WR:
+                    writes.append(val)
+                break
+            i += 1
+            continue
+        pos.append(a)
+        i += 1
+    return writes, pos, seen, values
+
+
+def _table(flags: str = "", **kinds) -> dict:
+    """Short table: every letter of `flags` is a flag; kwargs map kind -> letters."""
+    t = {ch: _FLAG for ch in flags}
+    for kind, letters in kinds.items():
+        for ch in letters:
+            t[ch] = {"rd": _RD, "wr": _WR, "ex": _EXEC, "ord": _OPT_RD, "owr": _OPT_WR}[kind]
+    return t
+
+
+def _ltable(flags: str = "", **kinds) -> dict:
+    """Long table: space-separated names per kind."""
+    t = {n: _FLAG for n in flags.split()}
+    for kind, names in kinds.items():
+        for n in names.split():
+            t[n] = {"rd": _RD, "wr": _WR, "ex": _EXEC, "ord": _OPT_RD, "owr": _OPT_WR}[kind]
+    return t
+
+
+_COMMON_LONG = "help version"
+
+_SORT = (_table("bdfgiMhnRrVcCmsuz", rd="ktS", wr="oT"),
+         _ltable("ignore-leading-blanks dictionary-order ignore-case general-numeric-sort "
+                 "ignore-nonprinting month-sort human-numeric-sort numeric-sort random-sort "
+                 "reverse version-sort merge stable unique zero-terminated debug " + _COMMON_LONG,
+                 ord="check", rd="sort key field-separator buffer-size parallel batch-size "
+                 "random-source files0-from", wr="output temporary-directory",
+                 ex="compress-program"))
+_UNIQ = (_table("cdDiuz", rd="fsw"),
+         _ltable("count repeated ignore-case unique zero-terminated " + _COMMON_LONG,
+                 ord="all-repeated group", rd="skip-fields skip-chars check-chars"))
+_SPLIT = (_table("dxeu", rd="abClnt"),
+          _ltable("elide-empty-files unbuffered verbose " + _COMMON_LONG,
+                  ord="numeric-suffixes hex-suffixes",
+                  rd="suffix-length bytes line-bytes lines number separator additional-suffix",
+                  ex="filter"))
+_CSPLIT = (_table("ksqz", rd="bn", wr="f"),
+           _ltable("keep-files quiet silent elide-empty-files suppress-matched " + _COMMON_LONG,
+                   rd="suffix-format digits", wr="prefix"))
+_CURL = (_table("sSLfkiIvGNqgjlnBZMVhJRp0123456#O", rd="XHduAebmErTwxUCFyYzQtP",
+                wr="ocD", ex="K"),
+         _ltable("silent show-error location location-trusted fail fail-with-body fail-early "
+                 "insecure include head verbose get no-buffer compressed http1.0 http1.1 http2 "
+                 "http3 ipv4 ipv6 globoff remote-header-name remote-time progress-bar "
+                 "no-progress-meter create-dirs ssl ssl-reqd tlsv1.2 tlsv1.3 disable raw "
+                 "remote-name remote-name-all no-keepalive path-as-is " + _COMMON_LONG,
+                 rd="request header data data-raw data-binary data-urlencode user user-agent "
+                 "referer cookie max-time connect-timeout cert key cacert range upload-file "
+                 "write-out proxy proxy-user continue-at form form-string retry retry-delay "
+                 "retry-max-time json url max-filesize resolve interface oauth2-bearer tls-max "
+                 "limit-rate speed-limit speed-time max-redirs",
+                 wr="output dump-header cookie-jar trace trace-ascii stderr libcurl etag-save "
+                 "hsts alt-svc output-dir", ex="config"))
+_WGET = (_table("qvSNcxkpEKnrmb", rd="tTwUiQlARDIX", wr="OoaP", ex="e"),
+         _ltable("quiet verbose no-verbose server-response spider timestamping continue "
+                 "no-clobber recursive mirror page-requisites convert-links adjust-extension "
+                 "no-check-certificate no-parent no-directories force-directories "
+                 "no-host-directories content-disposition https-only inet4-only inet6-only "
+                 "background " + _COMMON_LONG,
+                 ex="execute config",
+                 rd="tries timeout wait user-agent input-file quota level accept reject "
+                 "domains header user password post-data post-file method body-data limit-rate "
+                 "referer max-redirect load-cookies",
+                 wr="output-document output-file append-output directory-prefix save-cookies "
+                 "warc-file rejected-log"))
+_TAR = (_table("crutxdAvzjJZapPkmOShWlBiMUw", rd="fCTXbNHKVL", wr="g", ex="FI"),
+        _ltable("create append update catenate concatenate list diff compare delete verbose "
+                "gzip gunzip bzip2 xz zstd lzip lzma auto-compress preserve-permissions "
+                "same-permissions absolute-names keep-old-files touch no-same-owner to-stdout "
+                "sparse dereference verify check-links ignore-zeros multi-volume no-recursion "
+                "recursion wildcards no-wildcards anchored no-anchored totals numeric-owner "
+                "no-xattrs xattrs acls selinux one-file-system null exclude-vcs "
+                "exclude-vcs-ignores sort " + _COMMON_LONG,
+                rd="file directory files-from exclude exclude-from newer newer-mtime format "
+                "starting-file label tape-length owner group mode mtime transform xform "
+                "strip-components blocking-factor exclude-tag",
+                wr="listed-incremental index-file volno-file",
+                ex="extract get info-script new-volume-script to-command use-compress-program "
+                "checkpoint-action rmt-command rsh-command"))
+_COMPRESS = (_table("cdfhklLnNqrtvVe0123456789", rd="STMFCDB", wr="o"),
+             _ltable("stdout to-stdout decompress uncompress force keep list license no-name "
+                     "name quiet recursive test verbose best fast rm rsyncable extreme ultra "
+                     "no-progress " + _COMMON_LONG,
+                     rd="suffix threads memlimit format check", ord="long", wr="output"))
+_SED = (_table("nErsuz", rd="el", ex="f", ord="i"),
+        _ltable("quiet silent posix debug sandbox regexp-extended separate unbuffered "
+                "null-data follow-symlinks " + _COMMON_LONG,
+                ord="in-place", rd="expression line-length", ex="file"))
+_AWK = (_table("bcPrSOMntVhC", rd="Fve", ex="fEil", owr="dpo", ord="DL"),
+        _ltable("characters-as-bytes traditional posix re-interval sandbox optimize "
+                "no-optimize use-lc-numeric bignum non-decimal-data copyright gen-pot csv "
+                + _COMMON_LONG,
+                rd="field-separator assign source", ex="file exec include load",
+                owr="dump-variables profile pretty-print", ord="debug lint"))
+_COMPRESSORS = frozenset({"gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "lzma", "unlzma",
+                          "zstd", "unzstd", "lz4", "compress", "uncompress", "pigz"})
+
+#: sed: a `w`/`W` command, or the `w` flag of `s///`, names a file the script WRITES.
+_SED_WRITE = re.compile(r"(?:^|[;{}\n]|\d|\$|/)\s*[wW]\s*\S|s(.).*?\1.*?\1[gpiImMeE0-9]*w")
+#: awk: output redirection inside print/printf, a command piped into getline, or system().
+#: A bare `>` elsewhere is a comparison (`NR>5`) and does not write.
+_AWK_WRITE = re.compile(r"\bprintf?\b[^;{}]*?(?:>|\|)|\|\s*getline|\bsystem\s*\(")
+#: Verbs that only read or print, safe to run from xargs / find -exec on governed paths.
+#: (rg is NOT here: `--pre CMD` runs a program on every input -- Codex, #1349. Each verb kept has
+#: no option that executes or writes, so its arguments cannot add an effect.)
+_PASSIVE_VERBS = frozenset({"grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls",
+                            "stat", "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum",
+                            "echo", "printf", "basename", "dirname", "realpath", "readlink",
+                            "du", "test", "[", "true", "diff", "cmp"})
+#: find primaries: name -> (arity, kind). kind None = read; "w" = writes its first argument.
+_FIND_PRIMARIES = dict(
+    [(p, (0, None)) for p in (
+        "-print -print0 -ls -prune -quit -true -false -depth -mount -xdev -follow -empty "
+        "-readable -writable -executable -nouser -nogroup -daystart -noleaf -not -a -and -o "
+        "-or ! ( ) , -ignore_readdir_race -noignore_readdir_race").split()]
+    + [(p, (1, None)) for p in (
+        "-name -iname -path -ipath -wholename -iwholename -lname -ilname -regex -iregex "
+        "-regextype -type -xtype -maxdepth -mindepth -mtime -atime -ctime -mmin -amin -cmin "
+        "-newer -anewer -cnewer -size -perm -user -group -uid -gid -links -inum -samefile "
+        "-used -printf -fstype -context -files0-from").split()]
+    + [(p, (1, "w")) for p in "-fprint -fprint0 -fls".split()]
+    + [("-fprintf", (2, "w"))])
+
+
+def _inner_is_passive(words: list) -> bool:
+    """For xargs / find -exec: is the command they run one that only reads?"""
+    words = _strip_wrappers(words)
+    return bool(words) and os.path.basename(words[0]) in _PASSIVE_VERBS
+
+
+def _find_exec_open(cur: list) -> bool:
+    """Is `cur` a find command with an -exec/-execdir/-ok/-okdir not yet terminated?"""
+    words = _strip_wrappers(cur) if cur else []
+    if not words or os.path.basename(words[0]) != "find":
+        return False
+    open_ = False
+    for w in words[1:]:
+        if w in ("-exec", "-execdir", "-ok", "-okdir"):
+            open_ = True
+        elif open_ and w in (";", "+"):
+            open_ = False
+    return open_
+
+
+def _expand_old_tar(args: list) -> list:
+    """`tar czf A x` -> `-c -z -f A x`: an undashed first word is a letter cluster whose
+    value letters take the following words in order."""
+    if not args or args[0].startswith("-") or not re.fullmatch(r"[A-Za-z]+", args[0]):
+        return args
+    out, k = [], 1
+    for ch in args[0]:
+        out.append("-" + ch)
+        if _TAR[0].get(ch) in (_RD, _WR):
+            if k >= len(args):
+                raise _OutOfGrammar()
+            out.append(args[k])
+            k += 1
+    return out + args[k:]
+
+
+def _find_write_targets(args: list) -> list:
+    i = 0
+    while i < len(args) and args[i] in ("-H", "-L", "-P"):
+        i += 1
+    while i < len(args) and args[i] in ("-D", "-O") or (i < len(args) and args[i].startswith("-O")):
+        i += 2 if args[i] in ("-D", "-O") else 1
+    starts = []
+    while i < len(args) and not (args[i].startswith("-") or args[i] in ("!", "(", ")", ",")):
+        starts.append(args[i])
+        i += 1
+    out = []
+    while i < len(args):
+        p = args[i]
+        if p in ("-exec", "-execdir", "-ok", "-okdir"):
+            # The terminator is `+` or `;`. The walker keeps an escaped `\;` inside this simple
+            # command (see _bash_write_targets); none at all means the shell would reject it.
+            end = next((k for k in range(i + 1, len(args)) if args[k] in (";", "+")), len(args))
+            if not _inner_is_passive(args[i + 1:end]):
+                raise _OutOfGrammar()  # runs a command that may write
+            i = end + 1
+            continue
+        if p == "-delete":
+            out.extend(starts or ["."])
+            i += 1
+            continue
+        if p.startswith("-newer") and len(p) == 8:  # -newerXY ref
+            i += 2
+            continue
+        spec = _FIND_PRIMARIES.get(p)
+        if spec is None:
+            raise _OutOfGrammar()  # an unknown primary may act
+        arity, kind = spec
+        if kind == "w" and i + 1 < len(args):
+            out.append(args[i + 1])
+        i += 1 + arity
+    return out
+
+
+def _output_verb_write_targets(name: str, args: list):
+    """Write targets for the #1348 verbs, or None when `name` is not one of them."""
+    if name == "sort":
+        return _parse_opts(args, *_SORT)[0]
+    if name == "uniq":
+        w, pos, _, _ = _parse_opts(args, *_UNIQ)
+        return w + pos[1:2]
+    if name == "split":
+        w, pos, _, _ = _parse_opts(args, *_SPLIT)
+        return w + (pos[1:2] if len(pos) > 1 else ["."])   # default prefix `x` in the cwd
+    if name == "csplit":
+        w, pos, seen, _ = _parse_opts(args, *_CSPLIT)
+        return w if ("-f" in seen or "--prefix" in seen) else w + ["."]  # default `xx` in cwd
+    if name in ("mkdir", "mkfifo", "mknod"):
+        pos = _positionals(args, opts_with_value=("-m", "--mode", "-Z", "--context"))
+        return pos[:1] if name == "mknod" else pos
+    if name == "curl":
+        w, _, seen, vals = _parse_opts(args, *_CURL)
+        # --write-out is a small program: `%output{F}` / `%output{>>F}` open F for writing, and
+        # `@F` reads the program from a file this classifier does not read (Codex, #1349).
+        for fmt in vals.get("-w", []) + vals.get("--write-out", []):
+            if fmt.startswith("@") or "%output{" in fmt or "%{output" in fmt:
+                raise _OutOfGrammar()
+        w = [v for v in w if v != "-"]
+        if seen & {"-O", "--remote-name", "--remote-name-all"}:
+            w += vals.get("--output-dir", []) or ["."]       # named by the URL, in the cwd
+        return w
+    if name == "wget":
+        w, _, seen, _ = _parse_opts(args, *_WGET)
+        w = [v for v in w if v != "-"]
+        if not seen & {"--spider", "-O", "--output-document"} and "-P" not in seen \
+                and "--directory-prefix" not in seen:
+            w.append(".")                                    # named by the URL, in the cwd
+        return w
+    if name in ("tar", "bsdtar", "gtar"):
+        w, _, seen, vals = _parse_opts(_expand_old_tar(args), *_TAR)
+        if "-x" in seen:
+            raise _OutOfGrammar()  # extraction writes the archive's members wherever they say
+        modifying = seen & {"-c", "-r", "-u", "-A", "--create", "--append", "--update",
+                            "--catenate", "--concatenate", "--delete"}
+        if modifying:
+            w += vals.get("-f", []) + vals.get("--file", [])
+        return [v for v in w if v and v != "-"]
+    if name in _COMPRESSORS:
+        w, pos, seen, _ = _parse_opts(args, *_COMPRESS)
+        to_stdout = seen & {"-c", "--stdout", "--to-stdout", "-t", "--test", "-l", "--list"}
+        if to_stdout and "--rm" not in seen:
+            return w
+        # The input is replaced, or (-k) a sibling output is created beside it.
+        return w + pos
+    if name == "find":
+        return _find_write_targets(args)
+    if name == "xargs":
+        inner = _positionals(args, opts_with_value=(
+            "-I", "-i", "-n", "-L", "-l", "-P", "-d", "-E", "-e", "-s", "-a", "--arg-file",
+            "--delimiter", "--max-args", "--max-lines", "--max-procs", "--replace", "--eof",
+            "--max-chars"))
+        first = next((k for k, a in enumerate(args) if inner and a == inner[0]), None)
+        if first is None or not _inner_is_passive(args[first:]):
+            raise _OutOfGrammar()  # runs a command that may write
+        return []
+    if name in ("awk", "gawk", "mawk", "nawk"):
+        w, pos, seen, vals = _parse_opts(args, *_AWK)
+        progs = vals.get("-e", []) + vals.get("--source", [])
+        if not progs:
+            progs = pos[:1]
+        if any(_AWK_WRITE.search(p) for p in progs):
+            raise _OutOfGrammar()
+        # Each of -d / -p / -o given WITHOUT a file writes its default (awkvars.out /
+        # awkprof.out) in the cwd -- per option: an explicit file for one does not stand in for
+        # another given bare (`gawk -d -p/tmp/prof` still writes ./awkvars.out; Codex, #1349).
+        for short_k, long_k in (("-d", "--dump-variables"), ("-p", "--profile"),
+                                ("-o", "--pretty-print")):
+            for k in (short_k, long_k):
+                # Any BARE occurrence writes the default, even if another occurrence names a
+                # file. (gawk honours that for -p/-o; for -d the last one wins, so counting a
+                # bare -d errs toward refusing -- the safe direction.)
+                if None in vals.get(k, []):
+                    w.append(".")
+        # An EMPTY `--dump-variables=` also writes the default awkvars.out in the cwd (gawk
+        # treats it as no file given). Not so for `--profile=` / `--pretty-print=`, which
+        # create nothing and print to stderr (Codex's probes, #1349 round 7).
+        if "" in vals.get("--dump-variables", []):
+            w.append(".")
+        return [x for x in w if x != ""]
+    if name in ("perl", "ruby"):
+        if any(a.startswith("-") and not a.startswith("--")
+               and re.match(r"^-[A-Za-z]*i", a) is not None for a in args):
+            raise _OutOfGrammar()  # rewrites every file operand; the script is opaque
+        return []
+    return None
+
+
 def _command_write_targets(words: list, stdin_src=None) -> list:
     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
     their file args are read positions by default (the anti-FP stance; the daemon's
@@ -969,20 +1359,18 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
             raise _OpaqueWriter()
         return _patch_write_targets(pin)
     if name == "sed":
-        # In-place: `--in-place[=SUFFIX]`, `-i`, `-i.bak`, AND bundled short clusters that
-        # contain `i` (`-Ei`, `-nEi`, ...). A short cluster is `-<letters>` (not `--`); the
-        # regex fires when an `i` appears anywhere in that letter run before an attached suffix.
-        in_place = any(
-            a == "--in-place" or a.startswith("--in-place=")
-            or (a.startswith("-") and not a.startswith("--")
-                and re.match(r"^-[A-Za-z]*i", a) is not None)
-            for a in args)
-        if not in_place:
-            return []
-        script_flag = any(a in ("-e", "-f") or a.startswith(("--expression", "--file"))
-                          for a in args)
-        pos = _positionals(args, opts_with_value=("-e", "-f"))
-        return pos if script_flag else pos[1:]
+        # #1348: parsed against sed's option table (any spelling of -e/-f/-i), and a script
+        # with a `w`/`W` command or `s///w` is out of grammar: it names a file to write.
+        _, pos, seen, vals = _parse_opts(args, *_SED)
+        scripts = vals.get("-e", []) + vals.get("--expression", [])
+        operands = pos if scripts else pos[1:]
+        if not scripts:
+            scripts = pos[:1]
+        if any(_SED_WRITE.search(sc) for sc in scripts):
+            raise _OutOfGrammar()
+        if seen & {"-i", "--in-place"}:
+            return operands
+        return []
     if name in ("chmod", "chown", "chgrp"):
         pos = _positionals(args, opts_with_value=("--reference",))
         return pos[1:]
@@ -998,6 +1386,9 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
         return _positionals(args)
     if name == "touch":
         return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
+    verb_out = _output_verb_write_targets(name, args)
+    if verb_out is not None:
+        return verb_out
     if name == "git":
         # Skip global options to find the subcommand.
         i = 0
@@ -1079,7 +1470,24 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
             return _positionals(rest, opts_with_value=("-s", "--source"))
         if sub == "clean":
             return _positionals(rest)
-        return []
+        # #1348: any subcommand writes through `--output[=F]` / `--output-directory`, and git's
+        # parser accepts unique abbreviations (`--out=F`); plus `-o` where it means output.
+        out = []
+        for k, a in enumerate(rest):
+            if a.startswith("--out"):
+                nm, eq, val = a[2:].partition("=")
+                if "output".startswith(nm) or "output-directory".startswith(nm):
+                    if not eq and k + 1 < len(rest):
+                        val = rest[k + 1]
+                    if val:
+                        out.append(val)
+        if sub in ("format-patch", "archive", "bundle"):
+            out += [rest[k + 1] for k, a in enumerate(rest[:-1]) if a == "-o"]
+            out += [a[2:] for a in rest if a.startswith("-o") and len(a) > 2
+                    and not a.startswith("--")]
+        if sub == "bundle" and rest[:1] == ["create"] and len(rest) > 1:
+            out.append(rest[1])
+        return out
     return []
 
 
@@ -1172,14 +1580,31 @@ def _bash_write_targets(command: str) -> list:
     any out-of-grammar construct (caller -> out-of-grammar posture)."""
     toks = _tokenize(_strip_heredoc_bodies(command))
     targets, cur = [], []
+    # An out-of-grammar SIMPLE command is remembered, not raised on the spot: the walk goes on,
+    # so a later opaque writer (an unreadable `git apply` / `patch`, which refuses
+    # unconditionally) still decides. Raising at the first one let `tar -x ... && git apply
+    # <unreadable>` resolve to the weaker, vocabulary-conditional posture (#1348 replay).
+    deferred_oog = False
     stdin_src = None  # `< file` source for the current simple command (patch input)
     eff = ""  # relative cwd accumulator; cd within this command line adjusts it
     i = 0
     while i < len(toks):
         t = toks[i]
+        if t == ";" and _find_exec_open(cur):
+            # `find ... -exec CMD {} \;`: the tokenizer cannot tell an escaped `\;` from a
+            # separator, and treating it as one ended `find` here and turned what follows
+            # (`-fprint F`, `-delete`) into a "command" of its own that writes nothing (#1349
+            # round 4). Keep it as find's terminator. For an unescaped `;` this over-reads
+            # (bash would end the command there and fail), which errs toward refusing.
+            cur.append(t)
+            i += 1
+            continue
         if t in _SEPARATORS:
             if cur:
-                eff = _flush_simple_command(cur, eff, targets, stdin_src)
+                try:
+                    eff = _flush_simple_command(cur, eff, targets, stdin_src)
+                except _OutOfGrammar:
+                    deferred_oog = True
                 cur = []
             stdin_src = None
             i += 1
@@ -1210,7 +1635,12 @@ def _bash_write_targets(command: str) -> list:
         cur.append(t)
         i += 1
     if cur:
-        eff = _flush_simple_command(cur, eff, targets, stdin_src)
+        try:
+            eff = _flush_simple_command(cur, eff, targets, stdin_src)
+        except _OutOfGrammar:
+            deferred_oog = True
+    if deferred_oog:
+        raise _OutOfGrammar()
     return targets
 
 
