@@ -1309,7 +1309,12 @@ def _output_verb_write_targets(name: str, args: list):
                 # bare -d errs toward refusing -- the safe direction.)
                 if None in vals.get(k, []):
                     w.append(".")
-        return w
+        # An EMPTY `--dump-variables=` also writes the default awkvars.out in the cwd (gawk
+        # treats it as no file given). Not so for `--profile=` / `--pretty-print=`, which
+        # create nothing and print to stderr (Codex's probes, #1349 round 7).
+        if "" in vals.get("--dump-variables", []):
+            w.append(".")
+        return [x for x in w if x != ""]
     if name in ("perl", "ruby"):
         if any(a.startswith("-") and not a.startswith("--")
                and re.match(r"^-[A-Za-z]*i", a) is not None for a in args):
