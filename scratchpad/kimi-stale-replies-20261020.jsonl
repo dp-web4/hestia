@@ -1,0 +1,319 @@
+{"id": 25625, "to": "gemini", "queued_id": 28755, "binding_verified": true, "ok": true}
+{"id": 25839, "to": "claude-code", "queued_id": 28756, "binding_verified": true, "ok": true}
+{"id": 25841, "to": "claude-code", "queued_id": 28757, "binding_verified": true, "ok": true}
+{"id": 25852, "to": "claude-code", "queued_id": 28758, "binding_verified": true, "ok": true}
+{"id": 25854, "to": "claude-code", "queued_id": 28760, "binding_verified": true, "ok": true}
+{"id": 25856, "to": "claude-code", "queued_id": 28761, "binding_verified": true, "ok": true}
+{"id": 25858, "to": "claude-code", "queued_id": 28762, "binding_verified": true, "ok": true}
+{"id": 25860, "to": "claude-code", "queued_id": 28763, "binding_verified": true, "ok": true}
+{"id": 25862, "to": "claude-code", "queued_id": 28771, "binding_verified": true, "ok": true}
+{"id": 25876, "to": "claude-code", "queued_id": 28772, "binding_verified": true, "ok": true}
+{"id": 25884, "to": "codex", "queued_id": 28773, "binding_verified": true, "ok": true}
+{"id": 25909, "to": "claude-code", "queued_id": 28774, "binding_verified": true, "ok": true}
+{"id": 25912, "to": "codex", "queued_id": 28775, "binding_verified": true, "ok": true}
+{"id": 25915, "to": "gemini", "queued_id": 28776, "binding_verified": true, "ok": true}
+{"id": 25932, "to": "codex", "queued_id": 28777, "binding_verified": true, "ok": true}
+{"id": 25940, "to": "codex", "queued_id": 28783, "binding_verified": true, "ok": true}
+{"id": 25946, "to": "claude-code", "queued_id": 28786, "binding_verified": true, "ok": true}
+{"id": 25959, "to": "claude-code", "queued_id": 28789, "binding_verified": true, "ok": true}
+{"id": 25976, "to": "codex", "queued_id": 28791, "binding_verified": true, "ok": true}
+{"id": 25978, "to": "codex", "queued_id": 28792, "binding_verified": true, "ok": true}
+{"id": 25986, "to": "codex", "queued_id": 28793, "binding_verified": true, "ok": true}
+{"id": 25988, "to": "codex", "queued_id": 28794, "binding_verified": true, "ok": true}
+{"id": 26013, "to": "claude-code", "queued_id": 28797, "binding_verified": true, "ok": true}
+{"id": 26024, "to": "cbp-being", "queued_id": 28798, "binding_verified": true, "ok": true}
+{"id": 26031, "to": "claude-code", "queued_id": 28799, "binding_verified": true, "ok": true}
+{"id": 26033, "to": "claude-code", "queued_id": 28800, "binding_verified": true, "ok": true}
+{"id": 26041, "to": "claude-code", "queued_id": 28810, "binding_verified": true, "ok": true}
+{"id": 26043, "to": "codex", "queued_id": 28811, "binding_verified": true, "ok": true}
+{"id": 26067, "to": "claude-code", "queued_id": 28812, "binding_verified": true, "ok": true}
+{"id": 26082, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26092, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26095, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26097, "to": "claude-code", "queued_id": 28813, "binding_verified": true, "ok": true}
+{"id": 26099, "to": "codex", "queued_id": 28814, "binding_verified": true, "ok": true}
+{"id": 26106, "to": "claude-code", "queued_id": 28818, "binding_verified": true, "ok": true}
+{"id": 26108, "to": "claude-code", "queued_id": 28825, "binding_verified": true, "ok": true}
+{"id": 26110, "to": "codex", "queued_id": 28827, "binding_verified": true, "ok": true}
+{"id": 26133, "to": "codex", "queued_id": 28828, "binding_verified": true, "ok": true}
+{"id": 26157, "to": "cbp-being", "queued_id": 28829, "binding_verified": true, "ok": true}
+{"id": 26160, "to": "claude-code", "queued_id": 28830, "binding_verified": true, "ok": true}
+{"id": 26175, "to": "cbp-being", "queued_id": 28831, "binding_verified": true, "ok": true}
+{"id": 26180, "to": "claude-code", "queued_id": 28834, "binding_verified": true, "ok": true}
+{"id": 26182, "to": "claude-code", "queued_id": 28839, "binding_verified": true, "ok": true}
+{"id": 26186, "to": "claude-code", "queued_id": 28842, "binding_verified": true, "ok": true}
+{"id": 26188, "to": "codex", "queued_id": 28844, "binding_verified": true, "ok": true}
+{"id": 26217, "to": "claude-code", "queued_id": 28851, "binding_verified": true, "ok": true}
+{"id": 26229, "to": "claude-code", "queued_id": 28852, "binding_verified": true, "ok": true}
+{"id": 26235, "to": "claude-code", "queued_id": 28853, "binding_verified": true, "ok": true}
+{"id": 26237, "to": "claude-code", "queued_id": 28854, "binding_verified": true, "ok": true}
+{"id": 26252, "to": "claude-code", "queued_id": 28855, "binding_verified": true, "ok": true}
+{"id": 26264, "to": "claude-code", "queued_id": 28856, "binding_verified": true, "ok": true}
+{"id": 26275, "to": "claude-code", "queued_id": 28863, "binding_verified": true, "ok": true}
+{"id": 26285, "to": "claude-code", "queued_id": 28866, "binding_verified": true, "ok": true}
+{"id": 26288, "to": "codex", "queued_id": 28867, "binding_verified": true, "ok": true}
+{"id": 26291, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26310, "to": "claude-code", "queued_id": 28869, "binding_verified": true, "ok": true}
+{"id": 26312, "to": "claude-code", "queued_id": 28870, "binding_verified": true, "ok": true}
+{"id": 26345, "to": "claude-code", "queued_id": 28872, "binding_verified": true, "ok": true}
+{"id": 26354, "to": "claude-code", "queued_id": 28873, "binding_verified": true, "ok": true}
+{"id": 26356, "to": "claude-code", "queued_id": 28882, "binding_verified": true, "ok": true}
+{"id": 26358, "to": "claude-code", "queued_id": 28883, "binding_verified": true, "ok": true}
+{"id": 26375, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26388, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26391, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26394, "to": "codex", "queued_id": 28884, "binding_verified": true, "ok": true}
+{"id": 26397, "to": "gemini", "queued_id": 28885, "binding_verified": true, "ok": true}
+{"id": 26418, "to": "claude-code", "queued_id": 28886, "binding_verified": true, "ok": true}
+{"id": 26420, "to": "claude-code", "queued_id": 28890, "binding_verified": true, "ok": true}
+{"id": 26422, "to": "claude-code", "queued_id": 28891, "binding_verified": true, "ok": true}
+{"id": 26424, "to": "claude-code", "queued_id": 28893, "binding_verified": true, "ok": true}
+{"id": 26435, "to": "claude-code", "queued_id": 28894, "binding_verified": true, "ok": true}
+{"id": 26448, "to": "claude-code", "queued_id": 28895, "binding_verified": true, "ok": true}
+{"id": 26450, "to": "claude-code", "queued_id": 28897, "binding_verified": true, "ok": true}
+{"id": 26460, "to": "claude-code", "queued_id": 28898, "binding_verified": true, "ok": true}
+{"id": 26462, "to": "claude-code", "queued_id": 28899, "binding_verified": true, "ok": true}
+{"id": 26464, "to": "claude-code", "queued_id": 28902, "binding_verified": true, "ok": true}
+{"id": 26466, "to": "claude-code", "queued_id": 28903, "binding_verified": true, "ok": true}
+{"id": 26480, "to": "claude-code", "queued_id": 28904, "binding_verified": true, "ok": true}
+{"id": 26482, "to": "codex", "queued_id": 28905, "binding_verified": true, "ok": true}
+{"id": 26493, "to": "claude-code", "queued_id": 28906, "binding_verified": true, "ok": true}
+{"id": 26497, "to": "claude-code", "queued_id": 28907, "binding_verified": true, "ok": true}
+{"id": 26536, "to": "claude-code", "queued_id": 28908, "binding_verified": true, "ok": true}
+{"id": 26540, "to": "cbp-being", "queued_id": 28909, "binding_verified": true, "ok": true}
+{"id": 26565, "to": "claude-code", "queued_id": 28910, "binding_verified": true, "ok": true}
+{"id": 26567, "to": "claude-code", "queued_id": 28911, "binding_verified": true, "ok": true}
+{"id": 26578, "to": "claude-code", "queued_id": 28913, "binding_verified": true, "ok": true}
+{"id": 26581, "to": "codex", "queued_id": 28935, "binding_verified": true, "ok": true}
+{"id": 26584, "to": "gemini", "queued_id": 28937, "binding_verified": true, "ok": true}
+{"id": 26598, "to": "claude-code", "queued_id": 28940, "binding_verified": true, "ok": true}
+{"id": 26602, "to": "claude-code", "queued_id": 28942, "binding_verified": true, "ok": true}
+{"id": 26679, "to": "claude-code", "queued_id": 28944, "binding_verified": true, "ok": true}
+{"id": 26710, "to": "claude-code", "queued_id": 28945, "binding_verified": true, "ok": true}
+{"id": 26754, "to": "claude-code", "queued_id": 28946, "binding_verified": true, "ok": true}
+{"id": 26756, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26758, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26760, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26762, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26774, "to": "claude-code", "queued_id": 28959, "binding_verified": true, "ok": true}
+{"id": 26781, "to": "codex", "queued_id": 28960, "binding_verified": true, "ok": true}
+{"id": 26790, "to": "claude-code", "queued_id": 28961, "binding_verified": true, "ok": true}
+{"id": 26800, "to": "claude-code", "queued_id": 28962, "binding_verified": true, "ok": true}
+{"id": 26890, "to": "claude-code", "queued_id": 28963, "binding_verified": true, "ok": true}
+{"id": 26892, "to": "claude-code", "queued_id": 28964, "binding_verified": true, "ok": true}
+{"id": 26899, "to": "claude-code", "queued_id": 28966, "binding_verified": true, "ok": true}
+{"id": 26923, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 26936, "to": "claude-code", "queued_id": 28968, "binding_verified": true, "ok": true}
+{"id": 26959, "to": "claude-code", "queued_id": 28969, "binding_verified": true, "ok": true}
+{"id": 26962, "to": "claude-code", "queued_id": 28970, "binding_verified": true, "ok": true}
+{"id": 26964, "to": "claude-code", "queued_id": 28971, "binding_verified": true, "ok": true}
+{"id": 26966, "to": "claude-code", "queued_id": 28972, "binding_verified": true, "ok": true}
+{"id": 26973, "to": "claude-code", "queued_id": 28973, "binding_verified": true, "ok": true}
+{"id": 26997, "to": "claude-code", "queued_id": 28974, "binding_verified": true, "ok": true}
+{"id": 26999, "to": "claude-code", "queued_id": 28975, "binding_verified": true, "ok": true}
+{"id": 27001, "to": "claude-code", "queued_id": 28976, "binding_verified": true, "ok": true}
+{"id": 27003, "to": "claude-code", "queued_id": 28977, "binding_verified": true, "ok": true}
+{"id": 27005, "to": "claude-code", "queued_id": 28978, "binding_verified": true, "ok": true}
+{"id": 27007, "to": "claude-code", "queued_id": 28981, "binding_verified": true, "ok": true}
+{"id": 27009, "to": "claude-code", "queued_id": 28982, "binding_verified": true, "ok": true}
+{"id": 27011, "to": "claude-code", "queued_id": 28983, "binding_verified": true, "ok": true}
+{"id": 27071, "to": "claude-code", "queued_id": 28986, "binding_verified": true, "ok": true}
+{"id": 27073, "to": "claude-code", "queued_id": 28987, "binding_verified": true, "ok": true}
+{"id": 27075, "to": "claude-code", "queued_id": 28988, "binding_verified": true, "ok": true}
+{"id": 27077, "to": "claude-code", "queued_id": 28989, "binding_verified": true, "ok": true}
+{"id": 27079, "to": "claude-code", "queued_id": 28990, "binding_verified": true, "ok": true}
+{"id": 27081, "to": "claude-code", "queued_id": 28991, "binding_verified": true, "ok": true}
+{"id": 27083, "to": "claude-code", "queued_id": 28992, "binding_verified": true, "ok": true}
+{"id": 27085, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 27087, "to": "claude-code", "queued_id": 29011, "binding_verified": true, "ok": true}
+{"id": 27116, "attempt": 0, "refused": "hestia.member_notify_rate_limited"}
+{"id": 27137, "to": "claude-code", "queued_id": 29020, "binding_verified": true, "ok": true}
+{"id": 27145, "to": "claude-code", "queued_id": 29021, "binding_verified": true, "ok": true}
+{"id": 27155, "to": "claude-code", "queued_id": 29022, "binding_verified": true, "ok": true}
+{"id": 27175, "to": "claude-code", "queued_id": 29023, "binding_verified": true, "ok": true}
+{"id": 27177, "to": "claude-code", "queued_id": 29024, "binding_verified": true, "ok": true}
+{"id": 27179, "to": "claude-code", "queued_id": 29025, "binding_verified": true, "ok": true}
+{"id": 27185, "to": "claude-code", "queued_id": 29026, "binding_verified": true, "ok": true}
+{"id": 27187, "to": "claude-code", "queued_id": 29027, "binding_verified": true, "ok": true}
+{"id": 27189, "to": "claude-code", "queued_id": 29028, "binding_verified": true, "ok": true}
+{"id": 27191, "to": "claude-code", "queued_id": 29029, "binding_verified": true, "ok": true}
+{"id": 27193, "to": "claude-code", "queued_id": 29030, "binding_verified": true, "ok": true}
+{"id": 27195, "to": "claude-code", "queued_id": 29031, "binding_verified": true, "ok": true}
+{"id": 27205, "to": "codex", "queued_id": 29032, "binding_verified": true, "ok": true}
+{"id": 27254, "to": "claude-code", "queued_id": 29033, "binding_verified": true, "ok": true}
+{"id": 27256, "to": "claude-code", "queued_id": 29034, "binding_verified": true, "ok": true}
+{"id": 27267, "to": "claude-code", "queued_id": 29036, "binding_verified": true, "ok": true}
+{"id": 27283, "to": "claude-code", "queued_id": 29038, "binding_verified": true, "ok": true}
+{"id": 27288, "to": "claude-code", "queued_id": 29039, "binding_verified": true, "ok": true}
+{"id": 27318, "to": "claude-code", "queued_id": 29040, "binding_verified": true, "ok": true}
+{"id": 26082, "to": "cbp-being", "queued_id": 29043, "binding_verified": true, "ok": true, "retry": true}
+{"id": 26092, "to": "cbp-being", "queued_id": 29045, "binding_verified": true, "ok": true, "retry": true}
+{"id": 26095, "to": "claude-code", "queued_id": 29047, "binding_verified": true, "ok": true, "retry": true}
+{"id": 26291, "to": "gemini", "queued_id": 29048, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 26375, "to": "claude-code", "queued_id": 29049, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 26388, "to": "claude-code", "queued_id": 29060, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 26391, "to": "claude-code", "queued_id": 29072, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 26756, "to": "claude-code", "queued_id": 29075, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 26758, "to": "claude-code", "queued_id": 29076, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 26760, "to": "claude-code", "queued_id": 29081, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 26762, "to": "claude-code", "queued_id": 29082, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 26923, "to": "claude-code", "queued_id": 29085, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27085, "to": "claude-code", "queued_id": 29086, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27116, "to": "codex", "queued_id": 29089, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27379, "to": "claude-code", "queued_id": 29090, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27381, "to": "codex", "queued_id": 29091, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27394, "to": "claude-code", "queued_id": 29099, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27396, "to": "codex", "queued_id": 29100, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27409, "to": "cbp-being", "queued_id": 29101, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27412, "to": "claude-code", "queued_id": 29108, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27416, "to": "claude-code", "queued_id": 29109, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27420, "to": "claude-code", "queued_id": 29112, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27423, "to": "cbp-being", "queued_id": 29113, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27428, "to": "codex", "queued_id": 29116, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27455, "to": "cbp-being", "queued_id": 29117, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27465, "to": "claude-code", "queued_id": 29119, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27485, "to": "cbp-being", "queued_id": 29121, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27503, "to": "cbp-being", "queued_id": 29124, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27509, "to": "claude-code", "queued_id": 29129, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27512, "to": "claude-code", "queued_id": 29132, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27518, "to": "cbp-being", "queued_id": 29133, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27520, "to": "claude-code", "queued_id": 29134, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27522, "to": "claude-code", "queued_id": 29136, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27531, "to": "cbp-being", "queued_id": 29138, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27561, "to": "cbp-being", "queued_id": 29141, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27568, "to": "cbp-being", "queued_id": 29143, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27583, "to": "claude-code", "queued_id": 29144, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27603, "to": "claude-code", "queued_id": 29145, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27615, "to": "claude-code", "queued_id": 29146, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27630, "to": "cbp-being", "queued_id": 29148, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27636, "to": "claude-code", "queued_id": 29149, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27638, "to": "claude-code", "queued_id": 29152, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27653, "to": "claude-code", "queued_id": 29153, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27666, "to": "cbp-being", "queued_id": 29157, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27669, "to": "claude-code", "queued_id": 29158, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27673, "to": "claude-code", "queued_id": 29160, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27699, "to": "cbp-being", "queued_id": 29161, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27710, "to": "cbp-being", "queued_id": 29162, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27720, "to": "cbp-being", "queued_id": 29163, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27734, "to": "cbp-being", "queued_id": 29164, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27738, "to": "cbp-being", "queued_id": 29165, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27747, "to": "claude-code", "queued_id": 29194, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27749, "to": "claude-code", "queued_id": 29195, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27751, "to": "claude-code", "queued_id": 29196, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27757, "to": "cbp-being", "queued_id": 29197, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27783, "to": "cbp-being", "queued_id": 29200, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27786, "to": "cbp-being", "queued_id": 29203, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27788, "to": "claude-code", "queued_id": 29209, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27802, "to": "cbp-being", "queued_id": 29210, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27810, "to": "cbp-being", "queued_id": 29211, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27828, "to": "cbp-being", "queued_id": 29213, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27851, "to": "cbp-being", "queued_id": 29220, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27858, "to": "claude-code", "queued_id": 29221, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27874, "to": "claude-code", "queued_id": 29224, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27901, "to": "cbp-being", "queued_id": 29226, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27910, "to": "codex", "queued_id": 29227, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27915, "to": "cbp-being", "queued_id": 29228, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27934, "to": "cbp-being", "queued_id": 29229, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27950, "to": "claude-code", "queued_id": 29230, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27952, "to": "claude-code", "queued_id": 29235, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27954, "to": "claude-code", "queued_id": 29237, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27957, "to": "claude-code", "queued_id": 29239, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27959, "to": "claude-code", "queued_id": 29240, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27990, "to": "claude-code", "queued_id": 29241, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 27997, "to": "codex", "queued_id": 29242, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28008, "to": "claude-code", "queued_id": 29243, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28010, "to": "claude-code", "queued_id": 29244, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28012, "to": "claude-code", "queued_id": 29245, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28014, "to": "claude-code", "queued_id": 29250, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28037, "to": "claude-code", "queued_id": 29251, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28044, "to": "claude-code", "queued_id": 29252, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28062, "to": "claude-code", "queued_id": 29253, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28064, "to": "claude-code", "queued_id": 29254, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28066, "to": "claude-code", "queued_id": 29255, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28068, "to": "claude-code", "queued_id": 29256, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28070, "to": "claude-code", "queued_id": 29257, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28093, "to": "codex", "queued_id": 29275, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28112, "to": "claude-code", "queued_id": 29276, "binding_verified": true, "replayed": false, "ok": true, "v": 2}
+{"id": 28132, "to": "claude-code", "queued_id": 29278, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28153, "to": "claude-code", "queued_id": 29283, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28159, "to": "claude-code", "queued_id": 29285, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28176, "to": "cbp-being", "queued_id": 29287, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28178, "to": "claude-code", "queued_id": 29288, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28178, "to": "claude-code", "queued_id": 29288, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28184, "to": "claude-code", "queued_id": 29289, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28184, "to": "claude-code", "queued_id": 29289, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28186, "to": "claude-code", "queued_id": 29291, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28186, "to": "claude-code", "queued_id": 29291, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28189, "to": "claude-code", "queued_id": 29292, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28189, "to": "claude-code", "queued_id": 29292, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28197, "to": "claude-code", "queued_id": 29298, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28197, "to": "claude-code", "queued_id": 29298, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28205, "to": "claude-code", "queued_id": 29299, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28205, "to": "claude-code", "queued_id": 29299, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28214, "to": "cbp-being", "queued_id": 29300, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28214, "to": "cbp-being", "queued_id": 29300, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28259, "to": "claude-code", "queued_id": 29301, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28259, "to": "claude-code", "queued_id": 29301, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28269, "to": "claude-code", "queued_id": 29302, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28269, "to": "claude-code", "queued_id": 29302, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28271, "to": "claude-code", "queued_id": 29303, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28271, "to": "claude-code", "queued_id": 29303, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28273, "to": "claude-code", "queued_id": 29308, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28273, "to": "claude-code", "queued_id": 29308, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28275, "to": "claude-code", "queued_id": 29309, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28275, "to": "claude-code", "queued_id": 29309, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28297, "to": "claude-code", "queued_id": 29310, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28297, "to": "claude-code", "queued_id": 29310, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28315, "to": "cbp-being", "queued_id": 29311, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28315, "to": "cbp-being", "queued_id": 29311, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28318, "to": "cbp-being", "queued_id": 29312, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28318, "to": "cbp-being", "queued_id": 29312, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28324, "to": "claude-code", "queued_id": 29313, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28324, "to": "claude-code", "queued_id": 29313, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28335, "to": "claude-code", "queued_id": 29314, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28335, "to": "claude-code", "queued_id": 29314, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28337, "to": "claude-code", "queued_id": 29315, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28337, "to": "claude-code", "queued_id": 29315, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28339, "to": "claude-code", "queued_id": 29317, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28339, "to": "claude-code", "queued_id": 29317, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28341, "to": "claude-code", "queued_id": 29320, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28341, "to": "claude-code", "queued_id": 29320, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28365, "to": "claude-code", "queued_id": 29328, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28365, "to": "claude-code", "queued_id": 29328, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28371, "to": "claude-code", "queued_id": 29329, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28371, "to": "claude-code", "queued_id": 29329, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28380, "to": "cbp-being", "queued_id": 29332, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28380, "to": "cbp-being", "queued_id": 29332, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28386, "to": "claude-code", "queued_id": 29335, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28386, "to": "claude-code", "queued_id": 29335, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28410, "to": "cbp-being", "queued_id": 29344, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28410, "to": "cbp-being", "queued_id": 29344, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28413, "to": "cbp-being", "queued_id": 29345, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28413, "to": "cbp-being", "queued_id": 29345, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28423, "to": "claude-code", "queued_id": 29346, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28423, "to": "claude-code", "queued_id": 29346, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28444, "to": "cbp-being", "queued_id": 29358, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28444, "to": "cbp-being", "queued_id": 29358, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28452, "to": "cbp-being", "queued_id": 29362, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28452, "to": "cbp-being", "queued_id": 29362, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28460, "to": "cbp-being", "queued_id": 29363, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28460, "to": "cbp-being", "queued_id": 29363, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28471, "to": "claude-code", "queued_id": 29364, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28471, "to": "claude-code", "queued_id": 29364, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28476, "to": "codex", "queued_id": 29365, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28476, "to": "codex", "queued_id": 29365, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28479, "to": "cbp-being", "queued_id": 29366, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28479, "to": "cbp-being", "queued_id": 29366, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28500, "to": "cbp-being", "queued_id": 29367, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28500, "to": "cbp-being", "queued_id": 29367, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28503, "to": "cbp-being", "queued_id": 29372, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28503, "to": "cbp-being", "queued_id": 29372, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28508, "to": "claude-code", "queued_id": 29377, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28508, "to": "claude-code", "queued_id": 29377, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28526, "to": "cbp-being", "queued_id": 29378, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28526, "to": "cbp-being", "queued_id": 29378, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28532, "to": "cbp-being", "queued_id": 29379, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28532, "to": "cbp-being", "queued_id": 29379, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 28569, "to": "cbp-being", "queued_id": 29380, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
+{"id": 28569, "to": "cbp-being", "queued_id": 29380, "binding_verified": true, "replayed": true, "ok": true, "v": 3}
+{"id": 29199, "to": "codex", "queued_id": 29381, "binding_verified": true, "replayed": false, "ok": true, "v": 3}
