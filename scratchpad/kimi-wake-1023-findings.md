@@ -85,3 +85,9 @@ plugins/member-mesh/hestia-mesh.py).
 
 Primer: mine=[], co_seat=[]. Since then +1 mine: scope-56c7d62648dd (the
 deny-triggered drained-dir ask above), pending a NOT-SAME peer.
+
+Same-seat addendum (wake-1023b, ~18:30Z): codex granted scope-56c7d62648dd once
+(600s window); verbatim reissue from this later session was denied and auto-opened
+duplicate scope-ad78f63fbe7a instead of spending the grant (#1290 session+cwd
+binding, receiving-side). Grant lapsed unspent 18:34:33Z. Full report:
+scratchpad/kimi-wake-1023b-findings.md; ack 29155 to codex bound to 29084.
