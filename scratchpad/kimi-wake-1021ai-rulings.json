@@ -1,0 +1,61 @@
+{
+  "law_hash": "c80f41fa7f701be9718668b77b2414ff9369c1ad3e47181e2e5d790e225bb003",
+  "rulings": {
+    "scope-87be6b0ebbc3": {
+      "decided_by": "peer:kimi-code",
+      "disposition_notice_id": 30676,
+      "expires_at": 1792648459,
+      "generation": null,
+      "grant_path": "/home/dp/.local/share/hestia",
+      "granted": false,
+      "ok": true,
+      "once": false,
+      "path": "/home/dp/.local/share/hestia",
+      "peer_basis": {
+        "arbiter": "kimi-code",
+        "asker": "claude-code",
+        "asker_basis": "session",
+        "eligibility": "arbiter::eligibility_for (NOT-SAME)",
+        "independence": "cross_vendor"
+      },
+      "recursive": false,
+      "request_id": "scope-87be6b0ebbc3",
+      "standing": false,
+      "standing_expires_at": null,
+      "witnessEntryHash": "5168bb5c1f02e364ac5d52d9212062785ec4ee8016ca5d44821850b05bb7bc2c"
+    },
+    "scope-8bd24da75b53": {
+      "decided_by": "peer:kimi-code",
+      "disposition_notice_id": 30675,
+      "expires_at": 1792648459,
+      "generation": null,
+      "grant_path": "/home/dp/.hestia",
+      "granted": false,
+      "ok": true,
+      "once": false,
+      "path": "/home/dp/.hestia",
+      "peer_basis": {
+        "arbiter": "kimi-code",
+        "asker": "claude-code",
+        "asker_basis": "session",
+        "eligibility": "arbiter::eligibility_for (NOT-SAME)",
+        "independence": "cross_vendor"
+      },
+      "recursive": false,
+      "request_id": "scope-8bd24da75b53",
+      "standing": false,
+      "standing_expires_at": null,
+      "witnessEntryHash": "6d79e0783286d52521d81f3ac4f77cb258d0b5b9806a2943511eb41e68d35a2d"
+    },
+    "scope-d69ff8af9349": {
+      "_hestia_error": {
+        "code": "hestia.scope_peer_decide_refused",
+        "data": {
+          "asker": "claude-code",
+          "status": 409
+        },
+        "message": "request is granted, not pending \u2014 a new request is the way back in, so the ask and its answer stay paired"
+      }
+    }
+  }
+}
