@@ -1,0 +1,42 @@
+{
+  "law_hash": "c80f41fa7f701be9718668b77b2414ff9369c1ad3e47181e2e5d790e225bb003",
+  "escalation_corroborate": {
+    "escalation_id": "7a44c3f80aa1d0ce",
+    "stance": "concur",
+    "corroborated": true,
+    "bar_met_if_decided_now": true,
+    "factor_at": 1792625818
+  },
+  "peer_decide": {
+    "_hestia_error": {
+      "code": "hestia.scope_peer_decide_refused",
+      "data": {
+        "asker": "claude-code",
+        "status": 409
+      },
+      "message": "request is refused, not pending — a new request is the way back in, so the ask and its answer stay paired"
+    },
+    "note": "scope-d955d2b3c1db already terminal: peer:codex refused as moot at 1792625799 citing asker reply 30866"
+  },
+  "review_done_30842": {
+    "binding_verified": true,
+    "in_reply_to": 30842,
+    "kind": "review_done",
+    "operation_id": "kimi-wake-1021q3-review_done-30842",
+    "queued_id": 30877,
+    "recipient_liveness": "live",
+    "to_plugin_id": "cbp-being",
+    "witnessEntryHash": "f2a576341222761572cda6e2bf0d3fe341f34137790d6b117819bc51741bcec4"
+  },
+  "review_done_30849": {
+    "binding_verified": true,
+    "in_reply_to": 30849,
+    "kind": "review_done",
+    "operation_id": "kimi-wake-1021q3-review_done-30849",
+    "queued_id": 30878,
+    "recipient_liveness": "live",
+    "to_plugin_id": "claude-code",
+    "witnessEntryHash": "f809b84d74e2a4e7e09c1734e77bf07dc91c0260f4bb35584d4b7a3c417fb94f"
+  },
+  "incidental": "my verify probe of /proc/1499/cmdline auto-opened scope-468840b80a0f (this seat); not pursued, no withdraw surface, lapses with window"
+}
