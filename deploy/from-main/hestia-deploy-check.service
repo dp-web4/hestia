@@ -1,0 +1,15 @@
+[Unit]
+Description=hestia update check against origin/main (reports only: no build, no install, no restart)
+After=hestia.service
+
+[Service]
+Type=oneshot
+Environment=HESTIA_HOME=%h/.hestia
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# --check syncs the deploy checkout, compares it with the running daemon, and writes the
+# verdict to $HESTIA_HOME/deploy-check.tsv for the dashboard. Exit 3 means "an update is
+# available"; that is a result, not a failure of this unit.
+ExecStart=%h/.local/bin/hestia-deploy --check
+SuccessExitStatus=3
+Nice=10
+TimeoutStartSec=10min

@@ -770,6 +770,32 @@
       }
     },
     {
+      "id": "deployment-check",
+      "title": "Check whether a hestia update is available (installs nothing)",
+      "place": "me",
+      "kind": "write",
+      "risk": "low",
+      "routes": [
+        "POST /api/operator/deployment/check"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "obligations": [
+        "starts only the check unit (hestia-deploy --check): it syncs the deploy checkout and records a verdict; it never builds, installs or restarts",
+        "shown as \"check for updates\" only where the check unit is installed (deployment.check_capable); the header names when the last check ran"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
       "id": "deployment-auto-update",
       "title": "Switch scheduled deploys (the hestia-deploy timer) on or off",
       "place": "me",

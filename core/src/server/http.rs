@@ -1097,6 +1097,156 @@ async fn operator_deployment_update(
     }
 }
 
+/// Fixed check trigger: start the check-only unit, never the deploy. Linux user systemd only;
+/// elsewhere there is no check unit, so the dashboard has only the update button.
+fn deployment_check_trigger_for(os: &str) -> Option<DeploymentUpdateTrigger> {
+    (os == "linux").then(|| DeploymentUpdateTrigger {
+        program: "systemctl",
+        // --no-block: answer the browser now; the dashboard poll shows the verdict.
+        args: vec![
+            "--user".into(),
+            "--no-block".into(),
+            "start".into(),
+            "hestia-deploy-check.service".into(),
+        ],
+    })
+}
+
+/// Whether a deploy-check.tsv line is a check still in flight (requested or checking, recent).
+fn deployment_check_in_flight(raw: &str) -> bool {
+    super::dashboard::deploy_check_in(raw, env!("HESTIA_GIT_VERSION"), chrono::Utc::now())
+        .is_some_and(|c| c.state == "requested" || c.state == "checking")
+}
+
+/// `POST /api/operator/deployment/check` - ask whether an update is available, and nothing
+/// else (operator, tl-dell 2026-10-21: "check for update means ONLY to check").
+///
+/// Starts hestia-deploy-check.service (`hestia-deploy --check`): sync the deploy checkout,
+/// compare it with the running build, write the verdict to deploy-check.tsv. No build, no
+/// install, no restart; installing stays with `/deployment/update`. The browser sends no body.
+async fn operator_deployment_check(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let now = super::state::unix_now();
+    let (operator, provenance) = {
+        let s = state.lock().await;
+        current_operator_context(&s, &headers, now)
+    };
+    let home = match deployment_update_authority() {
+        Ok((home, _, _)) => home,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "check_unavailable", "error": error })),
+            );
+        }
+    };
+    // Refuse before witnessing or writing anything when there is no check unit to start.
+    let Some(trigger) = deployment_check_trigger_for(std::env::consts::OS)
+        .filter(|_| super::dashboard::deploy_check_installed())
+    else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "check_unavailable",
+                "error": "the update-check unit (hestia-deploy-check) is not installed on this box; \
+                          the next update installs it, or re-run deploy/fleet/install.sh",
+            })),
+        );
+    };
+    let result_path = home.join("deploy-check.tsv");
+    if std::fs::read_to_string(&result_path).is_ok_and(|raw| deployment_check_in_flight(&raw)) {
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "checking", "message": "a check is already running" })),
+        );
+    }
+
+    // Witnessed before the side effect, as the update request is: no record, no check.
+    {
+        let mut s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "running_build": env!("HESTIA_GIT_VERSION"),
+                "platform": std::env::consts::OS,
+                "mechanism": "hestia-deploy --check (no build, no install, no restart)",
+            }),
+            provenance.as_ref(),
+        );
+        if let Err(error) = s.append_chain("deployment_check_requested", record) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": format!("cannot witness the update check request: {error}"),
+                })),
+            );
+        }
+    }
+
+    // "requested" first, so the dashboard shows "checking…" on its next poll instead of the
+    // previous verdict; the supervisor overwrites it with its own.
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let _ = write_deployment_update_file(
+        &result_path,
+        &format!("requested\t{stamp}\t{}\t\n", env!("HESTIA_GIT_VERSION")),
+    );
+    let trigger_for_run = trigger.clone();
+    let outcome = match tokio::task::spawn_blocking(move || deployment_trigger_output(&trigger_for_run)).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("update check trigger task failed: {error}")),
+    };
+    let mut s = state.lock().await;
+    match outcome {
+        Ok(()) => {
+            let witnessed = s
+                .append_chain(
+                    "deployment_check_triggered",
+                    super::operator_auth::attach_operator_provenance(
+                        serde_json::json!({
+                            "operator": operator,
+                            "trigger_program": trigger.program,
+                            "trigger_args": trigger.args,
+                            "outcome": "requested",
+                        }),
+                        provenance.as_ref(),
+                    ),
+                )
+                .is_ok();
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "requested",
+                    "witnessed": witnessed,
+                    "message": "checking origin/main for an update; nothing will be installed",
+                })),
+            )
+        }
+        Err(error) => {
+            let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let _ = write_deployment_update_file(
+                &result_path,
+                &format!("failed\t{stamp}\t{}\t\n", env!("HESTIA_GIT_VERSION")),
+            );
+            let witnessed = s
+                .append_chain(
+                    "deployment_check_trigger_failed",
+                    super::operator_auth::attach_operator_provenance(
+                        serde_json::json!({ "operator": operator, "outcome": "trigger-failed", "error": error }),
+                        provenance.as_ref(),
+                    ),
+                )
+                .is_ok();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "failed", "witnessed": witnessed, "error": error })),
+            )
+        }
+    }
+}
+
 /// Body of `POST /api/operator/deployment/auto-update`: on or off, nothing else. No unit,
 /// path or schedule is taken from the browser.
 #[derive(serde::Deserialize)]
@@ -1347,6 +1497,26 @@ mod deployment_update_tests {
     }
 
     #[test]
+    fn deployment_check_starts_the_check_unit_and_never_the_deploy() {
+        let t = deployment_check_trigger_for("linux").unwrap();
+        assert_eq!(t.program, "systemctl");
+        assert_eq!(t.args, ["--user", "--no-block", "start", "hestia-deploy-check.service"]);
+        assert!(!t.args.iter().any(|a| a == "hestia-deploy.service"));
+        assert!(deployment_check_trigger_for("macos").is_none());
+        assert!(deployment_check_trigger_for("windows").is_none());
+    }
+
+    #[test]
+    fn deployment_check_in_flight_only_while_requested_or_checking() {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(deployment_check_in_flight(&format!("requested\t{now}\t\t\n")));
+        assert!(deployment_check_in_flight(&format!("checking\t{now}\t\t\n")));
+        assert!(!deployment_check_in_flight(&format!("available\t{now}\t\tv9\n")));
+        assert!(!deployment_check_in_flight(&format!("failed\t{now}\t\t\n")));
+        assert!(!deployment_check_in_flight("checking\t2020-01-01T00:00:00Z\t\t\n"));
+    }
+
+    #[test]
     fn auto_update_reply_reports_what_happened_not_what_was_asked() {
         let ok: std::result::Result<(), String> = Ok(());
         let failed: std::result::Result<(), String> = Err("systemctl exited 1".into());
@@ -1590,6 +1760,10 @@ pub async fn serve_with_callback(
         .route(
             "/api/operator/deployment/auto-update",
             post(operator_deployment_auto_update),
+        )
+        .route(
+            "/api/operator/deployment/check",
+            post(operator_deployment_check),
         )
         .route(
             "/api/operator/gate-escalation",

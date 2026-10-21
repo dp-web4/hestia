@@ -107,7 +107,13 @@ preflight and refuses identically, so there is nothing for the seat to retry.
 it clones the two deploy checkouts over https, installs `hestia-deploy` and both units with
 `HESTIA_WORKSPACE` rendered, and leaves the **timer off**. The dashboard's update button works
 straight away. Scheduled deploys stay off until the operator switches them on, either with the
-dashboard toggle (#1334) or with `HESTIA_AUTO_UPDATE=1` at install time. A release (`curl | sh`) install is
+dashboard toggle (#1334) or with `HESTIA_AUTO_UPDATE=1` at install time. It also installs the
+**update check** (`hestia-deploy-check.{service,timer}`) and switches its timer on: every 4h, at
+02:17/06:17/… (two hours off the deploy marks), it runs `hestia-deploy --check` and writes the verdict
+to `~/.hestia/deploy-check.tsv`. That is what the dashboard shows as "up to date · checked <time>" or
+"update available", and what its "check for updates" button starts. A check builds, installs and
+restarts nothing. A box whose units predate the check gets them from its next full deploy cycle.
+A release (`curl | sh`) install is
 skipped on purpose: it tracks releases, not main. The manual lines below remain the reference,
 and they are how a release install opts in to main-tracking.
 
@@ -116,8 +122,10 @@ and they are how a release install opts in to main-tracking.
     git clone git@github.com:dp-web4/web4.git   ~/.hestia/deploy/web4
     install -m 0755 deploy/from-main/hestia-deploy.sh ~/.local/bin/hestia-deploy
     install -m 0644 deploy/from-main/hestia-deploy.{service,timer} ~/.config/systemd/user/
+    install -m 0644 deploy/from-main/hestia-deploy-check.{service,timer} ~/.config/systemd/user/
     systemctl --user daemon-reload
-    systemctl --user enable --now hestia-deploy.timer
+    systemctl --user enable --now hestia-deploy-check.timer   # check only, every 4h
+    systemctl --user enable --now hestia-deploy.timer         # optional: install every 4h
     journalctl --user -u hestia-deploy -f
 
 Until #698 merges, `deploy/from-main/` is **not on main**: run the two `install` lines from
@@ -228,7 +236,10 @@ primitive that is not there must never be indistinguishable from a lock that is 
   The next cycle skips and logs the reason. A hold older than 6h is ignored, so a
   forgotten file cannot stop deploys silently. Remove it when done.
 - `hestia-deploy --check` says whether the running daemon is current (exit 0) or
-  stale (exit 3) without building. `hestia-deploy --build-only` builds without
+  stale (exit 3) without building, and records it in `~/.hestia/deploy-check.tsv`
+  (`<state> <checked_at> <running> <latest>`; state `checking`, `up-to-date`, `available` or
+  `failed`). It installs nothing, not even a newer copy of this script, and a hold does not stop
+  it (a hold protects builds and restarts, and a check does neither). `hestia-deploy --build-only` builds without
   installing, for a pre-flight before a hold. Any other argument is usage, exit 2,
   and does not take the lock — the default is refusal, not deployment.
 - A half deploy heals on the **next timer cycle**: a full cycle that finds the binary

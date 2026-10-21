@@ -34,7 +34,9 @@
 # cannot silently stop deploys).
 #
 # Modes:  (none)        full cycle
-#         --check       sync + report currency, no build, no restart, exit 0 current / 3 stale
+#         --check       sync + report currency, no build, no restart, no self-update, exit 0
+#                       current / 3 stale. Writes the result to deploy-check.tsv (below), which
+#                       the dashboard reads. hestia-deploy-check.timer runs this every 4h.
 #         --build-only  sync + build, no install, no restart
 #         --hooks-only  re-run the members' install against the deployed binary (recovery for
 #                       hooks=FAILED; refuses if main has moved since — see the block below).
@@ -147,11 +149,39 @@ read_update_request_id() {
   esac
 }
 
+# Whether an update is available, and when that was last asked: what the dashboard shows as
+# "up to date · checked <time>" or "update available". One line, tab-separated:
+#   <state> <checked_at> <running> <latest>
+# state is checking, up-to-date, available or failed. Written by every cycle that syncs (a
+# full cycle is a check too), atomically, so the dashboard never reads half a line. Before this
+# file the daemon had no way to know main had moved: "deployment current" only compared the
+# running binary with the local install record (#438).
+CHECK_RESULT="$HESTIA_HOME/deploy-check.tsv"
+CHECK_WRITTEN=0
+
+write_check_result() {
+  local state="$1" latest="${2:-}" now tmp
+  now="$(date -u +%FT%TZ)"
+  tmp="$CHECK_RESULT.tmp.$$"
+  # A status file that cannot be written must never stop a deploy: warn and carry on.
+  if ! { printf '%s\t%s\t%s\t%s\n' "$state" "$now" "${running:-}" "$latest" > "$tmp" && mv "$tmp" "$CHECK_RESULT"; } 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    log "WARN could not write $CHECK_RESULT ($state)"
+    return 0
+  fi
+  case "$state" in checking) ;; *) CHECK_WRITTEN=1 ;; esac
+}
+
 cleanup_deploy() {
   local rc=$?
   if [ "$LOCKD_OWNED" = "1" ]; then
     rm -f "$LOCKD/pid"
     rmdir "$LOCKD" 2>/dev/null || true
+  fi
+  # A check that died before its verdict (fetch failed, no deploy checkout) says so, rather
+  # than leaving "checking" or an older verdict on the dashboard.
+  if [ "$MODE" = "--check" ] && [ "$CHECK_WRITTEN" = 0 ] && [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+    write_check_result failed || true
   fi
   finish_update_status "$rc"
 }
@@ -997,7 +1027,9 @@ fi
 trap cleanup_deploy EXIT
 
 # ---- operator hold -----------------------------------------------------------------------
-if [ -e "$HOLD" ]; then
+# A check builds nothing and restarts nothing, which is all a hold protects, so a hold does not
+# stop it. Skipping it would leave the dashboard's "last checked" frozen for the hold's length.
+if [ -e "$HOLD" ] && [ "$MODE" != "--check" ]; then
   age=$(( $(date +%s) - $(mtime_of "$HOLD") ))
   if [ "$age" -lt "$HOLD_MAX_SECS" ]; then
     if [ "$MODE" = full ] && read_update_request_id; then
@@ -1012,6 +1044,7 @@ if [ -e "$HOLD" ]; then
 fi
 
 # ---- sync the deploy checkout and its sibling --------------------------------------------
+[ "$MODE" = "--check" ] && write_check_result checking
 [ -d "$DEPLOY_ROOT/hestia/.git" ] || die "no deploy checkout at $DEPLOY_ROOT/hestia (see README)"
 [ -d "$DEPLOY_ROOT/web4/.git" ]   || die "no web4 sibling at $DEPLOY_ROOT/web4 (see README)"
 # --force: a moved tag is otherwise never updated in an existing clone, and every identity
@@ -1034,6 +1067,17 @@ running="$(running_version)"
 ondisk="$("$BIN" --version 2>/dev/null | describe_of || true)"
 log "target=$target ($target_sha, web4 $web4_sha, atlas $atlas) running=${running:-none} ondisk=${ondisk:-none} bin=$BIN"
 
+# The answer to "is there an update?", recorded for the dashboard before anything else happens.
+# A full cycle that goes on to deploy rewrites it as up-to-date once the new binary is live.
+case "$MODE" in
+  full|--check)
+    if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
+      write_check_result up-to-date "$target"
+    else
+      write_check_result available "$target"
+    fi ;;
+esac
+
 # Claim a dashboard request only now: lock and hold have both passed, and `target` is the
 # supervisor's actual synced target rather than the old current-build authority record.
 if [ "$MODE" = full ] && [ -r "$UPDATE_REQUEST" ]; then
@@ -1053,11 +1097,45 @@ fi
 # main. When this ran after the guard, the daemon_exe bug (McNugget, 2026-09-29) could never
 # heal itself: the installed copy died at the guard every cycle and never installed the fix.
 # Updating the script deploys nothing; the guard still stands between it and the binary.
-if [ -f "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" ] && \
+# Not on --check: a check installs nothing, this script included. The operator asked for a
+# check that only checks, so a new script arrives with the next update, not the next check.
+if [ "$MODE" != "--check" ] && [ -f "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" ] && \
    ! cmp -s "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" "$SELF_INSTALL"; then
   install -m 0755 "$DEPLOY_ROOT/hestia/deploy/from-main/hestia-deploy.sh" "$SELF_INSTALL.new" && \
     mv -f "$SELF_INSTALL.new" "$SELF_INSTALL" && log "self-updated $SELF_INSTALL from $target"
 fi
+
+# The update-check units arrive with the update that ships them. A box whose deploy units were
+# installed before they existed would otherwise never get a scheduled check: install.sh is a
+# once-per-box step. Linux user systemd only, and only where the deploy service itself is
+# installed (the box opted in to the supervisor). The timer is enabled once, when it is first
+# installed; an operator who turns it off later is not overridden by the next cycle.
+install_check_units() {
+  [ "$OS" = Linux ] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local unit_dir="$HOME/.config/systemd/user"   # where install.sh puts the units
+  local src="$DEPLOY_ROOT/hestia/deploy/from-main" changed=0 fresh=0 u
+  [ -f "$unit_dir/hestia-deploy.service" ] || return 0
+  [ -f "$unit_dir/hestia-deploy-check.timer" ] || fresh=1
+  for u in hestia-deploy-check.service hestia-deploy-check.timer; do
+    [ -f "$src/$u" ] || return 0
+    if ! cmp -s "$src/$u" "$unit_dir/$u"; then
+      install -m 0644 "$src/$u" "$unit_dir/$u" || { log "WARN could not install $unit_dir/$u"; return 0; }
+      changed=1
+    fi
+  done
+  [ "$changed" = 1 ] || return 0
+  systemctl --user daemon-reload || { log "WARN update-check units installed, daemon-reload failed"; return 0; }
+  log "installed the update-check units from $target"
+  if [ "$fresh" = 1 ]; then
+    if systemctl --user enable --now hestia-deploy-check.timer >/dev/null 2>&1; then
+      log "enabled hestia-deploy-check.timer: checks for an update every 4h, installs nothing"
+    else
+      log "WARN could not enable hestia-deploy-check.timer"
+    fi
+  fi
+}
+[ "$MODE" = full ] && install_check_units
 
 # BIN must be the file the daemon execs. Otherwise one cycle installs to a path nothing
 # launches, restarts the OLD binary, sees the old version, and "rolls back" a file nobody runs
@@ -1175,6 +1253,9 @@ done
 
 secret_hygiene
 log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory seats=$seats in $(( $(date +%s) - T0 ))s"
+# The new binary is live, so this box now runs the latest main: no update is available.
+running="$newv"
+write_check_result up-to-date "$target"
 
 # A DEPLOYED line with hooks != ok is HALF a deploy: the binary is current, the manifest is not,
 # and the dashboard reads stale (or unknown) until someone runs --hooks-only. Until 2026-08-27

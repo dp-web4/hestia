@@ -803,10 +803,11 @@ step_workspace_marker() {
 # shell lines to get a working update button.
 #
 # WHAT IT INSTALLS, AND WHAT IT LEAVES OFF. The two deploy clones under $HESTIA_HOME/deploy, the
-# hestia-deploy script, and the service + timer units, with HESTIA_WORKSPACE rendered. The
-# TIMER STAYS OFF unless HESTIA_AUTO_UPDATE=1: nothing builds or restarts until the operator
-# clicks update or switches auto-update on in the dashboard. A re-run never turns an armed
-# timer off and never touches the deploy clones' history.
+# hestia-deploy script, the service + timer units with HESTIA_WORKSPACE rendered, and the
+# update-check service + timer. The DEPLOY TIMER STAYS OFF unless HESTIA_AUTO_UPDATE=1: nothing
+# builds or restarts until the operator clicks update or switches auto-update on in the
+# dashboard. The CHECK timer is on: it only reports whether an update is available. A re-run
+# never turns an armed timer off and never touches the deploy clones' history.
 #
 # WHEN IT SKIPS (and says so). The supervisor builds hestia main from source, so it needs a
 # checkout install (a resolved HESTIA_WORKSPACE) with git and cargo. A release install
@@ -898,6 +899,13 @@ step_deploy_supervisor() {
     return 1
   fi
   install -m 0644 "$src/hestia-deploy.timer" "$unit_dir/hestia-deploy.timer"
+  # The update CHECK (report only, never installs): what the dashboard's "check for updates"
+  # starts and what keeps its "checked <time>" fresh. Its timer is switched on the first time it
+  # is installed; a re-run leaves an operator's later choice alone.
+  local check_fresh=0
+  [ -f "$unit_dir/hestia-deploy-check.timer" ] || check_fresh=1
+  install -m 0644 "$src/hestia-deploy-check.service" "$unit_dir/hestia-deploy-check.service"
+  install -m 0644 "$src/hestia-deploy-check.timer" "$unit_dir/hestia-deploy-check.timer"
   # Read back, as the other steps do: a zero exit is not evidence the bytes landed.
   if ! grep -qxF -- "$env_line" "$unit_dir/hestia-deploy.service"; then
     c_err "hestia-deploy.service was written without HESTIA_WORKSPACE: $unit_dir/hestia-deploy.service"
@@ -916,6 +924,10 @@ step_deploy_supervisor() {
   fi
   systemctl --user daemon-reload
   c_ok "deploy supervisor installed: the dashboard update button works"
+  if [ "$check_fresh" = 1 ]; then
+    systemctl --user enable --now hestia-deploy-check.timer
+    c_ok "update check ON: checks hestia main every 4h and shows the result; installs nothing"
+  fi
   if [ "${HESTIA_AUTO_UPDATE:-}" = 1 ]; then
     systemctl --user enable --now hestia-deploy.timer
     c_ok "auto-update ON (HESTIA_AUTO_UPDATE=1): deploys hestia main every 4h"

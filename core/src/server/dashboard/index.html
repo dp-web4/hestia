@@ -1125,7 +1125,7 @@
          chip (`#govern-chip-badge`) rather than dropped, so the count that made dp look is
          still on the face of the nav. -->
     <div class="live">
-      <span class="deployment-health unknown" id="deployment-health" title="Deployment freshness">● deployment unknown</span>
+      <span class="deployment-health unknown" id="deployment-health" title="Whether a newer hestia is available">● update status unknown</span>
       <button class="deployment-update" id="deployment-update" type="button" hidden>update</button>
       <button class="deployment-auto" id="deployment-auto" type="button" hidden aria-pressed="false">auto-update off</button>
       <span class="dot"></span>
@@ -3423,37 +3423,80 @@
     const btn = $('deployment-update');
     const state = ['current', 'stale', 'unknown'].includes(d.state) ? d.state : 'unknown';
     const updateState = d.update_state || 'idle';
-    el.className = `deployment-health ${state}`;
-    el.textContent = state === 'current'
-      ? '● deployment current'
-      : state === 'stale' ? '! deployment stale' : '● deployment unknown';
-    el.title = `${d.note || 'deployment status unavailable'}${d.running_build ? ` (running ${d.running_build})` : ''}${d.current_build ? `; current ${d.current_build}` : ''}${d.update_note ? `; ${d.update_note}` : ''}`;
+    const updating = ['requested', 'held', 'running'].includes(updateState);
+    const updateFailed = updateState === 'failed';
+    // The update CHECK (hestia-deploy --check, every 4h and on "check for updates"): the only
+    // source that can say whether hestia main has moved. `state` cannot: it compares the
+    // running build with this box's own install record (#438). So the words follow the check:
+    // "up to date" only when a check said so, with the time it said it.
+    const chk = d.check_capable ? (d.check || null) : null;
+    const checkState = chk ? chk.state : (d.check_capable ? 'never' : 'none');
+    const checked = chk && chk.at ? ` · checked ${fmt.stamp(chk.at)}` : '';
+
+    // [status text, colour class, button label, button action, button style]
+    let view;
+    if (state === 'unknown') {
+      view = ['● update status unknown', 'unknown', null, null, ''];
+    } else if (updating) {
+      view = ['● updating…', 'unknown', updateState === 'held' ? 'update held' : 'updating…', null, 'quiet'];
+    } else if (state === 'stale') {
+      // The running build is not the one this box last installed: an install did not finish.
+      view = ['! install incomplete', 'stale', updateFailed ? 'retry update' : 'update', 'update', updateFailed ? 'failed' : ''];
+    } else if (updateFailed) {
+      view = ['! last update failed', 'stale', 'retry update', 'update', 'failed'];
+    } else if (checkState === 'requested' || checkState === 'checking') {
+      view = ['● checking for updates…', 'unknown', 'checking…', null, 'quiet'];
+    } else if (checkState === 'available') {
+      view = [`! update available${checked}`, 'stale', 'update', 'update', ''];
+    } else if (checkState === 'up-to-date') {
+      view = [`● up to date${checked}`, 'current', 'check for updates', 'check', 'quiet'];
+    } else if (checkState === 'failed') {
+      view = [`! update check failed${checked}`, 'stale', 'retry check', 'check', 'failed'];
+    } else if (checkState === 'unchecked') {
+      view = ['● not checked since this build', 'unknown', 'check for updates', 'check', 'quiet'];
+    } else if (checkState === 'never') {
+      view = ['● not checked yet', 'unknown', 'check for updates', 'check', 'quiet'];
+    } else {
+      // No check unit on this box (macOS, or installed before the check existed): nothing
+      // here can see hestia main, so say that, and offer the one action there is. The next
+      // update installs the check on Linux.
+      view = ['● update status unknown', 'unknown', 'update', 'update', 'quiet'];
+    }
+    const [text, colour, label, action, style] = view;
+    el.className = `deployment-health ${colour}`;
+    el.textContent = text;
+
+    const lines = [];
+    if (d.running_build) lines.push(`running ${d.running_build}`);
+    if (chk && chk.latest) lines.push(`hestia main at the last check: ${chk.latest}`);
+    if (d.check_capable) {
+      lines.push('checks for updates every 4h and when you click "check for updates"; a check installs nothing');
+    } else {
+      lines.push('no update check on this box: "update" fetches hestia main and installs it if it has moved');
+    }
+    if (state === 'stale') lines.push(d.note || 'the running build is not the one this box last installed');
+    if (d.update_note) lines.push(d.update_note);
     if (d.last_cycle) {
       // When the deploy supervisor last ran (timer, update or check) and how that run ended.
-      el.title += `\nlast deploy run ${fmt.stamp(d.last_cycle.at)}: ${d.last_cycle.result}`
-        + (d.last_cycle.detail ? ` ${d.last_cycle.detail}` : '');
+      lines.push(`last deploy run ${fmt.stamp(d.last_cycle.at)}: ${d.last_cycle.result}`
+        + (d.last_cycle.detail ? ` ${d.last_cycle.detail}` : ''));
     }
+    el.title = lines.join('\n');
 
     if (!btn) return;
-    // Stale: the local install is half-updated, so the button says "update". Current: the box
-    // matches its own manifest, but only the supervisor can see whether origin/main has moved,
-    // so the same request is offered as "check for updates" (with the timer off it is the only
-    // way to find out). Unknown: no supervisor to ask, so no button.
-    const stale = state === 'stale';
-    const active = ['requested', 'held', 'running'].includes(updateState);
-    const failed = updateState === 'failed';
-    btn.hidden = !d.update_capable || !(stale || state === 'current');
-    btn.disabled = active;
-    btn.classList.toggle('failed', failed);
-    btn.classList.toggle('quiet', !stale && !failed);
-    btn.textContent = updateState === 'held' ? (stale ? 'update held' : 'check held')
-      : active ? (stale ? 'updating…' : 'checking…')
-      : failed ? (stale ? 'retry update' : 'retry check')
-      : stale ? 'update' : 'check for updates';
-    btn.title = active || failed
-      ? (d.update_note || (failed ? 'last update failed; retry' : 'deployment supervisor is working'))
-      : stale ? 'bring this deployment current through the registered supervisor'
-      : 'ask the deployment supervisor to fetch hestia main and update if it has moved (builds only when there is something new)';
+    btn.hidden = !d.update_capable || !label;
+    btn.disabled = !action;
+    btn.dataset.action = action || '';
+    btn.classList.toggle('failed', style === 'failed');
+    btn.classList.toggle('quiet', style === 'quiet');
+    btn.textContent = label || '';
+    btn.title = action === 'check'
+      ? 'ask whether a newer hestia is available; nothing is installed'
+      : action === 'update'
+        ? (chk && chk.latest && checkState === 'available'
+          ? `install ${chk.latest}: builds, installs and restarts the hestia daemon`
+          : 'fetch hestia main and install it if it has moved: builds, installs and restarts the hestia daemon')
+        : (d.update_note || 'deployment supervisor is working');
   }
 
   // Scheduled auto-update (the hestia-deploy timer). Shown only where the timer is installed
@@ -3510,30 +3553,29 @@
     if (!btn) return;
     btn.addEventListener('click', async () => {
       if (btn.disabled) return;
+      // What the button does is what renderDeployment last decided: check, or update.
+      const checking = btn.dataset.action === 'check';
+      if (!checking && btn.dataset.action !== 'update') return;
       btn.disabled = true;
-      const checking = btn.classList.contains('quiet');
       btn.textContent = checking ? 'checking…' : 'requesting…';
       btn.classList.remove('failed');
       try {
-        const res = await apiFetch('/api/operator/deployment/update', { method: 'POST' });
+        const res = checking
+          ? await apiFetch('/api/operator/deployment/check', { method: 'POST' })
+          : await apiFetch('/api/operator/deployment/update', { method: 'POST' });
         const body = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
-        if (body.status === 'current') {
-          await tick();
-          return;
-        }
         btn.textContent = checking ? 'checking…' : 'updating…';
         $('live-status').textContent = checking ? 'checking for updates…' : 'updating…';
-        // Re-read authoritative supervisor state rather than inventing a client-side success.
-        // The daemon may disappear during restart; the ordinary poll will reconnect and only
-        // deployment.state=current clears the stale badge.
+        // Re-read authoritative supervisor state rather than inventing a client-side result.
+        // An update may restart the daemon; the ordinary poll reconnects and re-renders.
         await tick();
       } catch (error) {
         btn.disabled = false;
         btn.classList.add('failed');
-        btn.textContent = 'retry update';
-        btn.title = `update request failed: ${error.message}`;
-        $('live-status').textContent = `update failed (${error.message})`;
+        btn.textContent = checking ? 'retry check' : 'retry update';
+        btn.title = `${checking ? 'update check' : 'update'} request failed: ${error.message}`;
+        $('live-status').textContent = `${checking ? 'update check' : 'update'} failed (${error.message})`;
       }
     });
   })();
