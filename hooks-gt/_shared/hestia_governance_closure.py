@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 1eae4d4ee389c4d394eba91a5a76ebd220739b890e23f8e899ea51518136b2e3  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 0346c5a4e81669b0aed984e5e68a029ab3552c7445db8338f85ced1f3c3538cb  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1157,10 +1157,41 @@ _FIND_PRIMARIES = dict(
     + [("-fprintf", (2, "w"))])
 
 
-def _inner_is_passive(words: list) -> bool:
-    """For xargs / find -exec: is the command they run one that only reads?"""
-    words = _strip_wrappers(words)
-    return bool(words) and os.path.basename(words[0]) in _PASSIVE_VERBS
+#: Directories whose files are taken to be what their names say. A passive name anywhere else
+#: (`./cat`, `/tmp/x/cat`) is an arbitrary program that happens to share the name.
+_TRUSTED_BIN_DIRS = frozenset({"/bin", "/usr/bin"})
+#: `PATH` as a word anywhere in a command: an assignment, `export`, `read PATH`, `printf -v PATH`.
+#: find and xargs exec their command through PATH, so a bare name is trusted only when nothing
+#: in the command line can have changed it. Over-broad on purpose (`echo $PATH` counts): the
+#: cost is a refused find/xargs, never a misread one.
+_PATH_WORD = re.compile(r"(?<![A-Za-z0-9_])PATH(?![A-Za-z0-9_])")
+
+
+def _inner_is_passive(words: list, path_pinned: bool = False) -> bool:
+    """For xargs / find -exec: is the command they run one that only reads?
+
+    Identity, not basename (Nova, #1356 P1). The old test kept `os.path.basename(words[0])`, so
+    `find . -exec ./cat {} +` or `xargs /tmp/x/cat` -- any program NAMED like a passive verb --
+    read as passive while it could write anything. Now the program must be either a bare
+    passive name, looked up through a PATH this command line cannot have changed
+    (`path_pinned`, computed by _bash_write_targets over the whole line), or a passive name
+    directly inside /bin or /usr/bin. Every other spelling fails closed. An `env` that sets PATH
+    or takes options is a wrapper that changes how the name is found, so it fails closed too.
+    Default False: a caller that cannot vouch for PATH gets the refusal, not the trust."""
+    words = list(words)
+    stripped = _strip_wrappers(words)
+    if not stripped:
+        return False
+    prefix = words[:len(words) - len(stripped)]
+    if any(_PATH_WORD.search(w) or w.startswith("-") for w in prefix):
+        return False
+    prog = stripped[0]
+    name = os.path.basename(prog)
+    if name not in _PASSIVE_VERBS:
+        return False
+    if "/" not in prog:
+        return path_pinned
+    return os.path.isabs(prog) and os.path.normpath(os.path.dirname(prog)) in _TRUSTED_BIN_DIRS
 
 
 def _find_exec_open(cur: list) -> bool:
@@ -1193,7 +1224,7 @@ def _expand_old_tar(args: list) -> list:
     return out + args[k:]
 
 
-def _find_write_targets(args: list) -> list:
+def _find_write_targets(args: list, path_pinned: bool = False) -> list:
     i = 0
     while i < len(args) and args[i] in ("-H", "-L", "-P"):
         i += 1
@@ -1210,7 +1241,7 @@ def _find_write_targets(args: list) -> list:
             # The terminator is `+` or `;`. The walker keeps an escaped `\;` inside this simple
             # command (see _bash_write_targets); none at all means the shell would reject it.
             end = next((k for k in range(i + 1, len(args)) if args[k] in (";", "+")), len(args))
-            if not _inner_is_passive(args[i + 1:end]):
+            if not _inner_is_passive(args[i + 1:end], path_pinned):
                 raise _OutOfGrammar()  # runs a command that may write
             i = end + 1
             continue
@@ -1231,7 +1262,7 @@ def _find_write_targets(args: list) -> list:
     return out
 
 
-def _output_verb_write_targets(name: str, args: list):
+def _output_verb_write_targets(name: str, args: list, path_pinned: bool = False):
     """Write targets for the #1348 verbs, or None when `name` is not one of them."""
     if name == "sort":
         return _parse_opts(args, *_SORT)[0]
@@ -1282,14 +1313,14 @@ def _output_verb_write_targets(name: str, args: list):
         # The input is replaced, or (-k) a sibling output is created beside it.
         return w + pos
     if name == "find":
-        return _find_write_targets(args)
+        return _find_write_targets(args, path_pinned)
     if name == "xargs":
         inner = _positionals(args, opts_with_value=(
             "-I", "-i", "-n", "-L", "-l", "-P", "-d", "-E", "-e", "-s", "-a", "--arg-file",
             "--delimiter", "--max-args", "--max-lines", "--max-procs", "--replace", "--eof",
             "--max-chars"))
         first = next((k for k, a in enumerate(args) if inner and a == inner[0]), None)
-        if first is None or not _inner_is_passive(args[first:]):
+        if first is None or not _inner_is_passive(args[first:], path_pinned):
             raise _OutOfGrammar()  # runs a command that may write
         return []
     if name in ("awk", "gawk", "mawk", "nawk"):
@@ -1324,7 +1355,7 @@ def _output_verb_write_targets(name: str, args: list):
     return None
 
 
-def _command_write_targets(words: list, stdin_src=None) -> list:
+def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:
     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
     their file args are read positions by default (the anti-FP stance; the daemon's
     destructive preset stays behind anything exotic)."""
@@ -1386,7 +1417,7 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
         return _positionals(args)
     if name == "touch":
         return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
-    verb_out = _output_verb_write_targets(name, args)
+    verb_out = _output_verb_write_targets(name, args, path_pinned)
     if verb_out is not None:
         return verb_out
     if name == "git":
@@ -1491,7 +1522,8 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
     return []
 
 
-def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None) -> str:
+def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None,
+                          path_pinned: bool = False) -> str:
     """Resolve ONE simple command: detect out-of-grammar heads (shell block, `bash -c`,
     `eval`, `git apply`/`patch` — the last two via _command_write_targets), track `cd` into
     the effective cwd, else append this command's cd-resolved write targets. Returns the
@@ -1539,7 +1571,7 @@ def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None) 
             eff = d if (os.path.isabs(d) or d.startswith("~")) \
                 else os.path.normpath(os.path.join(eff or ".", d))
         return eff
-    for tg in _command_write_targets(words, stdin_src):  # may raise (git apply/am, patch)
+    for tg in _command_write_targets(words, stdin_src, path_pinned):  # may raise (git apply/am, patch)
         if _has_subst(tg):
             raise _OutOfGrammar()  # substitution in a write position
         targets.append(_join_eff(eff, tg))
@@ -1587,6 +1619,9 @@ def _bash_write_targets(command: str) -> list:
     deferred_oog = False
     stdin_src = None  # `< file` source for the current simple command (patch input)
     eff = ""  # relative cwd accumulator; cd within this command line adjusts it
+    # A bare name run by find -exec / xargs is found through PATH; trust it only when no word of
+    # this line (heredoc bodies included, to err toward refusing) names PATH (Nova, #1356).
+    path_pinned = not _PATH_WORD.search(command)
     i = 0
     while i < len(toks):
         t = toks[i]
@@ -1602,7 +1637,7 @@ def _bash_write_targets(command: str) -> list:
         if t in _SEPARATORS:
             if cur:
                 try:
-                    eff = _flush_simple_command(cur, eff, targets, stdin_src)
+                    eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
                 except _OutOfGrammar:
                     deferred_oog = True
                 cur = []
@@ -1636,7 +1671,7 @@ def _bash_write_targets(command: str) -> list:
         i += 1
     if cur:
         try:
-            eff = _flush_simple_command(cur, eff, targets, stdin_src)
+            eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
         except _OutOfGrammar:
             deferred_oog = True
     if deferred_oog:

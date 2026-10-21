@@ -143,6 +143,24 @@ PAIRS = [
     # a verb that runs another verb
     ("xargs rm", f"echo {T} | xargs rm", f"grep -l deny {T}"),
     ("find -exec", f"find {D} -name '*.py' -exec rm {{}} +", f"find {D} -name '*.py'"),
+    # Nova P1 on #1356: a program NAMED like a passive verb is not that verb. The executable's
+    # identity is checked, not its basename, and a PATH this line could have changed is not
+    # trusted to find the real one.
+    ("find -exec ./cat", f"find {D} -exec ./cat {{}} +", f"find {D} -exec cat {{}} +"),
+    ("find -exec /tmp/x/cat", f"find {D} -exec /tmp/x/cat {{}} \\;",
+     f"find {D} -exec /bin/cat {{}} \\;"),
+    ("find -execdir ./grep", f"find {D} -execdir ./grep -l x {{}} +",
+     f"find {D} -execdir grep -l x {{}} +"),
+    ("xargs /tmp/evil/cat", f"ls {D} | xargs /tmp/evil/cat", f"ls {D} | xargs /usr/bin/cat"),
+    ("xargs ../bin/head", f"ls {D} | xargs ../bin/head", f"ls {D} | xargs head"),
+    ("xargs /usr/local/bin/wc", f"ls {D} | xargs /usr/local/bin/wc", f"ls {D} | xargs wc"),
+    ("PATH= prefix on xargs", f"ls {D} | PATH=/tmp/e xargs cat", f"ls {D} | xargs cat"),
+    ("export PATH then find -exec", f"export PATH=/tmp/e; find {D} -exec cat {{}} +",
+     f"export LC_ALL=C; find {D} -exec cat {{}} +"),
+    ("read PATH then xargs", f"read PATH < /tmp/p; ls {D} | xargs grep x",
+     f"read LINE < /tmp/p; ls {D} | xargs grep x"),
+    ("xargs env PATH= cat", f"ls {D} | xargs env PATH=/tmp/e cat", f"ls {D} | xargs env cat"),
+    ("xargs env -S", f"ls {D} | xargs env -S 'touch {T}' cat", f"ls {D} | xargs env LC_ALL=C cat"),
 ]
 
 
