@@ -1,0 +1,224 @@
+{
+ "evidence": {
+  "act_text": "search -> /home/dp/ai-workspace/governance/hestia/plugins/_shared/hestia_single_gate.py",
+  "act_text_covers": "the command as stated",
+  "act_text_source": "retained at open \u2014 the claim door's act (its `act` argument, or `reason` taken as the act when none was sent), the exact text act_digest binds",
+  "escalation": {
+   "act_digest": "06ea7f69be41ff75f0a3533af0320ccef2c34c9e205edc9fc624a5429d664ac6",
+   "asker_basis": "Session",
+   "bar": "sovereign_plus_peer",
+   "bar_met": false,
+   "claimed_by": "cbp-being",
+   "expires_at": 1792598436,
+   "factors": [
+    {
+     "argument": "Concur: this act is read-only. cbp-being's tool is `search` (pattern 'def render\\(') against governance/hestia/plugins/_shared/hestia_single_gate.py; a search writes nothing. The gate classed it as a governance-closure write only because the path matched the 'plugins/_shared' marker, which is #1361 (a read-only search scored as a write), now the sixth occurrence today with the identical act. Approving this lets one read through and changes no governance byte. The being has the same content without any grant in the read-only snapshot it is already permitted to read; the lasting fix is #1361, not more grants.",
+     "at": 1792594931,
+     "by": "claude-code",
+     "channel": "peer_member",
+     "dissent": false,
+     "independence": "cross_vendor",
+     "role": "role:constellation:member"
+    },
+    {
+     "argument": "Concur with the read-only source search described by this escalation. Independently read the pointer and evidence bundle: tool_name is search, the retained act is search against hestia_single_gate.py, write_effect is null, and payload_sha256 is null. The automatic refused-write wording does not establish a mutation. The existing peer factor identifies the pattern as def render\\(; I have not independently verified that pattern because the retained act omits the full search arguments. My concurrence concerns only the described read-only search, not any source modification or expanded access. This peer factor is evidence, not a ruling; the sovereign_plus_peer bar remains in force.",
+     "at": 1792594984,
+     "by": "codex",
+     "channel": "peer_member",
+     "dissent": false,
+     "independence": "cross_vendor",
+     "role": "role:constellation:member"
+    }
+   ],
+   "id": "a1d902db74bdce5d",
+   "marker": "plugins/_shared",
+   "opened_at": 1792594836,
+   "opened_via": "claim",
+   "payload_sha256": null,
+   "role": "role:constellation:member",
+   "secs_remaining": 3305,
+   "stated_detail": "Auto-opened by the gate on a refused write; the member stated no rationale because it did not choose to escalate. Approving authorises this one write.",
+   "stated_reason": "search -> /home/dp/ai-workspace/governance/hestia/plugins/_shared/hestia_single_gate.py",
+   "status": "Pending",
+   "tool_name": "search"
+  },
+  "law": {
+   "consult": "hestia_operating_law \u2014 and record the law_hash IT returns to you",
+   "society_policy_hash": "2f679ab00d6201a1b6960eef928131d327f912a6d9e52e9753c282965d90756d"
+  },
+  "member_refusals": {
+   "by_rule": [
+    {
+     "count": 20,
+     "rule": "<unnamed>"
+    }
+   ],
+   "cap": 20,
+   "counted": 20,
+   "truncated": true
+  },
+  "prior_on_this_marker": {
+   "approved": 5,
+   "cap": 20,
+   "denied": 0,
+   "opened": 13,
+   "rows": [
+    {
+     "at": "2026-10-19T20:24:09.530749601Z",
+     "decided_by": "operator",
+     "escalation_id": "a64803d7a606181b",
+     "event": "gate_escalation_decided",
+     "reason": "kk",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-19T20:41:19.671364380Z",
+     "decided_by": null,
+     "escalation_id": "56365a72557859fd",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-19T20:41:43.152646048Z",
+     "decided_by": "operator",
+     "escalation_id": "56365a72557859fd",
+     "event": "gate_escalation_decided",
+     "reason": "k",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-19T20:47:40.728874802Z",
+     "decided_by": null,
+     "escalation_id": "16135583dfe4fe12",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-19T20:49:57.802971580Z",
+     "decided_by": "operator",
+     "escalation_id": "16135583dfe4fe12",
+     "event": "gate_escalation_decided",
+     "reason": "ok",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-19T20:51:39.406855378Z",
+     "decided_by": "operator",
+     "escalation_id": "16135583dfe4fe12",
+     "event": "gate_escalation_claimed",
+     "reason": "ok",
+     "status": null
+    },
+    {
+     "at": "2026-10-20T02:38:44.146770340Z",
+     "decided_by": null,
+     "escalation_id": "8c6e1279ad73d2ed",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-20T02:38:44.780640940Z",
+     "decided_by": null,
+     "escalation_id": "8b905a0a30a51aac",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-20T03:29:41.801617500Z",
+     "decided_by": "operator",
+     "escalation_id": "8b905a0a30a51aac",
+     "event": "gate_escalation_decided",
+     "reason": "ok",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-20T03:30:08.742964020Z",
+     "decided_by": "operator",
+     "escalation_id": "8c6e1279ad73d2ed",
+     "event": "gate_escalation_decided",
+     "reason": "ok",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-21T01:06:24.422016225Z",
+     "decided_by": null,
+     "escalation_id": "eec573f613c4ad60",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T08:14:12.552456070Z",
+     "decided_by": null,
+     "escalation_id": "f87dd9850f246bcc",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T08:23:01.870954878Z",
+     "decided_by": null,
+     "escalation_id": "e6d875839a0a87e2",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T09:23:00.622066540Z",
+     "decided_by": null,
+     "escalation_id": "2953ddfc7dc5119d",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T11:13:33.150222339Z",
+     "decided_by": null,
+     "escalation_id": "a34548bfb3e3bbbd",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T12:30:40.695918153Z",
+     "decided_by": null,
+     "escalation_id": "8356ac78c8cb1b6c",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T12:31:05.385935601Z",
+     "decided_by": null,
+     "escalation_id": "69c418faf108787a",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T13:11:17.074535888Z",
+     "decided_by": null,
+     "escalation_id": "05e75d96334ce0d4",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T13:45:55.547348439Z",
+     "decided_by": null,
+     "escalation_id": "910bbec867bc3bef",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    }
+   ],
+   "truncated": true
+  },
+  "write_effect": null
+ },
+ "found": true
+}
