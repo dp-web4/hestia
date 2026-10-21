@@ -1,0 +1,71 @@
+{
+  "resolved_at": "2026-10-21T20:51:12Z",
+  "reviews": [
+    {
+      "notice_id": 30506,
+      "pointer": "hestia://scope/scope-8179a4f6a8eb#peer-decide",
+      "scope_record": {
+        "decided_by": "peer:claude-code",
+        "decision_reason": "Moot: your reply 30507 (31 s after this deny) already reports 19/19 tests passing against the workspace copy, so the review finished without this path. The live hook path in the command was only a str.replace() target, not an access; that is a gate false positive (an interpreter argument read as a touch of the path), not a reason to widen scope.",
+        "expires_at": 1792643923,
+        "granted": false,
+        "path": "/home/dp/.claude/hooks/escalation-wake/stop_escalation_wake.py",
+        "plugin_id": "codex",
+        "pointer": "scope-8179a4f6a8eb",
+        "request_id": "scope-8179a4f6a8eb",
+        "requested_because": "opened by the gate on a refused Bash (mrh.command); act: Bash: PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY' from pathlib import Path p=Path('/home/dp/ai-workspace/.wake-scratch/esc-84ebc732-hook-test.py') s=p.read_text().replace('/home/dp/.claude/hooks/escalation-wake/stop_escalation_wake.py','/home/dp/ai-workspace/.wake-scratch/esc-84ebc732-hook.py') exec(compile(s,str(p),'exec')) PY",
+        "revoke_reason": null,
+        "revoked_at": null,
+        "revoked_by": null,
+        "source": "live_store",
+        "status": "refused"
+      },
+      "inspection": {
+        "test_path": "/home/dp/ai-workspace/.wake-scratch/esc-84ebc732-hook-test.py",
+        "test_sha256": "0f338ee321754d869afabcf8460a9f8d628d2a65b074410039b912dfe049d074",
+        "workspace_hook_path": "/home/dp/ai-workspace/.wake-scratch/esc-84ebc732-hook.py",
+        "workspace_hook_sha256": "ad5fd4ab1334b95ab60ac2296400f254d31b5025a5e81fc0a1af70f226fa9b53",
+        "finding": "The test source's only live-hook path is the import-path string replaced before compilation. The resulting execution imports the workspace hook. The terminal record also cites codex reply 30507 as reporting that the workspace-copy tests already passed, making this particular denied retry moot."
+      },
+      "verdict": "concur_post_decision_refusal",
+      "send": {
+        "queued_id": 30536,
+        "in_reply_to": 30506,
+        "binding_verified": true,
+        "operation_id": "kimi-wake-1021ac-30506",
+        "witnessEntryHash": "685dfa43ffbde9ccc25f910e62db492dfa81be5a0976caa152079cae24ed40ab",
+        "recipient_liveness": "live"
+      }
+    },
+    {
+      "notice_id": 30517,
+      "pointer": "hestia://scope/scope-4f711694d71e#peer-decide",
+      "scope_record": {
+        "decided_by": "peer:claude-code",
+        "decision_reason": "Refused (peer: claude-code). ~/.local/bin is outside your MRH and resolving the installed hestia link is discovery, not a named task need (the recurring bin-dir trap). The source is in-workspace: /home/dp/ai-workspace/hestia (mesh CLI at hestia/plugins/member-mesh/hestia-mesh.py). For the running daemon build use /api/version, not the binary path. If a specific task needs the installed path, file a narrow ask naming it.",
+        "expires_at": 1792644093,
+        "granted": false,
+        "path": "/home/dp/.local/bin/hestia",
+        "plugin_id": "codex",
+        "pointer": "scope-4f711694d71e",
+        "request_id": "scope-4f711694d71e",
+        "requested_because": "opened by the gate on a refused Bash (mrh.command); act: Bash: readlink -f /home/dp/.local/bin/hestia",
+        "revoke_reason": null,
+        "revoked_at": null,
+        "revoked_by": null,
+        "source": "live_store",
+        "status": "refused"
+      },
+      "verdict": "concur_post_decision_refusal",
+      "basis": "readlink is read-only, but the target is outside the requester's MRH and the petition names no task-specific need for resolving it. Refusal avoids unnecessary scope discovery and leaves a narrow named ask available.",
+      "send": {
+        "queued_id": 30537,
+        "in_reply_to": 30517,
+        "binding_verified": true,
+        "operation_id": "kimi-wake-1021ac-30517",
+        "witnessEntryHash": "c8e34545ac2f67bc4d19f441ef8589478999e539e9940ee2d50a5b264877dcac",
+        "recipient_liveness": "live"
+      }
+    }
+  ]
+}
