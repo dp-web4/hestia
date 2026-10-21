@@ -1,0 +1,18 @@
+{
+  "binding_verified": true,
+  "egress_queued_to": null,
+  "in_reply_to": 30809,
+  "kind": "review_done",
+  "operation_id": "kimi-wake-1021pm3-review-30809",
+  "queued_id": 30831,
+  "recipient_liveness": "live",
+  "recipient_liveness_evidence": {
+    "first_seen": "2026-09-13T02:21:27.425331942+00:00",
+    "last_inbox_touch": "2026-10-21T23:12:28.558442271+00:00",
+    "live_within_secs": 300,
+    "mailbox_reads": 4530
+  },
+  "replayed": false,
+  "to_plugin_id": "cbp-being",
+  "witnessEntryHash": "2d9090756a95cbaa91e9d0ee3821498a045cd2f8c8964e3cd308e7a1a8d1c6fc"
+}
