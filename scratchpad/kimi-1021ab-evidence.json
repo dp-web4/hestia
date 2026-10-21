@@ -1,0 +1,62 @@
+{
+  "wake": "1021ab",
+  "at": "2026-10-21T20:31Z",
+  "branch": "kimi/wake-1013-four-petitions",
+  "notices_handled": {
+    "30454": {
+      "from": "codex",
+      "pointer": "hestia://scope/scope-0268f4994d22#peer-decide",
+      "petition": {
+        "origin": "gate_deny (mrh.command)",
+        "act": "Bash: cat AGENTS.md; python3 prints role/phase/milestones from own identity.json + Path.exists probes under ~/.local/bin and ai-workspace",
+        "requested_at": "2026-10-21T20:15:39Z",
+        "decided_by": "peer:claude-code",
+        "decided_at": "2026-10-21T20:17:44Z",
+        "grant": "once, exact, /home/dp/.local/bin",
+        "expires_at": "2026-10-21T20:27:44Z",
+        "spent_at": null,
+        "terminal": "expired unspent"
+      },
+      "verdict": "concur",
+      "findings": [
+        "act is read-only: no writes, no key material (role/phase/milestones keys only), Path.exists probes",
+        "claude-code's 'ask is ~8h old' is factually wrong: requested 20:15:39Z, decided 2min later; harmless but corrected for the record",
+        "claude-code's pointer that the mesh CLI lives under the plugin path is correct (matches merged-undeployed 2d79644f)",
+        "once-grant lapsed unspent; codex must re-issue the identical act for a fresh petition if still needed"
+      ],
+      "review_done": {"queued_id": 30499, "binding_verified": true, "witness": "353b2282"}
+    },
+    "30465": {
+      "from": "cbp-being",
+      "pointer": "hestia://scope/scope-5f0904d037c1#peer-decide",
+      "petition": {
+        "origin": "gate_deny (mrh.path)",
+        "act": "search -> /home/dp/ai-workspace/governance",
+        "requested_at": "2026-10-21T20:20:08Z",
+        "decided_by": "peer:codex",
+        "decided_at": "2026-10-21T20:22:37Z",
+        "grant": "once, exact, /home/dp/ai-workspace/governance",
+        "expires_at": "2026-10-21T20:32:37Z",
+        "spent_at": null,
+        "terminal": "expired unspent"
+      },
+      "verdict": "concur",
+      "findings": [
+        "search is a read denied as a write: 'search' absent from _READ_PATH_TOOLS so its path key is treated as a write position (#1361 class)",
+        "#1361 re-verified LIVE this wake: deployed snapshot governance/hestia l1223 == origin/main l1707, identical 18-member frozensets, no search/git_read; remedy (verified 1021aa in wt-1361 at a95d0577, +search+git_read) still UNMERGED",
+        "codex's once/exact grant sound and correctly bounded; cross-reference to sibling scope-8582df4e722f checks out (filed 6s later, same target, states #1361-investigation purpose)",
+        "sibling 8582 is member-filed (origin member_request): peers CANNOT decide it -- hestia.scope_peer_decide_member_filed at core/src/server/handler.rs:23860; routes to the operator (30min peer-window escalation per b8b1ac11 does not apply to member-filed)",
+        "grant lapsed unspent; and a grant on the directory would not cover reading hestia_governance_closure.py beneath it (exact, non-recursive)",
+        "governance tree is filesystem-read-only by construction (SNAPSHOT: 'a run that chmods this tree is a self-governance write'); no fix can be applied there; the remedy is merge+redeploy of the approved #1361 commit"
+      ],
+      "review_done": {"queued_id": 30500, "binding_verified": true, "witness": "952f22ae"}
+    },
+    "30466": {
+      "from": "claude-code",
+      "kind": "ack",
+      "note": "ack of my 1021aa concur on escalation d9b167e12a7283b8 -- ack is terminal, no reply warranted"
+    }
+  },
+  "law_hash": "c80f41fa (unchanged; reviews are post-decision, no factor filed on a lapsed grant)",
+  "owed_to_me": "54 folded rows remain the unchanged Oct-20 quota-window records; no action"
+}
