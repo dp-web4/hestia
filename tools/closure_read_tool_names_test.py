@@ -68,6 +68,17 @@ def test_a_scope_request_naming_a_gate_file_is_not_a_write():
     check("request_scope_is_not_write", v.classification != "write", str(v))
 
 
+def test_a_being_composed_read_verb_is_a_read():
+    # SAGE's search and git_read reach the gate under their own names with {pattern, path} /
+    # {op, rev, path}; the seat composes a grep / git read from them. Both were refused as
+    # governance WRITES on the snapshot (cbp-being, 2026-10-21: 08f7aa13417d5c50, #1361).
+    for tool, args in (("search", {"pattern": "verdict_available", "path": GATE_FILE}),
+                       ("search", {"pattern": "x", "path": os.path.dirname(GATE_FILE)}),
+                       ("git_read", {"op": "log", "path": GATE_FILE})):
+        v = g.classify(tool, args, cwd=NEUTRAL_CWD)
+        check(f"{tool}_is_read", v.classification == "read", str(v))
+
+
 def test_writers_and_unknown_tools_still_write():
     # Controls: the fix must not widen into the write names, and an unknown tool keeps the
     # conservative default (its path keys are destinations).
@@ -97,6 +108,7 @@ ALL = [
     test_a_being_read_of_a_gate_file_is_a_read,
     test_every_lowercase_reader_is_a_read,
     test_a_scope_request_naming_a_gate_file_is_not_a_write,
+    test_a_being_composed_read_verb_is_a_read,
     test_writers_and_unknown_tools_still_write,
     test_gemini_readers_are_closure_readers,
     test_witness_read_names_are_closure_readers,

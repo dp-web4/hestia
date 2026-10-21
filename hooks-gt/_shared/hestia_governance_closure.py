@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: f32a4241f27f3f89f7d7391d9c02bbe1e1965c0d876c0ffd03377abb6e58687e  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 86d7664624946f36d77935168ac82dcfc8ee5bd5bf025cbe7ed1f4ce31dd5fc1  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1712,7 +1712,11 @@ _READ_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead", "Tod
                               # A being's scope ASK: its path is what it asks for, not a
                               # destination. Filing records a petition; it does not write the
                               # requested file (cbp-being, 2026-10-19).
-                              "request_scope"})
+                              "request_scope",
+                              # A being's composed reads (SAGE being_gate_client): the seat
+                              # builds a grep / git read from {pattern, path}; the law judges
+                              # that command and nothing is written (cbp-being, 2026-10-21, #1361).
+                              "search", "git_read"})
 
 
 def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:

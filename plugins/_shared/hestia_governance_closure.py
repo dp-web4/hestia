@@ -1711,7 +1711,11 @@ _READ_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead", "Tod
                               # A being's scope ASK: its path is what it asks for, not a
                               # destination. Filing records a petition; it does not write the
                               # requested file (cbp-being, 2026-10-19).
-                              "request_scope"})
+                              "request_scope",
+                              # A being's composed reads (SAGE being_gate_client): the seat
+                              # builds a grep / git read from {pattern, path}; the law judges
+                              # that command and nothing is written (cbp-being, 2026-10-21, #1361).
+                              "search", "git_read"})
 
 
 def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
