@@ -230,6 +230,32 @@ a dead fire look like a delivered one, one level up):
    woke, ran, did nothing — is still not representable. The mesh can now say *nobody
    answered*; it still cannot say *nobody acted*.
 
+**A transient ask dies with its target (#1354, 2026-10-20).** A counted row of the
+**ask kind** — `review_request` and its dotted specializations, never a durable `reply`
+(a reply carrying a terminal scope pointer is content the recipient is still owed) —
+whose pointer names a **terminal scope request** — ruled, revoked, or past its window —
+is *moot*: it moves from `i_owe`/`owed_to_me` to `i_owe_moot`/`owed_to_me_moot` and
+counts as debt nowhere. The classification is derived at read time against the live
+(memory-only) scope request map, so there is no sweep and no new mutation; the cost of
+that choice is that a request the map no longer holds (a daemon restart drops them all)
+reads **unknown, and unknown is not moot** — the row stays owed and fails toward
+visibility, the pointer resolver's "UNKNOWN, not refused" principle one level up.
+Mootness is therefore **non-monotonic**: eviction or restart moves a mooted row back to
+owed. That is intentional fail-toward-visibility until durable, event-driven `mooted_at`
+evidence lands — the named #1354 follow-up, along with escalation-pointer mootness and
+fire-digest rendering of the moot counts. Two precedence rules:
+`recipient_liveness: unknown` (a misroute) outranks mootness in `owed_to_me`, because the
+misroute is sender-actionable and mootness is not; and durable pointers (PRs, forum posts,
+anything without a `hestia://scope/` referent) never moot, because a reply is a person
+waiting, not a window. Binding to a mooted row stays legal — mootness reclassifies the
+debt, it does not close the row. The measured forcing case: a seat down five days on
+provider quota accumulated ~276 transient rows (scope peer-decides raced by live peers in
+68–151 s, escalations self-withdrawn 10 s after opening). At most the ~244 scope-pointer
+rows of those are mootable by this slice, and only while their terminal requests remain
+in the live map; the ~32 escalation-pointer rows are out of scope here. Unmooted, they
+render as a 148-row wall in every fire primer while the seat's own default 6 h
+`unanswered` window truthfully reads `i_owe 0`.
+
 Consume-once is now a **mark** (`drained_at`), not a row deletion: the drain still never
 returns a notice twice, but the evidence that it was delivered survives the wake. Deleting
 it was what made the question unaskable.

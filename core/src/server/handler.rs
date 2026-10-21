@@ -8127,22 +8127,66 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (mine, theirs): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|n| n.to_plugin == who.plugin_id);
+    // #1354: a transient ask dies with its target. A `review_request` row whose
+    // pointer names a scope request that is TERMINAL (ruled, revoked, or past its
+    // window) is moot: it stops counting as debt and moves to `*_moot`. Derivation
+    // is read-time against the live request map — no sweep — so a request the map
+    // no longer holds (a restart; scope requests are memory-only) reads UNKNOWN,
+    // and unknown is NOT moot: the row stays owed and fails toward visibility, the
+    // pointer resolver's "UNKNOWN, not refused" principle one level up. That also
+    // makes mootness NON-MONOTONIC across an eviction/restart (moot -> owed), which
+    // is intentional: the durable fix (event-driven `mooted_at` evidence at the
+    // terminal transition) is #1354's named follow-up, not this slice.
+    //
+    // KIND-RESTRICTED (nova's P1 on #1357): only a transient ASK dies with its
+    // target. A durable `reply` carrying a terminal scope pointer is CONTENT the
+    // recipient is still owed — mooting it would silently erase debt. The match is
+    // by kind ROOT, because the send gate admits dotted specializations
+    // (review_request.pr) and the ledger's own kind matching is by prefix; the two
+    // must agree here too.
+    //
+    // In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness —
+    // the misroute is sender-actionable, mootness is not.
+    let now = super::gate_escalation::now_secs();
+    let scope_moot = |kind: &str, pointer_uri: &Option<String>| -> bool {
+        if kind.split('.').next() != Some("review_request") {
+            return false;
+        }
+        let Some(p) = pointer_uri.as_deref() else {
+            return false;
+        };
+        let Some(rest) = p.strip_prefix("hestia://scope/") else {
+            return false;
+        };
+        let id = rest.split('#').next().unwrap_or(rest);
+        match s.scope_requests.get(id) {
+            Some(req) => {
+                req.granted.is_some() || req.revoked.is_some() || now >= req.expires_at
+            }
+            None => false,
+        }
+    };
+    let (mine, mine_moot): (Vec<_>, Vec<_>) =
+        mine.into_iter().partition(|n| !scope_moot(&n.kind, &n.pointer_uri));
     // Arm the strong asker (the fire primer) with the distinction that matters
     // on THIS side of the ledger: "live and unanswered" is a member choosing
     // not to reply; "never seen locally" is a misroute, and the two want
     // opposite responses from the sender. Carried on `owed_to_me` only — on
     // `i_owe` the recipient is the caller, who just proved its own liveness by
     // asking, so the field would be a constant.
-    let theirs: Vec<Value> = theirs
+    let (theirs, theirs_moot): (Vec<(bool, Value)>, Vec<(bool, Value)>) = theirs
         .into_iter()
         .map(|n| {
+            let moot = scope_moot(&n.kind, &n.pointer_uri);
             let (liveness, evidence) = recipient_liveness(&s.inbox_store, &n.to_plugin);
             let mut row = serde_json::to_value(&n).unwrap_or_else(|_| json!({}));
             row["recipient_liveness"] = json!(liveness);
             row["recipient_liveness_evidence"] = evidence;
-            row
+            (moot && liveness != "unknown", row)
         })
-        .collect();
+        .partition(|(mooted, _)| !mooted);
+    let theirs_moot: Vec<Value> = theirs_moot.into_iter().map(|(_, row)| row).collect();
+    let theirs: Vec<Value> = theirs.into_iter().map(|(_, row)| row).collect();
     Ok(json!({
         "plugin_id": who.plugin_id,
         "older_than_secs": older_than_secs,
@@ -8151,6 +8195,21 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "i_owe": mine,
         // Notices I sent that nobody answered: did my wake land?
         "owed_to_me": theirs,
+        // Transient rows whose target is terminal: answered by time, not by a
+        // member. Counted nowhere; visible here so a late wake can still bind a
+        // disposition to one (binding is unchanged by mootness).
+        "i_owe_moot": mine_moot,
+        "owed_to_me_moot": theirs_moot,
+        "moot_scope": "moot = a review_request row (the transient ASK kind — a durable \
+                       reply never moots) whose pointer names a scope request that is \
+                       TERMINAL (ruled, revoked, or past its window), derived at read \
+                       time against the live request map — no sweep (#1354). A request \
+                       the memory-only map no longer holds reads UNKNOWN, and unknown \
+                       stays owed: absence of evidence is not mootness. Eviction or \
+                       restart therefore reverts moot -> owed; that non-monotonicity is \
+                       intentional until durable mooted_at evidence lands (the #1354 \
+                       follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
+                       outranks mootness — the misroute is sender-actionable.",
         "scope": "unanswered = no notice binds in_reply_to to it; \
                   drained_at:null additionally means it was never picked up; \
                   each row carries its OWN in_reply_to - group by that, not by \
@@ -12569,6 +12628,199 @@ mod member_mesh_tests {
             scope.contains("group by"),
             "scope must tell the reader HOW to group: {scope}"
         );
+    }
+
+    /// #1354: a transient ask dies with its target. A `review_request` row pointing at a
+    /// scope request that is TERMINAL (ruled, revoked, or past its window) leaves the debt
+    /// fold for `i_owe_moot`; a pending request, an UNKNOWN id (the map is memory-only —
+    /// post-restart every id is unknown, and unknown fails toward owed), a durable
+    /// pointer (no `hestia://scope/` referent), and any DURABLE kind (a `reply` carrying
+    /// a terminal scope pointer is content, still owed — nova's P1) all stay owed. A
+    /// dotted specialization of the ask kind moots exactly like its root. Evicting the
+    /// request from the map moves the row BACK to owed (moot -> owed): read-time
+    /// derivation is deliberately non-monotonic until durable mooted_at evidence lands.
+    /// In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness,
+    /// because the misroute is the sender-actionable signal. Binding to a mooted row
+    /// still works: mootness reclassifies the debt, it does not close the row.
+    #[tokio::test]
+    async fn unanswered_moots_rows_whose_scope_target_is_terminal() {
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let claude = connect(&state, "claude-code").await;
+        let now = crate::server::gate_escalation::now_secs();
+        use crate::server::state::ScopeRequest;
+
+        // claude -> kimi, one ask per target state.
+        for ptr in [
+            "hestia://scope/scope-moot-decided#peer-decide",
+            "hestia://scope/scope-moot-expired#peer-decide",
+            "hestia://scope/scope-moot-pending#peer-decide",
+            "hestia://scope/scope-never-heard#peer-decide",
+            "pr/1354",
+        ] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                        "pointer_uri": ptr, "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        // nova's P1 on #1357: a durable `reply` carrying a TERMINAL scope pointer is
+        // content the recipient is still owed — it must NEVER moot. And a dotted
+        // specialization of the ask kind (review_request.pr — the send gate admits it,
+        // the ledger matches it by prefix) MUST moot: the three surfaces agree or the
+        // kind restriction is a lie.
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "reply",
+                    "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide;reply-content-still-owed",
+                    "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request.pr",
+                    "pointer_uri": "hestia://scope/scope-moot-expired#peer-decide",
+                    "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        // kimi -> claude: a scope ask whose request is decided (mootable), and the same
+        // shape to a never-seen recipient (misroute: must NOT moot).
+        let mut decided_ask_id = None;
+        for to in ["claude-code", "ghost-member"] {
+            let out = tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": to, "kind": "review_request",
+                        "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide",
+                        "session_id": kimi}),
+            )
+            .await
+            .unwrap();
+            if to == "claude-code" {
+                decided_ask_id = Some(out["queued_id"].as_u64().unwrap());
+            }
+        }
+        // claude is a live recipient (reads its mailbox); ghost-member never has.
+        tool_member_inbox(&state, &json!({"session_id": claude})).await.unwrap();
+
+        {
+            let mut s = state.lock().await;
+            let req = |id: &str, granted: Option<bool>, expires_at: u64| ScopeRequest {
+                id: id.into(),
+                plugin_id: "cbp-being".into(),
+                role: String::new(),
+                path: "/w/x".into(),
+                reason: "a scope ask whose state pins a mootness arm".into(),
+                requested_at: now,
+                expires_at,
+                granted,
+                decided_by: granted.map(|_| "operator".to_string()),
+                decided_at: granted.map(|_| now),
+                decision_reason: None,
+                recursive: false,
+                revoked: None,
+                ext: Default::default(),
+            };
+            s.scope_requests
+                .insert("scope-moot-decided".into(), req("scope-moot-decided", Some(true), now + 3600));
+            s.scope_requests
+                .insert("scope-moot-expired".into(), req("scope-moot-expired", None, now - 3600));
+            s.scope_requests
+                .insert("scope-moot-pending".into(), req("scope-moot-pending", None, now + 3600));
+        }
+
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let ptrs = |key: &str| -> Vec<String> {
+            rows[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} missing: {rows}"))
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r["to_plugin"].as_str().unwrap_or("?"),
+                        r["pointer_uri"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        };
+        let i_owe = ptrs("i_owe");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-moot-pending#peer-decide".to_string()), "{rows}");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-never-heard#peer-decide".to_string()),
+                "unknown id stays owed — absence of evidence is not mootness: {rows}");
+        assert!(i_owe.contains(&"kimi-code|pr/1354".to_string()),
+                "a durable pointer never moots: {rows}");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide;reply-content-still-owed".to_string()),
+                "a durable reply never moots, even on a terminal scope pointer: {rows}");
+        let i_moot = ptrs("i_owe_moot");
+        assert!(i_moot.contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
+        assert_eq!(
+            i_moot.iter().filter(|p| *p == "kimi-code|hestia://scope/scope-moot-expired#peer-decide").count(),
+            2,
+            "the expired ask moots under BOTH the bare kind and its dotted specialization: {rows}"
+        );
+        assert_eq!(i_moot.len(), 3, "exactly the terminal review_request rows moot: {rows}");
+
+        let owed = ptrs("owed_to_me");
+        assert!(owed.contains(&"ghost-member|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "misroute outranks mootness: {rows}");
+        let owed_moot = ptrs("owed_to_me_moot");
+        assert!(owed_moot.contains(&"claude-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
+        assert_eq!(owed_moot.len(), 1, "{rows}");
+
+        // Eviction/restart regression (dp-web4 review of #1357): the request map is
+        // memory-only, so losing the request must move the row BACK to owed. Mootness
+        // is a read-time property of available evidence, not a row state — the
+        // non-monotonicity is intentional until durable `mooted_at` evidence lands
+        // (the #1354 follow-up), and this transition is the proof it fails toward
+        // visibility rather than silently staying moot.
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.remove("scope-moot-decided");
+        }
+        let rows2 = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let ptrs2 = |key: &str| -> Vec<String> {
+            rows2[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} missing: {rows2}"))
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r["to_plugin"].as_str().unwrap_or("?"),
+                        r["pointer_uri"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        };
+        assert!(ptrs2("i_owe").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "evicted request: moot -> owed, the row fails back toward visibility: {rows2}");
+        assert!(!ptrs2("i_owe_moot").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "nothing stays moot on absent evidence: {rows2}");
+
+        // Mootness reclassifies; it does not close. The ASKED member can still bind late.
+        let late = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "reply",
+                    "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide;window-missed;via=claude-code",
+                    "in_reply_to": decided_ask_id.unwrap(), "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        assert!(late["queued_id"].is_u64(), "binding to a mooted row stays legal: {late}");
     }
 
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /
