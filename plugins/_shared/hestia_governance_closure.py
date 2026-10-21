@@ -1711,11 +1711,12 @@ _READ_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead", "Tod
                               # A being's scope ASK: its path is what it asks for, not a
                               # destination. Filing records a petition; it does not write the
                               # requested file (cbp-being, 2026-10-19).
-                              "request_scope",
-                              # A being's composed reads (SAGE being_gate_client): the seat
-                              # builds a grep / git read from {pattern, path}; the law judges
-                              # that command and nothing is written (cbp-being, 2026-10-21, #1361).
-                              "search", "git_read"})
+                              "request_scope"})
+# A being's COMPOSED reads (SAGE being_gate_client, #1361): the seat builds a grep / git read from
+# {pattern, path}, so their `path` is the read target, never a destination. The NAME buys nothing
+# else (review hold on #1362): a `command` such an event carries is classified for write positions
+# exactly as a Bash command is, and file_path / notebook_path keep the unknown-tool reading.
+_COMPOSED_READ_TOOLS = frozenset({"search", "git_read"})
 
 
 def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
@@ -1725,6 +1726,13 @@ def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
         return [], None
     if tool_name in _READ_PATH_TOOLS:
         return [], None
+    if tool_name in _COMPOSED_READ_TOOLS:
+        targets, note = [], None
+        if isinstance(tool_input.get("command"), str) and tool_input["command"].strip():
+            targets, note = _write_position_targets("Bash", {"command": tool_input["command"]})
+        rest = [v for k in _PATH_KEYS
+                if k != "path" and isinstance((v := tool_input.get(k)), str) and v]
+        return list(targets) + rest, note
     if tool_name in _BASH_TOOLS:
         cmd = tool_input.get("command")
         if not isinstance(cmd, str) or not cmd.strip():
@@ -1755,7 +1763,7 @@ def _read_position_mentions(tool_name: str, tool_input: Any) -> list:
     if not isinstance(tool_input, dict):
         return []
     out = []
-    if tool_name in _BASH_TOOLS:
+    if tool_name in _BASH_TOOLS or tool_name in _COMPOSED_READ_TOOLS:
         cmd = tool_input.get("command")
         if isinstance(cmd, str) and cmd.strip():
             try:

@@ -77,6 +77,24 @@ def test_a_being_composed_read_verb_is_a_read():
                        ("git_read", {"op": "log", "path": GATE_FILE})):
         v = g.classify(tool, args, cwd=NEUTRAL_CWD)
         check(f"{tool}_is_read", v.classification == "read", str(v))
+    # A composed command that only READS keeps it a read.
+    for tool, cmd in (("search", f"grep -r -n -I -E -s --max-count=20 -e verdict_available -- {GATE_FILE}"),
+                      ("git_read", f"git -C /tmp/wt log --oneline -- {GATE_FILE}")):
+        v = g.classify(tool, {"path": GATE_FILE, "command": cmd}, cwd=NEUTRAL_CWD)
+        check(f"{tool}_reading_command_is_read", v.classification == "read", str(v))
+
+
+def test_a_composed_read_name_does_not_launder_a_write():
+    # Review hold on #1362: the NAME must not be what makes it a read. A command such an event
+    # carries is classified for write positions as Bash is, and the other destination keys keep
+    # the unknown-tool reading. Each of these was a read at a95d0577.
+    for tool in ("search", "git_read"):
+        for cmd in (f"tee {GATE_FILE}", f"sed -i s/a/b/ {GATE_FILE}", f"cat x > {GATE_FILE}",
+                    f"grep -r x -- /tmp && cp /tmp/evil {GATE_FILE}"):
+            v = g.classify(tool, {"path": GATE_FILE, "command": cmd}, cwd=NEUTRAL_CWD)
+            check(f"{tool}_command_write::{cmd}", v.classification == "write", str(v))
+        v = g.classify(tool, {"pattern": "x", "file_path": GATE_FILE}, cwd=NEUTRAL_CWD)
+        check(f"{tool}_file_path_is_write", v.classification == "write", str(v))
 
 
 def test_writers_and_unknown_tools_still_write():
@@ -109,6 +127,7 @@ ALL = [
     test_every_lowercase_reader_is_a_read,
     test_a_scope_request_naming_a_gate_file_is_not_a_write,
     test_a_being_composed_read_verb_is_a_read,
+    test_a_composed_read_name_does_not_launder_a_write,
     test_writers_and_unknown_tools_still_write,
     test_gemini_readers_are_closure_readers,
     test_witness_read_names_are_closure_readers,
