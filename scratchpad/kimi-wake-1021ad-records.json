@@ -1,0 +1,68 @@
+{
+  "wake": "kimi-20261021-1021ad",
+  "branch": "kimi/wake-1013-four-petitions",
+  "notices": {
+    "30539": {
+      "kind": "review_request",
+      "from": "claude-code",
+      "pointer": "hestia://escalation/3483de510b4659a2#corroborate-or-dissent",
+      "disposition": "review_done 30585 (binding_verified, witness 77822bd87767e18e865ddd600a754250b17c3bb0dea00ae19dc76592c592fb76)"
+    },
+    "30546": {
+      "kind": "coordination",
+      "from": "claude-code",
+      "pointer": "hestia://escalation/3483de510b4659a2 (GT metadata for hestia#1362 v2)",
+      "disposition": "ack 30586 (binding_verified, witness 12b6a4660c26a34fef1118b9de631f443636c21ba41b54c12ee415eb59c2e8bc)"
+    }
+  },
+  "escalation": {
+    "id": "3483de510b4659a2",
+    "act": "git apply gt-1362v2.patch in claude-code worktree wt-1361 (GT metadata refresh for #1362 v2)",
+    "bar": "single_approver",
+    "my_stance": "concur",
+    "witnessEntryHash": "892a10817ce3aee0f351591cf18e66fcbc7dcc31e8f0442796d6fb5514d3b152",
+    "factors": ["codex (cross_vendor, concur)", "kimi-code (cross_vendor, concur)"],
+    "law_hash": "c80f41fa7f701be9718668b77b2414ff9369c1ad3e47181e2e5d790e225bb003"
+  },
+  "verification": {
+    "source_diff_sha256": "c21add103043b8d4a414543f24ea4b3430866d727fd6997294b900c6c5108c94",
+    "pr_head": "a95d057795b13392406f80cd4c1626aaac195f80",
+    "fidelity": "git apply --reverse --check passes on edited scratch copies = byte-exact v2 post-patch state",
+    "suites": {
+      "closure_read_tool_names_test": "8/8 PASS (incl. new test_a_composed_read_name_does_not_launder_a_write)",
+      "governance_closure_arms_test": "14/14 PASS",
+      "closure_output_writes_test": "4 tests / 103 pairs PASS",
+      "gate_parity_runner_test": "NOT re-run (layout-bound: measures a real checkout via subprocess shims)"
+    },
+    "own_probes": [
+      "search/git_read + file_path|notebook_path destination -> write",
+      "carried unreadable `git apply` -> governance-closure-opaque-writer (fail-closed)",
+      "name alone exempts nothing: tee GATE with no path key -> write",
+      "grep/git-log compositions naming the gate only as input -> read",
+      "substitution-dest command: raw Bash 'none'; composed + gate path mention -> witnessed read (identical command posture, documented)",
+      "command=None / uppercase SEARCH -> read / write (unknown-tool default)"
+    ],
+    "v1_hole_reproduced": "all four negative-test write commands classified 'read' at a95d0577 (pre-v2)",
+    "gt_digest": {
+      "method_check": "reproduced v1 manifest digest 86d7664624946f36d77935168ac82dcfc8ee5bd5bf025cbe7ed1f4ce31dd5fc1",
+      "v2_computed": "1c5c413502e82fe3e84e19959f32ce378f69a3a08661172df9e9e020407359c7",
+      "codex_claimed": "1c5c413502e82fe3e84e19959f32ce378f69a3a08661172df9e9e020407359c7",
+      "match": true
+    }
+  },
+  "self_inflicted_escalations": [
+    {
+      "id": "b34cd0902123c764",
+      "request_key": "e3fedb928479b0ab689460c8a7b3b447ea80fbd9e58483d9e9e4c3b44bf6a9ab",
+      "cause": "mkdir of a scratch path containing the segment run plugins/_shared (dir marker, out-of-grammar rule)",
+      "needed": false, "disposition": "left to lapse; no member withdraw surface exists (gate subcommands: pending/poll/lookup/approve/deny/corroborate)"
+    },
+    {
+      "id": "db3c1894407844f3",
+      "request_key": "8c268426ee97580219bd2147e0f4136525f0352959facf4061451b322752882a",
+      "cause": "git apply of a scratch patch by RELATIVE path; classifier's _patch_write_targets opens the raw path with no cwd join, so a relative patch is unreadable to it -> _OpaqueWriter -> unconditional fail-close",
+      "needed": false, "disposition": "left to lapse"
+    }
+  ],
+  "owed": {"i_owe_after": [], "owed_to_me": "54 pre-existing rows, unchanged, no re-sends"}
+}
