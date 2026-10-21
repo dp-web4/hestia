@@ -161,6 +161,15 @@ PAIRS = [
      f"read LINE < /tmp/p; ls {D} | xargs grep x"),
     ("xargs env PATH= cat", f"ls {D} | xargs env PATH=/tmp/e cat", f"ls {D} | xargs env cat"),
     ("xargs env -S", f"ls {D} | xargs env -S 'touch {T}' cat", f"ls {D} | xargs env LC_ALL=C cat"),
+    # #1356 v3 review (codex, claude-code, kimi-code): a program NAMED like a wrapper is not that
+    # wrapper either. Each wrapper word gets the same identity rule as the program it runs.
+    ("find -exec ./env cat", f"find {D} -exec ./env cat {{}} +", f"find {D} -exec env cat {{}} +"),
+    ("xargs /tmp/x/nice cat", f"ls {D} | xargs /tmp/x/nice cat", f"ls {D} | xargs /usr/bin/nice cat"),
+    ("xargs ./timeout 5 cat", f"ls {D} | xargs ./timeout 5 cat", f"ls {D} | xargs timeout 5 cat"),
+    ("xargs /tmp/x/sudo cat", f"ls {D} | xargs /tmp/x/sudo cat", f"ls {D} | xargs sudo cat"),
+    ("xargs nice ./env cat", f"ls {D} | xargs nice ./env cat", f"ls {D} | xargs nice env cat"),
+    ("find -exec env ./nice cat", f"find {D} -exec env ./nice cat {{}} +",
+     f"find {D} -exec /usr/bin/env nice cat {{}} +"),
 ]
 
 

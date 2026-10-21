@@ -1176,7 +1176,11 @@ def _inner_is_passive(words: list, path_pinned: bool = False) -> bool:
     (`path_pinned`, computed by _bash_write_targets over the whole line), or a passive name
     directly inside /bin or /usr/bin. Every other spelling fails closed. An `env` that sets PATH
     or takes options is a wrapper that changes how the name is found, so it fails closed too.
-    Default False: a caller that cannot vouch for PATH gets the refusal, not the trust."""
+    Default False: a caller that cannot vouch for PATH gets the refusal, not the trust.
+
+    The wrappers in front of the program get the same identity rule (codex / claude-code /
+    kimi-code, #1356 v3): _strip_wrappers matches a wrapper by basename, so `./env cat` or
+    `/tmp/x/nice cat` stripped an arbitrary program as if it were env or nice."""
     words = list(words)
     stripped = _strip_wrappers(words)
     if not stripped:
@@ -1184,10 +1188,25 @@ def _inner_is_passive(words: list, path_pinned: bool = False) -> bool:
     prefix = words[:len(words) - len(stripped)]
     if any(_PATH_WORD.search(w) or w.startswith("-") for w in prefix):
         return False
+    prev = ""
+    for w in prefix:
+        if _ASSIGN_RE.match(w):
+            continue
+        if prev == "timeout" and re.match(r"^\d", w):
+            prev = ""
+            continue  # the duration, not a program
+        if not _is_trusted_program(w, path_pinned):
+            return False
+        prev = os.path.basename(w)
     prog = stripped[0]
-    name = os.path.basename(prog)
-    if name not in _PASSIVE_VERBS:
+    if os.path.basename(prog) not in _PASSIVE_VERBS:
         return False
+    return _is_trusted_program(prog, path_pinned)
+
+
+def _is_trusted_program(prog: str, path_pinned: bool) -> bool:
+    """Is `prog` the program its name says? A bare name is, when PATH is pinned; a path is only
+    when it sits directly in a trusted bin directory (normalized, so `/bin/../tmp/x` is not)."""
     if "/" not in prog:
         return path_pinned
     return os.path.isabs(prog) and os.path.normpath(os.path.dirname(prog)) in _TRUSTED_BIN_DIRS
