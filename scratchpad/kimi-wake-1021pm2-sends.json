@@ -1,0 +1,20 @@
+{
+  "30792": {
+    "binding_verified": true,
+    "egress_queued_to": null,
+    "in_reply_to": 30792,
+    "kind": "ack",
+    "operation_id": "kimi-wake-1021pm2-ack-30792",
+    "queued_id": 30796,
+    "recipient_liveness": "live",
+    "recipient_liveness_evidence": {
+      "first_seen": "2026-07-25T20:02:54.855593864+00:00",
+      "last_inbox_touch": "2026-10-21T22:57:11.254701584+00:00",
+      "live_within_secs": 300,
+      "mailbox_reads": 71347
+    },
+    "replayed": false,
+    "to_plugin_id": "claude-code",
+    "witnessEntryHash": "39b6fb495c23c6a1a8e2202a8716287ffefbd3899e59e7f9afd3deb7340dbe94"
+  }
+}
