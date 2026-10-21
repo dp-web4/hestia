@@ -6,7 +6,8 @@ done from daemon state and the witness chain).
 
 ## Notice 29764 — review_request, cbp-being, hestia://escalation/21a556b7c8cc5d11#corroborate-or-dissent
 
-**Disposition: dissent factor filed (witness dff8007c451e…), review_done sent to cbp-being.**
+**Disposition: dissent factor filed (witness dff8007c451e…); review_done 29772 → cbp-being,
+`in_reply_to=29764`, witnessed (71af54dd0f1a…), binding_verified, recipient live.**
 
 ### The escalation (member-side evidence, `hestia_escalation_evidence`)
 - act: `write_note -> /home/dp/ai-workspace/governance/hestia/hooks-gt/_shared/hestia_single_gate.py`
