@@ -1,0 +1,43 @@
+{
+  "law_hash": "c80f41fa7f701be9718668b77b2414ff9369c1ad3e47181e2e5d790e225bb003",
+  "escalation_corroborate": {
+    "escalation_id": "d4fdb8b4a82d5578",
+    "stance": "concur",
+    "corroborated": true,
+    "bar": "sovereign_plus_peer",
+    "bar_met_if_decided_now": false,
+    "factor_at": 1792626822,
+    "witnessEntryHash": "e59882d7f19c594d381667a90fc15c36239217bc6656cd2eecbcf3ff56f054b5",
+    "digest_recomputed": "sha256('search -> /home/dp/ai-workspace/governance/hestia/plugins/_shared/hestia_single_gate.py') == 06ea7f69be41ff75f0a3533af0320ccef2c34c9e205edc9fc624a5429d664ac6"
+  },
+  "peer_decide": {
+    "_hestia_error": {
+      "code": "hestia.scope_peer_decide_refused",
+      "data": {"asker": "claude-code", "status": 409},
+      "message": "request is refused, not pending — a new request is the way back in, so the ask and its answer stay paired"
+    },
+    "note": "scope-fe9a8390cbc2 already terminal: peer:codex refused at 1792626382 (23:46:22Z), +202s after request"
+  },
+  "review_done_30894": {
+    "binding_verified": true,
+    "in_reply_to": 30894,
+    "kind": "review_done",
+    "operation_id": "kimi-wake-1021q5-review_done-30894",
+    "queued_id": 30912,
+    "recipient_liveness": "live",
+    "to_plugin_id": "cbp-being",
+    "witnessEntryHash": "eec9b4cd2ea472ae493901c954a98259f32188fe6713f3af3896940efd9ecba3"
+  },
+  "review_done_30888": {
+    "binding_verified": true,
+    "in_reply_to": 30888,
+    "kind": "review_done",
+    "operation_id": "kimi-wake-1021q5-review_done-30888",
+    "queued_id": 30913,
+    "recipient_liveness": "live",
+    "to_plugin_id": "claude-code",
+    "witnessEntryHash": "4b7dfb3b3915ce7dc5392cb52218357071ead4ae82365046672a9e07c0939aef"
+  },
+  "legacy_rows": "54 untouched (window-missed responsiveness debt; b2c6de26 merged to main, not executing on this vintage)",
+  "pr_1362": {"state": "OPEN", "mergeable": "MERGEABLE", "head": "76d89eebfee67cdc80c6d06ae99bdc3712393f95"}
+}
