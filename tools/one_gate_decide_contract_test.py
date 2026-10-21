@@ -851,6 +851,136 @@ def test_a_declared_probe_opens_no_scope_request(m, g, wc, home):
         stub.close()
 
 
+def test_declared_egress_is_swept_and_never_scoped(m, g, wc, home):
+    """#1201 (NOVA's 10-03 acceptance contract): `egress` is text that LEAVES the machine (a
+    being's web_search query, SAGE #335; a remote model's prompt, #1338). Gate 1a sweeps it with
+    the innate `egress.secret` rule; Gate 1b never path- or command-scopes it; natural language
+    with path-like words stays allowed; an event that declares none is judged exactly as before;
+    and the web-tool surfaces the gate already finds by name reach the core through the same
+    field, so its separate precheck could go without moving a verdict."""
+    core = g.core
+    # Assembled from parts, like CRED_PATH: the literal never has to be typed.
+    secret_q = "how do i rotate " + "~/." + "ssh/id_" + "rsa safely"
+    # Starts with an absolute path outside every scope: if any stage read egress as a path, this
+    # would be refused mrh.* (measured: a repo-relative-looking query resolves in scope and hides it).
+    benign_q = "/etc/ollama models config and ~/projects layout for qwen weights"
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            for seat in SEATS:
+                prof = profile_for(g, seat, home)
+                ev = to_event(g, seat, native_event(seat, "web_search", {"query": secret_q}, str(REPO), 1))
+                ev.egress = [secret_q]
+                d = g.decide(ev, prof)
+                check(f"{seat}-declared-egress-secret-denied",
+                      d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
+                check(f"{seat}-declared-egress-reaches-the-core",
+                      secret_q in g.normalized_event(ev).egress, g.normalized_event(ev))
+                ev = to_event(g, seat, native_event(seat, "web_search", {"query": benign_q}, str(REPO), 2))
+                ev.egress = [benign_q]
+                d = g.decide(ev, prof)
+                check(f"{seat}-benign-egress-never-scoped",
+                      d.decision == "allow" and not d.rule.startswith("mrh.")
+                      and d.rule != "egress.secret", d)
+
+            # The core alone, in its full law and in its degraded mode (egress is the one rule no
+            # mode relaxes), with no path, repo or command for the old sweep to see.
+            cprof = profile_for(g, "kimi", home).core_profile()
+            for q, want in ((secret_q, True), (benign_q, False)):
+                nev = core.NormalizedEvent(tool="web_search", egress=[q], cwd=str(REPO))
+                for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
+                                ("degraded", core.degraded_verdict(nev, cprof))):
+                    tag = f"core-{name}-{'secret' if want else 'benign'}"
+                    check(tag, (v.decision == "deny" and v.rule == "egress.secret" and v.innate) if want
+                          else v.rule != "egress.secret", v)
+
+            # NOVA HOLD at 7a6e410b: a BARE STRING is one blob, never its characters. The first
+            # patch ran `list(...)` over it, so `~/.ssh/id_rsa` became one-character blobs that
+            # matched no token and the act was allowed. Nested lists flatten to their strings.
+            for shape, val in (("str", secret_q), ("nested", [[secret_q]]), ("tuple", (secret_q,))):
+                for seat in SEATS:
+                    prof = profile_for(g, seat, home)
+                    ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 40))
+                    ev.egress = val
+                    d = g.decide(ev, prof)
+                    check(f"{seat}-direct-{shape}-egress-secret-denied",
+                          d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
+                    check(f"{seat}-direct-{shape}-egress-reaches-the-core-whole",
+                          secret_q in g.normalized_event(ev).egress, g.normalized_event(ev))
+                nev = core.NormalizedEvent(tool="web_search", egress=val, cwd=str(REPO))
+                for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
+                                ("degraded", core.degraded_verdict(nev, cprof))):
+                    check(f"core-{name}-direct-{shape}-secret",
+                          v.decision == "deny" and v.rule == "egress.secret" and v.innate, v)
+            for seat in SEATS:
+                prof = profile_for(g, seat, home)
+                ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 41))
+                ev.egress = benign_q
+                d = g.decide(ev, prof)
+                check(f"{seat}-direct-str-benign-allowed-and-unscoped",
+                      d.decision == "allow" and not d.rule.startswith("mrh.") and d.rule != "egress.secret", d)
+            nev = core.NormalizedEvent(tool="web_search", egress=benign_q, cwd=str(REPO))
+            for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
+                            ("degraded", core.degraded_verdict(nev, cprof))):
+                check(f"core-{name}-direct-str-benign", v.rule != "egress.secret", v)
+
+            # Egress the gate cannot read whole FAILS CLOSED, even when its text is benign:
+            # a dict, bytes, a number, a set, a generator, or a list holding one of them.
+            unsweepable = (("dict", lambda: {"q": benign_q}), ("bytes", lambda: benign_q.encode()),
+                           ("int", lambda: 7), ("set", lambda: {benign_q}),
+                           ("generator", lambda: (q for q in [benign_q])),
+                           ("list-with-dict", lambda: [benign_q, {"q": benign_q}]))
+            for shape, make in unsweepable:
+                for seat in SEATS:
+                    prof = profile_for(g, seat, home)
+                    ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 42))
+                    ev.egress = make()
+                    d = g.decide(ev, prof)
+                    check(f"{seat}-unsweepable-{shape}-fails-closed",
+                          d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
+                for name, fn in (("evaluate", lambda n: core.evaluate(n, cprof, workspace=str(REPO))),
+                                 ("degraded", lambda n: core.degraded_verdict(n, cprof))):
+                    v = fn(core.NormalizedEvent(tool="web_search", egress=make(), cwd=str(REPO)))
+                    check(f"core-{name}-unsweepable-{shape}-fails-closed",
+                          v.decision == "deny" and v.rule == "egress.secret" and v.innate, v)
+                # The single gate hands it to the core whole, so the core refuses it on its own.
+                ev = to_event(g, "kimi", native_event("kimi", "web_search", {"query": "x"}, str(REPO), 43))
+                ev.egress = make()
+                v = core.evaluate(g.normalized_event(ev), cprof, workspace=str(REPO))
+                check(f"handoff-unsweepable-{shape}-core-alone-denies",
+                      v.decision == "deny" and v.rule == "egress.secret", v)
+
+            # Default-empty parity: declaring nothing and declaring [] are judged identically,
+            # across a write, a shell read, an innate deny and a web tool.
+            for i, (seat, tool, ti) in enumerate((
+                    ("codex", *_act(IN_SCOPE_EDIT)),
+                    ("claude-code", "Bash", {"command": "cat /etc/hostname"}),
+                    ("kimi", "Bash", {"command": "cat ~/." + "ssh/id_rsa"}),
+                    ("gemini", "WebFetch", {"url": "https://x.example/?q=." + "env"}))):
+                prof = profile_for(g, seat, home)
+                a = g.decide(to_event(g, seat, native_event(seat, tool, ti, str(REPO), 10 + i)), prof)
+                ev = to_event(g, seat, native_event(seat, tool, ti, str(REPO), 20 + i))
+                ev.egress = []
+                b = g.decide(ev, prof)
+                check(f"default-empty-parity-{seat}-{tool}", (a.decision, a.rule) == (b.decision, b.rule),
+                      (a, b))
+
+            # The Gemini migration pin: every web-tool surface `egress_surfaces` finds by name now
+            # rides `NormalizedEvent.egress`, and the core denies it ON ITS OWN, so deleting the
+            # shim-era precheck would not move these verdicts.
+            for i, (tool, ti) in enumerate((
+                    ("WebFetch", {"url": "https://x.example/?q=." + "env"}),
+                    ("WebFetch", {"url": "https://x.example/", "prompt": "summarise ~/." + "ssh/id_rsa"}),
+                    ("WebSearch", {"query": "where is ~/." + "ssh/id_rsa"}))):
+                ev = to_event(g, "gemini", native_event("gemini", tool, ti, str(REPO), 30 + i))
+                nev = g.normalized_event(ev)
+                v = core.evaluate(nev, profile_for(g, "gemini", home).core_profile(), workspace=str(REPO))
+                check(f"migration-core-alone-denies-{tool}-{i}",
+                      v.decision == "deny" and v.rule == "egress.secret", (nev.egress, v))
+    finally:
+        stub.close()
+
+
 def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home):
     """dp, 2026-10-05: "escalation should allow standing grants". An `mrh.path` / `mrh.command`
     refusal asks the daemon ONCE (`hestia_scope_claim`): a request is opened (or re-found) on the
@@ -1585,6 +1715,7 @@ CONTRACT_TESTS = [
     test_superseded_is_denied_in_every_mode,
     test_daemon_verdicts_and_the_warn_rollout,
     test_a_declared_probe_opens_no_scope_request,
+    test_declared_egress_is_swept_and_never_scoped,
     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
     test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
     test_prose_in_a_message_position_is_data_on_every_seat,

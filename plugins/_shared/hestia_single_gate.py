@@ -160,6 +160,12 @@ class GateEvent:
     session_id: Optional[str] = None
     tool_use_id: Optional[str] = None
     raw: dict = field(default_factory=dict)
+    #: Text the INVOKER declares will leave the machine (#1201): a being's web_search query, a
+    #: prompt for a remote model. Swept with the innate `egress.secret` rule, never scoped. It can
+    #: only add a deny, so an invoker that declares it cannot lift anything; one that declares
+    #: nothing is judged exactly as before. Harness tools are still found by name in
+    #: `egress_surfaces`; this field is for acts no harness tool name describes.
+    egress: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -663,6 +669,7 @@ def normalized_event(event: GateEvent) -> core.NormalizedEvent:
         else _command_text(ti),
         cwd=event.cwd,
         raw=event.raw if isinstance(event.raw, dict) else {},
+        egress=egress_surfaces(event),
     )
 
 
@@ -682,10 +689,17 @@ _WEB_TOOLS = ("webfetch", "websearch", "web_fetch", "google_web_search")
 
 
 def egress_surfaces(event: GateEvent) -> list:
-    """Egress strings the core's paths/command do not carry: a web tool's url/prompt/query and
-    the MCP transport context a shim lifts into `tool_input["_hestia_mcp_context"]`."""
+    """Egress strings the core's paths/command do not carry: the invoker's declared `egress`
+    (#1201), a web tool's url/prompt/query and the MCP transport context a shim lifts into
+    `tool_input["_hestia_mcp_context"]`. `normalized_event` hands the same list to the core as
+    `NormalizedEvent.egress`, so the core's Gate 1a (and its degraded mode) sweeps it too."""
     ti = event.tool_input if isinstance(event.tool_input, dict) else {}
-    out: list = []
+    # The declared part goes through the core's one normalizer: a string is ONE blob, never its
+    # characters (NOVA HOLD at 7a6e410b). Egress it cannot sweep is handed to the core WHOLE, so
+    # the core's Gate 1a (and its degraded mode) refuses it too. `_egress_precheck` refuses it here.
+    raw = getattr(event, "egress", None)
+    declared = core.egress_items(raw)
+    out: list = list(declared) if declared is not None else [raw]
     if isinstance(event.tool, str) and event.tool.lower() in _WEB_TOOLS:
         for key in ("url", "urls", "prompt", "query"):
             out.extend(_leaves(ti.get(key)))
@@ -1116,7 +1130,12 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
 
 def _egress_precheck(inv: _Invocation, cprofile: core.HarnessProfile) -> Optional[GateDecision]:
     forbidden = core.forbidden_tokens(cprofile)
+    unswept = core.egress_unsweepable_deny(inv.event)
+    if unswept is not None:
+        return _verdict_deny(unswept)
     for blob in egress_surfaces(inv.event):
+        if not isinstance(blob, str):
+            continue  # only unsweepable declared egress, refused just above
         low = blob.lower()
         for token in forbidden:
             if token in low:

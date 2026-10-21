@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 2b946d537ebbebd68fa8f38289edfcad101eebd30232a9ec35068b26b0beeed0  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -492,6 +492,65 @@ class NormalizedEvent:
     command: Optional[str] = None               # shell command, if any
     cwd: Optional[str] = None
     raw: dict = field(default_factory=dict)     # kept for witnessing, never for deciding
+    #: Text that LEAVES THE MACHINE: a web query, a url, a prompt or context handed to a remote
+    #: model (#1201). Gate 1a sweeps it with the same innate `egress.secret` rule as paths, repos
+    #: and the command. Gate 1b NEVER reads it: natural language is not a path, and scoping its
+    #: words is the false-deny SAGE #335 measured ("'models' is not granted"). The field can
+    #: only ADD a deny. Default empty: an event that declares no egress is judged as before.
+    egress: list = field(default_factory=list)
+
+
+def egress_items(value: object) -> Optional[list]:
+    """Declared egress as the strings Gate 1a sweeps, or None when it cannot be swept.
+
+    A string is ONE blob. `list("~/.ssh/id_rsa")` is fourteen one-character blobs that match no
+    token, which is how a bare string slipped past the first #1201 patch (NOVA HOLD at 7a6e410b).
+    A list or tuple contributes its strings, flattened through nested lists/tuples, and None
+    entries are skipped. Anything else (a dict, bytes, a number, a set, a generator) is not text
+    this gate can read whole, so it returns None and the caller fails closed."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple)):
+        return None
+    out: list = []
+    for x in value:
+        if x is None:
+            continue
+        sub = egress_items(x)
+        if sub is None:
+            return None
+        out.extend(sub)
+    return out
+
+
+def egress_unsweepable(event: "NormalizedEvent") -> str:
+    """The type name of declared egress that `egress_items` cannot sweep; "" when it can."""
+    raw = getattr(event, "egress", None)
+    return type(raw).__name__ if egress_items(raw) is None else ""
+
+
+def egress_unsweepable_deny(event: "NormalizedEvent") -> Optional["Verdict"]:
+    """Gate 1a's fail-closed half: egress the gate cannot read whole is denied, never passed
+    unread. Both Gate 1a sites call it before the token sweep, so the degraded mode does too."""
+    bad = egress_unsweepable(event)
+    if not bad:
+        return None
+    return _deny("egress.secret",
+                 f"'{event.tool}' declares egress the gate cannot sweep ({bad}): egress must be "
+                 f"a string or a list of strings, so it is denied rather than sent unread",
+                 innate=True)
+
+
+def egress_blobs(event: "NormalizedEvent") -> list:
+    """Every string Gate 1a sweeps for the innate forbidden tokens: paths, repos, declared
+    egress text, and the command. `getattr`, not attribute access: a caller's own event
+    shape (SAGE's test fakes) may predate the `egress` field, and that must read as none.
+    Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
+    return (list(event.paths) + list(event.repos)
+            + (egress_items(getattr(event, "egress", None)) or [])
+            + ([event.command] if event.command else []))
 
 
 @dataclass(frozen=True)
@@ -2850,9 +2909,13 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     forbidden = forbidden_tokens(profile)
 
     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
-    # Repo names are scanned too: an MCP call naming a forbidden token is still egress.
-    for blob in (list(event.paths) + list(event.repos)
-                 + ([event.command] if event.command else [])):
+    # Repo names are scanned too: an MCP call naming a forbidden token is still egress. So is
+    # declared egress text (#1201), which Gate 1b below never scopes; egress it cannot read
+    # whole is refused first, never passed unread.
+    unswept = egress_unsweepable_deny(event)
+    if unswept is not None:
+        return unswept
+    for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
             if f in low:
@@ -3088,8 +3151,10 @@ def degraded_verdict(event: NormalizedEvent,
     read-allows are recorded on the gate-availability telemetry instead (they are an infra
     series, not refusals, and the deny log's readers expect denies)."""
     forbidden = forbidden_tokens(profile) if profile is not None else FORBIDDEN_DEFAULT
-    for blob in (list(event.paths) + list(event.repos)
-                 + ([event.command] if event.command else [])):
+    unswept = egress_unsweepable_deny(event)
+    if unswept is not None:
+        return unswept
+    for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
             if f in low:
