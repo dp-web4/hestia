@@ -17956,6 +17956,29 @@ mod tests {
             assert!(e.observed_at.is_none() && e.consumed_at.is_none(), "untouched by both: {e:?}");
         }
 
+        // Nova's review of #1363: observation only AFTER the authenticated session binding.
+        // (a) No session at all: an unattributed caller naming the asker's member and exact act
+        //     has no proven host session, so nothing is observed and nothing is claimed.
+        let anon = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "claude-code", "tool_name": "Bash", "marker": "hestia_governance_closure.py",
+            "reason": ACT, "invocation_key": "inv-anon",
+        })).await;
+        if let Ok(v) = &anon {
+            assert_ne!(v["claimed"], json!(true), "an unattributed re-issue claimed the asker's grant: {v}");
+        }
+        // (b) The asker's own session, but ASSERTING another host session: the precedence block
+        //     refuses the call before observation, so the grant stays unobserved.
+        let mut forged = claim(&asker, ACT, "inv-forged");
+        forged["host_session_id"] = json!("hs-sibling");
+        let refused = tool_gate_escalation_claim(&shared, &forged).await;
+        assert!(refused.is_err(), "a mismatched host_session_id must be refused: {refused:?}");
+        {
+            let s = shared.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert!(e.observed_at.is_none() && e.consumed_at.is_none(),
+                    "neither the unattributed nor the forged call may observe or spend: {e:?}");
+        }
+
         let mine = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-reissue")).await.unwrap();
         assert_eq!(mine["claimed"], json!(true), "the asker's exact re-issue must claim its lapsed grant: {mine}");
         assert_eq!(mine["escalation_id"], json!(id), "{mine}");
