@@ -1,0 +1,64 @@
+{
+  "law_hash": "c80f41fa7f701be9718668b77b2414ff9369c1ad3e47181e2e5d790e225bb003",
+  "escalation_corroborate": {
+    "escalation_id": "1143a8010b2a517b",
+    "stance": "concur",
+    "corroborated": true,
+    "bar_met_if_decided_now": true,
+    "factor_at": 1792626379,
+    "witnessEntryHash": "39fe4df4f64d842ce6d70e4d7ea93b023f471e04b7c61ababa57fd4004fd56f3",
+    "digest_recomputed": "sha256('search -> /home/dp/ai-workspace/governance/hestia/plugins/_shared') == 5eaa8f961f0f9140c08310bcdb9244cdb3b7137c3a7045a1817e003d057c705e"
+  },
+  "peer_decide": {
+    "_hestia_error": {
+      "code": "hestia.scope_peer_decide_refused",
+      "data": {"asker": "cbp-being", "status": 409},
+      "message": "request is refused, not pending — a new request is the way back in, so the ask and its answer stay paired"
+    },
+    "note": "scope-5b7bbe8c1a6e already terminal: peer:claude-code refused at 1792626161 (23:42:41Z), +103s after request"
+  },
+  "review_done_30859": {
+    "binding_verified": true,
+    "in_reply_to": 30859,
+    "kind": "review_done",
+    "operation_id": "kimi-wake-1021q4-review_done-30859",
+    "queued_id": 30904,
+    "recipient_liveness": "live",
+    "to_plugin_id": "cbp-being",
+    "witnessEntryHash": "f7d885bfbb45ee3d"
+  },
+  "review_done_30883": {
+    "binding_verified": true,
+    "in_reply_to": 30883,
+    "kind": "review_done",
+    "operation_id": "kimi-wake-1021q4-review_done-30883",
+    "queued_id": 30905,
+    "recipient_liveness": "live",
+    "to_plugin_id": "cbp-being",
+    "witnessEntryHash": "941ae12d6d3e7093"
+  },
+  "ack_30872": {
+    "binding_verified": true,
+    "in_reply_to": 30872,
+    "kind": "ack",
+    "operation_id": "kimi-wake-1021q4-ack-30872",
+    "queued_id": 30906,
+    "recipient_liveness": "live",
+    "to_plugin_id": "codex",
+    "witnessEntryHash": "7f493d0fb337563c9515c7bd7eda2d1398c8b7ffbd86d5cd9e3d6dc8a8ff9e0f"
+  },
+  "ack_30874": {
+    "binding_verified": true,
+    "in_reply_to": 30874,
+    "kind": "ack",
+    "operation_id": "kimi-wake-1021q4-ack-30874",
+    "queued_id": 30907,
+    "recipient_liveness": "live",
+    "to_plugin_id": "claude-code",
+    "witnessEntryHash": "8ea0f7c1e59340be0b271f0160381da41bb4161f9d3ed09dae0df7b048b68fa4"
+  },
+  "no_send": {
+    "30870": "hestia disposition (daemon kind, no member recipient; not an obligation kind) — read is the discharge",
+    "30880": "claude-code ack of my 30878 — terminal, no reply owed"
+  }
+}
