@@ -1,0 +1,206 @@
+===== d9b167e12a7283b8 =====
+{
+ "evidence": {
+  "act_text": "Bash: git -C /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/wt-1361 apply /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/gt-1361.patch",
+  "act_text_covers": "the command as stated",
+  "act_text_source": "retained at open \u2014 the claim door's act (its `act` argument, or `reason` taken as the act when none was sent), the exact text act_digest binds",
+  "escalation": {
+   "act_digest": "7b9efa770d8dad5bff347b24925c6b5c6314e68981b932ad1dd193fd35875f9e",
+   "asker_basis": "Session",
+   "bar": "single_approver",
+   "bar_met": true,
+   "claimed_by": "claude-code",
+   "expires_at": 1792617248,
+   "factors": [
+    {
+     "at": 1792613670,
+     "by": "operator",
+     "channel": "operator_session",
+     "dissent": false,
+     "independence": null,
+     "role": "role:constellation:sovereign"
+    }
+   ],
+   "id": "d9b167e12a7283b8",
+   "marker": "hestia_governance_closure.py",
+   "opened_at": 1792613648,
+   "opened_via": "claim",
+   "payload_sha256": null,
+   "role": "role:constellation:member",
+   "secs_remaining": 3470,
+   "stated_detail": "Auto-opened by the gate on a refused write; the member stated no rationale because it did not choose to escalate. Approving authorises this one write.",
+   "stated_reason": "Bash: git -C /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/wt-1361 apply /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/gt-1361.patch",
+   "status": "Approved",
+   "tool_name": "Bash"
+  },
+  "law": {
+   "consult": "hestia_operating_law \u2014 and record the law_hash IT returns to you",
+   "society_policy_hash": "2f679ab00d6201a1b6960eef928131d327f912a6d9e52e9753c282965d90756d"
+  },
+  "member_refusals": {
+   "by_rule": [
+    {
+     "count": 20,
+     "rule": "<unnamed>"
+    }
+   ],
+   "cap": 20,
+   "counted": 20,
+   "truncated": true
+  },
+  "prior_on_this_marker": {
+   "approved": 7,
+   "cap": 20,
+   "denied": 0,
+   "opened": 6,
+   "rows": [
+    {
+     "at": "2026-10-20T00:30:26.411587706Z",
+     "decided_by": "operator",
+     "escalation_id": "e685a88ff520baf0",
+     "event": "gate_escalation_decided",
+     "reason": "k",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-20T01:54:35.332212228Z",
+     "decided_by": null,
+     "escalation_id": "1f181484a6adc1f3",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-20T01:55:06.401945837Z",
+     "decided_by": "operator",
+     "escalation_id": "1f181484a6adc1f3",
+     "event": "gate_escalation_decided",
+     "reason": "k",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-20T02:24:38.890450604Z",
+     "decided_by": null,
+     "escalation_id": "916b0fe5557875af",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-20T02:24:57.500659364Z",
+     "decided_by": "operator",
+     "escalation_id": "916b0fe5557875af",
+     "event": "gate_escalation_decided",
+     "reason": "k",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-20T02:25:22.607088246Z",
+     "decided_by": "operator",
+     "escalation_id": "916b0fe5557875af",
+     "event": "gate_escalation_claimed",
+     "reason": "k",
+     "status": null
+    },
+    {
+     "at": "2026-10-20T19:05:51.059396352Z",
+     "decided_by": null,
+     "escalation_id": "78fcba4bcf3bc63f",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-20T19:13:12.802400406Z",
+     "decided_by": "operator",
+     "escalation_id": "78fcba4bcf3bc63f",
+     "event": "gate_escalation_decided",
+     "reason": "k",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-20T19:13:30.548999806Z",
+     "decided_by": "operator",
+     "escalation_id": "78fcba4bcf3bc63f",
+     "event": "gate_escalation_claimed",
+     "reason": "k",
+     "status": null
+    },
+    {
+     "at": "2026-10-21T03:56:06.098146258Z",
+     "decided_by": null,
+     "escalation_id": "dda1f6319effaf0d",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T03:56:46.835175222Z",
+     "decided_by": "operator",
+     "escalation_id": "dda1f6319effaf0d",
+     "event": "gate_escalation_decided",
+     "reason": "k",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-21T03:57:04.846940857Z",
+     "decided_by": "operator",
+     "escalation_id": "dda1f6319effaf0d",
+     "event": "gate_escalation_claimed",
+     "reason": "k",
+     "status": null
+    },
+    {
+     "at": "2026-10-21T07:05:25.807132592Z",
+     "decided_by": null,
+     "escalation_id": "f9bd5935bf5bdc2d",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T07:06:57.194756609Z",
+     "decided_by": "operator",
+     "escalation_id": "f9bd5935bf5bdc2d",
+     "event": "gate_escalation_decided",
+     "reason": "k",
+     "status": "approved"
+    },
+    {
+     "at": "2026-10-21T07:07:20.790631331Z",
+     "decided_by": "operator",
+     "escalation_id": "f9bd5935bf5bdc2d",
+     "event": "gate_escalation_claimed",
+     "reason": "k",
+     "status": null
+    },
+    {
+     "at": "2026-10-21T19:24:25.865974389Z",
+     "decided_by": null,
+     "escalation_id": "cf54d46850bcdfe0",
+     "event": "gate_escalation_opened",
+     "reason": null,
+     "status": null
+    },
+    {
+     "at": "2026-10-21T19:43:08.682421661Z",
+     "decided_by": "operator",
+     "escalation_id": "cf54d46850bcdfe0",
+     "event": "gate_escalation_decided",
+     "reason": "k",
+     "status": "approved"
+    }
+   ],
+   "truncated": true
+  },
+  "write_effect": {
+   "kind": "patch",
+   "note": "the act names a patch file the daemon cannot read; nothing about what it would change is asserted here",
+   "patch_path": "/tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/gt-1361.patch",
+   "patch_read": false,
+   "patch_readable": false,
+   "summary_complete": false
+  }
+ },
+ "found": true
+}
