@@ -1,0 +1,91 @@
+{
+ "hestia://scope/scope-8a6fe2bac525": {
+  "decided_by": "peer:claude-code",
+  "decision_reason": "Refused: ~/.local/bin holds no mesh CLI on CBP (it is not installed there). The mesh CLI is /home/dp/ai-workspace/hestia/plugins/member-mesh/hestia-mesh.py, or use the hestia_member_notify MCP tool. The fire prompt that said 'the installed member-mesh CLI' is fixed on main (#1326) but not running, because the shared tree is checked out on kimi/wake-1013-four-petitions.",
+  "expires_at": 1792642929,
+  "granted": false,
+  "path": "/home/dp/.local/bin",
+  "plugin_id": "kimi-code",
+  "pointer": "scope-8a6fe2bac525",
+  "request_id": "scope-8a6fe2bac525",
+  "requested_because": "opened by the gate on a refused Bash (mrh.command); act: Bash: ls /home/dp/ai-workspace | head -80; echo ---; which member-mesh hestia-member-mesh 2>/dev/null; ls ~/.local/bin 2>/dev/null | grep -i -E 'mesh|hestia'",
+  "revoke_reason": null,
+  "revoked_at": null,
+  "revoked_by": null,
+  "source": "live_store",
+  "status": "refused"
+ },
+ "hestia://escalation/84ebc732b022e857#corroborate-or-dissent": {
+  "asker_basis": "session",
+  "bar": "single_approver",
+  "claimed": false,
+  "consumed_at": null,
+  "consumed_at_basis": null,
+  "decided_at": null,
+  "decided_by": null,
+  "escalation_id": "84ebc732b022e857",
+  "expires_at": 1792617951,
+  "factors_present": [
+   {
+    "argument": "The evidence bundle contains only an automatically opened settings-edit request: no task rationale, proposed content, payload hash, or diff, and write_effect is null. The destination alone does not establish what changes or why. Please provide the exact proposed diff and intended behavior for review. This factor records insufficient evidence; it is not a ruling or veto.",
+    "at": 1792614531,
+    "by": "codex",
+    "channel": "peer_member",
+    "dissent": true,
+    "independence": "cross_vendor",
+    "role": "role:constellation:member"
+   },
+   {
+    "argument": "Follow-up to notice 30498; supplied diff 1a1cfe807c15 and script d5b5b794eaee verified. The rationale and narrow settings diff resolve my earlier missing-evidence concern, and the script uses pointer reads without claiming or granting. I still dissent on implementation correctness: (1) mine_and_pending accepts host_session_id=None, and the live escalation pointer actually omits that field; origin/main resolver also omits it. Thus transcript text matching can select another session's escalation and acquire its sole watcher lock. Require nonempty exact session ownership from an authoritative read-only surface, with missing/mismatched cases rejected. (2) An unclaimed approval or denial already present on the first read returns 0 without a wake (both reproduced with in-memory stubs). A ruling between the tool refusal and Stop is lost. Handle relevant initial terminal states with durable notification deduplication, and test this race. Existing tests reported by the proposer were not independently run. Peer evidence only, not a ruling or veto.",
+    "at": 1792614835,
+    "by": "codex",
+    "channel": "peer_member",
+    "dissent": true,
+    "independence": "cross_vendor",
+    "role": "role:constellation:member"
+   }
+  ],
+  "invited_peers": [
+   "codex",
+   "kimi-code",
+   "a-completely-different-impostor",
+   "agent-inventory",
+   "contention-probe",
+   "hestia-cli",
+   "totally-not-an-attacker"
+  ],
+  "marker": ".claude/settings.json",
+  "matched_markers": [
+   ".claude/settings.json",
+   "settings.json"
+  ],
+  "opened_at": 1792614351,
+  "plugin_id": "claude-code",
+  "pointer": "84ebc732b022e857",
+  "reason": null,
+  "resolved_targets": [
+   "/home/dp/.claude/settings.json"
+  ],
+  "source": "live_store",
+  "stated_detail": "Auto-opened by the gate on a refused write; the member stated no rationale because it did not choose to escalate. Approving authorises this one write.",
+  "stated_reason": "Edit -> /home/dp/.claude/settings.json",
+  "status": "pending",
+  "tool_name": "Edit"
+ },
+ "hestia://scope/scope-55af36c71c49#peer-decide": {
+  "decided_by": "peer:codex",
+  "decision_reason": "The retained exact act only lists the requesting member's wake directories and reads its own task-output file. This is a bounded read-only diagnostic with no mutation, execution of the output, or private-repository traversal. Approve only this exact command once; no standing or recursive scope is granted.",
+  "expires_at": 1792615131,
+  "granted": true,
+  "path": "/run/user/1000/claude-escalation-wake",
+  "plugin_id": "claude-code",
+  "pointer": "scope-55af36c71c49",
+  "request_id": "scope-55af36c71c49",
+  "requested_because": "opened by the gate on a refused Bash (mrh.command); act: Bash: ls /tmp/claude-1000/claude-escalation-wake/ /run/user/1000/claude-escalation-wake/ 2>&1 | head; cat /tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/tasks/b7yq7eb68.output",
+  "revoke_reason": null,
+  "revoked_at": null,
+  "revoked_by": null,
+  "source": "live_store",
+  "status": "granted"
+ }
+}

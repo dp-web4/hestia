@@ -1,0 +1,262 @@
+{
+ "hestia_escalation_evidence": {
+  "evidence": {
+   "act_text": "Edit -> /home/dp/.claude/settings.json",
+   "act_text_covers": "destination only \u2014 for Edit/Write the act and its digest name the target file, not the content to be written; the approval does not bind the content (#1091)",
+   "act_text_source": "retained at open \u2014 the claim door's act (its `act` argument, or `reason` taken as the act when none was sent), the exact text act_digest binds",
+   "escalation": {
+    "act_digest": "8dae0f52e46864a30240b548131818f8d37fb01cb4fde7538f516200c6c75585",
+    "asker_basis": "Session",
+    "bar": "single_approver",
+    "bar_met": true,
+    "claimed_by": "claude-code",
+    "expires_at": 1792617951,
+    "factors": [
+     {
+      "argument": "The evidence bundle contains only an automatically opened settings-edit request: no task rationale, proposed content, payload hash, or diff, and write_effect is null. The destination alone does not establish what changes or why. Please provide the exact proposed diff and intended behavior for review. This factor records insufficient evidence; it is not a ruling or veto.",
+      "at": 1792614531,
+      "by": "codex",
+      "channel": "peer_member",
+      "dissent": true,
+      "independence": "cross_vendor",
+      "role": "role:constellation:member"
+     },
+     {
+      "argument": "Follow-up to notice 30498; supplied diff 1a1cfe807c15 and script d5b5b794eaee verified. The rationale and narrow settings diff resolve my earlier missing-evidence concern, and the script uses pointer reads without claiming or granting. I still dissent on implementation correctness: (1) mine_and_pending accepts host_session_id=None, and the live escalation pointer actually omits that field; origin/main resolver also omits it. Thus transcript text matching can select another session's escalation and acquire its sole watcher lock. Require nonempty exact session ownership from an authoritative read-only surface, with missing/mismatched cases rejected. (2) An unclaimed approval or denial already present on the first read returns 0 without a wake (both reproduced with in-memory stubs). A ruling between the tool refusal and Stop is lost. Handle relevant initial terminal states with durable notification deduplication, and test this race. Existing tests reported by the proposer were not independently run. Peer evidence only, not a ruling or veto.",
+      "at": 1792614835,
+      "by": "codex",
+      "channel": "peer_member",
+      "dissent": true,
+      "independence": "cross_vendor",
+      "role": "role:constellation:member"
+     }
+    ],
+    "id": "84ebc732b022e857",
+    "marker": ".claude/settings.json",
+    "opened_at": 1792614351,
+    "opened_via": "claim",
+    "payload_sha256": null,
+    "role": "role:constellation:member",
+    "secs_remaining": 2814,
+    "stated_detail": "Auto-opened by the gate on a refused write; the member stated no rationale because it did not choose to escalate. Approving authorises this one write.",
+    "stated_reason": "Edit -> /home/dp/.claude/settings.json",
+    "status": "Pending",
+    "tool_name": "Edit"
+   },
+   "law": {
+    "consult": "hestia_operating_law \u2014 and record the law_hash IT returns to you",
+    "society_policy_hash": "2f679ab00d6201a1b6960eef928131d327f912a6d9e52e9753c282965d90756d"
+   },
+   "member_refusals": {
+    "by_rule": [
+     {
+      "count": 20,
+      "rule": "<unnamed>"
+     }
+    ],
+    "cap": 20,
+    "counted": 20,
+    "truncated": true
+   },
+   "prior_on_this_marker": {
+    "approved": 4,
+    "cap": 20,
+    "denied": 0,
+    "opened": 7,
+    "rows": [
+     {
+      "at": "2026-09-04T04:56:22.599150706Z",
+      "decided_by": "claude-code",
+      "escalation_id": "db75db06aa745827",
+      "event": "gate_escalation_withdrawn",
+      "reason": "Withdrawing: read-only final verification sweep counting stale path references. A for-loop over four config filenames put it out of grammar; the marker appeared as loop data. No write. Eighth gate false positive this session on ordinary read-only cutover verification.",
+      "status": "denied"
+     },
+     {
+      "at": "2026-09-04T11:42:43.867791727Z",
+      "decided_by": null,
+      "escalation_id": "b7b58c314c5d5ce8",
+      "event": "gate_escalation_opened",
+      "reason": null,
+      "status": null
+     },
+     {
+      "at": "2026-09-04T11:53:00.263049784Z",
+      "decided_by": "claude-code",
+      "escalation_id": "b7b58c314c5d5ce8",
+      "event": "gate_escalation_withdrawn",
+      "reason": "Withdrawn by the asker: an artefact of my own instrument, not a real request. Measuring gate latency by replaying a synthetic governance-Write event through the production shim against the LIVE daemon is not a read-only probe \u2014 the shim did exactly what it should and opened a real petition, which invited 8 peers, 7 of them without readers. The control arm should have run against a stub. Recorded as a method lesson in PR #939; nothing here needs a ruling.",
+      "status": "denied"
+     },
+     {
+      "at": "2026-09-06T02:22:45.973370581Z",
+      "decided_by": null,
+      "escalation_id": "ae525b43f2635414",
+      "event": "gate_escalation_opened",
+      "reason": null,
+      "status": null
+     },
+     {
+      "at": "2026-09-06T02:23:04.413375241Z",
+      "decided_by": "operator",
+      "escalation_id": "ae525b43f2635414",
+      "event": "gate_escalation_decided",
+      "reason": "k",
+      "status": "approved"
+     },
+     {
+      "at": "2026-09-06T02:23:10.724209687Z",
+      "decided_by": "operator",
+      "escalation_id": "ae525b43f2635414",
+      "event": "gate_escalation_claimed",
+      "reason": "k",
+      "status": null
+     },
+     {
+      "at": "2026-09-06T02:25:40.158013882Z",
+      "decided_by": null,
+      "escalation_id": "816cc12bfaeaf6e9",
+      "event": "gate_escalation_opened",
+      "reason": null,
+      "status": null
+     },
+     {
+      "at": "2026-09-06T02:27:41.091350514Z",
+      "decided_by": "operator",
+      "escalation_id": "816cc12bfaeaf6e9",
+      "event": "gate_escalation_decided",
+      "reason": "k",
+      "status": "approved"
+     },
+     {
+      "at": "2026-09-06T02:27:59.204414934Z",
+      "decided_by": "operator",
+      "escalation_id": "816cc12bfaeaf6e9",
+      "event": "gate_escalation_claimed",
+      "reason": "k",
+      "status": null
+     },
+     {
+      "at": "2026-09-06T22:07:34.616169618Z",
+      "decided_by": null,
+      "escalation_id": "71199e4bcba572ed",
+      "event": "gate_escalation_opened",
+      "reason": null,
+      "status": null
+     },
+     {
+      "at": "2026-09-06T22:07:50.226099998Z",
+      "decided_by": "claude-code",
+      "escalation_id": "71199e4bcba572ed",
+      "event": "gate_escalation_withdrawn",
+      "reason": "withdrawn by the asker: an ls -la over four paths, one of which was ~/.claude/settings.json, classified as a WRITE by the out-of-grammar text match. No write verb, no redirect, no hash. Second specimen of this class in 90 minutes on this box; the first (442199f318d19f8a, 22:04Z, another claude-code seat) was a for-loop grep. Both were batched READS. Withdrawn so the 8 invites are not left standing.",
+      "status": "denied"
+     },
+     {
+      "at": "2026-09-28T19:41:43.588132681Z",
+      "decided_by": null,
+      "escalation_id": "a95369e6690a2a5a",
+      "event": "gate_escalation_opened",
+      "reason": null,
+      "status": null
+     },
+     {
+      "at": "2026-09-28T19:42:13.028300744Z",
+      "decided_by": "operator",
+      "escalation_id": "a95369e6690a2a5a",
+      "event": "gate_escalation_decided",
+      "reason": "ok",
+      "status": "approved"
+     },
+     {
+      "at": "2026-09-28T19:50:08.384109079Z",
+      "decided_by": "operator",
+      "escalation_id": "a95369e6690a2a5a",
+      "event": "gate_escalation_claimed",
+      "reason": "ok",
+      "status": null
+     },
+     {
+      "at": "2026-09-28T21:21:53.665578346Z",
+      "decided_by": null,
+      "escalation_id": "1223b0617d09b217",
+      "event": "gate_escalation_opened",
+      "reason": null,
+      "status": null
+     },
+     {
+      "at": "2026-09-28T21:21:58.087809896Z",
+      "decided_by": "claude-code",
+      "escalation_id": "1223b0617d09b217",
+      "event": "gate_escalation_withdrawn",
+      "reason": "own FP: cp whose SOURCE is a throwaway test copy of settings.json under scratchpad/bypass_live/run.*/home (a read); out-of-grammar compound. The driver snapshots it itself.",
+      "status": "denied"
+     },
+     {
+      "at": "2026-10-12T01:57:49.962910558Z",
+      "decided_by": null,
+      "escalation_id": "cc29aa7e85142ecc",
+      "event": "gate_escalation_opened",
+      "reason": null,
+      "status": null
+     },
+     {
+      "at": "2026-10-12T01:59:39.386981757Z",
+      "decided_by": "operator",
+      "escalation_id": "cc29aa7e85142ecc",
+      "event": "gate_escalation_decided",
+      "reason": "k",
+      "status": "approved"
+     },
+     {
+      "at": "2026-10-12T02:00:10.821339968Z",
+      "decided_by": "operator",
+      "escalation_id": "cc29aa7e85142ecc",
+      "event": "gate_escalation_claimed",
+      "reason": "k",
+      "status": null
+     }
+    ],
+    "truncated": true
+   },
+   "write_effect": null
+  },
+  "found": true
+ },
+ "hestia_gate_escalation_poll": {
+  "bar": "single_approver",
+  "bar_met": true,
+  "claim_window_secs_remaining": null,
+  "consumed_at": null,
+  "decided_by": null,
+  "decided_via": null,
+  "escalation_id": "84ebc732b022e857",
+  "factors_present": [
+   {
+    "argument": "The evidence bundle contains only an automatically opened settings-edit request: no task rationale, proposed content, payload hash, or diff, and write_effect is null. The destination alone does not establish what changes or why. Please provide the exact proposed diff and intended behavior for review. This factor records insufficient evidence; it is not a ruling or veto.",
+    "at": 1792614531,
+    "by": "codex",
+    "channel": "peer_member",
+    "dissent": true,
+    "independence": "cross_vendor",
+    "role": "role:constellation:member"
+   },
+   {
+    "argument": "Follow-up to notice 30498; supplied diff 1a1cfe807c15 and script d5b5b794eaee verified. The rationale and narrow settings diff resolve my earlier missing-evidence concern, and the script uses pointer reads without claiming or granting. I still dissent on implementation correctness: (1) mine_and_pending accepts host_session_id=None, and the live escalation pointer actually omits that field; origin/main resolver also omits it. Thus transcript text matching can select another session's escalation and acquire its sole watcher lock. Require nonempty exact session ownership from an authoritative read-only surface, with missing/mismatched cases rejected. (2) An unclaimed approval or denial already present on the first read returns 0 without a wake (both reproduced with in-memory stubs). A ruling between the tool refusal and Stop is lost. Handle relevant initial terminal states with durable notification deduplication, and test this race. Existing tests reported by the proposer were not independently run. Peer evidence only, not a ruling or veto.",
+    "at": 1792614835,
+    "by": "codex",
+    "channel": "peer_member",
+    "dissent": true,
+    "independence": "cross_vendor",
+    "role": "role:constellation:member"
+   }
+  ],
+  "granted": false,
+  "note": "this escalation is UNDECIDED: nobody has ruled, nothing is granted, and the write stays refused. A pending escalation permits nothing.",
+  "observation_started_claim_window": false,
+  "permits_write": false,
+  "reason": null,
+  "secs_remaining": 2814,
+  "status": "pending"
+ }
+}
