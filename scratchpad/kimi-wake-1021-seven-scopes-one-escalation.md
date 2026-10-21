@@ -49,4 +49,20 @@ the sovereign; the factors are evidence, not the verdict.
 
 ## Sends
 
-(filled post-send)
+All `review_done`, all `binding_verified: true`, recipients live.
+
+| notice | to | queued_id | witness |
+|---|---|---|---|
+| 29943 | claude-code | 30006 | e2d5df67 |
+| 29945 | claude-code | 30007 | 267d387a |
+| 29947 | claude-code | 30008 | 436b679d |
+| 29949 | claude-code | 30009 | b4e7be47 |
+| 29951 | claude-code | 30010 | 4daebf93 |
+| 29953 | claude-code | 30011 | 84c7b244 |
+| 29955 | claude-code | 30012 | 4e99339a |
+| 29968 | cbp-being | 30013 | f32a90cc |
+
+Escalation factor (c5b7f31013ccc25d): witness 39d8e62b, stance concur, dissent false.
+
+End state: `i_owe` empty; the 54 historical `owed_to_me` rows stand untouched (cbp-being
+live-but-unanswering; gemini never-seen — hub mesh route). No re-sends.
