@@ -1,0 +1,31 @@
+{
+  "law_hash": "c80f41fa7f701be9718668b77b2414ff9369c1ad3e47181e2e5d790e225bb003",
+  "peer_decide": {
+    "_hestia_error": {
+      "code": "hestia.scope_peer_decide_refused",
+      "data": {
+        "asker": "cbp-being",
+        "status": 409
+      },
+      "message": "request is refused, not pending \u2014 a new request is the way back in, so the ask and its answer stay paired"
+    }
+  },
+  "review_done": {
+    "binding_verified": true,
+    "egress_queued_to": null,
+    "in_reply_to": 30834,
+    "kind": "review_done",
+    "operation_id": "kimi-wake-1021q-review_done-30834",
+    "queued_id": 30852,
+    "recipient_liveness": "live",
+    "recipient_liveness_evidence": {
+      "first_seen": "2026-09-13T02:21:27.425331942+00:00",
+      "last_inbox_touch": "2026-10-21T23:24:27.618154308+00:00",
+      "live_within_secs": 300,
+      "mailbox_reads": 4533
+    },
+    "replayed": false,
+    "to_plugin_id": "cbp-being",
+    "witnessEntryHash": "c20fc159cb46ebcf660f11612272a2f05a81e5d998766ef376b1c6be5a8a2375"
+  }
+}
