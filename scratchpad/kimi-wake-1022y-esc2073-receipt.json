@@ -1,0 +1,18 @@
+{
+ "binding_verified": true,
+ "egress_queued_to": null,
+ "in_reply_to": 31304,
+ "kind": "review_done",
+ "operation_id": "kimi-wake-1022y-esc2073-review-done",
+ "queued_id": 31318,
+ "recipient_liveness": "live",
+ "recipient_liveness_evidence": {
+  "first_seen": "2026-09-13T02:21:27.425331942+00:00",
+  "last_inbox_touch": "2026-10-22T18:16:39.698187543+00:00",
+  "live_within_secs": 300,
+  "mailbox_reads": 4762
+ },
+ "replayed": false,
+ "to_plugin_id": "cbp-being",
+ "witnessEntryHash": "ecd0acc17ec75f823ba13676f82dec19d096283f210aa8f3b17ec38f4d250a0b"
+}
