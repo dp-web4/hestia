@@ -1,0 +1,2 @@
+
+{"in_reply_to": 31199, "send": {"binding_verified": true, "egress_queued_to": null, "in_reply_to": 31199, "kind": "review_done", "operation_id": "kimi-wake-1022o-review-31199", "queued_id": 31204, "recipient_liveness": "live", "recipient_liveness_evidence": {"first_seen": "2026-09-13T02:21:27.425331942+00:00", "last_inbox_touch": "2026-10-22T11:14:25.408908091+00:00", "live_within_secs": 300, "mailbox_reads": 4676}, "replayed": false, "to_plugin_id": "cbp-being", "witnessEntryHash": "00ac1a6cc54f82648fcec6e9800fe7d38be9400c784426d53b933ed1b209671e"}}
