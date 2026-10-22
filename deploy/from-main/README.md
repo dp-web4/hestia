@@ -341,3 +341,30 @@ remembering to clone agent-atlas and run `plugins/agent-inventory/install.sh` by
 `inventory_step_test.py` runs both functions under `set -euo pipefail` through every failure
 above; `unit_templates_test.py` holds the launchd and systemd copies of each unit to the same
 environment keys and to a strict XML parse.
+
+## The operator's steps after a deploy: `$HESTIA_HOME/post-deploy.d`
+
+Some state on a box is derived from the deployed build without being hestia's. On CBP the beings
+read their law from a read-only snapshot of the deployed source (SAGE `scripts/governance_snapshot.sh`).
+When #1362 deployed, the snapshot stayed one build behind for 45 minutes. The being looked for the fix
+in the only copy it may read, didn't find it, and asked for scope on paths that don't exist.
+
+After the members' install, every `DEPLOYED` or `CURRENT` cycle runs each executable in
+`$HESTIA_HOME/post-deploy.d`, in name order, with the build in `HESTIA_DEPLOYED_BUILD`.
+
+- **The directory is the operator's.** It sits beside the vault, outside every member's grant. A step not
+  owned by the deploy's user, or group- or world-writable, is skipped and logged.
+- **A step can't stop a deploy.** A failure or a hang (bounded by `POST_DEPLOY_SECS`, default 300, where
+  `timeout(1)` exists) is logged and counted. The summary line says `post_deploy=ok=<n> failed=<n>`,
+  `none`, `skipped(HESTIA_DEPLOY_POST=0)` or `refused(governed session)`.
+- **Steps must be idempotent.** `CURRENT` cycles run them too, so a step that failed is retried by the
+  next timer run.
+
+CBP's install is one symlink:
+
+    mkdir -p ~/.hestia/post-deploy.d
+    ln -s <workspace>/SAGE/scripts/governance_snapshot.sh ~/.hestia/post-deploy.d/50-governance-snapshot
+
+The script finds its workspace from its own path, asks the running daemon's `/api/version` which build
+to snapshot, and prints "already at" when nothing has changed. `post_deploy_step_test.py` covers each of
+these cases under `set -euo pipefail`.

@@ -893,6 +893,48 @@ install_inventory() {
   fi
 }
 
+# THE OPERATOR'S STEPS AFTER A DEPLOY, NOT HESTIA'S (cbp-claude, 2026-10-22). Some state on a
+# box is derived from the deployed build and is not hestia's to know about. On CBP the beings
+# read their law from a read-only snapshot of the deployed source (SAGE
+# scripts/governance_snapshot.sh). Nothing refreshed it at a deploy, so for 45 minutes after
+# #1362 deployed the being's only readable copy of its law was the build before the one judging
+# it, and it read that as "the fix is not in place". Each executable in
+# $HESTIA_HOME/post-deploy.d runs, in name order, after the members' install, with the build in
+# HESTIA_DEPLOYED_BUILD. The directory is the operator's: it lives beside the vault, outside every
+# member's grant, and a file a member could have written there (not ours, or group/world
+# writable) is skipped and said so. The same contract as the inventory: a step may fail in any
+# way, and never stops a deploy. Steps run on CURRENT cycles too, so a step that failed is
+# retried by the next timer run; a step must therefore be idempotent.
+post_deploy=""
+run_post_deploy() {
+  post_deploy="none"
+  [ "${HESTIA_DEPLOY_POST:-1}" = "1" ] || { post_deploy="skipped(HESTIA_DEPLOY_POST=0)"; return 0; }
+  if [ -n "${CLAUDECODE:-}" ] || [ -n "${HESTIA_ROLE:-}" ]; then
+    post_deploy="refused(governed session)"; return 0
+  fi
+  local dir="$HESTIA_HOME/post-deploy.d" f name ok=0 bad=0 bound=()
+  [ -d "$dir" ] || return 0
+  # Bounded where timeout(1) exists, as the gate probes are; stock macOS has none.
+  command -v timeout >/dev/null 2>&1 && bound=(timeout "${POST_DEPLOY_SECS:-300}")
+  for f in "$dir"/*; do
+    [ -f "$f" ] && [ -x "$f" ] || continue
+    name="$(basename "$f")"
+    # -perm -g+w / -o+w, not /022: BSD find has no `/`. `|| true`: find on a vanished file
+    # exits 1, and `set -e` would end the deploy over it.
+    if [ ! -O "$f" ] || [ -n "$(find -L "$f" -maxdepth 0 \( -perm -g+w -o -perm -o+w \) 2>/dev/null || true)" ]; then
+      log "WARN post-deploy: skipped $name (not owned by this user, or group/world-writable)"
+      bad=$((bad + 1)); continue
+    fi
+    if HESTIA_DEPLOYED_BUILD="$1" ${bound[@]+"${bound[@]}"} "$f" >>"$LOG" 2>&1; then
+      ok=$((ok + 1))
+    else
+      log "WARN post-deploy: $name exited $?"
+      bad=$((bad + 1))
+    fi
+  done
+  [ $((ok + bad)) -eq 0 ] || post_deploy="ok=$ok failed=$bad"
+}
+
 # The manifest the members' installer writes; empty when it is absent or unreadable. The
 # -r guard is load-bearing under `set -e -o pipefail`: sed on a missing file exits 2, and
 # that took the whole cycle down at rc=2 with no log line at all (measured, 2026-08-28,
@@ -1102,7 +1144,8 @@ if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
     log "CURRENT $target but manifest says '${manifest:-none}'; re-running the members' install"
     install_hooks
     install_inventory
-    log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory seats=$seats"
+    run_post_deploy "$target"
+    log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory seats=$seats post_deploy=$post_deploy"
     case "$hooks" in
       ok) exit 0 ;;
       *)  log "HALF-DEPLOYED $target: binary current, manifest still '${manifest:-none}' (hooks=$hooks); $(hooks_repair_hint)"; exit 1 ;;
@@ -1110,9 +1153,9 @@ if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
   fi
   # The ordinary cycle is where a stale inventory copy gets noticed: most cycles are this
   # one, and the inventory's source moves without the daemon's binary moving with it.
-  if [ "$MODE" = "full" ]; then install_inventory; fi
+  if [ "$MODE" = "full" ]; then install_inventory; run_post_deploy "$target"; fi
   secret_hygiene
-  log "CURRENT $target${inventory:+ inventory=$inventory}"
+  log "CURRENT $target${inventory:+ inventory=$inventory}${post_deploy:+ post_deploy=$post_deploy}"
   exit 0
 fi
 if [ "$MODE" = "--check" ]; then
@@ -1167,6 +1210,7 @@ log "daemon up on $newv after $(( $(date +%s) - T0 ))s"
 # ---- members' governance surface, from the SAME checkout -----------------------------------------
 install_hooks
 install_inventory
+run_post_deploy "$newv"
 
 # ---- prune old backups (newest KEEP_BACKUPS stay) -----------------------------------------------------
 ls -1t "$HESTIA_HOME"/hestia.prev-* 2>/dev/null | tail -n +"$(( KEEP_BACKUPS + 1 ))" | while read -r f; do
@@ -1174,7 +1218,7 @@ ls -1t "$HESTIA_HOME"/hestia.prev-* 2>/dev/null | tail -n +"$(( KEEP_BACKUPS + 1
 done
 
 secret_hygiene
-log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory seats=$seats in $(( $(date +%s) - T0 ))s"
+log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory seats=$seats post_deploy=$post_deploy in $(( $(date +%s) - T0 ))s"
 
 # A DEPLOYED line with hooks != ok is HALF a deploy: the binary is current, the manifest is not,
 # and the dashboard reads stale (or unknown) until someone runs --hooks-only. Until 2026-08-27
