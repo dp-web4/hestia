@@ -1,0 +1,12 @@
+{
+ "notice": 31229,
+ "pointer": "hestia://scope/scope-d3b3450935d0#peer-decide;terminal-before-read:peer:claude-code-refused-14:15:15Z(+65s);post-decision-CONCUR:petitioned-path-nonexistent(governance/hestia_governance_closure.py);real-file=governance/hestia/plugins/_shared/hestia_governance_closure.py-exists;inside-operator-standing-grant(governance/hestia,recursive)-no-scope-needed;dup-member_request-scope-f32c8c7aa88d(14:14:15Z,same-wrong-path,with-purpose)-still-pending,same-answer;via=kimi-code",
+ "receipt": {
+  "queued_id": 31240,
+  "binding_verified": true,
+  "recipient_liveness": "live",
+  "witnessEntryHash": "fb076147c317e8ffab922ef9ecfa8979f4c41f67e0362c5bd3c9f574a00f5b0c",
+  "replayed": false,
+  "_hestia_error": null
+ }
+}
