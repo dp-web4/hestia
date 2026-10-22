@@ -28,7 +28,9 @@ _UNIT = re.compile(r"[a-zA-Z0-9_-]{1,80}\Z")
 
 
 class CandidateError(ValueError):
-    pass
+    def __init__(self, message, *, unresolved_targets=None):
+        super().__init__(message)
+        self.unresolved_targets = unresolved_targets
 
 
 def require(ok, message):
@@ -147,6 +149,54 @@ def manifest(reader, name, version):
     return m, rows(m["files"], sources=True, owner=name)
 
 
+def command_targets(registration, wanted):
+    """Resolve the published direct-command grammar; never interpret shell code.
+
+    Unknown syntax refuses, including wrappers, extra arguments and substitutions.
+    The runtime interpreter and environment are outside this artifact closure.
+    """
+    assignments = (
+        "HESTIA_HOME=@HESTIA_HOME@", "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@",
+        'HESTIA_ROLE="${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}"',
+        "CODEX_PLUGIN_ROOT=@HESTIA_PLUGIN_SOURCE@",
+    )
+    prefix = "(?:" + "|".join(re.escape(s) for s in assignments) + ")"
+    pattern = re.compile(
+        rf"(?:{prefix}[ \t]+)*(?:python3[ \t]+)?"
+        r"(?P<quote>['\"]?)@HESTIA_PLUGIN_ROOT@/(?P<path>[A-Za-z0-9_./-]+)(?P=quote)\Z")
+    targets, unresolved = set(), []
+    commands = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            if "command" in value:
+                commands.append(value["command"])
+            if "type" in value:
+                require(value["type"] == "command" and "command" in value,
+                        "unsupported registration hook type")
+            for key, child in value.items():
+                if key != "command":
+                    walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(registration["hooks"])
+    require(bool(commands), "registration has no commands")
+    for command in commands:
+        match = pattern.fullmatch(command) if isinstance(command, str) else None
+        if match:
+            path = relative(match["path"])
+            if path in wanted:
+                targets.add(path)
+                continue
+        unresolved.append(command)
+    if unresolved:
+        raise CandidateError("registration has unresolved command targets",
+                             unresolved_targets=unresolved)
+    return sorted(targets)
+
+
 def candidate(root, *, name, version, member):
     """Return a deterministic review candidate; no selection of latest/current."""
     unit(name)
@@ -175,6 +225,7 @@ def candidate(root, *, name, version, member):
         require(isinstance(reqs, list) and len(reqs) <= MAX_FILES, "invalid requirements")
         for req in reqs:
             require(isinstance(req, dict) and set(req) == {"unit", "path", "sha256"}, "invalid requirement")
+            require(req["unit"] not in (name, "_shared"), "dependency overlays reserved namespace")
             key = f"{unit(req['unit'])}/{relative(req['path'])}"
             require(key not in wanted, "overlapping or duplicate dependency path")
             wanted[key] = digest(req["sha256"])
@@ -184,21 +235,27 @@ def candidate(root, *, name, version, member):
         for path, expected in sorted(wanted.items()):
             data = reader.read(f"blobs/{expected[:2]}/{expected}")
             require(gt.canonical_digest(data) == expected, "blob differs from pinned digest")
-            if not path.endswith(".json"):
-                headers = [gt._HEADER_RE.match(line) for line in data.decode(
-                    "utf-8", "surrogateescape").split("\n")]
+            headers = [gt._HEADER_RE.match(line) for line in data.decode(
+                "utf-8", "surrogateescape").split("\n")]
+            if path.endswith(".json"):
+                require(not any(headers), "JSON blob contains a published header")
+            else:
                 require(sum(h is not None for h in headers) == 1
                         and gt.header_value(data) == expected, "published header differs from manifest")
             if path == registration_key:
                 reg = parse(data)
                 require(isinstance(reg, dict) and isinstance(reg.get("hooks"), dict)
                         and bool(reg["hooks"]), "registration has no hook-event map")
+                targets = command_targets(reg, wanted)
             files.append({"path": path, "canonical_sha256": expected,
                           "bytes_sha256": hashlib.sha256(data).hexdigest(), "size": len(data)})
         result = {"schema": "hook-certification-candidate/v1", "status": "uncertified",
                   "unit": name, "member": member, "gt_version": version,
                   "engine_version": pin["gt_version"],
                   "registration": {"path": registration_key, "sha256": own[registration]},
+                  "command_targets": targets, "unresolved_targets": [],
+                  "unverified_dependency_labels": sorted(
+                      [dict(req) for req in reqs], key=lambda req: (req["unit"], req["path"])),
                   "files": files}
         result["candidate_sha256"] = hashlib.sha256(json.dumps(
             result, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -221,7 +278,10 @@ def main(argv=None):
         print(json.dumps(candidate(args.store, name=args.unit, version=args.version,
                                    member=args.member), indent=2, sort_keys=True))
     except CandidateError as exc:
-        print(f"refused: {exc}", file=sys.stderr)
+        refusal = {"error": str(exc)}
+        if exc.unresolved_targets is not None:
+            refusal["unresolved_targets"] = exc.unresolved_targets
+        print(json.dumps(refusal, sort_keys=True), file=sys.stderr)
         return 2
     return 0
 

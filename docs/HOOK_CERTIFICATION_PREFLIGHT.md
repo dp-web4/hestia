@@ -14,15 +14,39 @@ and full version digest. It resolves that exact stored closure, never `current`,
 latest, live installed bytes or an ambient default directory. It checks:
 
 - the manifest's content address and member identity;
-- a bound registration artifact and its JSON hook-event map;
+- a bound registration artifact, its JSON hook-event map and every direct command
+  target's membership in the closure;
 - the exact pinned shared-engine manifest and file digests;
-- declared cross-unit file dependencies, with no overlapping destinations;
+- declared cross-unit file digests, with no overlapping destinations or additions
+  to the member's own or `_shared` namespace;
 - each blob's canonical digest and published header, and its full byte digest.
 
 The deterministic output is `hook-certification-candidate/v1`, explicitly
 `uncertified`. It lists logical artifact paths, versions, byte counts and digests,
 not hook contents or installation locations. Its candidate digest binds the whole
 review payload. This is evidence for later authorization, not authorization itself.
+
+`command_targets` lists the resolved script paths. Commands use the current
+published direct-command grammar: optional known environment assignments, optional
+`python3`, then one `@HESTIA_PLUGIN_ROOT@/unit/path` target (optionally quoted).
+The accepted assignments are `HESTIA_HOME=@HESTIA_HOME@`,
+`HESTIA_WORKSPACE=@HESTIA_WORKSPACE@`,
+`HESTIA_ROLE="${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}"`, and
+`CODEX_PLUGIN_ROOT=@HESTIA_PLUGIN_SOURCE@`. Other syntax, extra arguments, shell
+operators, wrappers, unknown placeholders and absolute script paths refuse.
+Unknown or missing targets appear in the refusal's `unresolved_targets` field
+on stderr, with no candidate on stdout. Successful candidates carry an empty
+`unresolved_targets`. The external `python3` interpreter, shell and substituted
+environment values are not pinned artifacts.
+
+`unverified_dependency_labels` lists **every** cross-unit dependency's declared
+unit, path and digest. The bytes match the digest, but the current `requires`
+schema has no dependency closure version: it cannot prove that those bytes were
+ever published by that unit under that path, or even that the unit exists.
+Consequently a dependency target in `command_targets` proves membership in the
+declared file set only. Dependencies are file-level, not transitive; their own
+imports and invoked programs are not automatically included. The member and
+engine inventories likewise do not establish runtime import completeness.
 
 For an already ingested store, run:
 
@@ -54,7 +78,7 @@ review the exact version and its independently established publication provenanc
 The later certification path must revalidate the reviewed candidate at commit;
 the projection path must revalidate against the certified record again on use.
 
-Registration JSON parsing is structural evidence only. It does not render commands,
+Registration parsing and direct-target checks are structural evidence only. They do not render commands,
 prove ownership of installed entries, prove that a registered command reaches the
 gate, or account for a harness's cached configuration. Those are projection and
 live-verification responsibilities, not properties of this candidate digest.
@@ -72,6 +96,10 @@ something to hide behind two sequential successful writes. A failure must preser
 the previous certified selection or expose a recoverable incomplete transaction.
 Certification alone must not activate projection or silently replace legacy gate
 expectations. Old and new evidence must remain distinguishable.
+Before claiming dependency provenance, extend `requires` to bind a dependency's
+closure version and validate its path/digest against that closure. Any certification
+using the current schema must preserve the unverified-label and nontransitive
+dependency limitations in the evidence shown to the operator.
 
 **4 — Projection from certification, not from this tool.** Startup, restore and
 repair must use the same path: resolve only the member's last certified closure,

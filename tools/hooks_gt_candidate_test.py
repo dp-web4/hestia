@@ -1,5 +1,7 @@
 """Hermetic certification-preflight checks; no installed hooks or vault access."""
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -36,7 +38,8 @@ class CandidateTests(unittest.TestCase):
             (base / "expects.json").write_text(json.dumps(spec))
             (base / "hooks/worker.py").write_text(f"print('{name}')\n")
             (base / "hooks/hooks.json").write_text(json.dumps({
-                "hooks": {"BeforeEvent": [{"command": "python3 ${ROOT}/hooks/worker.py"}]}}))
+                "hooks": {"BeforeEvent": [{"command":
+                    f"python3 @HESTIA_PLUGIN_ROOT@/{name}/hooks/worker.py"}]}}))
         shared = self.repo / "plugins/_shared"
         shared.mkdir()
         (shared / "RUNTIME_MANIFEST.txt").write_text("engine.py\n")
@@ -149,6 +152,100 @@ class CandidateTests(unittest.TestCase):
         self.rewrite(lambda m: m["requires"].append({
             "unit": "beta", "path": m["files"][0]["path"], "sha256": m["files"][0]["sha256"]}))
         with self.assertRaises(c.CandidateError):
+            self.get()
+
+    def test_dependency_cannot_extend_reserved_namespaces(self):
+        for name in ("beta", "_shared"):
+            with self.subTest(unit=name):
+                self.rewrite(lambda m: m.update(requires=[{
+                    "unit": name, "path": "extra.py", "sha256": m["files"][0]["sha256"]}]))
+                with self.assertRaisesRegex(c.CandidateError, "reserved namespace"):
+                    self.get()
+
+    def test_unverified_dependency_identity_is_explicit_and_digest_bound(self):
+        original = self.get()
+        for name in ("alpha", "nosuchunit"):
+            self.rewrite(lambda m: m.update(requires=[{
+                "unit": name, "path": "forged.py", "sha256": m["engine"]["files"][0]["sha256"]}]))
+            result = self.get()
+            labels = result["unverified_dependency_labels"]
+            self.assertEqual(labels[0]["unit"], name)
+            self.assertEqual(labels[0]["path"], "forged.py")
+            self.assertNotEqual(original["candidate_sha256"], result["candidate_sha256"])
+            claimed = result.pop("candidate_sha256")
+            self.assertEqual(claimed, c.hashlib.sha256(json.dumps(
+                result, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+
+    def set_registration(self, registration):
+        sha, _ = st.put_blob(self.root, json.dumps(registration).encode())
+
+        def change(m):
+            for row in m["files"]:
+                if row["path"] == m["registration"]:
+                    row["sha256"] = sha
+
+        self.rewrite(change)
+
+    def test_unresolved_command_targets_refuse_with_diagnostics(self):
+        target = "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"
+        for command in (
+            "python3 @HESTIA_PLUGIN_ROOT@/beta/hooks/ghost.py",
+            "python3 ${ROOT}/hooks/worker.py", "python3 /outside/worker.py",
+            "bash -c 'python3 " + target + "'", "python3 " + target + "; /outside/worker.py",
+            "python3 " + target + " $(outside)", "python3 " + target + " `outside`",
+            "env python3 " + target, "python3 " + target + " --extra=/outside/file",
+            "python3 @HESTIA_PLUGIN_ROOT@/beta/hooks/*.py", None,
+        ):
+            with self.subTest(command=command):
+                self.set_registration({"hooks": {"Event": [{"command": command}]}})
+                with self.assertRaises(c.CandidateError) as caught:
+                    self.get()
+                self.assertEqual(caught.exception.unresolved_targets, [command])
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = c.main(["--store", str(self.root), "--unit", "beta",
+                                 "--member", "beta-member", "--version", self.version])
+                self.assertEqual(rc, 2)
+                self.assertEqual(out.getvalue(), "")
+                self.assertEqual(json.loads(err.getvalue())["unresolved_targets"], [command])
+
+    def test_all_nested_command_targets_are_checked(self):
+        self.set_registration({"hooks": {"Event": [{"hooks": [
+            {"type": "command", "command": "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"},
+            {"type": "command", "command": "@HESTIA_PLUGIN_ROOT@/alpha/hooks/worker.py"}]}]}})
+        result = self.get()
+        self.assertEqual(result["command_targets"], ["alpha/hooks/worker.py", "beta/hooks/worker.py"])
+        self.assertEqual(result["unresolved_targets"], [])
+        self.set_registration({"hooks": {"Event": [{"hooks": [
+            {"command": "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"},
+            {"command": "@HESTIA_PLUGIN_ROOT@/alpha/hooks/missing.py"}]}]}})
+        with self.assertRaises(c.CandidateError):
+            self.get()
+
+    def test_empty_or_noncommand_hooks_refuse(self):
+        for hooks in ({"Event": []}, {"Event": [{"type": "prompt", "prompt": "do it"}]}):
+            self.set_registration({"hooks": hooks})
+            with self.assertRaises(c.CandidateError):
+                self.get()
+
+    def test_quoted_target_resolves_but_traversal_refuses(self):
+        self.set_registration({"hooks": {"Event": [{"command":
+            'python3 "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"'}]}})
+        self.assertEqual(self.get()["command_targets"], ["beta/hooks/worker.py"])
+        self.set_registration({"hooks": {"Event": [{"command":
+            "python3 @HESTIA_PLUGIN_ROOT@/beta/hooks/../hooks/worker.py"}]}})
+        with self.assertRaises(c.CandidateError):
+            self.get()
+
+    def test_nonregistration_json_cannot_hide_digest_header(self):
+        # Derive a recognized header from a published non-JSON blob.
+        header = next(line for line in self.blob().read_bytes().splitlines()
+                      if st.hooks_gt._HEADER_RE.match(line.decode()))
+        data = header + b'\n{}\n'
+        sha, _ = st.put_blob(self.root, data)
+        self.rewrite(lambda m: m["files"].append({
+            "path": "extra.json", "source": "plugins/beta/extra.json", "sha256": sha}))
+        with self.assertRaisesRegex(c.CandidateError, "JSON blob contains"):
             self.get()
 
     def test_duplicate_dependency_refuses(self):
