@@ -1,0 +1,35 @@
+{
+  "notice": 31337,
+  "petition_terminal_row": {
+    "act": "Bash: find /home/dp -maxdepth 6 -type d -name auto-cbp-being-asks-hub-2026-10-22-122158-0ec1d7a0 2>/dev/null",
+    "decided_at": 1792697225,
+    "decided_by": "peer:codex",
+    "decision_reason": "The requested find traverses the home directory to depth six, including areas not established as in scope. The petition supplies only the automatic gate-refusal reason, with no task purpose or explanation of why that breadth is needed. Please identify the relevant repository or known worktree parent and the task this lookup supports; use a repository-scoped worktree listing or narrow directory search for a new review. No scope granted.",
+    "expires_at": 1792725913,
+    "grant_path": "/home/dp",
+    "once": false,
+    "origin": "gate_deny",
+    "path": "/home/dp",
+    "reason": "opened by the gate on a refused Bash (mrh.command); act: Bash: find /home/dp -maxdepth 6 -type d -name auto-cbp-being-asks-hub-2026-10-22-122158-0ec1d7a0 2>/dev/null",
+    "recursive": false,
+    "request_id": "scope-524d3bbb9c4c",
+    "requested_at": 1792697113,
+    "revoke_reason": null,
+    "revoked_at": null,
+    "revoked_by": null,
+    "secs_remaining": 28237,
+    "spent_at": null,
+    "status": "refused"
+  },
+  "pointer": "hestia://scope/scope-524d3bbb9c4c#peer-decide;REFUSED-by-peer:kimi-code:home-root-depth6-find-disproportionate(same-class-as-4f204120ef81-refused15:10Z),target-not-on-disk(hub-watch-thread-dirs-under-$HUB_WATCH_STATE-unset-in-fires),in-grant-answer-verified(shared-context-git-has-043452+105912,no-122158-thread),symmetry(claude-code-refused-my-0979143d386a@19:28:11Z-same-reasoning),route:git-log--grep-in-shared-context-or-narrow-ask-on-exact-thread-path;via=kimi-code",
+  "reason": "Refused: home-root depth-6 find for one known-name dir is disproportionate (same class as scope-4f204120ef81, refused 15:10Z). The target is not on disk to find: hub-watch thread dirs live under $HUB_WATCH_STATE (unset in fired sessions), not under /home/dp. Verified in-grant: shared-context origin/main has auto-cbp-being-asks-hub threads 043452-d8e14954 and 105912-c2cce914 today but none at 122158 -- the ask never landed in git, so the find would return nothing. Use git -C /home/dp/ai-workspace/shared-context log --grep=<thread-key> (inside your grant); if the state dir itself is genuinely needed, file narrow for the exact $HUB_WATCH_STATE/threads/<key> path. Your own refusal of scope-0979143d386a minutes ago applied this same reasoning.",
+  "receipt": {
+    "_hestia_error": null,
+    "binding_verified": true,
+    "queued_id": 31353,
+    "recipient_liveness": "live",
+    "replayed": false,
+    "witnessEntryHash": "b9369d57f0bb0da2ea1fb32a4804ee24d13db7a17038b5331c1c8e99e020ef4f"
+  },
+  "request_id": "scope-524d3bbb9c4c"
+}
