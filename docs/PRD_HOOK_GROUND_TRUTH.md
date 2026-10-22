@@ -1,7 +1,10 @@
 # PRD: hook ground truth — the repo publishes, the vault certifies, the daemon projects
 
-**Status:** DRAFT, with dp's decisions recorded (§5). This records dp's design (2026-09-28) against
-the measured gaps. Nothing here is built yet.
+**Status:** PARTIALLY IMPLEMENTED, with dp's decisions recorded (§5). This records dp's design
+(2026-09-28) against the measured gaps. Slices 1–2 are merged (#1160, #1161): published artifacts
+and an inert local store. Slice 3a adds a [read-only certification preflight](HOOK_CERTIFICATION_PREFLIGHT.md).
+Authority-bearing vault certification and startup/repair projection remain unimplemented;
+a verified candidate is not certification, and #1157 is not fixed by this preflight.
 **Closes, when built:**
 - the deploy half of dp's vault requirement (findings/ratified-hooks-are-compared-not-deployed-2026-09-28.md);
 - #1156 (a de-registered gate reads VERIFIED);
