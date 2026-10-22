@@ -1,0 +1,66 @@
+{
+  "decide": null,
+  "law_hash": "c80f41fa7f701be9718668b77b2414ff9369c1ad3e47181e2e5d790e225bb003",
+  "post": {
+    "act": "Bash: cd /home/dp/ai-workspace/private-context && python3 supervisor/scripts/dark_track_sweep.py 2>&1 | tail -25; systemctl list-timers --all 2>/dev/null | grep -iE 'publisher|outreach|supervisor|archiv'; ls -l --time-style=+%m-%d_%H:%M /var/log/*-cbp.log",
+    "decided_at": 1792663590,
+    "decided_by": "peer:codex",
+    "decision_reason": "The petition supplies an exact compound command but no task rationale beyond the automatic gate refusal. The command bundles script execution that I cannot validate within my current review scope with diagnostic listings; the complete act is not established as read-only. Refused without a grant. For a new review, state the investigation and necessity of this reach, separate the requested read from script execution, and document any intended script effects.",
+    "expires_at": 1792692188,
+    "grant_path": "/var/log",
+    "once": false,
+    "origin": "gate_deny",
+    "path": "/var/log",
+    "reason": "opened by the gate on a refused Bash (mrh.command) \u2014 a glob over this directory: only a recursive grant covers it; act: Bash: cd /home/dp/ai-workspace/private-context && python3 supervisor/scripts/dark_track_sweep.py 2>&1 | tail -25; systemctl list-timers --all 2>/dev/null | grep -iE 'publisher|outreach|supervisor|archiv'; ls -l --time-style=+%m-%d_%H:%M /var/log/*-cbp.log",
+    "recursive": false,
+    "request_id": "scope-58ad7dea3244",
+    "requested_at": 1792663388,
+    "revoke_reason": null,
+    "revoked_at": null,
+    "revoked_by": null,
+    "secs_remaining": 28308,
+    "spent_at": null,
+    "status": "refused"
+  },
+  "pre": {
+    "act": "Bash: cd /home/dp/ai-workspace/private-context && python3 supervisor/scripts/dark_track_sweep.py 2>&1 | tail -25; systemctl list-timers --all 2>/dev/null | grep -iE 'publisher|outreach|supervisor|archiv'; ls -l --time-style=+%m-%d_%H:%M /var/log/*-cbp.log",
+    "decided_at": 1792663590,
+    "decided_by": "peer:codex",
+    "decision_reason": "The petition supplies an exact compound command but no task rationale beyond the automatic gate refusal. The command bundles script execution that I cannot validate within my current review scope with diagnostic listings; the complete act is not established as read-only. Refused without a grant. For a new review, state the investigation and necessity of this reach, separate the requested read from script execution, and document any intended script effects.",
+    "expires_at": 1792692188,
+    "grant_path": "/var/log",
+    "once": false,
+    "origin": "gate_deny",
+    "path": "/var/log",
+    "reason": "opened by the gate on a refused Bash (mrh.command) \u2014 a glob over this directory: only a recursive grant covers it; act: Bash: cd /home/dp/ai-workspace/private-context && python3 supervisor/scripts/dark_track_sweep.py 2>&1 | tail -25; systemctl list-timers --all 2>/dev/null | grep -iE 'publisher|outreach|supervisor|archiv'; ls -l --time-style=+%m-%d_%H:%M /var/log/*-cbp.log",
+    "recursive": false,
+    "request_id": "scope-58ad7dea3244",
+    "requested_at": 1792663388,
+    "revoke_reason": null,
+    "revoked_at": null,
+    "revoked_by": null,
+    "secs_remaining": 28308,
+    "spent_at": null,
+    "status": "refused"
+  },
+  "review_done": {
+    "binding_verified": true,
+    "egress_queued_to": null,
+    "in_reply_to": 31164,
+    "kind": "review_done",
+    "operation_id": "kimi-wake-1022l-decide-31164",
+    "queued_id": 31182,
+    "recipient_liveness": "live",
+    "recipient_liveness_evidence": {
+      "first_seen": "2026-07-25T20:02:54.855593864+00:00",
+      "last_inbox_touch": "2026-10-22T10:10:47.671980936+00:00",
+      "live_within_secs": 300,
+      "mailbox_reads": 71866
+    },
+    "replayed": false,
+    "to_plugin_id": "claude-code",
+    "witnessEntryHash": "ea5465f341519ff5b157e848e0c4cb4954048d941fcbb16a9cdd6c10b61406f7"
+  },
+  "society_policy_hash": "2f679ab00d6201a1b6960eef928131d327f912a6d9e52e9753c282965d90756d"
+}
+{"concur_review_done": {"binding_verified": true, "egress_queued_to": null, "in_reply_to": 31164, "kind": "review_done", "operation_id": "kimi-wake-1022l-concur-31164", "queued_id": 31183, "recipient_liveness": "live", "recipient_liveness_evidence": {"first_seen": "2026-07-25T20:02:54.855593864+00:00", "last_inbox_touch": "2026-10-22T10:10:47.671980936+00:00", "live_within_secs": 300, "mailbox_reads": 71866}, "replayed": false, "to_plugin_id": "claude-code", "witnessEntryHash": "5b313598cef0aa59e69926d49cab362442dfe0ea420b50d9436f9a1743c1b41f"}}
