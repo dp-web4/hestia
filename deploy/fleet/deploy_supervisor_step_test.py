@@ -88,17 +88,22 @@ def systemd_environment(unit_text):
     return env
 
 
-def run(*, workspace="ws", cargo=True, os_name="Linux", env_extra=None, timer_enabled=False):
+def run(*, workspace="ws", cargo=True, os_name="Linux", env_extra=None, timer_enabled=False,
+        check_timer_present=False):
     with tempfile.TemporaryDirectory() as t:
         t = pathlib.Path(t)
         home, bin_stubs = t / "home", t / "stubs"
         home.mkdir()
         bin_stubs.mkdir()
+        if check_timer_present:
+            (home / ".config/systemd/user").mkdir(parents=True)
+            (home / ".config/systemd/user/hestia-deploy-check.timer").write_text("old\n")
         calls = t / "systemctl.log"
         # git clone <url> <dest>: lay down the deploy/from-main files a real clone would carry.
         stub(bin_stubs, "git", f"""dest="$4"
 mkdir -p "$dest/.git" "$dest/deploy/from-main"
-cp "{FROM_MAIN}/hestia-deploy.sh" "{FROM_MAIN}/hestia-deploy.service" "{FROM_MAIN}/hestia-deploy.timer" "$dest/deploy/from-main/"
+cp "{FROM_MAIN}/hestia-deploy.sh" "{FROM_MAIN}/hestia-deploy.service" "{FROM_MAIN}/hestia-deploy.timer" \
+   "{FROM_MAIN}/hestia-deploy-check.service" "{FROM_MAIN}/hestia-deploy-check.timer" "$dest/deploy/from-main/"
 """)
         if cargo:
             stub(bin_stubs, "cargo", "exit 0\n")
@@ -130,6 +135,8 @@ exit 0
             "calls": calls.read_text().splitlines() if calls.exists() else [],
             "unit": unit.read_text() if unit.exists() else None,
             "timer": (home / ".config/systemd/user/hestia-deploy.timer").exists(),
+            "check_units": all((home / ".config/systemd/user" / u).exists()
+                               for u in ("hestia-deploy-check.service", "hestia-deploy-check.timer")),
             "script": (home / ".local/bin/hestia-deploy").exists(),
             "ws": ws,
         }
@@ -145,9 +152,18 @@ check("HESTIA_WORKSPACE rendered into the unit",
       r["unit"] is not None and systemd_environment(r["unit"]).get("HESTIA_WORKSPACE") == r["ws"],
       r["unit"])
 check("units reloaded", "--user daemon-reload" in r["calls"], r["calls"])
-check("timer NOT enabled by default", not any("enable" in c and "is-enabled" not in c for c in r["calls"]),
+check("deploy timer NOT enabled by default",
+      not any("enable" in c and "is-enabled" not in c and "hestia-deploy.timer" in c for c in r["calls"]),
       r["calls"])
+check("update-check units installed", r["check_units"], r["out"])
+check("update-check timer enabled on first install",
+      "--user enable --now hestia-deploy-check.timer" in r["calls"], r["calls"])
 check("says auto-update is off", "auto-update OFF" in r["out"], r["out"])
+
+# 1b. A re-run where the check timer is already installed leaves the operator's choice alone.
+r = run(check_timer_present=True)
+check("re-run does not re-enable the update-check timer",
+      not any("hestia-deploy-check.timer" in c for c in r["calls"]), r["calls"])
 
 # 2. Opt-in arms the timer.
 r = run(env_extra={"HESTIA_AUTO_UPDATE": "1"})
