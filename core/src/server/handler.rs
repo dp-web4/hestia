@@ -17901,6 +17901,89 @@ mod tests {
         );
     }
 
+    /// #366 through the REAL claim handler: a grant approved 900 s ago and never observed
+    /// (lapsed) is claimed by the asker session's byte-identical re-issue, instead of minting a
+    /// duplicate petition (cf54d46850bcdfe0 → d9b167e12a7283b8, 2026-10-21). A sibling session
+    /// on the same seat re-issuing the same act does not claim it, and neither does the asker
+    /// re-issuing a different act; the grant stays lapsed and unobserved for both.
+    #[tokio::test]
+    async fn the_askers_exact_reissue_claims_a_grant_ruled_while_it_was_idle() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+        let (_dir, shared) = make_shared_state();
+        let connect = |hs: &'static str| {
+            let shared = shared.clone();
+            async move {
+                tool_connect(
+                    &shared,
+                    &json!({ "plugin_id": "claude-code", "host_agent": "h", "host_session_id": hs }),
+                )
+                .await
+                .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let asker = connect("hs-asker").await;
+        let sibling = connect("hs-sibling").await;
+        const ACT: &str = "Bash: git -C /tmp/wt apply /tmp/gt.patch";
+        let claim = |sid: &str, act: &str, inv: &str| json!({
+            "plugin_id": "claude-code", "session_id": sid, "tool_name": "Bash",
+            "marker": "hestia_governance_closure.py", "reason": act, "invocation_key": inv,
+        });
+
+        let opened = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-open")).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(&id, true, "operator", "role:constellation:sovereign",
+                        Channel::OperatorSession, None, Some("k"), now_secs() - 900)
+                .expect("the sovereign channel approves");
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert_eq!(e.host_session_id.as_deref(), Some("hs-asker"), "fixture: asker recorded");
+            assert!(e.observed_at.is_none() && !e.is_claimable(now_secs()), "precondition: lapsed unobserved");
+        }
+
+        let sib = tool_gate_escalation_claim(&shared, &claim(&sibling, ACT, "inv-sib")).await.unwrap();
+        assert_ne!(sib["claimed"], json!(true), "a sibling session's re-issue claimed the asker's grant: {sib}");
+        let other = tool_gate_escalation_claim(&shared, &claim(&asker, "Bash: git apply /tmp/other.patch", "inv-other"))
+            .await.unwrap();
+        assert_ne!(other["claimed"], json!(true), "a different act claimed the grant: {other}");
+        {
+            let s = shared.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert!(e.observed_at.is_none() && e.consumed_at.is_none(), "untouched by both: {e:?}");
+        }
+
+        // Nova's review of #1363: observation only AFTER the authenticated session binding.
+        // (a) No session at all: an unattributed caller naming the asker's member and exact act
+        //     has no proven host session, so nothing is observed and nothing is claimed.
+        let anon = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "claude-code", "tool_name": "Bash", "marker": "hestia_governance_closure.py",
+            "reason": ACT, "invocation_key": "inv-anon",
+        })).await;
+        if let Ok(v) = &anon {
+            assert_ne!(v["claimed"], json!(true), "an unattributed re-issue claimed the asker's grant: {v}");
+        }
+        // (b) The asker's own session, but ASSERTING another host session: the precedence block
+        //     refuses the call before observation, so the grant stays unobserved.
+        let mut forged = claim(&asker, ACT, "inv-forged");
+        forged["host_session_id"] = json!("hs-sibling");
+        let refused = tool_gate_escalation_claim(&shared, &forged).await;
+        assert!(refused.is_err(), "a mismatched host_session_id must be refused: {refused:?}");
+        {
+            let s = shared.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert!(e.observed_at.is_none() && e.consumed_at.is_none(),
+                    "neither the unattributed nor the forged call may observe or spend: {e:?}");
+        }
+
+        let mine = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-reissue")).await.unwrap();
+        assert_eq!(mine["claimed"], json!(true), "the asker's exact re-issue must claim its lapsed grant: {mine}");
+        assert_eq!(mine["escalation_id"], json!(id), "{mine}");
+    }
+
     /// THE CLAIMABLE REPLY STATES THE ANCHOR ITS OWN CALL USES (GPT review of #613 @ dd3f1b1).
     ///
     /// `hestia_gate_escalation_claimable` observes the asking session's own grants before it
@@ -25285,6 +25368,15 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         attempted_act.as_deref(),
         &resolved_targets,
     );
+    // RE-ISSUING IS OBSERVING (#366): the proven asker session re-issuing this exact act has
+    // learned of its ruling, so its matching grant is observed before the spend is tried. A
+    // grant approved while the asker sat idle is then claimed by the re-issue the deny asked
+    // for, instead of lapsing at decided_at + 600 and minting a duplicate petition. The key is
+    // the DERIVED host session above, never the caller's assertion (the precedence block).
+    if let Some(h) = proven_host_session_id.as_deref() {
+        s.gate_escalations
+            .observe_reissue(&plugin_id, h, &marker, attempted_act.as_deref(), now);
+    }
     if let Some(esc) = s.gate_escalations.claim_bound(
         &plugin_id,
         &marker,

@@ -2797,6 +2797,52 @@ impl EscalationStore {
         mine.into_iter().filter(|id| self.mark_observed(id, plugin_id, now)).collect()
     }
 
+    /// RE-ISSUING IS OBSERVING (#366). The asker that re-issues the very act it was refused has
+    /// learned of the ruling by any reading — that re-issue is what the deny told it to do. Yet
+    /// only a poll or a `claimable` call recorded an observation, so a grant approved while the
+    /// asker sat idle died at `decided_at + 600` and its exact re-issue minted a duplicate
+    /// petition for the operator to rule again (cf54d46850bcdfe0 → d9b167e12a7283b8,
+    /// 2026-10-21; the #366 census: 26 of 103 approvals lapsed in a week). A poll from the
+    /// same session would have revived it, so this adds no authority the asker lacked — it
+    /// removes a step only a seat that already knew the trick would take.
+    ///
+    /// Narrower than `observe_session_grants`: only rows of this proven asker session whose
+    /// marker AND act digest equal the incoming act's, so re-issuing one act never starts the
+    /// fuse of another. Each passes `mark_observed`'s own conjuncts (approved, bar met, unspent,
+    /// first observation), and `decided_horizon` keeps its outer cap at `expires_at + 600`.
+    pub fn observe_reissue(
+        &mut self,
+        plugin_id: &str,
+        host_session_id: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        now: u64,
+    ) -> Vec<String> {
+        let (plugin_id, marker) = (plugin_id.trim(), marker.trim());
+        if host_session_id.trim().is_empty() || plugin_id.is_empty() || marker.is_empty() {
+            return Vec::new();
+        }
+        let Some(want) = attempted_act
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(Self::act_digest_of)
+        else {
+            return Vec::new();
+        };
+        let mine: Vec<String> = self
+            .by_id
+            .values()
+            .filter(|e| {
+                e.plugin_id == plugin_id
+                    && e.marker == marker
+                    && e.host_session_id.as_deref() == Some(host_session_id)
+                    && e.act_digest.as_deref() == Some(want.as_str())
+            })
+            .map(|e| e.id.clone())
+            .collect();
+        mine.into_iter().filter(|id| self.mark_observed(id, plugin_id, now)).collect()
+    }
+
     pub fn claimable_for(&self, plugin_id: &str, now: u64) -> Vec<&Escalation> {
         let mut out: Vec<&Escalation> = self
             .by_id
@@ -5645,6 +5691,59 @@ mod tests {
                  not one predicate at all (offset {offset})"
             );
         }
+    }
+
+    /// #366: the asker's exact re-issue observes its own grant, and only that grant. A grant
+    /// ruled at T0+5 and never observed is lapsed at T0+1200 (decided_at + 600); before this,
+    /// its byte-identical re-issue found nothing claimable and minted a duplicate petition.
+    /// Arms: another session, another act, another marker observe nothing; the asker's
+    /// re-issue observes exactly the matching row and leaves a sibling grant of the same
+    /// session unarmed; and the outer cap (`expires_at + 600`) still holds after observation.
+    #[test]
+    fn a_reissue_observes_only_its_own_matching_grant() {
+        let mut s = EscalationStore::default();
+        let open = |s: &mut EscalationStore, marker: &str, act: &str, host: &str| {
+            let id = s
+                .open("claude-code", "r", "Bash", marker, Some(act), None, None, T0, DEFAULT_TTL_SECS)
+                .unwrap()
+                .id;
+            assert!(s.record_seat_keys(&id, None, Some(host), None));
+            s.decide(&id, true, "operator", "role:constellation:sovereign",
+                     Channel::OperatorSession, None, Some("k"), T0 + 5)
+                .unwrap();
+            id
+        };
+        let id = open(&mut s, "pre_tool_use.py", TEST_ACT, "hs-asker");
+        let other_act = open(&mut s, "pre_tool_use.py", "Edit -> /repo/other.rs", "hs-asker");
+        let late = T0 + 1200;
+        assert!(!s.get(&id).unwrap().is_claimable(late), "precondition: lapsed unobserved");
+
+        assert!(s.observe_reissue("claude-code", "hs-sibling", "pre_tool_use.py", Some(TEST_ACT), late).is_empty(),
+                "a sibling session's identical re-issue observes nothing");
+        assert!(s.observe_reissue("claude-code", "hs-asker", "pre_tool_use.py", Some("Bash: rm -rf /"), late).is_empty(),
+                "a different act observes nothing");
+        assert!(s.observe_reissue("claude-code", "hs-asker", "other.py", Some(TEST_ACT), late).is_empty(),
+                "a different marker observes nothing");
+        assert!(s.observe_reissue("codex", "hs-asker", "pre_tool_use.py", Some(TEST_ACT), late).is_empty(),
+                "another member observes nothing");
+        assert!(s.observe_reissue("claude-code", "hs-asker", "pre_tool_use.py", None, late).is_empty(),
+                "an unnamed act observes nothing");
+        assert_eq!(s.get(&id).unwrap().observed_at, None);
+
+        assert_eq!(s.observe_reissue("claude-code", "hs-asker", "pre_tool_use.py", Some(TEST_ACT), late),
+                   vec![id.clone()]);
+        assert!(s.get(&id).unwrap().is_claimable(late), "observed at the re-issue: claimable again");
+        assert_eq!(s.get(&other_act).unwrap().observed_at, None,
+                   "re-issuing one act never starts the fuse of another");
+        let claimed = s.claim("claude-code", "pre_tool_use.py", Some(TEST_ACT), late).expect("claims");
+        assert_eq!(claimed.id, id);
+
+        // Outer cap: observation never stretches a grant past expires_at + 600.
+        let capped = open(&mut s, "cap.py", TEST_ACT, "hs-asker");
+        let past = s.get(&capped).unwrap().expires_at + APPROVAL_CLAIM_WINDOW_SECS + 1;
+        assert_eq!(s.observe_reissue("claude-code", "hs-asker", "cap.py", Some(TEST_ACT), past),
+                   vec![capped.clone()], "observed (mark_observed does not read the clock)…");
+        assert!(!s.get(&capped).unwrap().is_claimable(past), "…but not claimable past the cap");
     }
 
     /// Observation must not re-arm a SPENT permit. `mark_observed` read four conjuncts and
