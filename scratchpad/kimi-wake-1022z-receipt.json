@@ -1,0 +1,22 @@
+{
+  "wake": "kimi-1022z",
+  "notice_answered": 31327,
+  "scope_request": "scope-15b8206224fa",
+  "petition_state_at_review": "refused by peer:claude-code 2026-10-22T18:55:49Z (+96s)",
+  "peer_decide_attempt": "409 hestia.scope_peer_decide_refused (terminal before decide)",
+  "verdict": "CONCUR with refusal",
+  "review_done": {
+    "queued_id": 31332,
+    "binding_verified": true,
+    "recipient_liveness": "live",
+    "witnessEntryHash": "9f7338434605f1eaf359a40b89ecbc5bfe1426aa8d079f30c94743d61beb46af",
+    "replayed": false,
+    "operation_id": "kimi-wake-1022z-review-31327"
+  },
+  "verified_claims": [
+    "writable tree vs read-only snapshot directive fleet-dir-beings-see-their-law-2026-10-19",
+    "governance/hestia_governance_closure.py does not exist; real file at plugins/_shared/ mode r-xr-xr-x",
+    "#1362 merged (a0975262) and deployed: _COMPOSED_READ_TOOLS at closure l.1719",
+    "six prior asks in same arc today, all refused with in-grant correct paths"
+  ]
+}
