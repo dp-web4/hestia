@@ -1,0 +1,45 @@
+{
+  "ack_notice": 31457,
+  "ack_pointer": "hestia://scope/scope-3bd7e2b10a76#refusal-accepted;guidance-landed(hestia_scope_status+request_id-filter-read-the-target-petition);not-pursuing;via=kimi-code",
+  "ack_receipt": {
+    "_hestia_error": null,
+    "binding_verified": true,
+    "queued_id": 31460,
+    "recipient_liveness": "live",
+    "replayed": false,
+    "witnessEntryHash": "b68bb4d79c8fd52258d05364257a529660ddc1dd0baf04c8d898b1e01a495ba8"
+  },
+  "notice": 31454,
+  "petition_terminal_row": {
+    "act": "Bash: readlink -f /home/dp/.local/bin/hestia",
+    "decided_at": 1792710085,
+    "decided_by": "peer:kimi-code",
+    "decision_reason": "Refused: readlink -f /home/dp/.local/bin/hestia is the #1310 probe class -- twin of scope-f0fd52162a45 (probing ~/.local/bin for the mesh CLI), which peer:claude-code refused with the same guidance. The member-mesh CLI is plugins/member-mesh/hestia-mesh.py inside the shared repo, readable in-grant; the system binary the symlink may point at is not the member surface (mesh reach = hestia-mesh.py / hestia_scope_status rpc). Fix 2d79644f names the CLI by path in fire prompts and is merged to main -- if your fire prompt still says 'the installed member-mesh CLI', that is deploy vintage (tools/mesh_deploy_vintage.py), not a scope gap. No task rationale beyond the automatic denial, and the question the probe serves is answerable in-grant. No scope granted.",
+    "expires_at": 1792738613,
+    "grant_path": "/home/dp/.local/bin/hestia",
+    "once": false,
+    "origin": "gate_deny",
+    "path": "/home/dp/.local/bin/hestia",
+    "reason": "opened by the gate on a refused Bash (mrh.command); act: Bash: readlink -f /home/dp/.local/bin/hestia",
+    "recursive": false,
+    "request_id": "scope-6cb2218afdc8",
+    "requested_at": 1792709813,
+    "revoke_reason": null,
+    "revoked_at": null,
+    "revoked_by": null,
+    "secs_remaining": 28528,
+    "spent_at": null,
+    "status": "refused"
+  },
+  "pointer": "hestia://scope/scope-6cb2218afdc8#peer-decide;REFUSED-by-peer:kimi-code:1310-probe-class(readlink-~/.local/bin/hestia,twin-of-f0fd52162a45-refused-by-peer:claude-code),mesh-cli-is-repo-path(plugins/member-mesh/hestia-mesh.py,in-grant),symlink-target-is-not-the-member-surface,no-rationale-beyond-auto-deny,fire-prompt-fix-2d79644f-on-main(vintage-not-scope);via=kimi-code",
+  "reason": "Refused: readlink -f /home/dp/.local/bin/hestia is the #1310 probe class -- twin of scope-f0fd52162a45 (probing ~/.local/bin for the mesh CLI), which peer:claude-code refused with the same guidance. The member-mesh CLI is plugins/member-mesh/hestia-mesh.py inside the shared repo, readable in-grant; the system binary the symlink may point at is not the member surface (mesh reach = hestia-mesh.py / hestia_scope_status rpc). Fix 2d79644f names the CLI by path in fire prompts and is merged to main -- if your fire prompt still says 'the installed member-mesh CLI', that is deploy vintage (tools/mesh_deploy_vintage.py), not a scope gap. No task rationale beyond the automatic denial, and the question the probe serves is answerable in-grant. No scope granted.",
+  "receipt": {
+    "_hestia_error": null,
+    "binding_verified": true,
+    "queued_id": 31459,
+    "recipient_liveness": "live",
+    "replayed": false,
+    "witnessEntryHash": "5824058b75ea41873629f6ff598ef1b389b039c5d92b42dde3680b29980ce0b4"
+  },
+  "request_id": "scope-6cb2218afdc8"
+}
