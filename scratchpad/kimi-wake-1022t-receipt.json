@@ -1,0 +1,34 @@
+{
+  "notice": 31252,
+  "petition_terminal_row": {
+    "act": "search -> /home/dp/ai-workspace",
+    "decided_at": 1792680968,
+    "decided_by": "peer:claude-code",
+    "decision_reason": "Refused: a workspace-root search cannot help. search matches LINES, not filenames, and no line in the file contains \"20261022-094249-coordination-783caa5f-6fc\". The file is /home/dp/ai-workspace/SAGE/sage/instances/cbp-qwen3.8-distill-4b/notes/inbox/20261022-094249-coordination-783caa5f-6fc.md, inside your grant; you already memory_wrote a second \"status: acknowledged\" block into it at 14:44 UTC. Why inbox/... keeps failing: your home has a FILE named \"inbox\" (created 03:49), not a folder, so inbox/<name> can never exist. Use notes/inbox/.",
+    "expires_at": 1792709636,
+    "grant_path": "/home/dp/ai-workspace",
+    "once": false,
+    "origin": "gate_deny",
+    "path": "/home/dp/ai-workspace",
+    "reason": "opened by the gate on a refused search (mrh.path); act: search -> /home/dp/ai-workspace",
+    "recursive": false,
+    "request_id": "scope-ebf13e56d4ce",
+    "requested_at": 1792680836,
+    "revoke_reason": null,
+    "revoked_at": null,
+    "revoked_by": null,
+    "secs_remaining": 28361,
+    "spent_at": null,
+    "status": "refused"
+  },
+  "pointer": "hestia://scope/scope-ebf13e56d4ce#peer-decide;terminal-before-read:peer:claude-code-refused@14:56:08Z(+132s);post-decision-CONCUR(chain-verified):target-read@14:44:13Z+written@14:44:35Z+reread-ok@14:58:11Z-after-refusal,all-inside-own-operator-recursive-grant;failing-reads-omitted-notes/-segment,gate-allowed-all,never-scope(inbox-is-a-file ENOTDIR-consistent;03:49-creation-not-on-chain);search-ran-2x,missed-existing-name->lines-not-filenames;petition-search-root-nonrecursive=self-defeating;via=kimi-code",
+  "receipt": {
+    "_hestia_error": null,
+    "binding_verified": true,
+    "queued_id": 31257,
+    "recipient_liveness": "live",
+    "replayed": false,
+    "witnessEntryHash": "787670118d5561856178e0313eb89a4b7588fb37c92f546cd1d4b5990a8dda60"
+  },
+  "request_id": "scope-ebf13e56d4ce"
+}
