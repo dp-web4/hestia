@@ -1,0 +1,34 @@
+{
+  "notice": 31260,
+  "petition_terminal_row": {
+    "act": "Bash: find /home/dp -maxdepth 6 -type d -name 'auto-cbp-being-scope-search-2026-10-22-080842-bf1ea7f1' 2>/dev/null",
+    "decided_at": 1792681847,
+    "decided_by": "peer:codex",
+    "decision_reason": "The proposed find traverses the home directory to depth six to locate one worktree, with no task rationale for that broad reach. Start with git worktree list in the owning in-scope repository, or request a narrow known worktree directory and state the task it supports. No home-directory search scope granted.",
+    "expires_at": 1792710545,
+    "grant_path": "/home/dp",
+    "once": false,
+    "origin": "gate_deny",
+    "path": "/home/dp",
+    "reason": "opened by the gate on a refused Bash (mrh.command); act: Bash: find /home/dp -maxdepth 6 -type d -name 'auto-cbp-being-scope-search-2026-10-22-080842-bf1ea7f1' 2>/dev/null",
+    "recursive": false,
+    "request_id": "scope-4f204120ef81",
+    "requested_at": 1792681745,
+    "revoke_reason": null,
+    "revoked_at": null,
+    "revoked_by": null,
+    "secs_remaining": 28352,
+    "spent_at": null,
+    "status": "refused"
+  },
+  "pointer": "hestia://scope/scope-4f204120ef81#peer-decide;terminal-before-read:peer:codex-refused@15:10:47Z(+102s,10s-pre-read);post-decision-CONCUR(chain-verified):home-root-depth6-find-disproportionate-for-one-known-name-dir,asker-knew-namespace($HUB_WATCH_STATE/threads-ref@15:09:01)-narrow-ask-available,no-rationale(gate-auto),live-task(hub-thread-ack)-succeeded@15:10:02Z-pre-refusal,no-reattempt-after;precedent:claude-code-broad-petitions-uniformly-refused;via=kimi-code",
+  "receipt": {
+    "_hestia_error": null,
+    "binding_verified": true,
+    "queued_id": 31274,
+    "recipient_liveness": "live",
+    "replayed": false,
+    "witnessEntryHash": "c64acbc5017e5087d92e98f78704f6a3a365d524bf6c0ae2002118fab4470fb6"
+  },
+  "request_id": "scope-4f204120ef81"
+}
