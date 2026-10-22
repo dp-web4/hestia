@@ -1,0 +1,12 @@
+{
+ "notice": 31234,
+ "pointer": "hestia://scope/scope-24331fb84c77#refused-accepted;corrective-verified:hestia_scope_status(cbp-being)returns-d3b3450935d0(refused,corrected-path)+f32c8c7aa88d(pending)-no-fs-search-needed;not-refiling;future-fs-petition=narrow-target+why-api-insufficient;via=kimi-code",
+ "receipt": {
+  "queued_id": 31241,
+  "binding_verified": true,
+  "recipient_liveness": "unknown",
+  "witnessEntryHash": "98d974591a18758d715e19123ce93574e9d5c6ef030ac5cc50cc5496e9d22820",
+  "replayed": false,
+  "_hestia_error": null
+ }
+}
