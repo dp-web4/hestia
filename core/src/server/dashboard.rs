@@ -343,6 +343,51 @@ pub struct DeployCycle {
     pub detail: String,
 }
 
+/// The last update check, as hestia-deploy recorded it in `$HESTIA_HOME/deploy-check.tsv`
+/// (`<state> <checked_at> <running> <latest>`, tab-separated), read against the build this
+/// daemon is running now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeployCheck {
+    /// `requested` (the dashboard asked), `checking`, `up-to-date`, `available`, `failed`, or
+    /// `unchecked` (the last check was about a different build than the one running now).
+    pub state: String,
+    /// When the check ran (RFC 3339, UTC).
+    pub at: String,
+    /// origin/main's build at that check; empty when it did not get that far.
+    pub latest: String,
+}
+
+/// Read a deploy-check.tsv line. `running` is this daemon's build; `now` is passed in so the
+/// "a check that never finished" cut-off is testable.
+pub(crate) fn deploy_check_in(raw: &str, running: &str, now: chrono::DateTime<chrono::Utc>) -> Option<DeployCheck> {
+    let fields: Vec<&str> = raw.trim_end_matches('\n').split('\t').collect();
+    let [state, at, checked_running, latest] = fields[..] else { return None };
+    let when = chrono::DateTime::parse_from_rfc3339(at).ok()?.with_timezone(&chrono::Utc);
+    let age_secs = now.signed_duration_since(when).num_seconds();
+    let state = match state {
+        // A check takes seconds to a few minutes (one git fetch). One still "in flight" after
+        // 30 minutes did not finish, and saying "checking…" forever would hide that.
+        "requested" | "checking" if age_secs > 30 * 60 => "failed",
+        "requested" | "checking" | "failed" => state,
+        // The box installed main after the check found it: no update is available any more.
+        "available" if same_deployed_build(latest, None, running) => "up-to-date",
+        "available" => "available",
+        "up-to-date" if same_deployed_build(latest, None, running) => "up-to-date",
+        // Up to date for a build that is no longer the one running (a local build, a
+        // rollback): that verdict says nothing about this build.
+        "up-to-date" if !checked_running.is_empty() && checked_running != running => "unchecked",
+        "up-to-date" => "up-to-date",
+        _ => return None,
+    };
+    Some(DeployCheck { state: state.into(), at: at.into(), latest: latest.into() })
+}
+
+/// Whether the check-only unit the dashboard starts is installed (Linux user systemd).
+pub(crate) fn deploy_check_installed() -> bool {
+    cfg!(target_os = "linux")
+        && systemd_user_unit_dir().is_some_and(|d| d.join("hestia-deploy-check.service").exists())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeploymentHealth {
     /// `current`, `stale`, or `unknown`.
@@ -375,6 +420,16 @@ pub struct DeploymentHealth {
     /// `deploy-status.tsv` does not (it only tracks dashboard-originated requests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cycle: Option<DeployCycle>,
+    /// Whether an update is available, and when that was last checked. `state` above only
+    /// compares the running build with the local install record; it cannot see origin/main
+    /// (#438). This is the supervisor's answer to that question, from its last sync. None when
+    /// no check has ever run on this box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<DeployCheck>,
+    /// Whether the dashboard can start a check-only run here: the hestia-deploy-check unit is
+    /// installed (Linux user systemd). Without it the dashboard has only the update button.
+    #[serde(default)]
+    pub check_capable: bool,
     /// The last gate-capability self-report accepted during this daemon run, distinct from
     /// the daemon build above. This is A1 historical runtime evidence with no freshness,
     /// session, identity, or build binding — not installed-byte attestation. #481 owns that
@@ -551,6 +606,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             gate_engine: GateEngineHealth::default(),
             auto_update: String::new(),
             last_cycle: None,
+            check: None,
+            check_capable: false,
         };
     };
     let raw = match std::fs::read_to_string(path) {
@@ -568,6 +625,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 gate_engine: GateEngineHealth::default(),
                 auto_update: String::new(),
                 last_cycle: None,
+                check: None,
+                check_capable: false,
             };
         }
     };
@@ -586,6 +645,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
                 gate_engine: GateEngineHealth::default(),
                 auto_update: String::new(),
                 last_cycle: None,
+                check: None,
+                check_capable: false,
             };
         }
     };
@@ -608,6 +669,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             gate_engine: GateEngineHealth::default(),
             auto_update: String::new(),
             last_cycle: None,
+            check: None,
+            check_capable: false,
         };
     };
     let head_sha = manifest.get("head_sha").and_then(serde_json::Value::as_str);
@@ -636,6 +699,8 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
         gate_engine: GateEngineHealth::default(),
         auto_update: String::new(),
         last_cycle: None,
+        check: None,
+        check_capable: false,
     }
 }
 
@@ -785,9 +850,14 @@ fn deployment_health(state: &ServerState) -> DeploymentHealth {
             .into(),
     };
     health.auto_update = auto_update_state().into();
-    health.last_cycle = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
-        .and_then(|p| Path::new(&p).parent().map(|d| d.join("deploy.log")))
-        .and_then(|log| last_deploy_cycle(&log));
+    let home = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
+        .and_then(|p| Path::new(&p).parent().map(Path::to_path_buf));
+    health.last_cycle = home.as_ref().and_then(|d| last_deploy_cycle(&d.join("deploy.log")));
+    health.check = home
+        .as_ref()
+        .and_then(|d| std::fs::read_to_string(d.join("deploy-check.tsv")).ok())
+        .and_then(|raw| deploy_check_in(&raw, &health.running_build, chrono::Utc::now()));
+    health.check_capable = deploy_check_installed();
     if health.update_capable && !deploy_supervisor_installed() {
         health.update_capable = false;
         health.update_state = "unavailable".into();
@@ -2077,6 +2147,40 @@ mod tests {
         assert!(last_deploy_cycle_in("").is_none());
         let fail = last_deploy_cycle_in("2026-10-17T00:17:02Z FAIL cargo build\n").unwrap();
         assert_eq!((fail.result.as_str(), fail.detail.as_str()), ("FAIL", "cargo build"));
+    }
+
+    #[test]
+    fn deploy_check_reports_the_supervisors_verdict_against_the_running_build() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-21T22:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let run = "v0.3.0-rc.3-20-g21409f93";
+        let state = |raw: &str| deploy_check_in(raw, run, now).map(|c| c.state);
+
+        // The two verdicts, as hestia-deploy writes them.
+        let up = deploy_check_in(&format!("up-to-date\t2026-10-21T20:17:00Z\t{run}\t{run}\n"), run, now).unwrap();
+        assert_eq!((up.state.as_str(), up.at.as_str(), up.latest.as_str()), ("up-to-date", "2026-10-21T20:17:00Z", run));
+        let avail = format!("available\t2026-10-21T20:17:00Z\t{run}\tv0.3.0-rc.3-25-gabcdef12\n");
+        assert_eq!(state(&avail).as_deref(), Some("available"));
+
+        // An update found by a check, then installed: no longer available. Commit identity, not
+        // abbreviation length (#1250): the check's clone may spell the same commit longer.
+        let installed = "available\t2026-10-21T20:17:00Z\tv0.3.0-rc.3-15-gc11caab4\tv0.3.0-rc.3-20-g21409f93a\n";
+        assert_eq!(state(installed).as_deref(), Some("up-to-date"));
+
+        // Up to date for some other build than the one running now says nothing about this one.
+        let other = "up-to-date\t2026-10-21T20:17:00Z\tv0.3.0-rc.3-9-g1111111\tv0.3.0-rc.3-9-g1111111\n";
+        assert_eq!(state(other).as_deref(), Some("unchecked"));
+
+        // In flight, and in flight too long.
+        assert_eq!(state("checking\t2026-10-21T21:55:00Z\t\t\n").as_deref(), Some("checking"));
+        assert_eq!(state("requested\t2026-10-21T21:59:00Z\t\t\n").as_deref(), Some("requested"));
+        assert_eq!(state("checking\t2026-10-21T21:00:00Z\t\t\n").as_deref(), Some("failed"));
+        assert_eq!(state(&format!("failed\t2026-10-21T21:00:00Z\t{run}\t\n")).as_deref(), Some("failed"));
+
+        // Anything else is not a verdict: no check is shown rather than a guessed one.
+        assert_eq!(state("bogus\t2026-10-21T20:17:00Z\t\t\n"), None);
+        assert_eq!(state("available\tnot-a-time\t\t\n"), None);
+        assert_eq!(state("available\t2026-10-21T20:17:00Z\n"), None);
+        assert_eq!(state(""), None);
     }
 
     #[test]

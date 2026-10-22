@@ -25,6 +25,26 @@ Build ids name only release tags: every producer describes with `--match 'v[0-9]
 an `app-v*` tag can no longer become a build id. Builds made before that change, including the
 2026-08-08 audit baseline below, still carry `app-v0.1.2-...` names.
 
+**What the header says, and what each answer is based on.** The comparison above cannot see
+hestia main: a box can match its own install record while main is days ahead (#438). So the header
+no longer says "deployment current". It reports the **update check** (`hestia-deploy --check`, run
+every 4h by `hestia-deploy-check.timer` and by the "check for updates" button), which syncs main
+and records its verdict in `$HESTIA_HOME/deploy-check.tsv`:
+
+| header | meaning | button |
+|---|---|---|
+| `● up to date · checked <time>` | the last check found main == the running build | check for updates (checks only) |
+| `! update available · checked <time>` | the last check found a newer main | update (builds, installs, restarts) |
+| `● checking for updates…` | a check is running | (disabled) |
+| `! update check failed · <time>` | the last check could not sync main | retry check |
+| `● not checked yet` / `● not checked since this build` | no check result applies to this build | check for updates |
+| `! install incomplete` | the running build is not the one last installed (the old "stale") | update |
+| `● update status unknown` | no check unit on this box, or no install record | update, where a supervisor exists |
+
+"check for updates" (`POST /api/operator/deployment/check`) never installs anything. Only "update"
+(`POST /api/operator/deployment/update`) does. The tooltip names the running build, main's build at
+the last check, and the last deploy run.
+
 The daemon's own build identity is baked in at compile time. The dashboard shows **current** in
 green when the identities match, **stale** in amber when they differ, and **unknown** when the
 authority is missing, unreadable, or malformed. `stale` means the running build and the last
