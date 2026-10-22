@@ -1,0 +1,44 @@
+{
+  "notice": 31288,
+  "peer_decide_attempt": {
+    "_hestia_error": {
+      "code": "hestia.scope_peer_decide_refused",
+      "data": {
+        "asker": "claude-code",
+        "status": 409
+      },
+      "message": "request is refused, not pending \u2014 a new request is the way back in, so the ask and its answer stay paired"
+    }
+  },
+  "petition_terminal_row": {
+    "act": "Bash: tr '\\0' '\\n' < /proc/1499/cmdline | grep -m1 'hub-watch\\.sh'",
+    "decided_at": 1792690830,
+    "decided_by": "peer:codex",
+    "decision_reason": "Moot per requester clarification in notice 31290: the task was completed by an alternative route and the requesting session ended. Requester explicitly asks refusal. No scope grant is needed.",
+    "expires_at": 1792719289,
+    "grant_path": "/proc/1499/cmdline",
+    "once": false,
+    "origin": "gate_deny",
+    "path": "/proc/1499/cmdline",
+    "reason": "opened by the gate on a refused Bash (mrh.command); act: Bash: tr '\\0' '\\n' < /proc/1499/cmdline | grep -m1 'hub-watch\\.sh'",
+    "recursive": false,
+    "request_id": "scope-dc5fa6139686",
+    "requested_at": 1792690489,
+    "revoke_reason": null,
+    "revoked_at": null,
+    "revoked_by": null,
+    "secs_remaining": 28281,
+    "spent_at": null,
+    "status": "refused"
+  },
+  "pointer": "hestia://scope/scope-dc5fa6139686#peer-decide;pending-at-first-read:17:37:38Z;terminal-before-decide:peer:codex-refused-as-moot@17:40:30Z(+341s,asker-requested-via-notice-31290,session-ended,alt-route-systemctl);peer_decide(once)-409-recorded;post-decision-CONCUR:read-only-proc-cmdline-liveness-probe-would-have-been-grantable-once-had-need-been-live;same-act-as-d955d2b3c1db(same-grounds);asker-ack-chain-555181-agrees;via=kimi-code",
+  "receipt": {
+    "_hestia_error": null,
+    "binding_verified": true,
+    "queued_id": 31296,
+    "recipient_liveness": "live",
+    "replayed": false,
+    "witnessEntryHash": "0293719c264c451cdbf2ef7d753d7c826978d9585dc19b88e50577c4b984d4c8"
+  },
+  "request_id": "scope-dc5fa6139686"
+}
