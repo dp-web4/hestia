@@ -49,6 +49,10 @@ function el(id) {
 const $ = id => el(id);
 const escapeHtml = s => String(s);
 const lastData = {}; const renderScopeGrants = () => {}; const tick = async () => {};
+// The grant binds to the standing row it would replace (dashboard_scope_binding_contract_test);
+// this lastData holds none, so every send here carries expected_existing: null and no confirm.
+const confirm = () => true;
+HELPERS
 const sent = []; const replies = JSON.parse(process.argv[1]);
 const apiFetch = async (url, opts) => {
   sent.push({ url, body: JSON.parse(opts.body) });
@@ -63,6 +67,7 @@ BLOCK
   fill();
   await el('sg-grant-btn').click();
   log.push({ step: 'first send', sent: sent.length, flag: sent[0].body.grant_ahead_of_connect,
+             bound: sent[0].body.expected_existing === null,
              offered: el('sg-err').innerHTML.includes('sg-ahead-btn'), errShown: !el('sg-err').hidden });
   const script = JSON.parse(process.argv[2]);
   if (script === 'press') {
@@ -122,8 +127,21 @@ def block() -> str:
     return UI[a:UI.index("\n  })();", a)] + "\n  })();"
 
 
+def helper(name: str) -> str:
+    """A pure helper the block calls, lifted from the page itself (never a copy that can drift)."""
+    a = UI.index(f"function {name}(")
+    depth, i = 0, UI.index("{", a)
+    while True:
+        depth += UI[i] == "{"
+        depth -= UI[i] == "}"
+        i += 1
+        if depth == 0:
+            return UI[a:i]
+
+
 def run(replies, script) -> list:
-    prog = HARNESS.replace("BLOCK", block())
+    helpers = "\n".join(helper(n) for n in ("normScopePath", "standingBinding", "scopeMovedMessage"))
+    prog = HARNESS.replace("HELPERS", helpers).replace("BLOCK", block())
     r = subprocess.run(["node", "-e", prog, json.dumps(replies), json.dumps(script)],
                        capture_output=True, text=True, timeout=30)
     if r.returncode != 0 or not r.stdout:
@@ -149,6 +167,7 @@ def behaviour() -> None:
     log = run([REFUSED, GRANTED, GRANTED], "press")
     step = {s["step"]: s for s in log}
     check("first send: no flag, ever", step.get("first send", {}).get("flag"), None)
+    check("first send: bound to 'shown none' (no standing row on that path)", step.get("first send", {}).get("bound"), True)
     check("first send: the refusal is shown, with the deliberate path offered",
           (step.get("first send", {}).get("errShown"), step.get("first send", {}).get("offered")), (True, True))
     check("pressing it re-sends the SAME form, once, with the flag",

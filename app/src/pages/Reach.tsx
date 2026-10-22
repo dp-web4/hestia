@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { getDashboard, grantReach, operatorStatus, revokeReach } from "../lib/tauri";
-import type { DashboardSnapshot, OperatorStatus, ScopeGrantRow } from "../lib/types";
+import {
+  getDashboard,
+  grantReach,
+  operatorStatus,
+  promoteGrant,
+  reassignGrant,
+  revokeReach,
+  setReach,
+} from "../lib/tauri";
+import type { DashboardSnapshot, OperatorStatus, ScopeGrantRow, StandingActOutcome } from "../lib/types";
 
 /**
  * Reach — what each member can touch, and the operator's own grant and revoke (Sprint 4a).
@@ -16,8 +24,11 @@ import type { DashboardSnapshot, OperatorStatus, ScopeGrantRow } from "../lib/ty
  *    if another view changed it since, nothing is sent and the new row is shown instead.
  *  - Signed out, the controls are absent.
  *
- * Out of this sprint: promote-to-standing, reassign and delegations (4b / 4c), and the society
- * floor, which the spec keeps off every UI for now.
+ * Sprint 4b adds the acts on a grant already in force: make a live grant standing, widen it to
+ * its subtree or narrow it back, and reassign a standing grant to another member. Promote and
+ * reassign replace or move a row, so they are bound to the row as shown, like grant.
+ *
+ * Out of scope: delegations (4c), and the society floor, which the spec keeps off every UI.
  */
 
 const short = (n?: number | null) => {
@@ -60,41 +71,106 @@ export function replacedBy(
   );
 }
 
+type RowAct = "revoke" | "promote" | "widen" | "reassign";
+
 function GrantRow({
   g,
   signedIn,
+  twin,
+  members,
   onActed,
 }: {
   g: ScopeGrantRow;
   signedIn: boolean;
+  /** For a live row: the standing grant on the same path, which "make standing" replaces. */
+  twin: ScopeGrantRow | null;
+  /** Recorded, unretired members — reassign destinations are chosen, never typed. */
+  members: string[];
   onActed: (msg: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState<RowAct | null>(null);
   const [reason, setReason] = useState("");
+  const [to, setTo] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const label = `${g.plugin_id} · ${g.path}`;
 
-  const revoke = async () => {
+  const openAct = (a: RowAct) => {
+    setOpen(a);
+    setReason("");
+    setTo("");
+    setErr(null);
+  };
+
+  // One reading of the three standing acts' outcomes; conflicts are outcomes, not errors.
+  const report = (verb: string, out: StandingActOutcome) => {
+    if (out.outcome === "done") onActed(`${label}: ${verb}.`);
+    else if (out.outcome === "moved")
+      onActed(
+        `${label}: nothing was done — the standing grant changed since you looked` +
+          (out.current ? ` (it now reads "${out.current.reason ?? ""}")` : " (it is gone)") +
+          ". Review it and act again.",
+      );
+    else onActed(`${label}: ${out.detail}`);
+  };
+
+  const run = async () => {
     setBusy(true);
     setErr(null);
     try {
-      const out = await revokeReach(g, reason.trim() || null);
-      if (out.outcome === "already_revoked") {
-        onActed(`${g.plugin_id} · ${g.path}: already gone — ${out.detail}`);
-      } else if (out.outcome === "revoked") {
-        const still = (out.result as { standing_grant_still_covers_path?: boolean })
-          .standing_grant_still_covers_path;
-        onActed(
-          still
-            ? `${g.plugin_id} · ${g.path}: live grant revoked, but a STANDING grant still covers this path.`
-            : `${g.plugin_id} · ${g.path}: revoked.`,
-        );
+      const r = reason.trim() || null;
+      if (open === "revoke") {
+        const out = await revokeReach(g, r);
+        if (out.outcome === "already_revoked") onActed(`${label}: already gone — ${out.detail}`);
+        else if (out.outcome === "revoked") {
+          const still = (out.result as { standing_grant_still_covers_path?: boolean })
+            .standing_grant_still_covers_path;
+          onActed(
+            still
+              ? `${label}: live grant revoked, but a STANDING grant still covers this path.`
+              : `${label}: revoked.`,
+          );
+        }
+      } else if (open === "promote") {
+        report("now standing — it survives restarts", await promoteGrant(g, r, twin));
+      } else if (open === "widen") {
+        // Widening needs a reason; narrowing never does.
+        if (!g.recursive && !r) {
+          setErr("Reaching the whole subtree requires a reason: it widens one path into a tree.");
+          return;
+        }
+        report(g.recursive ? "now exactly this path" : "now reaches everything below", await setReach(g, !g.recursive, r));
+      } else if (open === "reassign") {
+        if (!to) {
+          setErr("Choose the member to move it to.");
+          return;
+        }
+        if (!r) {
+          setErr("Reassigning requires a reason: it widens what the destination can reach.");
+          return;
+        }
+        report(`moved to ${to}`, await reassignGrant(g, to, r));
       }
+      setOpen(null);
     } catch (e) {
       setErr(String(e));
     } finally {
       setBusy(false);
     }
+  };
+
+  const needsReason = open === "reassign" || (open === "widen" && !g.recursive);
+  const reasonHint =
+    open === "promote"
+      ? `optional — defaults to the live grant's own: "${g.reason ?? ""}"`
+      : needsReason
+        ? "required"
+        : "optional — narrowing needs none";
+  const go: Record<RowAct, string> = {
+    revoke: "Revoke",
+    promote: twin ? "Make standing (replaces the standing grant)" : "Make standing",
+    widen: g.recursive ? "Make exact" : "Include everything below",
+    reassign: `Move to ${to || "…"}`,
   };
 
   return (
@@ -117,25 +193,49 @@ function GrantRow({
         </div>
       </td>
       <td>
-        {signedIn &&
-          (open ? (
-            <div className="decide-actions">
+        {signedIn && !open && (
+          <div className="row-acts">
+            {g.lifetime === "live" && <button onClick={() => openAct("promote")}>Make standing…</button>}
+            <button onClick={() => openAct("widen")}>{g.recursive ? "Make exact…" : "Include below…"}</button>
+            {g.lifetime === "standing" && <button onClick={() => openAct("reassign")}>Reassign…</button>}
+            <button onClick={() => openAct("revoke")}>Revoke…</button>
+          </div>
+        )}
+        {signedIn && open && (
+          <div className="decide-actions">
+            {open === "promote" && twin && (
+              <div className="error-banner" data-replaces>
+                This REPLACES the standing grant on this path: {twin.recursive ? "subtree" : "exact"}, reason "
+                {twin.reason ?? ""}". Last edit wins.
+              </div>
+            )}
+            {open === "reassign" && (
               <label>
-                reason <span className="muted">(optional — revoking needs none)</span>
-                <input
-                  type="text"
-                  value={reason}
-                  maxLength={512}
-                  onChange={(e) => setReason(e.target.value)}
-                />
+                to
+                <select value={to} onChange={(e) => setTo(e.target.value)}>
+                  <option value="">— choose —</option>
+                  {members
+                    .filter((m) => m !== g.plugin_id)
+                    .map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                </select>
               </label>
-              <button disabled={busy} onClick={revoke}>
-                Revoke
-              </button>
-            </div>
-          ) : (
-            <button onClick={() => setOpen(true)}>Revoke…</button>
-          ))}
+            )}
+            <label>
+              reason <span className="muted">({reasonHint})</span>
+              <input type="text" value={reason} maxLength={512} onChange={(e) => setReason(e.target.value)} />
+            </label>
+            <button disabled={busy} onClick={run}>
+              {go[open]}
+            </button>
+            <button disabled={busy} onClick={() => setOpen(null)}>
+              Cancel
+            </button>
+          </div>
+        )}
         {err && <div className="error-banner">{err}</div>}
       </td>
     </tr>
@@ -353,6 +453,8 @@ export function Reach() {
                   key={`${g.lifetime}:${g.path}:${g.request_id ?? ""}`}
                   g={g}
                   signedIn={signedIn}
+                  twin={g.lifetime === "live" ? replacedBy(grants, g.plugin_id, g.path) : null}
+                  members={grantable}
                   onActed={acted}
                 />
               ))}

@@ -261,6 +261,131 @@ pub async fn revoke_reach(
     revoke_outcome(status, value)
 }
 
+// --- Sprint 4b: make standing, reach, reassign ----------------------------------------------
+//
+// Three acts on grants already in force, each on its own daemon route that already witnesses
+// intent -> commit -> terminal. What the app adds is what those routes cannot see: that the
+// operator was SHOWN the row being replaced or moved. Promote replaces a standing twin on the
+// same path, and reassign moves the source row as it is NOW, so both send the shown row as
+// `expected_existing`; the daemon refuses (409 `moved`) under its lock if it changed. Reach only
+// flips exact/subtree and the daemon already refuses a no-op, so it needs no binding.
+
+/// One reading of the three routes' answers. `already` / `already_gone` / `moved` are
+/// OUTCOMES — another view (or the clock) got there first — not errors.
+fn standing_act_outcome(
+    act: &str,
+    status: reqwest::StatusCode,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let why = body.get("error").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if status.is_success() {
+        if body.get("status").and_then(|v| v.as_str()) == Some("already_standing") {
+            return Ok(serde_json::json!({ "outcome": "already", "detail": "already standing — nothing was appended" }));
+        }
+        return Ok(serde_json::json!({ "outcome": "done", "result": body }));
+    }
+    if status == reqwest::StatusCode::CONFLICT && body.get("moved").and_then(|v| v.as_bool()) == Some(true) {
+        return Ok(serde_json::json!({
+            "outcome": "moved",
+            "current": body.get("current").cloned().unwrap_or(serde_json::Value::Null),
+        }));
+    }
+    // Reach's 409 is its no-op ("already recursive/exact; nothing witnessed"). Reassign's 409s
+    // (same member, destination already holds the path) are the operator's call to resolve.
+    if status == reqwest::StatusCode::CONFLICT && act == "reach" {
+        return Ok(serde_json::json!({ "outcome": "already", "detail": why }));
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(serde_json::json!({ "outcome": "already_gone", "detail": why }));
+    }
+    Err(if why.is_empty() { format!("daemon returned {status}") } else { why })
+}
+
+/// Make a LIVE grant standing. `seen` is the standing row the form showed on that path (null
+/// = none); a reason is optional here only because the daemon falls back to the live grant's
+/// own recorded reason — and refuses when there is none.
+#[tauri::command]
+pub async fn promote_grant(
+    state: State<'_, AppState>,
+    member: String,
+    path: String,
+    reason: Option<String>,
+    seen: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let reason = check_reason(false, reason.as_deref())?;
+    let path = normalize_scope_path(&path);
+    let seen = seen.unwrap_or(serde_json::Value::Null);
+    let mut body = serde_json::json!({
+        "plugin_id": member.trim(), "path": path, "expected_existing": replaced_key(&seen),
+    });
+    if let Some(r) = reason {
+        body["reason"] = serde_json::Value::String(r);
+    }
+    let (status, value) =
+        daemon::request_status(&state, reqwest::Method::POST, "/api/scope/standing/promote", Some(body)).await?;
+    standing_act_outcome("promote", status, value)
+}
+
+/// Widen a grant to its subtree (reason required) or narrow it back to exactly its path (none).
+#[tauri::command]
+pub async fn set_reach(
+    state: State<'_, AppState>,
+    member: String,
+    path: String,
+    recursive: bool,
+    reason: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let reason = check_reason(recursive, reason.as_deref()).map_err(|e| {
+        if recursive { "making a grant reach its whole subtree requires a reason: it widens one path into a tree".to_string() } else { e }
+    })?;
+    let mut body = serde_json::json!({
+        "plugin_id": member.trim(), "path": normalize_scope_path(&path), "recursive": recursive,
+    });
+    if let Some(r) = reason {
+        body["reason"] = serde_json::Value::String(r);
+    }
+    let (status, value) =
+        daemon::request_status(&state, reqwest::Method::POST, "/api/scope/standing/recursive", Some(body)).await?;
+    standing_act_outcome("reach", status, value)
+}
+
+/// The destination of a reassign, checked like a grant's member: recorded, unretired, chosen
+/// from the list, and not the source.
+fn preflight_reassign(snapshot: &serde_json::Value, from: &str, to: &str, path: &str) -> Result<String, String> {
+    if from == to {
+        return Err("the destination is the member that already holds it".to_string());
+    }
+    preflight_grant(snapshot, to, path)
+}
+
+/// Move ONE standing grant to another member, as one act (a typo'd grant to the real seat).
+/// `seen` is the source row as the form showed it; the move is refused if it changed.
+#[tauri::command]
+pub async fn reassign_grant(
+    state: State<'_, AppState>,
+    member: String,
+    path: String,
+    to: String,
+    reason: Option<String>,
+    seen: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let reason = check_reason(true, reason.as_deref())
+        .map_err(|_| "reassigning a grant requires a reason: it widens what the destination can reach".to_string())?
+        .unwrap_or_default();
+    if seen.is_null() {
+        return Err("a reassign moves a row you were shown; none was".to_string());
+    }
+    let snapshot = daemon::get(&state, "/api/dashboard").await?;
+    let path = preflight_reassign(&snapshot, member.trim(), to.trim(), &path)?;
+    let body = serde_json::json!({
+        "plugin_id": member.trim(), "path": path, "to": to.trim(), "reason": reason,
+        "expected_existing": replaced_key(&seen),
+    });
+    let (status, value) =
+        daemon::request_status(&state, reqwest::Method::POST, "/api/scope/standing/reassign", Some(body)).await?;
+    standing_act_outcome("reassign", status, value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +488,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("RETRY"), "the retry instruction reaches the operator whole");
+    }
+
+    #[test]
+    fn the_standing_acts_read_conflicts_as_outcomes_where_they_are() {
+        let moved = standing_act_outcome("promote", StatusCode::CONFLICT,
+            json!({"error": "not the one you were shown", "moved": true, "current": {"reason": "x"}})).unwrap();
+        assert_eq!((moved["outcome"].clone(), moved["current"]["reason"].clone()), (json!("moved"), json!("x")));
+        let noop = standing_act_outcome("reach", StatusCode::CONFLICT, json!({"error": "already recursive"})).unwrap();
+        assert_eq!(noop["outcome"], "already");
+        // a reassign 409 without `moved` is the operator's decision to make, not a race
+        assert!(standing_act_outcome("reassign", StatusCode::CONFLICT,
+            json!({"error": "'codex' already holds a standing grant on '/w'"})).unwrap_err().contains("already holds"));
+        assert_eq!(standing_act_outcome("promote", StatusCode::OK, json!({"status": "already_standing"})).unwrap()["outcome"], "already");
+        assert_eq!(standing_act_outcome("promote", StatusCode::OK, json!({"ok": true})).unwrap()["outcome"], "done");
+        assert_eq!(standing_act_outcome("reach", StatusCode::NOT_FOUND, json!({"error": "no grant"})).unwrap()["outcome"], "already_gone");
+        assert!(standing_act_outcome("reassign", StatusCode::BAD_REQUEST, json!({"error": "reason is required"})).is_err());
+    }
+
+    #[test]
+    fn a_reassign_goes_only_to_a_recorded_unretired_other_member() {
+        let s = snap();
+        assert_eq!(preflight_reassign(&s, "caude-code", "claude-code", "/w/x").unwrap(), "/w/x");
+        assert!(preflight_reassign(&s, "claude-code", "claude-code", "/w").unwrap_err().contains("already holds it"));
+        assert!(preflight_reassign(&s, "claude-code", "Claude-code", "/w").unwrap_err().contains("not a member"));
+        assert!(preflight_reassign(&s, "claude-code", "caude-code", "/w").unwrap_err().contains("retired"));
     }
 }
