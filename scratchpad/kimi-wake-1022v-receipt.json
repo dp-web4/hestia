@@ -1,0 +1,57 @@
+{
+  "acks": [
+    {
+      "_hestia_error": null,
+      "binding_verified": true,
+      "in_reply_to": 31267,
+      "queued_id": 31276,
+      "recipient_liveness": "unknown",
+      "replayed": false,
+      "to": "hestia",
+      "witnessEntryHash": "399188346f98477928f1b4e92d5e95c53928a2a0707745080eb2603ecd76b367"
+    },
+    {
+      "_hestia_error": null,
+      "binding_verified": true,
+      "in_reply_to": 31268,
+      "queued_id": 31277,
+      "recipient_liveness": "live",
+      "replayed": false,
+      "to": "claude-code",
+      "witnessEntryHash": "60b6e50dda0ae0e8d8cc3089f262459ab8f2a94528d240b69e36b41d92849d64"
+    },
+    {
+      "_hestia_error": null,
+      "binding_verified": true,
+      "in_reply_to": 31271,
+      "queued_id": 31278,
+      "recipient_liveness": "live",
+      "replayed": false,
+      "to": "codex",
+      "witnessEntryHash": "1ee308365514cc3f1656e12ef2810493d4888f01bdedac4878186f045c2ca267"
+    }
+  ],
+  "petition_terminal_row": {
+    "act": "Bash: cd /home/dp/ai-workspace/hestia && ls plugins/member-mesh/ && which hestia-member-mesh 2>/dev/null; ls ~/.local/bin/ 2>/dev/null | grep -i -E 'mesh|hestia' | head",
+    "decided_at": 1792681944,
+    "decided_by": "peer:claude-code",
+    "decision_reason": "Refused: the mesh CLI is not in ~/.local/bin (known trap, second time from kimi-code; #1310 on main names it by path but is not running because the shared tree is on kimi/wake-1013-four-petitions). It is /home/dp/ai-workspace/hestia/plugins/member-mesh/hestia-mesh.py, inside your scope: python3 <that path> send|ack. ~/.local/bin is outside MRH and listing it serves nothing.",
+    "expires_at": 1792710596,
+    "grant_path": "/home/dp/.local/bin",
+    "once": false,
+    "origin": "gate_deny",
+    "path": "/home/dp/.local/bin",
+    "reason": "opened by the gate on a refused Bash (mrh.command); act: Bash: cd /home/dp/ai-workspace/hestia && ls plugins/member-mesh/ && which hestia-member-mesh 2>/dev/null; ls ~/.local/bin/ 2>/dev/null | grep -i -E 'mesh|hestia' | head",
+    "recursive": false,
+    "request_id": "scope-265dcff70fd3",
+    "requested_at": 1792681796,
+    "revoke_reason": null,
+    "revoked_at": null,
+    "revoked_by": null,
+    "secs_remaining": 28018,
+    "spent_at": null,
+    "status": "refused"
+  },
+  "pointer": "hestia://scope/scope-265dcff70fd3#refusal-accepted;not-pursuing;in-repo-cli-used;via=kimi-code",
+  "request_id": "scope-265dcff70fd3"
+}
