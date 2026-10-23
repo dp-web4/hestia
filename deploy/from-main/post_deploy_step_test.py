@@ -16,8 +16,9 @@ checked on the RESOLVED path: what runs must be a file only the operator could h
 
 Pinned here, each under `set -euo pipefail` as the script runs:
   - no directory, an opt-out, or a governed session: nothing runs, and the status says why;
-  - a step runs with the deployed build in HESTIA_DEPLOYED_BUILD; a symlink to a file inside
-    post-deploy.d runs; a symlink OUT of it is skipped and not run (the escape);
+  - a step runs with the deployed build in HESTIA_DEPLOYED_BUILD and the deploy's own clone in
+    HESTIA_DEPLOY_SRC; a symlink to a file inside post-deploy.d runs; a symlink OUT of it is
+    skipped and not run (the escape);
   - a step whose resolved target is group-writable, through a link or directly, is skipped;
   - a group-writable post-deploy.d or $HESTIA_HOME, or a post-deploy.d that is a symlink,
     refuses everything;
@@ -74,7 +75,7 @@ def clean_env(**extra: str) -> dict:
 
 def run(fn_src: str, home: Path, env: dict) -> tuple[int, str, str, float, bool]:
     """Run the function as the script does; a sentinel line after it proves the caller continues."""
-    prog = (f"set -euo pipefail\nHESTIA_HOME={home}\nLOG={home}/deploy.log\n"
+    prog = (f"set -euo pipefail\nHESTIA_HOME={home}\nLOG={home}/deploy.log\nDEPLOY_ROOT={home}/deploy\n"
             "log() { printf '%s\\n' \"$*\" >>\"$LOG\"; }\n"
             f"{fn_src}\nrun_post_deploy v0.0.0-1-gabc1234\n"
             "printf 'STATUS=%s\\n' \"$post_deploy\"\nprintf 'SENTINEL\\n'\n")
@@ -118,14 +119,15 @@ def main() -> int:
         #    non-executable file is not a step.
         home, d = home_with_dir(tmp, "h2")
         out = tmp / "seen"
-        step(d, "10-record", f'echo "$HESTIA_DEPLOYED_BUILD" >> {out}')
+        step(d, "10-record", f'echo "$HESTIA_DEPLOYED_BUILD" "$HESTIA_DEPLOY_SRC" >> {out}')
         step(d, ".inner-target", f'echo linked >> {out}')
         (d / "20-linked-inside").symlink_to(d / ".inner-target")
         step(d, "30-not-executable", f'echo WRONG >> {out}', mode=0o644)
         rc, st, _, _, ok = run(fn, home, clean_env())
         # .inner-target is itself a step (a dotfile matches no `*` glob, so it runs only via the link)
         check("ok rc", rc, 0); check("ok status", st, "ok=2 failed=0"); check("ok sentinel", ok, True)
-        check("ok saw build, in name order", out.read_text().split(), ["v0.0.0-1-gabc1234", "linked"])
+        check("ok saw build and the deploy's own clone, in name order", out.read_text().split(),
+              ["v0.0.0-1-gabc1234", str(home / "deploy" / "hestia"), "linked"])
 
         # 3. A symlink that ESCAPES the directory is skipped and never run, even when its target
         #    is ours and not writable by anyone else: the operator installs a copy.

@@ -930,7 +930,11 @@ install_inventory() {
 # #1362 deployed the being's only readable copy of its law was the build before the one judging
 # it, and it read that as "the fix is not in place". Each executable in
 # $HESTIA_HOME/post-deploy.d runs, in name order, after the members' install, with the build in
-# HESTIA_DEPLOYED_BUILD. The same contract as the inventory: a step may fail in any way, and
+# HESTIA_DEPLOYED_BUILD and this deploy's own clone, already at that build, in HESTIA_DEPLOY_SRC.
+# A step that needs hestia's source reads THAT clone, not the shared workspace checkout: members can
+# write the checkout's .git/config, and git runs commands it names (core.fsmonitor, core.sshCommand,
+# a hooksPath hook), so a step running git there would run a member's command with the deploy's
+# privileges (SAGE governance_snapshot.sh, which refuses that fallback). The same contract as the inventory: a step may fail in any way, and
 # never stops a deploy. Steps run on CURRENT cycles too, so a step that failed is retried by the
 # next timer run; a step must therefore be idempotent.
 #
@@ -997,7 +1001,8 @@ run_post_deploy() {
       bad=$((bad + 1)); continue
     fi
     rc=0
-    HESTIA_DEPLOYED_BUILD="$1" ${bound[@]+"${bound[@]}"} "$real" </dev/null >>"$LOG" 2>&1 || rc=$?
+    HESTIA_DEPLOYED_BUILD="$1" HESTIA_DEPLOY_SRC="$DEPLOY_ROOT/hestia" \
+      ${bound[@]+"${bound[@]}"} "$real" </dev/null >>"$LOG" 2>&1 || rc=$?
     if [ "$rc" -eq 0 ]; then
       ok=$((ok + 1))
     elif [ ${#bound[@]} -gt 0 ] && { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; }; then

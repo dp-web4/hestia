@@ -361,7 +361,8 @@ When #1362 deployed, the snapshot stayed one build behind for 45 minutes. The be
 in the only copy it may read, didn't find it, and asked for scope on paths that don't exist.
 
 After the members' install, every `DEPLOYED` or `CURRENT` cycle runs each executable in
-`$HESTIA_HOME/post-deploy.d`, in name order, with the build in `HESTIA_DEPLOYED_BUILD`.
+`$HESTIA_HOME/post-deploy.d`, in name order, with the build in `HESTIA_DEPLOYED_BUILD` and this deploy's
+own clone, already at that build, in `HESTIA_DEPLOY_SRC`.
 
 - **Only what the operator could have put there runs.** This is code run with the deploy's privileges,
   so every check is on the resolved path, not the name in the listing:
@@ -382,6 +383,10 @@ After the members' install, every `DEPLOYED` or `CURRENT` cycle runs each execut
   - The next step and the rest of the cycle run either way. The summary line says
     `post_deploy=ok=<n> failed=<n>`, `none`, `skipped(HESTIA_DEPLOY_POST=0)`, `refused(governed session)` or
     `refused(post-deploy.d not operator-only)`.
+- **A step that needs hestia's source reads `HESTIA_DEPLOY_SRC`, never the shared workspace checkout.**
+  Members can write that checkout's git config, and git runs commands named there (`core.fsmonitor`,
+  `core.sshCommand`, a `core.hooksPath` hook). A step running git in it would run a member's command with
+  the deploy's privileges.
 - **Steps must be idempotent.** `CURRENT` cycles run them too, so a step that failed is retried by the
   next timer run.
 
@@ -391,7 +396,8 @@ CBP's install is one copy:
     install -m 0755 <workspace>/SAGE/scripts/governance_snapshot.sh ~/.hestia/post-deploy.d/50-governance-snapshot
 
 The copy finds the workspace from `HESTIA_WORKSPACE`, which the deploy unit already sets for the inventory
-step. It asks the running daemon's `/api/version` which build to snapshot, and prints "already at" when
-nothing has changed. A copy doesn't follow later edits to SAGE's script, by design: re-run the `install`
+step. It snapshots `HESTIA_DEPLOY_SRC` at `HESTIA_DEPLOYED_BUILD` without fetching, refuses to run as a step
+without that clone, and prints "already at" when nothing has changed. Use a version of the script that
+has SAGE's private-source change; an older copy reads the shared checkout. A copy doesn't follow later edits to SAGE's script, by design: re-run the `install`
 to take a new version, after reading it. `post_deploy_step_test.py` covers each of these cases under
 `set -euo pipefail`.
