@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: d2ddf60f60e23965b9b413c3eaf6a4e096bfea9bbc1495c4e60caf7df4ef1b38  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 9430ffc67a2193a3712fe161218d2276fec0875a7d3f0331498604f53daa6abd  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -2613,40 +2613,6 @@ def _literal_for_body_uncertain(body: str, var: str, item: str) -> bool:
     return False
 
 
-#: Operator-declared TOOLCHAIN roots (colon- or comma-separated absolute paths), e.g. a conda
-#: install under the home: `HESTIA_TOOL_ROOTS=<home>/miniforge3`. A command's reach under one is
-#: not MRH-scoped, the way TEMP_ROOTS are not: an interpreter and its libraries are the tool, not
-#: the territory. Why (SAGE #368, 2026-10-05): with a being judged under its seat's workspace (the
-#: home), every sandboxed `check` (`bwrap --ro-bind <home>/miniforge3 ...`, PATH=...) and every
-#: `game` (`<home>/miniforge3/bin/python3 ...`) was denied "'miniforge3' is not granted": a grant
-#: for an interpreter would be a grant of nothing the member owns. DECLARED, never inferred, and
-#: egress still applies first. A root that is `/`, relative, the workspace, or an ancestor of it is
-#: ignored, so a misconfiguration cannot ungovern the territory it was meant to sit beside.
-TOOL_ROOTS_ENV = "HESTIA_TOOL_ROOTS"
-
-
-def _tool_roots(workspace: str) -> tuple:
-    raw = os.environ.get(TOOL_ROOTS_ENV, "")
-    ws = os.path.normpath(os.path.expanduser(workspace or "/")).replace("\\", "/").rstrip("/") or "/"
-    out = []
-    for part in re.split(r"[:,]", raw):
-        part = part.strip()
-        if not part:
-            continue
-        r = os.path.normpath(os.path.expanduser(part)).replace("\\", "/").rstrip("/")
-        if not r.startswith("/") or r in ("", "/"):
-            continue
-        if ws == r or ws.startswith(r + "/"):
-            continue                      # the workspace or an ancestor: never a tool root
-        out.append(r)
-    return tuple(out)
-
-
-def _under_any(path: str, roots) -> bool:
-    p = os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
-    return any(p == r or p.startswith(r + "/") for r in roots)
-
-
 def _grammar_patterns(cmd: str, cwd: Optional[str]) -> tuple:
     """(patterns, judged) from the shell grammar: the literal grep-family PATTERN values it
     recognised (`_PATTERN_HEADS`), and every word it judges as a path. ((), ()) when it cannot
@@ -2733,13 +2699,18 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     # Pass 0 — the shell's home spellings, expanded before anything reads the text, so a
     # workspace path spelled `~/…` or `$HOME/…` meets pass 1 like its literal spelling does.
     cmd = _expand_home_words(cmd)
-    # TWO THINGS INSIDE THE WORKSPACE ARE NOT A REACH (#1241 recut, SAGE #368): a grep-family
-    # PATTERN, which the tool matches against and never opens (a being's own `-e '<ws>[^ ]*ft09'`
-    # was refused "'[^' is not granted"), and a path under a declared toolchain root. Patterns are
-    # recognised by the shell GRAMMAR (`_CMD_SPECS`), never by rewriting the text, so a live
-    # substitution inside one is still lifted out and judged, and pass 3 is not touched.
+    # A grep-family PATTERN INSIDE THE WORKSPACE IS NOT A REACH (#1241 recut, SAGE #368): the tool
+    # matches against it and never opens it (a being's own `-e '<ws>[^ ]*ft09'` was refused
+    # "'[^' is not granted"). Patterns are recognised by the shell GRAMMAR (`_CMD_SPECS`), never by
+    # rewriting the text, so a live substitution inside one is still lifted out and judged, and
+    # pass 3 is not touched. A TOOLCHAIN (the being's interpreter, its sandbox's `--ro-bind`) is
+    # NOT exempted here: it is reached through an operator's recursive `path:<root>/**` grant,
+    # which lives in the member's vault-held scope, is witnessed and revocable, and is matched on
+    # the REALPATH. #1377 first shipped an environment variable for it (HESTIA_TOOL_ROOTS); Nova's
+    # review asked who can set it, and a symlink under the declared root read an ungranted repo
+    # (`cat <root>/lib/link/x`), because the exemption was lexical. A caller-controlled
+    # environment must not become authority.
     patterns, judged_words = _grammar_patterns(cmd, cwd)
-    tool_roots = _tool_roots(workspace)
     for after in cmd.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
@@ -2764,10 +2735,6 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
         hidden = _symlink_target_forbidden(resolved, egress)
         if hidden is not None:
             return False, hidden, hidden
-        # A DECLARED TOOLCHAIN is not governed territory (HESTIA_TOOL_ROOTS): judged after egress,
-        # so a forbidden symlink target under a tool root still denies.
-        if tool_roots and _under_any(resolved, tool_roots):
-            continue
         seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
         if seg not in repo_scopes and not _within_path_grant(resolved, scopes, workspace):
             refused = _symlinked_reach_verdict(resolved, seg, repo_scopes, scopes, workspace)

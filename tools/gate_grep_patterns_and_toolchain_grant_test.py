@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Command scope: declared toolchain roots, and grep-family PATTERN operands (SAGE #368, #1241 recut).
+"""Command scope: grep-family PATTERN operands, and a toolchain reached by GRANT (SAGE #368, #1241 recut).
 
 Measured 2026-10-05 on 2,187 legion-being calls replayed through the one gate with the being under
 its SEAT's workspace (dp's ruling: a being judged by anything else is judged by a different law
@@ -12,8 +12,14 @@ grammar (`_CMD_SPECS`, `_Found.patterns`), never by rewriting the command text. 
 re-quoted `"$(...)"` as an inert `'$(...)'` and admitted acts main refuses; those rows are the
 must-deny regressions below.
 
-Run:  ./tools/gate_tool_roots_and_patterns_test.py
-      HESTIA_SCOPE_BATTERY_CORE=<path> ./tools/gate_tool_roots_and_patterns_test.py   (a staged core)
+The toolchain (#1377, Nova's HOLD): the first apply exempted roots named by an environment variable,
+HESTIA_TOOL_ROOTS. Nothing proved a governed member could not set it (a seat's systemd unit is inside
+its own grant on Legion), and the exemption was lexical, so a symlink under the root read an ungranted
+repo. Removed. The being's interpreter is reached by an operator's recursive `path:<root>/**` grant:
+vault-held, witnessed, revocable, matched on the realpath.
+
+Run:  ./tools/gate_grep_patterns_and_toolchain_grant_test.py
+      HESTIA_SCOPE_BATTERY_CORE=<path> ./tools/gate_grep_patterns_and_toolchain_grant_test.py   (a staged core)
 """
 from __future__ import annotations
 
@@ -58,35 +64,50 @@ def main() -> int:
         ok, o, _ = reach(c)
         return (not ok) and (off is None or o == off or (o or "").startswith(off)), o
 
-    # ---- declared toolchain roots ----
-    os.environ.pop(G.TOOL_ROOTS_ENV, None)
-    ok, off, _ = reach(f"bwrap --ro-bind {ws}/tools/conda {ws}/tools/conda {ws}/tools/conda/bin/python3 {ws}/granted/t.py")
-    check("without a declared tool root, the interpreter is an ungranted reach (unchanged)", not ok and off == "tools", off)
+    # ---- the toolchain is an operator's RECURSIVE PATH GRANT, never an environment variable ----
+    conda = f"{ws}/tools/conda"
+    check_line = (f"bwrap --ro-bind {conda} {conda} --setenv PATH {conda}/bin:/usr/bin "
+                  f"{conda}/bin/python3 -m pytest {ws}/granted/sub")
+    granted_tool = scopes + (f"path:{conda}/**",)
 
-    os.environ[G.TOOL_ROOTS_ENV] = f"{ws}/tools/conda"
-    ok, off, _ = reach(f"bwrap --ro-bind {ws}/tools/conda {ws}/tools/conda --setenv PATH {ws}/tools/conda/bin:/usr/bin "
-                       f"{ws}/tools/conda/bin/python3 -m pytest {ws}/granted/sub")
-    check("a declared tool root is not governed territory (check-shaped line)", ok, off)
-    ok, off, _ = reach(f"{ws}/tools/conda/bin/python3 {ws}/other/stepper.py --instance {ws}/granted")
-    check("operands outside the tool root are still judged (game-shaped line)", not ok and off == "other", off)
-    ok, off, _ = reach(f"cat {ws}/tools/condaX/secret")
-    check("a sibling of a tool root is not under it (boundary, not prefix)", not ok, off)
-    for bad in ("/", ws, os.path.dirname(ws)):
-        os.environ[G.TOOL_ROOTS_ENV] = bad
-        ok, off, _ = reach(f"cat {ws}/other/x")
-        check(f"a tool root that is /, the workspace or its ancestor is ignored ({bad})", not ok and off == "other", off)
-    os.environ[G.TOOL_ROOTS_ENV] = "relative/path"
-    ok, _, _ = reach(f"cat {ws}/other/x")
-    check("a relative tool root is ignored", not ok)
+    def reach_with(c, sc):
+        return G.command_scope_reach(c, sc, ws, cwd=f"{ws}/granted")
 
-    os.environ[G.TOOL_ROOTS_ENV] = f"{ws}/tools/conda"
+    ok, off, _ = reach(check_line)
+    check("without a grant, the interpreter is an ungranted reach (unchanged)", not ok and off == "tools", off)
+    ok, off, _ = reach_with(check_line, granted_tool)
+    check("an operator's recursive grant on the toolchain admits the check-shaped line", ok, off)
+    ok, off, _ = reach_with(f"{conda}/bin/python3 {ws}/other/stepper.py --instance {ws}/granted", granted_tool)
+    check("operands outside the granted toolchain are still judged (game-shaped line)", not ok and off == "other", off)
+    ok, off, _ = reach_with(f"cat {ws}/tools/condaX/secret", granted_tool)
+    check("a sibling of the granted root is not under it (boundary, not prefix)", not ok, off)
+    ok, off, _ = reach_with(f"{conda}/bin/python3 -c pass", scopes + (f"path:{conda}",))
+    check("an EXACT grant on the root does not reach its interpreter", not ok, off)
+
+    os.symlink(f"{ws}/other", f"{conda}/escape")
+    ok, off, _ = reach_with(f"cat {conda}/escape/x", granted_tool)
+    check("must deny: a symlink under the granted toolchain into an ungranted dir (realpath)", not ok and off == "other", off)
     secret = tempfile.mkdtemp(prefix="s-")
     os.makedirs(f"{secret}/.ssh")
     open(f"{secret}/.ssh/id_x", "w").close()
-    os.symlink(f"{secret}/.ssh/id_x", f"{ws}/tools/conda/link")
-    ok, off, _ = reach(f"cat {ws}/tools/conda/link")
-    check("egress is judged before the tool root: a link to a forbidden target denies", not ok and ".ssh" in (off or ""), off)
-    os.environ.pop(G.TOOL_ROOTS_ENV, None)
+    os.symlink(f"{secret}/.ssh/id_x", f"{conda}/link")
+    ok, off, _ = reach_with(f"cat {conda}/link", granted_tool)
+    check("egress is judged before the grant: a link to a forbidden target denies", not ok and ".ssh" in (off or ""), off)
+
+    # A caller-set environment is not authority: the variable #1377 first shipped does nothing,
+    # whether it is in the gate's own environment or written as a prefix on the command.
+    name = "HESTIA_TOOL_" + "ROOTS"
+    os.environ[name] = conda
+    try:
+        ok, off, _ = reach(check_line)
+        check("must deny: HESTIA_TOOL_ROOTS in the gate's environment grants nothing", not ok and off == "tools", off)
+        ok, off, _ = reach(f"{name}={conda} {check_line}")
+        check("must deny: HESTIA_TOOL_ROOTS as a command prefix grants nothing", not ok, off)
+        ok, off, _ = reach(f"cat {conda}/escape/x")
+        check("must deny: the symlink escape #1377 admitted under HESTIA_TOOL_ROOTS", not ok and off in ("tools", "other"), off)
+    finally:
+        os.environ.pop(name, None)
+    check("the gate core carries no tool-roots declaration", not hasattr(G, "TOOL_ROOTS_ENV") and not hasattr(G, "_tool_roots"))
 
     # ---- grep-family PATTERN operands are text, recognised by the grammar ----
     ok, off, _ = reach(f"git --no-pager -C {ws}/granted grep -n -I -E --max-count=15 -e 'ft09\\.py.*bytes|{ws}[^ ]*ft09\\.py' -- {ws}/granted/sub")
