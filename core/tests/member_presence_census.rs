@@ -662,6 +662,14 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_standing_recursive", &[
         "let subject = s.member_lct(&plugin_id);",
     ], SiteClass::Naming),
+    // ADDED 2026-10-22 (nomad-claude, #1345 part A: the one-act grant Edit). (1) Changes who
+    // is named? No: it names the grant's own member in the edit's intent and terminal rows,
+    // the subject `scope_standing_recursive` names for the same kind of act. (2) Compared to
+    // decide control flow? No: the edit is keyed on `(member, path)` strings; the LCT is only
+    // serialised into the record. Naming. Caught by the full `cargo test` after `--lib`.
+    ("server/http.rs::scope_standing_edit", &[
+        "let subject = s.member_lct(&plugin_id);",
+    ], SiteClass::Naming),
     // ADDED 2026-09-09 (cbp, the atomic `reassign` — GPT's hold on #1006). Caught by the
     // full `cargo test` after `--lib` was green, exactly as the header warns.
     //

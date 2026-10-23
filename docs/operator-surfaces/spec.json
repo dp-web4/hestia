@@ -301,14 +301,15 @@
     },
     {
       "id": "scope-standing",
-      "title": "Make a grant standing / recursive / reassign it",
+      "title": "Make a grant standing / recursive / reassign it, or edit its path, reach and modes",
       "place": "activity",
       "kind": "write",
       "risk": "high",
       "routes": [
         "POST /api/scope/standing/promote",
         "POST /api/scope/standing/recursive",
-        "POST /api/scope/standing/reassign"
+        "POST /api/scope/standing/reassign",
+        "POST /api/scope/standing/edit"
       ],
       "rules": [
         "reason-to-permit",

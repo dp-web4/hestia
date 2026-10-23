@@ -957,6 +957,10 @@ enum ScopeCmd {
         /// Include everything below the granted path
         #[arg(long)]
         recursive: bool,
+        /// What the grant lets the asker do: letters of r (read), w (write), e (execute),
+        /// d (delete), e.g. `--mode r`. Default: all four (#1345)
+        #[arg(long = "mode")]
+        modes: Option<String>,
         /// Why — the asker reads it. Required in both directions.
         #[arg(long)]
         reason: String,
@@ -1112,7 +1116,7 @@ pub fn run() -> AnyResult<()> {
             cmd_scope_arbitrate(&home, &endpoint, &request_id, grant, reason, &as_member, &target)
         }
         Command::Scope(ScopeCmd::Decide { request_id, once, session, standing, refuse, grant_path,
-                                          recursive, reason, as_member, endpoint }) => {
+                                          recursive, modes, reason, as_member, endpoint }) => {
             let decision = match (once, session, standing, refuse) {
                 (true, false, false, false) => "once",
                 (false, true, false, false) => "session",
@@ -1120,8 +1124,11 @@ pub fn run() -> AnyResult<()> {
                 (false, false, false, true) => "refuse",
                 _ => anyhow::bail!("say exactly one of --once, --session, --standing or --refuse"),
             };
+            if let Some(m) = &modes {
+                hestia::server::grant_modes::Modes::parse(m).map_err(|e| anyhow::anyhow!("--mode: {e}"))?;
+            }
             hestia::gate_cli::scope_peer_decide(&endpoint, &as_member, &request_id, decision,
-                                                grant_path, recursive, &reason)
+                                                grant_path, recursive, modes, &reason)
         }
         Command::Scope(ScopeCmd::Pending { json, as_member, endpoint }) => {
             hestia::gate_cli::scope_pending(&endpoint, as_member, "role:constellation:member", json)

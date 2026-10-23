@@ -226,6 +226,10 @@ pub struct ScopeRequestExt {
     /// NOT-SAME basis the ruling rested on. `None` for an operator ruling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_basis: Option<serde_json::Value>,
+    /// What the live grant lets the member DO at its reach (#1345). Set by the decider, like
+    /// `recursive`; all four by default, which is what every live grant meant before.
+    #[serde(default, skip_serializing_if = "crate::server::grant_modes::is_all")]
+    pub modes: crate::server::grant_modes::Modes,
 }
 
 impl ScopeRequestExt {
@@ -322,7 +326,13 @@ impl ScopeRequest {
     /// Reach is by the grant's own rule (`covers_path`): exact unless the operator made it
     /// recursive — the same rule the standing store uses, so the two channels agree.
     pub fn grants(&self, path: &str, now: u64) -> bool {
+        self.grants_for(path, now, crate::server::grant_modes::Modes::ALL)
+    }
+
+    /// `grants`, and the grant includes every mode in `needed` (#1345).
+    pub fn grants_for(&self, path: &str, now: u64, needed: crate::server::grant_modes::Modes) -> bool {
         self.is_live(now)
+            && self.ext.modes.includes(needed)
             && crate::server::standing_scope::covers_path(self.reach_path(), self.recursive, path)
     }
 
@@ -1358,15 +1368,25 @@ impl ServerState {
     /// grant of record", not "is this filesystem object reachable". A symlink is still a
     /// symlink; see `docs/GATE_BYPASS_CATALOG.md`.
     pub fn has_scope_grant(&self, plugin_id: &str, path: &str) -> bool {
+        // ALL MODES (#1345): every caller of this asks "may the member act here", without
+        // saying how, and answers `already_granted` / `in_force: permits` on a yes. A grant
+        // narrower than rwed cannot answer that yes, or a read-only grant would be reported
+        // in force for a write.
+        self.has_scope_grant_for(plugin_id, path, crate::server::grant_modes::Modes::ALL)
+    }
+
+    /// `has_scope_grant` for an act that needs exactly `needed`.
+    pub fn has_scope_grant_for(&self, plugin_id: &str, path: &str,
+                               needed: crate::server::grant_modes::Modes) -> bool {
         let now = crate::server::gate_escalation::now_secs();
         let want = normalize_scope_path(path);
         self.scope_requests
             .values()
-            .any(|r| r.plugin_id == plugin_id && r.grants(&want, now))
+            .any(|r| r.plugin_id == plugin_id && r.grants_for(&want, now, needed))
             // A STANDING grant answers the same question — "is there a grant of record for
             // exactly this path" — so a member re-asking for a path it durably holds hears
             // `already_granted` instead of filing an ask nobody needs to rule on.
-            || self.standing_scope.has_live(plugin_id, &want, now)
+            || self.standing_scope.has_live_for(plugin_id, &want, now, needed)
     }
 
     /// Every live STANDING grant this member holds (durable row of the asymmetry).
@@ -2911,6 +2931,7 @@ mod tests {
             expires_at: None,
             request_id: None,
         recursive: false,
+        modes: crate::server::grant_modes::Modes::ALL,
         }
     }
 
