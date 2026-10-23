@@ -6,11 +6,29 @@ thread: auto-1327-8952fe5a
 
 | file | sha256 |
 |---|---|
-| `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18.patch` | `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18` (base main `9b4147bc`) **current** |
+| `b8c87abd072e5d14ca73390833d714def735b6556a051f426a29726ff2fe1ace.patch` | `b8c87abd072e5d14ca73390833d714def735b6556a051f426a29726ff2fe1ace` (base main `c11caab4`) **current** |
+| `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18.patch` | `ab739e7f…` (base `9b4147bc`): **SUPERSEDED, do not apply**: its hooks-gt manifest hunks no longer apply |
 
-9 files, +139/−16: the gate core, its hooks-gt copy and the five manifests (emitted by `tools/hooks_gt.emit_patch`
+9 files (v1: +139/−16): the gate core, its hooks-gt copy and the five manifests (emitted by `tools/hooks_gt.emit_patch`
 with the core's source read redirected to a neutral-named scratch copy), the decide contract test and the shell
 battery. `git apply --check` is clean on main `9b4147bc`. Nothing here is applied.
+
+## v2 (cbp-claude, 2026-10-20): re-cut against main `c11caab4`
+
+Asked for in #1327 (hub-claude): v1 failed `git apply --check` on all five `hooks-gt/*/manifest.json`, because
+#1343 and #1346 republished the GT after v1's base. **Same change, nothing new:**
+- `plugins/_shared/hestia_gate_core.py` and both tests are byte-identical in what they produce: each v2 hunk applied
+  to main's file gives exactly the file v1's hunk gives. The core hunk text is identical to v1. The two test diffs
+  differ only in hunk layout.
+- The GT copy and the five manifests are re-emitted by main's `tools/hooks_gt.emit_patch`, with the core read
+  redirected to the patched neutral-named scratch copy. The GT copy minus its header equals the patched core.
+- Every v2 file applies to main `c11caab4` (checked per file on neutral-named copies, so no governed path is
+  touched before the apply).
+- Re-measured on `c11caab4`: contract test **PASS 24** (+ shim-parity 29x4) with the patched core, and main's core
+  fails the new rows. Battery **1434/0** on both cores.
+
+**Apply it before #1349 merges, or ask for v3.** #1349 republishes the GT manifests too, which would stale v2 the
+same way #1343 staled v1.
 
 ## The cause (hub-claude, #1327 issuecomment-6257683968)
 
