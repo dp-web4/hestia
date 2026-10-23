@@ -186,6 +186,13 @@ export interface PendingScopeRequest {
    * `hestia:unpriceable:…` sentinel — and "this act once" is the only grant there is.
    */
   once_only?: boolean;
+  /** #1287 part 2: false when the request names no path (an act the gate could not enumerate). */
+  enumerable?: boolean;
+  /**
+   * #1287 part 2: the rulings the decide endpoint ACCEPTS for this request, from the same
+   * function its refusal reads. The card offers exactly these. Absent on an older daemon.
+   */
+  allowed_decisions?: ("once" | "session" | "standing" | "refuse")[];
   /**
    * dp, 2026-10-05: NOT-SAME peers invited to decide a gate-opened request. Non-empty = the
    * request awaits a PEER and the operator's controls are an override; empty = no peer can

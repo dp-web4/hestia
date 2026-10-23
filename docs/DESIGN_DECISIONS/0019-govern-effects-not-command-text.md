@@ -193,3 +193,23 @@ This decision sharpens the meaning of Hestia's assurance ladder:
 
 The moat is not a better refusal classifier. It is **identity + role + provenance + witnessed
 history + enforceable authority at the machine that can actually cause the effect**.
+
+
+## 2026-10-17 scope clarification — separate governance decisions from optional execution control
+
+**dp ruling:** the Web4/Hestia governance function checks a proposed action for compliance with applicable law and returns YES/NO, recording who asked, when, and under what authority. The agent presents that decision as evidence to the *recipient*, which makes its own acceptance decision. The issuing gate **does not own downstream execution** and cannot 'recall the bullet.' A recipient may operate its own sandbox, resource checks, controls or refusal policy.
+
+Read this document's A2+ capability-envelope requirements as requirements **for a Hestia-provided execution service that expressly claims A2+ containment**, not requirements for every A1 authorization or a universal Web4 grant. The local gate must not imply that inspection of command text guarantees subsequent side effects. Conversely, it need not guarantee full runtime effects to issue a legitimate law decision. Hestia may optionally be both issuer and recipient on a single machine, but those are distinct accountable roles.
+
+Present priorities: trustworthy law/identity/scope decisions, unambiguous portable authorization evidence, recipient-side ability to verify and refuse, and accurate audit/provenance. Explicitly distinguish authorized, presented, accepted, executor-reported and independently witnessed when these data exist; **do not require** all stages or claim observation of unobserved effects. Abuse may presently be addressed through T3/V3 trust reduction and future refusals. ATP/ADP/BDA telemetry can provide a deeper feedback loop later, but reliable observation/control requires independent bandwidth and resilience engineering and is **not top priority**.
+
+Atomic single-use redemption, deterministic file swaps, post-authorization execution integrity, and crash/outcome reconciliation remain valid *conditional executor assurance tests* where such a guarantee is advertised; they are not blanket conformance criteria for the governance gate. A single-use grant records at most one redemption, not necessarily one external effect.
+
+
+## 2026-10-17 decision clarification: authorization is not execution control
+
+Governance checks a proposed act under applicable law, decides YES/NO, and preserves attributable evidence. The agent carries the authorization to the recipient, which independently accepts or refuses using its own authority, trust and defenses. The issuing gate cannot recall an executed act or claim to govern its downstream effects. Hestia may also operate an executing endpoint locally, but that is a separate role with its own assurance claims.
+
+The A2+ capability-envelope tests above apply when Hestia offers an **execution service claiming OS containment**, not as universal prerequisites for Web4 authorization. A1 authorization may be useful and honest without enforcement beyond its MRH. Precise identity, applicable law, action/scope, time and decision receipts are the present governance priority. Content substitution, single-use redemption, crash recovery and effect-level proofs are conditional requirements only if the recipient or executor promises those properties; an atomically consumed grant alone does not establish exactly one effect.
+
+Separate authorized, presented, accepted, reported and witnessed states as evidence permits, and leave unobserved outcomes UNKNOWN. Trust reduction or later refusal are currently important remedies for abuse/misrepresentation. Optional ATP/ADP and BDA telemetry can later improve feedback and effect accountability, but observation or control requires a reliable resilient channel and is not the current priority.

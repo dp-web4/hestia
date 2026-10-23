@@ -318,7 +318,6 @@ def run(fx: Fixture) -> dict:
             ("prefix-assignment-not-in-scope-of-expansion", "D=/tmp cat $D/hostname"),
             ("cd-unknown-then-relative", "cd \"$SCOPE_BATTERY_UNSET_VAR\" && cat ../x/y"),
             # formerly MODELLED (allowed on 01e68a1c): now unenumerated, and priced honestly
-            ("was-for-literal-list", "for f in a.txt b.txt; do cat $f; done"),
             ("was-for-relative-glob", "for f in *.txt; do cat $f; done"),
             ("was-lister-subst-relative", "cat $(find . -name '*.txt')"),
             ("was-date-in-temp-path", "x=$(date +%s); cat /tmp/review-probe-$x"),
@@ -332,6 +331,32 @@ def run(fx: Fixture) -> dict:
             ("was-pwd-subst", "cat \"$(pwd)/a.txt\""),
             # dp, 2026-10-11: the single-literal-assignment rule is scoped exactly this tightly.
             # Each row is an exclusion that must stay UNENUMERATED (a scope request).
+            # The literal-list loop rule's exclusions that stay UNENUMERATED (scope requests).
+            ("litfor-glob-list", "for f in *.txt; do cat $f; done"),
+            ("litfor-dotdot-item", "for d in a ..; do ls $d/x; done"),
+            ("litfor-rebound-in-body", "for r in a b; do r=$(pwd); cat $r/x; done"),
+            ("litfor-read-rebinds", "for r in a b; do read r; cat $r/x; done"),
+            ("litfor-eval-body", "for r in a b; do eval \"cat $r\"; done"),
+            ("litfor-quoted-item", "for r in 'a b' c; do cat $r/x; done"),
+            ("litfor-var-item", "for r in a $SCOPE_BATTERY_UNSET_VAR; do cat $r/x; done"),
+            ("litfor-subst-item", "for r in a $(pwd); do cat $r/x; done"),
+            ("litfor-ifs-var", "for IFS in a b; do cat $IFS/x; done"),
+            ("litfor-piped-out", "for r in a b; do cat $r/x; done | sort"),
+            ("litfor-over-budget", "for r in " + " ".join(f"i{k}" for k in range(40)) + "; do cat $r/x; done"),
+            # Codex HOLD 23938: a body whose state persists into the next iteration, or that holds a
+            # second loop keyword, is judged as before (V unenumerated), not per iteration.
+            ("litfor-body-cd", "for f in a.txt b.txt; do cat $f; cd sub; done"),
+            ("litfor-body-command-cd", "for f in a.txt b.txt; do cat $f; command cd sub; done"),
+            ("litfor-body-pushd", "for f in a.txt b.txt; do pushd sub; cat $f; done"),
+            ("litfor-body-assigns", "for f in a.txt b.txt; do cat $f; Z=sub; done"),
+            ("litfor-body-default-assign", "for f in a.txt b.txt; do cat ${Z:=sub}/$f; done"),
+            ("litfor-body-printf-v", "for f in a.txt b.txt; do printf -v Z %s sub; cat $Z/$f; done"),
+            ("litfor-body-function-def", "for f in a.txt b.txt; do g(){ cat $f; }; g; done"),
+            ("litfor-body-dot-source", "for f in a.txt b.txt; do . ./x; cat $f; done"),
+            ("litfor-body-done-word", "for f in a.txt b.txt; do cat $f; echo done; done"),
+            ("litfor-body-comment", "for f in a.txt b.txt; do cat $f # ; done\ndone"),
+            ("litfor-trailing-semicolon", "for f in a.txt b.txt; do cat $f; done;"),
+            ("litfor-done-without-separator", "for f in a.txt b.txt; do cat $f &done"),
             ("lit-use-before-assignment", "cat $S/x; S=/tmp/review-probe"),
             ("lit-assignment-is-a-pipeline-stage", "S=/tmp/review-probe | cat $S/x"),
             ("lit-assignment-entered-from-a-pipe", "true | S=/tmp/review-probe; cat $S/x"),
@@ -358,7 +383,6 @@ def run(fx: Fixture) -> dict:
             ("lit-IFS", "IFS=/tmp/review-probe; cat $IFS/x"),
             ("lit-PATH", "PATH=/tmp/review-probe; cat $PATH/x"),
             ("lit-name-in-the-environment", "SCOPE_BATTERY_ENV_SET=/tmp/review-probe; cat $SCOPE_BATTERY_ENV_SET/x"),
-            ("lit-for-loop", "for S in /tmp/review-probe; do cat $S/x; done"),
             ("lit-read", "read S; cat $S/x"),
             ("lit-read-after", "S=/tmp/review-probe; read S; cat $S/x"),
             ("lit-unset", "S=/tmp/review-probe; unset S; cat $S/x"),
@@ -381,6 +405,142 @@ def run(fx: Fixture) -> dict:
             # a code literal before the binding does not crash the scan (a 2026-10-11 regression).
             ("lit-after-a-python-c-literal",
              "python3 -c \"print(open('/tmp/review-probe').read())\"; S=/tmp/review-probe; cat $S/x"),
+        ]
+        # #1287 part 1 (2026-10-13): a value that cannot bind is unenumerated only where its use
+        # is judged as a PATH. Message / pattern / string positions (and the prose options) are
+        # data; an UNQUOTED glob-valued name there is still a pathname expansion.
+        deny += [
+            ('1287-prose-flag-does-not-hide-a-file', 'R="x * y"; hestia gate deny X --reason "$R" /etc/hostname'),
+            ('1287-prose-flag-does-not-hide-a-glob', 'hestia gate deny X --reason /etc/*'),
+            # Codex HOLD 21639: prose is per (command, subcommand), never generic. These options are
+            # value-less FLAGS on these commands; the next word is a file and stays judged.
+            ('1287-grep-text-is-a-flag', 'grep needle --text /etc/hostname'),
+            ('1287-rg-text-is-a-flag', 'rg needle --text /etc/hostname'),
+            ('1287-diff-text-is-a-flag', 'diff --text /etc/hostname /dev/null'),
+            ('1287-readelf-notes-is-a-flag', 'readelf --notes /etc/hostname'),
+            ('1287-git-diff-summary-is-a-flag', 'git diff --no-index /dev/null --summary /etc/hostname'),
+            ('1287-gh-pr-review-c-is-a-flag', 'gh pr review 1 -c /etc/hostname'),
+            ('1287-gh-prose-needs-its-subcommand', 'gh pr view 1 --body /etc/hostname'),
+        ]
+        request += [
+            ('1287-path-glob-var', 'F="a*"; cat $F'),
+            ('1287-path-glob-var-quoted', 'F="a*"; cat "$F"'),
+            ('1287-unquoted-glob-var-in-echo', 'R="/tmp/review-probe/*"; echo $R'),
+            ('1287-unquoted-glob-var-in-reason', 'R="/tmp/review-probe/*"; hestia gate deny X --reason $R'),
+            ('1287-prose-var-also-used-as-a-path', 'R="a* b"; hestia gate deny X --reason "$R" $R'),
+            ('1287-dash-m-is-not-prose-for-python', 'R="a* b"; python3 -m "$R"'),
+            ('1287-dash-m-is-not-prose-for-mkdir', 'R="a* b"; mkdir -m "$R" x'),
+            ('1287-dash-m-is-not-prose-for-hestia', 'R="x * y"; hestia mesh send peer -m "$R"'),
+            ('1287-grep-text-var-is-a-file', 'grep needle --text "$SCOPE_BATTERY_UNSET_VAR"'),
+            # Codex HOLD 21675: an UNQUOTED value that field splitting breaks apart inserts more
+            # arguments, a file among them. Its six shapes, then main's own positions that had it.
+            ('1289-split-pr-title-body-file', 'R="hello --body-file /etc/hostname"; gh pr create --title $R'),
+            ('1289-split-pr-title-eq-body-file', 'R="hello --body-file /etc/hostname"; gh pr create --title=$R'),
+            ('1289-split-issue-title-body-file', 'R="hello --body-file /etc/hostname"; gh issue create --title $R'),
+            ('1289-split-release-title-asset', 'R="hello /etc/hostname"; gh release create v2 --title $R'),
+            ('1289-split-release-notes-asset', 'R="hello /etc/hostname"; gh release create v2 --notes $R'),
+            ('1289-split-release-notes-eq-asset', 'R="hello /etc/hostname"; gh release create v2 --notes=$R'),
+            ('1289-split-grep-pattern', 'R="x /etc/hostname"; grep $R'),
+            ('1289-split-grep-e', 'R="x /etc/hostname"; grep -e $R'),
+            ('1289-split-sed-script', 'R="p /etc/hostname"; sed -n $R'),
+            ('1289-split-awk-program', 'R="1 /etc/hostname"; awk $R'),
+            ('1289-split-git-m', 'R="x /etc/hostname"; git commit -m $R'),
+            ('1289-split-unknown-unquoted-reason', 'hestia gate deny X --reason $SCOPE_BATTERY_UNSET_VAR'),
+            ('1289-split-cmdsub-unquoted-pattern', 'grep $(cat a.txt) a.txt'),
+            ('1289-split-cmdsub-unquoted-git-m', 'git commit -m $(cat a.txt)'),
+            ('1289-split-backtick-unquoted-reason', 'hestia gate deny X --reason `cat a.txt`'),
+            # Codex HOLD 21718: quoted, `${A[@]}` is still one argument PER ELEMENT. Its six
+            # shapes, then the supplementary ones and main's own positions.
+            ('1289-array-pr-title-body-file', 'A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; gh pr create --title "${A[@]}"'),
+            ('1289-array-pr-title-eq-body-file', 'A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; gh pr create --title="${A[@]}"'),
+            ('1289-array-issue-title-body-file', 'A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; gh issue create --title "${A[@]}"'),
+            ('1289-array-release-title-asset', 'A[0]=hello; A[1]=/etc/hostname; gh release create v2 --title "${A[@]}"'),
+            ('1289-array-release-notes-asset', 'A[0]=hello; A[1]=/etc/hostname; gh release create v2 --notes "${A[@]}"'),
+            ('1289-array-slice-notes-eq-asset', 'A[0]=unused; A[1]=hello; A[2]=/etc/hostname; gh release create v2 --notes="${A[@]:1}"'),
+            ('1289-array-positional-slice-reason', 'hestia gate deny X --reason "${@:1}"'),
+            ('1289-array-keys-notes', 'A[0]=x; gh release create v2 --notes "${!A[@]}"'),
+            ('1289-array-prefix-names-notes', 'gh release create v2 --notes "${!SCOPE_BATTERY@}"'),
+            ('1289-array-grep-pattern', 'A[0]=x; A[1]=/etc/hostname; grep "${A[@]}"'),
+            ('1289-array-git-m', 'A[0]=x; A[1]=/etc/hostname; git commit -m "${A[@]}"'),
+            ('1289-positional-all-reason', 'hestia gate deny X --reason "$@"'),
+            # Codex HOLD 21790: the same, nested in a default / alternate word. Its six shapes,
+            # then deeper nesting, nested quotes, positionals, and indirection (R='A[@]').
+            ('1289-nested-pr-title-default', 'A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; R=; gh pr create --title "${R:-${A[@]}}"'),
+            ('1289-nested-pr-title-eq-default', 'A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; R=; gh pr create --title="${R:-${A[@]}}"'),
+            ('1289-nested-issue-title-alternate', 'A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; R=yes; gh issue create --title "${R:+${A[@]}}"'),
+            ('1289-nested-release-title-default', 'A[0]=hello; A[1]=/etc/hostname; R=; gh release create v2 --title "${R:-${A[@]}}"'),
+            ('1289-nested-release-notes-alternate', 'A[0]=hello; A[1]=/etc/hostname; R=yes; gh release create v2 --notes "${R+${A[@]}}"'),
+            ('1289-nested-release-notes-eq-default', 'A[0]=hello; A[1]=/etc/hostname; R=; gh release create v2 --notes="${R:-${A[@]}}"'),
+            ('1289-nested-twice', 'A[0]=hello; A[1]=/etc/hostname; R=; gh release create v2 --notes "${R:-${X:-${A[@]}}}"'),
+            ('1289-nested-inner-quotes', 'A[0]=hello; A[1]=/etc/hostname; R=; gh release create v2 --notes "${R:-"${A[@]}"}"'),
+            ('1289-nested-positional', 'R=; gh release create v2 --notes "${R:-$@}"'),
+            ('1289-nested-positional-slice', 'R=; gh release create v2 --notes "${R:-${@:1}}"'),
+            ('1289-indirect-array', 'A[0]=hello; A[1]=/etc/hostname; R="A[@]"; gh release create v2 --notes "${!R}"'),
+            ('1289-indirect-with-default', 'A[0]=hello; A[1]=/etc/hostname; R=A[@]; gh release create v2 --notes "${!R:-x}"'),
+            # Codex HOLD 21861: the indirection target from a positional. Its six shapes, then the
+            # other special-parameter targets and a nested one.
+            ('1289-posind-pr-title', "A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; set -- 'A[@]'; gh pr create --title \"${!1}\""),
+            ('1289-posind-pr-title-eq', "A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; set -- 'A[@]'; gh pr create --title=\"${!1}\""),
+            ('1289-posind-issue-title', "A[0]=hello; A[1]=--body-file; A[2]=/etc/hostname; set -- 'A[@]'; gh issue create --title \"${!1}\""),
+            ('1289-posind-release-title', "A[0]=hello; A[1]=/etc/hostname; set -- 'A[@]'; gh release create v2 --title \"${!1}\""),
+            ('1289-posind-release-notes', "A[0]=hello; A[1]=/etc/hostname; set -- 'A[@]'; gh release create v2 --notes \"${!1}\""),
+            ('1289-posind-release-notes-eq', "A[0]=hello; A[1]=/etc/hostname; set -- 'A[@]'; gh release create v2 --notes=\"${!1}\""),
+            ('1289-posind-multi-digit', "A[0]=hello; A[1]=/etc/hostname; set -- 1 2 3 4 5 6 7 8 9 'A[@]'; gh release create v2 --notes \"${!10}\""),
+            ('1289-posind-count', "A[0]=hello; A[1]=/etc/hostname; set -- 'A[@]'; gh release create v2 --notes \"${!#}\""),
+            ('1289-posind-with-default', "A[0]=hello; A[1]=/etc/hostname; set -- 'A[@]'; gh release create v2 --notes \"${!1:-x}\""),
+            ('1289-posind-nested', "A[0]=hello; A[1]=/etc/hostname; set -- 'A[@]'; R=; gh release create v2 --notes \"${R:-${!1}}\""),
+            ('1289-array-spaced-index', 'A[0]=hello; A[1]=/etc/hostname; gh release create v2 --notes "${A[ @ ]}"'),
+        ]
+        allow += [
+            ('1287-prose-1287-exact-shape', 'cd ~/ws/granted; R="Refused: no seat asked for this. The act is the deploy preflight\'s advisory hold probe (deploy/from-main/hestia-deploy.sh ~L605, plugins/*/expects.json \'evaluate deploy hold\'), fired for ever …"; hestia gate deny 0123abcd --as claude-code --reason "$R"'),
+            ('1287-prose-reason-eq', 'R="see plugins/*/x \'q\'"; hestia gate deny 1 --as claude-code --reason="$R"'),
+            ('1287-prose-gh-body', 'R="see plugins/*/expects.json \'q\'"; gh pr comment 1 --body "$R"'),
+            ('1287-prose-git-m', 'R="fix: plugins/*/x \'b\'"; git commit -m "$R"'),
+            ('1287-prose-argument', 'R="plugins/*/x \'y\'"; hestia gate corroborate X --stance dissent --argument "$R"'),
+            ('1287-prose-title-body', 'T="a * b"; D="c/* \'d\'"; gh pr create --title "$T" --body "$D"'),
+            ('1287-prose-gh-close-comment', 'R="see plugins/*/x"; gh pr close 7 -c "$R"'),
+            ('1287-prose-gh-merge-subject', 'R="land plugins/*"; gh pr merge 7 --squash --subject "$R"'),
+            ('1287-prose-echo-quoted', 'R="a/* b"; echo "$R"'),
+            ('1287-prose-printf-quoted', 'R="a/* b"; printf \'%s\\n\' "$R"'),
+            ('1287-prose-grep-pattern-quoted', 'R="a.*b"; grep -n "$R" a.txt'),
+            ('1287-prose-unknown-var-quoted-in-reason', 'hestia gate deny X --as claude-code --reason "$SCOPE_BATTERY_UNSET_VAR"'),
+            # Codex HOLD 21675 controls: quoted is one argument; an unquoted value is data where it
+            # is provably one field; an echo / printf operand split is only more strings.
+            ('1289-quoted-title-control', 'R="hello --body-file /etc/hostname"; gh pr create --title "$R"'),
+            ('1289-quoted-notes-eq-control', 'R="hello /etc/hostname"; gh release create v2 --notes="$R"'),
+            ('1289-quoted-grep-control', 'R="x /etc/hostname"; grep "$R" a.txt'),
+            ('1289-unquoted-echo-split-is-strings', 'R="x /etc/hostname"; echo $R'),
+            ('1289-one-field-unquoted-reason', 'R=abc; hestia gate deny X --reason $R'),
+            ('1289-one-field-unquoted-pattern', 'P=needle; grep $P a.txt'),
+            ('1289-arithmetic-unquoted-pattern', 'grep $((1+2)) a.txt'),
+            ('1289-status-unquoted-pattern', 'grep $? a.txt'),
+            ('1289-quoted-cmdsub-git-m', 'git commit -m "$(cat a.txt)"'),
+            ('1289-quoted-backtick-reason', 'hestia gate deny X --reason "`cat a.txt`"'),
+            ('1289-quoted-cmdsub-inside-prose', 'gh pr comment 1 --body "ran at $(date), see a.txt"'),
+            ('1289-ansi-c-pattern-is-one-word', "grep -v -c $'\\tpass\\t' a.txt"),
+            ('1289-loop-var-quoted-in-sed-program', 'for r in 1,2 3,4; do sed -n "${r}p" a.txt; done'),
+            # Codex HOLD 21718 controls: these quoted forms are ONE word.
+            ('1289-array-star-joins-one-word', 'A[0]=hello; A[1]=/etc/hostname; gh release create v2 --notes "${A[*]}"'),
+            ('1289-array-element-is-one-word', 'A[0]=hello; gh release create v2 --notes "${A[0]}"'),
+            ('1289-array-count-is-one-word', 'A[0]=hello; gh release create v2 --notes "${#A[@]}"'),
+            ('1289-default-with-at-is-one-word', 'gh pr comment 1 --body "${SCOPE_BATTERY_UNSET_VAR:-ping a@b}"'),
+            ('1289-array-in-echo-is-strings', 'A[0]=x; A[1]=/etc/hostname; echo "${A[@]}"'),
+            # Codex HOLD 21790 controls: nested scalars and joined arrays are ONE word.
+            ('1289-nested-star-joins-one-word', 'A[0]=hello; A[1]=/etc/hostname; R=; gh release create v2 --notes "${R:-${A[*]}}"'),
+            ('1289-nested-element-is-one-word', 'A[0]=hello; R=; gh release create v2 --notes "${R:-${A[0]}}"'),
+            ('1289-nested-scalar-braced-is-one-word', 'X=hi; R=; gh release create v2 --notes "${R:-${X}}"'),
+            ('1289-nested-scalar-is-one-word', 'X=hi; R=; gh release create v2 --notes "${R:-$X}"'),
+            ('1289-escaped-brace-is-one-word', 'R=; gh release create v2 --notes "${R:-x\\}y}"'),
+            ('1289-last-pid-is-one-word', 'gh release create v2 --notes "${!}"'),
+            ('1289-indirect-keys-joined-is-one-word', 'A[0]=x; gh release create v2 --notes "${!A[*]}"'),
+            # Codex HOLD 21861 controls: the allowlist's one-word heads.
+            ('1289-positional-is-one-word', "set -- hi; gh release create v2 --notes \"${1}\""),
+            ('1289-positional-default-is-one-word', "gh release create v2 --notes \"${1:-none}\""),
+            ('1289-star-is-one-word', 'gh release create v2 --notes "${*}"'),
+            ('1289-count-is-one-word', 'A[0]=x; gh release create v2 --notes "${#A[@]}"'),
+            ('1289-transform-is-one-word', 'X=hi; gh release create v2 --notes "${X@Q}"'),
+            ('1289-element-expr-is-one-word', 'A[0]=x; gh release create v2 --notes "${A[0]:-y}"'),
+            ('1289-prefix-joined-is-one-word', 'gh release create v2 --notes "${!HESTIA*}"'),
         ]
         # Codex's quote runner (docs/reviews/scope-1232-quote-regressions.py, notice 20554,
         # 33bddc1c) and the marker / IFS rows that generalise it (2026-10-12).
@@ -466,6 +626,14 @@ def run(fx: Fixture) -> dict:
             ('codex-lit-spaced-printf-variable', 'S=/tmp/review-probe; printf -v S %s /etc; cat $S/hostname'),
             ('codex-lit-spaced-read-array', 'S=/tmp/review-probe; read -a S <<< /etc; cat $S/hostname'),
             ('codex-lit-direct-forbidden', 'S=/etc; cat $S/hostname'),
+            # The literal-list loop rule's exclusions: each must still refuse.
+            ('litfor-outside-item', f"for r in granted {o}; do ls $r; done"),
+            ('litfor-outside-in-body', f"for r in a b; do cat {o}/secret.txt; done"),
+            ('litfor-then-outside', f"for f in a.txt; do cat $f; done; cat {o}/secret.txt"),
+            ('litfor-and-then-outside', f"for f in a.txt; do cat $f; done && cat {o}/secret.txt"),
+            ('litfor-item-builds-outside', f"for r in secret.txt; do cat {o}/$r; done"),
+            ('litfor-nested-outside', f"for r in a; do for s in {o}; do ls $s; done; done"),
+            ('litfor-ungranted-repo-item', f"for r in granted notgranted; do ls {ws}/$r; done"),
         ]
         allow += [
             ('codex-shell-allowed-temp-path', 'cat /tmp/hestia-scope-review-nonexistent'),
@@ -538,6 +706,21 @@ def run(fx: Fixture) -> dict:
             ("lit-newline", "S=/tmp/review-probe\ncat $S/x"),
             ("lit-relative-in-repo", "S=a.txt; cat $S"),
             ("lit-used-inside-a-later-substitution", "S=/tmp/review-probe; echo \"$(cat $S/x)\""),
+            # THE LITERAL-LIST LOOP RULE (proposal, cbp-claude 2026-10-14; #1205 L-b): a whole
+            # command that is one `for V in <literals>; do BODY; done` is judged as `V=item; BODY`
+            # per item, and allowed only if every iteration is. Formerly `was-for-literal-list`,
+            # a request.
+            ("litfor-literal-list", "for f in a.txt b.txt; do cat $f; done"),
+            ("litfor-quoted-use", "for f in a.txt b.txt; do wc -l \"$f\"; done"),
+            ("litfor-newline-form", "for f in a.txt b.txt\ndo\n  cat \"$f\"\ndone"),
+            ("litfor-temp-items", "for n in 1 2 3; do cat /tmp/review-probe-$n; done"),
+            # Formerly request `lit-for-loop` (dp's 2026-10-11 ruling listed `for` among the
+            # binders that stay unenumerated; this proposal admits only a LITERAL list).
+            ("litfor-was-lit-for-loop", "for S in /tmp/review-probe; do cat $S/x; done"),
+            # Formerly request `1289-split-loop-var-in-sed-program` (Codex HOLD 21675: an unquoted
+            # value can split into extra arguments). A literal item has no whitespace and no glob
+            # character, so it is one field; the IFS-touched case stays refused by `_literal_names`.
+            ("litfor-was-1289-split-sed-program", "for r in 1,2 3,4; do sed -n ${r}p a.txt; done"),
             ("commit-message-heredoc-apostrophe",
              "git commit -m \"$(cat <<'EOF'\nit's fine (really\nEOF\n)\""),
             ("comment-is-not-run", f"ls  # {o}/secret.txt"),
@@ -577,6 +760,114 @@ def run(fx: Fixture) -> dict:
             lifted = fx.reach(cmd, scopes=("granted", "path:" + UNENUM))
             check(f"request-lifted-by-once:{name}", lifted[0] is True or lifted[2] not in (None, UNENUM),
                   f"{cmd!r} lifted -> {lifted}")
+
+        # #1296 (live case scope-55faf36cae2d, 2026-10-13): a variable the single-literal rule
+        # resolves is judged by its VALUE's shape, as its literal spelling would be. Run from a
+        # cwd OUTSIDE the workspace, where judging it as a relative path is a false deny.
+        # The issue's repro needs the fleet's grant shape and an EXISTING cwd outside it.
+        out_cwd = f"{o}/sub"
+        ws_tree = (f"path:{ws}/**",)
+        for name, cmd in (
+            ("1296-header-value", 'S=aa0fd2f4; curl -s -X POST http://127.0.0.1:8010/mcp -H "mcp-session-id: $S"'),
+            ("1296-header-braced-suffix", 'S=abc; curl -s http://h/mcp -H "id: ${S}x"'),
+            ("1296-bare-token", "S=abc; echo x | grep -c $S"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree, cwd=out_cwd)
+            check(f"allow-outside-cwd:{name}", r[0] is True, f"{cmd!r} -> {r}")
+        # The literal-list loop under the fleet's real grant shape (`path:<ws>/**`; #1205 L-b).
+        # Under a repo-NAME grant, pass 1 reads `<ws>/$r` lexically, as it does for the
+        # single-literal rule; that stricter residual is unchanged here.
+        ws_tree = (f"path:{ws}/**",)
+        for name, cmd in (
+            ("litfor-abs-under-path-grant", f"for r in granted notgranted; do ls {ws}/$r; done"),
+            ("litfor-git-C-under-path-grant", f"for r in granted; do git -C {ws}/$r status --short; done"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree)
+            check(f"allow-path-grant:{name}", r[0] is True, f"{cmd!r} -> {r}")
+        r = fx.reach(f"for r in granted {o}; do ls $r; done", scopes=ws_tree)
+        check("deny-path-grant:litfor-outside-item", r[0] is False, r)
+        for name, cmd in (
+            ("1296-control-literal-path-value", f"S={o}/secret.txt; cat $S"),
+            ("1296-control-slash-built", "S=etc; cat /$S/hostname"),
+            ("1296-control-relative-escape", "S=../secret.txt; cat $S"),
+            ("1296-control-relative-dotted", "S=./deep.txt; cat $S"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree, cwd=out_cwd)
+            check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
+        # Codex HOLD 23938 (P1 a): a `done` that ends a FILENAME after an already-closed loop is
+        # not the loop's end. Stripping it judged `<o>/granted-` (granted) for `<o>/granted-done`.
+        gd = pathlib.Path(o) / "granted-done"
+        gd.write_text("ungranted\n")
+        (pathlib.Path(o) / "granted-").write_text("granted\n")
+        r = fx.reach(f"for f in a; do :; done; cat {gd}", scopes=("granted", f"path:{o}/granted-"))
+        check("deny-1312-done-suffix-is-a-filename", r[0] is False and r[2] == str(gd), r)
+        # (P1 b): `cd` persists across iterations; judged one iteration at a time, the third pass
+        # of `cd sub` through a `sub/sub -> <o>` link was never examined.
+        cdl = pathlib.Path(ws) / "cdloop"
+        (cdl / "sub").mkdir(parents=True)
+        (cdl / "sub" / "sub").symlink_to(o, target_is_directory=True)
+        r = fx.reach("for f in secret.txt secret.txt secret.txt; do cat $f; cd sub; done",
+                     scopes=ws_tree, cwd=str(cdl))
+        check("refuse-1312-cd-persists-across-iterations", r[0] is False, r)
+        # Codex HOLD 23996: bash forms the command word AFTER quote removal and expansion, so a
+        # raw-text `cd` match misses `c''d`, `c\\d`, a line continuation, `pu''shd`, an item that
+        # is `cd`, `c$f`, `$(echo c)d`, `$'\\x63d'` and a glob that could match `cd`. Each must be
+        # refused AND must not take the loop rule (a refusal for another reason would hide it).
+        lfi = getattr(G, "_literal_for_iterations", lambda _c: None)
+        l3 = "for f in secret.txt secret.txt secret.txt; do cat $f; "
+        for name, cmd in (
+            ("empty-single", l3 + "c''d sub; done"), ("empty-double", l3 + 'c""d sub; done'),
+            ("inner-double", l3 + 'c"d" sub; done'), ("backslash", l3 + "c\\d sub; done"),
+            ("continuation", l3 + "c\\\nd sub; done"), ("pushd-split", l3 + "pu''shd sub; done"),
+            ("ansi-c-hex", l3 + "$'\\x63d' sub; done"), ("subst-joined", l3 + "$(echo c)d sub; done"),
+            ("glob-q", l3 + "c? sub; done"), ("glob-class", l3 + "c[d] sub; done"),
+            ("glob-star", l3 + "c* sub; done"), ("dot-escaped", l3 + "\\. sub/x; done"),
+            ("item-is-cd", "for f in cd cd cd; do cat secret.txt; $f sub; done"),
+            ("item-braced-cd", "for f in cd cd cd; do cat secret.txt; ${f} sub; done"),
+            ("item-completes-cd", "for f in d d d; do cat secret.txt; c$f sub; done"),
+            ("item-sliced", "for f in cdx cdx cdx; do cat secret.txt; ${f:0:2} sub; done"),
+            ("item-is-dot", "for f in . . .; do $f sub/x; done"),
+            ("other-var-head", "for f in a a a; do cat secret.txt; $Z sub; done"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))
+            check(f"refuse-1312-stateful-spelling:{name}", r[0] is False and lfi(cmd) is None,
+                  f"{cmd!r} -> {r}, rule={lfi(cmd) is not None}")
+        # ...and quoting or globbing an ARGUMENT keeps the rule.
+        for name, cmd in (
+            ("quoted-arg", "for f in a.txt b.txt; do grep -n 'foo bar' $f; done"),
+            ("quoted-var", 'for f in a.txt b.txt; do wc -l "$f"; done'),
+            ("glob-arg", "for f in a.txt b.txt; do ls *.txt; cat ${f}; done"),
+        ):
+            check(f"allow-1312-quoted-or-globbed-argument:{name}",
+                  fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))[0] is True, cmd)
+        # Codex review 24029: fnmatch has no POSIX classes or `[^x]`, so `c[[:alpha:]]` beside a
+        # file named `cd` runs `cd` while fnmatch says it cannot (an end-to-end false allow on
+        # 28148979); and `.` (source) is a command after `!`, `if`, `time` or a redirection, not
+        # only after a separator (refused there by the ordinary judge, but not by the rule).
+        (cdl / "cd").write_text("")
+        (cdl / "move").write_text("cd sub\n")
+        for name, cmd in (
+            ("posix-class", l3 + "c[[:alpha:]] sub; done"), ("posix-head", l3 + "[[:lower:]]d sub; done"),
+            ("posix-alnum", l3 + "c[[:alnum:]] sub; done"), ("caret-negation", l3 + "c[^x] sub; done"),
+            ("posix-pushd", l3 + "pu[[:alpha:]]hd sub; done"),
+            ("extglob", l3 + "@(c?) sub; done"),
+            ("dot-after-bang", l3 + "! . ./move; done"), ("dot-after-if", l3 + "if . ./move; then :; fi; done"),
+            ("dot-after-time", l3 + "time . ./move; done"), ("dot-after-redirect", l3 + ">/dev/null . ./move; done"),
+            ("dot-after-then", l3 + "if true; then . ./move; fi; done"),
+            ("dot-after-else", l3 + "if false; then :; else . ./move; fi; done"),
+        ):
+            check(f"refuse-1312-stateful-spelling:{name}", lfi(cmd) is None
+                  and fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))[0] is False,
+                  f"{cmd!r}, rule={lfi(cmd) is not None}")
+        # ...and the test words `[`/`[[` keep the rule. (A `.` argument never had it: the
+        # single-literal rule does not resolve V in a statement holding a bare `.` word.)
+        for name, cmd in (
+            ("test-bracket", "for f in a.txt b.txt; do [ -f $f ] && cat $f; done"),
+            ("test-double-bracket", "for f in a.txt b.txt; do [[ -f $f ]] && cat $f; done"),
+        ):
+            r = fx.reach(cmd, scopes=ws_tree, cwd=str(cdl))
+            check(f"allow-1312-test-word:{name}", lfi(cmd) is not None and r[0] is True,
+                  f"{cmd!r} -> {r}")
 
         # GRANTS: the existing forms reach, at exactly their breadth.
         exact = ("granted", f"path:{o}/secret.txt")
@@ -671,12 +962,16 @@ def run(fx: Fixture) -> dict:
         # there — the verdict a seat acts on, not only the helper.
         for name, cmd in deny:
             ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
-            check(f"evaluate-denies:{name}", ve.blocks and ve.rule in ("mrh.command", "egress.secret"),
+            check(f"evaluate-denies:{name}", ve.blocks and ve.rule in (
+                      "mrh.command", "mrh.command.unenumerated", "egress.secret"),
                   f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}")
+        # hestia#1313 (dp, 2026-10-14): an unenumerable reach is refused under its own rule, which
+        # does not escalate (no scope request is opened). The target still names the sentinel.
+        unenum_rule = "mrh.command.unenumerated" if "mrh.command.unenumerated" in G.REMEDIES else "mrh.command"
         for name, cmd in request:
             ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
             check(f"evaluate-requests:{name}",
-                  ve.blocks and ve.rule == "mrh.command" and getattr(ve, "target", "") == UNENUM,
+                  ve.blocks and ve.rule == unenum_rule and getattr(ve, "target", "") == UNENUM,
                   f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}/{getattr(ve, 'target', None)}")
         # Parity on the deny side: every absolute deny target is also refused to Read.
         for name, cmd in deny:

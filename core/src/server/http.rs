@@ -869,13 +869,24 @@ async fn operator_deployment_update(
         }
     };
 
-    if super::dashboard::same_deployed_build(&authority_build, authority_head_sha.as_deref(), env!("HESTIA_GIT_VERSION")) {
+    // A box that is current against its OWN manifest can still be behind origin/main: the
+    // daemon never fetches, so only the supervisor knows. With the timer off, this request is
+    // the box's only way to find out, so it is not short-circuited here ("check for updates").
+    // The supervisor syncs, compares, and logs CURRENT without building when nothing moved.
+    let locally_current = super::dashboard::same_deployed_build(
+        &authority_build,
+        authority_head_sha.as_deref(),
+        env!("HESTIA_GIT_VERSION"),
+    );
+
+    // Refuse before witnessing or publishing anything when there is no supervisor to start:
+    // the trigger could only fail, and the old failure text named no remedy (#791).
+    if !super::dashboard::deploy_supervisor_installed() {
         return (
-            StatusCode::OK,
+            StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "status": "current",
-                "message": "deployment is already current",
-                "running_build": env!("HESTIA_GIT_VERSION"),
+                "status": "update_unavailable",
+                "error": super::dashboard::DEPLOY_SUPERVISOR_MISSING,
             })),
         );
     }
@@ -943,6 +954,7 @@ async fn operator_deployment_update(
                 "authority_build": authority_build,
                 "platform": std::env::consts::OS,
                 "mechanism": "registered-deployment-supervisor",
+                "locally_current": locally_current,
             }),
             provenance.as_ref(),
         );
@@ -1085,6 +1097,380 @@ async fn operator_deployment_update(
     }
 }
 
+/// Fixed check trigger: start the check-only unit, never the deploy. Linux user systemd only;
+/// elsewhere there is no check unit, so the dashboard has only the update button.
+fn deployment_check_trigger_for(os: &str) -> Option<DeploymentUpdateTrigger> {
+    (os == "linux").then(|| DeploymentUpdateTrigger {
+        program: "systemctl",
+        // --no-block: answer the browser now; the dashboard poll shows the verdict.
+        args: vec![
+            "--user".into(),
+            "--no-block".into(),
+            "start".into(),
+            "hestia-deploy-check.service".into(),
+        ],
+    })
+}
+
+/// Whether a deploy-check.tsv line is a check still in flight (requested or checking, recent).
+fn deployment_check_in_flight(raw: &str) -> bool {
+    super::dashboard::deploy_check_in(raw, env!("HESTIA_GIT_VERSION"), chrono::Utc::now())
+        .is_some_and(|c| c.state == "requested" || c.state == "checking")
+}
+
+/// `POST /api/operator/deployment/check` - ask whether an update is available, and nothing
+/// else (operator, tl-dell 2026-10-21: "check for update means ONLY to check").
+///
+/// Starts hestia-deploy-check.service (`hestia-deploy --check`): sync the deploy checkout,
+/// compare it with the running build, write the verdict to deploy-check.tsv. No build, no
+/// install, no restart; installing stays with `/deployment/update`. The browser sends no body.
+async fn operator_deployment_check(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let now = super::state::unix_now();
+    let (operator, provenance) = {
+        let s = state.lock().await;
+        current_operator_context(&s, &headers, now)
+    };
+    let home = match deployment_update_authority() {
+        Ok((home, _, _)) => home,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "check_unavailable", "error": error })),
+            );
+        }
+    };
+    // Refuse before witnessing or writing anything when there is no check unit to start.
+    let Some(trigger) = deployment_check_trigger_for(std::env::consts::OS)
+        .filter(|_| super::dashboard::deploy_check_installed())
+    else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "check_unavailable",
+                "error": "the update-check unit (hestia-deploy-check) is not installed on this box; \
+                          the next update installs it, or re-run deploy/fleet/install.sh",
+            })),
+        );
+    };
+    let result_path = home.join("deploy-check.tsv");
+    if std::fs::read_to_string(&result_path).is_ok_and(|raw| deployment_check_in_flight(&raw)) {
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "checking", "message": "a check is already running" })),
+        );
+    }
+
+    // Witnessed before the side effect, as the update request is: no record, no check.
+    {
+        let mut s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "running_build": env!("HESTIA_GIT_VERSION"),
+                "platform": std::env::consts::OS,
+                "mechanism": "hestia-deploy --check (no build, no install, no restart)",
+            }),
+            provenance.as_ref(),
+        );
+        if let Err(error) = s.append_chain("deployment_check_requested", record) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": format!("cannot witness the update check request: {error}"),
+                })),
+            );
+        }
+    }
+
+    // "requested" first, so the dashboard shows "checking…" on its next poll instead of the
+    // previous verdict; the supervisor overwrites it with its own.
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let _ = write_deployment_update_file(
+        &result_path,
+        &format!("requested\t{stamp}\t{}\t\n", env!("HESTIA_GIT_VERSION")),
+    );
+    let trigger_for_run = trigger.clone();
+    let outcome = match tokio::task::spawn_blocking(move || deployment_trigger_output(&trigger_for_run)).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("update check trigger task failed: {error}")),
+    };
+    let mut s = state.lock().await;
+    match outcome {
+        Ok(()) => {
+            let witnessed = s
+                .append_chain(
+                    "deployment_check_triggered",
+                    super::operator_auth::attach_operator_provenance(
+                        serde_json::json!({
+                            "operator": operator,
+                            "trigger_program": trigger.program,
+                            "trigger_args": trigger.args,
+                            "outcome": "requested",
+                        }),
+                        provenance.as_ref(),
+                    ),
+                )
+                .is_ok();
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "requested",
+                    "witnessed": witnessed,
+                    "message": "checking origin/main for an update; nothing will be installed",
+                })),
+            )
+        }
+        Err(error) => {
+            let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let _ = write_deployment_update_file(
+                &result_path,
+                &format!("failed\t{stamp}\t{}\t\n", env!("HESTIA_GIT_VERSION")),
+            );
+            let witnessed = s
+                .append_chain(
+                    "deployment_check_trigger_failed",
+                    super::operator_auth::attach_operator_provenance(
+                        serde_json::json!({ "operator": operator, "outcome": "trigger-failed", "error": error }),
+                        provenance.as_ref(),
+                    ),
+                )
+                .is_ok();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "failed", "witnessed": witnessed, "error": error })),
+            )
+        }
+    }
+}
+
+/// Body of `POST /api/operator/deployment/auto-update`: on or off, nothing else. No unit,
+/// path or schedule is taken from the browser.
+#[derive(serde::Deserialize)]
+struct AutoUpdateToggle {
+    enabled: bool,
+}
+
+/// Fixed timer toggle. `--now` makes enabled and active move together, so what the dashboard
+/// reads from the unit files (`auto_update_state`) is also what is scheduled.
+fn auto_update_trigger_for(os: &str, enabled: bool) -> Option<DeploymentUpdateTrigger> {
+    match os {
+        "linux" => Some(DeploymentUpdateTrigger {
+            program: "systemctl",
+            args: vec![
+                "--user".into(),
+                if enabled { "enable" } else { "disable" }.into(),
+                "--now".into(),
+                "hestia-deploy.timer".into(),
+            ],
+        }),
+        _ => None,
+    }
+}
+
+/// `POST /api/operator/deployment/auto-update` - switch scheduled deploys (hestia-deploy.timer)
+/// on or off. The update button is unaffected: with the timer off the box still updates, but
+/// only when the operator asks.
+///
+/// Turning it ON can start a deploy straight away: the timer is `Persistent=true`, so a missed
+/// fire time runs as soon as it is armed. The dashboard says so before it asks.
+async fn operator_deployment_auto_update(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(toggle): Json<AutoUpdateToggle>,
+) -> impl IntoResponse {
+    let now = super::state::unix_now();
+    let (operator, provenance) = {
+        let s = state.lock().await;
+        current_operator_context(&s, &headers, now)
+    };
+    let Some(unit_dir) = super::dashboard::auto_update_unit_dir() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "unavailable",
+                "error": format!("no auto-update toggle for {}", std::env::consts::OS),
+            })),
+        );
+    };
+    let Some(trigger) = auto_update_trigger_for(std::env::consts::OS, toggle.enabled) else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "unavailable",
+                "error": format!("no auto-update toggle for {}", std::env::consts::OS),
+            })),
+        );
+    };
+    let (code, body) = toggle_auto_update(
+        &state,
+        operator,
+        provenance,
+        toggle.enabled,
+        &unit_dir,
+        trigger,
+        deployment_trigger_output,
+    )
+    .await;
+    (code, Json(body))
+}
+
+/// One auto-update change at a time. Two opposing clicks (two tabs, a double click) would
+/// otherwise both read the same `before`, both witness an intent against it and race their
+/// systemctl calls, leaving a chain whose before/after pairs describe no real sequence.
+static AUTO_UPDATE_TOGGLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The toggle itself, with the unit directory and the systemctl runner passed in so tests can
+/// drive it without a real user systemd. Holds [`AUTO_UPDATE_TOGGLE`] from the first read of the
+/// timer state to the outcome record.
+async fn toggle_auto_update<F>(
+    state: &SharedState,
+    operator: Option<String>,
+    provenance: Option<super::operator_auth::OperatorProvenance>,
+    enabled: bool,
+    unit_dir: &std::path::Path,
+    trigger: DeploymentUpdateTrigger,
+    run: F,
+) -> (StatusCode, serde_json::Value)
+where
+    F: FnOnce(&DeploymentUpdateTrigger) -> std::result::Result<(), String> + Send + 'static,
+{
+    let _one_at_a_time = AUTO_UPDATE_TOGGLE.lock().await;
+    let before = super::dashboard::auto_update_state_in(unit_dir);
+    let wanted = if enabled { "on" } else { "off" };
+    if before == "absent" {
+        return (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "status": "absent",
+                "error": "hestia-deploy.timer is not installed on this box; see deploy/from-main/README.md",
+            }),
+        );
+    }
+    if before == wanted {
+        return (
+            StatusCode::OK,
+            serde_json::json!({ "status": wanted, "message": format!("auto-update is already {wanted}") }),
+        );
+    }
+
+    // SELF-WITNESS BEFORE SIDE EFFECT, as for the update request: no chain record, no toggle.
+    {
+        let s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "before": before,
+                "requested": wanted,
+                "platform": std::env::consts::OS,
+                "trigger_program": trigger.program,
+                "trigger_args": trigger.args,
+            }),
+            provenance.as_ref(),
+        );
+        if let Err(error) = s.append_chain("deployment_auto_update_intent", record) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "status": "failed",
+                    "error": format!("cannot witness auto-update change: {error}"),
+                }),
+            );
+        }
+    }
+
+    let trigger_for_run = trigger.clone();
+    let trigger_result = match tokio::task::spawn_blocking(move || run(&trigger_for_run)).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("auto-update toggle task failed: {error}")),
+    };
+    let after = super::dashboard::auto_update_state_in(unit_dir);
+    let outcome = auto_update_outcome(wanted, after, &trigger_result);
+    let witness = {
+        let s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "before": before,
+                "requested": wanted,
+                "after": after,
+                "outcome": outcome,
+                "error": trigger_result.as_ref().err(),
+            }),
+            provenance.as_ref(),
+        );
+        s.append_chain("deployment_auto_update_changed", record)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
+    auto_update_reply(wanted, after, outcome, &trigger_result, witness)
+}
+
+/// How a toggle ended, judged by the unit files afterwards, not by systemctl's exit alone:
+/// `changed` (asked for and now in force), `not-applied` (systemctl said yes but the timer
+/// still reads otherwise) or `trigger-failed`.
+fn auto_update_outcome(
+    wanted: &str,
+    after: &str,
+    trigger: &std::result::Result<(), String>,
+) -> &'static str {
+    match trigger {
+        Err(_) => "trigger-failed",
+        Ok(()) if after == wanted => "changed",
+        Ok(()) => "not-applied",
+    }
+}
+
+/// The caller's answer. A change that took effect but whose outcome record did not land is
+/// still an error, and it says the change happened: the operator must not retry a toggle that
+/// already took, and must know the chain is one record short.
+fn auto_update_reply(
+    wanted: &str,
+    after: &str,
+    outcome: &str,
+    trigger: &std::result::Result<(), String>,
+    witness: std::result::Result<(), String>,
+) -> (StatusCode, serde_json::Value) {
+    let witness_error = witness.err().map(|e| format!("the outcome record was not written: {e}"));
+    let (code, error) = match (outcome, trigger) {
+        ("changed", _) => match &witness_error {
+            None => (StatusCode::OK, None),
+            Some(w) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some(format!("auto-update is now {after}, but {w}")),
+            ),
+        },
+        ("not-applied", _) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(format!(
+                "systemctl reported success but the timer reads {after}, not {wanted}{}",
+                witness_error.as_ref().map(|w| format!("; {w}")).unwrap_or_default()
+            )),
+        ),
+        (_, Err(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(format!(
+                "{e}{}",
+                witness_error.as_ref().map(|w| format!("; {w}")).unwrap_or_default()
+            )),
+        ),
+        (_, Ok(())) => (StatusCode::INTERNAL_SERVER_ERROR, Some(format!("unexpected outcome {outcome}"))),
+    };
+    let mut body = serde_json::json!({
+        "status": after,
+        "requested": wanted,
+        "outcome": outcome,
+        "witnessed": witness_error.is_none(),
+    });
+    if let Some(e) = error {
+        body["error"] = e.into();
+    }
+    (code, body)
+}
+
 #[cfg(test)]
 mod deployment_update_tests {
     use super::*;
@@ -1097,6 +1483,166 @@ mod deployment_update_tests {
             trigger.args,
             ["--user", "--no-block", "start", "hestia-deploy.service"]
         );
+    }
+
+    #[test]
+    fn auto_update_toggle_is_fixed_on_linux_and_absent_elsewhere() {
+        let on = auto_update_trigger_for("linux", true).unwrap();
+        assert_eq!(on.program, "systemctl");
+        assert_eq!(on.args, ["--user", "enable", "--now", "hestia-deploy.timer"]);
+        let off = auto_update_trigger_for("linux", false).unwrap();
+        assert_eq!(off.args, ["--user", "disable", "--now", "hestia-deploy.timer"]);
+        assert!(auto_update_trigger_for("macos", true).is_none());
+        assert!(auto_update_trigger_for("windows", false).is_none());
+    }
+
+    #[test]
+    fn deployment_check_starts_the_check_unit_and_never_the_deploy() {
+        let t = deployment_check_trigger_for("linux").unwrap();
+        assert_eq!(t.program, "systemctl");
+        assert_eq!(t.args, ["--user", "--no-block", "start", "hestia-deploy-check.service"]);
+        assert!(!t.args.iter().any(|a| a == "hestia-deploy.service"));
+        assert!(deployment_check_trigger_for("macos").is_none());
+        assert!(deployment_check_trigger_for("windows").is_none());
+    }
+
+    #[test]
+    fn deployment_check_in_flight_only_while_requested_or_checking() {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(deployment_check_in_flight(&format!("requested\t{now}\t\t\n")));
+        assert!(deployment_check_in_flight(&format!("checking\t{now}\t\t\n")));
+        assert!(!deployment_check_in_flight(&format!("available\t{now}\t\tv9\n")));
+        assert!(!deployment_check_in_flight(&format!("failed\t{now}\t\t\n")));
+        assert!(!deployment_check_in_flight("checking\t2020-01-01T00:00:00Z\t\t\n"));
+    }
+
+    #[test]
+    fn auto_update_reply_reports_what_happened_not_what_was_asked() {
+        let ok: std::result::Result<(), String> = Ok(());
+        let failed: std::result::Result<(), String> = Err("systemctl exited 1".into());
+        // Asked, done, witnessed.
+        let (code, body) = auto_update_reply("on", "on", auto_update_outcome("on", "on", &ok), &ok, Ok(()));
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!((body["outcome"].as_str(), body["witnessed"].as_bool()), (Some("changed"), Some(true)));
+        assert!(body.get("error").is_none());
+        // Done but the outcome record failed: an error that says the change took.
+        let (code, body) = auto_update_reply("on", "on", "changed", &ok, Err("chain poisoned".into()));
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["witnessed"], false);
+        let e = body["error"].as_str().unwrap();
+        assert!(e.contains("auto-update is now on") && e.contains("chain poisoned"), "{e}");
+        // systemctl exit 0, timer unchanged: not reported as success.
+        assert_eq!(auto_update_outcome("off", "on", &ok), "not-applied");
+        let (code, body) = auto_update_reply("off", "on", "not-applied", &ok, Ok(()));
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["status"], "on");
+        assert!(body["error"].as_str().unwrap().contains("reads on, not off"));
+        // Trigger failed, and the record of that failed too: both named.
+        let (code, body) = auto_update_reply("on", "off", "trigger-failed", &failed, Err("disk full".into()));
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let e = body["error"].as_str().unwrap();
+        assert!(e.contains("systemctl exited 1") && e.contains("disk full"), "{e}");
+    }
+
+    async fn toggle_test_state() -> (tempfile::TempDir, SharedState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    /// A stand-in for `systemctl --user enable|disable --now`: moves the timers.target.wants
+    /// link the dashboard reads, after a pause so concurrent toggles would overlap.
+    fn fake_systemctl(
+        unit_dir: std::path::PathBuf,
+        apply: bool,
+    ) -> impl FnOnce(&DeploymentUpdateTrigger) -> std::result::Result<(), String> + Send + 'static {
+        move |t| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if apply {
+                let wants = unit_dir.join("timers.target.wants");
+                std::fs::create_dir_all(&wants).unwrap();
+                let link = wants.join("hestia-deploy.timer");
+                if t.args.iter().any(|a| a == "enable") {
+                    std::fs::write(&link, "").unwrap();
+                } else {
+                    let _ = std::fs::remove_file(&link);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_update_toggle_reports_a_change_systemctl_did_not_make() {
+        let (dir, state) = toggle_test_state().await;
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(units.join("hestia-deploy.timer"), "[Timer]\n").unwrap();
+        let trigger = auto_update_trigger_for("linux", true).unwrap();
+        let (code, body) = toggle_auto_update(
+            &state, Some("op".into()), None, true, &units, trigger, fake_systemctl(units.clone(), false),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["outcome"], "not-applied");
+        let s = state.lock().await;
+        let changed = s
+            .recent_chain(50)
+            .into_iter()
+            .find(|e| e.event_type == "deployment_auto_update_changed")
+            .expect("outcome record");
+        assert_eq!(changed.event_data["outcome"], "not-applied");
+        assert_eq!(changed.event_data["after"], "off");
+    }
+
+    #[tokio::test]
+    async fn opposing_auto_update_toggles_are_serialized() {
+        let (dir, state) = toggle_test_state().await;
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(units.join("hestia-deploy.timer"), "[Timer]\n").unwrap();
+        let on = {
+            let (state, units) = (state.clone(), units.clone());
+            tokio::spawn(async move {
+                let t = auto_update_trigger_for("linux", true).unwrap();
+                toggle_auto_update(&state, Some("a".into()), None, true, &units, t, fake_systemctl(units.clone(), true)).await
+            })
+        };
+        let off = {
+            let (state, units) = (state.clone(), units.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let t = auto_update_trigger_for("linux", false).unwrap();
+                toggle_auto_update(&state, Some("b".into()), None, false, &units, t, fake_systemctl(units.clone(), true)).await
+            })
+        };
+        let (on, off) = (on.await.unwrap(), off.await.unwrap());
+        assert_eq!(on.0, StatusCode::OK, "{}", on.1);
+        assert_eq!(off.0, StatusCode::OK, "{}", off.1);
+        assert_eq!(super::super::dashboard::auto_update_state_in(&units), "off");
+        // Chain order: each intent is followed by its own outcome, and the second toggle's
+        // `before` is the first one's `after`.
+        let s = state.lock().await;
+        let mut recs: Vec<_> = s
+            .recent_chain(200)
+            .into_iter()
+            .filter(|e| e.event_type.starts_with("deployment_auto_update_"))
+            .collect();
+        recs.sort_by_key(|e| e.chain_position);
+        let kinds: Vec<_> = recs.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "deployment_auto_update_intent",
+                "deployment_auto_update_changed",
+                "deployment_auto_update_intent",
+                "deployment_auto_update_changed"
+            ]
+        );
+        assert_eq!(recs[1].event_data["after"], "on");
+        assert_eq!(recs[2].event_data["before"], "on");
+        assert_eq!(recs[3].event_data["after"], "off");
     }
 
     #[test]
@@ -1210,6 +1756,14 @@ pub async fn serve_with_callback(
         .route(
             "/api/operator/deployment/update",
             post(operator_deployment_update),
+        )
+        .route(
+            "/api/operator/deployment/auto-update",
+            post(operator_deployment_auto_update),
+        )
+        .route(
+            "/api/operator/deployment/check",
+            post(operator_deployment_check),
         )
         .route(
             "/api/operator/gate-escalation",
@@ -1430,6 +1984,9 @@ pub async fn serve_with_callback(
         loop {
             tick.tick().await;
             let now = super::gate_escalation::now_secs();
+            // The gate set, discovered BEFORE the lock below: the inventory child takes about a
+            // second, and under the lock that second was a stall for every member (#1183).
+            let discovered = discovered_gate_paths_off_lock().await;
             // DURABLE READS: the pass runs in a durability scope (its outward writes also flush
             // the chain first: inbox barrier, lane, status file, vault barrier).
             let (lapsed, durable) = crate::storage::durability::durable_scope(async {
@@ -1454,7 +2011,7 @@ pub async fn serve_with_callback(
                 // Gate bytes on the same cadence, and at startup (an interval's first tick is
                 // immediate). Before this the daemon checked its gates only when an operator
                 // asked (#1085); dp, 2026-09-21: the daemon verifies, the installer reads.
-                let gates = super::gate_watch::check(&mut s);
+                let gates = super::gate_watch::check(&mut s, discovered);
                 if gates["status"] != "VERIFIED" {
                     tracing::warn!(status = %gates["status"], "gate integrity: not verified");
                 }
@@ -2775,6 +3332,10 @@ async fn scope_list_requests(State(state): State<SharedState>) -> impl IntoRespo
                 "recursive": r.recursive,
                 "invited_peers": r.ext.invited_peers,
                 "peer_basis": r.ext.peer_basis,
+                // #1287 part 2: what a surface may offer, from the decide endpoint's own source.
+                "enumerable": !crate::server::state::is_unpriceable_scope_path(&r.path),
+                "allowed_decisions": crate::server::state::scope_allowed_decisions(
+                    &r.path, r.ext.gate.is_some()),
             })
         })
         .collect();
@@ -2945,27 +3506,29 @@ pub(crate) async fn scope_decide_as(
     }
     let (plugin_id, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
     let gate_origin = req.ext.gate.clone();
-    // An UNENUMERATED act (dp, 2026-10-10, #1232 narrowed): the gate could not enumerate what it
-    // reaches, so the request names the act, not a path. ONCE (that act, exactly) or refuse —
-    // a session or standing grant would have to name a path nobody knows.
-    if granted && !once && crate::server::state::is_unpriceable_scope_path(&path) {
+    // WHICH KINDS this request accepts comes from `scope_allowed_decisions` — the same function
+    // every operator surface reads its offer from (`allowed_decisions` on the snapshot, the
+    // request listing and the ledger), so a button the UI renders is one this check admits
+    // (#1287 part 2: dp clicked a plain grant on an unenumerated request and learnt the rule
+    // from this error).
+    let kind = crate::server::state::scope_decision_kind(granted, once, standing);
+    let allowed = crate::server::state::scope_allowed_decisions(&path, gate_origin.is_some());
+    if !allowed.contains(&kind) {
+        let error = if kind == "once" {
+            "a one-time approval binds to the act the gate refused, and this request was filed by \
+             the member — it names no act. Grant it for the session or standing instead"
+        } else {
+            // An UNENUMERATED act (dp, 2026-10-10, #1232 narrowed): the gate could not
+            // enumerate what it reaches, so the request names the act, not a path. ONCE (that
+            // act, exactly) or refuse — a session or standing grant would have to name a path
+            // nobody knows.
+            "the gate could not enumerate what this act reaches (an expansion decides it), so \
+             there is no path a session or standing grant could name: approve it ONCE (this \
+             act, exactly) or refuse it"
+        };
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "the gate could not enumerate what this act reaches (an expansion \
-                          decides it), so there is no path a session or standing grant could \
-                          name: approve it ONCE (this act, exactly) or refuse it"
-            })),
-        );
-    }
-    if once && gate_origin.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "a one-time approval binds to the act the gate refused, and this request \
-                          was filed by the member — it names no act. Grant it for the session or \
-                          standing instead"
-            })),
+            Json(serde_json::json!({"error": error, "kind": kind, "allowed_decisions": allowed})),
         );
     }
     // The breadth, validated against the ASKED path: equal, or an ancestor at a separator.
@@ -6031,7 +6594,7 @@ async fn orchestrator_connect(
 /// adapter for, and what is actually governed. Read-only; the write half is
 /// `/api/orchestrators/:id/connect` (govern) and `/api/agents/:id/ungovern`.
 async fn agents_inventory(State(state): State<SharedState>) -> impl IntoResponse {
-    match crate::server::agents::inventory() {
+    match crate::server::agents::inventory_off_thread().await {
         // `bypassed`: the operator's active gate bypasses, beside -- never merged into -- the
         // inventory's own verdicts. The inventory is not told; whether it reads a bypassed member
         // as miswired is its finding (dp, 2026-09-28: the bypass is the test of that detection).
@@ -6111,7 +6674,7 @@ async fn agent_gate_bypass(
                              r.bypassed_at, r.reason),
         })));
     }
-    let inv = match crate::server::agents::inventory() {
+    let inv = match crate::server::agents::inventory_off_thread().await {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": format!("the inventory could not run ({e}); refusing to edit a registration it cannot see"),
@@ -6263,7 +6826,7 @@ async fn agent_register(
             })),
         );
     }
-    let report = match crate::server::agents::inventory() {
+    let report = match crate::server::agents::inventory_off_thread().await {
         Ok(v) => v,
         Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
             "error": format!("cannot register what was not discovered: the inventory did not run ({e})")}))),
@@ -6670,10 +7233,29 @@ fn refuse_if_retired(
 
 const RETIRE_ACTIVE_WINDOW_HOURS: i64 = 24;
 
+/// The operator principal for a retirement's act rows: `operator` is the authenticated
+/// principal for EVERY session kind (codex review of #1035, finding 1: reading
+/// provenance.principal alone wrote the office literal for a direct dashboard session);
+/// provenance.principal is the composed-session fallback. WHO retired is evidence — the
+/// literal "operator" this replaced named a role, not a party (#1036). A session always
+/// carries a principal, so the final fallback names the degradation (the dev-override
+/// path inserts no witness) rather than inventing an operator.
+fn gate_operator(gate: &Option<axum::Extension<super::operator_auth::GateWitness>>) -> String {
+    match gate {
+        Some(axum::Extension(w)) => w
+            .operator
+            .clone()
+            .or_else(|| w.provenance.as_ref().map(|p| p.principal.clone()))
+            .unwrap_or_else(|| "operator (direct session)".to_string()),
+        None => "operator (session not recorded on this path)".to_string(),
+    }
+}
+
 /// Retire an id on THIS seat: revoke its standing grants and take it out of the default view.
 /// Never deletion; see `server::retirement` for what it is and is deliberately not.
 async fn agent_retire(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -6707,6 +7289,7 @@ async fn agent_retire(
     let recent = measured.clone().unwrap_or(0);
 
     let now = crate::server::gate_escalation::now_secs();
+    let retired_by = gate_operator(&gate);
     let held: Vec<String> = s.standing_scope.grants.iter()
         .filter(|g| g.member == plugin_id).map(|g| g.path.clone()).collect();
     let record = serde_json::json!({
@@ -6719,14 +7302,14 @@ async fn agent_retire(
         "acts_measurable": measured.is_ok(),
         "window_hours": RETIRE_ACTIVE_WINDOW_HOURS,
         "confirmed_active": confirm_active,
-        "retired_by": "operator",
+        "retired_by": retired_by,
         "scope": "this seat only — a retirement is not published to the hub and does not reach \
                   another seat's registry",
     });
     // INTENT -> COMMIT -> SUCCESS, the ordering `witness_and_commit_standing_grant` exists to
     // keep: a failed commit must not leave the chain asserting an authority change that never
     // took effect.
-    let intent = match s.append_chain("member_retire_intent", record.clone()) {
+    let intent = match s.append_chain("member_retire_intent", stamp_gate(record.clone(), &gate)) {
         Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
@@ -6734,6 +7317,7 @@ async fn agent_retire(
     let rec = crate::server::retirement::RetiredMember {
         plugin_id: plugin_id.clone(), retired_at: now, reason: reason.clone(),
         evidence_ref: evidence_ref.clone(), revoked_paths: held.clone(), was_active: recent > 0,
+        retired_by: retired_by.clone(),
     };
     let revoked = match s.commit_retirement(&reason, |st| { st.retire(rec); Some(plugin_id.clone()) }) {
         Ok(v) => v,
@@ -6752,7 +7336,7 @@ async fn agent_retire(
         m.insert("revoked_delegations".into(), serde_json::json!(revoked.delegations));
         m.insert("intent".into(), serde_json::json!(intent.hash));
     }
-    let entry = s.append_chain("member_retired", done).ok();
+    let entry = s.append_chain("member_retired", stamp_gate(done, &gate)).ok();
     let gen = s.retired_members.generation;
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "retired": true,
@@ -6774,6 +7358,7 @@ async fn agent_retire(
 /// was revoked so the operator can re-grant deliberately.
 async fn agent_reinstate(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
@@ -6796,9 +7381,9 @@ async fn agent_reinstate(
         "was_retired_at": existing.retired_at,
         "was_retired_because": existing.reason,
         "paths_revoked_then_and_NOT_restored_now": existing.revoked_paths,
-        "reinstated_by": "operator",
+        "reinstated_by": gate_operator(&gate),
     });
-    let intent = match s.append_chain("member_reinstate_intent", record.clone()) {
+    let intent = match s.append_chain("member_reinstate_intent", stamp_gate(record.clone(), &gate)) {
         Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("witnessing intent: {e}")}))),
@@ -6807,7 +7392,7 @@ async fn agent_reinstate(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": format!("still retired: {e}"), "intentEntryHash": intent.hash })));
     }
-    let entry = s.append_chain("member_reinstated", record).ok();
+    let entry = s.append_chain("member_reinstated", stamp_gate(record, &gate)).ok();
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "retired": false,
         "generation": s.retired_members.generation,
@@ -6906,8 +7491,13 @@ fn ungovern_ordered(
 /// So coverage now comes from the inventory, which already stats every hook target on the
 /// machine across the full scope chain and simply kept the list to itself. One discovery
 /// path, measured once, consumed by both surfaces.
-pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
-    let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
+///
+/// The inventory runs on the blocking pool. Call this BEFORE taking the state lock (#1183):
+/// the child takes about a second, and under the lock that second stalls every member's gate
+/// round-trip. Holding the lock does not freeze the filesystem, so discovering first gives up
+/// no guarantee. The hashes a verdict or a ratification rests on are still taken under the lock.
+pub(crate) async fn discovered_gate_paths_off_lock() -> Result<Vec<(String, String)>, String> {
+    let inv = crate::server::agents::inventory_off_thread().await.map_err(|e| e.to_string())?;
     discovered_gate_paths_from(&inv)
 }
 
@@ -6915,8 +7505,9 @@ pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
 /// inventory read. The second list is what separates a stale expectation from a de-registered
 /// gate (#1156): a member that still declares a gate but has none registered was bypassed or
 /// miswired, and its ratified expectation is the only record that a gate belongs there.
-fn gate_inventory() -> Result<(Vec<(String, String)>, Vec<String>), String> {
-    let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
+/// Off the lock and off the async workers, as above.
+async fn gate_inventory_off_lock() -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let inv = crate::server::agents::inventory_off_thread().await.map_err(|e| e.to_string())?;
     Ok((discovered_gate_paths_from(&inv)?, members_declaring_a_gate(&inv)))
 }
 
@@ -7486,10 +8077,12 @@ fn annotate_gate_verdicts(
 /// `GET /api/gates/verify` — hash every known gate and compare to the vault's ratified
 /// expectation. The DAEMON hashes the file; it never asks a gate about itself.
 async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
+    // Discovered before the lock (#1183); the hashes below are still taken under it.
+    let inventory = gate_inventory_off_lock().await;
     let s = state.lock().await;
     let exp = s.vault.gate_expectations();
     // An unmeasurable denominator is UNKNOWN, never VERIFIED.
-    let (discovered, declaring) = match gate_inventory() {
+    let (discovered, declaring) = match inventory {
         Ok((d, decl)) => (d, not_retired(decl, &s.retired_members)),
         Err(reason) => {
             return (
@@ -7588,10 +8181,13 @@ async fn gates_ratify(
                 .into_response()
         }
     };
-    let mut s = state.lock().await;
     // Ratify from the DISCOVERED set, for the same reason verify checks it: a hardcoded list
     // would bless whichever gates it happened to name and leave the rest unmentioned.
-    let discovered = match discovered_gate_paths() {
+    // Discovered before the lock (#1183). What gets recorded is still hashed under the lock
+    // and re-hashed just before the vault write, so a gate that changes in between is refused.
+    let discovered = discovered_gate_paths_off_lock().await;
+    let mut s = state.lock().await;
+    let discovered = match discovered {
         Ok(d) => d,
         Err(reason) => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -7646,8 +8242,9 @@ async fn gates_forget(
             }))).into_response()
         }
     };
+    let inventory = gate_inventory_off_lock().await; // before the lock (#1183)
     let mut s = state.lock().await;
-    let (discovered, declaring) = match gate_inventory() {
+    let (discovered, declaring) = match inventory {
         Ok((d, decl)) => (d, not_retired(decl, &s.retired_members)),
         Err(reason) => {
             // Without the discovered set this cannot tell a stale expectation from a live gate.
@@ -10057,14 +10654,35 @@ mod disposition_tests {
     }
 
     async fn retire(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let resp = agent_retire(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        retire_gated(state, id, body, None).await
+    }
+
+    /// The same call carrying the gate witness the `operator_gate` middleware inserts —
+    /// the shape the production route always runs with (tests calling a handler directly
+    /// must opt in; `None` is the dev-override / direct-call shape).
+    async fn retire_gated(
+        state: &SharedState,
+        id: &str,
+        body: serde_json::Value,
+        gate: Option<axum::Extension<crate::server::operator_auth::GateWitness>>,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = agent_retire(State(state.clone()), gate, Path(id.to_string()), Json(body)).await.into_response();
         let st = resp.status();
         let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (st, serde_json::from_slice(&b).unwrap())
     }
 
     async fn reinstate(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let resp = agent_reinstate(State(state.clone()), Path(id.to_string()), Json(body)).await.into_response();
+        reinstate_gated(state, id, body, None).await
+    }
+
+    async fn reinstate_gated(
+        state: &SharedState,
+        id: &str,
+        body: serde_json::Value,
+        gate: Option<axum::Extension<crate::server::operator_auth::GateWitness>>,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = agent_reinstate(State(state.clone()), gate, Path(id.to_string()), Json(body)).await.into_response();
         let st = resp.status();
         let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (st, serde_json::from_slice(&b).unwrap())
@@ -10616,6 +11234,68 @@ mod disposition_tests {
         assert!(rec.event_data["scope"].as_str().unwrap().contains("this seat only"),
                 "the record states it is per-seat, so a later fleet-wide ruling changes a stated \
                  decision rather than discovering an accident");
+    }
+
+    /// WHO retired is evidence (#1036's review item 1, ported onto this route when the
+    /// duplicate `/api/operator/member/*` surface was dropped in favour of this one): the
+    /// record names the principal the gate middleware authenticated — never the literal
+    /// "operator", never a body field. The two session shapes carry the principal in
+    /// different places, so both are pinned: a direct dashboard session has `operator`
+    /// and NO provenance (codex review of #1035, finding 1), and a composed session has
+    /// both, with `operator` winning — the fixture below makes them disagree so the
+    /// precedence, not just the plumbing, is what the assert pins.
+    #[tokio::test]
+    async fn a_retirement_names_the_operator_the_gate_authenticated() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "caude-code").await;
+        // Shape 1: the dashboard's ordinary signed-in operator.
+        let direct = Some(axum::Extension(crate::server::operator_auth::GateWitness {
+            operator: Some("lct:web4:operator:dp".into()),
+            provenance: None,
+            gate_entry_hash: Some("gate-row-1".into()),
+        }));
+        let (st, b) = retire_gated(&state, "caude-code", serde_json::json!({
+            "reason": "typo", "ref": "dp 2026-09-08"}), direct).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        {
+            let s = state.lock().await;
+            let chain = s.recent_chain(20);
+            for t in ["member_retire_intent", "member_retired"] {
+                let rec = chain.iter().find(|e| e.event_type == t)
+                    .unwrap_or_else(|| panic!("{t} is witnessed"));
+                assert_eq!(rec.event_data["retired_by"], serde_json::json!("lct:web4:operator:dp"),
+                    "{t} names the authenticated operator, not the role literal");
+                assert_eq!(rec.event_data["authorized_by_gate"], serde_json::json!("gate-row-1"),
+                    "{t} binds the gate row that admitted the request");
+            }
+            assert_eq!(s.retired_members.get("caude-code").unwrap().retired_by,
+                "lct:web4:operator:dp", "the durable row carries the same WHO");
+        }
+        // Shape 2: composed session, with the two principals made to DISAGREE so the
+        // read order is what is pinned.
+        let composed = Some(axum::Extension(crate::server::operator_auth::GateWitness {
+            operator: Some("lct:web4:operator:dp".into()),
+            provenance: Some(crate::server::operator_auth::OperatorProvenance {
+                actor: "lct:web4:actor:app".into(),
+                principal: "lct:web4:operator:other".into(),
+                via_device: "lct:web4:device:cbp".into(),
+                office: "operator".into(),
+                authority: "session-ref-42".into(),
+            }),
+            gate_entry_hash: Some("gate-row-2".into()),
+        }));
+        let (st, b) = reinstate_gated(&state, "caude-code", serde_json::json!({
+            "reason": "restoring the typo for the test"}), composed).await;
+        assert_eq!(st, StatusCode::OK, "{b}");
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        for t in ["member_reinstate_intent", "member_reinstated"] {
+            let rec = chain.iter().find(|e| e.event_type == t)
+                .unwrap_or_else(|| panic!("{t} is witnessed"));
+            assert_eq!(rec.event_data["reinstated_by"], serde_json::json!("lct:web4:operator:dp"),
+                "{t}: `operator` — the authenticated principal — wins over provenance.principal");
+            assert_eq!(rec.event_data["authorized_by_gate"], serde_json::json!("gate-row-2"));
+        }
     }
 
     /// #1067, measured on McNugget: a grant to `Claude-code` succeeded, was witnessed, was
@@ -11467,6 +12147,92 @@ mod disposition_tests {
         let plain = rows.iter().find(|r| r["path"] == "/srv/plain.txt").expect("listed");
         assert_eq!(unenum["once_only"], true, "{unenum}");
         assert_eq!(plain["once_only"], false, "{plain}");
+    }
+
+    /// #1287 part 2 CONTRACT: for every request shape, the decisions the surfaces are TOLD they
+    /// may offer (`allowed_decisions` on the dashboard snapshot, the request listing and the
+    /// governance ledger) are EXACTLY the decisions the decide endpoint accepts — every listed
+    /// kind is admitted, every unlisted kind is refused. dp clicked a plain grant on
+    /// scope-1981a1b1f6e5 (unenumerated) and learnt the rule from the error; this pins that the
+    /// offer and the check read one source.
+    #[tokio::test]
+    async fn scope_allowed_decisions_are_exactly_what_decide_accepts() {
+        const KINDS: [&str; 4] = ["once", "session", "standing", "refuse"];
+        // BREADTH is a separate axis from the kind: a glob reach is offered recursive breadths
+        // only (scopeBreadthOptions), so its session/standing ruling is sent recursive.
+        let body_for = |id: &str, kind: &str, glob: bool| match kind {
+            "once" => serde_json::json!({"request_id": id, "granted": true, "reason": "r", "once": true}),
+            "session" => serde_json::json!({"request_id": id, "granted": true, "reason": "r", "recursive": glob}),
+            "standing" => serde_json::json!({"request_id": id, "granted": true, "reason": "r",
+                                             "standing": true, "recursive": glob}),
+            _ => serde_json::json!({"request_id": id, "granted": false}),
+        };
+        let unenum_act = "for f in a b; do cat $f; done";
+        let overflow_act = "cat /srv/a /srv/b /srv/c";
+        // (shape, path, gate-opened?, the kinds it must accept)
+        let shapes: Vec<(&str, String, bool, Vec<&str>)> = vec![
+            ("gate, a path", "/srv/plain.txt".into(), true, vec!["once", "session", "standing", "refuse"]),
+            ("gate, a glob dir", "/srv/logs/*".into(), true, vec!["once", "session", "standing", "refuse"]),
+            ("gate, unenumerated",
+             format!("hestia:unpriceable:unenumerated#{}", &digest_of(unenum_act)[..16]), true,
+             vec!["once", "refuse"]),
+            ("gate, overflow",
+             format!("hestia:unpriceable:overflow#{}", &digest_of(overflow_act)[..16]), true,
+             vec!["once", "refuse"]),
+            ("member-filed, a path", "/x/member.txt".into(), false, vec!["session", "standing", "refuse"]),
+        ];
+        for (shape, path, gate, expect) in &shapes {
+            for kind in KINDS {
+                let (_dir, state) = test_state().await;
+                let id = if *gate {
+                    let act = if path.contains("unenumerated") { unenum_act }
+                              else if path.contains("overflow") { overflow_act }
+                              else { "cat it" };
+                    let o = claim(&state, "codex", path, act, false).await;
+                    assert_eq!(o["verdict"], "opened", "{shape}: {o}");
+                    o["request_id"].as_str().unwrap().to_string()
+                } else {
+                    let now = crate::server::gate_escalation::now_secs();
+                    let mut req = live_req("scope-member-1", path, now);
+                    req.granted = None; req.decided_by = None; req.decided_at = None;
+                    req.decision_reason = None;
+                    state.lock().await.scope_requests.insert("scope-member-1".into(), req);
+                    "scope-member-1".to_string()
+                };
+                // What each surface is TOLD.
+                let snap = state.lock().await.dashboard_snapshot(10).pending_scope_requests;
+                let row = snap.iter().find(|r| r["request_id"] == id.as_str()).expect("on the snapshot");
+                let listed = {
+                    let resp = scope_list_requests(State(state.clone())).await.into_response();
+                    let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                    let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+                    v["requests"].as_array().unwrap().iter()
+                        .find(|r| r["request_id"] == id.as_str()).cloned().expect("listed")
+                };
+                let offered: Vec<String> = serde_json::from_value(row["allowed_decisions"].clone()).unwrap();
+                assert_eq!(&offered, expect, "{shape}: snapshot offer");
+                assert_eq!(listed["allowed_decisions"], row["allowed_decisions"], "{shape}: listing agrees");
+                assert_eq!(row["enumerable"], !path.starts_with("hestia:unpriceable:"), "{shape}");
+                assert_eq!(listed["enumerable"], row["enumerable"], "{shape}");
+                if *gate {
+                    // The ledger reads the same two inputs off the chain row.
+                    let rows = crate::server::governance_ledger::project(
+                        &state.lock().await.recent_chain(50),
+                        crate::server::gate_escalation::now_secs());
+                    let lrow = rows.iter().find(|r| r.id == id).expect("on the ledger");
+                    assert_eq!(&lrow.allowed_decisions, expect, "{shape}: ledger offer");
+                }
+                // What the endpoint ACCEPTS.
+                let (code, out) = decide(&state, body_for(&id, kind, path.ends_with("/*"))).await;
+                if expect.contains(&kind) {
+                    assert_eq!(code, StatusCode::OK, "{shape}: {kind} is offered, so it must land: {out}");
+                } else {
+                    assert_eq!(code, StatusCode::BAD_REQUEST, "{shape}: {kind} is not offered: {out}");
+                    assert_eq!(out["allowed_decisions"], row["allowed_decisions"],
+                               "{shape}: the refusal names the same set the surface was told");
+                }
+            }
+        }
     }
 
     /// A refusal is not reopened by re-issuing inside its window, and a member-filed ask has no

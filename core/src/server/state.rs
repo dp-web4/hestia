@@ -695,6 +695,76 @@ pub fn is_unpriceable_scope_path(path: &str) -> bool {
     unpriceable_scope_path(path).is_some()
 }
 
+/// The ruling KINDS a pending scope request can take: `once` (this act, exactly), `session`
+/// (memory-only, expires), `standing` (vault), `refuse`.
+pub const SCOPE_DECISION_KINDS: [&str; 4] = ["once", "session", "standing", "refuse"];
+
+/// Which kind a decide body asks for. A refusal is `refuse` whatever else it carries; the
+/// decide endpoint rejects the malformed combinations (once+standing, a standing refusal) on
+/// their own terms before this matters.
+pub fn scope_decision_kind(granted: bool, once: bool, standing: bool) -> &'static str {
+    match (granted, once, standing) {
+        (false, _, _) => "refuse",
+        (true, true, _) => "once",
+        (true, false, true) => "standing",
+        (true, false, false) => "session",
+    }
+}
+
+/// THE decisions a pending scope request accepts (#1287 part 2) — the one source both the decide
+/// endpoint's refusal and every operator surface's offer read, so the UI cannot offer a ruling
+/// the endpoint then refuses after the click.
+///
+/// * `once` only when the GATE opened the request: it binds to the act the gate refused, and a
+///   member-filed ask names no act.
+/// * `session` and `standing` only when the request names a PATH: an act whose reach the gate
+///   could not enumerate (`is_unpriceable_scope_path`, #1232) names none a grant could reach.
+/// * `refuse` always.
+///
+/// Order is `SCOPE_DECISION_KINDS` order, so surfaces can render it as given.
+pub fn scope_allowed_decisions(path: &str, gate_act: bool) -> Vec<&'static str> {
+    let enumerable = !is_unpriceable_scope_path(path);
+    SCOPE_DECISION_KINDS
+        .into_iter()
+        .filter(|k| match *k {
+            "once" => gate_act,
+            "session" | "standing" => enumerable,
+            _ => true,
+        })
+        .collect()
+}
+
+/// How long a peer-routed scope request waits for a NOT-SAME peer before it ESCALATES to the
+/// operator (dp, 2026-10-13: "escalate to me after a timeout"). On 10-13 every gate-opened
+/// request invited peers (codex, kimi-code), none ruled, and requests sat 8 h unseen. Default
+/// 30 min; `HESTIA_SCOPE_PEER_WINDOW_SECS` overrides it.
+pub const SCOPE_PEER_WINDOW_SECS_DEFAULT: u64 = 1800;
+
+pub fn scope_peer_window_secs() -> u64 {
+    std::env::var("HESTIA_SCOPE_PEER_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(SCOPE_PEER_WINDOW_SECS_DEFAULT)
+}
+
+/// Who a pending scope request is waiting on, and whether its peer window has lapsed.
+/// Authority does not change: peers may still decide after the window, and the operator could
+/// always override. What changes is whose queue it is in -- after the window it is the
+/// operator's, and the surfaces show it as awaiting the operator.
+/// Returns `("peer", false)` inside the window, `("operator", true)` once it has lapsed, and
+/// `("operator", false)` for a request no peer was invited to (it was always the operator's).
+pub fn scope_decided_by(gate_opened: bool, invited_peers: usize, requested_at: u64, now: u64,
+                        window_secs: u64) -> (&'static str, bool) {
+    if !(gate_opened && invited_peers > 0) {
+        return ("operator", false);
+    }
+    if now.saturating_sub(requested_at) >= window_secs {
+        ("operator", true)
+    } else {
+        ("peer", false)
+    }
+}
+
 /// A `path:` scope grant MUST be stored absolute (#722). A relative grant renders in the seat's
 /// grant set — e.g. `path:home/dp/ai-workspace` with no leading slash — but can never match a
 /// resolved absolute candidate under #597 prefix containment (`_within_path_grant`/`_scope_parts`),
@@ -2975,5 +3045,25 @@ mod tests {
             .find(|e| e.hash == intent_hash)
             .expect("the intent must be on the chain");
         assert_eq!(intent.event_data["plugin_id"].as_str(), Some("codex"));
+    }
+}
+
+#[cfg(test)]
+mod scope_peer_window_tests {
+    use super::scope_decided_by;
+
+    #[test]
+    fn a_peer_routed_request_escalates_to_the_operator_when_the_window_lapses() {
+        // invited peers, inside the window: the peers' queue
+        assert_eq!(scope_decided_by(true, 2, 1_000, 1_000 + 1_799, 1_800), ("peer", false));
+        // exactly at the window and after: escalated to the operator
+        assert_eq!(scope_decided_by(true, 2, 1_000, 1_000 + 1_800, 1_800), ("operator", true));
+        assert_eq!(scope_decided_by(true, 2, 1_000, 1_000 + 29_000, 1_800), ("operator", true));
+    }
+
+    #[test]
+    fn a_request_no_peer_was_invited_to_was_always_the_operators() {
+        assert_eq!(scope_decided_by(true, 0, 1_000, 1_001, 1_800), ("operator", false));
+        assert_eq!(scope_decided_by(false, 3, 1_000, 1_001, 1_800), ("operator", false));
     }
 }

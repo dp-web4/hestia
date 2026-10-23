@@ -2944,6 +2944,15 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
 /// patch header), short enough that a runaway heredoc cannot inflate the chain.
 const ATTEMPTED_MAX: usize = 400;
 
+/// The act carried on a scope request is ruled on by a NOT-SAME peer whose only view of it is
+/// the record (dp 2026-10-05: scope escalations go to peers), so the record carries it at
+/// review depth, not display depth — #648: on 2026-10-13 a peer refused five scope requests
+/// because the stored act truncated inside the command it was asked to approve. Same value
+/// and marker as the gate's `SCOPE_ACT_MAX`/`SCOPE_ACT_MARK`
+/// (plugins/_shared/hestia_gate_mechanism.py) — change them together: the truncation census
+/// lesson was "same marker, same number, three sites, no shared constant".
+const SCOPE_ACT_MAX: usize = 4000;
+
 /// Gate decisions per scope attestation. Small enough that a working member earns
 /// evidence within a session, large enough that the chain does not grow by one entry per
 /// tool call (17,649 outcomes on this chain would have become 17,649 attestations).
@@ -3388,6 +3397,23 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
         .iter_sorted()
         .into_iter()
         .map(|(id, _)| id.clone())
+        // The two names that can never answer, excluded by TYPE, exactly as at
+        // `resolve_invitation` (#990) — and this pool is MORE rivalrous, not
+        // less: it spends ONE slot where invitations spend up to a cap. The
+        // exclusions are needed here on top of the reasoner check because
+        // `is_recognised_reasoner` is a lineage PREFIX match, so residue names
+        // (`codex-cli`, `claudecode`) pass it, and act-liveness can rank one
+        // first: codex acting as `codex` while its gate witnessed as
+        // `codex-cli` is the measured case recorded in this file's own history.
+        // An operator who retires such a name reasonably reads it as out of
+        // EVERY selection path; leaving this pool open routed the appeal to a
+        // mailbox nobody reads — the silent-routing failure the reasoner check
+        // was added to stop, one clause downstream of it.
+        // RETIRED reads `retired_members` — the store the operator's one retire
+        // verb (`POST /api/agents/:id/retire`, #1100) writes — so the exclusion
+        // takes effect on the surface the operator actually uses.
+        .filter(|id| !s.retired_members.is_retired(id))
+        .filter(|id| !s.member_registry.is_filler(id))
         .filter(|id| {
             // Only drop a candidate PROVEN to be the same entity. member_lct fails closed to
             // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
@@ -8101,22 +8127,66 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (mine, theirs): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|n| n.to_plugin == who.plugin_id);
+    // #1354: a transient ask dies with its target. A `review_request` row whose
+    // pointer names a scope request that is TERMINAL (ruled, revoked, or past its
+    // window) is moot: it stops counting as debt and moves to `*_moot`. Derivation
+    // is read-time against the live request map — no sweep — so a request the map
+    // no longer holds (a restart; scope requests are memory-only) reads UNKNOWN,
+    // and unknown is NOT moot: the row stays owed and fails toward visibility, the
+    // pointer resolver's "UNKNOWN, not refused" principle one level up. That also
+    // makes mootness NON-MONOTONIC across an eviction/restart (moot -> owed), which
+    // is intentional: the durable fix (event-driven `mooted_at` evidence at the
+    // terminal transition) is #1354's named follow-up, not this slice.
+    //
+    // KIND-RESTRICTED (nova's P1 on #1357): only a transient ASK dies with its
+    // target. A durable `reply` carrying a terminal scope pointer is CONTENT the
+    // recipient is still owed — mooting it would silently erase debt. The match is
+    // by kind ROOT, because the send gate admits dotted specializations
+    // (review_request.pr) and the ledger's own kind matching is by prefix; the two
+    // must agree here too.
+    //
+    // In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness —
+    // the misroute is sender-actionable, mootness is not.
+    let now = super::gate_escalation::now_secs();
+    let scope_moot = |kind: &str, pointer_uri: &Option<String>| -> bool {
+        if kind.split('.').next() != Some("review_request") {
+            return false;
+        }
+        let Some(p) = pointer_uri.as_deref() else {
+            return false;
+        };
+        let Some(rest) = p.strip_prefix("hestia://scope/") else {
+            return false;
+        };
+        let id = rest.split('#').next().unwrap_or(rest);
+        match s.scope_requests.get(id) {
+            Some(req) => {
+                req.granted.is_some() || req.revoked.is_some() || now >= req.expires_at
+            }
+            None => false,
+        }
+    };
+    let (mine, mine_moot): (Vec<_>, Vec<_>) =
+        mine.into_iter().partition(|n| !scope_moot(&n.kind, &n.pointer_uri));
     // Arm the strong asker (the fire primer) with the distinction that matters
     // on THIS side of the ledger: "live and unanswered" is a member choosing
     // not to reply; "never seen locally" is a misroute, and the two want
     // opposite responses from the sender. Carried on `owed_to_me` only — on
     // `i_owe` the recipient is the caller, who just proved its own liveness by
     // asking, so the field would be a constant.
-    let theirs: Vec<Value> = theirs
+    let (theirs, theirs_moot): (Vec<(bool, Value)>, Vec<(bool, Value)>) = theirs
         .into_iter()
         .map(|n| {
+            let moot = scope_moot(&n.kind, &n.pointer_uri);
             let (liveness, evidence) = recipient_liveness(&s.inbox_store, &n.to_plugin);
             let mut row = serde_json::to_value(&n).unwrap_or_else(|_| json!({}));
             row["recipient_liveness"] = json!(liveness);
             row["recipient_liveness_evidence"] = evidence;
-            row
+            (moot && liveness != "unknown", row)
         })
-        .collect();
+        .partition(|(mooted, _)| !mooted);
+    let theirs_moot: Vec<Value> = theirs_moot.into_iter().map(|(_, row)| row).collect();
+    let theirs: Vec<Value> = theirs.into_iter().map(|(_, row)| row).collect();
     Ok(json!({
         "plugin_id": who.plugin_id,
         "older_than_secs": older_than_secs,
@@ -8125,6 +8195,21 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "i_owe": mine,
         // Notices I sent that nobody answered: did my wake land?
         "owed_to_me": theirs,
+        // Transient rows whose target is terminal: answered by time, not by a
+        // member. Counted nowhere; visible here so a late wake can still bind a
+        // disposition to one (binding is unchanged by mootness).
+        "i_owe_moot": mine_moot,
+        "owed_to_me_moot": theirs_moot,
+        "moot_scope": "moot = a review_request row (the transient ASK kind — a durable \
+                       reply never moots) whose pointer names a scope request that is \
+                       TERMINAL (ruled, revoked, or past its window), derived at read \
+                       time against the live request map — no sweep (#1354). A request \
+                       the memory-only map no longer holds reads UNKNOWN, and unknown \
+                       stays owed: absence of evidence is not mootness. Eviction or \
+                       restart therefore reverts moot -> owed; that non-monotonicity is \
+                       intentional until durable mooted_at evidence lands (the #1354 \
+                       follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
+                       outranks mootness — the misroute is sender-actionable.",
         "scope": "unanswered = no notice binds in_reply_to to it; \
                   drained_at:null additionally means it was never picked up; \
                   each row carries its OWN in_reply_to - group by that, not by \
@@ -12545,6 +12630,199 @@ mod member_mesh_tests {
         );
     }
 
+    /// #1354: a transient ask dies with its target. A `review_request` row pointing at a
+    /// scope request that is TERMINAL (ruled, revoked, or past its window) leaves the debt
+    /// fold for `i_owe_moot`; a pending request, an UNKNOWN id (the map is memory-only —
+    /// post-restart every id is unknown, and unknown fails toward owed), a durable
+    /// pointer (no `hestia://scope/` referent), and any DURABLE kind (a `reply` carrying
+    /// a terminal scope pointer is content, still owed — nova's P1) all stay owed. A
+    /// dotted specialization of the ask kind moots exactly like its root. Evicting the
+    /// request from the map moves the row BACK to owed (moot -> owed): read-time
+    /// derivation is deliberately non-monotonic until durable mooted_at evidence lands.
+    /// In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness,
+    /// because the misroute is the sender-actionable signal. Binding to a mooted row
+    /// still works: mootness reclassifies the debt, it does not close the row.
+    #[tokio::test]
+    async fn unanswered_moots_rows_whose_scope_target_is_terminal() {
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let claude = connect(&state, "claude-code").await;
+        let now = crate::server::gate_escalation::now_secs();
+        use crate::server::state::ScopeRequest;
+
+        // claude -> kimi, one ask per target state.
+        for ptr in [
+            "hestia://scope/scope-moot-decided#peer-decide",
+            "hestia://scope/scope-moot-expired#peer-decide",
+            "hestia://scope/scope-moot-pending#peer-decide",
+            "hestia://scope/scope-never-heard#peer-decide",
+            "pr/1354",
+        ] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                        "pointer_uri": ptr, "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        // nova's P1 on #1357: a durable `reply` carrying a TERMINAL scope pointer is
+        // content the recipient is still owed — it must NEVER moot. And a dotted
+        // specialization of the ask kind (review_request.pr — the send gate admits it,
+        // the ledger matches it by prefix) MUST moot: the three surfaces agree or the
+        // kind restriction is a lie.
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "reply",
+                    "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide;reply-content-still-owed",
+                    "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request.pr",
+                    "pointer_uri": "hestia://scope/scope-moot-expired#peer-decide",
+                    "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        // kimi -> claude: a scope ask whose request is decided (mootable), and the same
+        // shape to a never-seen recipient (misroute: must NOT moot).
+        let mut decided_ask_id = None;
+        for to in ["claude-code", "ghost-member"] {
+            let out = tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": to, "kind": "review_request",
+                        "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide",
+                        "session_id": kimi}),
+            )
+            .await
+            .unwrap();
+            if to == "claude-code" {
+                decided_ask_id = Some(out["queued_id"].as_u64().unwrap());
+            }
+        }
+        // claude is a live recipient (reads its mailbox); ghost-member never has.
+        tool_member_inbox(&state, &json!({"session_id": claude})).await.unwrap();
+
+        {
+            let mut s = state.lock().await;
+            let req = |id: &str, granted: Option<bool>, expires_at: u64| ScopeRequest {
+                id: id.into(),
+                plugin_id: "cbp-being".into(),
+                role: String::new(),
+                path: "/w/x".into(),
+                reason: "a scope ask whose state pins a mootness arm".into(),
+                requested_at: now,
+                expires_at,
+                granted,
+                decided_by: granted.map(|_| "operator".to_string()),
+                decided_at: granted.map(|_| now),
+                decision_reason: None,
+                recursive: false,
+                revoked: None,
+                ext: Default::default(),
+            };
+            s.scope_requests
+                .insert("scope-moot-decided".into(), req("scope-moot-decided", Some(true), now + 3600));
+            s.scope_requests
+                .insert("scope-moot-expired".into(), req("scope-moot-expired", None, now - 3600));
+            s.scope_requests
+                .insert("scope-moot-pending".into(), req("scope-moot-pending", None, now + 3600));
+        }
+
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let ptrs = |key: &str| -> Vec<String> {
+            rows[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} missing: {rows}"))
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r["to_plugin"].as_str().unwrap_or("?"),
+                        r["pointer_uri"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        };
+        let i_owe = ptrs("i_owe");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-moot-pending#peer-decide".to_string()), "{rows}");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-never-heard#peer-decide".to_string()),
+                "unknown id stays owed — absence of evidence is not mootness: {rows}");
+        assert!(i_owe.contains(&"kimi-code|pr/1354".to_string()),
+                "a durable pointer never moots: {rows}");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide;reply-content-still-owed".to_string()),
+                "a durable reply never moots, even on a terminal scope pointer: {rows}");
+        let i_moot = ptrs("i_owe_moot");
+        assert!(i_moot.contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
+        assert_eq!(
+            i_moot.iter().filter(|p| *p == "kimi-code|hestia://scope/scope-moot-expired#peer-decide").count(),
+            2,
+            "the expired ask moots under BOTH the bare kind and its dotted specialization: {rows}"
+        );
+        assert_eq!(i_moot.len(), 3, "exactly the terminal review_request rows moot: {rows}");
+
+        let owed = ptrs("owed_to_me");
+        assert!(owed.contains(&"ghost-member|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "misroute outranks mootness: {rows}");
+        let owed_moot = ptrs("owed_to_me_moot");
+        assert!(owed_moot.contains(&"claude-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
+        assert_eq!(owed_moot.len(), 1, "{rows}");
+
+        // Eviction/restart regression (dp-web4 review of #1357): the request map is
+        // memory-only, so losing the request must move the row BACK to owed. Mootness
+        // is a read-time property of available evidence, not a row state — the
+        // non-monotonicity is intentional until durable `mooted_at` evidence lands
+        // (the #1354 follow-up), and this transition is the proof it fails toward
+        // visibility rather than silently staying moot.
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.remove("scope-moot-decided");
+        }
+        let rows2 = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let ptrs2 = |key: &str| -> Vec<String> {
+            rows2[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} missing: {rows2}"))
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r["to_plugin"].as_str().unwrap_or("?"),
+                        r["pointer_uri"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        };
+        assert!(ptrs2("i_owe").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "evicted request: moot -> owed, the row fails back toward visibility: {rows2}");
+        assert!(!ptrs2("i_owe_moot").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "nothing stays moot on absent evidence: {rows2}");
+
+        // Mootness reclassifies; it does not close. The ASKED member can still bind late.
+        let late = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "reply",
+                    "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide;window-missed;via=claude-code",
+                    "in_reply_to": decided_ask_id.unwrap(), "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        assert!(late["queued_id"].is_u64(), "binding to a mooted row stays legal: {late}");
+    }
+
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /
     /// control-character pointers are prompt-injection carriers (the fire
     /// templates render notices into an LLM prompt) and oversized ones are
@@ -16088,6 +16366,205 @@ mod tests {
         );
     }
 
+    /// #990's remedy at the pool: a RETIRED name is excluded by administrative act,
+    /// and the exclusion stands until an operator lifts it.
+    ///
+    /// This is NOT the evidence-based exclusion dp's rule forbids ("it reorders
+    /// routing, it never excludes" — pinned one test above). The retirement row is
+    /// not evidence: it is an operator's witnessed judgement (`POST
+    /// /api/agents/:id/retire`, #1100 — the one retire verb, whose store this pool
+    /// now reads), the administrative remove the append-only registry never had.
+    /// The two halves pinned here: the retired name takes no slot WHILE the row
+    /// stands, and `reinstate` returns it to the pool — the reversibility that
+    /// keeps the act a single-operator call rather than a quorum one.
+    #[tokio::test]
+    async fn a_retired_member_holds_no_invitation_slot_until_reinstated() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "kimi-code", "attest-probe", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        // The operator act, applied directly to the state's copy of the store the
+        // route commits (the HTTP door — grant revocation included — is tested
+        // beside it in http.rs): retire the probe name.
+        {
+            let mut s = shared.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "attest-probe".into(),
+                retired_at: crate::server::gate_escalation::now_secs(),
+                reason: "probe residue — never a real seat".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: false,
+                retired_by: "lct:web4:operator:test".into(),
+            });
+        }
+
+        let claim = |act: &str| {
+            let shared = shared.clone();
+            let sid = session_of["codex"].clone();
+            let act = act.to_string();
+            async move {
+                tool_gate_escalation_claim(
+                    &shared,
+                    &json!({
+                        "plugin_id": "codex",
+                        "session_id": sid,
+                        "tool_name": "Edit",
+                        "marker": "pre_tool_use.py",
+                        "reason": act,
+                    }),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let invited_of = |claimed: serde_json::Value| -> Vec<String> {
+            claimed["invited_peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let invited = invited_of(claim("Edit -> file one").await);
+        assert!(
+            !invited.contains(&"attest-probe".to_string()),
+            "the retired name holds no slot: {invited:?}"
+        );
+        assert!(
+            invited.contains(&"kimi-code".to_string())
+                && invited.contains(&"claude-code".to_string()),
+            "the live seats are untouched: {invited:?}"
+        );
+
+        // Reversibility, visible at the pool: reinstated, the name is invited again.
+        {
+            let mut s = shared.lock().await;
+            assert!(
+                s.retired_members.reinstate("attest-probe").is_some(),
+                "the row existed to remove"
+            );
+        }
+        let invited = invited_of(claim("Edit -> file two").await);
+        assert!(
+            invited.contains(&"attest-probe".to_string()),
+            "a reinstated name returns to the pool: {invited:?}"
+        );
+    }
+
+    /// The same exclusion by TYPE: a filler is minted never-a-member, so the pool
+    /// never spends a slot on it — the residue defect one field over, caught at the
+    /// type mark rather than waiting for an operator to prune each filler by hand.
+    #[tokio::test]
+    async fn a_filler_is_never_spent_an_invitation_slot() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        {
+            let mut s = shared.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            crate::member_registry::ensure_filler(
+                vault,
+                member_registry,
+                "ollama:test-model@sha256:ff",
+                "sid",
+                "anchor",
+            )
+            .expect("the filler mints");
+        }
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"claude-code".to_string()),
+            "the real peer is invited: {invited:?}"
+        );
+        assert!(
+            !invited.contains(&"ollama:test-model@sha256:ff".to_string()),
+            "the filler holds no slot, even with slots free: {invited:?}"
+        );
+    }
+
+    /// The scope peer pool is the THIRD selection pool and the most rivalrous of them:
+    /// `take(3)` over an ALPHABETICAL list with no liveness ranking, so residue sorts in
+    /// early (claude-code's re-review, 2026-10-13, measured on the live chain:
+    /// `claudecode` and `codex-cli` took two of three slots on a real scope request
+    /// within the hour). The exclusion is the same two type-marks as the invitation and
+    /// appeal pools (#990), seeded here on the store the one retire verb commits.
+    /// The control half runs first: the prefix-recognised residue name IS pooled while
+    /// active, so the exclusion assert below is what removes it.
+    #[tokio::test]
+    async fn a_retired_name_holds_no_scope_peer_slot() {
+        let (_dir, shared) = make_shared_state();
+        for id in ["claude-code", "claudecode", "codex", "kimi-code"] {
+            tool_connect(&shared, &json!({"plugin_id": id, "host_agent": "h",
+                                          "gate_capabilities": ["society-floor:v1", REVIEW_CAPABILITY]}))
+                .await.unwrap();
+        }
+        // CONTROL: recognised (the `claude` prefix) + door-declared residue is pooled.
+        let before = {
+            let s = shared.lock().await;
+            scope_peer_pool(&s, "kimi-code")
+        };
+        assert!(
+            before.contains(&"claudecode".to_string()),
+            "control: the residue name takes a slot while active: {before:?}"
+        );
+        {
+            let mut s = shared.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "claudecode".into(),
+                retired_at: 1,
+                reason: "probe residue".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: false,
+                retired_by: "op".into(),
+            });
+        }
+        let after = {
+            let s = shared.lock().await;
+            scope_peer_pool(&s, "kimi-code")
+        };
+        assert!(
+            !after.contains(&"claudecode".to_string()),
+            "the retired name holds no slot: {after:?}"
+        );
+        assert!(
+            after.contains(&"claude-code".to_string()) && after.contains(&"codex".to_string()),
+            "the real seats are untouched: {after:?}"
+        );
+    }
+
     /// THE BAR A PEER CAN CLEAR ALONE IS THE BAR THAT MUST INVITE. `resolve_invitation` built
     /// its pool only under `SovereignPlusPeer`, reasoning that `SingleApprover` "names no peer
     /// conjunct". But `SingleApprover` is defined as one sovereign-channel decision OR a
@@ -17422,6 +17899,89 @@ mod tests {
             shared.lock().await.gate_escalations.get(&id).unwrap().observed_at.is_some(),
             "and the record keeps the instant it was observed"
         );
+    }
+
+    /// #366 through the REAL claim handler: a grant approved 900 s ago and never observed
+    /// (lapsed) is claimed by the asker session's byte-identical re-issue, instead of minting a
+    /// duplicate petition (cf54d46850bcdfe0 → d9b167e12a7283b8, 2026-10-21). A sibling session
+    /// on the same seat re-issuing the same act does not claim it, and neither does the asker
+    /// re-issuing a different act; the grant stays lapsed and unobserved for both.
+    #[tokio::test]
+    async fn the_askers_exact_reissue_claims_a_grant_ruled_while_it_was_idle() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+        let (_dir, shared) = make_shared_state();
+        let connect = |hs: &'static str| {
+            let shared = shared.clone();
+            async move {
+                tool_connect(
+                    &shared,
+                    &json!({ "plugin_id": "claude-code", "host_agent": "h", "host_session_id": hs }),
+                )
+                .await
+                .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let asker = connect("hs-asker").await;
+        let sibling = connect("hs-sibling").await;
+        const ACT: &str = "Bash: git -C /tmp/wt apply /tmp/gt.patch";
+        let claim = |sid: &str, act: &str, inv: &str| json!({
+            "plugin_id": "claude-code", "session_id": sid, "tool_name": "Bash",
+            "marker": "hestia_governance_closure.py", "reason": act, "invocation_key": inv,
+        });
+
+        let opened = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-open")).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(&id, true, "operator", "role:constellation:sovereign",
+                        Channel::OperatorSession, None, Some("k"), now_secs() - 900)
+                .expect("the sovereign channel approves");
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert_eq!(e.host_session_id.as_deref(), Some("hs-asker"), "fixture: asker recorded");
+            assert!(e.observed_at.is_none() && !e.is_claimable(now_secs()), "precondition: lapsed unobserved");
+        }
+
+        let sib = tool_gate_escalation_claim(&shared, &claim(&sibling, ACT, "inv-sib")).await.unwrap();
+        assert_ne!(sib["claimed"], json!(true), "a sibling session's re-issue claimed the asker's grant: {sib}");
+        let other = tool_gate_escalation_claim(&shared, &claim(&asker, "Bash: git apply /tmp/other.patch", "inv-other"))
+            .await.unwrap();
+        assert_ne!(other["claimed"], json!(true), "a different act claimed the grant: {other}");
+        {
+            let s = shared.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert!(e.observed_at.is_none() && e.consumed_at.is_none(), "untouched by both: {e:?}");
+        }
+
+        // Nova's review of #1363: observation only AFTER the authenticated session binding.
+        // (a) No session at all: an unattributed caller naming the asker's member and exact act
+        //     has no proven host session, so nothing is observed and nothing is claimed.
+        let anon = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "claude-code", "tool_name": "Bash", "marker": "hestia_governance_closure.py",
+            "reason": ACT, "invocation_key": "inv-anon",
+        })).await;
+        if let Ok(v) = &anon {
+            assert_ne!(v["claimed"], json!(true), "an unattributed re-issue claimed the asker's grant: {v}");
+        }
+        // (b) The asker's own session, but ASSERTING another host session: the precedence block
+        //     refuses the call before observation, so the grant stays unobserved.
+        let mut forged = claim(&asker, ACT, "inv-forged");
+        forged["host_session_id"] = json!("hs-sibling");
+        let refused = tool_gate_escalation_claim(&shared, &forged).await;
+        assert!(refused.is_err(), "a mismatched host_session_id must be refused: {refused:?}");
+        {
+            let s = shared.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert!(e.observed_at.is_none() && e.consumed_at.is_none(),
+                    "neither the unattributed nor the forged call may observe or spend: {e:?}");
+        }
+
+        let mine = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-reissue")).await.unwrap();
+        assert_eq!(mine["claimed"], json!(true), "the asker's exact re-issue must claim its lapsed grant: {mine}");
+        assert_eq!(mine["escalation_id"], json!(id), "{mine}");
     }
 
     /// THE CLAIMABLE REPLY STATES THE ANCHOR ITS OWN CALL USES (GPT review of #613 @ dd3f1b1).
@@ -20201,6 +20761,92 @@ mod appeal_tests {
         }
     }
 
+    /// #990 at the arbiter pool: a RETIRED name holds no arbiter slot, even when
+    /// every other signal would hand it the appeal — a recognised lineage prefix
+    /// (`codex-cli` passes the reasoner check on the `codex` prefix) AND Live on
+    /// its own witnessed acts. This is the exact shape claude-code's #1036 review
+    /// measured: residue passes the prefix check, act-liveness can rank it first,
+    /// and the appeal then goes to a mailbox nobody reads. The control half below
+    /// pins that the test would catch a missing filter: while the name is active,
+    /// it wins.
+    #[tokio::test]
+    async fn a_retired_recognised_prefix_name_is_live_and_still_not_routed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // The pool reads the registry: seed the residue name and a real peer.
+        {
+            let mut s = state.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                "codex-cli",
+                false,
+                "sid",
+                "anchor",
+            )
+            .unwrap();
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                "kimi-code",
+                false,
+                "sid",
+                "anchor",
+            )
+            .unwrap();
+        }
+        // codex-cli is LIVE on its own acts — the review's measured case: the
+        // gate's acts witness under the residue id while the member acts as codex.
+        {
+            let s = state.lock().await;
+            s.append_chain("outcome", json!({
+                "plugin_id": "codex-cli", "role_lct": APPELLANT_ROLE,
+                "session_id": "gate-session", "tool_name": "Bash", "success": true,
+                "target": "cargo test"})).unwrap();
+        }
+        let appellant_sid = seat(&state, "claude-code").await;
+        let deny_hash = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+        let filed = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": appellant_sid.to_string(),
+            "reason": "the preset permits deletes under /tmp",
+        })).await.unwrap();
+        assert_eq!(
+            filed.pointer("/dispatched/arbiter").and_then(Value::as_str),
+            Some("codex-cli"),
+            "CONTROL: Live + recognised + cross-vendor wins the slot while the name is active: {filed}"
+        );
+        // The operator retires the residue name — seeded on the store the one
+        // retire verb (#1100) commits, which is the store the pool now reads.
+        {
+            let mut s = state.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "codex-cli".into(),
+                retired_at: 1,
+                reason: "probe residue".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: true,
+                retired_by: "op".into(),
+            });
+        }
+        let deny_hash2 = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+        let filed2 = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash2, "session_id": appellant_sid.to_string(),
+            "reason": "and the deny was over-broad a second time",
+        })).await.unwrap();
+        assert_eq!(
+            filed2.pointer("/dispatched/arbiter").and_then(Value::as_str),
+            Some("kimi-code"),
+            "the retirement excludes the Live residue name; the appeal routes to a \
+             member that can answer: {filed2}"
+        );
+    }
+
     /// End to end: file, rule, and check that the CONDUCT SCALE moved. If the emitted shape
     /// drifts from what `derivation.rs` matches on, this fails — which is the point.
     #[tokio::test]
@@ -22293,6 +22939,26 @@ fn resolve_invitation(
                     false
                 }
             })
+            // The two names that can never answer, excluded by TYPE rather than by
+            // rank (#990). A slot on this list is RIVALROUS (top `MAX_INVITED_PEERS`
+            // of a pool that only grew), and every ranking fix left the residue in
+            // place underneath the cap:
+            //   * RETIRED — the operator's administrative remove, recorded in
+            //     `retired_members` by the one retire verb (`POST
+            //     /api/agents/:id/retire`, #1100): witnessed as
+            //     `member_retire_intent`/`member_retired`, and it revokes the id's
+            //     grants in the same act. dp's standing call is that evidence
+            //     (liveness, mailbox rows) may ORDER the pool but never shrink it —
+            //     a legitimate new member has no rows yet — so the shrink is an
+            //     administrative act, and this filter is where it takes effect.
+            //   * FILLER — typed never-a-member at mint (`ensure_filler`): it cannot
+            //     connect, witness, or answer, so a slot spent on it is dead by
+            //     construction. Same defect class as probe residue, one field over.
+            // Both stay in the registry (presence, history) — this is a SELECTION
+            // exclusion, not an erasure; the retirement row and the type mark are
+            // the record.
+            .filter(|id| !s.retired_members.is_retired(id))
+            .filter(|id| !s.member_registry.is_filler(id))
             .map(|id| {
                 let l = actor_liveness(&window, &id);
                 let reachable = has_mailbox_reader(&s.inbox_store, &id);
@@ -23481,7 +24147,16 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         ));
     }
     let tool = optional_string(args, "tool_name").unwrap_or_default();
-    let act: String = optional_string(args, "act").unwrap_or_default().chars().take(400).collect();
+    // The act at record depth: capped wide, the cut MARKED (the silent 400-take this replaces
+    // made a cut act indistinguishable from a complete one — the shape #648's scope-path
+    // instance was refused over), then re-masked on receipt — the layer-2 parity
+    // `policy_decision.attempted` already has (see `redact_secrets`).
+    let act_raw = optional_string(args, "act").unwrap_or_default();
+    let act = redact_secrets(&if act_raw.chars().count() > SCOPE_ACT_MAX {
+        act_raw.chars().take(SCOPE_ACT_MAX).collect::<String>() + "…[truncated]"
+    } else {
+        act_raw
+    });
     let spend = args.get("spend").and_then(Value::as_bool).unwrap_or(true);
     let role = optional_string(args, "role").unwrap_or_default();
     let host_session_id = optional_string(args, "host_session_id");
@@ -23799,12 +24474,23 @@ fn scope_how_to_decide(id: &str, no_peer: bool, once_only: bool) -> String {
 /// The NOT-SAME peers invited to decide `asker`'s scope request: recorded members other than
 /// the asker (and its aliases), with a declared review door, that `arbiter::eligibility_for`
 /// admits in the GRANTING direction. Ordered as the registry orders them; capped at 3.
+///
+/// The same two names that can never answer are excluded by TYPE here as at
+/// `resolve_invitation` and the appeal pool (#990) — and this pool is the MOST
+/// rivalrous of the three: `take(3)` over an ALPHABETICAL list with no liveness
+/// ranking, so residue sorts in early (claude-code's re-review, measured live:
+/// `claudecode` and `codex-cli` took two of three slots on a real request within
+/// the hour). `is_recognised_reasoner` inside `eligibility_for` is a lineage
+/// PREFIX match and does not stop them; the retirement row and the filler mark
+/// do.
 fn scope_peer_pool(s: &super::state::ServerState, asker: &str) -> Vec<String> {
     use crate::arbiter::{eligibility_for, AppealParties, AskerBasis, Disposition, Eligibility};
     s.member_registry
         .iter_sorted()
         .into_iter()
         .map(|(id, _)| id.clone())
+        .filter(|id| !s.retired_members.is_retired(id))
+        .filter(|id| !s.member_registry.is_filler(id))
         .filter(|id| id != asker && !s.same_entity(asker, id))
         .filter(|id| review_capability(s, id).is_ok())
         .filter(|id| matches!(
@@ -24682,6 +25368,15 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         attempted_act.as_deref(),
         &resolved_targets,
     );
+    // RE-ISSUING IS OBSERVING (#366): the proven asker session re-issuing this exact act has
+    // learned of its ruling, so its matching grant is observed before the spend is tried. A
+    // grant approved while the asker sat idle is then claimed by the re-issue the deny asked
+    // for, instead of lapsing at decided_at + 600 and minting a duplicate petition. The key is
+    // the DERIVED host session above, never the caller's assertion (the precedence block).
+    if let Some(h) = proven_host_session_id.as_deref() {
+        s.gate_escalations
+            .observe_reissue(&plugin_id, h, &marker, attempted_act.as_deref(), now);
+    }
     if let Some(esc) = s.gate_escalations.claim_bound(
         &plugin_id,
         &marker,
@@ -31027,6 +31722,64 @@ mod durable_reads_tests {
         durable.unwrap();
         assert_eq!(again["verdict"], json!("pending"), "{again}");
         assert_eq!(again["request_id"], first["request_id"]);
+    }
+
+    /// #648: the scope record carries the act at REVIEW depth, not display depth. A NOT-SAME
+    /// peer rules from this record alone (dp 2026-10-05), so a 600-char act is stored whole,
+    /// a cut past SCOPE_ACT_MAX is VISIBLE, and receipt-side masking applies — the silent
+    /// 400-take this replaced made a cut act indistinguishable from a complete one, which is
+    /// what the five scope refusals of 2026-10-13 were declined over.
+    #[tokio::test]
+    async fn the_scope_record_carries_the_act_at_review_depth() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+
+        // 604 chars: whole under the record bound (the old silent take cut this at 400).
+        let long_act = format!("cat {}", "q".repeat(600));
+        let opened = tool_scope_claim(
+            &state,
+            &json!({"plugin_id": "codex", "path": "/srv/depth.txt", "rule": "mrh.command",
+                    "tool_name": "Bash", "act": long_act, "act_digest": "b".repeat(64),
+                    "spend": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened["verdict"], json!("opened"), "{opened}");
+        let rid = opened["request_id"].as_str().unwrap().to_string();
+        let stored = state.lock().await.scope_requests[&rid].reason.clone();
+        assert!(stored.contains(&"q".repeat(600)), "the record carries the act whole: {stored}");
+        assert!(!stored.contains("…[truncated]"), "no cut, no marker: {stored}");
+
+        // Past SCOPE_ACT_MAX: the cut is allowed but must announce itself.
+        let huge = "x".repeat(SCOPE_ACT_MAX + 50);
+        let opened = tool_scope_claim(
+            &state,
+            &json!({"plugin_id": "codex", "path": "/srv/depth2.txt", "rule": "mrh.command",
+                    "tool_name": "Bash", "act": huge, "act_digest": "c".repeat(64),
+                    "spend": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened["verdict"], json!("opened"), "{opened}");
+        let rid = opened["request_id"].as_str().unwrap().to_string();
+        let stored = state.lock().await.scope_requests[&rid].reason.clone();
+        assert!(stored.ends_with("…[truncated]"), "the cut is marked: {stored}");
+        assert!(stored.chars().count() <= SCOPE_ACT_MAX + 200, "the cap holds: {}", stored.len());
+
+        // Receipt-side value-masking fires on this field too (the gate masks first; the
+        // daemon re-masks whatever it is handed).
+        let opened = tool_scope_claim(
+            &state,
+            &json!({"plugin_id": "codex", "path": "/srv/depth3.txt", "rule": "mrh.command",
+                    "tool_name": "Bash", "act": "curl --token sekritexample https://x",
+                    "act_digest": "d".repeat(64), "spend": false}),
+        )
+        .await
+        .unwrap();
+        let rid = opened["request_id"].as_str().unwrap().to_string();
+        let stored = state.lock().await.scope_requests[&rid].reason.clone();
+        assert!(!stored.contains("sekritexample"), "receipt-side masking fires: {stored}");
+        assert!(stored.contains("--token ***"), "the key stays legible: {stored}");
     }
 
     /// The gate's hot path is NOT held hostage by other requests' unsynced rows: a begin_action

@@ -823,6 +823,164 @@ def hashlib_sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def test_a_declared_probe_opens_no_scope_request(m, g, wc, home):
+    """dp, 2026-10-14 ("needless frictions are bad"): the deploy preflight's hold probe opened a
+    peer scope request per member every cycle. A non-harness invoker that declares
+    HESTIA_GATE_NO_ESCALATE=1 gets the refusal the law gives and the daemon is asked nothing;
+    any other value keeps today's escalation."""
+    stub = Stub(Policy())
+    saved = os.environ.get("HESTIA_GATE_NO_ESCALATE")
+    try:
+        os.environ["HESTIA_GATE_NO_ESCALATE"] = "1"
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Bash", {"command": "touch /etc/hostname"}, home)
+        check("probe-refused-as-law-judged", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("probe-asks-no-scope-claim", not stub.named("hestia_scope_claim"), stub.calls[-3:])
+        check("probe-carries-no-escalation-id", not getattr(d, "escalation_id", None), d)
+        check("probe-says-why", "HESTIA_GATE_NO_ESCALATE" in (d.reason or ""), d.reason)
+        os.environ["HESTIA_GATE_NO_ESCALATE"] = "0"
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Bash", {"command": "touch /etc/hostname"}, home)
+        check("probe-flag-other-value-still-escalates", len(stub.named("hestia_scope_claim")) == 1,
+              stub.calls[-3:])
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_GATE_NO_ESCALATE", None)
+        else:
+            os.environ["HESTIA_GATE_NO_ESCALATE"] = saved
+        stub.close()
+
+
+def test_declared_egress_is_swept_and_never_scoped(m, g, wc, home):
+    """#1201 (NOVA's 10-03 acceptance contract): `egress` is text that LEAVES the machine (a
+    being's web_search query, SAGE #335; a remote model's prompt, #1338). Gate 1a sweeps it with
+    the innate `egress.secret` rule; Gate 1b never path- or command-scopes it; natural language
+    with path-like words stays allowed; an event that declares none is judged exactly as before;
+    and the web-tool surfaces the gate already finds by name reach the core through the same
+    field, so its separate precheck could go without moving a verdict."""
+    core = g.core
+    # Assembled from parts, like CRED_PATH: the literal never has to be typed.
+    secret_q = "how do i rotate " + "~/." + "ssh/id_" + "rsa safely"
+    # Starts with an absolute path outside every scope: if any stage read egress as a path, this
+    # would be refused mrh.* (measured: a repo-relative-looking query resolves in scope and hides it).
+    benign_q = "/etc/ollama models config and ~/projects layout for qwen weights"
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            for seat in SEATS:
+                prof = profile_for(g, seat, home)
+                ev = to_event(g, seat, native_event(seat, "web_search", {"query": secret_q}, str(REPO), 1))
+                ev.egress = [secret_q]
+                d = g.decide(ev, prof)
+                check(f"{seat}-declared-egress-secret-denied",
+                      d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
+                check(f"{seat}-declared-egress-reaches-the-core",
+                      secret_q in g.normalized_event(ev).egress, g.normalized_event(ev))
+                ev = to_event(g, seat, native_event(seat, "web_search", {"query": benign_q}, str(REPO), 2))
+                ev.egress = [benign_q]
+                d = g.decide(ev, prof)
+                check(f"{seat}-benign-egress-never-scoped",
+                      d.decision == "allow" and not d.rule.startswith("mrh.")
+                      and d.rule != "egress.secret", d)
+
+            # The core alone, in its full law and in its degraded mode (egress is the one rule no
+            # mode relaxes), with no path, repo or command for the old sweep to see.
+            cprof = profile_for(g, "kimi", home).core_profile()
+            for q, want in ((secret_q, True), (benign_q, False)):
+                nev = core.NormalizedEvent(tool="web_search", egress=[q], cwd=str(REPO))
+                for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
+                                ("degraded", core.degraded_verdict(nev, cprof))):
+                    tag = f"core-{name}-{'secret' if want else 'benign'}"
+                    check(tag, (v.decision == "deny" and v.rule == "egress.secret" and v.innate) if want
+                          else v.rule != "egress.secret", v)
+
+            # NOVA HOLD at 7a6e410b: a BARE STRING is one blob, never its characters. The first
+            # patch ran `list(...)` over it, so `~/.ssh/id_rsa` became one-character blobs that
+            # matched no token and the act was allowed. Nested lists flatten to their strings.
+            for shape, val in (("str", secret_q), ("nested", [[secret_q]]), ("tuple", (secret_q,))):
+                for seat in SEATS:
+                    prof = profile_for(g, seat, home)
+                    ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 40))
+                    ev.egress = val
+                    d = g.decide(ev, prof)
+                    check(f"{seat}-direct-{shape}-egress-secret-denied",
+                          d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
+                    check(f"{seat}-direct-{shape}-egress-reaches-the-core-whole",
+                          secret_q in g.normalized_event(ev).egress, g.normalized_event(ev))
+                nev = core.NormalizedEvent(tool="web_search", egress=val, cwd=str(REPO))
+                for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
+                                ("degraded", core.degraded_verdict(nev, cprof))):
+                    check(f"core-{name}-direct-{shape}-secret",
+                          v.decision == "deny" and v.rule == "egress.secret" and v.innate, v)
+            for seat in SEATS:
+                prof = profile_for(g, seat, home)
+                ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 41))
+                ev.egress = benign_q
+                d = g.decide(ev, prof)
+                check(f"{seat}-direct-str-benign-allowed-and-unscoped",
+                      d.decision == "allow" and not d.rule.startswith("mrh.") and d.rule != "egress.secret", d)
+            nev = core.NormalizedEvent(tool="web_search", egress=benign_q, cwd=str(REPO))
+            for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
+                            ("degraded", core.degraded_verdict(nev, cprof))):
+                check(f"core-{name}-direct-str-benign", v.rule != "egress.secret", v)
+
+            # Egress the gate cannot read whole FAILS CLOSED, even when its text is benign:
+            # a dict, bytes, a number, a set, a generator, or a list holding one of them.
+            unsweepable = (("dict", lambda: {"q": benign_q}), ("bytes", lambda: benign_q.encode()),
+                           ("int", lambda: 7), ("set", lambda: {benign_q}),
+                           ("generator", lambda: (q for q in [benign_q])),
+                           ("list-with-dict", lambda: [benign_q, {"q": benign_q}]))
+            for shape, make in unsweepable:
+                for seat in SEATS:
+                    prof = profile_for(g, seat, home)
+                    ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 42))
+                    ev.egress = make()
+                    d = g.decide(ev, prof)
+                    check(f"{seat}-unsweepable-{shape}-fails-closed",
+                          d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
+                for name, fn in (("evaluate", lambda n: core.evaluate(n, cprof, workspace=str(REPO))),
+                                 ("degraded", lambda n: core.degraded_verdict(n, cprof))):
+                    v = fn(core.NormalizedEvent(tool="web_search", egress=make(), cwd=str(REPO)))
+                    check(f"core-{name}-unsweepable-{shape}-fails-closed",
+                          v.decision == "deny" and v.rule == "egress.secret" and v.innate, v)
+                # The single gate hands it to the core whole, so the core refuses it on its own.
+                ev = to_event(g, "kimi", native_event("kimi", "web_search", {"query": "x"}, str(REPO), 43))
+                ev.egress = make()
+                v = core.evaluate(g.normalized_event(ev), cprof, workspace=str(REPO))
+                check(f"handoff-unsweepable-{shape}-core-alone-denies",
+                      v.decision == "deny" and v.rule == "egress.secret", v)
+
+            # Default-empty parity: declaring nothing and declaring [] are judged identically,
+            # across a write, a shell read, an innate deny and a web tool.
+            for i, (seat, tool, ti) in enumerate((
+                    ("codex", *_act(IN_SCOPE_EDIT)),
+                    ("claude-code", "Bash", {"command": "cat /etc/hostname"}),
+                    ("kimi", "Bash", {"command": "cat ~/." + "ssh/id_rsa"}),
+                    ("gemini", "WebFetch", {"url": "https://x.example/?q=." + "env"}))):
+                prof = profile_for(g, seat, home)
+                a = g.decide(to_event(g, seat, native_event(seat, tool, ti, str(REPO), 10 + i)), prof)
+                ev = to_event(g, seat, native_event(seat, tool, ti, str(REPO), 20 + i))
+                ev.egress = []
+                b = g.decide(ev, prof)
+                check(f"default-empty-parity-{seat}-{tool}", (a.decision, a.rule) == (b.decision, b.rule),
+                      (a, b))
+
+            # The Gemini migration pin: every web-tool surface `egress_surfaces` finds by name now
+            # rides `NormalizedEvent.egress`, and the core denies it ON ITS OWN, so deleting the
+            # shim-era precheck would not move these verdicts.
+            for i, (tool, ti) in enumerate((
+                    ("WebFetch", {"url": "https://x.example/?q=." + "env"}),
+                    ("WebFetch", {"url": "https://x.example/", "prompt": "summarise ~/." + "ssh/id_rsa"}),
+                    ("WebSearch", {"query": "where is ~/." + "ssh/id_rsa"}))):
+                ev = to_event(g, "gemini", native_event("gemini", tool, ti, str(REPO), 30 + i))
+                nev = g.normalized_event(ev)
+                v = core.evaluate(nev, profile_for(g, "gemini", home).core_profile(), workspace=str(REPO))
+                check(f"migration-core-alone-denies-{tool}-{i}",
+                      v.decision == "deny" and v.rule == "egress.secret", (nev.egress, v))
+    finally:
+        stub.close()
+
+
 def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home):
     """dp, 2026-10-05: "escalation should allow standing grants". An `mrh.path` / `mrh.command`
     refusal asks the daemon ONCE (`hestia_scope_claim`): a request is opened (or re-found) on the
@@ -1041,58 +1199,51 @@ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home)
         stub.close()
 
 
-def test_an_unenumerated_reach_is_a_once_only_request(m, g, wc, home):
-    """dp, 2026-10-10 ("narrow and land"): nothing an expansion produces is modelled. A command
-    whose reach depends on one is refused with the UNENUMERATED target, and the refusal is a scope
-    REQUEST for the act — keyed on the act's complete digest, decidable only as "this act once" —
-    never a silent allow (Codex 17054 P1-output-model: `cat "$(date +/x)"` was allowed)."""
+def test_an_unenumerated_reach_is_refused_with_rewrite_guidance(m, g, wc, home):
+    """dp, 2026-10-10 ("narrow and land"): nothing an expansion produces is modelled. dp, 2026-10-14
+    (hestia#1313, option b): a command whose reach depends on one is refused under its OWN rule,
+    `mrh.command.unenumerated`, which is not a scope-escalating rule. So the gate asks the daemon
+    nothing (no peer scope request is opened, for the act or for any concrete path beside it),
+    and the remedy names the rewrite that works. Never a silent allow (Codex 17054
+    P1-output-model: `cat "$(date +/x)"` was allowed)."""
     unenum = g.core.UNENUMERATED_TARGET
-    act = 'cat "$(date +/etc/hostname)"'
+    rule = "mrh.command.unenumerated"
     stub = Stub(Policy())
     try:
         with _Env(m, stub.url, home):
-            d, _ = _decide(g, "codex", "Bash", {"command": act}, home)
-        claims = [a for a, _ in stub.named("hestia_scope_claim")]
-        c = claims[0] if claims else {}
-        dg = c.get("act_digest") or ""
-        check("unenum-17054-date-format-is-refused", d.decision == "deny" and d.rule == "mrh.command", d)
-        check("unenum-opens-one-request", len(claims) == 1 and c.get("spend") is False, claims)
-        check("unenum-request-keyed-on-the-act",
-              len(dg) == 64 and c.get("path") == f"{unenum}#{dg[:16]}", c)
-        check("unenum-deny-names-the-request", d.escalation_id and d.escalation_id in d.reason, d)
-        check("unenum-deny-says-once-only", "only ONCE" in d.reason and "no session" in d.reason, d.reason)
-        with _Env(m, stub.url, home):
-            d2, _ = _decide(g, "codex", "Bash", {"command": 'cat "$(date +/etc/os-release)"'}, home)
-        claims = [a for a, _ in stub.named("hestia_scope_claim")]
-        check("unenum-two-acts-two-requests",
-              d2.decision == "deny" and len({a.get("path") for a in claims}) == 2, claims)
+            d, _ = _decide(g, "codex", "Bash", {"command": 'cat "$(date +/etc/hostname)"'}, home)
+        claims = stub.named("hestia_scope_claim")
+        check("unenum-17054-date-format-is-refused", d.decision == "deny" and d.rule == rule, d)
+        check("unenum-opens-no-request", claims == [] and not d.escalation_id, (claims, d))
+        check("unenum-remedy-names-the-rewrite", "spell every path out literally" in d.remedy
+              and "script file" in d.remedy and "not a recast" in d.remedy, d.remedy)
+        check("unenum-says-no-request", "No scope request was opened" in d.remedy, d.remedy)
+        check("unenum-no-once-only-promise", "only ONCE" not in d.reason + d.remedy, d)
+        check("unenum-names-the-expansion", "a command substitution" in d.reason, d.reason)
     finally:
         stub.close()
-    # A one-time approval of the act lifts it: reserved after society, committed after evidence,
-    # under the same act-keyed path.
-    stub = Stub(Policy(scope_claim=lambda p: "approved" if p.startswith(unenum) else "opened"))
-    try:
-        with _Env(m, stub.url, home):
-            d, _ = _decide(g, "codex", "Bash", {"command": "cat /tmp/run-$(date +%s)/../x"}, home)
-        calls = [a for a, _ in stub.named("hestia_scope_claim")]
-        ops = [a.get("op") for a in calls if "op" in a]
-        reserve = [a for a in calls if a.get("op") == "reserve"]
-        check("unenum-once-approval-lifts", d.decision == "allow", d)
-        check("unenum-once-reserve-then-commit", ops == ["reserve", "commit"]
-              and reserve and all(p.startswith(unenum + "#") for p in reserve[0]["paths"]), calls)
-    finally:
-        stub.close()
-    # A concrete refusal in the same act is collected too, and is its own request.
+    # Even a daemon that WOULD approve is never asked: there is no approval route as written.
     stub = Stub(Policy(scope_claim=lambda p: "approved"))
     try:
         with _Env(m, stub.url, home):
-            # `$D` alone would now resolve (dp, 2026-10-11: one literal binds); `$E` does not.
-            d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D $E"}, home)
-        peeks = [a.get("path") for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
-        check("unenum-mixed-collects-both", d.decision == "allow" and len(peeks) == 2
-              and "/etc/hostname" in peeks and any(p.startswith(unenum + "#") for p in peeks), (d, peeks))
+            d, _ = _decide(g, "codex", "Bash", {"command": "cat /tmp/run-$(date +%s)/../x"}, home)
+        check("unenum-never-lifted", d.decision == "deny" and d.rule == rule, d)
+        check("unenum-daemon-never-asked", stub.named("hestia_scope_claim") == [], stub.named("hestia_scope_claim"))
     finally:
         stub.close()
+    # A concrete refusal in the same act is not escalated either: the act cannot pass as written.
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            # `$D` alone would resolve (dp, 2026-10-11: one literal binds); `$E` does not.
+            d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D $E"}, home)
+        check("unenum-mixed-is-refused-unescalated", d.decision == "deny" and d.rule == rule
+              and stub.named("hestia_scope_claim") == [], (d, stub.named("hestia_scope_claim")))
+    finally:
+        stub.close()
+    # The once-only lift still exists in the core (a trial scope carrying the sentinel), but no
+    # path in the gate builds that scope any more; pinned so a later change notices.
+    check("unenum-core-target-unchanged", unenum == "hestia:unpriceable:unenumerated", unenum)
     # Codex 17054 P1-quote-context, through decide(): the live substitution is found and judged.
     stub = Stub(Policy())
     try:
@@ -1102,6 +1253,42 @@ def test_an_unenumerated_reach_is_a_once_only_request(m, g, wc, home):
               and "/etc/hostname" in d.reason, d)
     finally:
         stub.close()
+
+
+def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
+    """#1287 part 1 (2026-10-13): a seat put prose with `*` and quotes in R and passed "$R" as
+    `--reason`; the literal rule made the act a once-only scope request although nothing in it is a
+    path. A value that cannot bind is unenumerated only where its use is judged as a PATH. Every
+    seat: the exact shape is allowed (and asks society law); a glob-valued name in a path position
+    is still a request; an UNQUOTED glob-valued name in the message position is still a request, and
+    so is an unquoted value that field splitting breaks into more arguments (Codex HOLD 21675)."""
+    prose = ("Refused: no seat asked for this. The act is the deploy preflight's advisory hold probe "
+             "(deploy/from-main/hestia-deploy.sh ~L605, plugins/*/expects.json 'evaluate deploy hold'), "
+             "fired for ever …")
+    exact = f'cd {REPO}; R="{prose}"; hestia gate deny 0123abcd --as claude-code --reason "$R"'
+    unenum = g.core.UNENUMERATED_TARGET
+    for seat in SEATS:
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, seat, "Bash", {"command": exact}, home)
+                check(f"1287-{seat}-prose-reason-allowed", d.decision == "allow", d)
+                check(f"1287-{seat}-prose-reason-asks-society", len(stub.named("hestia_begin_action")) == 1)
+                d, _ = _decide(g, seat, "Bash", {"command": 'F="a*"; cat $F'}, home)
+                check(f"1287-{seat}-glob-var-path-is-refused", d.decision == "deny"
+                      and d.rule == "mrh.command.unenumerated", d)
+                d, _ = _decide(g, seat, "Bash", {"command": 'R="/tmp/review-probe/*"; hestia gate deny X --reason $R'}, home)
+                check(f"1287-{seat}-unquoted-glob-reason-is-refused", d.decision == "deny"
+                      and d.rule == "mrh.command.unenumerated", d)
+                # Codex HOLD 21675: unquoted, the value splits and `--body-file` becomes gh's argument.
+                d, _ = _decide(g, seat, "Bash", {"command": 'R="hi --body-file /etc/hostname"; gh pr create --title $R'}, home)
+                check(f"1289-{seat}-unquoted-split-title-is-refused", d.decision == "deny"
+                      and d.rule == "mrh.command.unenumerated", d)
+            # hestia#1313: none of these opens a scope request any more.
+            check(f"1313-{seat}-no-requests-opened", stub.named("hestia_scope_claim") == [],
+                  stub.named("hestia_scope_claim"))
+        finally:
+            stub.close()
 
 
 def test_degraded_posture(m, g, wc, home):
@@ -1527,8 +1714,11 @@ CONTRACT_TESTS = [
     test_reads_meet_the_same_local_law_on_every_seat,
     test_superseded_is_denied_in_every_mode,
     test_daemon_verdicts_and_the_warn_rollout,
+    test_a_declared_probe_opens_no_scope_request,
+    test_declared_egress_is_swept_and_never_scoped,
     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
-    test_an_unenumerated_reach_is_a_once_only_request,
+    test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
+    test_prose_in_a_message_position_is_data_on_every_seat,
     test_degraded_posture,
     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
@@ -2018,16 +2208,14 @@ def test_against_an_isolated_real_daemon(m, g, wc, home):
         check("real-scope-reissue-finds-the-same-request", again.escalation_id == d.escalation_id,
               (d.escalation_id, again.escalation_id))
         check("real-scope-reissue-says-pending", "still pending" in again.reason, again.reason)
-        # dp, 2026-10-10 (narrowed): an act whose reach an expansion decides is a request for THE
-        # ACT against the real handler too — the daemon accepts the act-keyed sentinel, and a
-        # re-issue of the identical act finds the same request.
+        # dp, 2026-10-14 (hestia#1313): an act whose reach an expansion decides is refused under
+        # its own rule against the real handler too, and opens no request, on a re-issue either.
         u = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 7)
-        check("real-unenumerated-is-mrh-command", u.decision == "deny" and u.rule == "mrh.command", u)
-        check("real-unenumerated-opens-a-request", bool(u.escalation_id)
-              and str(u.escalation_id).startswith("scope-") and "only ONCE" in u.reason, u)
+        check("real-unenumerated-own-rule", u.decision == "deny"
+              and u.rule == "mrh.command.unenumerated", u)
+        check("real-unenumerated-opens-no-request", not u.escalation_id, u)
         u2 = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 8)
-        check("real-unenumerated-reissue-finds-it", u2.escalation_id == u.escalation_id,
-              (u.escalation_id, u2.escalation_id))
+        check("real-unenumerated-reissue-opens-none", not u2.escalation_id, u2)
 
 
 def teardown_module(module=None):

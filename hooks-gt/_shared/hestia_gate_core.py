@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 8fcdc2566613636e073717c597f6fd58d40c1e5dd620c3c66c8ebb93e39e49c2  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 2b946d537ebbebd68fa8f38289edfcad101eebd30232a9ec35068b26b0beeed0  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -109,6 +109,7 @@ over to evaluate() — decided from a policy snapshot fetched LIVE from the daem
 """
 from __future__ import annotations
 
+import fnmatch as _fnmatch
 import glob as _glob
 import json
 import os
@@ -219,6 +220,23 @@ REMEDIES: dict[str, Remedy] = {
         "hand you a file. If you believe the deny itself was wrong, that is the appeal, and it "
         "is a separate act.",
         ("hestia_request_scope", "hestia_scope_status", "hestia_appeal"),
+    ),
+    # AN UNENUMERABLE REACH (dp's ruling, 2026-10-14, hestia#1313: option (b) of three). The act's
+    # reach depends on an expansion the gate does not model, so no path exists for a grant to
+    # name. Until this ruling the refusal also opened a once-only peer scope request for the act;
+    # measured on claude-code's own 50,091 recorded commands, 9,178 (18%) were such requests and
+    # most lapsed or were refused as noise. Now it is its own rule, NOT a scope-escalating one
+    # (mechanism.SCOPE_ESCALATING_RULES), so the single gate asks the daemon nothing, and the
+    # remedy names the two rewrites that work. The rewrite is the asked-for act, not a recast.
+    "mrh.command.unenumerated": Remedy(
+        "Rewrite the act so the gate can see what it reaches. That rewrite is what this refusal "
+        "asks for; it is not a recast. Either spell every path out literally (if a value comes "
+        "from a command, run that command on its own first and use what it printed), or put "
+        "the expansion in a script file and run the script by its literal path. No scope "
+        "request was opened: no grant can name a path the gate cannot see. If the spelled-out "
+        "command then reaches outside your scope, its own refusal opens a request for that "
+        "path.",
+        ("hestia_request_scope",),
     ),
     "mrh.command": Remedy(
         "Scope the command to a granted path. If the path is genuinely needed: when this "
@@ -474,6 +492,65 @@ class NormalizedEvent:
     command: Optional[str] = None               # shell command, if any
     cwd: Optional[str] = None
     raw: dict = field(default_factory=dict)     # kept for witnessing, never for deciding
+    #: Text that LEAVES THE MACHINE: a web query, a url, a prompt or context handed to a remote
+    #: model (#1201). Gate 1a sweeps it with the same innate `egress.secret` rule as paths, repos
+    #: and the command. Gate 1b NEVER reads it: natural language is not a path, and scoping its
+    #: words is the false-deny SAGE #335 measured ("'models' is not granted"). The field can
+    #: only ADD a deny. Default empty: an event that declares no egress is judged as before.
+    egress: list = field(default_factory=list)
+
+
+def egress_items(value: object) -> Optional[list]:
+    """Declared egress as the strings Gate 1a sweeps, or None when it cannot be swept.
+
+    A string is ONE blob. `list("~/.ssh/id_rsa")` is fourteen one-character blobs that match no
+    token, which is how a bare string slipped past the first #1201 patch (NOVA HOLD at 7a6e410b).
+    A list or tuple contributes its strings, flattened through nested lists/tuples, and None
+    entries are skipped. Anything else (a dict, bytes, a number, a set, a generator) is not text
+    this gate can read whole, so it returns None and the caller fails closed."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple)):
+        return None
+    out: list = []
+    for x in value:
+        if x is None:
+            continue
+        sub = egress_items(x)
+        if sub is None:
+            return None
+        out.extend(sub)
+    return out
+
+
+def egress_unsweepable(event: "NormalizedEvent") -> str:
+    """The type name of declared egress that `egress_items` cannot sweep; "" when it can."""
+    raw = getattr(event, "egress", None)
+    return type(raw).__name__ if egress_items(raw) is None else ""
+
+
+def egress_unsweepable_deny(event: "NormalizedEvent") -> Optional["Verdict"]:
+    """Gate 1a's fail-closed half: egress the gate cannot read whole is denied, never passed
+    unread. Both Gate 1a sites call it before the token sweep, so the degraded mode does too."""
+    bad = egress_unsweepable(event)
+    if not bad:
+        return None
+    return _deny("egress.secret",
+                 f"'{event.tool}' declares egress the gate cannot sweep ({bad}): egress must be "
+                 f"a string or a list of strings, so it is denied rather than sent unread",
+                 innate=True)
+
+
+def egress_blobs(event: "NormalizedEvent") -> list:
+    """Every string Gate 1a sweeps for the innate forbidden tokens: paths, repos, declared
+    egress text, and the command. `getattr`, not attribute access: a caller's own event
+    shape (SAGE's test fakes) may predate the `egress` field, and that must read as none.
+    Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
+    return (list(event.paths) + list(event.repos)
+            + (egress_items(getattr(event, "egress", None)) or [])
+            + ([event.command] if event.command else []))
 
 
 @dataclass(frozen=True)
@@ -1332,8 +1409,9 @@ _SHELL_PUNCT = frozenset(";|&()<>")
 #: Sentinels in a tokenised word: a `$` / backtick the shell will NOT expand (quoted or escaped),
 #: and an UNQUOTED brace expansion (`{a,b}`, `{1..3}`) about to open.
 _LIT_DOLLAR, _LIT_TICK, _BRACE = "\x00", "\x02", "\x03"
-#: Marks a `$NAME` / `${…}` reference written INSIDE double quotes (no field splitting, no
-#: globbing at that use) — evidence the literal rule needs before a whitespace value may bind.
+#: Marks a `$NAME` / `${…}` reference, or a `$(…)` / backtick substitution, written INSIDE double
+#: quotes (no field splitting, no globbing at that use) — evidence the literal rule needs before a
+#: whitespace value may bind, and that a data position needs before an expansion is one argument.
 _DQ_REF = "\x04"
 #: `$'…'` (ANSI-C) and `$"…"` (locale) quoting rewrite their content; never modelled. The word
 #: carries this unbound parameter reference, so wherever it is judged as a path it is
@@ -1403,14 +1481,14 @@ def _tokenize(text: str) -> list:
                     continue
                 if text.startswith("$(", j):
                     k = _balanced_end(text, j + 1)
-                    seg.append(text[j:k + 1])
+                    seg.append(_DQ_REF + text[j:k + 1])   # a quoted substitution
                     j = k + 1
                     continue
                 if text[j] == "`":
                     k = text.find("`", j + 1)
                     if k < 0:
                         raise _Unmodelled("an unclosed backtick")
-                    seg.append(text[j:k + 1])
+                    seg.append(_DQ_REF + text[j:k + 1])
                     j = k + 1
                     continue
                 if text[j] == "$" and j + 1 < n and (text[j + 1] == "{" or text[j + 1] == "_"
@@ -1571,6 +1649,42 @@ for _h in ("su", "runuser"):
                       "value_opts": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"}}
 _CMD_SPECS["script"] = {"code_opts": {"-c", "--command"}}
 _CMD_SPECS["flock"] = {"code_opts": {"-c", "--command"}, "value_opts": {"-w", "--timeout"}}
+#: PROSE OPTIONS (#1287): values that are messages, not paths — a reason, a body, a title. A seat's
+#: `--reason "$R"` with prose in R (a `*`, quotes) was made a once-only scope request by the literal
+#: rule although nothing in it is a path. Keyed by (command, subcommand words) and NEVER generic: an
+#: option's arity is the command's, and often the subcommand's (`grep --text`, `readelf --notes`,
+#: `git diff --summary` and `gh pr review -c` take no value, so a generic prose `--text` swallowed
+#: the file after it — Codex HOLD 21639). Each entry is checked against the tool's own definition:
+#: hestia's clap tree (every `--reason` / `--argument` is a String) and `gh <sub> --help`. A
+#: subcommand word must precede the option; anything else stays a path. An UNQUOTED glob in the
+#: word itself is still judged (the shell expands it first), as for every other string position.
+_PROSE_OPTS = {
+    ("hestia",): {"--reason", "--argument"},
+    ("gh", "pr", "create"): {"--title", "-t", "--body", "-b"},
+    ("gh", "pr", "edit"): {"--title", "-t", "--body", "-b"},
+    ("gh", "issue", "create"): {"--title", "-t", "--body", "-b"},
+    ("gh", "issue", "edit"): {"--title", "-t", "--body", "-b"},
+    ("gh", "pr", "comment"): {"--body", "-b"},
+    ("gh", "issue", "comment"): {"--body", "-b"},
+    ("gh", "pr", "review"): {"--body", "-b"},
+    ("gh", "pr", "close"): {"--comment", "-c"},
+    ("gh", "issue", "close"): {"--comment", "-c"},
+    ("gh", "pr", "merge"): {"--subject", "-t", "--body", "-b"},
+    ("gh", "release", "create"): {"--title", "-t", "--notes", "-n"},
+    ("gh", "release", "edit"): {"--title", "-t", "--notes", "-n"},
+}
+
+
+def _string_opts(head, spec, subs=()) -> set:
+    """The options whose value is a plain string for `head` after the positional words `subs`:
+    its spec's, plus the prose options `_PROSE_OPTS` names for that command and subcommand."""
+    out = set(spec.get("string_opts", set()))
+    for key, opts in _PROSE_OPTS.items():
+        if key[0] == head and tuple(subs[:len(key) - 1]) == key[1:]:
+            out |= opts
+    return out
+
+
 #: Commands whose argv is built from STDIN: what they reach is another command's output.
 _STDIN_ARGV = frozenset(("xargs", "parallel"))
 #: Commands that resolve their relative arguments against a directory option (`-C D`).
@@ -1626,6 +1740,55 @@ OVERFLOW_TARGET = UNPRICEABLE_PREFIX + "overflow"
 #: `$!` (digits) and `$-` (flag letters), replaced by a placeholder of the same class.
 _PLACEHOLDER_PARAMS = {"$?": "0", "$#": "0", "$$": "0", "$!": "0", "$-": "x"}
 
+#: The heads of a `${…}` PROVED to be one word inside double quotes: a name with no index or an index
+#: holding no `@` (`${A[*]}` joins), a positional number, or `*` `#` `?` `$` `-`, then the closing
+#: brace or an operator; `${!}` (the last pid) alone; `${#…}` counts; the joined key and prefix
+#: lists `${!A[*]}` / `${!P*}`. This is an ALLOWLIST: `${@…}`, `${A[@]…}` and every other `${!…}`
+#: (a name, `${!1}`, `${!#}` — the target decides, and `set -- 'A[@]'` makes `"${!1}"` one argument
+#: per element) are unproved. A list of shapes known to split was held three times, each for one
+#: more shape (Codex HOLDs 21718, 21790, 21861).
+_ONE_WORD_HEAD = re.compile(r"\$\{(?:(?:[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]@]*\])?|[0-9]+|[*#?$-])"
+                            r"(?=[}:+=?#%/^,@-])|!\}|#[^}]*\}$|![A-Za-z_][A-Za-z0-9_]*(?:\[\*\]|\*)\}$)")
+
+
+def _brace_end(value: str, i: int) -> int:
+    """Index of the `}` closing the `${` at `i`, counting nested `${` (bash balances them:
+    `${R:-${A[@]}}` is ONE expansion, Codex HOLD 21790) and skipping a backslash-escaped char."""
+    depth, j, n = 0, i, len(value)
+    while j < n:
+        if value[j] == "\\":
+            j += 2
+            continue
+        if value.startswith("${", j):
+            depth += 1
+            j += 2
+            continue
+        if value[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def _per_element(ref: str) -> bool:
+    """Whether a QUOTED `${…}` can still expand to more than one argument: any head not in
+    `_ONE_WORD_HEAD` (`${A[@]}` and its forms, Codex HOLD 21718; every indirection, whose target
+    decides, Codex HOLD 21861), or an unproved form NESTED in an operator word (`"${R:-${A[@]}}"`,
+    `"${R+$@}"`, Codex HOLD 21790). Recursive; a nested scalar (`"${R:-$X}"`) or joined array
+    (`"${R:-${A[*]}}"`) stays one argument."""
+    if not ref.startswith("${"):
+        return False
+    if not _ONE_WORD_HEAD.match(ref):
+        return True
+    body = ref[2:-1].replace(_DQ_REF, "")
+    try:
+        inner = _expansion_spans(body)
+    except _Unmodelled:
+        return True
+    return any(body[a:b] == "$@" or (body[a:b].startswith("${") and _per_element(body[a:b]))
+               for a, b in inner)
+
 
 def _expansion_spans(value: str) -> list:
     """`(start, end)` of every live expansion in a tokenised word: `$(…)`, `$((…))`, backticks,
@@ -1643,7 +1806,7 @@ def _expansion_spans(value: str) -> list:
             spans.append((i, k + 1))
             i = k + 1
         elif value.startswith("${", i):
-            k = value.find("}", i + 2)
+            k = _brace_end(value, i)
             if k < 0:
                 raise _Unmodelled("an unclosed ${")
             spans.append((i, k + 1))
@@ -1845,6 +2008,12 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
         except _Unenumerated as why:
             found.unenum.append(str(why))
             return
+        if v != value and not _path_shaped(v, uglob):
+            # #1296: the word was path-shaped only because it held a `$` the single-literal
+            # rule then resolved. Its VALUE is judged as its literal spelling would be: a header
+            # (`-H "id: $S"`) or a bare token is not a path when written out, so it is not one
+            # when bound either.
+            return
         if v.startswith("~"):
             found.unenum.append("a ~user home the gate does not resolve")
             return
@@ -1886,6 +2055,52 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
 
     toks = _shell_words(cmd)
     state = {}
+    # Names assigned a value holding a glob character anywhere in the command (#1287). In a data
+    # position such a name is still DATA when quoted; UNQUOTED, the shell expands the glob there —
+    # a directory read — so that one use is unenumerated.
+    globby = {m.group(1) for k, w_, _g in toks if k == "word"
+              for m in [re.match(r"([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)", w_, re.S)]
+              if m and any(c in m.group(2) for c in "*?[")}
+
+    def data(word, fields=True):
+        """A word in a DATA position (a message, pattern or string operand): no path is judged.
+        A QUOTED expansion is one argument and stays data, unless it holds `@` (`"${A[@]}"`,
+        `"${A[@]:1}"`, `"${!A[@]}"`, `"${@:1}"`): one argument per element, so where `fields` holds it
+        is unenumerated (Codex HOLD 21718). An UNQUOTED one is expanded by the
+        shell first. A glob-valued name expands to a directory read, so it is unenumerated in
+        every data position. And where the next argument would be a file (`fields`: an option
+        value, the grep / sed / awk program, a prose option) a value that field splitting breaks
+        apart inserts more arguments: `--title $R` with R="hi --body-file F" hands gh a file
+        (Codex HOLD 21675; main had it at `grep $R`, `git commit -m $R`). There an unquoted
+        expansion is data only when it is provably ONE field: a name bound to one literal
+        with no IFS whitespace (`in_force`), arithmetic, or a digit / flag-letter parameter.
+        `$'…'` is quoted. In an `echo` / `printf` / `tr` operand (`fields=False`) another field is
+        another string."""
+        try:
+            spans = _expansion_spans(word)
+        except _Unmodelled as why:
+            found.unenum.append(str(why))
+            return
+        one = in_force() if fields else {}
+        for a, b in spans:
+            ref = word[a:b]
+            if a > 0 and word[a - 1] == _DQ_REF:
+                # Quoted, but `@` inside `${…}` is one argument PER ELEMENT (Codex HOLD 21718):
+                # `"${A[@]}"` with A=(hello OUTSIDE) hands `--notes` hello and gh an asset.
+                if fields and _per_element(ref):
+                    kind = _expansion_kind(ref.replace(_DQ_REF, ""))
+                    found.unenum.append(f"{kind}, quoted, still passes one argument per element "
+                                        "where another argument can be a file (use a scalar "
+                                        "variable)")
+                continue
+            name = ref[2:-1] if ref.startswith("${") else ref[1:]
+            if name in globby:
+                found.unenum.append(f"an unquoted ${name} whose value holds a glob")
+            elif fields and not (ref.startswith("$((") or ref in _PLACEHOLDER_PARAMS
+                                 or ref == _ANSI_C_MARK or (name in one and not one[name][1])):
+                # `$'…'` is a quoted word of its own: its placeholder never splits.
+                found.unenum.append(f"{_expansion_kind(ref)} unquoted where field splitting can "
+                                    "add arguments (quote it to pass one argument)")
     # The literal rule binds only in the OUTER command's own statements: substitution bodies are
     # appended after them by `_shell_words`, and a body is a subshell.
     main_len = len(_tokenize(cmd)) if depth == 0 else 0
@@ -1919,7 +2134,7 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 found.dirs.append(home)
             else:
                 found.dirs_unknown = f"`{state['head']}` with no directory"
-        state.update(head=None, spec={}, pending=None, redirect=False, positional=0,
+        state.update(head=None, spec={}, pending=None, redirect=False, positional=0, subs=[],
                      pattern_given=False, opts_done=False, dirpending=False, chdir_seen=False,
                      env_expansion=None, code_opt=False, stdin_prog=False, herestring=False,
                      script_arg=False, heredoc=False, piped_in=sep in ("|", "|&"))
@@ -2054,9 +2269,10 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 code(w)
                 continue
             if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
-                    or opt in spec.get("string_opts", ())) and not uglob:
+                    or opt in _string_opts(head, spec, state["subs"])) and not uglob:
                 if opt in spec.get("pattern_opts", ()):
                     state["pattern_given"] = True
+                data(w)
                 continue
             if opt == "-c" and _HEREDOC_SHELL.match(head):
                 code(w)
@@ -2084,8 +2300,9 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                     chdir(w[2:], uglob)
                     emit(w[2:], uglob)
                     continue
+            strs = _string_opts(head, spec, state["subs"])
             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
-                     | spec.get("string_opts", set()) | spec.get("file_opts", set())
+                     | strs | spec.get("file_opts", set())
                      | spec.get("value_opts", set()) | spec.get("code_opts", set()))
             if eq:
                 if name in spec.get("code_opts", ()):
@@ -2095,8 +2312,10 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                     state["pattern_given"] = True
                 if uglob or not (name in spec.get("delim_opts", ())
                                  or name in spec.get("pattern_opts", ())
-                                 or name in spec.get("string_opts", ())):
+                                 or name in strs):
                     emit(val, uglob)
+                else:
+                    data(val)
                 continue
             if (_HEREDOC_SHELL.match(head) or _CODE_ARG_HEADS.match(head)) and not w.startswith("--") \
                     and re.fullmatch(r"-[A-Za-z]*[ce][A-Za-z]*", w) \
@@ -2130,6 +2349,8 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 emit(m.group(1), uglob)                    # `-I/usr/include`, `-C/elsewhere`
             continue
         state["positional"] += 1
+        if len(state["subs"]) < 3:
+            state["subs"].append(w)
         if state["positional"] == 1 and _HEREDOC_INTERPRETER.match(head) and not state["code_opt"]:
             # The program: a script file (judged as a path below), or stdin / a descriptor.
             if w == "-" or w.startswith(("/dev/fd/", "/dev/stdin", "/proc/self/fd/")):
@@ -2165,9 +2386,11 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
         # (command, position) exception can make it a string or a pattern: `tr /x/* y` and
         # `grep /x/*` read /x (Codex review 17029c). Exceptions apply to glob-free words only.
         if mode in ("strings", "strings_noglob") and not uglob:
+            data(w, fields=False)
             continue
         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
                 and not uglob:
+            data(w)
             continue
         name, eq, val = w.partition("=")
         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
@@ -2250,8 +2473,130 @@ def _outside_reach_refused(resolved: str, scopes, workspace: str, cwd: Optional[
     return None
 
 
+#: A whole command that is ONE `for V in <literals>; do BODY; done` (L-b in the #1205 corpus
+#: proposal; #1232 field reports, 2026-10-13). Items are limited to characters that can never
+#: expand, quote or glob; anything else falls through to the ordinary judge, where V stays
+#: unenumerated. The closing `done` must follow a `;` or newline and end the command: Codex
+#: HOLD 23938 showed a `\bdone` suffix strips `done` from `.../granted-done` after an
+#: already-closed loop, judging a different path.
+_LITERAL_FOR = re.compile(
+    r"\A\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in((?:[ \t]+[A-Za-z0-9_./:@+,%=-]+)+)[ \t]*[;\n]\s*"
+    r"do[ \t\n](.*)[;\n][ \t\n]*done[ \t\n]*\Z", re.S)
+LITERAL_FOR_BUDGET = 32
+#: A body word that could close or open a loop. Matched ANYWHERE in the body, quoted or not:
+#: `echo done` is refused the rule (judged as before) so that no `done` but the last one can be
+#: the loop's end.
+_LITERAL_FOR_KEYWORD = re.compile(r"(?<![A-Za-z0-9_./-])(?:done|do|for|while|until|select)(?![A-Za-z0-9_./-])")
+#: Body state that persists from one iteration into the next, which an independent per-iteration
+#: judgement cannot see (Codex HOLD 23938: `cd sub` repeated walks a symlink out of the grant on
+#: the third pass). Matched anywhere in the body as a word: directory changes, every builtin
+#: that binds, unbinds or re-shapes expansion, function definitions, assignments (bare, array,
+#: `+=`, `${X:=}`), and comments/heredocs that could hide the structure. Source (`.`) is a
+#: standalone `.` word followed by an argument, in ANY position: Codex review 24029 showed a
+#: separator-anchored match misses `! . f`, `if . f`, `time . f` and `>/dev/null . f`. The
+#: cost is that `find . -name x` in a body loses the new allow.
+_LITERAL_FOR_STATEFUL = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?:cd|pushd|popd|export|unset|set|shopt|alias|unalias|source|eval|exec|"
+    r"declare|typeset|local|readonly|read|mapfile|readarray|let|getopts|umask|hash|enable|builtin|"
+    r"command|trap|ulimit|function|printf)(?![A-Za-z0-9_./-])"
+    r"|(?<![^\s;&|(){}`<>!])\.[ \t]+(?=[^\s;&|)])"
+    r"|(?:\A|[\s;&|(){}`])[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?="
+    r"|\$\{[^}]*=|\(\s*\)|#|<<")
+
+
+def _literal_for_iterations(cmd: str):
+    """`["V=item; BODY", ...]` when `cmd` is a single loop over literal items, else None.
+
+    THE LITERAL-LIST LOOP RULE extends the single-literal-assignment rule (dp, 2026-10-11) to a
+    loop whose list is literal: inside iteration i, V holds item i and nothing else, so the
+    iteration reaches exactly what `V=item; BODY` reaches, and that statement is judged by the
+    ordinary rule, which still refuses a body that re-binds V, runs a string as shell, and so
+    on. The loop is allowed only if EVERY iteration is. What is dropped from the judged text is
+    the loop header (a name and literals) and the closing `done`; every executable word of the
+    body is still judged. A list with a glob, a quote, a `$`, a `..` component, or more than
+    LITERAL_FOR_BUDGET items is not literal, and the loop is judged as before.
+
+    Judging iterations independently is sound only if no iteration changes what the next one
+    reaches, so a body with any word `_LITERAL_FOR_STATEFUL` names (a `cd`, an assignment, a
+    builtin that binds) is judged as before, as is a body holding a second loop keyword
+    (`_LITERAL_FOR_KEYWORD`), which could mean the loop closed earlier. Both are deliberately
+    coarse: a body they wrongly exclude loses only the new allow, never a refusal."""
+    m = _LITERAL_FOR.match(cmd)
+    if not m:
+        return None
+    var, items, body = m.group(1), m.group(2).split(), m.group(3)
+    if not body.strip() or len(items) > LITERAL_FOR_BUDGET or var in _SHELL_OWNED_NAMES:
+        return None
+    if _LITERAL_FOR_KEYWORD.search(body) or _LITERAL_FOR_STATEFUL.search(body):
+        return None
+    if any(not _is_bindable_literal(it, False) for it in items):
+        return None
+    if any(_literal_for_body_uncertain(body, var, it) for it in items):
+        return None
+    return [f"{var}={it}; {body}" for it in items]
+
+
+#: Builtin names `_LITERAL_FOR_STATEFUL` refuses as words, plus `.` (source), for the glob check.
+_LITERAL_FOR_STATEFUL_NAMES = (
+    "cd", "pushd", "popd", "export", "unset", "set", "shopt", "alias", "unalias", "source", "eval",
+    "exec", "declare", "typeset", "local", "readonly", "read", "mapfile", "readarray", "let",
+    "getopts", "umask", "hash", "enable", "builtin", "command", "trap", "ulimit", "function",
+    "printf", ".")
+
+
+def _literal_for_body_uncertain(body: str, var: str, item: str) -> bool:
+    r"""True when iteration `var=item` of `body` could run a stateful word the raw text hides.
+
+    `_LITERAL_FOR_STATEFUL` reads raw text, but bash forms command words AFTER expansion and quote
+    removal: `c''d`, `c"d"`, `c\d`, a line continuation inside the word, `pu''shd`, an item that is
+    itself `cd` (`$f sub`), `c$f`, `$(echo c)d`, `$'\x63d'`, or a glob such as `c?` beside a file
+    named `cd` all run `cd` (Codex HOLD 23996). This check does not decode those forms; it refuses
+    the ones it cannot read exactly (Codex: "a conservative refusal of uncertain forms is
+    preferable to extending the raw-text spelling list"):
+    - V is substituted (`$V`, `${V}`) with the item, which is a bindable literal; then any `$`,
+      backtick or brace left means an expansion whose result the text does not show;
+    - quote characters and backslashes are deleted (a backslash-newline pair first), which yields
+      every word quote removal could produce, over-approximately, and the stateful pattern is
+      run again on that text;
+    - any word still holding a glob character that could match a stateful name is refused;
+    - any word holding a bracket expression, and any extglob opener (`?(`, `*(`, `+(`, `@(`,
+      `!(`), is refused outright: Python's fnmatch does not implement POSIX classes
+      (`c[[:alpha:]]`) or `[^x]` negation, so it cannot show such a word misses a stateful
+      name (Codex review 24029). Only the test words `[` and `[[` are kept.
+    A body this refuses loses only the new allow and is judged as before."""
+    text = re.sub(r"\$\{" + var + r"\}|\$" + var + r"(?![A-Za-z0-9_])", lambda _m: item, body)
+    if re.search(r"[$`{}]", text):
+        return True
+    decoded = re.sub(r"['\"\\]", "", text.replace("\\\n", ""))
+    if _LITERAL_FOR_KEYWORD.search(decoded) or _LITERAL_FOR_STATEFUL.search(decoded):
+        return True
+    if re.search(r"[?*+@!]\(", decoded):
+        return True
+    for word in re.split(r"[\s;&|()<>]+", decoded):
+        if "[" in word and word not in ("[", "[["):
+            return True
+        if re.search(r"[*?]", word) and any(
+                _fnmatch.fnmatchcase(name, word) for name in _LITERAL_FOR_STATEFUL_NAMES):
+            return True
+    return False
+
+
 def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
                         forbidden=None, home_markers=None):
+    """Returns (ok, offending_token, resolved_path). See `_command_scope_reach_one`; a command
+    that is one literal-list loop is judged per iteration (`_literal_for_iterations`)."""
+    its = _literal_for_iterations(cmd)
+    if its is not None:
+        for it in its:
+            res = _command_scope_reach_one(it, scopes, workspace, cwd, forbidden, home_markers)
+            if not res[0]:
+                return res
+        return res
+    return _command_scope_reach_one(cmd, scopes, workspace, cwd, forbidden, home_markers)
+
+
+def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
+                             forbidden=None, home_markers=None):
     """Returns (ok, offending_token, resolved_path).
 
     OUTSIDE THE WORKSPACE (2026-10-05, dp: "yes on gate gap, let's fix it"). Until this pass the
@@ -2564,9 +2909,13 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     forbidden = forbidden_tokens(profile)
 
     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
-    # Repo names are scanned too: an MCP call naming a forbidden token is still egress.
-    for blob in (list(event.paths) + list(event.repos)
-                 + ([event.command] if event.command else [])):
+    # Repo names are scanned too: an MCP call naming a forbidden token is still egress. So is
+    # declared egress text (#1201), which Gate 1b below never scopes; egress it cannot read
+    # whole is refused first, never passed unread.
+    unswept = egress_unsweepable_deny(event)
+    if unswept is not None:
+        return unswept
+    for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
             if f in low:
@@ -2664,10 +3013,14 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                         f"could not be judged completely, and an incompletely judged command is "
                         f"refused — split it, or the act can be approved once as written")
             elif offending and offending.startswith(_UNMODELLED_PREFIX):
-                what = (f"the gate cannot enumerate what it reaches "
-                        f"({offending[len(_UNMODELLED_PREFIX):-1]}): nothing an expansion produces is "
-                        f"modelled, so this act can only be approved ONCE, as written — or rewritten "
-                        f"with every path spelled out literally")
+                # hestia#1313: its own rule, so nothing escalates (see REMEDIES).
+                return _deny(
+                    "mrh.command.unenumerated",
+                    f"'{event.tool}' command: the gate cannot enumerate what it reaches "
+                    f"({offending[len(_UNMODELLED_PREFIX):-1]}). Nothing an expansion produces is "
+                    f"modelled, so no grant can cover it as written",
+                    target=refused or "",
+                )
             elif outside:
                 what = f"'{offending}' is outside the workspace and no grant reaches it"
             else:
@@ -2798,8 +3151,10 @@ def degraded_verdict(event: NormalizedEvent,
     read-allows are recorded on the gate-availability telemetry instead (they are an infra
     series, not refusals, and the deny log's readers expect denies)."""
     forbidden = forbidden_tokens(profile) if profile is not None else FORBIDDEN_DEFAULT
-    for blob in (list(event.paths) + list(event.repos)
-                 + ([event.command] if event.command else [])):
+    unswept = egress_unsweepable_deny(event)
+    if unswept is not None:
+        return unswept
+    for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
             if f in low:
