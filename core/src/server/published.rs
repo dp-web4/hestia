@@ -194,6 +194,8 @@ pub struct PolicyPublication {
     /// Shared handles (not copies): session identity and gate-capability reports.
     pub sessions: Arc<SessionDirectory>,
     pub gate_capabilities: Arc<GateCapabilities>,
+    /// Delegation snapshot handle (see `delegation_gate`): shared, self-refreshing from disk.
+    pub delegation_gate: Arc<crate::server::delegation_gate::DelegationGate>,
     /// DURABLE READS: the chain length this publication's inputs reflect. A reader replying from
     /// it waits until that much of the chain is durable (`observe`).
     pub chain_durability: Arc<crate::storage::durability::Durability>,
