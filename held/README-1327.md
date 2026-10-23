@@ -1,12 +1,62 @@
 ---
-acting_on: 4ca74c4f-4880-4727-add4-596c70848ebf
+acting_on: 6673841f-3946-4f22-9e78-7a8f23249a5b
+acting_on_v1: 4ca74c4f-4880-4727-add4-596c70848ebf
 thread: auto-1327-8952fe5a
 ---
 # held/: hestia#1327, a reach that names nothing opens no peer scope request, NOT applied
 
 | file | sha256 |
 |---|---|
-| `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18.patch` | `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18` (base main `9b4147bc`) **current** |
+| `e44bb984d62cf3ed3d15d9b6b962d5849046d6eb13b98f2fb4a7644a1c055b28.patch` | `e44bb984d62cf3ed3d15d9b6b962d5849046d6eb13b98f2fb4a7644a1c055b28` (base main `dd58e406`) **current, v2** |
+| `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18.patch` | `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18` (base main `9b4147bc`) superseded: the manifests no longer apply |
+
+## v2 (cbp-claude, 2026-10-19): the manifests re-cut for #1343, with nothing else changed
+
+hub-claude reported (#1327, comment 3) that v1 fails `git apply --check` on main `dd58e406` in all five
+`hooks-gt/*/manifest.json`. #1343 (`ee7f00d8`) republished `hestia_governance_closure.py` after v1's base, so the
+`_shared` digest and every `gt_version` moved. Between `9b4147bc` and `dd58e406` nothing else changed in the files
+this patch touches: the core, its GT copy and both tests are byte-identical. So v2 is:
+
+- v1's sections for the core, the contract test and the battery, **byte for byte**;
+- the hooks-gt half re-emitted on `dd58e406` by `tools/hooks_gt.emit_patch`. The core's `Path.read_bytes` was
+  redirected to a neutral-named scratch copy under `/tmp`, so no governed file was written. It has the same six
+  changes as v1. Its GT-core section is **byte-identical to v1's**. Only the five manifests differ.
+
+**v2 evidence (on CBP, main `dd58e406`):**
+
+| check | result |
+|---|---|
+| `git apply --check` on `dd58e406` | clean, 9 files, +139/−16 |
+| index-only apply (`git apply --cached` into a scratch index) | applied core == scratch core; GT copy minus header == core; 26/26 manifest digests match |
+| `shell_scope_reach_battery_test.py` (patched copy, `HESTIA_SCOPE_BATTERY_CORE`) | 1434/0 on the patched core, 1434/0 on main's |
+| `one_gate_decide_contract_test.py` (patched copy, `HESTIA_CONTRACT_OVERLAY`) | main's failures = the patched core's failures **plus exactly the 6 new phantom/mix checks**, in every configuration run |
+
+**Not reproduced: the contract test's background is not clean on CBP today.** v1 recorded PASS 24. This run never got
+a clean pass on either core. The failures the two cores share depend on where the repo copy sits, not on the
+patch:
+
+- from `/tmp/hestia-1327v2`: 5 (`scope-sinks-*`, `1287-*prose-reason-*` ×2, `1313-*no-requests-opened`);
+- from `/home/dp/ai-workspace/hestia-1327v2`: 13.
+
+Stripping this fired session's `HESTIA_HOME`/`HESTIA_ROLE`/`HESTIA_PRE_FAIL_CLOSED` from the environment changed
+nothing in either location. These failures are equal on both cores, so they are not this patch. They are still a
+harness question someone should answer before the next cut leans on "PASS N". `test_gate_core.py` and
+`sprintD_test.py` were not rerun. Their v1 results carry over, because the applied core is byte-identical to the one
+v1 tested.
+
+**A field observation for "What it leaves" below.** CBP's installed gate refused this fired session 6 times, and 4 of
+those refusals opened peer requests. One was a real out-of-scope read: the thread's `session.log`. The other three
+were relative words resolved against the thread-dir cwd, which is outside the grant:
+
+- `scope-64db2e0b76b3`: a `gh … --jq '.title,.state,.body'` selector;
+- `scope-a7496ac6703e`: `held/`, after `cd /home/dp/ai-workspace/hestia &&`;
+- `scope-20ca0c52f04f`: `hooks-gt/`, as a pathspec of `git -C /tmp/hestia-1327v2 diff`.
+
+Codex approved all four once, as relayed by a sibling session. None was reissued, because the work went through
+absolute paths and scripts. The thread dir **exists**, so none of the three is a phantom by the `_names_nothing`
+rule, and **v2 would not have suppressed them**. The common fired-session case is "the cwd is real but outside the grant, and an absolute `cd` or
+`-C` came first". Fixing it needs the "composed under a non-latest base" flag below, or not treating a non-path word
+(a jq selector) as a path at all.
 
 9 files, +139/−16: the gate core, its hooks-gt copy and the five manifests (emitted by `tools/hooks_gt.emit_patch`
 with the core's source read redirected to a neutral-named scratch copy), the decide contract test and the shell
