@@ -3253,8 +3253,22 @@ impl SqliteInboxStore {
         Ok(conn.last_insert_rowid() as u64)
     }
 
-    /// The member's UNANSWERED sends on a channel since `since` (epoch seconds), oldest first:
-    /// the budget's count. A row the budget refused is not counted: it was never sent.
+    /// EVERY member's unanswered sends on a channel since `since`, oldest first. The caller
+    /// decides whose they are (`tool_channel_send` keeps the sender's and its aliases', through
+    /// `same_entity`), so the budget is not split by two spellings of one member.
+    pub fn channel_unanswered_on_channel(&self, channel_id: &str, since: u64) -> Result<Vec<ChannelOutboxRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_channel_schema(&conn)?;
+        let mut st = conn.prepare(&format!(
+            "SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox WHERE channel_id = ?1 \
+             AND created >= ?2 AND answered_at IS NULL AND would_deny = 0 ORDER BY id"))?;
+        let rows = st.query_map(params![channel_id, since as i64], Self::channel_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The member's UNANSWERED sends on a channel since `since` (epoch seconds), oldest first,
+    /// by its LCT exactly. A row the budget refused is not counted: it was never sent.
     pub fn channel_unanswered(&self, member_lct: &str, channel_id: &str, since: u64) -> Result<Vec<ChannelOutboxRow>> {
         let conn = self.conn.lock().unwrap();
         Self::ensure_channel_schema(&conn)?;

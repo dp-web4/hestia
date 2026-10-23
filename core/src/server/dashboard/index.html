@@ -4342,6 +4342,8 @@
     try {
       const res = await apiFetch(`/api/channel/outbox/${encodeURIComponent(id)}/answer`, { method: 'POST' });
       const out = await res.json().catch(() => ({}));
+      // already-decided-409: answered elsewhere is not a failure; re-read and show it.
+      if (res.status === 409) { await renderChannelSends(); return; }
       if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
       await renderChannelSends();
     } catch (err) { b.disabled = false; alert(`mark answered failed: ${err.message}`); }

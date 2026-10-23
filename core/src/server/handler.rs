@@ -7028,7 +7028,14 @@ async fn tool_channel_send(state: &SharedState, args: &Value) -> ToolResult {
     // 5. THE UNANSWERED BUDGET, counted from the outbox rows of the current clock hour.
     let now = crate::server::gate_escalation::now_secs();
     let (start, resets_at) = window(now);
-    let unanswered = s.inbox_store.channel_unanswered(&member_lct, &binding.channel_id, start)?;
+    // THE SENDER AND ITS ALIASES SHARE ONE BUDGET: a count keyed on one spelling of the member
+    // would give each alias its own three (a name-gate failing open; see member_presence_census).
+    let unanswered: Vec<_> = s
+        .inbox_store
+        .channel_unanswered_on_channel(&binding.channel_id, start)?
+        .into_iter()
+        .filter(|r| r.member == who.plugin_id || s.same_entity(&r.member, &who.plugin_id))
+        .collect();
     let would_deny = unanswered.len() as u32 >= UNANSWERED_LIMIT;
     let budget = json!({
         "limit": UNANSWERED_LIMIT, "window": "1h", "unanswered": unanswered.len(),
@@ -32407,6 +32414,33 @@ mod channel_send_tests {
         let out = send(&state, &being, "dp", "after the restart").await;
         assert_eq!(out["budget"]["unanswered"], UNANSWERED_LIMIT, "{out}");
         assert_eq!(out["budget"]["would_deny"], true);
+    }
+
+    /// Two spellings of one member share ONE budget: the operator's alias record joins them
+    /// (`same_entity`). Keyed on one LCT, each alias would have had its own three (fail-open).
+    #[tokio::test]
+    async fn an_alias_shares_the_members_budget() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        bind(&state, "legion-being-2", "dp").await;
+        {
+            let s = state.lock().await;
+            s.append_chain(crate::derivation::IDENTITY_ALIAS_EVENT,
+                           json!({"alias": "legion-being-2", "alias_of": "legion-being", "ref": "test"}))
+                .unwrap();
+        }
+        let a = connect(&state, "legion-being").await;
+        let b = connect(&state, "legion-being-2").await;
+        send(&state, &a, "dp", "one").await;
+        send(&state, &b, "dp", "two").await;
+        send(&state, &a, "dp", "three").await;
+        let fourth = send(&state, &b, "dp", "four, under the alias").await;
+        assert_eq!(fourth["budget"]["unanswered"], UNANSWERED_LIMIT, "{fourth}");
+        assert_eq!(fourth["budget"]["would_deny"], true, "the alias does not get a fresh budget");
+        // and an unrelated member on the same channel name is not counted
+        bind(&state, "cbp-being", "dp").await;
+        let c = connect(&state, "cbp-being").await;
+        assert_eq!(send(&state, &c, "dp", "mine").await["budget"]["unanswered"], 0);
     }
 
     #[tokio::test]
