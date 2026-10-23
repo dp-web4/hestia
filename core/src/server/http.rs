@@ -1802,6 +1802,9 @@ pub async fn serve_with_callback(
         .route("/api/scope/standing/promote", post(scope_standing_promote))
         .route("/api/scope/standing/recursive", post(scope_standing_recursive))
         .route("/api/scope/standing/reassign", post(scope_standing_reassign))
+        // dp's Edit row (2026-10-22, #1345): path, reach and modes of ONE standing grant,
+        // changed together, bound to the generation the operator saw.
+        .route("/api/scope/standing/edit", post(scope_standing_edit))
         .route("/api/scope/reroot", post(scope_reroot))
         // THE GRANT HALF NOW HAS A ROUTE, REVERSING A DELIBERATE DECISION RECORDED HERE.
         //
@@ -3389,6 +3392,21 @@ impl ScopeDecider {
     }
 }
 
+/// Read an optional `modes` field (#1345): absent = all four, today's meaning; present must be a
+/// non-empty subset of `r w e d`. A malformed value is a 400, never a guess, because guessing
+/// either way would put a grant in the store nobody chose.
+fn modes_arg(body: &serde_json::Value)
+    -> Result<crate::server::grant_modes::Modes, (StatusCode, Json<serde_json::Value>)> {
+    match body.get("modes") {
+        None | Some(serde_json::Value::Null) => Ok(crate::server::grant_modes::Modes::ALL),
+        Some(serde_json::Value::String(m)) => crate::server::grant_modes::Modes::parse(m)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))),
+        Some(_) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "modes must be a string of r, w, e, d (e.g. \"r\" or \"rw\")"
+        })))),
+    }
+}
+
 pub(crate) async fn scope_decide_as(
     state: SharedState,
     body: serde_json::Value,
@@ -3409,6 +3427,11 @@ pub(crate) async fn scope_decide_as(
     // gate refused, once, inside the claim window. Not a grant of reach — never served as
     // policy; only `hestia_scope_claim` spends it, and only for that act.
     let once = body.get("once").and_then(|v| v.as_bool()).unwrap_or(false);
+    // WHAT THE GRANT LETS THE MEMBER DO (#1345), the decider's choice like `recursive`.
+    let modes = match modes_arg(&body) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
     // BREADTH (2026-10-05, #1022's operator half): the path the grant reaches from — the asked
     // path, or an ANCESTOR of it the operator chose (then necessarily recursive: an exact grant
     // on an ancestor does not reach the asked path). Absent = exactly the asked path.
@@ -3458,12 +3481,12 @@ pub(crate) async fn scope_decide_as(
             })),
         );
     }
-    if once && (!granted || standing || recursive || grant_path_arg.is_some()) {
+    if once && (!granted || standing || recursive || grant_path_arg.is_some() || !modes.is_all()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "once:true approves ONE act exactly as it was refused — it is a grant, \
-                          never standing, never recursive, and has no breadth to choose"
+                          never standing, never recursive, and has no breadth or modes to choose"
             })),
         );
     }
@@ -3635,6 +3658,7 @@ pub(crate) async fn scope_decide_as(
             "standing": standing,
             "standing_expires_at": standing_expires_at,
             "recursive": recursive,
+            "modes": modes,
             // 2026-10-05: the duration and breadth the operator chose, and what was asked.
             "once": once,
             "grant_path": reach_path,
@@ -3714,6 +3738,7 @@ pub(crate) async fn scope_decide_as(
             expires_at: standing_expires_at,
             request_id: Some(request_id.clone()),
             recursive,
+            modes,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
             return (
@@ -3809,6 +3834,7 @@ pub(crate) async fn scope_decide_as(
         };
         req.expires_at = expires_at;
         req.recursive = recursive;
+        req.ext.modes = modes;
         req.ext.once = granted && once;
         req.ext.granted_path = (granted && reach_path != path).then(|| reach_path.clone());
     }
@@ -4628,6 +4654,9 @@ fn standing_grant_binding(
             serde_json::json!({
                 "reason": g.reason, "recursive": g.recursive, "granted_by": g.granted_by,
                 "expires_at": g.expires_at, "request_id": g.request_id,
+                // #1345: what the operator was shown includes what the grant lets the member
+                // do, so a row narrowed or widened since the read is refused as moved.
+                "modes": g.modes.as_letters(),
             })
         })
         .unwrap_or(serde_json::Value::Null)
@@ -4640,9 +4669,20 @@ fn grant_binding_of(v: &serde_json::Value) -> serde_json::Value {
         return serde_json::Value::Null;
     }
     let f = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    // A row from a surface that predates #1345 carries no `modes`: every grant it could have
+    // been shown was all-modes, so that is what it saw. Any other spelling is canonicalised, so
+    // "wr" and "rw" bind alike; an unparseable one is kept verbatim and can never match.
+    let modes = match v.get("modes") {
+        None | Some(serde_json::Value::Null) => serde_json::json!("rwed"),
+        Some(serde_json::Value::String(m)) => match crate::server::grant_modes::Modes::parse(m) {
+            Ok(m) => serde_json::json!(m.as_letters()),
+            Err(_) => serde_json::json!(m),
+        },
+        Some(other) => other.clone(),
+    };
     serde_json::json!({
         "reason": f("reason"), "recursive": f("recursive"), "granted_by": f("granted_by"),
-        "expires_at": f("expires_at"), "request_id": f("request_id"),
+        "expires_at": f("expires_at"), "request_id": f("request_id"), "modes": modes,
     })
 }
 
@@ -4704,6 +4744,11 @@ async fn scope_grant(
         .map(|w| now + w);
     // Exact by default; the operator opts into the subtree (dp, 2026-09-08).
     let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    // All four by default, today's meaning; the operator narrows explicitly (#1345).
+    let modes = match modes_arg(&body) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
 
     let mut s = state.lock().await;
     // A GRANT TO A MEMBER NOBODY HAS SEEN IS ALMOST ALWAYS A TYPO, and it fails silently:
@@ -4810,6 +4855,7 @@ async fn scope_grant(
         "request_id": serde_json::Value::Null,
         "origin": "operator_initiated",
         "recursive": recursive,
+        "modes": modes,
         "plugin_id": plugin_id,
         "subject_instance_lct": s.member_lct(&plugin_id),
         "path": path,
@@ -4838,6 +4884,7 @@ async fn scope_grant(
         // None, for the same reason `request_id` is null in the record above.
         request_id: None,
         recursive,
+        modes,
     };
     let (intent_hash, entry_hash) = match s.witness_and_commit_standing_grant(grant, record) {
         Ok(pair) => pair,
@@ -5707,7 +5754,7 @@ async fn scope_standing_promote(
     // add() replaces by (member, path)) instead of answering a no-op.
     if let Some(existing) = s.standing_scope.grants.iter()
         .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e)
-                  && (g.recursive || !live.recursive))
+                  && (g.recursive || !live.recursive) && g.modes.includes(live.ext.modes))
     {
         return (StatusCode::OK, Json(serde_json::json!({
             "status": "already_standing",
@@ -5717,6 +5764,24 @@ async fn scope_standing_promote(
             "granted_at": existing.granted_at,
             "standing_generation": s.standing_scope.generation,
             "note": "this grant is already standing; nothing was appended to the chain",
+        })));
+    }
+    // A STANDING TWIN WITH OTHER MODES (#1345). `add` replaces by (member, path), so promoting
+    // here would rewrite the twin's modes to the live grant's: a twin holding a mode the live
+    // grant lacks would lose it silently, a narrowing nobody chose. Which modes the durable
+    // grant should carry is the operator's call, and Edit makes it explicitly.
+    if let Some(twin) = s.standing_scope.grants.iter()
+        .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e)
+                  && g.modes != live.ext.modes)
+    {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!(
+                "a standing grant on this path already allows {} and this live grant allows {}; \
+                 promoting would replace one with the other. Nothing was written. Edit the \
+                 standing grant instead, choosing its modes explicitly.",
+                twin.modes, live.ext.modes),
+            "standing_modes": twin.modes,
+            "live_modes": live.ext.modes,
         })));
     }
     let reason = {
@@ -5742,6 +5807,7 @@ async fn scope_standing_promote(
         "via": "operator_session",
         "origin": "promoted_from_live",
         "recursive": live.recursive,
+        "modes": live.ext.modes,
         "standing": true,
         "standing_expires_at": expires_at,
         "standing_generation": s.standing_scope.generation + 1,
@@ -5760,6 +5826,8 @@ async fn scope_standing_promote(
         expires_at,
         request_id: Some(live.id.clone()),
         recursive: live.recursive,
+        // Promotion changes how LONG a grant lasts, never what it allows (#1345).
+        modes: live.ext.modes,
     };
     if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -5969,6 +6037,241 @@ async fn scope_standing_recursive(
         "applied_to": {"standing": false, "live": live_id},
         "generation": s.standing_scope.generation,
         "witnessEntryHash": entry.hash,
+    })))
+}
+
+/// Validate an operator-typed grant path for an EDIT (#1345). Stricter than a grant's
+/// `normalize_scope_path`, which resolves `..` lexically: here a `..` is refused rather than
+/// resolved, because the operator approves the path they typed and a before→after summary
+/// showing a path they did not type is the misreading this workflow exists to prevent.
+fn edit_path_arg(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("path must not be empty".into());
+    }
+    if raw.chars().any(|c| c.is_control()) {
+        return Err("path must not contain control characters".into());
+    }
+    if raw.split('/').any(|seg| seg == "..") {
+        return Err(format!("path must not contain '..' (got {raw}); type the path it should be"));
+    }
+    if raw.starts_with(crate::server::gate_escalation::UNPRICEABLE_PREFIX) {
+        return Err("that is an unenumerated-act key, not a path".into());
+    }
+    let path = crate::server::state::normalize_scope_path(raw);
+    crate::server::state::require_absolute_grant_path(&path)?;
+    if path == "/" {
+        return Err("a grant on the filesystem root is not a grant of scope".into());
+    }
+    Ok(path)
+}
+
+/// `POST /api/scope/standing/edit` — dp's Edit row (2026-10-22, #1345):
+/// `{plugin_id, path, new_path?, recursive, modes, reason, expected_generation, expected_existing?}`.
+///
+/// Changes ONE standing grant's path, reach (exact/recursive) and modes (r/w/e/d) as one act,
+/// so a staged edit is saved whole or not at all. The contract dp wrote:
+///   * **no mutation until Save**: this is the Save. Nothing on the page writes before it.
+///   * **bound to what the operator saw**: `expected_generation` is the store generation the
+///     page rendered; any mutation since (another tab, a peer ruling) refuses with 409 and
+///     writes nothing, because the before→after the operator approved was computed against a
+///     store that no longer exists. `expected_existing`, when sent, binds the row itself.
+///   * **identity kept**: the row is rewritten in place (`StandingScopeStore::edit`), so the
+///     old path is never left reachable beside the new one and the grant keeps its provenance.
+///   * **widening is named**: the response and both witness rows carry `widens` and on which
+///     axis, and a widening edit needs a reason, as every other widening here does.
+///   * **reassign stays separate**: there is no `member` field to edit.
+///
+/// A LIVE grant on the same (member, path) is a twin this edit would not move; leaving it would
+/// keep the old path or modes in force, so the edit is refused until it is revoked or lapses.
+///
+/// Order: INTENT → COMMIT → `scope_grant_edited`, with rollback if the terminal append fails,
+/// exactly as `scope_standing_recursive`.
+async fn scope_standing_edit(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::standing_scope::{EditRefused, GrantEdit};
+    let bad = |e: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})));
+    let plugin_id = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if plugin_id.is_empty() || raw_path.is_empty() {
+        return bad("plugin_id and path are required".into());
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let new_path = match body.get("new_path").and_then(|v| v.as_str()) {
+        None => path.clone(),
+        Some(raw) => match edit_path_arg(raw) {
+            Ok(p) => p,
+            Err(e) => return bad(e),
+        },
+    };
+    let Some(recursive) = body.get("recursive").and_then(|v| v.as_bool()) else {
+        return bad("recursive must be explicitly true or false: Save sends the whole row".into());
+    };
+    if body.get("modes").is_none() {
+        return bad("modes is required: Save sends the whole row".into());
+    }
+    let modes = match modes_arg(&body) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let Some(expected_generation) = body.get("expected_generation").and_then(|v| v.as_u64()) else {
+        return bad("expected_generation is required: an edit is bound to the store the operator saw".into());
+    };
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let now = crate::server::gate_escalation::now_secs();
+
+    let mut s = state.lock().await;
+    let Some(before) = s.standing_scope.grants.iter()
+        .find(|g| g.member == plugin_id && g.path == path && g.is_live(now)).cloned()
+    else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "no standing grant of record for that (plugin_id, path)"})));
+    };
+    if s.standing_scope.generation != expected_generation {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "the grants changed since this page read them; nothing was written. \
+                      Review the current row and edit again.",
+            "moved": true,
+            "generation": s.standing_scope.generation,
+        })));
+    }
+    if let Some(expected) = body.get("expected_existing") {
+        let current = standing_grant_binding(&s.standing_scope.grants, &plugin_id, &path, now);
+        if grant_binding_of(expected) != current {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "this grant is not the one you were shown; nothing was written.",
+                "moved": true,
+                "current": current,
+            })));
+        }
+    }
+    let mut after = before.clone();
+    after.path = new_path.clone();
+    after.recursive = recursive;
+    after.modes = modes;
+    if after == before {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "nothing changed; nothing witnessed",
+            "generation": s.standing_scope.generation,
+        })));
+    }
+    // Every refusal the store would make is made HERE, before the intent row: a refused edit
+    // must leave the chain as bit-identical as the store (O).
+    if after.path != before.path
+        && s.standing_scope.grants.iter().any(|g| g.member == plugin_id && g.path == after.path)
+    {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("{plugin_id} already holds a separate grant on {}; revoke one of \
+                              them first, so which reach wins is your explicit call. Nothing \
+                              was written.", after.path),
+        })));
+    }
+    let widens_modes = after.modes.widens(before.modes);
+    let widens_reach = GrantEdit::widens_reach(&before, &after);
+    let widens = widens_modes || widens_reach;
+    if widens && reason.is_empty() {
+        return bad("reason is required: this edit widens what the member can reach or do".into());
+    }
+    if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "an edited grant") {
+        if widens {
+            return refusal;
+        }
+    }
+    if let Some(twin) = s.scope_requests.values()
+        .find(|r| r.plugin_id == plugin_id && r.reach_path() == path && r.is_live(now))
+    {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("a LIVE grant on this path ({}) would stay in force beside the edited \
+                              one; revoke it (or let it lapse) first. Nothing was written.", twin.id),
+            "live_twin": twin.id,
+        })));
+    }
+    let row = |g: &crate::server::standing_scope::StandingGrant| serde_json::json!({
+        "path": g.path, "recursive": g.recursive, "modes": g.modes,
+    });
+    let subject = s.member_lct(&plugin_id);
+    let record = |kind: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "kind": kind,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": subject,
+            "before": row(&before),
+            "after": row(&after),
+            "widens": widens,
+            "widens_on": {"modes": widens_modes, "reach": widens_reach},
+            "reason": reason,
+            "changed_by": "operator",
+            "via": "operator_session",
+            "identity": "the same standing row, rewritten in place: granted_at, granted_by, \
+                         request_id and expires_at are the original grant's",
+        });
+        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in e { o.insert(k.clone(), val.clone()); }
+        }
+        v
+    };
+    let intent = match s.append_chain("scope_grant_edit_intent",
+        record("intent", serde_json::json!({"standing_generation": s.standing_scope.generation + 1}))) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, grant NOT edited: {e}")}))),
+    };
+    let prior = s.standing_scope.clone();
+    let change = GrantEdit { path: new_path.clone(), recursive, modes };
+    let mut refused: Option<EditRefused> = None;
+    if let Err(e) = s.commit_standing_scope(|st| {
+        if let Err(r) = st.edit(&plugin_id, &path, expected_generation, change) {
+            refused = Some(r);
+        }
+    }) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("grant NOT edited — vault write failed ({e}); the live store is \
+                              untouched (the candidate was persisted first). Retry."),
+            "state": "the chain holds the INTENT and no scope_grant_edited",
+            "intentEntryHash": intent.hash,
+        })));
+    }
+    if let Some(r) = refused {
+        // Unreachable under the lock (every refusal was checked above). If the store disagrees
+        // it wins: its refusal left the candidate unchanged, so what was persisted is the
+        // store as it was.
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("the store refused the edit ({r:?}); nothing changed"),
+            "intentEntryHash": intent.hash,
+        })));
+    }
+    let success = match s.append_chain("scope_grant_edited",
+        record("terminal", serde_json::json!({
+            "standing_generation": s.standing_scope.generation, "intent": intent.hash}))) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("grant NOT edited — the terminal record failed ({e}); rolled \
+                                      back (live store and vault), the chain holds only the \
+                                      intent. Retry."),
+                    "intentEntryHash": intent.hash,
+                }))),
+                Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("THE EDIT IS LIVE but its terminal record could not be \
+                                      appended ({e}) AND the rollback failed ({rb}). Repair the \
+                                      chain — do not assume the store is consistent."),
+                    "intentEntryHash": intent.hash,
+                }))),
+            };
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "plugin_id": plugin_id,
+        "before": row(&before),
+        "after": row(&after),
+        "widens": widens,
+        "widens_on": {"modes": widens_modes, "reach": widens_reach},
+        "generation": s.standing_scope.generation,
+        "witnessEntryHash": success.hash,
     })))
 }
 
@@ -8810,6 +9113,7 @@ mod disposition_tests {
         let g = crate::server::standing_scope::StandingGrant {
             member: "m".into(), path: "/p".into(), granted_at: 1, granted_by: "operator".into(),
             reason: "r".into(), expires_at: None, request_id: None, recursive: false,
+            modes: crate::server::grant_modes::Modes::ALL,
         };
         assert_eq!(grant_binding_of(&row), standing_grant_binding(&[g.clone()], "m", "/p", 10));
         let expired = crate::server::standing_scope::StandingGrant { expires_at: Some(5), ..g };
@@ -10446,6 +10750,7 @@ mod disposition_tests {
             member: "kimi-code".into(), path: "/y/tree".into(), granted_at: now,
             granted_by: "operator".into(), reason: "r".into(), expires_at: None,
             request_id: None, recursive: false,
+            modes: crate::server::grant_modes::Modes::ALL,
         })).unwrap();
         let rows = s.dashboard_snapshot(20).scope_grants;
         let tree: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/tree").collect();
@@ -10501,6 +10806,7 @@ mod disposition_tests {
                 member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
             assert!(s.has_scope_grant("kimi-code", "/w/tree"));
             assert!(!s.has_scope_grant("kimi-code", "/w/tree/child.py"), "EXACT by default");
@@ -10550,6 +10856,7 @@ mod disposition_tests {
                 member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
         let (gen0, chain0) = { let s = state.lock().await; (s.standing_scope.generation, s.recent_chain(50).len()) };
@@ -10574,6 +10881,7 @@ mod disposition_tests {
                 member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
         let (before_grants, before_gen) = {
@@ -10606,6 +10914,7 @@ mod disposition_tests {
                 member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
         let gen0 = state.lock().await.standing_scope.generation;
@@ -10636,6 +10945,7 @@ mod disposition_tests {
             member: member.into(), path: path.into(), granted_at: now,
             granted_by: "operator".into(), reason: "r".into(), expires_at: None,
             request_id: None, recursive,
+            modes: crate::server::grant_modes::Modes::ALL,
         })).unwrap();
     }
 
@@ -11373,6 +11683,135 @@ mod disposition_tests {
         (s.standing_scope.grants.clone(), s.standing_scope.generation, s.recent_chain(50).len())
     }
 
+    async fn edit(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = scope_standing_edit(State(state.clone()), Json(body)).await.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// dp's Edit contract (2026-10-22, #1345): Save changes path, reach and modes in one act,
+    /// bound to the generation the page saw; the old path is not left live; the receipt names
+    /// before, after, widening and the operator.
+    #[tokio::test]
+    async fn edit_saves_path_reach_and_modes_as_one_witnessed_act() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "nomad-being").await;
+        assert_eq!(grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/gov", "reason": "read the law", "recursive": true})).await.0, StatusCode::OK);
+        let gen = state.lock().await.standing_scope.generation;
+
+        // NARROW: rwed recursive -> r recursive. No reason needed.
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "nomad-being", "path": "/w/gov",
+            "recursive": true, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!((out["widens"].clone(), out["before"]["modes"].clone(), out["after"]["modes"].clone()),
+                   (serde_json::json!(false), serde_json::json!("rwed"), serde_json::json!("r")));
+        {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.generation, gen + 1);
+            let chain = s.recent_chain(5);
+            let kinds: Vec<&str> = chain.iter().map(|e| e.event_type.as_str()).collect();
+            assert!(kinds.contains(&"scope_grant_edit_intent") && kinds.contains(&"scope_grant_edited"), "{kinds:?}");
+        }
+
+        // PATH + WIDEN: a sibling path widens, so a reason is required.
+        let gen = state.lock().await.standing_scope.generation;
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "nomad-being", "path": "/w/gov",
+            "new_path": "/w/forum", "recursive": true, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "a widening edit with no reason went through: {out}");
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "nomad-being", "path": "/w/gov",
+            "new_path": "/w/forum", "recursive": true, "modes": "rw", "reason": "post to the forum",
+            "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["widens_on"], serde_json::json!({"modes": true, "reach": true}));
+        let s = state.lock().await;
+        let mine: Vec<_> = s.standing_scope.grants.iter().filter(|g| g.member == "nomad-being").collect();
+        assert_eq!(mine.len(), 1, "the old path stayed live beside the new one");
+        assert_eq!((mine[0].path.as_str(), mine[0].modes.as_letters()), ("/w/forum", "rw".to_string()));
+        assert_eq!(mine[0].reason, "read the law", "the row keeps its provenance");
+    }
+
+    /// Every refusal leaves the store and the chain bit-identical (O).
+    #[tokio::test]
+    async fn an_edit_that_is_refused_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "nomad-being").await;
+        assert_eq!(grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/a", "reason": "r"})).await.0, StatusCode::OK);
+        assert_eq!(grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/b", "reason": "r"})).await.0, StatusCode::OK);
+        let gen = state.lock().await.standing_scope.generation;
+        let before = snapshot(&*state.lock().await);
+        let base = serde_json::json!({"plugin_id": "nomad-being", "path": "/w/a",
+            "recursive": false, "modes": "r", "expected_generation": gen});
+        let with = |k: &str, v: serde_json::Value| { let mut b = base.clone(); b[k] = v; b };
+        let cases = [
+            ("stale generation", with("expected_generation", serde_json::json!(gen - 1)), StatusCode::CONFLICT),
+            ("no generation", { let mut b = base.clone(); b.as_object_mut().unwrap().remove("expected_generation"); b }, StatusCode::BAD_REQUEST),
+            ("no modes", { let mut b = base.clone(); b.as_object_mut().unwrap().remove("modes"); b }, StatusCode::BAD_REQUEST),
+            ("empty modes", with("modes", serde_json::json!("")), StatusCode::BAD_REQUEST),
+            ("unknown mode", with("modes", serde_json::json!("rx")), StatusCode::BAD_REQUEST),
+            ("dot-dot path", with("new_path", serde_json::json!("/w/a/../../etc")), StatusCode::BAD_REQUEST),
+            ("relative path", with("new_path", serde_json::json!("w/a")), StatusCode::BAD_REQUEST),
+            ("root", with("new_path", serde_json::json!("/")), StatusCode::BAD_REQUEST),
+            ("collides", { let mut b = with("new_path", serde_json::json!("/w/b")); b["modes"] = serde_json::json!("rwed"); b["reason"] = serde_json::json!("move it"); b }, StatusCode::CONFLICT),
+            ("nothing changed", with("modes", serde_json::json!("rwed")), StatusCode::CONFLICT),
+            ("no such grant", with("path", serde_json::json!("/w/zz")), StatusCode::NOT_FOUND),
+            ("row moved", with("expected_existing", serde_json::json!({"reason": "other", "recursive": false,
+                "granted_by": "operator", "expires_at": null, "request_id": null})), StatusCode::CONFLICT),
+        ];
+        for (name, body, want) in cases {
+            let (st, out) = edit(&state, body).await;
+            assert_eq!(st, want, "{name}: {out}");
+            assert_eq!(snapshot(&*state.lock().await), before, "{name}: a refused edit wrote something");
+        }
+    }
+
+    /// A live twin on the edited path would keep the old reach in force; the edit says so.
+    #[tokio::test]
+    async fn an_edit_with_a_live_twin_is_refused() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "nomad-being").await;
+        assert_eq!(grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/a", "reason": "r"})).await.0, StatusCode::OK);
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-twin".into(), crate::server::state::ScopeRequest {
+                id: "scope-twin".into(), plugin_id: "nomad-being".into(), role: String::new(),
+                path: "/w/a".into(), reason: "twin".into(), requested_at: now, expires_at: now + 600,
+                granted: Some(true), decided_by: Some("operator".into()), decided_at: Some(now),
+                decision_reason: None, recursive: false, revoked: None, ext: Default::default(),
+            });
+        }
+        let gen = state.lock().await.standing_scope.generation;
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "nomad-being", "path": "/w/a",
+            "recursive": false, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{out}");
+        assert_eq!(out["live_twin"], "scope-twin");
+    }
+
+    /// The direct grant and the decide path accept modes; once refuses them.
+    #[tokio::test]
+    async fn grants_carry_the_modes_they_were_given() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "nomad-being").await;
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/gov", "reason": "the law", "recursive": true, "modes": "r"})).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/x", "reason": "bad", "modes": "q"})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let s = state.lock().await;
+        let g = s.standing_scope.grants.iter().find(|g| g.path == "/w/gov").unwrap();
+        assert_eq!(g.modes, crate::server::grant_modes::Modes::READ);
+        assert!(!s.has_scope_grant("nomad-being", "/w/gov/law.rs"),
+                "a read-only grant answered an all-modes question");
+        assert!(s.has_scope_grant_for("nomad-being", "/w/gov/law.rs",
+                crate::server::grant_modes::Modes::READ));
+    }
+
     /// GPT's hold on #1006: reassign is ONE act. A recursive source arrives recursive, the
     /// source row is gone in the same commit, the generation moves once, and the terminal
     /// record carries the intent's hash and the generation the commit actually produced.
@@ -11552,6 +11991,7 @@ mod disposition_tests {
                 member: "claude-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
         let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({

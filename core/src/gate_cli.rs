@@ -382,7 +382,8 @@ pub fn scope_pending(endpoint: &str, asserted_id: Option<String>, role: &str, js
 /// peer rules a gate-opened scope request (dp, 2026-10-05). The daemon resolves the seat from
 /// this session and refuses the asker, an unproven asker's request, and an unrecognised seat.
 pub fn scope_peer_decide(endpoint: &str, as_member: &str, request_id: &str, decision: &str,
-                         grant_path: Option<String>, recursive: bool, reason: &str) -> Result<()> {
+                         grant_path: Option<String>, recursive: bool, modes: Option<String>,
+                         reason: &str) -> Result<()> {
     let mut m = Mcp::connect(endpoint)?;
     let (sid, who) = open_session(&mut m, as_member, "role:constellation:member")?;
     banner(&who);
@@ -390,6 +391,9 @@ pub fn scope_peer_decide(endpoint: &str, as_member: &str, request_id: &str, deci
                           "reason": reason, "recursive": recursive});
     if let Some(gp) = grant_path {
         args["grant_path"] = json!(gp);
+    }
+    if let Some(md) = modes {
+        args["modes"] = json!(md);
     }
     let r = m.tool("hestia_scope_peer_decide", args)?;
     println!("{}", serde_json::to_string_pretty(&r).context("encoding the ruling")?);

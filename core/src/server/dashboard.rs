@@ -1853,6 +1853,8 @@ impl ServerState {
                             "expires_at": r.expires_at,
                             "secs_remaining": r.expires_at.saturating_sub(now),
                             "recursive": r.recursive,
+                            // r / w / e / d, canonical letters (#1345).
+                            "modes": r.ext.modes,
                             "durability": "memory-only — the next daemon restart revokes this",
                         })
                     })
@@ -1867,10 +1869,16 @@ impl ServerState {
                     let member = row["plugin_id"].as_str().unwrap_or("");
                     let path = row["path"].as_str().unwrap_or("");
                     let live_recursive = row["recursive"].as_bool().unwrap_or(false);
+                    // A live row is superseded only by a standing row that allows at least
+                    // what it allows: a read-only standing twin must not hide a live rw grant.
+                    let live_modes = row["modes"].as_str()
+                        .and_then(|m| crate::server::grant_modes::Modes::parse(m).ok())
+                        .unwrap_or_default();
                     !self.standing_scope.grants.iter().any(|g| {
                         g.member == member && g.path == path
                             && g.expires_at.is_none_or(|e| now < e)
                             && (g.recursive || !live_recursive)
+                            && g.modes.includes(live_modes)
                     })
                 });
                 v.extend(self.standing_scope.grants.iter()
@@ -1885,6 +1893,7 @@ impl ServerState {
                             "granted_by": g.granted_by,
                             "request_id": g.request_id,
                             "recursive": g.recursive,
+                            "modes": g.modes,
                             // A peer's standing grant shows its NOT-SAME basis while the request
                             // it answered is still in memory (the chain row keeps it for good).
                             "peer_basis": g.request_id.as_ref()
