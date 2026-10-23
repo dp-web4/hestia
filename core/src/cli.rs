@@ -146,6 +146,21 @@ enum Command {
         key: PathBuf,
     },
 
+    /// Channel sends (#1344, shadow): bind a member's channel, list the outbox, and mark a
+    /// send answered. Operator-signed, like `member`.
+    Channel {
+        #[command(subcommand)]
+        cmd: ChannelCmd,
+
+        /// Daemon URL
+        #[arg(long, default_value = "http://127.0.0.1:7711", global = true)]
+        endpoint: String,
+
+        /// Operator credential file (JSON `{lct_id, secret_key_hex}`), as for `member`.
+        #[arg(long, global = true, env = "HESTIA_OPERATOR_KEY")]
+        key: PathBuf,
+    },
+
     /// Governance-surface escalations — the remedy every gate deny already names.
     ///
     /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
@@ -242,6 +257,40 @@ enum GateCmd {
         /// evidence)
         #[arg(long)]
         argument: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ChannelCmd {
+    /// Mark one outbox row answered: the bound recipient replied, so it no longer counts
+    /// against the member's unanswered budget (#1344 decision c). Once only.
+    Answer {
+        /// The outbox id (from `hestia channel outbox` or the dashboard)
+        outbox_id: u64,
+    },
+    /// Bind (or rebind) where a member's sends to a channel go.
+    Bind {
+        /// The member (plugin id), e.g. legion-being
+        member: String,
+        /// The channel name the member asks for, e.g. dp
+        channel_id: String,
+        /// The recipient class the gate rules on, e.g. operator
+        #[arg(long)]
+        recipient_class: String,
+        /// Where the adapter delivers (never shown to the member)
+        #[arg(long)]
+        address: String,
+        /// The adapter that will carry it
+        #[arg(long, default_value = "email")]
+        adapter: String,
+        /// WHY: required, it is on the witnessed record
+        #[arg(long)]
+        reason: String,
+    },
+    /// List the outbox, newest first.
+    Outbox {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
     },
 }
 
@@ -1151,6 +1200,14 @@ pub fn run() -> AnyResult<()> {
                 }
             }
         }
+        Command::Channel { cmd, endpoint, key } => match cmd {
+            ChannelCmd::Answer { outbox_id } => hestia::member_cli::channel_answer(&endpoint, &key, outbox_id),
+            ChannelCmd::Bind { member, channel_id, recipient_class, address, adapter, reason } => {
+                hestia::member_cli::channel_bind(&endpoint, &key, &member, &channel_id, &recipient_class,
+                                                 &adapter, &address, &reason)
+            }
+            ChannelCmd::Outbox { limit } => hestia::member_cli::channel_outbox(&endpoint, &key, limit),
+        },
         Command::Member { cmd, endpoint, key } => match cmd {
             MemberCmd::Retire { plugin_id, reason, r#ref, confirm_active } => {
                 hestia::member_cli::retire(&endpoint, &key, &plugin_id, &reason, &r#ref, confirm_active)

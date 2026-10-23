@@ -601,6 +601,9 @@ pub struct ServerState {
     /// and where the answer belongs. Operator-written through `commit_transport_bindings`,
     /// vault-persisted, read by `member_notify` at enqueue and by the egress plane.
     pub transport_bindings: crate::server::transport_binding::TransportBindingStore,
+    /// Channel bindings (#1344): where each member's `hestia_channel_send` to a channel goes.
+    /// Operator-written through `commit_channel_bindings`, vault-persisted.
+    pub channel_bindings: crate::server::channel::ChannelBindingStore,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -953,6 +956,13 @@ impl ServerState {
                  acts under carriers nobody bound",
             )?
         };
+        let channel_bindings: crate::server::channel::ChannelBindingStore = {
+            use anyhow::Context;
+            crate::vault::load_doc(&vault, "channel", "bindings", "channel-bindings.json").context(
+                "channel-binding store unreadable: failing closed rather than sending members' \
+                 messages to recipients nobody bound",
+            )?
+        };
         let standing_doc_present = vault.get_document("scope", "standing").is_some();
         let standing_scope: crate::server::standing_scope::StandingScopeStore = {
             use anyhow::Context;
@@ -1027,6 +1037,7 @@ impl ServerState {
             publication_version: 0,
             published_lists_gen: u64::MAX,
             transport_bindings,
+            channel_bindings,
             law_gate: crate::server::published::Watched::new(law_gate.map(Arc::new)),
             synthetic_plugins,
             home: home.to_path_buf(),
@@ -1426,6 +1437,19 @@ impl ServerState {
         let out = mutate(&mut candidate);
         crate::vault::save_doc(&mut self.vault, "transport", "bindings", "transport-bindings.json", &candidate)?;
         self.transport_bindings = candidate;
+        Ok(out)
+    }
+
+    /// Mutate the channel-binding store through a candidate persisted BEFORE it becomes live
+    /// (the `commit_transport_bindings` construction).
+    pub fn commit_channel_bindings<F, R>(&mut self, mutate: F) -> Result<R>
+    where
+        F: FnOnce(&mut crate::server::channel::ChannelBindingStore) -> R,
+    {
+        let mut candidate = self.channel_bindings.clone();
+        let out = mutate(&mut candidate);
+        crate::vault::save_doc(&mut self.vault, "channel", "bindings", "channel-bindings.json", &candidate)?;
+        self.channel_bindings = candidate;
         Ok(out)
     }
 

@@ -128,6 +128,22 @@ impl OperatorSession {
         })
     }
 
+    fn get(&self, path: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .with_context(|| format!("GET {path}"))?;
+        let status = resp.status();
+        let answer: serde_json::Value = resp.json().unwrap_or(json!(null));
+        if !status.is_success() {
+            let why = answer["error"].as_str().unwrap_or("(no error text)");
+            bail!("the daemon refused ({status}): {why}");
+        }
+        Ok(answer)
+    }
+
     fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let resp = self
             .client
@@ -250,4 +266,62 @@ mod tests {
             )
             .is_ok());
     }
+}
+
+
+/// `hestia channel answer <outbox_id>` (#1344): the bound recipient replied, so this send no
+/// longer counts against the member's unanswered budget. Once only; the daemon witnesses it.
+pub fn channel_answer(endpoint: &str, key_path: &Path, outbox_id: u64) -> Result<()> {
+    let session = OperatorSession::open(endpoint, key_path)?;
+    let answer = session.post(&format!("/api/channel/outbox/{outbox_id}/answer"), json!({}))?;
+    println!(
+        "outbox #{outbox_id} marked answered (operator session as {}; witness {})",
+        session.operator,
+        answer["witnessEntryHash"].as_str().unwrap_or("?"),
+    );
+    Ok(())
+}
+
+/// `hestia channel bind <member> <channel_id> --recipient-class C --address A --reason R`:
+/// where a member's sends to `channel_id` go. The member never sees the address.
+pub fn channel_bind(endpoint: &str, key_path: &Path, member: &str, channel_id: &str,
+                    recipient_class: &str, adapter: &str, address: &str, reason: &str) -> Result<()> {
+    let session = OperatorSession::open(endpoint, key_path)?;
+    let answer = session.post("/api/channel/binding", json!({
+        "member": member, "channel_id": channel_id, "recipient_class": recipient_class,
+        "adapter": adapter, "address": address, "reason": reason,
+    }))?;
+    println!(
+        "bound '{member}' channel '{channel_id}' -> target {} (version {}, witness {})",
+        answer["target"].as_str().unwrap_or("?"),
+        answer["version"],
+        answer["witnessEntryHash"].as_str().unwrap_or("?"),
+    );
+    Ok(())
+}
+
+/// `hestia channel outbox [--limit N]`: every member's channel sends, newest first (shadow:
+/// none of them left the machine), with what is still unanswered.
+pub fn channel_outbox(endpoint: &str, key_path: &Path, limit: u32) -> Result<()> {
+    let session = OperatorSession::open(endpoint, key_path)?;
+    let answer = session.get(&format!("/api/channel/outbox?limit={limit}"))?;
+    let rows = answer["outbox"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        println!("the channel outbox is empty");
+    }
+    for r in rows {
+        let state = if r["would_deny"].as_bool() == Some(true) {
+            "would-deny".to_string()
+        } else if r["answered_at"].is_null() {
+            "UNANSWERED".to_string()
+        } else {
+            format!("answered by {}", r["answered_by"].as_str().unwrap_or("?"))
+        };
+        let content = r["content"].as_str().unwrap_or("");
+        let head: String = content.chars().take(80).collect();
+        println!("#{:<5} {:<20} {:<12} {:<18} {}{}", r["id"], r["member"].as_str().unwrap_or("?"),
+                 r["channel_id"].as_str().unwrap_or("?"), state, head,
+                 if content.chars().count() > 80 { "…" } else { "" });
+    }
+    Ok(())
 }

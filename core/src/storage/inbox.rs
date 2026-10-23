@@ -3156,6 +3156,162 @@ impl SqliteInboxStore {
 }
 
 
+/// One channel-send in the outbox (#1344). The outbox is a table of the SQLCipher inbox, so a
+/// row is sealed at rest under the daemon's storage key like every other inbox row: a member's
+/// message is private-record material.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ChannelOutboxRow {
+    pub id: u64,
+    pub member: String,
+    pub member_lct: String,
+    pub channel_id: String,
+    pub recipient_class: String,
+    pub binding_version: u64,
+    pub content: String,
+    pub content_sha256: String,
+    /// Epoch seconds the send arrived.
+    pub created: u64,
+    /// The budget refused it (shadow: it is recorded, and it would not have been sent).
+    pub would_deny: bool,
+    pub answered_at: Option<u64>,
+    pub answered_by: Option<String>,
+    pub chain_hash: String,
+}
+
+/// The fields of a new outbox row (`channel_outbox_insert`).
+pub struct NewChannelOutbox<'a> {
+    pub member: &'a str,
+    pub member_lct: &'a str,
+    pub channel_id: &'a str,
+    pub recipient_class: &'a str,
+    pub binding_version: u64,
+    pub content: &'a str,
+    pub content_sha256: &'a str,
+    pub created: u64,
+    pub would_deny: bool,
+    pub chain_hash: &'a str,
+}
+
+const CHANNEL_OUTBOX_COLS: &str = "id, member, member_lct, channel_id, recipient_class, binding_version, \
+     content, content_sha256, created, would_deny, answered_at, answered_by, chain_hash";
+
+impl SqliteInboxStore {
+    fn ensure_channel_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_outbox (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                member           TEXT NOT NULL,
+                member_lct       TEXT NOT NULL,
+                channel_id       TEXT NOT NULL,
+                recipient_class  TEXT NOT NULL,
+                binding_version  INTEGER NOT NULL,
+                content          TEXT NOT NULL,
+                content_sha256   TEXT NOT NULL,
+                created          INTEGER NOT NULL,
+                would_deny       INTEGER NOT NULL,
+                answered_at      INTEGER,
+                answered_by      TEXT,
+                chain_hash       TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_channel_outbox_budget
+                 ON channel_outbox(member_lct, channel_id, created);",
+        )
+        .context("initializing channel_outbox schema")?;
+        Ok(())
+    }
+
+    fn channel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelOutboxRow> {
+        Ok(ChannelOutboxRow {
+            id: row.get::<_, i64>(0)? as u64,
+            member: row.get(1)?,
+            member_lct: row.get(2)?,
+            channel_id: row.get(3)?,
+            recipient_class: row.get(4)?,
+            binding_version: row.get::<_, i64>(5)? as u64,
+            content: row.get(6)?,
+            content_sha256: row.get(7)?,
+            created: row.get::<_, i64>(8)? as u64,
+            would_deny: row.get::<_, i64>(9)? != 0,
+            answered_at: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+            answered_by: row.get(11)?,
+            chain_hash: row.get(12)?,
+        })
+    }
+
+    /// Record one send. The row names its chain row, so the barrier runs first.
+    pub fn channel_outbox_insert(&self, r: &NewChannelOutbox<'_>) -> Result<u64> {
+        let conn = self.write_conn()?;
+        Self::ensure_channel_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO channel_outbox (member, member_lct, channel_id, recipient_class, \
+             binding_version, content, content_sha256, created, would_deny, chain_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![r.member, r.member_lct, r.channel_id, r.recipient_class, r.binding_version as i64,
+                    r.content, r.content_sha256, r.created as i64, r.would_deny as i64, r.chain_hash],
+        )
+        .context("recording channel send")?;
+        Ok(conn.last_insert_rowid() as u64)
+    }
+
+    /// The member's UNANSWERED sends on a channel since `since` (epoch seconds), oldest first:
+    /// the budget's count. A row the budget refused is not counted: it was never sent.
+    pub fn channel_unanswered(&self, member_lct: &str, channel_id: &str, since: u64) -> Result<Vec<ChannelOutboxRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_channel_schema(&conn)?;
+        let mut st = conn.prepare(&format!(
+            "SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox WHERE member_lct = ?1 AND channel_id = ?2 \
+             AND created >= ?3 AND answered_at IS NULL AND would_deny = 0 ORDER BY id"))?;
+        let rows = st.query_map(params![member_lct, channel_id, since as i64], Self::channel_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One outbox row by id.
+    pub fn channel_outbox_get(&self, id: u64) -> Result<Option<ChannelOutboxRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_channel_schema(&conn)?;
+        conn.query_row(&format!("SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox WHERE id = ?1"),
+                       params![id as i64], Self::channel_row)
+            .optional()
+            .context("reading channel outbox row")
+    }
+
+    /// Rows newest first: one member's (`member` = Some, its own only), or all (operator).
+    pub fn channel_outbox_list(&self, member: Option<&str>, limit: u32) -> Result<Vec<ChannelOutboxRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_channel_schema(&conn)?;
+        let limit = limit.clamp(1, 500) as i64;
+        let rows = match member {
+            Some(m) => {
+                let mut st = conn.prepare(&format!(
+                    "SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox WHERE member = ?1 ORDER BY id DESC LIMIT ?2"))?;
+                let v = st.query_map(params![m, limit], Self::channel_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            }
+            None => {
+                let mut st = conn.prepare(&format!(
+                    "SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox ORDER BY id DESC LIMIT ?1"))?;
+                let v = st.query_map(params![limit], Self::channel_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Mark a row answered. False when there is no such row or it was already answered: an
+    /// answer is recorded once, never moved.
+    pub fn channel_mark_answered(&self, id: u64, by: &str, at: u64) -> Result<bool> {
+        let conn = self.write_conn()?;
+        Self::ensure_channel_schema(&conn)?;
+        let n = conn.execute(
+            "UPDATE channel_outbox SET answered_at = ?1, answered_by = ?2 WHERE id = ?3 AND answered_at IS NULL",
+            params![at as i64, by, id as i64],
+        )
+        .context("marking channel send answered")?;
+        Ok(n == 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

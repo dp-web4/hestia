@@ -129,6 +129,8 @@ impl ServerHandler for HestiaServer {
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
             "hestia_egress_pending" => tool_egress_pending(&self.state, &args).await,
             "hestia_transport_binding" => tool_transport_binding(&self.state, &args).await,
+            "hestia_channel_send" => tool_channel_send(&self.state, &args).await,
+            "hestia_channel_outbox" => tool_channel_outbox(&self.state, &args).await,
             "hestia_member_unanswered" => tool_member_unanswered(&self.state, &args).await,
             "hestia_inbox" => tool_inbox(&self.state, &args).await,
             "hestia_pair_inbox" => tool_pair_inbox(&self.state, &args).await,
@@ -295,6 +297,7 @@ pub(crate) fn reports_shared_state(name: &str) -> bool {
     matches!(
         name,
         "hestia_gate_escalation_poll"
+            | "hestia_channel_outbox"
             | "hestia_gate_escalation_lookup"
             | "hestia_gate_escalation_claimable"
             | "hestia_gate_pending_escalations"
@@ -649,6 +652,36 @@ fn hestia_tools() -> Vec<Tool> {
                         "type": "string",
                         "description": "Your own live session_id from hestia_connect. Attribution is never inherited: an unattributable sender cannot notify another member."
                     }
+                }
+            }),
+        ),
+        t_args(
+            "hestia_channel_send",
+            "SHADOW (#1344): ask to send a message to a channel the operator bound for you (e.g. \
+             'dp'). Nothing leaves this machine yet: the send is judged, witnessed and kept in your \
+             outbox, and the reply says what would have happened. The recipient is the operator's \
+             binding, never yours to choose. A message naming a credential or secret path is \
+             refused. At most 3 unanswered messages per channel per clock hour; the reply names \
+             them and when the count resets.",
+            json!({
+                "type": "object",
+                "required": ["channel_id", "content"],
+                "properties": {
+                    "channel_id": {"type": "string", "description": "REQUIRED. The bound channel's name, e.g. dp. hestia_channel_outbox lists yours."},
+                    "content": {"type": "string", "minLength": 1, "maxLength": 8000, "description": "REQUIRED. The message, plain text."},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."}
+                }
+            }),
+        ),
+        t_args(
+            "hestia_channel_outbox",
+            "Your own channel sends (#1344), newest first, with whether each was answered, and the \
+             channels bound for you. You see only your own messages.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."}
                 }
             }),
         ),
@@ -2459,6 +2492,11 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "reversal",
     "appeal",
     "adjudication",
+    // #1344: daemon-written only; a member must not forge a send or its failure record.
+    "channel_send",
+    "channel_send_unrecorded",
+    "channel_answer",
+    "channel_binding_set",
 ];
 
 /// Reversal kinds — the operational shape of a reversal, distinct from the
@@ -6909,6 +6947,179 @@ async fn tool_transport_binding(state: &SharedState, args: &Value) -> ToolResult
         );
     }
     Ok(out)
+}
+
+/// `hestia_channel_send` (#1344, slice 1, SHADOW): a member's message to a channel the operator
+/// bound for it. Judged and recorded exactly as it would be enforced; NOTHING LEAVES THE MACHINE.
+/// The order is the contract (`server::channel`): attribute, binding, gate on the binding's
+/// target, innate secret sweep, unanswered budget, record (chain row, then outbox row).
+async fn tool_channel_send(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::channel::{forbidden_token, window, MAX_CONTENT_CHARS, UNANSWERED_LIMIT};
+    let channel_id = require_string(args, "channel_id")?.trim().to_string();
+    let content = require_string(args, "content")?;
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unattributed",
+            "hestia_channel_send requires your own live session_id (from hestia_connect): a message \
+             is sent as the member who asked, so the member must be known",
+            None,
+        ));
+    };
+    let Some(member_lct) = s.member_lct(&who.plugin_id) else {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unattributed",
+            "this member has no member LCT, so its sends cannot be counted against it; nothing \
+             was recorded",
+            None,
+        ));
+    };
+    // 2. THE BINDING. The recipient is the operator's choice, never the member's.
+    let Some(binding) = s.channel_bindings.get(&who.plugin_id, &channel_id).cloned() else {
+        let bound: Vec<String> =
+            s.channel_bindings.for_member(&who.plugin_id).iter().map(|b| b.channel_id.clone()).collect();
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unbound",
+            &if bound.is_empty() {
+                format!("no channel '{channel_id}' is bound for you, and you have no bound channels \
+                         yet. A channel is bound by the operator; nothing was sent or recorded.")
+            } else {
+                format!("no channel '{channel_id}' is bound for you. Your bound channels: {}. \
+                         Nothing was sent or recorded.", bound.join(", "))
+            },
+            Some(json!({"bound_channels": bound})),
+        ));
+    };
+    // 3. THE GATE, on the target built from the binding alone.
+    let target = binding.target();
+    if let Some(denied) = gate_direct_tool(&mut s, &who, "hestia_channel_send", "channel_egress", &target) {
+        return Ok(denied);
+    }
+    let chars = content.chars().count();
+    if chars == 0 || chars > MAX_CONTENT_CHARS {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_content_size",
+            &format!("a message is 1 to {MAX_CONTENT_CHARS} characters; this one is {chars}. Nothing \
+                      was sent or recorded."),
+            None,
+        ));
+    }
+    let base = json!({
+        "member": who.plugin_id, "member_lct": member_lct, "role_lct": who.role_lct,
+        "session_id": who.session_uuid, "channel_id": binding.channel_id,
+        "recipient_class": binding.recipient_class, "target": target,
+        "binding_version": binding.version, "shadow": true,
+    });
+    // 4. THE INNATE SECRET SWEEP. The deny and its rule are recorded; the content is not, and
+    // neither is its hash (#1344 amendment: no content_sha256 on a secret-denied row).
+    if let Some(tok) = forbidden_token(&content) {
+        let mut row = base.clone();
+        row["decision"] = json!("deny");
+        row["rule"] = json!("egress.secret");
+        row["innate"] = json!(true);
+        let entry = s.append_chain("channel_send", row)?;
+        return Ok(hestia_error_envelope(
+            "hestia.channel_secret",
+            &format!("not sent: the message names '{tok}', a credential or secret path, and that \
+                      never leaves this machine. The refusal is recorded; the message is not."),
+            Some(json!({"rule": "egress.secret", "witnessEntryHash": entry.hash})),
+        ));
+    }
+    // 5. THE UNANSWERED BUDGET, counted from the outbox rows of the current clock hour.
+    let now = crate::server::gate_escalation::now_secs();
+    let (start, resets_at) = window(now);
+    let unanswered = s.inbox_store.channel_unanswered(&member_lct, &binding.channel_id, start)?;
+    let would_deny = unanswered.len() as u32 >= UNANSWERED_LIMIT;
+    let budget = json!({
+        "limit": UNANSWERED_LIMIT, "window": "1h", "unanswered": unanswered.len(),
+        "would_deny": would_deny, "window_resets_at": resets_at,
+        "unanswered_ids": unanswered.iter().map(|r| r.id).collect::<Vec<_>>(),
+    });
+    let sha = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(content.as_bytes()))
+    };
+    // 6. RECORD: the chain row first (the outbox row names it), then the outbox row.
+    let mut row = base.clone();
+    row["decision"] = json!(if would_deny { "would_deny" } else { "would_send" });
+    row["rule"] = json!(if would_deny { "channel.unanswered_budget" } else { "" });
+    row["content_sha256"] = json!(sha);
+    row["content_chars"] = json!(chars);
+    row["budget"] = budget.clone();
+    row["arrived_at"] = json!(now);
+    let entry = s.append_chain("channel_send", row)?;
+    let outbox_id = match s.inbox_store.channel_outbox_insert(&crate::storage::inbox::NewChannelOutbox {
+        member: &who.plugin_id, member_lct: &member_lct, channel_id: &binding.channel_id,
+        recipient_class: &binding.recipient_class, binding_version: binding.version,
+        content: &content, content_sha256: &sha, created: now, would_deny, chain_hash: &entry.hash,
+    }) {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = s.append_chain("channel_send_unrecorded", json!({
+                "channel_send": entry.hash, "member": who.plugin_id, "error": e.to_string(),
+            }));
+            return Ok(hestia_error_envelope(
+                "hestia.channel_unrecorded",
+                "the send was witnessed but its outbox row could not be written, so it is not \
+                 counted and would not be delivered. The failure is recorded; this is the \
+                 operator's to repair, not yours.",
+                Some(json!({"witnessEntryHash": entry.hash})),
+            ));
+        }
+    };
+    let at = |t: u64| {
+        chrono::DateTime::from_timestamp(t as i64, 0)
+            .map(|d| d.format("%H:%M UTC").to_string())
+            .unwrap_or_else(|| t.to_string())
+    };
+    let note = if would_deny {
+        format!(
+            "Shadow: nothing left this machine. Once sends are enforced this one would NOT go: you \
+             have {} unanswered messages on '{}' this hour ({}), and the limit is {UNANSWERED_LIMIT}. \
+             It is kept in your outbox as outbox #{outbox_id}. The count resets at {}, or as soon as \
+             one of them is answered.",
+            unanswered.len(), binding.channel_id,
+            unanswered.iter().map(|r| format!("#{} at {}", r.id, at(r.created))).collect::<Vec<_>>().join(", "),
+            at(resets_at),
+        )
+    } else {
+        format!(
+            "Shadow: nothing left this machine. Once sends are enforced this would go to '{}' ({}). \
+             It is in your outbox as #{outbox_id}. Unanswered on this channel this hour, counting \
+             it: {} of {UNANSWERED_LIMIT}.",
+            binding.channel_id, binding.recipient_class, unanswered.len() + 1,
+        )
+    };
+    Ok(json!({
+        "shadow": true, "sent": false, "outbox_id": outbox_id,
+        "channel_id": binding.channel_id, "recipient_class": binding.recipient_class,
+        "decision": if would_deny { "would_deny" } else { "would_send" },
+        "budget": budget, "witnessEntryHash": entry.hash, "note": note,
+    }))
+}
+
+/// `hestia_channel_outbox` (#1344): the caller's OWN outbox rows, newest first, and its bound
+/// channels (without their addresses: who a message reaches is the operator's). A member reads
+/// its own rows only.
+async fn tool_channel_outbox(state: &SharedState, args: &Value) -> ToolResult {
+    let s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unattributed",
+            "hestia_channel_outbox requires your own live session_id (from hestia_connect): it \
+             shows the asking member's own messages, so the member must be known",
+            None,
+        ));
+    };
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20).min(100) as u32;
+    let rows = s.inbox_store.channel_outbox_list(Some(&who.plugin_id), limit)?;
+    let channels: Vec<Value> = s
+        .channel_bindings
+        .for_member(&who.plugin_id)
+        .iter()
+        .map(|b| json!({"channel_id": b.channel_id, "recipient_class": b.recipient_class, "adapter": b.adapter}))
+        .collect();
+    Ok(json!({"member": who.plugin_id, "channels": channels, "outbox": rows, "shadow": true}))
 }
 
 /// Retire an egress row that has exhausted its attempts, and pay what it owes.
@@ -31993,5 +32204,240 @@ mod query_policy_off_lock_tests {
                 reason: "test".into(), expires_at: None });
         }
         check("operator grant").await;
+    }
+}
+
+#[cfg(test)]
+mod channel_send_tests {
+    //! #1344 slice 1 acceptance: the order is the contract, nothing leaves, the budget is
+    //! derived from outbox rows (so it survives a restart), and a member sees only its own.
+    use super::*;
+    use crate::server::channel::{ChannelBinding, UNANSWERED_LIMIT};
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState, plugin: &str) -> String {
+        let c = tool_connect(state, &json!({"plugin_id": plugin, "host_agent": "t"})).await.unwrap();
+        c["sessionId"].as_str().unwrap().to_string()
+    }
+
+    async fn bind(state: &SharedState, member: &str, channel: &str) {
+        let mut s = state.lock().await;
+        s.commit_channel_bindings(|st| {
+            st.set(ChannelBinding {
+                member: member.into(), channel_id: channel.into(), recipient_class: "operator".into(),
+                adapter: "email".into(), address: "operator@example.invalid".into(),
+                reason: "test".into(), set_by: "operator".into(), set_at: 1, version: 0,
+            })
+        })
+        .unwrap();
+    }
+
+    async fn send(state: &SharedState, sid: &str, channel: &str, content: &str) -> Value {
+        tool_channel_send(state, &json!({"channel_id": channel, "content": content, "session_id": sid}))
+            .await
+            .unwrap()
+    }
+
+    async fn events(state: &SharedState, kind: &str) -> Vec<Value> {
+        let s = state.lock().await;
+        s.recent_chain(500).into_iter().filter(|e| e.event_type == kind).map(|e| e.event_data).collect()
+    }
+
+    async fn outbox_len(state: &SharedState) -> usize {
+        let s = state.lock().await;
+        s.inbox_store.channel_outbox_list(None, 500).unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn an_unattributed_send_is_refused_and_records_nothing() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let out = tool_channel_send(&state, &json!({"channel_id": "dp", "content": "hi"})).await.unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_unattributed", "{out}");
+        assert!(events(&state, "channel_send").await.is_empty());
+        assert_eq!(outbox_len(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unbound_channel_is_refused_and_names_the_bound_ones() {
+        let (_d, state) = test_state().await;
+        let being = connect(&state, "legion-being").await;
+        let out = send(&state, &being, "dp", "hi").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_unbound", "{out}");
+        bind(&state, "legion-being", "dp").await;
+        let out = send(&state, &being, "elsewhere", "hi").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_unbound");
+        assert_eq!(out["_hestia_error"]["data"]["bound_channels"], json!(["dp"]));
+        assert!(events(&state, "channel_send").await.is_empty());
+        assert_eq!(outbox_len(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_send_is_shadow_witnessed_and_kept_and_nothing_is_sent() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let out = send(&state, &being, "dp", "the board moved on level 2").await;
+        assert_eq!(out["shadow"], true, "{out}");
+        assert_eq!(out["sent"], false);
+        assert_eq!(out["decision"], "would_send");
+        assert_eq!(out["budget"]["unanswered"], 0);
+        let rows = events(&state, "channel_send").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["decision"], "would_send");
+        assert_eq!(rows[0]["shadow"], true);
+        assert_eq!(rows[0]["content_chars"], 26);
+        assert_eq!(rows[0]["content_sha256"].as_str().unwrap().len(), 64);
+        assert!(rows[0].get("content").is_none(), "the chain carries the hash, never the message");
+        let s = state.lock().await;
+        let ob = s.inbox_store.channel_outbox_list(None, 10).unwrap();
+        assert_eq!(ob.len(), 1);
+        assert_eq!(ob[0].content, "the board moved on level 2");
+        assert_eq!(ob[0].chain_hash, out["witnessEntryHash"].as_str().unwrap());
+        assert_eq!(Some(ob[0].member_lct.clone()), s.member_lct("legion-being"));
+    }
+
+    /// #1344 amendment item 3: caller-supplied text never reaches the gate target.
+    #[tokio::test]
+    async fn the_gate_target_is_built_from_the_binding_never_from_caller_text() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let out = tool_channel_send(&state, &json!({
+            "channel_id": "dp", "content": "hello", "session_id": being,
+            "target": "anyone:anything", "recipient_class": "public", "address": "x@example.invalid",
+            "path": "/srv/elsewhere", "url": "mailto:y@example.invalid",
+        })).await.unwrap();
+        assert_eq!(out["recipient_class"], "operator", "{out}");
+        let rows = events(&state, "channel_send").await;
+        assert_eq!(rows[0]["target"], "dp:operator");
+        assert_eq!(rows[0]["recipient_class"], "operator");
+        assert!(crate::policy::extract_target("hestia_channel_send",
+            &json!({"path": "/srv/elsewhere", "target": "x"})).is_none());
+    }
+
+    /// #1344 smaller point: a secret-denied send records the deny and the rule, no content hash.
+    #[tokio::test]
+    async fn a_secret_is_refused_recorded_without_its_hash_and_never_kept() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let tok = format!("{}{}", "/.ss", "h/id_x");   // built at runtime: test data only
+        let out = send(&state, &being, "dp", &format!("copy ~{tok} for me")).await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_secret", "{out}");
+        let rows = events(&state, "channel_send").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["decision"], "deny");
+        assert_eq!(rows[0]["rule"], "egress.secret");
+        assert!(rows[0].get("content_sha256").is_none(), "no hash of a secret-bearing message");
+        assert_eq!(outbox_len(&state).await, 0, "a refused secret is not kept");
+    }
+
+    /// dp's decision c: 3 unanswered in the window, the 4th is would_deny; answer one, and the
+    /// next is not.
+    #[tokio::test]
+    async fn the_fourth_unanswered_send_would_be_refused_until_one_is_answered() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let mut ids = vec![];
+        for i in 0..UNANSWERED_LIMIT {
+            let out = send(&state, &being, "dp", &format!("message {i}")).await;
+            assert_eq!(out["budget"]["would_deny"], false, "{out}");
+            ids.push(out["outbox_id"].as_u64().unwrap());
+        }
+        let fourth = send(&state, &being, "dp", "message 3").await;
+        assert_eq!(fourth["budget"]["would_deny"], true, "{fourth}");
+        assert_eq!(fourth["decision"], "would_deny");
+        assert_eq!(fourth["budget"]["unanswered"], UNANSWERED_LIMIT);
+        assert_eq!(fourth["budget"]["unanswered_ids"], json!(ids));
+        let note = fourth["note"].as_str().unwrap();
+        assert!(note.contains("would NOT go") && note.contains("resets at"), "{note}");
+        let fifth = send(&state, &being, "dp", "message 4").await;
+        assert_eq!(fifth["budget"]["unanswered"], UNANSWERED_LIMIT, "a would-deny row is not counted");
+        {
+            let s = state.lock().await;
+            assert!(s.inbox_store.channel_mark_answered(ids[0], "operator", 1).unwrap());
+            assert!(!s.inbox_store.channel_mark_answered(ids[0], "operator", 2).unwrap(), "answered once");
+        }
+        let next = send(&state, &being, "dp", "message 5").await;
+        assert_eq!(next["budget"]["would_deny"], false, "{next}");
+        assert_eq!(next["budget"]["unanswered"], UNANSWERED_LIMIT - 1);
+    }
+
+    /// The budget is per channel: a full one does not block another.
+    #[tokio::test]
+    async fn the_budget_is_per_channel() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        bind(&state, "legion-being", "ops").await;
+        let being = connect(&state, "legion-being").await;
+        for i in 0..UNANSWERED_LIMIT {
+            send(&state, &being, "dp", &format!("m{i}")).await;
+        }
+        assert_eq!(send(&state, &being, "dp", "x").await["budget"]["would_deny"], true);
+        assert_eq!(send(&state, &being, "ops", "x").await["budget"]["would_deny"], false);
+    }
+
+    /// Amendment item 5 / decision c: the count is derived from outbox rows, so a restart
+    /// forgets nothing.
+    #[tokio::test]
+    async fn the_unanswered_count_survives_a_daemon_restart() {
+        let dir = TempDir::new().unwrap();
+        {
+            let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            bind(&state, "legion-being", "dp").await;
+            let being = connect(&state, "legion-being").await;
+            for i in 0..UNANSWERED_LIMIT {
+                send(&state, &being, "dp", &format!("m{i}")).await;
+            }
+        }
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let being = connect(&state, "legion-being").await;
+        let out = send(&state, &being, "dp", "after the restart").await;
+        assert_eq!(out["budget"]["unanswered"], UNANSWERED_LIMIT, "{out}");
+        assert_eq!(out["budget"]["would_deny"], true);
+    }
+
+    #[tokio::test]
+    async fn a_member_reads_only_its_own_outbox_and_never_an_address() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        bind(&state, "cbp-being", "dp").await;
+        let legion = connect(&state, "legion-being").await;
+        let cbp = connect(&state, "cbp-being").await;
+        send(&state, &legion, "dp", "from legion").await;
+        send(&state, &cbp, "dp", "from cbp").await;
+        let mine = tool_channel_outbox(&state, &json!({"session_id": legion})).await.unwrap();
+        let rows = mine["outbox"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{mine}");
+        assert_eq!(rows[0]["content"], "from legion");
+        assert!(!mine.to_string().contains("example.invalid"), "the recipient address is the operator's");
+        let anon = tool_channel_outbox(&state, &json!({})).await.unwrap();
+        assert_eq!(anon["_hestia_error"]["code"], "hestia.channel_unattributed");
+    }
+
+    #[tokio::test]
+    async fn a_member_cannot_forge_a_channel_send_row() {
+        let (_d, state) = test_state().await;
+        let being = connect(&state, "legion-being").await;
+        let out = tool_request_witness(&state, &json!({"event_type": "channel_send", "data": {},
+                                                       "session_id": being})).await;
+        let refused = match out {
+            Err(_) => true,
+            Ok(v) => v.get("_hestia_error").is_some() || v.get("witnessEntryHash").is_none(),
+        };
+        assert!(refused, "channel_send is daemon-written only");
+        assert!(events(&state, "channel_send").await.is_empty());
     }
 }
