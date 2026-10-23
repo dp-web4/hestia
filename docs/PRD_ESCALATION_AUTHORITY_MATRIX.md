@@ -142,6 +142,8 @@ human approval -> wait for required independent peer factor(s) -> terminal
 
 This supports the inverse of today's common ordering. For some act kinds, the operator may decide quickly but law intentionally requires subsequent corroboration before the act becomes executable.
 
+Not built today (re-checked 2026-10-14): the shipped `Bar::SovereignPlusPeer` is not this pattern. In `core/src/server/gate_escalation.rs` (`bar_met_over`) it is met by the sovereign factor alone, and the peer factor is invited and recorded as evidence only (dp ruling 2026-08-06).
+
 ### D. Peer permitted immediately, human always available
 
 For lower-stakes kinds, law may permit a qualified peer to resolve during the human-live window while still surfacing the ask to the human. This MUST be explicit per kind/context; it is not the default implied by "sort by availability."
