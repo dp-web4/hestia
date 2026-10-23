@@ -170,6 +170,14 @@ def command_targets(registration, wanted):
     def walk(value):
         if isinstance(value, dict):
             if "command" in value:
+                require(set(value) <= {"command", "type", "timeout", "statusMessage"},
+                        "unsupported registration command fields")
+                if "timeout" in value:
+                    require(type(value["timeout"]) is int and value["timeout"] > 0,
+                            "unsupported registration timeout metadata")
+                if "statusMessage" in value:
+                    require(isinstance(value["statusMessage"], str),
+                            "unsupported registration status metadata")
                 commands.append(value["command"])
             if "type" in value:
                 require(value["type"] == "command" and "command" in value,
@@ -186,7 +194,11 @@ def command_targets(registration, wanted):
     for command in commands:
         match = pattern.fullmatch(command) if isinstance(command, str) else None
         if match:
-            path = relative(match["path"])
+            try:
+                path = relative(match["path"])
+            except CandidateError:
+                unresolved.append(command)
+                continue
             if path in wanted:
                 targets.add(path)
                 continue
