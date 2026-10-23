@@ -24028,6 +24028,26 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         })))
         .collect();
 
+    // THE FLOOR AS THIS MEMBER'S GATE MAY ENFORCE IT (dp, 2026-10-23: "'floor' should not
+    // override the actual grants"). A mode-blind gate unions `society_floor` with the member's
+    // grants, so an all-modes floor entry overlapping one of the member's NARROWED grants is
+    // withheld from it, and named; see StandingScopeStore::floor_for.
+    let narrowed: Vec<(String, bool, crate::server::grant_modes::Modes)> = live_all
+        .iter()
+        .filter(|r| !r.ext.modes.is_all())
+        .map(|r| (r.reach_path().to_string(), r.recursive, r.ext.modes))
+        .chain(standing_all.iter().filter(|g| !g.modes.is_all())
+               .map(|g| (g.path.clone(), g.recursive, g.modes)))
+        .collect();
+    let floor_view = s.standing_scope.floor_for(&narrowed);
+    let floor_row = |f: &crate::server::standing_scope::FloorEntry| json!({
+        "path": f.path,
+        "recursive": f.recursive,
+        "added_at": f.added_at,
+        "added_by": f.added_by,
+        "reason": f.reason,
+    });
+
     Ok(json!({
         "plugin_id": plugin_id,
         "requests": requests,
@@ -24077,17 +24097,33 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // applies only to members whose gate remembered to ask — which is per-seat law again,
         // wearing the word "uniform".
         //
-        // Member-independent by construction: this list does not depend on `plugin_id`, so
-        // two members comparing their snapshots see the same floor or the daemon is lying.
-        "society_floor": s.standing_scope.floor
-            .iter()
-            .map(|f| json!({
-                "path": f.path,
-                "added_at": f.added_at,
-                "added_by": f.added_by,
-                "reason": f.reason,
-            }))
+        // ALL-MODES floor entries this member's gate may enforce as reach. The same for every
+        // member except where one of the member's own narrowed grants overlaps an entry:
+        // that entry is withheld from that member (below), because the floor does not
+        // override a member's grant. `floor_by_mode` and `society_floor_digest` stay
+        // member-independent, so two members can still prove they received the same floor.
+        "society_floor": floor_view.reach.iter().map(|f| floor_row(f)).collect::<Vec<_>>(),
+        // NARROWED floor entries that include read, under their own key ON PURPOSE (dp,
+        // 2026-10-19: "the governed see the law"). A gate that predates this key must not see
+        // them as `society_floor` entries: it would map them to all-modes grants. Served
+        // apart, an old gate ignores them and admits nothing, and a gate that knows the key
+        // admits them for read acts only.
+        "society_floor_read": floor_view.read.iter().map(|f| floor_row(f)).collect::<Vec<_>>(),
+        // Floor entries this member's gate is NOT served, each with why: nothing is dropped
+        // silently, and a member that finds a floor path refused can read the reason here.
+        "society_floor_withheld": floor_view.withheld.iter()
+            .map(|w| json!({"path": w.path, "why": w.why}))
             .collect::<Vec<_>>(),
+        // EVERY floor entry with its modes (#1345's `grants_by_mode` for the floor), for the
+        // gate that enforces modes (part B) and for the dashboard.
+        "floor_by_mode": s.standing_scope.floor.iter().map(|f| json!({
+            "path": f.path,
+            "recursive": f.recursive,
+            "modes": f.modes,
+            "added_at": f.added_at,
+            "added_by": f.added_by,
+            "reason": f.reason,
+        })).collect::<Vec<_>>(),
         // Canonical over the path set, not presentation order or provenance. Combined with
         // `generation`, this lets two members prove they received the same society baseline
         // without learning anything about one another's personal expansions.
@@ -26818,6 +26854,7 @@ mod standing_scope_surface_tests {
                 added_at: now,
                 added_by: "operator".into(),
                 reason: "public workspace".into(),
+                ..Default::default()
             });
             s.standing_scope
                 .add(standing("kimi-code", "/w/kimi-only", now, None));
@@ -26837,6 +26874,82 @@ mod standing_scope_surface_tests {
         assert_eq!(kimi["standing_grants"].as_array().map(Vec::len), Some(1));
         assert_eq!(kimi["society_floor"][0]["path"], "/w/shared");
         assert_eq!(kimi["society_floor_digest"].as_str().map(str::len), Some(64));
+    }
+
+    /// dp, 2026-10-19 ("the governed see the law"): a READ-ONLY floor entry is served only under
+    /// `society_floor_read`. Under `society_floor` a gate that predates the key would map it to
+    /// an all-modes grant; apart, that gate ignores it and admits nothing. `floor_by_mode`
+    /// carries every entry with its modes.
+    #[tokio::test]
+    async fn a_read_only_floor_entry_is_served_apart_from_reach() {
+        let (_d, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/shared".into(),
+                recursive: true,
+                ..Default::default()
+            });
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/governance/hestia".into(),
+                recursive: true,
+                modes: crate::server::grant_modes::Modes::READ,
+                reason: "the governed see the law".into(),
+                ..Default::default()
+            });
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "cbp-being"}))
+            .await
+            .unwrap();
+        let reach: Vec<&str> = out["society_floor"].as_array().unwrap().iter()
+            .map(|f| f["path"].as_str().unwrap()).collect();
+        let read: Vec<&str> = out["society_floor_read"].as_array().unwrap().iter()
+            .map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(reach, vec!["/w/shared"]);
+        assert_eq!(read, vec!["/w/governance/hestia"]);
+        assert_eq!(out["society_floor"][0]["recursive"], true);
+        assert_eq!(out["society_floor_read"][0]["recursive"], true);
+        let by_mode = out["floor_by_mode"].as_array().unwrap();
+        assert_eq!(by_mode.len(), 2);
+        assert!(by_mode.iter().any(|f| f["path"] == "/w/governance/hestia" && f["modes"] == "r"));
+        assert!(by_mode.iter().any(|f| f["path"] == "/w/shared" && f["modes"] == "rwed"));
+        assert_eq!(out["society_floor_withheld"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// dp, 2026-10-23: "'floor' should not override the actual grants." A member whose own
+    /// grant under a floor path is narrowed is NOT served that all-modes floor entry as reach
+    /// (a mode-blind gate would union it over the narrowing); it is named as withheld. A
+    /// member without such a grant is served the entry as before, and the member-independent
+    /// digest and `floor_by_mode` stay identical for both.
+    #[tokio::test]
+    async fn an_all_modes_floor_entry_is_withheld_from_a_member_whose_own_grant_narrows_it() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/shared".into(),
+                recursive: true,
+                ..Default::default()
+            });
+            let mut g = standing("kimi-code", "/w/shared/law", now, None);
+            g.recursive = true;
+            g.modes = crate::server::grant_modes::Modes::READ;
+            s.standing_scope.add(g);
+        }
+        let kimi = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        let codex = tool_scope_status(&state, &json!({"plugin_id": "codex"})).await.unwrap();
+        assert_eq!(kimi["society_floor"].as_array().map(Vec::len), Some(0));
+        let withheld = kimi["society_floor_withheld"].as_array().unwrap();
+        assert_eq!(withheld.len(), 1);
+        assert_eq!(withheld[0]["path"], "/w/shared");
+        assert!(withheld[0]["why"].as_str().unwrap().contains("/w/shared/law"));
+        assert_eq!(codex["society_floor"][0]["path"], "/w/shared");
+        assert_eq!(kimi["society_floor_digest"], codex["society_floor_digest"]);
+        assert_eq!(kimi["floor_by_mode"], codex["floor_by_mode"]);
+        // kimi's narrowed grant itself stays out of the mode-blind lists (#1370) and in
+        // grants_by_mode, so nothing in kimi's snapshot reads as write reach over /w/shared/law.
+        assert_eq!(kimi["standing_grants"].as_array().map(Vec::len), Some(0));
     }
 
     /// (#407) The operating-law projection carries the scope_grants — live AND standing —
@@ -26948,6 +27061,7 @@ mod standing_scope_surface_tests {
                     added_at: now,
                     added_by: "operator".into(),
                     reason: "society baseline".into(),
+                    ..Default::default()
                 });
             })
             .unwrap();
@@ -27076,6 +27190,7 @@ mod standing_scope_surface_tests {
                 added_at: now,
                 added_by: "operator".into(),
                 reason: "baseline".into(),
+                ..Default::default()
             });
             st
         };

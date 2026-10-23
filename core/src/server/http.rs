@@ -4961,7 +4961,11 @@ async fn scope_grant(
     )
 }
 
-/// `POST /api/scope/floor` {path, reason} — add a path to THE SOCIETY FLOOR.
+/// `POST /api/scope/floor` {path, reason, recursive?, modes?, expected_generation?} — add a path
+/// to THE SOCIETY FLOOR, or replace its entry (keyed by path). `modes` is r/w/e/d as on a grant
+/// (#1345), all four when absent; `expected_generation` makes it the dashboard's Edit Save:
+/// a store that moved since is refused (409), and so is a Save that changes nothing. The
+/// witness records the entry before and after and whether the change widens.
 ///
 /// dp, 2026-08-16: *"law has to be applied uniformly to ALL. that is the only way the law is
 /// trusted."* This is the surface that makes that structural rather than aspirational: one
@@ -5194,6 +5198,22 @@ async fn scope_floor_add(
 ) -> impl IntoResponse {
     let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    // Both default to the pre-existing meaning (exact, all), so a caller that sends neither
+    // gets exactly the entry it got before these fields existed.
+    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    // The same r/w/e/d modes a grant carries (#1345); all four when absent.
+    let modes = match body.get("modes").and_then(|v| v.as_str()) {
+        None => crate::server::grant_modes::Modes::ALL,
+        Some(raw) => match crate::server::grant_modes::Modes::parse(raw) {
+            Ok(m) => m,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})));
+            }
+        },
+    };
+    // An EDIT from the dashboard names the generation it was staged against; a store that has
+    // moved since gets 409 and nothing is written, as /api/scope/standing/edit does (#1370).
+    let expected_generation = body.get("expected_generation").and_then(|v| v.as_u64());
     if raw_path.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -5222,7 +5242,36 @@ async fn scope_floor_add(
     let now = crate::server::gate_escalation::now_secs();
 
     let mut s = state.lock().await;
-    let replaces = s.standing_scope.floor_allows(&path);
+    if let Some(g) = expected_generation {
+        if g != s.standing_scope.generation {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("the scope store moved since this edit was staged (generation \
+                                      {g}, now {}); nothing was written. Reload and stage it again",
+                                     s.standing_scope.generation),
+                })),
+            );
+        }
+    }
+    let before = s.standing_scope.floor.iter().find(|f| f.path == path).cloned();
+    let replaces = before.is_some();
+    // What this change adds: a mode, or exact made recursive. A new entry widens by definition.
+    let widens = match &before {
+        None => true,
+        Some(b) => modes.widens(b.modes) || (recursive && !b.recursive),
+    };
+    // Save with nothing changed is not a mutation (an Edit only; a plain re-add still replaces).
+    if expected_generation.is_some()
+        && before.as_ref().is_some_and(|b| b.modes == modes && b.recursive == recursive) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "that floor entry already has exactly this reach and these modes; \
+                          nothing was written",
+            })),
+        );
+    }
     let members_affected = s.member_registry.len();
 
     // ORDER: WITNESS, THEN WIDEN — and the intent/success split, for the same reason the
@@ -5233,13 +5282,21 @@ async fn scope_floor_add(
         serde_json::json!({
             "path": path,
             "path_as_asked": raw_path,
+            "recursive": recursive,
+            "modes": modes,
+            "before": before.as_ref().map(|b| serde_json::json!({
+                "recursive": b.recursive, "modes": b.modes, "reason": b.reason,
+            })),
+            "widens": widens,
             "reason": reason,
             "added_by": "operator",
             "via": "operator_session",
             "replaces_existing": replaces,
             "members_in_registry": members_affected,
             "scope": "SOCIETY — every member of this society, present and future",
-            "semantics": "additive only: effective(m) = society_floor ∪ member(m)",
+            "semantics": "a member's own grant decides where it reaches; the floor applies \
+                          where none of the member's grants does (PRD_ALLOWLISTS AC-1, amended \
+                          2026-10-23)",
         }),
     ) {
         Ok(e) => e,
@@ -5259,6 +5316,8 @@ async fn scope_floor_add(
         added_at: now,
         added_by: "operator".to_string(),
         reason: reason.clone(),
+        recursive,
+        modes,
     };
     // The terminal success witness is part of finality. Preserve the exact prior store so
     // a failed terminal append can restore both memory and vault, including a predecessor
@@ -5280,6 +5339,7 @@ async fn scope_floor_add(
         "society_floor_added",
         serde_json::json!({
             "path": path, "reason": reason, "added_by": "operator",
+            "recursive": recursive, "modes": modes, "widens": widens,
             "intent": entry.hash, "standing_generation": generation,
         }),
     ) {
@@ -5318,8 +5378,10 @@ async fn scope_floor_add(
             "generation": generation,
             "replaced_existing": replaces,
             "applies_to": "every member of this society, including any that connect later",
-            "note": "additive only — a member's own grants can widen beyond this, never narrow \
-                     below it",
+            "modes": modes,
+            "widens": widens,
+            "note": "a member's own grant decides wherever it reaches; this entry applies only \
+                     where none of a member's grants does",
             // The terminal fact, not the intent. This is the record that says the floor is
             // durably in force and is the only correct pointer for downstream consumers.
             "witnessEntryHash": success.hash,
@@ -12882,6 +12944,7 @@ mod disposition_tests {
                     added_at: 1,
                     added_by: "operator".into(),
                     reason: "predecessor".into(),
+                    ..Default::default()
                 })
             })
             .unwrap();
@@ -12940,6 +13003,64 @@ mod disposition_tests {
         assert_eq!(s.standing_scope.floor[0].reason, "common working surface");
     }
 
+    /// The floor's Edit Save (dp, 2026-10-23: "we want granularity and edit"): modes as on a
+    /// grant, a stale staging refused with nothing written, a Save that changes nothing
+    /// refused, and the witness recording before/after and whether it widens.
+    #[tokio::test]
+    async fn a_floor_edit_saves_modes_refuses_stale_and_empty_saves_and_names_widening() {
+        let (_dir, state) = test_state().await;
+        let post = |state: &SharedState, body: serde_json::Value| {
+            let state = state.clone();
+            async move { scope_floor_add(State(state), Json(body)).await.into_response() }
+        };
+        let resp = post(&state, serde_json::json!({
+            "path": "/x/law", "reason": "the governed see the law", "recursive": true, "modes": "r",
+        })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let gen = {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.floor[0].modes,
+                       crate::server::grant_modes::Modes::READ);
+            assert!(!s.standing_scope.floor_allows("/x/law/a.py"), "read-only is not reach");
+            s.standing_scope.generation
+        };
+        // A bad mode is refused before anything is witnessed.
+        let resp = post(&state, serde_json::json!({"path": "/x/law", "reason": "r", "modes": "rx"})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Stale staging: 409, nothing written.
+        let resp = post(&state, serde_json::json!({
+            "path": "/x/law", "reason": "widen", "recursive": true, "modes": "rw",
+            "expected_generation": gen + 7,
+        })).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        // A Save that changes nothing: 409.
+        let resp = post(&state, serde_json::json!({
+            "path": "/x/law", "reason": "same", "recursive": true, "modes": "r",
+            "expected_generation": gen,
+        })).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.generation, gen, "no refused Save moved the store");
+        }
+        // A real widening Save lands and the witness says it widens, with the before state.
+        let resp = post(&state, serde_json::json!({
+            "path": "/x/law", "reason": "let members write the law", "recursive": true,
+            "modes": "rw", "expected_generation": gen,
+        })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.floor.len(), 1, "replaced by path, never forked");
+        assert_eq!(s.standing_scope.floor[0].modes.as_letters(), "rw");
+        // recent_chain is newest first: the first intent found is this Save's.
+        let intent = s.recent_chain(20).into_iter()
+            .find(|e| e.event_type == "society_floor_intent").unwrap();
+        let body = &intent.event_data;
+        assert_eq!(body["widens"], true, "{body}");
+        assert_eq!(body["before"]["modes"], "r", "{body}");
+        assert_eq!(body["modes"], "rw", "{body}");
+    }
+
     /// #490 NOT-SAME: a vault failure cannot leave a terminal removal claim for a path
     /// that restart resurrects. The candidate persist fails before live memory changes;
     /// the chain therefore contains only an intent, and restart reloads the unchanged floor.
@@ -12954,6 +13075,7 @@ mod disposition_tests {
                     added_at: 1,
                     added_by: "operator".into(),
                     reason: "restart invariant".into(),
+                    ..Default::default()
                 })
             })
             .unwrap();
@@ -13018,6 +13140,7 @@ mod disposition_tests {
                     added_at: 1,
                     added_by: "operator".into(),
                     reason: "terminal invariant".into(),
+                    ..Default::default()
                 })
             })
             .unwrap();

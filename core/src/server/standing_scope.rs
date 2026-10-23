@@ -159,11 +159,14 @@ pub struct StandingScopeStore {
     /// per-member grants, so it is per-machine because the vault is, and editing it is an
     /// operator act rather than a release. Nothing in the binary names a path.
     ///
-    /// **Additive only** — `effective(m) = floor ∪ member(m)` (`PRD_ALLOWLISTS` AC-1). The
-    /// floor is a written MINIMUM, never a ceiling and never a subtraction: a member's own
-    /// grants can only widen what the floor already allows. That direction is what makes it
-    /// safe to apply to everyone at once — no member can be made *worse* off by a floor edit
-    /// than by having no floor at all.
+    /// **The member's own grant first, the floor for the rest** (`PRD_ALLOWLISTS` AC-1, as
+    /// amended 2026-10-23). Where a member's own grant reaches, its modes decide; the floor
+    /// applies only where no grant of the member's does (`effective_modes`). dp: *"'floor'
+    /// should not override the actual grants."* Before modes this was the union
+    /// `floor ∪ member(m)`, and the two readings agreed, because every grant and every floor
+    /// entry meant all modes. With modes a union would let one society-wide entry undo an
+    /// operator's narrowing of one member's grant. A floor edit still never narrows a member
+    /// below its own grants.
     ///
     /// **Why a floor rather than granting each member the same list**: uniformity has to be
     /// structural or it decays. Per-member copies of one list drift the moment somebody is
@@ -280,7 +283,7 @@ pub enum EditRefused {
 /// It carries its own provenance for the same reason a standing grant does — a widening whose
 /// rationale is not recorded is indistinguishable afterwards from a misconfiguration, and this
 /// one is wider than any single grant because it binds every seat at once.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FloorEntry {
     /// Normalised absolute path (see `state::normalize_scope_path`).
     pub path: String,
@@ -289,6 +292,73 @@ pub struct FloorEntry {
     pub added_by: String,
     #[serde(default)]
     pub reason: String,
+    /// The subtree as well as the path itself, by the same `covers_path` rule a standing grant
+    /// uses. Absent on entries written before this field existed, which read as exact — the
+    /// narrower meaning, so no stored floor widens on upgrade.
+    #[serde(default)]
+    pub recursive: bool,
+    /// What the entry lets a member DO there: the same r/w/e/d `Modes` a grant carries (#1345),
+    /// so the floor and a member's grants speak one language. ALL BY DEFAULT and written
+    /// without the field when all, so every floor entry stored before this existed loads and
+    /// digests exactly as it did. dp's 2026-10-19 "the governed see the law" is one entry with
+    /// modes `r` on the governance snapshot. (#1347's first cut had its own `access: all|read`;
+    /// dp, 2026-10-23: "we want granularity and edit", one mode model for grants and floor.)
+    #[serde(default, skip_serializing_if = "crate::server::grant_modes::is_all")]
+    pub modes: crate::server::grant_modes::Modes,
+}
+
+impl FloorEntry {
+    /// Does this entry reach `path`, by its own rule? Says nothing about mode.
+    pub fn covers(&self, path: &str) -> bool {
+        covers_path(&self.path, self.recursive, path)
+    }
+
+    /// The reach-bearing spelling, keyed by the digests and the divergence report.
+    ///
+    /// LEGACY (exact, all modes): exactly the path, so a floor written before
+    /// `recursive`/`modes` existed digests byte-identically after the upgrade.
+    ///
+    /// ANY OTHER entry: `\x1f<len>:<path>\x1f<exact|recursive>\x1f<modes>`. It cannot collide
+    /// with a legacy spelling, because an admitted floor path is absolute and starts with `/`,
+    /// never `\x1f`; and two such spellings cannot collide with each other, because the length
+    /// prefix fixes where the path ends whatever characters it contains. (The first cut
+    /// appended ` (read)` to the path, which made read-only `/w/law` and an all-access path
+    /// literally named `/w/law (read)` one string: Codex HOLD on #1347, P2.)
+    pub fn spelling(&self) -> String {
+        if !self.recursive && self.modes.is_all() {
+            return self.path.clone();
+        }
+        format!(
+            "\u{1f}{}:{}\u{1f}{}\u{1f}{}",
+            self.path.len(),
+            self.path,
+            if self.recursive { "recursive" } else { "exact" },
+            self.modes.as_letters()
+        )
+    }
+
+    /// Do this entry and a grant on `path` (with `recursive`) reach any path in common?
+    pub fn overlaps(&self, path: &str, recursive: bool) -> bool {
+        self.covers(path) || covers_path(path, recursive, &self.path)
+    }
+}
+
+/// Why one floor entry is not served to one member's mode-blind gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FloorWithheld {
+    pub path: String,
+    pub why: String,
+}
+
+/// The floor as one member's gate may enforce it today (`StandingScopeStore::floor_for`).
+#[derive(Debug, Clone, Default)]
+pub struct FloorForMember<'a> {
+    /// All-modes entries: served as reach (`society_floor`).
+    pub reach: Vec<&'a FloorEntry>,
+    /// Narrowed entries that include read: served for read acts only (`society_floor_read`).
+    pub read: Vec<&'a FloorEntry>,
+    /// Everything else, each with the reason, so nothing is silently dropped.
+    pub withheld: Vec<FloorWithheld>,
 }
 
 impl StandingScopeStore {
@@ -319,27 +389,85 @@ impl StandingScopeStore {
     /// do anything there", and a read-only grant must never answer that question yes.
     pub fn has_live_for(&self, member: &str, path: &str, now: u64,
                         needed: crate::server::grant_modes::Modes) -> bool {
-        // THE UNION, and the floor is checked FIRST because it is the common case and
-        // because it is member-independent: if the society allows this path, no per-member
-        // lookup can change the answer. `effective(m) = floor ∪ member(m)` (AC-1).
-        self.floor_allows(path)
-            || self
-                .grants
-                .iter()
-                .any(|g| {
-                    g.member == member && g.is_live(now) && g.covers(path)
-                        && g.modes.includes(needed)
-                })
+        self.effective_modes(member, path, now).is_some_and(|m| m.includes(needed))
     }
 
-    /// Does the society floor admit this path, for anyone?
+    /// What `member` may do at `path`, or None for nothing.
+    ///
+    /// THE MEMBER'S OWN GRANTS DECIDE WHERE THEY REACH; THE FLOOR FILLS ONLY WHAT THEY DO NOT
+    /// (dp, 2026-10-23: "'floor' should not override the actual grants"). This replaces the
+    /// union `effective(m) = floor ∪ member(m)` (AC-1), which was the same thing while every
+    /// grant and every floor entry meant "all modes": with modes, a union would let an
+    /// all-modes floor entry silently undo an operator's narrowing of one member's grant.
+    /// Several of the member's grants covering one path add up (their union); several floor
+    /// entries covering it add up the same way. Expired grants never count.
+    pub fn effective_modes(&self, member: &str, path: &str, now: u64)
+                           -> Option<crate::server::grant_modes::Modes> {
+        let own = self
+            .grants
+            .iter()
+            .filter(|g| g.member == member && g.is_live(now) && g.covers(path))
+            .map(|g| g.modes)
+            .reduce(|a, b| a.union(b));
+        own.or_else(|| {
+            self.floor
+                .iter()
+                .filter(|f| f.covers(path))
+                .map(|f| f.modes)
+                .reduce(|a, b| a.union(b))
+        })
+    }
+
+    /// Does an ALL-MODES society floor entry reach this path, for anyone?
     ///
     /// No expiry and no member: the floor is what this society has decided its members may
     /// reach, full stop. A path that should lapse is a per-member grant, not a floor entry —
     /// keeping the floor unconditional is what lets a reader answer "may members reach X"
-    /// without knowing who is asking or what time it is.
+    /// without knowing who is asking or what time it is. A narrowed entry does not answer
+    /// "is X granted" (for an act of unknown mode, that question means all modes); whether
+    /// a given member may use any entry is `effective_modes`.
     pub fn floor_allows(&self, path: &str) -> bool {
-        self.floor.iter().any(|f| f.path == path)
+        self.floor.iter().any(|f| f.modes.is_all() && f.covers(path))
+    }
+
+    /// The floor as ONE member's mode-blind gate may enforce it, given that member's
+    /// NARROWED grants as `(path, recursive)` (live and standing; the caller collects both).
+    ///
+    /// The gate unions `society_floor` with the member's grants, so an all-modes floor entry
+    /// overlapping a narrowed grant would undo the narrowing there: it is WITHHELD for that
+    /// member, and named. Fail closed: the member loses the floor's reach over that entry's
+    /// whole span, not just the overlap, until the gate enforces modes and can take the
+    /// member's grant first path by path (#1345 part B). A narrowed entry with read goes to
+    /// `read` (admitted for read acts only), unless a narrowed grant overlapping it lacks
+    /// read. Every other entry is withheld with its reason.
+    pub fn floor_for<'a>(&'a self, narrowed: &[(String, bool, crate::server::grant_modes::Modes)])
+                         -> FloorForMember<'a> {
+        use crate::server::grant_modes::Mode;
+        let mut out = FloorForMember::default();
+        for f in &self.floor {
+            let clash = narrowed.iter().find(|(p, rec, m)| {
+                f.overlaps(p, *rec) && (f.modes.is_all() || !m.contains(Mode::Read))
+            });
+            if let Some((p, _, m)) = clash {
+                out.withheld.push(FloorWithheld {
+                    path: f.path.clone(),
+                    why: format!("your own grant on {p} allows only {m} there, and the floor does \
+                                  not override a member's grant; served again when your gate \
+                                  enforces modes"),
+                });
+            } else if f.modes.is_all() {
+                out.reach.push(f);
+            } else if f.modes.contains(Mode::Read) {
+                out.read.push(f);
+            } else {
+                out.withheld.push(FloorWithheld {
+                    path: f.path.clone(),
+                    why: format!("this floor entry allows {} without read; a mode-blind gate \
+                                  cannot enforce that, so it waits for one that can", f.modes),
+                });
+            }
+        }
+        out
     }
 
     /// A canonical digest of the EFFECTIVE society-wide path set.
@@ -348,7 +476,10 @@ impl StandingScopeStore {
     /// members received the same enforcing floor, while `generation` answers which complete
     /// policy revision they received. Length-prefixing prevents concatenation ambiguity.
     pub fn floor_digest(&self) -> String {
-        let mut paths: Vec<&str> = self.floor.iter().map(|f| f.path.as_str()).collect();
+        // Keyed on the reach-bearing spelling, so a floor that differs only in recursion or
+        // access digests differently. An entry with neither spells its bare path, so a floor
+        // written before those fields digests exactly as it did.
+        let mut paths: Vec<String> = self.floor.iter().map(FloorEntry::spelling).collect();
         paths.sort_unstable();
         let mut hasher = Sha256::new();
         for path in paths {
@@ -392,7 +523,7 @@ impl StandingScopeStore {
         let mut rows: Vec<String> = self
             .floor
             .iter()
-            .map(|f| format!("floor\u{1f}{}", f.path))
+            .map(|f| format!("floor\u{1f}{}", f.spelling()))
             .chain(self.grants.iter().map(Self::grant_row))
             .collect();
         rows.sort_unstable();
@@ -483,10 +614,10 @@ impl StandingScopeStore {
                 ));
             }
         }
-        let runtime_floor: std::collections::BTreeSet<&str> =
-            self.floor.iter().map(|f| f.path.as_str()).collect();
-        let vault_floor: std::collections::BTreeSet<&str> =
-            vault.floor.iter().map(|f| f.path.as_str()).collect();
+        let runtime_floor: std::collections::BTreeSet<String> =
+            self.floor.iter().map(FloorEntry::spelling).collect();
+        let vault_floor: std::collections::BTreeSet<String> =
+            vault.floor.iter().map(FloorEntry::spelling).collect();
         for phantom in runtime_floor.difference(&vault_floor) {
             out.push(format!("PHANTOM floor path in runtime: {phantom}"));
         }
@@ -936,7 +1067,184 @@ mod tests {
             added_at: at,
             added_by: "operator".into(),
             reason: "society baseline".into(),
+            ..Default::default()
         }
+    }
+
+    fn modes(s: &str) -> crate::server::grant_modes::Modes {
+        crate::server::grant_modes::Modes::parse(s).unwrap()
+    }
+
+    /// dp, 2026-10-19: every member may READ the governance snapshot. A read-only floor entry
+    /// is not reach: `floor_allows` (the "is X granted" question, all modes) must not answer
+    /// yes for it, and neither may `has_live`; a READ question may.
+    #[test]
+    fn a_read_only_floor_entry_answers_reads_and_nothing_more() {
+        let mut s = StandingScopeStore::default();
+        s.floor_add(FloorEntry { recursive: true, modes: modes("r"),
+                                 ..floor("/w/governance/hestia", 1) });
+        let file = "/w/governance/hestia/core/src/lib.rs";
+        assert!(!s.floor_allows("/w/governance/hestia"));
+        assert!(!s.floor_allows(file));
+        assert!(!s.has_live("anyone", file, 2));
+        assert!(s.has_live_for("anyone", file, 2, modes("r")));
+        assert!(!s.has_live_for("anyone", file, 2, modes("w")));
+        assert_eq!(s.effective_modes("anyone", file, 2), Some(modes("r")));
+    }
+
+    /// dp, 2026-10-23: "'floor' should not override the actual grants." Where a member's own
+    /// grant reaches, it decides, in BOTH directions: an all-modes floor entry does not widen a
+    /// member's read-only grant, and a read-only floor entry does not narrow a member's
+    /// all-modes grant. Where the member's grant does not reach, the floor applies.
+    #[test]
+    fn a_members_own_grant_decides_where_it_reaches_and_the_floor_fills_the_rest() {
+        let mut s = StandingScopeStore::default();
+        s.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        s.add(StandingGrant { recursive: true, modes: modes("r"),
+                              ..grant("kimi-code", "/w/shared/law", 2, None) });
+        let law = "/w/shared/law/x.md";
+        assert_eq!(s.effective_modes("kimi-code", law, 3), Some(modes("r")),
+                   "the floor's rwed does not override kimi's r-only grant");
+        assert!(!s.has_live_for("kimi-code", law, 3, modes("w")));
+        assert!(s.has_live("codex", law, 3), "codex holds no grant there: the floor applies");
+        assert!(s.has_live("kimi-code", "/w/shared/other.md", 3), "outside kimi's grant: floor");
+
+        let mut t = StandingScopeStore::default();
+        t.floor_add(FloorEntry { recursive: true, modes: modes("r"), ..floor("/w/gov", 1) });
+        t.add(StandingGrant { recursive: true, ..grant("codex", "/w/gov/mine", 2, None) });
+        assert!(t.has_live("codex", "/w/gov/mine/a", 3), "a read floor does not narrow a grant");
+        assert!(!t.has_live("kimi-code", "/w/gov/mine/a", 3));
+        // An expired grant is no grant: the floor applies again.
+        let mut u = StandingScopeStore::default();
+        u.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        u.add(StandingGrant { recursive: true, modes: modes("r"),
+                              ..grant("kimi-code", "/w/shared/law", 2, Some(5)) });
+        assert!(u.has_live("kimi-code", law, 6));
+    }
+
+    /// What a mode-blind gate is served for one member: an all-modes floor entry that would
+    /// undo that member's narrowed grant is withheld from it, by name; read-only entries go
+    /// to the read list; an entry without read is never served as reach.
+    #[test]
+    fn floor_for_withholds_what_would_override_a_narrowed_grant_and_names_it() {
+        let mut s = StandingScopeStore::default();
+        s.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        s.floor_add(FloorEntry { recursive: true, modes: modes("r"), ..floor("/w/gov", 1) });
+        s.floor_add(FloorEntry { modes: modes("w"), ..floor("/w/drop", 1) });
+        s.floor_add(floor("/w/plain", 1));
+        let none = s.floor_for(&[]);
+        let paths = |v: &Vec<&FloorEntry>| v.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        assert_eq!(paths(&none.reach), vec!["/w/shared", "/w/plain"]);
+        assert_eq!(paths(&none.read), vec!["/w/gov"]);
+        assert_eq!(none.withheld.len(), 1);
+        assert_eq!(none.withheld[0].path, "/w/drop");
+
+        let narrowed = vec![("/w/shared/law".to_string(), true, modes("r"))];
+        let kimi = s.floor_for(&narrowed);
+        assert_eq!(paths(&kimi.reach), vec!["/w/plain"], "the overlapping rwed entry is withheld");
+        assert!(kimi.withheld.iter().any(|w| w.path == "/w/shared" && w.why.contains("/w/shared/law")));
+        assert_eq!(paths(&kimi.read), vec!["/w/gov"], "a read entry beside an r grant stays");
+        // A narrowed grant without read under a read-only floor entry withholds that too.
+        let wonly = vec![("/w/gov/x".to_string(), false, modes("w"))];
+        assert!(s.floor_for(&wonly).read.is_empty());
+        // An overlap is either direction: a grant ABOVE the floor entry clashes as well.
+        let above = vec![("/w".to_string(), true, modes("r"))];
+        assert!(s.floor_for(&above).reach.is_empty());
+    }
+
+    #[test]
+    fn a_recursive_floor_entry_covers_its_subtree_at_the_separator() {
+        let mut s = StandingScopeStore::default();
+        s.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        assert!(s.floor_allows("/w/shared"));
+        assert!(s.floor_allows("/w/shared/a/b.md"));
+        assert!(!s.floor_allows("/w/shared-not"), "containment is at the separator");
+        // And an exact entry stays exact: the field defaults to the narrower meaning.
+        let mut e = StandingScopeStore::default();
+        e.floor_add(floor("/w/shared", 1));
+        assert!(!e.floor_allows("/w/shared/a/b.md"));
+    }
+
+    /// Upgrading must not move the digest of a floor written before `recursive`/`modes`
+    /// existed (a moved digest reads as a changed society baseline), while a floor that
+    /// differs only in recursion or modes must digest differently.
+    #[test]
+    fn floor_digest_is_unchanged_for_legacy_entries_and_sees_reach_and_modes() {
+        let mut legacy = StandingScopeStore::default();
+        legacy.floor_add(floor("/w/shared", 1));
+        let mut hasher = Sha256::new();
+        hasher.update(("/w/shared".len() as u64).to_be_bytes());
+        hasher.update(b"/w/shared");
+        assert_eq!(legacy.floor_digest(), hex::encode(hasher.finalize()));
+
+        let mut rec = StandingScopeStore::default();
+        rec.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        let mut ro = StandingScopeStore::default();
+        ro.floor_add(FloorEntry { modes: modes("r"), ..floor("/w/shared", 1) });
+        let mut rw = StandingScopeStore::default();
+        rw.floor_add(FloorEntry { modes: modes("rw"), ..floor("/w/shared", 1) });
+        assert_ne!(legacy.floor_digest(), rec.floor_digest());
+        assert_ne!(legacy.floor_digest(), ro.floor_digest());
+        assert_ne!(rec.floor_digest(), ro.floor_digest());
+        assert_ne!(ro.floor_digest(), rw.floor_digest());
+        // And the divergence report can name the difference the digest sees.
+        assert!(!rec.divergence_from(&legacy).is_empty());
+        assert!(!ro.divergence_from(&legacy).is_empty());
+        assert!(!ro.divergence_from(&rw).is_empty());
+    }
+
+    /// Codex HOLD on #1347, P2: the first spelling appended " (read)" to the path, so a
+    /// read-only `/w/law` and an all-access path literally named `/w/law (read)` digested as
+    /// one floor. Every pair of distinct (path, recursive, modes) must spell differently.
+    #[test]
+    fn floor_spellings_never_collide_across_path_recursion_and_modes() {
+        let e = |p: &str, recursive: bool, m: &str| FloorEntry {
+            path: p.into(),
+            recursive,
+            modes: modes(m),
+            ..Default::default()
+        };
+        let entries = [
+            e("/w/law", false, "rwed"),
+            e("/w/law", false, "r"),
+            e("/w/law", true, "rwed"),
+            e("/w/law", true, "r"),
+            e("/w/law (read)", false, "rwed"),
+            e("/w/law/**", false, "rwed"),
+            e("/w/law/** (read)", false, "rwed"),
+            e("/w/law\u{1f}exact\u{1f}r", false, "rwed"),
+            e("/w/law\u{1f}exact\u{1f}r", true, "rwed"),
+            e("/w", true, "r"),
+            e("/w/law", false, "rw"),
+            e("/w/law", true, "rwe"),
+        ];
+        let spelt: std::collections::BTreeSet<String> =
+            entries.iter().map(FloorEntry::spelling).collect();
+        assert_eq!(spelt.len(), entries.len(), "two distinct entries spelt alike: {spelt:?}");
+        for pair in [(1usize, 4usize), (2, 5), (3, 6), (1, 10)] {
+            let mut a = StandingScopeStore::default();
+            a.floor_add(entries[pair.0].clone());
+            let mut b = StandingScopeStore::default();
+            b.floor_add(entries[pair.1].clone());
+            assert_ne!(a.floor_digest(), b.floor_digest(), "{pair:?}");
+            assert_ne!(a.authority_digest(), b.authority_digest(), "{pair:?}");
+            assert!(!a.divergence_from(&b).is_empty(), "{pair:?}");
+        }
+        // Legacy stays the bare path, explicitly.
+        assert_eq!(entries[0].spelling(), "/w/law");
+    }
+
+    #[test]
+    fn a_stored_floor_without_the_new_fields_reads_as_exact_and_all_and_writes_back_unchanged() {
+        let raw = r#"{"path":"/w/x","added_at":1,"added_by":"operator","reason":"r"}"#;
+        let e: FloorEntry = serde_json::from_str(raw).unwrap();
+        assert!(!e.recursive);
+        assert!(e.modes.is_all());
+        let back = serde_json::to_value(&e).unwrap();
+        assert!(back.get("modes").is_none(), "an all-modes entry is written without the field");
+        let r: FloorEntry = serde_json::from_str(
+            r#"{"path":"/w/x","added_at":1,"recursive":true,"modes":"r"}"#).unwrap();
+        assert_eq!(r.modes, modes("r"));
     }
 
     #[test]

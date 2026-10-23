@@ -224,6 +224,11 @@ pub struct DashboardSnapshot {
     /// Rendered beside the grants so a stale panel is legible AS stale (#438).
     #[serde(default)]
     pub standing_generation: u64,
+    /// THE SOCIETY FLOOR, one row per entry: what every member may reach without asking, with
+    /// its reach (`recursive`) and its `modes` (r/w/e/d, as a grant has). Rendered beside the
+    /// per-member grants so the operator sees the whole of what a member may reach in one place.
+    #[serde(default)]
+    pub society_floor: Vec<serde_json::Value>,
     /// Set when the chain read backing `stats` / `stats_by_plugin` FAILED.
     ///
     /// When this is present the counts are not measurements and must not be rendered as
@@ -1921,6 +1926,14 @@ impl ServerState {
                 v
             },
             standing_generation: self.standing_scope.generation,
+            society_floor: self.standing_scope.floor.iter().map(|f| serde_json::json!({
+                "path": f.path,
+                "recursive": f.recursive,
+                "modes": f.modes,
+                "reason": f.reason,
+                "added_by": f.added_by,
+                "added_at": f.added_at,
+            })).collect(),
             stats_unavailable: stats_read_error,
             recent_unavailable: recent_read_error,
             deployment: deployment_health(self),
