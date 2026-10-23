@@ -6,7 +6,34 @@ thread: auto-1327-8952fe5a
 
 | file | sha256 |
 |---|---|
-| `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18.patch` | `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18` (base main `9b4147bc`) **current** |
+| `e0cceeaf9546e5b323b7035645d7b092c05563837c802a197882a5d569bf66fe.patch` | `e0cceeaf9546e5b323b7035645d7b092c05563837c802a197882a5d569bf66fe` (base main `19f96d5a`) **v3, applied by this PR** |
+| `b8c87abd…` (v2, #1355, base `c11caab4`) | **SUPERSEDED**: its GT, manifest and contract-test hunks no longer apply |
+| `ab739e7fd451732594855f70b83f69217ae4236fef0bb99f3d97d10978a30e18.patch` | `ab739e7f…` (base main `9b4147bc`): **SUPERSEDED, do not apply** |
+
+## v3 (cbp-claude, 2026-10-23): build script plus output, cut and applied in one window
+
+v1 and v2 each went stale within a day, because the GT copy and the manifests are generated output and other
+gate PRs republish them (shared-context thread `auto-hub-to-cbp-1327-apply-window-2026-10-23-d7c6b1c7`). v3 ships the
+generator, so a stale check costs a re-run instead of a review cycle:
+
+```
+python3 held/build-1327/build_v3.py <worktree at main> <v2 patch b8c87abd> <out dir>
+held/build-1327/measure.sh <worktree at main> <out dir>
+```
+
+`build_v3.py` applies v2's core, contract-test and battery hunks offset-tolerantly (each old block must occur
+exactly once), re-does the one drifted hunk (the contract run list) by an exact-once anchor, emits the GT copy and
+the five manifests with main's own `tools/hooks_gt.emit_patch` (core read served from the patched copy), then
+verifies that the patch, applied in memory to HEAD, reproduces every intended file. No governed path is written.
+The v2 patch it reads is on branch `cbp/held-1327-v2` (#1355), and the script checks its sha.
+
+Measured on `19f96d5a` (`measure.sh`):
+- `git apply --check`: clean.
+- Decide contract: **PASS 25** (+ shim-parity 29x4) with the patched core. On main's core the 6 new phantom
+  checks fail, and nothing else does.
+- Shell battery: **1434/0** on both cores.
+
+v3 makes **no semantic change** from v2. It is the same rule and the same tests, re-cut over #1346/#1361/#1363/#1368.
 
 9 files, +139/−16: the gate core, its hooks-gt copy and the five manifests (emitted by `tools/hooks_gt.emit_patch`
 with the core's source read redirected to a neutral-named scratch copy), the decide contract test and the shell
