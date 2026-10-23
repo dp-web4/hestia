@@ -33,6 +33,8 @@ codebase keeps finding in itself: a check that reports success while measuring n
 > the baseline artifact; gate-consolidation status below was refreshed on 2026-08-23 against the
 > subsequently merged work and keeps repo state separate from live-install evidence.
 
+> **Status dating (2026-10-23):** The August 2026 status audit and gate-consolidation summary below are historical baselines, **not a fresh audit of today's installed gate**. October development includes scope/grant handling, read-tool classification, closure/miswiring detection and related reviews. Source fixes, CI and a running install are different evidence classes; verify the exact deployed gate version and its exercised refusal paths before upgrading capability claims. The current A1 cooperative/tamper-evident boundary remains in force.
+
 **Standards and public-sector reviewers:** the [standards review entry point](docs/STANDARDS_REVIEW.md) maps Hestia's identity, delegated authority, runtime governance, provenance, audit, non-repudiation, and allow/deny/revoke mechanisms into current NIST / NCCoE agent-identity vocabulary, with explicit A1/A2 assurance boundaries.
 
 > ### ⚠️ The gate stops accidents, not adversaries
