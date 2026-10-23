@@ -407,7 +407,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_scope_peer_decide",
-            "Rule ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05: scope escalations go to peers, the operator is the override). Pass your own live session_id, the request_id, decision = once | session | standing | refuse, a reason (the asker reads it), and for session/standing optionally grant_path (the asked path or a directory above it, never the root) with recursive=true. Refused by name when: you are the asker (in either direction — the asker can never decide its own request); the asker was never proven against a session (NOT-SAME cannot peer-clear an asserted name, eligibility clause 0); you are not a recognised reasoner; the request was filed by the member rather than opened by the gate. The record names you (granted_by peer:<you>), the channel (peer_not_same) and your NOT-SAME basis",
+            "Rule ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05: scope escalations go to peers, the operator is the override). Pass your own live session_id, the request_id, decision = once | session | standing | refuse, a reason (the asker reads it), and for session/standing optionally grant_path (the asked path or a directory above it, never the root) with recursive=true, and modes (a string of r read, w write, e execute, d delete; default all four, #1345). Refused by name when: you are the asker (in either direction — the asker can never decide its own request); the asker was never proven against a session (NOT-SAME cannot peer-clear an asserted name, eligibility clause 0); you are not a recognised reasoner; the request was filed by the member rather than opened by the gate. The record names you (granted_by peer:<you>), the channel (peer_not_same) and your NOT-SAME basis",
         ),
         t(
             "hestia_scope_claim",
@@ -1390,13 +1390,13 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // pins the hash learns its reach changed instead of discovering it by trying.
         "scope_grants": p.live_scope_grants(&who.plugin_id)
             .iter()
-            .map(|r| json!({
+            .map(|r| with_modes(json!({
                 "path": r.reach_path(),
                 "granted_by": r.decided_by,
                 "requested_because": r.reason,
                 "decision_reason": r.decision_reason,
                 "expires_at": r.expires_at,
-            }))
+            }), r.ext.modes))
             .collect::<Vec<_>>(),
         // STANDING grants, disclosed beside the live ones and inside the same hashed body
         // (Sprint F R1): the durable widening is the one a member most needs to see, because
@@ -1404,13 +1404,13 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // or being revoked MOVES law_hash.
         "standing_grants": p.live_standing_grants(&who.plugin_id)
             .iter()
-            .map(|g| json!({
+            .map(|g| with_modes(json!({
                 "path": g.path,
                 "granted_by": g.granted_by,
                 "reason": g.reason,
                 "granted_at": g.granted_at,
                 "expires_at": g.expires_at,
-            }))
+            }), g.modes))
             .collect::<Vec<_>>(),
         "law": statements,
     });
@@ -23913,6 +23913,19 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
 
 /// `hestia_scope_status` — what a member may reach beyond its standing MRH, and what it has asked
 /// for. Read-only and unwitnessed: reading your own permissions is not an act.
+/// Disclose a grant's modes in the operating law when, and only when, they are narrower than all
+/// four (#1345). An all-modes row is left exactly as it was, so `law_hash` does not move for a
+/// society that never narrows a grant, and moves the moment one is narrowed: a member pinning
+/// the hash learns that what it may DO changed, as it already does for what it may reach.
+fn with_modes(mut row: Value, modes: crate::server::grant_modes::Modes) -> Value {
+    if !modes.is_all() {
+        if let Some(o) = row.as_object_mut() {
+            o.insert("modes".into(), json!(modes));
+        }
+    }
+    row
+}
+
 async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
 
@@ -23978,8 +23991,41 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "secs_remaining": r.expires_at.saturating_sub(now),
                 "grant_path": r.reach_path(),
                 "recursive": r.recursive,
+                "modes": r.ext.modes,
             })
         })
+        .collect();
+
+    // FAIL CLOSED FOR A MODE-BLIND GATE (#1345). Every gate released before modes existed
+    // turns each row of `live_grants` / `standing_grants` into reach for EVERY act, so a
+    // read-only grant served there would be enforced as rwed: the narrowing the operator chose
+    // would widen silently on the way to enforcement. Those two keys therefore carry only
+    // all-modes grants, exactly what they always meant. Every grant, narrowed or not, is
+    // ALSO served in `grants_by_mode` with its modes; a gate that predates that key ignores it
+    // and refuses, so an older gate reads a narrowed grant as no grant, never as a wider one.
+    // (#1347 makes the same choice for read-only floor entries with `society_floor_read`.)
+    let live_all = s.live_scope_grants(&plugin_id);
+    let standing_all = s.live_standing_grants(&plugin_id);
+    let grants_by_mode: Vec<Value> = live_all
+        .iter()
+        .map(|r| json!({
+            "channel": "live",
+            "path": r.reach_path(),
+            "recursive": r.recursive,
+            "modes": r.ext.modes,
+            "expires_at": r.expires_at,
+            "granted_by": r.decided_by,
+            "request_id": r.id,
+        }))
+        .chain(standing_all.iter().map(|g| json!({
+            "channel": "standing",
+            "path": g.path,
+            "recursive": g.recursive,
+            "modes": g.modes,
+            "expires_at": g.expires_at,
+            "granted_by": g.granted_by,
+            "request_id": g.request_id,
+        })))
         .collect();
 
     Ok(json!({
@@ -23988,16 +24034,18 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // The operative list, separated from the history, because "what may I read right now"
         // and "what have I asked for" are different questions and only one of them is a
         // permission.
-        "live_grants": s.live_scope_grants(&plugin_id)
+        "live_grants": live_all
             .iter()
+            .filter(|r| r.ext.modes.is_all())
             .map(|r| json!({"path": r.reach_path(), "expires_at": r.expires_at, "granted_by": r.decided_by,
                             "recursive": r.recursive}))
             .collect::<Vec<_>>(),
         // The DURABLE list, additive beside live_grants (Sprint F R1): operator-promoted
         // standing grants from the vault-persisted store. Expired grants are filtered in
         // the store's read, so nothing served here is past its horizon.
-        "standing_grants": s.live_standing_grants(&plugin_id)
+        "standing_grants": standing_all
             .iter()
+            .filter(|g| g.modes.is_all())
             .map(|g| json!({
                 "path": g.path,
                 "granted_at": g.granted_at,
@@ -24011,6 +24059,9 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "recursive": g.recursive,
             }))
             .collect::<Vec<_>>(),
+        // EVERY live and standing grant with what it lets the member DO (#1345). See the
+        // fail-closed note above: the two lists before this one hold only all-modes grants.
+        "grants_by_mode": grants_by_mode,
         // CERTIFICATION, issued by the authority — the two fields the plugin gate's
         // certified-replica logic (AgentPolicy) has demanded since 2026-08-04 with nothing
         // issuing them: WHICH policy this is (the standing store's monotonic generation,
@@ -24064,7 +24115,11 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                      expire or are revoked. society_floor is the society's own list: it is \
                      durable, applies to EVERY member identically, and is not yours to lose — \
                      effective(you) = society_floor ∪ your grants, additive only. None of the \
-                     three is ever written to your identity file.",
+                     three is ever written to your identity file. grants_by_mode lists \
+                     every live and standing grant with its modes (r read, w write, e execute, \
+                     d delete); live_grants and standing_grants hold only the grants that allow \
+                     all four, so a gate that does not know modes never treats a narrower grant \
+                     as a wider one.",
     }))
 }
 
@@ -24588,6 +24643,11 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
             body["granted"] = json!(true);
             body["standing"] = json!(decision == "standing");
             body["recursive"] = json!(args.get("recursive").and_then(Value::as_bool).unwrap_or(false));
+            // What the grant lets the asker DO (#1345); absent = all four. Validated by the
+            // decide path itself, so a peer and the operator are held to one rule.
+            if let Some(m) = args.get("modes").filter(|v| !v.is_null()) {
+                body["modes"] = m.clone();
+            }
             if let Some(gp) = optional_string(args, "grant_path") {
                 body["grant_path"] = json!(gp);
             }
@@ -26664,6 +26724,7 @@ mod standing_scope_surface_tests {
             expires_at,
             request_id: Some("scope-test01".into()),
         recursive: false,
+        modes: crate::server::grant_modes::Modes::ALL,
         }
     }
 
@@ -26671,6 +26732,37 @@ mod standing_scope_surface_tests {
     /// exact pre-existing shape (a consumer keyed on it must not notice this PR), and
     /// `standing_grants` + `generation` + `snapshot_expires_at` arrive beside it.
     /// (d, at the surface) an expired standing grant is not served.
+    /// #1345, FAIL CLOSED: a gate that predates modes reads `live_grants` / `standing_grants` as
+    /// reach for every act, so a narrowed grant must not appear there. It appears only in
+    /// `grants_by_mode`, which such a gate ignores: it reads the grant as no grant.
+    #[tokio::test]
+    async fn a_narrowed_grant_is_withheld_from_the_mode_blind_lists() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            let mut live = live_request("kimi-code", "/w/live-r.md", now);
+            live.ext.modes = crate::server::grant_modes::Modes::READ;
+            s.scope_requests.insert(live.id.clone(), live);
+            s.standing_scope.add(standing("kimi-code", "/w/full", now, None));
+            let mut ro = standing("kimi-code", "/w/gov", now, None);
+            ro.modes = crate::server::grant_modes::Modes::READ;
+            ro.recursive = true;
+            s.standing_scope.add(ro);
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        let paths = |k: &str| -> Vec<String> { out[k].as_array().unwrap().iter()
+            .map(|g| g["path"].as_str().unwrap().to_string()).collect() };
+        assert_eq!(paths("live_grants"), Vec::<String>::new(), "a read-only live grant reached a mode-blind list");
+        assert_eq!(paths("standing_grants"), vec!["/w/full".to_string()]);
+        let by_mode = out["grants_by_mode"].as_array().unwrap();
+        let find = |p: &str| by_mode.iter().find(|g| g["path"] == p).unwrap_or_else(|| panic!("{p} missing: {by_mode:?}"));
+        assert_eq!((find("/w/gov")["modes"].clone(), find("/w/gov")["recursive"].clone(), find("/w/gov")["channel"].clone()),
+                   (json!("r"), json!(true), json!("standing")));
+        assert_eq!(find("/w/live-r.md")["channel"], "live");
+        assert_eq!(find("/w/full")["modes"], "rwed");
+    }
+
     #[tokio::test]
     async fn scope_status_serves_standing_beside_live_additively() {
         let (_d, state) = test_state().await;
@@ -29238,6 +29330,7 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
             expires_at: None,
             request_id: Some(request_id.clone()),
             recursive: false,
+            modes: crate::server::grant_modes::Modes::ALL,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
             return Err(anyhow::anyhow!(

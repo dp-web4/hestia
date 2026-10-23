@@ -98,6 +98,15 @@ pub struct StandingGrant {
     /// at all: the concern in `has_live` was never subtrees, it was UNREAD widening.
     #[serde(default)]
     pub recursive: bool,
+    /// What the holder may DO at the path it reaches: read / write / execute / delete (#1345).
+    ///
+    /// ALL BY DEFAULT, for the same reason `recursive` defaults to exact: every grant written
+    /// before this field existed was effectively rwed, so it loads as rwed and nothing an
+    /// operator already read silently changes. An all-modes grant is also WRITTEN without the
+    /// field, so the vault document of a society that never narrows a grant is byte-identical
+    /// to what it was.
+    #[serde(default, skip_serializing_if = "crate::server::grant_modes::is_all")]
+    pub modes: crate::server::grant_modes::Modes,
 }
 
 impl StandingGrant {
@@ -222,6 +231,50 @@ pub enum ReassignRefused {
     DestinationHoldsPath,
 }
 
+/// The new shape of a grant in one `edit`: everything the dashboard's Edit row stages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantEdit {
+    /// Already normalised and validated by the caller (`state::normalize_scope_path`).
+    pub path: String,
+    pub recursive: bool,
+    pub modes: crate::server::grant_modes::Modes,
+}
+
+impl GrantEdit {
+    /// Would `after` let its holder reach or do anything `before` did not?
+    ///
+    /// Any one of: a mode added; exact made recursive; or a path no longer inside what the
+    /// old grant covered. Narrowing on one axis never cancels widening on another, so this is
+    /// an OR, and the operator is shown it before Save.
+    pub fn widens(before: &StandingGrant, after: &StandingGrant) -> bool {
+        after.modes.widens(before.modes) || Self::widens_reach(before, after)
+    }
+
+    /// Does `after` reach any path `before` did not? Modes aside.
+    pub fn widens_reach(before: &StandingGrant, after: &StandingGrant) -> bool {
+        if after.recursive {
+            // a subtree is inside the old reach only when the old grant was a subtree that
+            // contains it
+            !(before.recursive && covers_path(&before.path, true, &after.path))
+        } else {
+            !before.covers(&after.path)
+        }
+    }
+}
+
+/// Why `edit` changed nothing. None of them moves the generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditRefused {
+    /// The store moved since the editor read it.
+    Moved { current: u64 },
+    NoSuchGrant,
+    /// The staged row equals the stored one: Save with nothing changed is not a mutation.
+    NoChange,
+    /// The member already holds the new path as a separate grant; merging them is the
+    /// operator's explicit call (revoke one first).
+    DestinationHoldsPath,
+}
+
 /// One floor path: every member may reach this, because the society says so.
 ///
 /// It carries its own provenance for the same reason a standing grant does — a widening whose
@@ -256,6 +309,16 @@ impl StandingScopeStore {
     /// "prefix matching would silently widen what the operator read" — still true, and
     /// still honoured: a recursive grant is one the operator read as recursive.
     pub fn has_live(&self, member: &str, path: &str, now: u64) -> bool {
+        self.has_live_for(member, path, now, crate::server::grant_modes::Modes::ALL)
+    }
+
+    /// `has_live`, counting only grants that include every mode in `needed` (#1345).
+    ///
+    /// `has_live` asks for ALL modes, and that is the safe reading for every caller that does
+    /// not know what the act will do: "a grant covers this path" used to mean "the member may
+    /// do anything there", and a read-only grant must never answer that question yes.
+    pub fn has_live_for(&self, member: &str, path: &str, now: u64,
+                        needed: crate::server::grant_modes::Modes) -> bool {
         // THE UNION, and the floor is checked FIRST because it is the common case and
         // because it is member-independent: if the society allows this path, no per-member
         // lookup can change the answer. `effective(m) = floor ∪ member(m)` (AC-1).
@@ -263,7 +326,10 @@ impl StandingScopeStore {
             || self
                 .grants
                 .iter()
-                .any(|g| g.member == member && g.is_live(now) && g.covers(path))
+                .any(|g| {
+                    g.member == member && g.is_live(now) && g.covers(path)
+                        && g.modes.includes(needed)
+                })
     }
 
     /// Does the society floor admit this path, for anyone?
@@ -301,13 +367,20 @@ impl StandingScopeStore {
     /// contract on the one field that changes authority over time. Anything the digest can
     /// distinguish, the report must be able to name.
     fn grant_row(g: &StandingGrant) -> String {
-        format!(
+        let row = format!(
             "grant\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
             g.member,
             g.path,
             g.granted_at,
             g.expires_at.map(|e| e.to_string()).unwrap_or_default()
-        )
+        );
+        // MODES ARE AUTHORITY (#1345), so the digest must see a narrowed grant. An all-modes
+        // grant keeps its pre-#1345 row exactly, so no existing digest moves on upgrade.
+        if g.modes.is_all() {
+            row
+        } else {
+            format!("{row}\u{1f}modes={}", g.modes)
+        }
     }
 
     /// A canonical digest of the ENTIRE authority: floor plus every per-member grant, with
@@ -391,6 +464,14 @@ impl StandingScopeStore {
                             k.0, k.1, g.granted_at, v.granted_at
                         ));
                     }
+                    // WHAT IT MAY DO. A mode the vault never authorised is a widening; a
+                    // missing one is a silent narrowing. Either is drift (#1345).
+                    if g.modes != v.modes {
+                        out.push(format!(
+                            "CHANGED grant {} -> {}: modes runtime {} vs vault {}",
+                            k.0, k.1, g.modes, v.modes
+                        ));
+                    }
                 }
             }
         }
@@ -468,7 +549,7 @@ impl StandingScopeStore {
     }
 
     /// Move one grant to another member, as ONE mutation: the source row is removed and a
-    /// destination row with the same `(path, recursive, expires_at)` is added, and the
+    /// destination row with the same `(path, recursive, modes, expires_at)` is added, and the
     /// generation moves once. The repair for a grant made against a mistyped member id.
     ///
     /// Why one mutation and not `add` + `revoke`: the two-step shape is what the dashboard
@@ -504,11 +585,56 @@ impl StandingScopeStore {
             expires_at: src.expires_at,
             request_id: None,
             recursive: src.recursive,
+            // Copied with the reach: a reassign moves a grant, it never re-decides one.
+            modes: src.modes,
         };
         self.grants.retain(|g| !(g.member == from && g.path == path));
         self.grants.push(moved.clone());
         self.generation += 1;
         Ok(moved)
+    }
+
+    /// Edit one grant's path, reach and modes, as ONE mutation (dp, 2026-10-22, #1345).
+    ///
+    /// The dashboard's Edit workflow stages all three and saves once, so the store must change
+    /// all three at once: a path edit done as revoke + add is the partial-transaction class
+    /// `reassign` already rejects (an interruption leaves both grants live, or neither), and a
+    /// path edit done as a second grant leaves the OLD path reachable, which dp's contract
+    /// names directly: "must not ... leave both old and new grants active".
+    ///
+    /// The row is rewritten IN PLACE, so its provenance (granted_at, granted_by, reason,
+    /// request_id, expires_at) is the original grant's. The edit's own operator, reason and
+    /// before→after are the witness record's job, which is where every other mutation's
+    /// history lives.
+    ///
+    /// `expected_generation` is the store generation the editor SAW: if anything moved since,
+    /// the edit is refused, because the before→after summary the operator approved was
+    /// computed against a store that no longer exists.
+    pub fn edit(&mut self, member: &str, path: &str, expected_generation: u64,
+                change: GrantEdit) -> Result<(StandingGrant, StandingGrant), EditRefused> {
+        if self.generation != expected_generation {
+            return Err(EditRefused::Moved { current: self.generation });
+        }
+        let Some(idx) = self.grants.iter().position(|g| g.member == member && g.path == path)
+        else {
+            return Err(EditRefused::NoSuchGrant);
+        };
+        let before = self.grants[idx].clone();
+        let mut after = before.clone();
+        after.path = change.path;
+        after.recursive = change.recursive;
+        after.modes = change.modes;
+        if after == before {
+            return Err(EditRefused::NoChange);
+        }
+        if after.path != before.path
+            && self.grants.iter().any(|g| g.member == member && g.path == after.path)
+        {
+            return Err(EditRefused::DestinationHoldsPath);
+        }
+        self.grants[idx] = after.clone();
+        self.generation += 1;
+        Ok((before, after))
     }
 
     /// Rewrite every grant at or under `from` to sit under `to`, as ONE mutation.
@@ -597,6 +723,7 @@ mod reach_tests {
         StandingGrant {
             member: "m".into(), path: path.into(), granted_at: 1, granted_by: "op".into(),
             reason: "r".into(), expires_at: None, request_id: None, recursive,
+            modes: crate::server::grant_modes::Modes::ALL,
         }
     }
 
@@ -608,6 +735,7 @@ mod reach_tests {
                 member: (*member).into(), path: (*path).into(), granted_at: 1,
                 granted_by: "op".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             });
         }
         st
@@ -798,6 +926,7 @@ mod tests {
             expires_at,
             request_id: None,
         recursive: false,
+        modes: crate::server::grant_modes::Modes::ALL,
         }
     }
 
@@ -941,3 +1070,112 @@ mod tests {
         assert!(!legacy.exists(), "the plaintext sidecar must be retired");
     }
 }
+
+/// #1345: per-grant modes (r/w/e/d) and the one-act Edit.
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+    use crate::server::grant_modes::Modes;
+
+    fn g(member: &str, path: &str, recursive: bool, modes: &str) -> StandingGrant {
+        StandingGrant {
+            member: member.into(), path: path.into(), granted_at: 7, granted_by: "op".into(),
+            reason: "because".into(), expires_at: None, request_id: Some("scope-1".into()),
+            recursive, modes: Modes::parse(modes).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_grant_written_before_modes_loads_as_all_four_and_writes_back_unchanged() {
+        let old = r#"{"member":"m","path":"/w","granted_at":1,"recursive":true}"#;
+        let back: StandingGrant = serde_json::from_str(old).unwrap();
+        assert_eq!(back.modes, Modes::ALL, "an unmoded grant narrowed silently");
+        let written = serde_json::to_value(&back).unwrap();
+        assert!(written.get("modes").is_none(), "an all-modes grant must serialise as before: {written}");
+        let narrowed = serde_json::to_value(g("m", "/w", true, "r")).unwrap();
+        assert_eq!(narrowed["modes"], "r");
+    }
+
+    #[test]
+    fn the_digest_is_unchanged_for_all_modes_and_moves_when_a_grant_is_narrowed() {
+        let mut st = StandingScopeStore::default();
+        st.grants.push(g("m", "/w", false, "rwed"));
+        let mut legacy = st.clone();
+        // the pre-#1345 row, computed by hand: the same five fields, nothing else
+        let row = "grant\u{1f}m\u{1f}/w\u{1f}7\u{1f}".to_string();
+        assert_eq!(StandingScopeStore::grant_row(&legacy.grants[0]), row);
+        legacy.grants[0].modes = Modes::READ;
+        assert_ne!(st.authority_digest(), legacy.authority_digest(), "a narrowed grant must move the digest");
+        let d = legacy.divergence_from(&st);
+        assert!(d.iter().any(|l| l.contains("modes runtime r vs vault rwed")), "{d:?}");
+    }
+
+    #[test]
+    fn a_read_only_grant_never_answers_has_live_for_an_unknown_act() {
+        let mut st = StandingScopeStore::default();
+        st.add(g("m", "/w", true, "r"));
+        assert!(!st.has_live("m", "/w/x", 10), "has_live means all modes; r alone must not answer it");
+        assert!(st.has_live_for("m", "/w/x", 10, Modes::READ));
+        assert!(!st.has_live_for("m", "/w/x", 10, Modes::parse("w").unwrap()));
+    }
+
+    #[test]
+    fn reassign_carries_the_modes() {
+        let mut st = StandingScopeStore::default();
+        st.add(g("typo", "/w", true, "re"));
+        let moved = st.reassign("typo", "/w", "real", 9, "fix").unwrap();
+        assert_eq!(moved.modes.as_letters(), "re");
+    }
+
+    #[test]
+    fn edit_rewrites_one_row_in_place_and_keeps_its_provenance() {
+        let mut st = StandingScopeStore::default();
+        st.add(g("m", "/w/a", false, "rwed"));
+        st.add(g("other", "/w/a", false, "rwed"));
+        let gen = st.generation;
+        let (before, after) = st.edit("m", "/w/a", gen, GrantEdit {
+            path: "/w/b".into(), recursive: true, modes: Modes::READ }).unwrap();
+        assert_eq!(st.generation, gen + 1, "one edit, one generation step");
+        assert_eq!((before.path.as_str(), after.path.as_str()), ("/w/a", "/w/b"));
+        let mine: Vec<_> = st.grants.iter().filter(|x| x.member == "m").collect();
+        assert_eq!(mine.len(), 1, "the old path must not stay live beside the new one");
+        assert_eq!((mine[0].granted_at, mine[0].reason.as_str(), mine[0].request_id.as_deref()),
+                   (7, "because", Some("scope-1")), "provenance is the original grant's");
+        assert!(mine[0].recursive && mine[0].modes == Modes::READ);
+        assert!(st.grants.iter().any(|x| x.member == "other" && x.path == "/w/a"),
+                "another member's grant on the old path is untouched");
+    }
+
+    #[test]
+    fn edit_refusals_change_nothing() {
+        let mut st = StandingScopeStore::default();
+        st.add(g("m", "/w/a", false, "rw"));
+        st.add(g("m", "/w/b", false, "rw"));
+        let gen = st.generation;
+        let snap = st.grants.clone();
+        let same = GrantEdit { path: "/w/a".into(), recursive: false, modes: Modes::parse("rw").unwrap() };
+        assert_eq!(st.edit("m", "/w/a", gen, same.clone()), Err(EditRefused::NoChange));
+        assert_eq!(st.edit("m", "/w/a", gen - 1, GrantEdit { modes: Modes::READ, ..same.clone() }),
+                   Err(EditRefused::Moved { current: gen }));
+        assert_eq!(st.edit("m", "/w/zz", gen, same.clone()), Err(EditRefused::NoSuchGrant));
+        assert_eq!(st.edit("m", "/w/a", gen, GrantEdit { path: "/w/b".into(), ..same }),
+                   Err(EditRefused::DestinationHoldsPath));
+        assert_eq!((st.generation, st.grants.clone()), (gen, snap));
+    }
+
+    #[test]
+    fn widening_is_named_on_each_axis() {
+        let base = g("m", "/w/a", true, "r");
+        let w = |path: &str, rec: bool, modes: &str| g("m", path, rec, modes);
+        assert!(!GrantEdit::widens(&base, &w("/w/a/sub", true, "r")), "a subtree of a recursive grant narrows");
+        assert!(!GrantEdit::widens(&base, &w("/w/a", false, "r")), "recursive to exact narrows");
+        assert!(GrantEdit::widens(&base, &w("/w/a", true, "rw")), "an added mode widens");
+        assert!(GrantEdit::widens(&base, &w("/w/b", true, "r")), "a sibling path widens");
+        assert!(GrantEdit::widens(&base, &w("/w", true, "r")), "the parent widens");
+        let exact = g("m", "/w/a", false, "rw");
+        assert!(GrantEdit::widens_reach(&exact, &w("/w/a", true, "rw")), "exact to recursive widens");
+        assert!(!GrantEdit::widens(&exact, &w("/w/a", false, "r")), "dropping a mode only narrows");
+        assert!(GrantEdit::widens(&exact, &w("/w/a", false, "rd")), "swapping w for d still widens");
+    }
+}
+

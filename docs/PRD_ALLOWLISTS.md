@@ -831,7 +831,9 @@ delegated seat's signed `hestia scope arbitrate`.
 **What this does not fix, said here so it is not rediscovered:** pending requests are still
 memory-only and die with the daemon (#908); the 8 h request window is still shorter than the
 mesh's delivery latency (#956); the member still cannot ask for recursion itself (#1022's member
-half); grants carry reach, not mode (#1098 §2); and a shell path the parser cannot see (code
+half); grants now RECORD a mode (r/w/e/d, #1345 part A) but the gate does not yet enforce it, so a
+grant narrower than rwed is withheld from the gate entirely (fail closed) until #1345 part B; and a
+shell path the parser cannot see (code
 inside `python -c`, a variable set earlier in the same command, `cd` followed by relative paths)
 is still judged only where it is spelled.
 

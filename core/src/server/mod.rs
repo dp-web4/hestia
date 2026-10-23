@@ -11,6 +11,7 @@ pub mod decision_witness;
 pub mod evidence;
 pub mod gate_escalation;
 pub mod governance_ledger;
+pub mod grant_modes;
 mod handler;
 mod http;
 mod hub_tab;

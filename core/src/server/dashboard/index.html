@@ -909,6 +909,17 @@
     border-radius: 4px; font-size: 11px; padding: 2px 8px; cursor: pointer; margin-left: 6px; }
   .grant-act:hover { filter: brightness(1.2); }
   .grant-reach { color: var(--accent); margin-left: 2px; font-weight: 600; }
+  /* r / w / e / d on the grant heading, after LIVE/STANDING (dp, 2026-10-22, #1345). Disabled
+     except in the row's Edit mode, so no stray click can change what a member may do. */
+  .grant-modes { display: inline-flex; gap: 4px; flex-wrap: wrap; font-size: 0.74rem; }
+  .grant-modes label { display: inline-flex; align-items: center; gap: 1px; color: var(--fg-dim);
+    border: 1px solid var(--border, var(--fg-dim)); border-radius: 3px; padding: 0 4px; }
+  .grant-modes label.on { color: var(--fg); }
+  .grant-modes input { margin: 0 2px 0 0; }
+  .grant-row.editing { border-color: var(--accent); }
+  .grant-edit-path { font: inherit; font-family: monospace; min-width: 18rem; flex: 1 1 18rem; }
+  .grant-edit-summary { flex-basis: 100%; font-size: 0.76rem; color: var(--fg-dim); white-space: pre-line; }
+  .grant-edit-summary.widens { color: var(--warning); }
   .grant-revoke { background: transparent; color: var(--coral); border: 1px solid var(--coral);
     border-radius: 4px; padding: 0.15rem 0.6rem; font: inherit; font-size: 0.72rem; cursor: pointer; }
 
@@ -4185,6 +4196,61 @@
   // have a grant" and "you have a grant until someone restarts the daemon" are different
   // facts and only one of them is what the operator thinks they bought. Standing renders
   // plain. There is no state in which a grant that is about to evaporate renders as calm.
+  // GRANT MODES (#1345): r read, w write, e execute, d delete. A grant without `modes` is from a
+  // daemon that predates them, where every grant allowed all four.
+  const GRANT_MODES = [['r', 'read'], ['w', 'write'], ['e', 'execute'], ['d', 'delete']];
+  function grantModeSet(m) { return new Set(String(m ?? 'rwed').split('')); }
+  function grantModeLetters(set) { return GRANT_MODES.map(([l]) => l).filter(l => set.has(l)).join(''); }
+  function grantModeBoxes(modes, enabled) {
+    const on = modes instanceof Set ? modes : grantModeSet(modes);
+    return `<span class="grant-modes" title="what this grant lets the member do here">${
+      GRANT_MODES.map(([l, word]) => `<label class="${on.has(l) ? 'on' : ''}" title="${word}"><input type="checkbox"
+        data-grant-mode="${l}" ${on.has(l) ? 'checked' : ''} ${enabled ? '' : 'disabled'}>${l}</label>`).join('')
+    }</span>`;
+  }
+
+  // The Edit row's staged draft: nothing is sent until Save (dp, 2026-10-22). One edit at a time.
+  let grantEdit = null;
+
+  // What Save would change, in words, and whether it WIDENS. Mirrors the daemon's rule
+  // (`GrantEdit::widens`): any added mode, exact made recursive, or a path outside the old
+  // reach. The daemon recomputes it and is the authority; this is so the operator reads it first.
+  function grantEditSummary(ed) {
+    const b = ed.before, d = ed.draft;
+    const lines = [];
+    const bm = grantModeLetters(b.modes), dm = grantModeLetters(d.modes);
+    if (d.path !== b.path) lines.push(`path: ${b.path} → ${d.path}`);
+    if (d.recursive !== b.recursive) lines.push(`reach: ${b.recursive ? 'recursive' : 'exact'} → ${d.recursive ? 'recursive' : 'exact'}`);
+    if (dm !== bm) lines.push(`modes: ${bm || '(none)'} → ${dm || '(none)'}`);
+    const under = (root, p) => p === root || p.startsWith(root.replace(/\/+$/, '') + '/');
+    const addsMode = [...d.modes].some(l => !b.modes.has(l));
+    const widensReach = d.recursive ? !(b.recursive && under(b.path, d.path))
+                                    : !(d.path === b.path || (b.recursive && under(b.path, d.path)));
+    return { lines, widens: addsMode || widensReach, empty: !lines.length, none: !d.modes.size };
+  }
+
+  function renderGrantEditRow(g) {
+    const ed = grantEdit;
+    const sum = grantEditSummary(ed);
+    const narrowed = ed.draft.modes.size < 4;
+    return `
+        <div class="grant-row editing">
+          <span class="grant-who">${memberName(g.plugin_id ?? '?')}</span>
+          <span class="grant-preset scope-standing">STANDING</span>
+          ${grantModeBoxes(ed.draft.modes, true)}
+          <input class="grant-edit-path" data-grant-edit-path value="${escapeHtml(ed.draft.path)}" spellcheck="false">
+          <label class="grant-ttl"><input type="checkbox" data-grant-edit-recursive ${ed.draft.recursive ? 'checked' : ''}> recursive (/**)</label>
+          <button class="grant-act" data-grant-edit-save ${sum.empty || sum.none ? 'disabled' : ''}>save</button>
+          <button class="grant-revoke" data-grant-edit-cancel>cancel</button>
+          <span class="grant-edit-summary${sum.widens ? ' widens' : ''}">${escapeHtml(
+            sum.none ? 'choose at least one of r, w, e, d (to remove the grant, revoke it)'
+            : sum.empty ? 'no change yet'
+            : sum.lines.join('\n') + (sum.widens ? '\n⚠ WIDENS what this member may reach or do (a reason is required)' : '\nnarrows only'))}${
+            narrowed ? escapeHtml('\nNote: until this machine\'s gate enforces modes (hestia #1345, part B), a grant narrower than rwed is withheld from the gate entirely, so it gives the member no reach at all. Nothing widens in the meantime.') : ''}</span>
+          <span class="grant-edit-summary widens grant-edit-moved" hidden>the grants changed since you opened this edit; Save will be refused. Cancel and edit again.</span>
+        </div>`;
+  }
+
   function renderScopeGrants(data) {
     const gen = $('scope-gen');
     if (gen) {
@@ -4236,8 +4302,20 @@
         a path outside it will be denied until you grant one here.</div>`;
       return;
     }
+    // AN EDIT IN PROGRESS IS NOT REDRAWN UNDER THE OPERATOR (#1345). The list re-renders on every
+    // tick; rebuilding it mid-edit would drop focus and the half-typed path. The staged draft
+    // lives in `grantEdit`, and the row is kept as it is until Save or Cancel. If the store moved
+    // meanwhile, the row says so now, and the daemon refuses the Save anyway.
+    if (grantEdit && list.querySelector('.grant-row.editing')) {
+      const moved = (data.standing_generation ?? 0) !== grantEdit.generation;
+      const note = list.querySelector('.grant-edit-moved');
+      if (note) note.hidden = !moved;
+      return;
+    }
     list.innerHTML = rows.map(g => {
       const live = g.lifetime === 'live';
+      const editing = !live && grantEdit && grantEdit.member === g.plugin_id && grantEdit.path === g.path;
+      if (editing) return renderGrantEditRow(g);
       const secs = g.secs_remaining;
       const when = live
         ? `dies on restart · ${escFmtAge(secs ?? 0)} left`
@@ -4253,6 +4331,7 @@
         <div class="grant-row">
           <span class="grant-who">${memberName(g.plugin_id ?? '?')}</span>
           <span class="grant-preset${live ? '' : ' scope-standing'}">${live ? 'LIVE' : 'STANDING'}</span>
+          ${grantModeBoxes(g.modes, false)}
           <code>${escapeHtml(String(g.path ?? ''))}${g.recursive ? '<span class="grant-reach" title="reaches the whole subtree">/**</span>' : ''}</code>
           <span class="grant-ttl">${escapeHtml(when)}</span>
           <span class="grant-why">${escapeHtml(origin)}${
@@ -4273,6 +4352,9 @@
             : `<button class="grant-revoke" data-revoke-member="${
             escapeHtml(String(g.plugin_id))}" data-revoke-path="${
             escapeHtml(String(g.path))}">revoke</button>`}
+          ${live ? '' : `<button class="grant-act" data-edit-member="${
+            escapeHtml(String(g.plugin_id))}" data-edit-path="${
+            escapeHtml(String(g.path))}" title="change this grant's path, reach and r/w/e/d together; nothing changes until Save">edit</button>`}
           ${live ? '' : `<button class="grant-act" data-move-member="${
             escapeHtml(String(g.plugin_id))}" data-move-path="${
             escapeHtml(String(g.path))}" data-move-recursive="${g.recursive ? 'true' : 'false'}"
@@ -6159,9 +6241,80 @@
 
     // Revoke, and the hand-off to the one decide control. Delegated, because the rows are
     // re-rendered on every tick and per-row listeners would be rebound continuously.
+    // EDIT (dp, 2026-10-22, #1345): stage path + reach + modes; nothing changes until Save.
+    pane.addEventListener('input', (e) => {
+      if (!grantEdit) return;
+      const row = e.target.closest('.grant-row.editing');
+      if (!row) return;
+      if (e.target.matches('[data-grant-edit-path]')) grantEdit.draft.path = e.target.value.trim();
+      else if (e.target.matches('[data-grant-edit-recursive]')) grantEdit.draft.recursive = e.target.checked;
+      else if (e.target.matches('[data-grant-mode]')) {
+        const l = e.target.dataset.grantMode;
+        if (e.target.checked) grantEdit.draft.modes.add(l); else grantEdit.draft.modes.delete(l);
+        e.target.closest('label')?.classList.toggle('on', e.target.checked);
+      } else return;
+      // Refresh only the summary and Save: redrawing the row would steal the cursor.
+      const sum = grantEditSummary(grantEdit);
+      const box = row.querySelector('.grant-edit-summary:not(.grant-edit-moved)');
+      const tmp = document.createElement('div');
+      tmp.innerHTML = renderGrantEditRow({ plugin_id: grantEdit.member });
+      const fresh = tmp.querySelector('.grant-edit-summary:not(.grant-edit-moved)');
+      if (box && fresh) { box.className = fresh.className; box.textContent = fresh.textContent; }
+      const save = row.querySelector('[data-grant-edit-save]');
+      if (save) save.disabled = sum.empty || sum.none;
+    });
     pane.addEventListener('click', async (e) => {
       const open = e.target.closest('[data-open-scope]');
       if (open) { $('scope-modal').hidden = false; return; }
+      const ed = e.target.closest('[data-edit-member]');
+      if (ed) {
+        const member = ed.dataset.editMember, p = ed.dataset.editPath;
+        const g = (lastData?.scope_grants ?? []).find(x => x.lifetime === 'standing'
+          && x.plugin_id === member && x.path === p);
+        if (!g) return;
+        const before = { path: g.path, recursive: !!g.recursive, modes: grantModeSet(g.modes) };
+        grantEdit = { member, path: p, generation: lastData?.standing_generation ?? 0, row: g, before,
+                      draft: { path: before.path, recursive: before.recursive, modes: new Set(before.modes) } };
+        err.hidden = true;
+        renderScopeGrants(lastData);
+        return;
+      }
+      if (e.target.closest('[data-grant-edit-cancel]')) {
+        grantEdit = null; err.hidden = true;
+        renderScopeGrants(lastData);
+        return;
+      }
+      const save = e.target.closest('[data-grant-edit-save]');
+      if (save && grantEdit) {
+        const sum = grantEditSummary(grantEdit);
+        if (sum.empty || sum.none) return;
+        const head = `Save this edit to ${grantEdit.member}'s standing grant?\n\n${sum.lines.join('\n')}\n\n`;
+        const why = sum.widens
+          ? prompt(head + 'This WIDENS what the member may reach or do. Reason (required):')
+          : prompt(head + 'This only narrows. Reason (optional):');
+        if (why === null) return;
+        if (sum.widens && !why.trim()) { err.textContent = 'a reason is required to widen a grant'; err.hidden = false; return; }
+        save.disabled = true; err.hidden = true;
+        try {
+          const res = await apiFetch('/api/scope/standing/edit', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              plugin_id: grantEdit.member, path: grantEdit.path,
+              new_path: grantEdit.draft.path, recursive: grantEdit.draft.recursive,
+              modes: grantModeLetters(grantEdit.draft.modes), reason: why,
+              expected_generation: grantEdit.generation, expected_existing: grantEdit.row,
+            }),
+          });
+          const out = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+          grantEdit = null;
+          await tick(); renderScopeGrants(lastData);
+        } catch (e2) {
+          // The draft is kept: a refused Save leaves both the grant and the staged edit as they were.
+          err.textContent = `edit failed: ${e2.message}`; err.hidden = false; save.disabled = false;
+        }
+        return;
+      }
       // make standing — POST /api/scope/standing/promote
       const pro = e.target.closest('[data-promote-member]');
       if (pro) {
