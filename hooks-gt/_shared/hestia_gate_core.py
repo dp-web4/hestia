@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 2b946d537ebbebd68fa8f38289edfcad101eebd30232a9ec35068b26b0beeed0  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: d2ddf60f60e23965b9b413c3eaf6a4e096bfea9bbc1495c4e60caf7df4ef1b38  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -1610,6 +1610,12 @@ _GREP_SPEC = {"pattern_first": True, "pattern_opts": {"-e", "--regexp"}, "file_o
               "value_opts": {"-A", "-B", "-C", "-m", "--max-count", "--include", "--exclude",
                              "--exclude-dir", "--context", "--after-context", "--before-context",
                              "-d", "--directories", "-D", "--devices", "--label"}}
+#: `git grep` (after the subcommand): grep's grammar. Its `-C` is context, not git's directory.
+_GIT_GREP_SPEC = dict(_GREP_SPEC)
+#: Heads whose PATTERN operands the in-workspace passes of `command_scope_reach` do not read as
+#: reaches (#1241 recut, SAGE #368): the tool matches the text against what it reads and never
+#: opens it. Recorded by value in `_Found.patterns`, LITERAL words only (an expansion stays live).
+_PATTERN_HEADS = frozenset(("grep", "egrep", "fgrep", "rg", "git-grep"))
 _CMD_SPECS = {
     "tr": {"positional": "strings"},
     "echo": {"positional": "strings_noglob"},
@@ -1891,6 +1897,7 @@ class _Found:
         self.dirs = []              # literal directories relative paths may resolve under
         self.dirs_unknown = None    # why a directory change cannot be followed
         self.known = {}             # names bound to ONE literal so far (`_literal_names`)
+        self.patterns = []          # literal grep-family PATTERN values (`_PATTERN_HEADS`, #1241)
 
 
 #: THE SINGLE-LITERAL-ASSIGNMENT RULE (dp's ruling, 2026-10-11, measured on #1232 first: ~45% of
@@ -2037,6 +2044,21 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
         out.extend(_outside_candidates(_strip_data_heredocs(
             text.replace(_DQ_REF, "").replace(_BRACE, "").replace(_LIT_DOLLAR, "$")
             .replace(_LIT_TICK, "`")), pwd, depth + 1, found))
+
+    def pattern(word, judge=True):
+        """A grep-family PATTERN operand: data like any other (`data`), and, when it is one LITERAL
+        word, its value is recorded so the workspace passes do not judge text the tool only matches
+        against (#1241 recut). A word holding any expansion is not recorded: what it expands to is
+        not known, and a substitution inside it was already lifted out and is judged."""
+        if state["head"] in _PATTERN_HEADS and _LIT_DOLLAR not in word and _LIT_TICK not in word:
+            try:
+                literal = not _expansion_spans(word)
+            except _Unmodelled:
+                literal = False
+            if literal and "$" not in word and "`" not in word and word:
+                found.patterns.append(word)
+        if judge:
+            data(word)
 
     def in_force():
         cut = body_origin
@@ -2272,7 +2294,9 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                     or opt in _string_opts(head, spec, state["subs"])) and not uglob:
                 if opt in spec.get("pattern_opts", ()):
                     state["pattern_given"] = True
-                data(w)
+                    pattern(w)
+                else:
+                    data(w)
                 continue
             if opt == "-c" and _HEREDOC_SHELL.match(head):
                 code(w)
@@ -2314,6 +2338,8 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                                  or name in spec.get("pattern_opts", ())
                                  or name in strs):
                     emit(val, uglob)
+                elif name in spec.get("pattern_opts", ()):
+                    pattern(val)
                 else:
                     data(val)
                 continue
@@ -2343,12 +2369,18 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                                  or w[:2] in spec.get("pattern_opts", ())
                                  or w[:2] in spec.get("string_opts", ())):
                     emit(w[2:], uglob)
+                elif w[:2] in spec.get("pattern_opts", ()):
+                    pattern(w[2:], judge=False)            # as before, plus its value recorded
                 continue
             m = _ATTACHED_OPT.match(w)
             if m:
                 emit(m.group(1), uglob)                    # `-I/usr/include`, `-C/elsewhere`
             continue
         state["positional"] += 1
+        if head == "git" and state["positional"] == 1 and w == "grep":
+            # `git [opts] grep …`: from here the arguments are grep's (#1241 recut).
+            state.update(head="git-grep", spec=_GIT_GREP_SPEC, positional=0, opts_done=False)
+            continue
         if len(state["subs"]) < 3:
             state["subs"].append(w)
         if state["positional"] == 1 and _HEREDOC_INTERPRETER.match(head) and not state["code_opt"]:
@@ -2390,7 +2422,7 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
             continue
         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
                 and not uglob:
-            data(w)
+            pattern(w)
             continue
         name, eq, val = w.partition("=")
         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
@@ -2581,6 +2613,59 @@ def _literal_for_body_uncertain(body: str, var: str, item: str) -> bool:
     return False
 
 
+#: Operator-declared TOOLCHAIN roots (colon- or comma-separated absolute paths), e.g. a conda
+#: install under the home: `HESTIA_TOOL_ROOTS=<home>/miniforge3`. A command's reach under one is
+#: not MRH-scoped, the way TEMP_ROOTS are not: an interpreter and its libraries are the tool, not
+#: the territory. Why (SAGE #368, 2026-10-05): with a being judged under its seat's workspace (the
+#: home), every sandboxed `check` (`bwrap --ro-bind <home>/miniforge3 ...`, PATH=...) and every
+#: `game` (`<home>/miniforge3/bin/python3 ...`) was denied "'miniforge3' is not granted": a grant
+#: for an interpreter would be a grant of nothing the member owns. DECLARED, never inferred, and
+#: egress still applies first. A root that is `/`, relative, the workspace, or an ancestor of it is
+#: ignored, so a misconfiguration cannot ungovern the territory it was meant to sit beside.
+TOOL_ROOTS_ENV = "HESTIA_TOOL_ROOTS"
+
+
+def _tool_roots(workspace: str) -> tuple:
+    raw = os.environ.get(TOOL_ROOTS_ENV, "")
+    ws = os.path.normpath(os.path.expanduser(workspace or "/")).replace("\\", "/").rstrip("/") or "/"
+    out = []
+    for part in re.split(r"[:,]", raw):
+        part = part.strip()
+        if not part:
+            continue
+        r = os.path.normpath(os.path.expanduser(part)).replace("\\", "/").rstrip("/")
+        if not r.startswith("/") or r in ("", "/"):
+            continue
+        if ws == r or ws.startswith(r + "/"):
+            continue                      # the workspace or an ancestor: never a tool root
+        out.append(r)
+    return tuple(out)
+
+
+def _under_any(path: str, roots) -> bool:
+    p = os.path.normpath(path.replace("\\", "/")).replace("\\", "/")
+    return any(p == r or p.startswith(r + "/") for r in roots)
+
+
+def _grammar_patterns(cmd: str, cwd: Optional[str]) -> tuple:
+    """(patterns, judged) from the shell grammar: the literal grep-family PATTERN values it
+    recognised (`_PATTERN_HEADS`), and every word it judges as a path. ((), ()) when it cannot
+    read the line, so nothing is skipped (pass 3 then refuses the line as unenumerated)."""
+    found = _Found()
+    try:
+        cands = _outside_candidates(_strip_data_heredocs(cmd), cwd or "", found=found)
+    except _Unmodelled:
+        return (), ()
+    return tuple(found.patterns), tuple(c[0] for c in cands)
+
+
+def _only_pattern_text(text: str, patterns, judged) -> bool:
+    """A mention the in-workspace passes do not judge (#1241 recut): it lies inside a recognised
+    grep-family PATTERN and inside no word the grammar judges as a path. `grep '<ws>/x' <ws>/x`
+    still judges `<ws>/x`, because the operand names it too."""
+    return bool(text) and any(text in p_ for p_ in patterns) and not any(text in j for j in judged)
+
+
 def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
                         forbidden=None, home_markers=None):
     """Returns (ok, offending_token, resolved_path). See `_command_scope_reach_one`; a command
@@ -2648,12 +2733,22 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     # Pass 0 — the shell's home spellings, expanded before anything reads the text, so a
     # workspace path spelled `~/…` or `$HOME/…` meets pass 1 like its literal spelling does.
     cmd = _expand_home_words(cmd)
+    # TWO THINGS INSIDE THE WORKSPACE ARE NOT A REACH (#1241 recut, SAGE #368): a grep-family
+    # PATTERN, which the tool matches against and never opens (a being's own `-e '<ws>[^ ]*ft09'`
+    # was refused "'[^' is not granted"), and a path under a declared toolchain root. Patterns are
+    # recognised by the shell GRAMMAR (`_CMD_SPECS`), never by rewriting the text, so a live
+    # substitution inside one is still lifted out and judged, and pass 3 is not touched.
+    patterns, judged_words = _grammar_patterns(cmd, cwd)
+    tool_roots = _tool_roots(workspace)
     for after in cmd.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
         # resolving into an ungranted repo — path_in_scope's B5 one function over. A command's
         # text is member-controlled end to end, so this one needs no harness to cooperate.
         tok = re.split(r"""[\s"'`);&|<>]""", after.lstrip("/"), 1)[0]
+        if patterns and _only_pattern_text(workspace + after[:len(after) - len(after.lstrip("/"))] + tok,
+                                           patterns, judged_words):
+            continue
         resolved = os.path.normpath(f"{ws}/{tok}").replace("\\", "/")
         if resolved != ws and not resolved.startswith(ws + "/"):
             # Traversed out of the workspace: judged WHERE IT LANDS, by the outside rule (pass 3),
@@ -2669,6 +2764,10 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
         hidden = _symlink_target_forbidden(resolved, egress)
         if hidden is not None:
             return False, hidden, hidden
+        # A DECLARED TOOLCHAIN is not governed territory (HESTIA_TOOL_ROOTS): judged after egress,
+        # so a forbidden symlink target under a tool root still denies.
+        if tool_roots and _under_any(resolved, tool_roots):
+            continue
         seg = resolved[len(ws):].lstrip("/").split("/", 1)[0]
         if seg not in repo_scopes and not _within_path_grant(resolved, scopes, workspace):
             refused = _symlinked_reach_verdict(resolved, seg, repo_scopes, scopes, workspace)
@@ -2698,6 +2797,8 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
                 continue
             if "/" not in tok and tok in MEMBER_ADDRESSES:
                 continue
+            if patterns and _only_pattern_text(tok, patterns, judged_words):
+                continue                      # text inside a grep-family pattern (#1241 recut)
             if tok in seen2:
                 continue                      # a repeated spelling is judged once
             seen2.add(tok)
