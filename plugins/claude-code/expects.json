@@ -18,8 +18,18 @@
       "hooks/pre_tool_use.py",
       "hooks/witness.py",
       "hooks/law_inject.py",
-      "hooks/disposition_deliver.py"
+      "hooks/disposition_deliver.py",
+      "../member-mesh/session-mesh-inbox.sh",
+      "../member-mesh/prompt-disposition-watch.sh"
     ],
+    "companions": [
+      {
+        "file": "../member-mesh/hestia-mesh.py",
+        "beside": "session-mesh-inbox.sh"
+      }
+    ],
+    "_companions_note": "#1373: a companion is a file no harness registers but a registered hook calls from its own directory; install-members.sh installs it into the directory the named hook was installed to, with the same backup and verify, and records it in the manifest.",
+    "mesh_member": "claude-code",
     "gate_probe": {
       "entry": "hooks/pre_tool_use.py",
       "environment": {

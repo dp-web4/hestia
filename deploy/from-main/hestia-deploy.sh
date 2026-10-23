@@ -923,6 +923,36 @@ install_inventory() {
   fi
 }
 
+# THE MEMBER MESH'S WATCHERS (#1373). dp, 2026-10-23: the mesh is "a standard part of what hestia does,
+# fleet-wide, and installation should be automatic". The members' install above now installs each member's
+# mesh hooks from its template, like any other hook (delivery into a live session). This step installs what
+# wakes or reports to a member between sessions: one systemd user unit per member registered on this host,
+# written by plugins/member-mesh/install-watchers.sh from THIS checkout. Firing a headless CLI stays an
+# operator act per member ($HESTIA_HOME/mesh-fire.d/<member>); the default unit is print-only.
+# The same contract as the inventory: never stops a deploy, refuses inside a governed session (it writes and
+# starts units for the very seats such a session belongs to), and records what is RUNNING, read back from
+# systemd, not the installer's exit code. Thor ran this deploy every 4 h with no watcher and no mesh hook for
+# weeks, and no line anywhere said so; `mesh=` on every DEPLOYED/CURRENT line is that line.
+mesh=""
+install_mesh() {
+  mesh="skipped"
+  [ "${HESTIA_DEPLOY_MESH:-1}" = "1" ] || { mesh="skipped(HESTIA_DEPLOY_MESH=0)"; return 0; }
+  if [ -n "${CLAUDECODE:-}" ] || [ -n "${HESTIA_ROLE:-}" ]; then
+    mesh="refused(governed session)"; return 0
+  fi
+  local src="$DEPLOY_ROOT/hestia/plugins/member-mesh/install-watchers.sh" out rc=0
+  [ -f "$src" ] || { mesh="skipped(no installer in the checkout)"; return 0; }
+  # `|| rc=$?`: under `set -euo pipefail` a dying installer makes the pipeline's status the assignment's, and
+  # without the guard that ends the WHOLE deploy (the inventory step's first draft, inventory_step_test.py). The
+  # installer exits 0 by contract, so any other status means it did not finish: its last line is not a summary.
+  out="$(HESTIA_HOME="$HESTIA_HOME" HESTIA_WORKSPACE="${HESTIA_WORKSPACE:-}" bash "$src" 2>>"$LOG" | tee -a "$LOG" | tail -1)" || rc=$?
+  [ "$rc" = "0" ] || { mesh="FAILED(install-watchers.sh rc=$rc)"; return 0; }
+  case "$out" in
+    "mesh:"*) mesh="$(printf '%s' "${out#mesh:}" | sed -e 's/^ *//' -e 's/ /,/g')"; mesh="${mesh:-none}" ;;
+    *)        mesh="FAILED(no summary line from install-watchers.sh)" ;;
+  esac
+}
+
 # THE OPERATOR'S STEPS AFTER A DEPLOY, NOT HESTIA'S (cbp-claude, 2026-10-22). Some state on a
 # box is derived from the deployed build and is not hestia's to know about. On CBP the beings
 # read their law from a read-only snapshot of the deployed source (SAGE
@@ -1251,7 +1281,8 @@ if [ "$MODE" = "--hooks-only" ]; then
   fi
   install_hooks
   install_inventory
-  log "HOOKS-ONLY $target hooks=$hooks inventory=$inventory seats=$seats"
+  install_mesh
+  log "HOOKS-ONLY $target hooks=$hooks inventory=$inventory mesh=$mesh seats=$seats"
   [ "$hooks" = "ok" ] || { log "manifest not written; $(hooks_repair_hint)"; exit 1; }
   exit 0
 fi
@@ -1268,8 +1299,9 @@ if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
     log "CURRENT $target but manifest says '${manifest:-none}'; re-running the members' install"
     install_hooks
     install_inventory
+    install_mesh
     run_post_deploy "$target"
-    log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory seats=$seats post_deploy=$post_deploy"
+    log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory mesh=$mesh seats=$seats post_deploy=$post_deploy"
     case "$hooks" in
       ok) exit 0 ;;
       *)  log "HALF-DEPLOYED $target: binary current, manifest still '${manifest:-none}' (hooks=$hooks); $(hooks_repair_hint)"; exit 1 ;;
@@ -1277,9 +1309,9 @@ if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
   fi
   # The ordinary cycle is where a stale inventory copy gets noticed: most cycles are this
   # one, and the inventory's source moves without the daemon's binary moving with it.
-  if [ "$MODE" = "full" ]; then install_inventory; run_post_deploy "$target"; fi
+  if [ "$MODE" = "full" ]; then install_inventory; install_mesh; run_post_deploy "$target"; fi
   secret_hygiene
-  log "CURRENT $target${inventory:+ inventory=$inventory}${post_deploy:+ post_deploy=$post_deploy}"
+  log "CURRENT $target${inventory:+ inventory=$inventory}${mesh:+ mesh=$mesh}${post_deploy:+ post_deploy=$post_deploy}"
   exit 0
 fi
 if [ "$MODE" = "--check" ]; then
@@ -1334,6 +1366,7 @@ log "daemon up on $newv after $(( $(date +%s) - T0 ))s"
 # ---- members' governance surface, from the SAME checkout -----------------------------------------
 install_hooks
 install_inventory
+install_mesh
 run_post_deploy "$newv"
 
 # ---- prune old backups (newest KEEP_BACKUPS stay) -----------------------------------------------------
@@ -1342,7 +1375,7 @@ ls -1t "$HESTIA_HOME"/hestia.prev-* 2>/dev/null | tail -n +"$(( KEEP_BACKUPS + 1
 done
 
 secret_hygiene
-log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory seats=$seats post_deploy=$post_deploy in $(( $(date +%s) - T0 ))s"
+log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory mesh=$mesh seats=$seats post_deploy=$post_deploy in $(( $(date +%s) - T0 ))s"
 # The new binary is live, so this box now runs the latest main: no update is available.
 running="$newv"
 write_check_result up-to-date "$target"

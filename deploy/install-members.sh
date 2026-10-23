@@ -520,10 +520,54 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
     # actually went — not where a manifest said they would. An audit that reads this can
     # now be checked against the live registration instead of against the same claim.
     member_files_json="$member_files_json{\"file\":\"$base\",\"path\":\"$target\",\"sha256\":\"$src_hash\"},"
+    # basename -> the directory it was installed to; companions anchor here (#1373). Declared on first use
+    # (an existing associative array keeps its entries), unset after this member's companions below.
+    declare -A installed_dir
+    installed_dir["$base"]="$target_dir"
     # Where the hooks actually run from anchors the identity seed below. hydrate.sh's fallback is
     # $(dirname "$0")/.., so its own directory wins when it is one of the files.
     if [ -z "$seed_anchor" ] || [ "$base" = "hydrate.sh" ]; then seed_anchor="$target_dir"; fi
   done
+
+  # --- COMPANIONS (#1373) -----------------------------------------------------------------------
+  # A file no harness registers but a registered hook calls from its OWN directory: the member
+  # mesh's session-mesh-inbox.sh and prompt-disposition-watch.sh both run $(dirname "$0")/
+  # hestia-mesh.py. The registration-derived loop above cannot place it (nothing invokes it by
+  # path), so the member declares which installed hook it sits beside, and it goes wherever that
+  # hook went -- derived, never assumed (invariant 1). The hook was not installed on this host ->
+  # the companion is not either, said aloud. Same backup (2) and per-file verify (3).
+  declare -A installed_dir
+  mapfile -t companions < <(python3 -c '
+import json,sys
+for c in (json.load(open(sys.argv[1])).get("install") or {}).get("companions",[]):
+    print(c["file"] + "\t" + c["beside"])' "$expects")
+  for row in "${companions[@]}"; do
+    rel="${row%%$'\t'*}"; beside="${row#*$'\t'}"
+    src="$REPO_ROOT/plugins/$member/$rel"
+    [ -f "$src" ] || die "$member declares companion '$rel' but $src does not exist"
+    base="$(basename "$rel")"
+    dir="${installed_dir[$beside]:-}"
+    if [ -z "$dir" ]; then
+      log "  skip  $base — companion of $beside, which is not installed on this host"
+      any_skipped=1
+      continue
+    fi
+    target="$dir/$base"
+    src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
+    if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$src_hash" ]; then
+      log "  ok    $base (companion of $beside, already current) -> $dir"
+    elif [ "$DRY_RUN" = "1" ]; then
+      log "  would $base (companion of $beside) -> $dir"
+    else
+      [ -f "$target" ] && cp -p "$target" "$target.pre-install.bak"
+      install -m 0755 "$src" "$target"
+      got="$(sha256sum "$target" | cut -d' ' -f1)"
+      [ "$got" = "$src_hash" ] || die "$member/$base verify FAILED (src $src_hash != installed $got)"
+      log "  wrote $base (companion of $beside) -> $dir"
+    fi
+    member_files_json="$member_files_json{\"file\":\"$base\",\"path\":\"$target\",\"sha256\":\"$src_hash\"},"
+  done
+  unset installed_dir
 
   # A member every one of whose files was unregistered installed NOTHING; recording it
   # would be invariant 4's failure one level down — a partial (here, empty) install
