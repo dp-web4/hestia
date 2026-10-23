@@ -228,14 +228,48 @@ class CandidateTests(unittest.TestCase):
             with self.assertRaises(c.CandidateError):
                 self.get()
 
+    def test_unknown_command_fields_refuse_even_with_a_known_target(self):
+        target = "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"
+        for extra in ({"args": ["--other"]}, {"env": {"PYTHONPATH": "/elsewhere"}},
+                      {"commands": ["echo other"]}, {"futureField": False}):
+            with self.subTest(extra=extra):
+                self.set_registration({"hooks": {"Event": [{
+                    "type": "command", "command": target, **extra}]}})
+                with self.assertRaises(c.CandidateError):
+                    self.get()
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = c.main(["--store", str(self.root), "--unit", "beta",
+                                 "--member", "beta-member", "--version", self.version])
+                self.assertEqual(rc, 2)
+                self.assertEqual(out.getvalue(), "")
+
+    def test_known_command_metadata_passes_without_becoming_a_target(self):
+        self.set_registration({"hooks": {"Event": [{"hooks": [{
+            "type": "command", "command": "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py",
+            "timeout": 15, "statusMessage": "Checking the request"}]}]}})
+        self.assertEqual(self.get()["command_targets"], ["beta/hooks/worker.py"])
+
+    def test_command_metadata_must_not_hide_structures_or_coerce_types(self):
+        for extra in ({"timeout": True}, {"timeout": 0}, {"timeout": "15"},
+                      {"timeout": {"command": "echo hidden"}},
+                      {"statusMessage": {"command": "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"}}):
+            with self.subTest(extra=extra):
+                self.set_registration({"hooks": {"Event": [{
+                    "command": "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py", **extra}]}})
+                with self.assertRaises(c.CandidateError):
+                    self.get()
+
     def test_quoted_target_resolves_but_traversal_refuses(self):
         self.set_registration({"hooks": {"Event": [{"command":
             'python3 "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"'}]}})
         self.assertEqual(self.get()["command_targets"], ["beta/hooks/worker.py"])
         self.set_registration({"hooks": {"Event": [{"command":
             "python3 @HESTIA_PLUGIN_ROOT@/beta/hooks/../hooks/worker.py"}]}})
-        with self.assertRaises(c.CandidateError):
+        with self.assertRaises(c.CandidateError) as caught:
             self.get()
+        self.assertEqual(caught.exception.unresolved_targets,
+                         ["python3 @HESTIA_PLUGIN_ROOT@/beta/hooks/../hooks/worker.py"])
 
     def test_nonregistration_json_cannot_hide_digest_header(self):
         # Derive a recognized header from a published non-JSON blob.
