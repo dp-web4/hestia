@@ -112,7 +112,7 @@ _READER_EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit")
 _CC_FILES = ("pre_tool_use.py", "witness.py", "law_inject.py", "disposition_deliver.py")
 #: The member-mesh pair every member template (claude-code, kimi, codex) registers since #1373:
 #: SessionStart/session-mesh-inbox.sh and UserPromptSubmit/prompt-disposition-watch.sh. install-members.sh
-#: installs them from plugins/member-mesh/ (and hestia-mesh.py beside them, an install.companions entry).
+#: installs them from plugins/member-mesh/RUNTIME_MANIFEST.txt (with hestia-mesh.py, the CLI they call).
 _MESH_FILES = ("session-mesh-inbox.sh", "prompt-disposition-watch.sh")
 _MESH_EVENTS = {"session-mesh-inbox.sh": "SessionStart", "prompt-disposition-watch.sh": "UserPromptSubmit"}
 #: The id each member's mesh lines pin (#108 removed the CLI default; kimi's mesh id is kimi-code).
@@ -1173,7 +1173,7 @@ _SESSION_KEYS = ("CLAUDECODE", "HESTIA_ROLE", "DRY_RUN", "HESTIA_WORKSPACE", "HE
 
 def _e2e_root(tmp: Path):
     """A throwaway repo root with the REAL installer, registrar, shared engine, claude-code plugin and
-    member-mesh plugin (claude-code's expects.json installs ../member-mesh/* since #1373), and a
+    member-mesh runtime (claude-code's expects.json declares mesh_member since #1373), and a
     throwaway HOME holding only ~/.claude/ -- the reviewer's case."""
     root = tmp / "repo"
     (root / "deploy").mkdir(parents=True)
@@ -1208,23 +1208,24 @@ def test_install_members_end_to_end_in_an_isolated_home():
         dest = home / ".claude" / "hooks" / "hestia"
         for b in _CC_FILES:
             assert (dest / b).read_bytes() == (REPO / "plugins" / "claude-code" / "hooks" / b).read_bytes(), b
-        # #1373: the member-mesh pair from plugins/member-mesh, and its CLI, the companion both of them
-        # run as $(dirname $0)/hestia-mesh.py, BESIDE session-mesh-inbox.sh -- with the plugin's bytes
+        # #1373: the member-mesh runtime (RUNTIME_MANIFEST.txt: the pair and the CLI both of them run as
+        # $(dirname $0)/hestia-mesh.py), in the directory session-mesh-inbox.sh runs from -- with the plugin's bytes
         mesh_src = REPO / "plugins" / "member-mesh"
         for b in _MESH_FILES + ("hestia-mesh.py",):
             assert (dest / b).read_bytes() == (mesh_src / b).read_bytes(), b
-        assert "wrote hestia-mesh.py (companion of session-mesh-inbox.sh)" in out, out[-3000:]
+        for b in _MESH_FILES + ("hestia-mesh.py",):
+            assert f"wrote {b} (member mesh) -> {dest}" in out, out[-3000:]
         data = json.loads((home / ".claude" / "settings.json").read_text())
         targets = [RM.target_path(h["command"]) for gs in data["hooks"].values() for g in gs for h in g["hooks"]]
         assert sorted(os.path.basename(x) for x in targets) == sorted(
             ["law_inject.py", "pre_tool_use.py", "witness.py"] + ["disposition_deliver.py"] * 3 + list(_MESH_FILES)), targets
         assert all(os.path.isfile(x) for x in targets), "a registration points at a file that is not on disk"
-        assert "hestia-mesh.py" not in {os.path.basename(x) for x in targets}, "a companion is installed, never registered"
+        assert "hestia-mesh.py" not in {os.path.basename(x) for x in targets}, "the mesh CLI is installed, never registered"
         mesh_cmds = sorted(h["command"] for gs in data["hooks"].values() for g in gs for h in g["hooks"]
                            if h["command"].endswith(_MESH_FILES))
         assert mesh_cmds == sorted(_mesh_cmd("claude-code", dest, b) for b in _MESH_FILES), mesh_cmds
         assert "@HESTIA" not in (home / ".claude" / "settings.json").read_text()
-        # the authority manifest records every file where it actually went, the companion included
+        # the authority manifest records every file where it actually went, the mesh runtime included
         auth = json.loads((Path(env["HESTIA_HOME"]) / "current-build.json").read_text())
         files = {f["file"]: f for m in auth["members"] if m["member"] == "claude-code" for f in m["files"]}
         for b in _MESH_FILES + ("hestia-mesh.py",):
@@ -1237,6 +1238,89 @@ def test_install_members_end_to_end_in_an_isolated_home():
         out2 = p2.stdout + p2.stderr
         assert p2.returncode == 0 and "ok    claude-code — every templated hook is registered" in out2, out2[-2000:]
         assert json.loads((home / ".claude" / "settings.json").read_text()) == data
+
+
+def test_mesh_runtime_loss_refuses_a_local_tuning_and_upgrades_a_banner_only_copy():
+    """#1374 (kimi's v2 review): the LOSS rule is install.sh's. An installed session-mesh-inbox.sh that
+    assigns a HESTIA_* its pinned line does not (an operator's HESTIA_MESH_RESEND_WINDOW=600) is NOT
+    overwritten, named, and the member is skipped -- even though hestia-mesh.py's source text names the
+    same variable. An older copy whose only HESTIA_*= is the banner's HESTIA_MESH_PLUGIN is upgraded, and
+    a drifted hestia-mesh.py (docstrings full of HESTIA_*= text) never blocks an upgrade."""
+    mesh_src = REPO / "plugins" / "member-mesh"
+    inbox = (mesh_src / "session-mesh-inbox.sh").read_text()
+    for label, installed, refused in (
+            ("local tuning", inbox.replace("\n", "\nexport HESTIA_MESH_RESEND_WINDOW=600\n", 1), True),
+            ("banner-only older copy", inbox + "\n# an older revision\n", False)):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            root, home, env = _e2e_root(tmp)
+            dest = home / ".claude" / "hooks" / "hestia"
+            dest.mkdir(parents=True)
+            (dest / "session-mesh-inbox.sh").write_text(installed)
+            (dest / "hestia-mesh.py").write_text((mesh_src / "hestia-mesh.py").read_text() + "\nHESTIA_LOCAL = 1\n")
+            p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True, text=True, env=env)
+            out = p.stdout + p.stderr
+            assert "FATAL" not in out, (label, out[-3000:])
+            if refused:
+                assert "skip  member mesh — the installed" in out and "HESTIA_MESH_RESEND_WINDOW" in out, (label, out[-3000:])
+                assert (dest / "session-mesh-inbox.sh").read_text() == installed, label
+                assert not (dest / "prompt-disposition-watch.sh").exists(), label
+            else:
+                for b in _MESH_FILES + ("hestia-mesh.py",):
+                    assert (dest / b).read_bytes() == (mesh_src / b).read_bytes(), (label, b)
+                assert (dest / "session-mesh-inbox.sh.pre-install.bak").read_text() == installed, label
+
+
+def test_mesh_runtime_refuses_unsafe_names_and_symlinks_before_any_write():
+    """#1374 (Nova): the mesh runtime refuses, BEFORE writing anything into the member's hooks dir, a manifest
+    name that is not a bare filename (`..` traversal, an absolute path, a dotfile), a source that is a symlink,
+    and a plugins/member-mesh that resolves outside the checkout -- at the preflight, so not even the member's
+    own hooks are written (no partial install). A target that is a symlink is skipped and
+    named (a host-side anomaly must not kill the member's whole install), and the symlink is left as it was."""
+    def run(mutate):
+        d = tempfile.mkdtemp()
+        tmp = Path(d)
+        root, home, env = _e2e_root(tmp)
+        dest = home / ".claude" / "hooks" / "hestia"
+        mutate(root, dest, tmp)
+        p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True, text=True, env=env)
+        return p, p.stdout + p.stderr, dest
+
+    def manifest(names):
+        def m(root, dest, tmp):
+            (root / "plugins" / "member-mesh" / "RUNTIME_MANIFEST.txt").write_text("\n".join(names) + "\n")
+        return m
+
+    for bad in ("../claude-code/hooks/witness.py", "/etc/passwd", ".hidden", "sub/x.sh"):
+        p, out, dest = run(manifest(["session-mesh-inbox.sh", bad]))
+        assert p.returncode != 0 and "is not a bare filename" in out, (bad, out[-2000:])
+        assert not dest.exists() or not any(dest.iterdir()), (bad, sorted(os.listdir(dest)))  # nothing at all, not a partial install
+
+    def src_link(root, dest, tmp):
+        f = root / "plugins" / "member-mesh" / "hestia-mesh.py"
+        (tmp / "elsewhere.py").write_bytes(f.read_bytes())
+        f.unlink()
+        f.symlink_to(tmp / "elsewhere.py")
+    p, out, dest = run(src_link)
+    assert p.returncode != 0 and "is a symlink" in out, out[-2000:]
+    assert not dest.exists() or not any(dest.iterdir()), sorted(os.listdir(dest))
+
+    def dir_escape(root, dest, tmp):
+        mm = root / "plugins" / "member-mesh"
+        shutil.move(str(mm), str(tmp / "outside-mesh"))
+        mm.symlink_to(tmp / "outside-mesh")
+    p, out, dest = run(dir_escape)
+    assert p.returncode != 0 and "outside this checkout's plugins/" in out, out[-2000:]
+    assert not dest.exists() or not any(dest.iterdir()), sorted(os.listdir(dest))
+
+    def tgt_link(root, dest, tmp):
+        dest.mkdir(parents=True)
+        (tmp / "victim").write_text("operator's file\n")
+        (dest / "hestia-mesh.py").symlink_to(tmp / "victim")
+    p, out, dest = run(tgt_link)
+    assert "FATAL" not in out, out[-2000:]
+    assert "skip  member mesh — " in out and "hestia-mesh.py is a symlink" in out, out[-2000:]
+    assert (dest / "hestia-mesh.py").is_symlink() and (dest / "hestia-mesh.py").read_text() == "operator's file\n"
 
 
 def test_install_members_reports_a_foreign_narrow_gate_and_widens_an_owned_one():
@@ -1968,8 +2052,9 @@ def test_shipped_member_templates_register_the_mesh_pair_pinned():
     """#1373, the governed half: every mesh member's REAL template registers the mesh pair exactly once --
     session-mesh-inbox.sh on SessionStart (15 s), prompt-disposition-watch.sh on UserPromptSubmit (5 s) --
     pinned to the member's mesh id (an unpinned line is a DARK member since #108), with the launch-role
-    pass-through, and its expects.json agrees: the pin is install.mesh_member, both files are declared
-    from ../member-mesh/, and hestia-mesh.py is a companion beside session-mesh-inbox.sh."""
+    pass-through, and its expects.json agrees: the pin is install.mesh_member, the member's own files never
+    name ../member-mesh/ (the runtime is one shared unit, plugins/member-mesh/RUNTIME_MANIFEST.txt), and
+    install.requires binds all three runtime files into the member's certified version."""
     for m, mid in _MESH_ID.items():
         doc = json.loads((REPO / "plugins" / m / "hooks" / "hooks.json").read_text())
         spec = json.loads((REPO / "plugins" / m / "expects.json").read_text())["install"]
@@ -1982,12 +2067,15 @@ def test_shipped_member_templates_register_the_mesh_pair_pinned():
             assert h["command"] == (f'HESTIA_MESH_PLUGIN={mid} HESTIA_ROLE="${{HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}}" '
                                     f"@HESTIA_PLUGIN_ROOT@/{m}/hooks/{b}"), (m, h["command"])
             assert h["timeout"] == (15 if b == "session-mesh-inbox.sh" else 5), (m, b, h)
-            assert f"../member-mesh/{b}" in spec["files"], (m, b, spec["files"])
-            assert (REPO / "plugins" / m / f"../member-mesh/{b}").resolve().is_file(), (m, b)
         assert spec.get("mesh_member") == mid, (m, spec.get("mesh_member"))
-        assert spec.get("companions") == [{"file": "../member-mesh/hestia-mesh.py", "beside": "session-mesh-inbox.sh"}], \
-            (m, spec.get("companions"))
-        assert (REPO / "plugins" / "member-mesh" / "hestia-mesh.py").is_file()
+        assert not any("member-mesh" in f for f in spec["files"]), (m, spec["files"])
+        assert "companions" not in spec, (m, spec.get("companions"))
+        runtime = [l.strip() for l in (REPO / "plugins" / "member-mesh" / "RUNTIME_MANIFEST.txt").read_text().splitlines()
+                   if l.strip() and not l.lstrip().startswith("#")]
+        assert sorted(runtime) == sorted(_MESH_FILES + ("hestia-mesh.py",)), runtime
+        assert spec.get("requires") == [f"member-mesh/{b}" for b in _MESH_FILES + ("hestia-mesh.py",)], (m, spec.get("requires"))
+        for b in runtime:
+            assert (REPO / "plugins" / "member-mesh" / b).is_file(), b
 
 
 TESTS = [
@@ -2028,6 +2116,8 @@ TESTS = [
     test_install_refuses_a_home_path_with_shell_special_characters,
     test_covers,
     test_install_members_end_to_end_in_an_isolated_home,
+    test_mesh_runtime_loss_refuses_a_local_tuning_and_upgrades_a_banner_only_copy,
+    test_mesh_runtime_refuses_unsafe_names_and_symlinks_before_any_write,
     test_install_members_reports_a_foreign_narrow_gate_and_widens_an_owned_one,
     test_install_names_the_seat_document_step_and_never_fails_on_it,
     test_a_short_registered_timeout_is_reconciled_in_every_reader,

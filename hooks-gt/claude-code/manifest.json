@@ -12,7 +12,7 @@
     },
     {
       "path": "hooks/hooks.json",
-      "sha256": "99abbd954c119823bd411ddb4be4fe5d727819dd899700163da1b679a17a0ff7",
+      "sha256": "6b1c103d29ab0a19227b2e409a3a8a2b0560e576d82cac9c35f980a7da46b5ca",
       "source": "plugins/claude-code/hooks/hooks.json"
     },
     {
@@ -61,6 +61,22 @@
       }
     ]
   },
-  "requires": [],
-  "gt_version": "b1662c83d9c4cc12fd7d23ee192586802880388316821076bb0bbab1bf8e4e28"
+  "requires": [
+    {
+      "unit": "member-mesh",
+      "path": "hestia-mesh.py",
+      "sha256": "79db46f592c5b9f3d32260485578d6c0c8603f75ec12130beedee5573da4d1ce"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "prompt-disposition-watch.sh",
+      "sha256": "23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "session-mesh-inbox.sh",
+      "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+    }
+  ],
+  "gt_version": "8634b7d2b8684ad9f14de2a30a953fc9526393aa3b714029b8aae96d528f885d"
 }

@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "501ba4ed4c864dfddb102db3189c2aa93f92cd30bd71292e133c3e8856428f29",
+      "sha256": "a8157d20a130aefbf073872e25c9a3978406b5376472eabc05a2213208e84b72",
       "source": "plugins/codex/hooks/hooks.json"
     },
     {
@@ -61,6 +61,22 @@
       }
     ]
   },
-  "requires": [],
-  "gt_version": "726f554213431a316ebc331fa7bdd545f363aeb332a350fbc8c2f022031f7615"
+  "requires": [
+    {
+      "unit": "member-mesh",
+      "path": "hestia-mesh.py",
+      "sha256": "79db46f592c5b9f3d32260485578d6c0c8603f75ec12130beedee5573da4d1ce"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "prompt-disposition-watch.sh",
+      "sha256": "23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "session-mesh-inbox.sh",
+      "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+    }
+  ],
+  "gt_version": "7f52901f8869da0e0bd8a1f88e15c3d3f02d86e303bfbb5a105add2e6659999c"
 }

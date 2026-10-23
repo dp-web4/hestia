@@ -60,8 +60,46 @@ TABLE="${HESTIA_MESH_WATCH_TABLE:-claude-code|.claude/settings.json|fire-claude.
 kimi-code|.kimi-code/config.toml|fire-kimi.sh
 codex|.codex/config.toml|fire-codex.sh}"
 
+# HESTIA_MESH_SYSTEMCTL replaces systemctl for the test (install_watchers_test.py): a real run under test would
+# otherwise drive this machine's own user manager, by the real unit names.
+SYSTEMCTL="${HESTIA_MESH_SYSTEMCTL:-systemctl}"
 have_systemd=1
-command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1 || have_systemd=0
+command -v "$SYSTEMCTL" >/dev/null 2>&1 && "$SYSTEMCTL" --user show-environment >/dev/null 2>&1 || have_systemd=0
+
+# Every unit this script writes carries this marker; only a unit carrying it is ever retired.
+MARK="installed by the hestia deploy, #1373"
+
+realp() { realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null \
+  || python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || true; }
+# Owned by this user and writable by no one else -- hestia-deploy.sh's _post_deploy_operator_only, the test that
+# guards $HESTIA_HOME/post-deploy.d (Nova's hold on #1368). -perm -g+w / -o+w: BSD find has no `/`.
+operator_only() {
+  [ -n "$1" ] && [ -O "$1" ] \
+    && [ -z "$(find "$1" -maxdepth 0 \( -perm -g+w -o -perm -o+w \) 2>/dev/null || true)" ]
+}
+
+# FIRE AUTHORITY (Nova's review of #1374): a flag's PRESENCE is not the operator's word. Firing is armed only by a
+# REGULAR file directly in $HESTIA_HOME/mesh-fire.d whose realpath stays there, with that file, the directory and
+# $HESTIA_HOME each owned by this user and writable by no one else, and the directory not itself a symlink. Anything
+# else leaves the unit print-only and says why. Seats do not reach $HESTIA_HOME: the member gate's scope refuses it
+# (a governed member asking for ~/.hestia opens a scope request a peer decides), so the operator-only test is the
+# filesystem half of a boundary whose other half is the gate.
+# Prints "ok" or the reason firing is refused.
+fire_authority() {
+  local id="$1" dir="$HESTIA_HOME/mesh-fire.d" flag rdir rflag
+  flag="$dir/$id"
+  [ -e "$flag" ] || [ -L "$flag" ] || { echo "none"; return 0; }
+  operator_only "$(realp "$HESTIA_HOME")" || { echo "HESTIA_HOME is not operator-only"; return 0; }
+  [ -L "$dir" ] && { echo "mesh-fire.d is a symlink"; return 0; }
+  rdir="$(realp "$dir")"
+  operator_only "$rdir" || { echo "mesh-fire.d is not operator-only"; return 0; }
+  [ -L "$flag" ] && { echo "the flag is a symlink"; return 0; }
+  rflag="$(realp "$flag")"
+  [ "$(dirname "$rflag")" = "$rdir" ] || { echo "the flag resolves outside mesh-fire.d"; return 0; }
+  [ -f "$rflag" ] || { echo "the flag is not a regular file"; return 0; }
+  operator_only "$rflag" || { echo "the flag is not operator-only"; return 0; }
+  echo "ok"
+}
 
 summary=""
 while IFS='|' read -r id cfg fire; do
@@ -73,12 +111,32 @@ while IFS='|' read -r id cfg fire; do
   # in both config formats. Comment lines dropped first so a commented-out hook does not count.
   if [ ! -f "$conf" ] || ! sed -e '/^[[:space:]]*#/d' "$conf" | grep -F 'session-mesh-inbox.sh' | grep -qE "HESTIA_MESH_PLUGIN=$id([^A-Za-z0-9_-]|\$)"; then
     state="absent"
+    # RETIRE (Nova's review of #1374): a unit this script wrote for a member that is no longer registered here must
+    # not keep running. Only a unit carrying MARK is touched; anyone else's unit of the same name is reported.
+    if [ -f "$UNIT_DIR/$unit" ]; then
+      if grep -qF "$MARK" "$UNIT_DIR/$unit"; then
+        if [ "$CHECK" = "1" ]; then
+          state="absent(WOULD-RETIRE $unit)"
+        elif [ "$have_systemd" = "1" ]; then
+          "$SYSTEMCTL" --user disable --now "$unit" >/dev/null 2>&1 || true
+          rm -f "$UNIT_DIR/$unit"
+          "$SYSTEMCTL" --user daemon-reload >/dev/null 2>&1 || true
+          act="$("$SYSTEMCTL" --user is-active "$unit" 2>/dev/null || true)"
+          if [ "$act" = "active" ]; then state="absent(RETIRE FAILED: $unit still active)"; else state="absent(retired $unit)"; fi
+        else
+          rm -f "$UNIT_DIR/$unit"
+          state="absent(retired $unit, no systemd user manager to stop it)"
+        fi
+      else
+        state="absent($unit exists without the deploy's marker; left as it is)"
+      fi
+    fi
   elif [ "$have_systemd" = "0" ]; then
     state="skipped(no systemd user manager)"
   else
     lock="$STATE/watch-$id.lock"
     held=""
-    if [ -f "$lock" ] && ! systemctl --user is-active --quiet "$unit"; then
+    if [ -f "$lock" ] && ! "$SYSTEMCTL" --user is-active --quiet "$unit"; then
       if ! flock -n "$lock" true 2>/dev/null; then held=1; fi
     fi
     if [ -n "$held" ]; then
@@ -86,13 +144,16 @@ while IFS='|' read -r id cfg fire; do
     else
       args="$id $id-watch"
       mode="print-only"
-      if [ -e "$HESTIA_HOME/mesh-fire.d/$id" ]; then
+      auth="$(fire_authority "$id")"
+      if [ "$auth" = "ok" ]; then
         if [ -n "${HESTIA_WORKSPACE:-}" ] && [ -d "${HESTIA_WORKSPACE:-}" ]; then
           args="$args $SRC/$fire"
           mode="fire"
         else
           mode="print-only(fire flag set, but no HESTIA_WORKSPACE directory for the fired CLI to run in)"
         fi
+      elif [ "$auth" != "none" ]; then
+        mode="print-only(fire flag refused: $auth)"
       fi
       want="[Unit]
 Description=hestia member-mesh watcher for $id ($mode; installed by the hestia deploy, #1373)
@@ -115,7 +176,7 @@ WantedBy=default.target
 "
       if [ "$CHECK" = "1" ]; then
         if [ -f "$UNIT_DIR/$unit" ] && printf '%s' "$want" | cmp -s - "$UNIT_DIR/$unit"; then cur="current"; else cur="WOULD-WRITE"; fi
-        act="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+        act="$("$SYSTEMCTL" --user is-active "$unit" 2>/dev/null || true)"
         state="${act:-inactive}($mode, unit $cur)"
       else
         changed=0
@@ -125,16 +186,16 @@ WantedBy=default.target
           changed=1
           echo "  $id: wrote $UNIT_DIR/$unit ($mode)"
         fi
-        systemctl --user daemon-reload >/dev/null 2>&1 || true
-        systemctl --user enable "$unit" >/dev/null 2>&1 || true
+        "$SYSTEMCTL" --user daemon-reload >/dev/null 2>&1 || true
+        "$SYSTEMCTL" --user enable "$unit" >/dev/null 2>&1 || true
         if [ "$changed" = "1" ]; then
-          systemctl --user restart "$unit" >/dev/null 2>&1 || true
+          "$SYSTEMCTL" --user restart "$unit" >/dev/null 2>&1 || true
         else
-          systemctl --user start "$unit" >/dev/null 2>&1 || true
+          "$SYSTEMCTL" --user start "$unit" >/dev/null 2>&1 || true
         fi
         # The post-condition is the process, not systemctl's exit code (the inventory rule): read what is running.
-        sleep 2
-        act="$(systemctl --user is-active "$unit" 2>/dev/null || true)"
+        sleep "${HESTIA_MESH_SETTLE:-2}"
+        act="$("$SYSTEMCTL" --user is-active "$unit" 2>/dev/null || true)"
         state="${act:-unknown}($mode)"
       fi
     fi

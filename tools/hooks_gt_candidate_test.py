@@ -209,6 +209,29 @@ class CandidateTests(unittest.TestCase):
                 self.assertEqual(out.getvalue(), "")
                 self.assertEqual(json.loads(err.getvalue())["unresolved_targets"], [command])
 
+    def test_member_mesh_lines_resolve_only_to_a_required_runtime_file(self):
+        """#1373: a mesh line names <member>/hooks/<file>; it resolves to the required member-mesh/<file> and
+        nothing looser. The pin must be a literal id."""
+        wanted = {"beta/hooks/worker.py": "0" * 64, "member-mesh/session-mesh-inbox.sh": "1" * 64}
+        ok = 'HESTIA_MESH_PLUGIN=beta-x HESTIA_ROLE="${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}" ' \
+             "@HESTIA_PLUGIN_ROOT@/beta/hooks/session-mesh-inbox.sh"
+        self.assertEqual(c.command_targets({"hooks": {"SessionStart": [{"command": ok}]}}, wanted),
+                         ["member-mesh/session-mesh-inbox.sh"])
+        for command in (
+            # not required by this member
+            "HESTIA_MESH_PLUGIN=beta-x @HESTIA_PLUGIN_ROOT@/beta/hooks/prompt-disposition-watch.sh",
+            # a substitution or a placeholder instead of a literal pin
+            "HESTIA_MESH_PLUGIN=$(id) @HESTIA_PLUGIN_ROOT@/beta/hooks/session-mesh-inbox.sh",
+            "HESTIA_MESH_PLUGIN=@HESTIA_MESH@ @HESTIA_PLUGIN_ROOT@/beta/hooks/session-mesh-inbox.sh",
+            # not directly in hooks/
+            "HESTIA_MESH_PLUGIN=beta-x @HESTIA_PLUGIN_ROOT@/beta/hooks/sub/session-mesh-inbox.sh",
+            "HESTIA_MESH_PLUGIN=beta-x @HESTIA_PLUGIN_ROOT@/beta/session-mesh-inbox.sh",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaises(c.CandidateError) as caught:
+                    c.command_targets({"hooks": {"SessionStart": [{"command": command}]}}, wanted)
+                self.assertEqual(caught.exception.unresolved_targets, [command])
+
     def test_all_nested_command_targets_are_checked(self):
         self.set_registration({"hooks": {"Event": [{"hooks": [
             {"type": "command", "command": "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"},
