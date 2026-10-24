@@ -9,9 +9,9 @@ entries under their own key, `society_floor_read`, and the gate admits them for 
 Driven through the production composition: a daemon answer -> fetch_policy_snapshot ->
 resolve_agent_policy -> evaluate. Nothing here hand-authors a scope entry.
 
-Held beside the patch until the governed apply lands (main's gate has no read admission, so this
-fails there by design); the apply commit moves it to tools/.
-Run: python3 held/build-1347/run_with_overlay.py <wt> <out dir> held/build-1347/floor_read_only_test.py
+Landed with the governed apply (hestia #1381, escalation de1f77995d0c720a).
+
+Run: python3 tools/floor_read_only_test.py
 """
 import os
 import pathlib

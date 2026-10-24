@@ -49,9 +49,3 @@ plugin-sdk/python/tests/conformance/test_conformance.py
 # pinned hermetically by tools/upgrade_path_plumbing_test.py, which plugin-tests does run.
 tools/upgrade_path_test.py
 
-# Held beside an unapplied governed gate patch (held/README-1347.md). It tests the
-# read-only floor admission that only the held gate copies have, so on main's gate it
-# fails by design. It runs against the re-cut copies through
-# held/build-1347/run_with_overlay.py; the governed apply moves it to tools/ and removes
-# this line in the same commit.
-held/build-1347/floor_read_only_test.py
