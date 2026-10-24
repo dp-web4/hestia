@@ -963,7 +963,8 @@ def run(fx: Fixture) -> dict:
         for name, cmd in deny:
             ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
             check(f"evaluate-denies:{name}", ve.blocks and ve.rule in (
-                      "mrh.command", "mrh.command.unenumerated", "egress.secret"),
+                      "mrh.command", "mrh.command.unenumerated", "mrh.command.nonexistent",
+                      "egress.secret"),
                   f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}")
         # hestia#1313 (dp, 2026-10-14): an unenumerable reach is refused under its own rule, which
         # does not escalate (no scope request is opened). The target still names the sentinel.
