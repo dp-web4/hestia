@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use hestia_wire::{
@@ -327,6 +327,18 @@ impl ChainVerification {
     }
 }
 
+/// What [`SqliteChainStore::install_witness_signer`] did with the chain it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessInstall {
+    /// Empty chain: installed, signing starts at genesis with no unsigned prefix.
+    Fresh,
+    /// Chain already carries signing evidence: installed, signing continues.
+    AlreadySigned,
+    /// Unsigned rows and no signing evidence: NOT installed, appends stay unsigned until the
+    /// migration decision is made (see `activate_signing_on_legacy_chain`).
+    LegacyDeferred,
+}
+
 /// Witness chain persisted to SQLite. Locking is internal so the store
 /// is `Send + Sync` from the caller's perspective.
 pub struct SqliteChainStore {
@@ -382,6 +394,9 @@ pub struct SqliteChainStore {
     /// The chain witness (#339). `None` = this handle appends unsigned rows, which it may only
     /// do on a chain that has never been signed.
     signer: RwLock<Option<Arc<ChainWitnessSigner>>>,
+    /// Set only by [`SqliteChainStore::activate_signing_on_legacy_chain`]: this handle may start
+    /// signing a chain that already holds unsigned rows (establish a boundary past genesis).
+    legacy_activation: AtomicBool,
     /// Cached chain id, once a genesis row exists.
     chain_id: Mutex<Option<String>>,
 }
@@ -690,24 +705,56 @@ impl SqliteChainStore {
             derivations: crate::derivation_cache::DerivationCache::new(),
             read_high_water: AtomicU64::new(0),
             signer: RwLock::new(None),
+            legacy_activation: AtomicBool::new(false),
             chain_id: Mutex::new(chain_id),
         })
     }
 
-    /// Install the chain witness: every row appended through this handle from now on is signed
-    /// in its own insert transaction. Replaces any previous signer (a rotation: rows already
-    /// signed keep verifying under the key they carry). Records the signer's aliases in
-    /// `chain_meta` so a reader can resolve legacy `signer_lct` strings on older rows.
-    pub fn install_witness_signer(&self, signer: Arc<ChainWitnessSigner>) -> Result<()> {
+    /// Install the chain witness on a chain that is EMPTY (signing starts at genesis, no
+    /// boundary) or ALREADY SIGNED (continue, or rotate: rows already signed keep verifying under
+    /// the key they carry). Replaces any previous signer and records its aliases in `chain_meta`
+    /// so a reader can resolve legacy `signer_lct` strings on older rows.
+    ///
+    /// A chain holding unsigned rows and no signing evidence is a LEGACY chain: the signer is NOT
+    /// installed, nothing is written, and this handle keeps appending unsigned rows. Starting to
+    /// sign such a chain records a boundary after an unsigned prefix, which is the migration
+    /// decision Decision 0014 §6 leaves open (archive-and-sign-from-genesis vs keep the prefix)
+    /// — so it is a separate, explicit call ([`Self::activate_signing_on_legacy_chain`]), never a
+    /// side effect of opening the store (Codex review of #1322).
+    pub fn install_witness_signer(&self, signer: Arc<ChainWitnessSigner>) -> Result<WitnessInstall> {
+        let mode = {
+            let conn = self.conn.lock().unwrap();
+            let mode = if signing_boundary(&conn)?.is_some() {
+                WitnessInstall::AlreadySigned
+            } else if conn
+                .query_row("SELECT 1 FROM chain_entries LIMIT 1", [], |_| Ok(()))
+                .optional()?
+                .is_none()
+            {
+                WitnessInstall::Fresh
+            } else {
+                WitnessInstall::LegacyDeferred
+            };
+            if mode == WitnessInstall::LegacyDeferred {
+                return Ok(mode);
+            }
+            record_signer_aliases(&conn, &signer)?;
+            mode
+        };
+        *self.signer.write().unwrap() = Some(signer);
+        Ok(mode)
+    }
+
+    /// The explicit legacy activation: install `signer` on a chain that already holds unsigned
+    /// rows, so the next append records `signed_from_position` after them and everything earlier
+    /// stays `legacy_unsigned`. No daemon or CLI path calls this; it exists so the migration
+    /// decision can be made (and tested) as its own authorized change.
+    pub fn activate_signing_on_legacy_chain(&self, signer: Arc<ChainWitnessSigner>) -> Result<()> {
         {
             let conn = self.conn.lock().unwrap();
-            for alias in signer.signer_aliases() {
-                conn.execute(
-                    "INSERT OR REPLACE INTO chain_meta (key, value) VALUES (?1, ?2)",
-                    params![format!("{META_SIGNER_ALIAS_PREFIX}{alias}"), signer.witness_lct()],
-                )?;
-            }
+            record_signer_aliases(&conn, &signer)?;
         }
+        self.legacy_activation.store(true, Ordering::Release);
         *self.signer.write().unwrap() = Some(signer);
         Ok(())
     }
@@ -979,6 +1026,18 @@ impl SqliteChainStore {
                      signed (#339), and this handle has no chain witness signer installed"
                 );
             }
+        } else if boundary.is_none()
+            && chain_position > 0
+            && !self.legacy_activation.load(Ordering::Acquire)
+        {
+            // The signer was installed on an empty chain, and another handle has since appended
+            // unsigned rows. Signing now would establish a boundary after an unsigned prefix —
+            // the legacy activation — as a side effect of a race. Refuse instead.
+            anyhow::bail!(
+                "witness chain refuses to start signing at position {chain_position}: the chain \
+                 holds unsigned rows and no signing boundary, and starting one there is the \
+                 explicit legacy activation (activate_signing_on_legacy_chain), not an append"
+            );
         }
 
         let timestamp = Utc::now();
@@ -1889,6 +1948,16 @@ fn meta_u64(conn: &Connection, key: &str) -> Result<Option<u64>> {
 /// while signatures survive (or the reverse) cannot reopen unsigned appends. The earlier of the
 /// two wins, because that is the conservative answer when they disagree. A malformed record is
 /// an error, never "unsigned".
+fn record_signer_aliases(conn: &Connection, signer: &ChainWitnessSigner) -> Result<()> {
+    for alias in signer.signer_aliases() {
+        conn.execute(
+            "INSERT OR REPLACE INTO chain_meta (key, value) VALUES (?1, ?2)",
+            params![format!("{META_SIGNER_ALIAS_PREFIX}{alias}"), signer.witness_lct()],
+        )?;
+    }
+    Ok(())
+}
+
 fn signing_boundary(conn: &Connection) -> Result<Option<u64>> {
     let recorded = meta_u64(conn, META_SIGNED_FROM)?;
     let first_signature: Option<i64> =
@@ -2818,7 +2887,9 @@ mod tests {
     }
 
     /// #339 test 7: an unsigned historical chain stays readable as legacy_unsigned with its
-    /// hashes unchanged, and signing begins at the next append.
+    /// hashes unchanged. Installing a witness does NOT activate it (#1322 review): appends stay
+    /// unsigned and no boundary is written. Only the explicit activation starts signing, at the
+    /// next append.
     #[test]
     fn legacy_rows_stay_legacy_and_signing_begins_after_them() {
         let dir = TempDir::new().unwrap();
@@ -2831,14 +2902,49 @@ mod tests {
         let v = store.verify_chain().unwrap();
         assert_eq!((v.legacy_unsigned, v.signed_valid), (3, 0));
         assert!(v.link_intact() && v.signatures_authentic());
-        store.install_witness_signer(witness(1)).unwrap();
+        assert_eq!(store.install_witness_signer(witness(1)).unwrap(), WitnessInstall::LegacyDeferred);
+        assert!(store.witness_signer().is_none(), "a legacy chain is not activated by install");
         store.append("evt", json!({"i": 3}), "lct:new").unwrap();
+        assert_eq!(store.signed_from().unwrap(), None, "no boundary was established");
         let v = store.verify_chain().unwrap();
-        assert_eq!((v.legacy_unsigned, v.signed_valid, v.first_signed_position), (3, 1, Some(3)));
+        assert_eq!((v.legacy_unsigned, v.signed_valid, v.recorded_signed_from), (4, 0, None));
+
+        store.activate_signing_on_legacy_chain(witness(1)).unwrap();
+        store.append("evt", json!({"i": 4}), "lct:new").unwrap();
+        let v = store.verify_chain().unwrap();
+        assert_eq!((v.legacy_unsigned, v.signed_valid, v.first_signed_position), (4, 1, Some(4)));
+        assert_eq!(v.recorded_signed_from, Some(4));
         assert!(v.signatures_authentic(), "{v:?}");
         let now: Vec<String> = store.read_from(0, 3).unwrap().into_iter().map(|e| e.hash).collect();
         assert_eq!(now, legacy, "no historical row was rewritten");
         assert_eq!(store.chain_id(), Some(chain_id_for_genesis(&legacy[0])));
+    }
+
+    /// The activation cannot happen by race either (#1322 review): a witness installed while the
+    /// chain was empty must not start signing after another handle wrote unsigned rows, since
+    /// that would record a boundary after an unsigned prefix. Checked inside the append tx.
+    #[test]
+    fn a_witness_installed_on_an_empty_chain_does_not_activate_a_legacy_prefix() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let signed = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(signed.install_witness_signer(witness(1)).unwrap(), WitnessInstall::Fresh);
+        let unsigned = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        unsigned.append("evt", json!({"i": 0}), "lct:old").unwrap();
+        let err = signed.append("evt", json!({"i": 1}), "lct:new").unwrap_err();
+        assert!(format!("{err}").contains("explicit legacy activation"), "{err}");
+        let fresh = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(fresh.len().unwrap(), 1, "the refused append left nothing behind");
+        assert_eq!(fresh.signed_from().unwrap(), None);
+        // Fresh and already-signed installs are unaffected.
+        let dir2 = TempDir::new().unwrap();
+        let (path2, store2, _w) = signed_store(&dir2);
+        store2.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store2);
+        let again = SqliteChainStore::open(&path2, TEST_KEY).unwrap();
+        assert_eq!(again.install_witness_signer(witness(1)).unwrap(), WitnessInstall::AlreadySigned);
+        again.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        assert!(again.verify_chain().unwrap().signatures_authentic());
     }
 
     /// Downgrade, two ways: a handle without the key refuses to append to a signed chain, and an
@@ -2930,7 +3036,10 @@ mod tests {
         assert!(unsigned.append("evt", json!({"i": 1}), "lct:a").is_err());
         drop(unsigned);
         let signed = SqliteChainStore::open(&path, TEST_KEY).unwrap();
-        signed.install_witness_signer(w).unwrap();
+        // Installing classifies the chain from the same boundary read, so it fails closed too
+        // (daemon startup refuses); a signer installed by other means still cannot append.
+        assert!(signed.install_witness_signer(w.clone()).is_err());
+        signed.activate_signing_on_legacy_chain(w).unwrap();
         assert!(signed.append("evt", json!({"i": 1}), "lct:a").is_err());
         assert_eq!(signed.len().unwrap(), 1);
     }
@@ -3075,7 +3184,7 @@ mod tests {
             s.append_once("k1", "evt", json!({"n": 1}), anchor).unwrap().0
         };
         let s = SqliteChainStore::open(&path, TEST_KEY).unwrap();
-        s.install_witness_signer(witness(1)).unwrap();
+        s.activate_signing_on_legacy_chain(witness(1)).unwrap();
         let (again, inserted) = s.append_once("k1", "evt", json!({"n": 1}), anchor).unwrap();
         assert!(!inserted);
         assert_eq!(again.hash, first.hash);

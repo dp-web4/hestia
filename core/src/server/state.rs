@@ -879,14 +879,26 @@ impl ServerState {
             "[hestia] sovereign LCT {} (self-issued bootstrap, placeholder strength)",
             sovereign.lct_id()
         );
-        // B2 (#339): the Society key witnesses the chain. Every row appended from here on is
-        // signed in its own insert transaction, and rows appended "as the sovereign" name the
-        // real key-derived LCT (the anchor string above is recorded as its alias). A chain that
-        // is already signed and a key that cannot be recovered is a refusal to start: the
-        // alternative is a daemon whose every append fails, or a silent downgrade.
+        // B2 (#339): the Society key witnesses the chain. On an empty or already-signed chain,
+        // every row appended from here on is signed in its own insert transaction, and rows
+        // appended "as the sovereign" name the real key-derived LCT (the anchor string above is
+        // recorded as its alias). A LEGACY chain (unsigned rows, no signing evidence) is left
+        // unsigned: activating it is the separate migration decision (#1322 review), never a
+        // side effect of startup. A chain that is already signed and a key that cannot be
+        // recovered is a refusal to start: the alternative is a daemon whose every append
+        // fails, or a silent downgrade.
         match crate::sovereign::Sovereign::chain_witness_signer(&vault) {
             Ok(signer) if signer.witness_lct() == sovereign.lct_id() => {
-                chain_store.install_witness_signer(Arc::new(signer))?;
+                if chain_store.install_witness_signer(Arc::new(signer))?
+                    == crate::storage::WitnessInstall::LegacyDeferred
+                {
+                    eprintln!(
+                        "[hestia] WARNING: witness chain is LEGACY UNSIGNED ({} rows, no signing \
+                         boundary); chain signing is NOT activated and rows this boot are \
+                         UNSIGNED. Activation is a pending migration decision (#339/#1322).",
+                        chain_store.len()?
+                    );
+                }
             }
             other => {
                 let why = match other {
@@ -2424,6 +2436,28 @@ mod tests {
         let e2 = state.append_chain("evt", serde_json::json!({"n": 2})).unwrap();
         let rec2 = state.chain_store.signature_for(e2.chain_position).unwrap().unwrap();
         assert_eq!(rec2.policy_generation, gen1);
+    }
+
+    /// #1322 review: daemon startup on a LEGACY chain (unsigned rows, never signed) must not
+    /// establish a signing boundary. The witness is not installed, appends stay unsigned, and
+    /// activation is left to the explicit migration call.
+    #[test]
+    fn startup_on_a_legacy_chain_does_not_establish_a_signing_boundary() {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        {
+            let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+            let legacy = SqliteChainStore::open(dir.path().join("witness.db"), key).unwrap();
+            legacy.append("evt", serde_json::json!({"n": 0}), "lct:old").unwrap();
+        }
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
+        assert!(state.chain_store.witness_signer().is_none());
+        let e = state.append_chain("evt", serde_json::json!({"n": 1})).unwrap();
+        assert!(state.chain_store.signature_for(e.chain_position).unwrap().is_none());
+        assert_eq!(state.chain_store.signed_from().unwrap(), None);
+        let v = state.chain_store.verify_chain().unwrap();
+        assert_eq!((v.legacy_unsigned, v.signed_valid), (state.chain_store.len().unwrap(), 0));
+        assert!(v.link_intact() && v.signatures_authentic(), "{v:?}");
     }
 
     fn ctx_for(role: &'static str) -> crate::reputation::RepContext<'static> {

@@ -4941,7 +4941,16 @@ fn open_witnessed_chain(
 ) -> AnyResult<hestia::storage::SqliteChainStore> {
     let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
     match hestia::sovereign::Sovereign::chain_witness_signer(vault) {
-        Ok(signer) => chain.install_witness_signer(std::sync::Arc::new(signer))?,
+        Ok(signer) => {
+            if chain.install_witness_signer(std::sync::Arc::new(signer))?
+                == hestia::storage::WitnessInstall::LegacyDeferred
+            {
+                eprintln!(
+                    "WARNING: witness chain is legacy unsigned; signing is not activated \
+                     (pending migration decision, #1322), rows from this pass will be UNSIGNED"
+                );
+            }
+        }
         Err(e) if chain.signed_from()?.is_some() => {
             return Err(e.context("witness chain is signed but the chain witness key is unavailable"));
         }
