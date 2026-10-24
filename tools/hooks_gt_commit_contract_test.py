@@ -26,6 +26,19 @@ class Row:
     witness: str = "expected-witness"
     signature_valid: bool = True
     operator_authorized: bool = True
+    reservation_generation: int | None = None
+    authorization: int | None = None
+    observed_generation: int | None = None
+
+
+@dataclass(frozen=True)
+class Selection:
+    request: Request
+    authorization: int
+    reservation_generation: int
+    reservation_floor: int
+    generation: int
+    outcome_floor: int
 
 
 class Refused(Exception):
@@ -43,7 +56,8 @@ class Model:
     A stable witness is a fixture, not a key registry or universal trust threshold.
     """
     def __init__(self):
-        self.disk = dict(generation=0, pending=None, selected=None, closed={})
+        self.disk = dict(generation=0, pending=None, reservation=None,
+                         selected=None, closed={})
         self.memory = deepcopy(self.disk)
         self.rows = []
         self.durable = 0
@@ -54,7 +68,8 @@ class Model:
             raise Refused()
 
     def save(self, value, expected_generation, fault=None):
-        self.require(self.usable and self.disk["generation"] == expected_generation)
+        self.require(self.usable and self.memory["generation"] == expected_generation
+                     and self.disk["generation"] == expected_generation)
         value = deepcopy(value)
         value["generation"] = expected_generation + 1
         self.memory = value  # Deliberately model a setter mutating memory before save.
@@ -72,25 +87,29 @@ class Model:
         self.usable = True
 
     def selected_id(self):
-        selected = self.disk["selected"]
-        return selected[0].operation if selected else None
+        self.require(self.usable)
+        selected = self.memory["selected"]
+        return selected.request.operation if selected else None
 
     def begin(self, request, *, authorized=True, candidate_matches=True,
               dependency_labels=(), expected_generation=None, fault=None):
         self.require(self.usable and authorized and candidate_matches and not dependency_labels)
         self.require(request.member == "member" and all((request.operation, request.candidate,
                                                        request.actor, request.reason)))
-        old = self.disk["closed"].get(request.operation)
+        old = self.memory["closed"].get(request.operation)
         if old:
             self.require(old[0] == request)
             return old[1]  # Historical result; NEVER reselect an older certification.
-        if self.disk["pending"]:
-            self.require(self.disk["pending"] == request)
+        if self.memory["pending"]:
+            self.require(self.memory["pending"] == request)
             return "pending"  # Explicit resume still needs fresh authority below.
         self.require(request.prior == self.selected_id())
-        value = deepcopy(self.disk)
+        # A saved frontier must survive restart; do not anchor it in volatile rows.
+        self.require(self.durable == len(self.rows))
+        value = deepcopy(self.memory)
         value["pending"] = request
-        self.save(value, self.disk["generation"] if expected_generation is None
+        value["reservation"] = (self.memory["generation"] + 1, len(self.rows))
+        self.save(value, self.memory["generation"] if expected_generation is None
                   else expected_generation, fault)
         return "pending"
 
@@ -100,51 +119,107 @@ class Model:
         return len(self.rows) - 1
 
     def flush(self, fail=False):
+        self.require(self.usable)
         if fail:
             self.usable = False
             raise Unknown()
         self.durable = len(self.rows)
 
-    def evidence(self, position, kind, request):
+    def evidence(self, position, kind, request, reservation_generation, floor):
         self.require(type(position) is int and 0 <= position < self.durable)
         row = self.rows[position]
-        self.require(row.kind == kind and row.request == request
+        self.require(position >= floor and row.kind == kind and row.request == request
+                     and row.reservation_generation == reservation_generation
                      and row.signature_valid and row.operator_authorized
                      and row.witness == "expected-witness")
+        return row
+
+    def authorize(self):
+        """Well-ordered writer; append remains available for adversarial fixtures."""
+        self.require(self.usable and self.memory["pending"] is not None)
+        return self.append(Row("authorization", self.memory["pending"],
+                               reservation_generation=self.memory["reservation"][0]))
+
+    def has_abandonment(self, request, generation, floor):
+        for position in range(floor, self.durable):
+            try:
+                row = self.evidence(position, "abandoned", request, generation, floor)
+                self.require(row.authorization is None and row.observed_generation == generation)
+                return True
+            except Refused:
+                pass
+        return False
 
     def select(self, position, *, authorized=True, candidate_matches=True,
                expected_generation=None, fault=None):
         self.require(self.usable and authorized and candidate_matches)
-        request = self.disk["pending"]
+        request = self.memory["pending"]
         self.require(request is not None and request.prior == self.selected_id())
-        self.evidence(position, "authorization", request)
-        value = deepcopy(self.disk)
-        value["selected"] = (request, position)
-        self.save(value, self.disk["generation"] if expected_generation is None
+        generation, floor = self.memory["reservation"]
+        self.evidence(position, "authorization", request, generation, floor)
+        # The selection barrier covers all staged rows: a volatile abandonment
+        # must not become durable after selection and contradict its outcome.
+        self.require(self.durable == len(self.rows))
+        self.require(not self.has_abandonment(request, generation, floor))
+        value = deepcopy(self.memory)
+        value["selected"] = Selection(request, position, generation, floor,
+                                      self.memory["generation"] + 1, len(self.rows))
+        self.save(value, self.memory["generation"] if expected_generation is None
                   else expected_generation, fault)
 
     def readable_selection(self):
         self.require(self.usable)
-        selected = self.disk["selected"]
+        selected = self.memory["selected"]
         if selected:
-            self.evidence(selected[1], "authorization", selected[0])
+            self.evidence(selected.authorization, "authorization", selected.request,
+                          selected.reservation_generation, selected.reservation_floor)
         return selected
 
-    def finish(self, position, *, authorized=True, fault=None):
-        self.require(self.usable and authorized)
-        request = self.disk["pending"]
+    def observe(self, *, authorized=True):
+        """Witness persisted selection (or unchanged prior), with the lock held.
+
+        Disk read is intentional here: outcome evidence observes persistence,
+        whereas ordinary readers and transition planning use memory.
+        """
+        self.require(self.usable and authorized and self.memory == self.disk)
+        request = self.memory["pending"]
         self.require(request is not None)
+        generation, _ = self.memory["reservation"]
         if self.selected_id() == request.operation:
-            self.readable_selection()
+            selected = self.readable_selection()
+            row = Row("applied", request, reservation_generation=generation,
+                      authorization=selected.authorization,
+                      observed_generation=selected.generation)
+        else:
+            self.require(request.prior == self.selected_id())
+            row = Row("abandoned", request, reservation_generation=generation,
+                      observed_generation=self.disk["generation"])
+        return self.append(row)
+
+    def finish(self, position, *, authorized=True, expected_generation=None, fault=None):
+        self.require(self.usable and authorized)
+        request = self.memory["pending"]
+        self.require(request is not None)
+        generation, floor = self.memory["reservation"]
+        if self.selected_id() == request.operation:
+            selected = self.readable_selection()
             outcome = "applied"
+            row = self.evidence(position, outcome, request, generation, selected.outcome_floor)
+            self.require(position > selected.authorization
+                         and row.authorization == selected.authorization
+                         and row.observed_generation == selected.generation
+                         and not self.has_abandonment(request, generation, floor))
         else:
             self.require(request.prior == self.selected_id())
             outcome = "abandoned"
-        self.evidence(position, outcome, request)
-        value = deepcopy(self.disk)
+            row = self.evidence(position, outcome, request, generation, floor)
+            self.require(row.authorization is None and row.observed_generation == generation)
+        value = deepcopy(self.memory)
         value["closed"][request.operation] = (request, outcome)
         value["pending"] = None
-        self.save(value, self.disk["generation"], fault)
+        value["reservation"] = None
+        self.save(value, self.memory["generation"] if expected_generation is None
+                  else expected_generation, fault)
 
 
 R = Request("op-1", "member", "candidate-1", "operator", "reviewed closure", None)
@@ -154,14 +229,14 @@ class ContractTests(unittest.TestCase):
     def prepared(self):
         model = Model()
         model.begin(R)
-        pos = model.append(Row("authorization", R))
+        pos = model.authorize()
         model.flush()
         return model, pos
 
     def completed(self):
         model, pos = self.prepared()
         model.select(pos)
-        effect = model.append(Row("applied", R))
+        effect = model.observe()
         model.flush()
         model.finish(effect)
         return model
@@ -185,7 +260,8 @@ class ContractTests(unittest.TestCase):
         m.begin(R)
         self.assertEqual(m.begin(R), "pending")
         for request in (replace(R, operation="op-2"), replace(R, candidate="other"),
-                        replace(R, actor="other"), replace(R, reason="other")):
+                        replace(R, actor="other"), replace(R, reason="other"),
+                        replace(R, prior="other")):
             with self.assertRaises(Refused):
                 m.begin(request)
         self.assertEqual(m.disk["generation"], 1)
@@ -205,7 +281,7 @@ class ContractTests(unittest.TestCase):
         for fault in ("before_rename", "after_rename"):
             m, pos = self.prepared()
             m.select(pos)
-            effect = m.append(Row("applied", R))
+            effect = m.observe()
             m.flush()
             with self.assertRaises(Unknown):
                 m.finish(effect, fault=fault)
@@ -224,7 +300,7 @@ class ContractTests(unittest.TestCase):
                 next_request = replace(R, operation="op-2", candidate="candidate-2", prior="op-1")
                 m.begin(next_request)
                 if cut != "pending":
-                    m.append(Row("authorization", next_request))
+                    m.authorize()
                 if cut == "durable":
                     m.flush()
                 m.restart()
@@ -236,12 +312,12 @@ class ContractTests(unittest.TestCase):
         m.append(Row("unrelated", R))
         m.flush()
         m.begin(R)
-        pos = m.append(Row("authorization", R))
+        pos = m.authorize()
         with self.assertRaises(Refused):
             m.select(pos)
         m.flush()
         m.select(pos)
-        self.assertEqual(m.readable_selection()[1], pos)
+        self.assertEqual(m.readable_selection().authorization, pos)
 
     def test_signature_validity_is_not_operator_or_witness_authority(self):
         for row in (Row("authorization", R, signature_valid=False),
@@ -252,7 +328,7 @@ class ContractTests(unittest.TestCase):
             with self.subTest(row=row):
                 m = Model()
                 m.begin(R)
-                pos = m.append(row)
+                pos = m.append(replace(row, reservation_generation=m.memory["reservation"][0]))
                 m.flush()
                 with self.assertRaises(Refused):
                     m.select(pos)
@@ -270,7 +346,7 @@ class ContractTests(unittest.TestCase):
     def test_barrier_failure_never_selects(self):
         m = Model()
         m.begin(R)
-        pos = m.append(Row("authorization", R))
+        pos = m.authorize()
         with self.assertRaises(Unknown):
             m.flush(fail=True)
         with self.assertRaises(Refused):
@@ -301,7 +377,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(m.disk["pending"], R)
         with self.assertRaises(Refused):
             m.finish(pos)  # Authorization is not an effect receipt.
-        effect = m.append(Row("applied", R))
+        effect = m.observe()
         m.flush()
         m.finish(effect)
         self.assertEqual(m.begin(R), "applied")
@@ -310,7 +386,7 @@ class ContractTests(unittest.TestCase):
         m, authorization = self.prepared()
         with self.assertRaises(Refused):
             m.finish(authorization)
-        abandoned = m.append(Row("abandoned", R))
+        abandoned = m.observe()
         with self.assertRaises(Refused):
             m.finish(abandoned)
         m.flush()
@@ -322,7 +398,7 @@ class ContractTests(unittest.TestCase):
     def test_selected_operation_cannot_be_relabelled_abandoned(self):
         m, pos = self.prepared()
         m.select(pos)
-        pos = m.append(Row("abandoned", R))
+        pos = m.append(Row("abandoned", R, reservation_generation=1, observed_generation=1))
         m.flush()
         with self.assertRaises(Refused):
             m.finish(pos)
@@ -331,10 +407,10 @@ class ContractTests(unittest.TestCase):
         m = self.completed()
         r2 = replace(R, operation="op-2", candidate="candidate-2", prior="op-1")
         m.begin(r2)
-        pos = m.append(Row("authorization", r2))
+        pos = m.authorize()
         m.flush()
         m.select(pos)
-        effect = m.append(Row("applied", r2))
+        effect = m.observe()
         m.flush()
         with self.assertRaises(Unknown):
             m.finish(effect, fault="after_rename")
@@ -351,6 +427,121 @@ class ContractTests(unittest.TestCase):
         m.restart()
         with self.assertRaises(Refused):
             m.readable_selection()
+
+    def test_pre_reservation_authorization_cannot_bind_a_later_reservation(self):
+        m = Model()
+        # Even predicting the next generation cannot backdate authorization.
+        pos = m.append(Row("authorization", R, reservation_generation=1))
+        m.flush()
+        m.begin(R)
+        before = deepcopy(m.__dict__)
+        with self.assertRaises(Refused):
+            m.select(pos)
+        self.assertEqual(m.__dict__, before)
+        pos = m.authorize()
+        m.flush()
+        m.select(pos)
+
+    def test_authorization_for_a_different_reservation_is_refused(self):
+        m, _ = self.prepared()
+        pos = m.append(Row("authorization", R, reservation_generation=0))
+        m.flush()
+        with self.assertRaises(Refused):
+            m.select(pos)
+        self.assertIsNone(m.readable_selection())
+
+    def test_pre_selection_receipt_cannot_observe_a_later_selection(self):
+        m, pos = self.prepared()
+        # Correct-looking future bindings still precede the selection frontier.
+        effect = m.append(Row("applied", R, reservation_generation=1,
+                              authorization=pos, observed_generation=2))
+        m.flush()
+        m.select(pos)
+        before = deepcopy(m.__dict__)
+        with self.assertRaises(Refused):
+            m.finish(effect)
+        self.assertEqual(m.__dict__, before)
+        effect = m.observe()
+        m.flush()
+        m.finish(effect)
+
+    def test_applied_receipt_must_bind_exact_selection_and_generation(self):
+        for changed in (dict(reservation_generation=0), dict(authorization=99),
+                        dict(observed_generation=1)):
+            m, pos = self.prepared()
+            m.select(pos)
+            row = Row("applied", R, reservation_generation=1,
+                      authorization=pos, observed_generation=2)
+            effect = m.append(replace(row, **changed))
+            m.flush()
+            with self.assertRaises(Refused):
+                m.finish(effect)
+            self.assertEqual(m.memory["pending"], R)
+
+    def test_abandonment_prevents_selection_before_and_after_restart(self):
+        for durable in (False, True):
+            m, pos = self.prepared()
+            abandoned = m.observe()
+            if durable:
+                m.flush()
+            before = deepcopy(m.__dict__)
+            with self.assertRaises(Refused):
+                m.select(pos)
+            self.assertEqual(m.__dict__, before)
+            m.flush()
+            m.restart()
+            with self.assertRaises(Refused):
+                m.select(pos)
+            m.finish(abandoned)
+            self.assertEqual(m.begin(R), "abandoned")
+            self.assertEqual([row.kind for row in m.rows], ["authorization", "abandoned"])
+
+    def test_close_has_stale_generation_cas_for_both_outcomes(self):
+        for applied in (False, True):
+            m, pos = self.prepared()
+            if applied:
+                m.select(pos)
+            effect = m.observe()
+            m.flush()
+            before = deepcopy(m.__dict__)
+            with self.assertRaises(Refused):
+                m.finish(effect, expected_generation=m.memory["generation"] - 1)
+            self.assertEqual(m.__dict__, before)
+            m.finish(effect)
+
+    def test_readers_use_memory_and_observation_requires_persisted_agreement(self):
+        m, pos = self.prepared()
+        m.select(pos)
+        m.memory["selected"] = None
+        self.assertIsNone(m.readable_selection())
+        self.assertIsNone(m.selected_id())
+        with self.assertRaises(Refused):
+            m.observe()
+        m.restart()
+        self.assertEqual(m.selected_id(), R.operation)
+
+    def test_stale_memory_generation_cannot_overwrite_persistent_state(self):
+        for transition in ("begin", "select", "finish"):
+            m, pos = self.prepared()
+            if transition == "begin":
+                m = Model()
+                action = lambda **options: m.begin(R, **options)
+            elif transition == "select":
+                action = lambda **options: m.select(pos, **options)
+            else:
+                m.select(pos)
+                effect = m.observe()
+                m.flush()
+                action = lambda **options: m.finish(effect, **options)
+            m.disk["generation"] += 1  # Another process advanced the vault.
+            before = deepcopy(m.__dict__)
+            with self.assertRaises(Refused):
+                action()
+            self.assertEqual(m.__dict__, before)
+            # Supplying a newer disk generation cannot bless stale memory.
+            with self.assertRaises(Refused):
+                action(expected_generation=m.disk["generation"])
+            self.assertEqual(m.__dict__, before)
 
 
 if __name__ == "__main__":
