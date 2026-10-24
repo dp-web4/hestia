@@ -1863,6 +1863,9 @@ pub async fn serve_with_callback(
             get(transport_binding_list).post(transport_binding_set),
         )
         .route("/api/transport/binding/remove", post(transport_binding_remove))
+        .route("/api/channel/binding", get(channel_binding_list).post(channel_binding_set))
+        .route("/api/channel/outbox", get(channel_outbox_list))
+        .route("/api/channel/outbox/:id/answer", post(channel_outbox_answer))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -4980,6 +4983,166 @@ async fn scope_grant(
 /// the same list — produces N copies that drift the moment one member is granted something the
 /// others are not, and then the law differs per seat while looking identical. Uniformity has
 /// to be structural or it decays. One list cannot drift.
+// ---- #1344: channel bindings and the channel outbox (operator-gated) -------------------------
+
+/// Every channel binding, addresses included: this is the operator's own view.
+async fn channel_binding_list(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    Json(serde_json::json!({
+        "bindings": s.channel_bindings.bindings,
+        "generation": s.channel_bindings.generation,
+    }))
+}
+
+fn channel_operator(gate: &Option<axum::Extension<super::operator_auth::GateWitness>>) -> String {
+    gate.as_ref().and_then(|g| g.0.operator.clone()).unwrap_or_else(|| "operator".to_string())
+}
+
+/// Bind (insert or replace) a member's channel. The chain row names the recipient by the hash of
+/// its address, never the address: chain rows are readable by members, and who a message
+/// reaches is the operator's. Persist first, then witness; if the witness fails, the store is
+/// rolled back, so no binding is in force without its record.
+async fn channel_binding_set(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::channel::{validate, ChannelBinding};
+    let field = |k: &str| {
+        body.get(k).and_then(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    };
+    let operator = channel_operator(&gate);
+    let binding = ChannelBinding {
+        member: field("member").unwrap_or_default(),
+        channel_id: field("channel_id").unwrap_or_default(),
+        recipient_class: field("recipient_class").unwrap_or_default(),
+        adapter: field("adapter").unwrap_or_else(|| "email".to_string()),
+        address: field("address").unwrap_or_default(),
+        reason: field("reason").unwrap_or_default(),
+        set_by: operator.clone(),
+        set_at: crate::server::gate_escalation::now_secs(),
+        version: 0,
+    };
+    if let Err(msg) = validate(&binding) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+    }
+    let address_sha256 = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(binding.address.as_bytes()))
+    };
+    let mut s = state.lock().await;
+    let prior = s.channel_bindings.clone();
+    let version = match s.commit_channel_bindings(|st| st.set(binding.clone())) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("binding NOT changed: vault write failed ({e})")})),
+            );
+        }
+    };
+    match s.append_chain(
+        "channel_binding_set",
+        serde_json::json!({
+            "member": binding.member, "channel_id": binding.channel_id,
+            "recipient_class": binding.recipient_class, "adapter": binding.adapter,
+            "address_sha256": address_sha256, "reason": binding.reason, "set_by": operator,
+            "version": version, "operator_gate": gate.as_ref().and_then(|g| g.0.gate_entry_hash.clone()),
+        }),
+    ) {
+        Ok(entry) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true, "member": binding.member, "channel_id": binding.channel_id,
+                "target": binding.target(), "version": version, "witnessEntryHash": entry.hash,
+            })),
+        ),
+        Err(e) => {
+            let restored = s.commit_channel_bindings(|st| *st = prior);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("the channel_binding_set append failed ({e}); rollback: {}",
+                        match restored {
+                            Ok(()) => "prior bindings restored, the binding is NOT in force".to_string(),
+                            Err(rb) => format!("FAILED ({rb}): the binding is live without its record"),
+                        }),
+                })),
+            )
+        }
+    }
+}
+
+/// The whole outbox, newest first (`?limit=`, default 100): the operator's view, content included.
+async fn channel_outbox_list(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = q.get("limit").and_then(|v| v.parse::<u32>().ok()).unwrap_or(100);
+    let s = state.lock().await;
+    match s.inbox_store.channel_outbox_list(None, limit) {
+        Ok(rows) => (StatusCode::OK, Json(serde_json::json!({"outbox": rows, "shadow": true}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// Mark one outbox row answered (#1344 decision c: in this slice there is no email ingress, so
+/// the operator says when the bound recipient replied). Once only: an answer is never moved.
+async fn channel_outbox_answer(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let operator = channel_operator(&gate);
+    let s = state.lock().await;
+    let row = match s.inbox_store.channel_outbox_get(id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("no outbox row #{id}")})));
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    };
+    if row.answered_at.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("outbox #{id} was already answered"), "row": row})),
+        );
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let entry = match s.append_chain(
+        "channel_answer",
+        serde_json::json!({
+            "outbox_id": id, "member": row.member, "member_lct": row.member_lct,
+            "channel_id": row.channel_id, "channel_send": row.chain_hash, "answered_by": operator,
+            "via": "operator", "operator_gate": gate.as_ref().and_then(|g| g.0.gate_entry_hash.clone()),
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witness append failed, NOT marked answered: {e}")})),
+            );
+        }
+    };
+    match s.inbox_store.channel_mark_answered(id, &operator, now) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "outbox_id": id, "answered_at": now, "witnessEntryHash": entry.hash})),
+        ),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("outbox #{id} was answered concurrently"),
+                                    "witnessEntryHash": entry.hash})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessed but NOT marked answered: {e}"),
+                                    "witnessEntryHash": entry.hash})),
+        ),
+    }
+}
+
 async fn transport_binding_list(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
     Json(serde_json::json!({
@@ -13881,5 +14044,172 @@ mod operator_vault_tests {
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let b = body_json(r).await;
         assert!(b.get("credential").is_none(), "a credential was released unrecorded: {b}");
+    }
+}
+
+#[cfg(test)]
+mod channel_route_tests {
+    //! #1344: the operator's channel surface. A binding is witnessed by the hash of its address
+    //! (never the address) and is not in force without its record; an answer is witnessed,
+    //! once only, and frees the member's budget; and the routes sit behind the operator gate.
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    fn body() -> serde_json::Value {
+        serde_json::json!({
+            "member": "legion-being", "channel_id": "dp", "recipient_class": "operator",
+            "adapter": "email", "address": "operator@example.invalid",
+            "reason": "the being may write to dp",
+        })
+    }
+
+    async fn set(state: &SharedState, b: serde_json::Value) -> axum::response::Response {
+        channel_binding_set(State(state.clone()), None, Json(b)).await.into_response()
+    }
+
+    async fn answer(state: &SharedState, id: u64) -> axum::response::Response {
+        channel_outbox_answer(State(state.clone()), None, Path(id)).await.into_response()
+    }
+
+    fn fail_on(dir: &TempDir, event: &str) -> rusqlite::Connection {
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_one BEFORE INSERT ON chain_entries WHEN NEW.event_type = '{event}' \
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;"
+        ))
+        .unwrap();
+        conn
+    }
+
+    async fn outbox_row(state: &SharedState, n: u64) -> u64 {
+        let s = state.lock().await;
+        let lct = s.member_lct("legion-being").unwrap();
+        s.inbox_store
+            .channel_outbox_insert(&crate::storage::inbox::NewChannelOutbox {
+                member: "legion-being", member_lct: &lct, channel_id: "dp", recipient_class: "operator",
+                binding_version: 1, content: "m", content_sha256: "0", created: n, would_deny: false,
+                chain_hash: "h",
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_binding_is_refused_and_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        for k in ["member", "channel_id", "recipient_class", "address", "reason"] {
+            let mut b = body();
+            b[k] = serde_json::json!("");
+            assert_eq!(set(&state, b).await.status(), StatusCode::BAD_REQUEST, "{k}");
+        }
+        let mut b = body();
+        b["channel_id"] = serde_json::json!("dp/../x");
+        assert_eq!(set(&state, b).await.status(), StatusCode::BAD_REQUEST);
+        let s = state.lock().await;
+        assert!(s.channel_bindings.bindings.is_empty());
+        assert!(!s.recent_chain(20).iter().any(|e| e.event_type.starts_with("channel_")));
+    }
+
+    #[tokio::test]
+    async fn a_binding_is_witnessed_by_its_address_hash_and_survives_restart() {
+        let (dir, state) = test_state().await;
+        assert_eq!(set(&state, body()).await.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            let row = s.recent_chain(20).into_iter().find(|e| e.event_type == "channel_binding_set").unwrap();
+            assert_eq!(row.event_data["address_sha256"].as_str().unwrap().len(), 64);
+            assert!(!row.event_data.to_string().contains("example.invalid"), "no address on the chain");
+        }
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = state.lock().await;
+        let b = s.channel_bindings.get("legion-being", "dp").expect("restart must reload the binding");
+        assert_eq!((b.target(), b.version), ("dp:operator".to_string(), 1));
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_binding_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let conn = fail_on(&dir, "channel_binding_set");
+        assert_eq!(set(&state, body()).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.lock().await.channel_bindings.get("legion-being", "dp").is_none(),
+                "not in force without its record");
+        conn.execute_batch("DROP TRIGGER fail_one").unwrap();
+        assert_eq!(set(&state, body()).await.status(), StatusCode::OK, "the identical retry lands");
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_witnessed_once_and_frees_the_budget() {
+        let (_dir, state) = test_state().await;
+        let id = outbox_row(&state, 100).await;
+        let lct = state.lock().await.member_lct("legion-being").unwrap();
+        assert_eq!(state.lock().await.inbox_store.channel_unanswered(&lct, "dp", 0).unwrap().len(), 1);
+        assert_eq!(answer(&state, id + 99).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(answer(&state, id).await.status(), StatusCode::OK);
+        assert_eq!(answer(&state, id).await.status(), StatusCode::CONFLICT, "answered once, never moved");
+        let s = state.lock().await;
+        assert!(s.inbox_store.channel_unanswered(&lct, "dp", 0).unwrap().is_empty());
+        let rows: Vec<_> = s.recent_chain(20).into_iter().filter(|e| e.event_type == "channel_answer").collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_data["outbox_id"], id);
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_answer_is_not_recorded() {
+        let (dir, state) = test_state().await;
+        let id = outbox_row(&state, 100).await;
+        let _conn = fail_on(&dir, "channel_answer");
+        assert_eq!(answer(&state, id).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let s = state.lock().await;
+        assert!(s.inbox_store.channel_outbox_get(id).unwrap().unwrap().answered_at.is_none());
+    }
+
+    /// The routes are on the operator-gated router: no session, no answer and no outbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_channel_routes_refuse_a_request_without_an_operator_session() {
+        std::env::remove_var("HESTIA_OPERATOR_DEV_TOKEN");
+        let (_dir, state) = test_state().await;
+        let id = outbox_row(&state, 100).await;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let bind = format!("127.0.0.1:{port}");
+        let served = state.clone();
+        let _server = tokio::spawn(async move {
+            let _ = super::serve_with_callback(served, &bind, None).await;
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let mut up = false;
+        for _ in 0..600 {
+            if client.get(format!("{base}/api/channel/outbox")).send().await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(up, "the test server never came up on {base}");
+        for (method, path) in [("GET", "/api/channel/outbox".to_string()), ("GET", "/api/channel/binding".to_string()),
+                               ("POST", "/api/channel/binding".to_string()),
+                               ("POST", format!("/api/channel/outbox/{id}/answer"))] {
+            let req = if method == "GET" { client.get(format!("{base}{path}")) }
+                      else { client.post(format!("{base}{path}")).json(&body()) };
+            let st = req.send().await.unwrap().status();
+            assert!(st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN, "{method} {path}: {st}");
+        }
+        let s = state.lock().await;
+        assert!(s.inbox_store.channel_outbox_get(id).unwrap().unwrap().answered_at.is_none());
+        assert!(s.channel_bindings.bindings.is_empty());
     }
 }

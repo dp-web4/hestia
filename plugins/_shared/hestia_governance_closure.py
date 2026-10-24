@@ -326,6 +326,12 @@ LITERAL_FLOOR = Closure(
                                      # the pre-consolidation gate allowed exactly that, because
                                      # it protected known filenames, not the directory)
         ("hestia", "hooks"),
+        # The member mesh's FIRE FLAGS ($HESTIA_HOME/mesh-fire.d/<member>, #1373/#1374): a flag there turns a
+        # print-only watcher into one that launches a headless CLI for that member. install-watchers.sh checks
+        # owner/mode/symlinks, but every governed member runs as the operator's UID, so only the gate can tell
+        # the operator's flag from a member's. Creating, changing or removing anything in/under it is a closure
+        # write (Nova's release gate on #1374: "a file's mere presence should not convey operator authority").
+        ("mesh-fire.d",),
     ),
     files_anywhere=(
         "hestia_gate_core.py",

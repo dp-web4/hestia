@@ -91,6 +91,13 @@ def with_header(src: bytes, rel: str) -> bytes:
     return placeholder.replace(ZERO.encode(), digest.encode(), 1)
 
 
+# Units published from a RUNTIME_MANIFEST.txt rather than an expects.json: shared code a member RUNS but does not
+# own. `_shared` is the decision engine every gate imports; `member-mesh` (#1373) is the mesh runtime a mesh
+# member's hooks dir carries (session-mesh-inbox.sh, prompt-disposition-watch.sh and the CLI they call). A member
+# binds the runtime it executes through `install.requires`, so its version changes when the runtime's bytes do.
+RUNTIME_UNITS = ("_shared", "member-mesh")
+
+
 def units(root: Path = ROOT) -> dict[str, dict]:
     """{unit: {member, files: {gt_rel: source_rel}, registration, requires}} from the declarations,
     never a glob. `requires` is the member's declared cross-unit dependency (install.requires:
@@ -107,11 +114,14 @@ def units(root: Path = ROOT) -> dict[str, dict]:
         out[d] = {"member": inst.get("member") or d, "files": files,
                   "registration": "hooks/hooks.json" if tmpl.is_file() else None,
                   "requires": sorted(inst.get("requires") or [])}
-    man = root / "plugins" / "_shared" / "RUNTIME_MANIFEST.txt"
-    names = [ln.strip() for ln in man.read_text(encoding="utf-8").splitlines()
-             if ln.strip() and not ln.lstrip().startswith("#")]
-    out["_shared"] = {"member": None, "files": {n: f"plugins/_shared/{n}" for n in names},
-                      "registration": None, "requires": []}
+    for unit in RUNTIME_UNITS:
+        man = root / "plugins" / unit / "RUNTIME_MANIFEST.txt"
+        if unit != "_shared" and not man.is_file():
+            continue
+        names = [ln.strip() for ln in man.read_text(encoding="utf-8").splitlines()
+                 if ln.strip() and not ln.lstrip().startswith("#")]
+        out[unit] = {"member": None, "files": {n: f"plugins/{unit}/{n}" for n in names},
+                     "registration": None, "requires": []}
     return out
 
 
@@ -140,7 +150,7 @@ def manifest_for(unit: str, u: dict, digests: dict[str, str], engine: dict | Non
         "member": u["member"],
         "digest_rule": DIGEST_RULE,
         "registration": u["registration"],
-        "registration_note": (None if u["registration"] or unit == "_shared" else
+        "registration_note": (None if u["registration"] or unit in RUNTIME_UNITS else
                               "this member ships no registration template yet; its registration "
                               "edge is NOT ground truth until it does"),
         "files": rows,
@@ -166,6 +176,10 @@ def _compose(root: Path, digest_of) -> dict[str, dict]:
     pin = _engine_pin(out["_shared"])
     for unit, u in decl.items():
         if unit == "_shared":
+            continue
+        if unit in RUNTIME_UNITS:
+            # a runtime unit is not a gate: it imports no engine, so it pins none (members pin it via requires)
+            out[unit] = manifest_for(unit, u, {rel: digest_of(unit, rel) for rel in u["files"]}, None, [])
             continue
         reqs = []
         for ref in u["requires"]:
