@@ -91,7 +91,7 @@ def _normalize(lit: str) -> str:
 # path mentioned in a comment's prose never is.
 # Dashboard helpers that take no method argument and always send one. Asserted against the
 # dashboard itself in main(), so a renamed or changed helper fails here instead of being read as GET.
-FIXED_METHOD_HELPERS = {"hubAct": "POST"}
+FIXED_METHOD_HELPERS = {"hubAct": "POST", "floorPost": "POST"}
 _DASH_LIT = re.compile(r"([(,:=+?\[])\s*([`'\"])(/api/[^`'\"]*)\2")
 
 
