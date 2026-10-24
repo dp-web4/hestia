@@ -1414,6 +1414,29 @@
             <div class="pol-section-label">In force now</div>
             <div id="scope-grant-list"><div class="empty">loading…</div></div>
 
+            <div class="pol-section-label">Society floor — every member, present and future</div>
+            <div class="grant-note">
+              What <strong>every</strong> member may do without asking, where none of its own
+              grants reaches: <strong>a member's own grant always decides where it reaches</strong>,
+              and the floor never overrides it. <strong>r w e d</strong> are read, write, execute
+              and delete, as on a grant; <strong>/**</strong> reaches everything under the path.
+              Change an entry with <strong>edit</strong>; nothing is sent until Save, and every
+              change is witnessed and asks for a reason.
+            </div>
+            <div id="scope-floor-list"><div class="empty">loading…</div></div>
+            <div class="grant-row floor-add">
+              <input id="floor-add-path" type="text" placeholder="/absolute/path" spellcheck="false">
+              <span class="grant-modes" title="what every member may do here">
+                <label class="on" title="read"><input id="floor-add-r" type="checkbox" checked> r</label>
+                <label title="write"><input id="floor-add-w" type="checkbox"> w</label>
+                <label title="execute"><input id="floor-add-e" type="checkbox"> e</label>
+                <label title="delete"><input id="floor-add-d" type="checkbox"> d</label>
+              </span>
+              <label title="reach everything under the path"><input id="floor-add-rec" type="checkbox" checked> /**</label>
+              <input id="floor-add-reason" type="text" placeholder="reason (required)">
+              <button class="grant-act" id="floor-add-btn">add to floor</button>
+            </div>
+
             <div class="pol-section-label">Grant scope directly — no member request needed</div>
             <div class="grant-note">
               This is the <strong>operator-originated</strong> grant. Until 2026-08-15 the only
@@ -4251,6 +4274,85 @@
         </div>`;
   }
 
+  // THE SOCIETY FLOOR (dp, 2026-08-16; modes and Edit 2026-10-23). One row per entry with the
+  // same r/w/e/d boxes and Edit -> Save/Cancel a grant has (#1370): an entry binds every member,
+  // so a stray click must never widen the whole society (Nova on #1347). The boxes are disabled
+  // outside Edit. Where a member's own grant reaches, it decides; the floor fills only the rest
+  // (PRD_ALLOWLISTS AC-1 as amended), and the note under each member says so.
+  let floorEdit = null;
+
+  // What Save would change, and whether it WIDENS: any added mode, or exact made recursive.
+  // The daemon recomputes `widens` and records it; this is so the operator reads it first.
+  function floorEditSummary(ed) {
+    const b = ed.before, d = ed.draft, lines = [];
+    const bm = grantModeLetters(b.modes), dm = grantModeLetters(d.modes);
+    if (d.recursive !== b.recursive) lines.push(`reach: ${b.recursive ? 'recursive' : 'exact'} → ${d.recursive ? 'recursive' : 'exact'}`);
+    if (dm !== bm) lines.push(`modes: ${bm || '(none)'} → ${dm || '(none)'}`);
+    const widens = [...d.modes].some(l => !b.modes.has(l)) || (d.recursive && !b.recursive);
+    return { lines, widens, empty: !lines.length, none: !d.modes.size };
+  }
+
+  function renderFloorEditRow(f) {
+    const p = escapeHtml(String(f.path ?? ''));
+    const sum = floorEditSummary(floorEdit);
+    return `
+        <div class="grant-row editing floor-editing">
+          <span class="grant-who">everyone</span>
+          <span class="grant-preset scope-standing">FLOOR</span>
+          ${grantModeBoxes(floorEdit.draft.modes, true)}
+          <code>${p}</code>
+          <label class="grant-ttl"><input type="checkbox" data-floor-edit-recursive ${floorEdit.draft.recursive ? 'checked' : ''}> recursive (/**)</label>
+          <button class="grant-act" data-floor-edit-save ${sum.empty || sum.none ? 'disabled' : ''}>save</button>
+          <button class="grant-revoke" data-floor-edit-cancel>cancel</button>
+          <span class="grant-edit-summary${sum.widens ? ' widens' : ''}">${escapeHtml(
+            sum.none ? 'choose at least one of r, w, e, d (to take the path off the floor, remove it)'
+            : sum.empty ? 'no change yet'
+            : sum.lines.join('\n') + (sum.widens ? '\n⚠ WIDENS what EVERY member may reach or do' : '\nnarrows only')
+              + '\nA reason is required: this changes every member at once.')}${
+            sum.none || sum.empty || floorEdit.draft.modes.size === 4 ? '' : escapeHtml(
+              '\nNote: until this machine\'s gate enforces modes (hestia #1345, part B), an entry with read is admitted for read acts only, and one without read is not served to the gate at all.')}</span>
+        </div>`;
+  }
+
+  // Every floor write: POST /api/scope/floor {path, reason, recursive, modes,
+  // expected_generation?} (replaces by path) and POST /api/scope/floor/remove {path, reason}.
+  // Always POSTs; tools/operator_surfaces_spec_test.py reads it as such (FIXED_METHOD_HELPERS).
+  async function floorPost(url, body, what, err) {
+    err.hidden = true;
+    try {
+      const res = await apiFetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      await tick(); renderScopeGrants(lastData);
+      return true;
+    } catch (e2) { err.textContent = `${what} failed: ${e2.message}`; err.hidden = false; return false; }
+  }
+
+  function renderSocietyFloor(data) {
+    const fl = $('scope-floor-list');
+    if (!fl) return;
+    if (!data) { fl.innerHTML = '<div class="empty">loading…</div>'; return; }
+    const rows = data.society_floor ?? [];
+    if (floorEdit && !rows.some(f => f.path === floorEdit.path)) floorEdit = null;
+    fl.innerHTML = rows.length ? rows.map(f => {
+      if (floorEdit && floorEdit.path === f.path) return renderFloorEditRow(f);
+      const p = escapeHtml(String(f.path ?? ''));
+      return `
+        <div class="grant-row">
+          <span class="grant-who">everyone</span>
+          <span class="grant-preset scope-standing">FLOOR</span>
+          ${grantModeBoxes(f.modes, false)}
+          <code>${p}${f.recursive ? '<span class="grant-reach" title="reaches the whole subtree">/**</span>' : ''}</code>
+          <span class="grant-why">${escapeHtml(String(f.reason ?? ''))}</span>
+          <button class="grant-act" data-floor-edit="${p}">edit</button>
+          <button class="grant-revoke" data-floor-remove="${p}">remove</button>
+        </div>`;
+    }).join('') : '<div class="empty">The floor is empty: no path is reachable by every member without a grant.</div>';
+  }
+
   function renderScopeGrants(data) {
     const gen = $('scope-gen');
     if (gen) {
@@ -4275,6 +4377,8 @@
             </div>`).join('')
         : '<div class="empty">No member is waiting on a scope decision.</div>';
     }
+
+    renderSocietyFloor(data);
 
     const list = $('scope-grant-list');
     if (!list) return;
@@ -6297,9 +6401,21 @@
     // Revoke, and the hand-off to the one decide control. Delegated, because the rows are
     // re-rendered on every tick and per-row listeners would be rebound continuously.
     // EDIT (dp, 2026-10-22, #1345): stage path + reach + modes; nothing changes until Save.
+    // The floor's Edit row (same staging; a floor row is never a grant row).
+    pane.addEventListener('input', (e) => {
+      if (!floorEdit) return;
+      const row = e.target.closest('.grant-row.floor-editing');
+      if (!row) return;
+      if (e.target.matches('[data-floor-edit-recursive]')) floorEdit.draft.recursive = e.target.checked;
+      else if (e.target.matches('[data-grant-mode]')) {
+        const l = e.target.dataset.grantMode;
+        if (e.target.checked) floorEdit.draft.modes.add(l); else floorEdit.draft.modes.delete(l);
+      } else return;
+      renderSocietyFloor(lastData);
+    });
     pane.addEventListener('input', (e) => {
       if (!grantEdit) return;
-      const row = e.target.closest('.grant-row.editing');
+      const row = e.target.closest('.grant-row.editing:not(.floor-editing)');
       if (!row) return;
       if (e.target.matches('[data-grant-edit-path]')) grantEdit.draft.path = e.target.value.trim();
       else if (e.target.matches('[data-grant-edit-recursive]')) grantEdit.draft.recursive = e.target.checked;
@@ -6367,6 +6483,62 @@
         } catch (e2) {
           // The draft is kept: a refused Save leaves both the grant and the staged edit as they were.
           err.textContent = `edit failed: ${e2.message}`; err.hidden = false; save.disabled = false;
+        }
+        return;
+      }
+      // SOCIETY FLOOR (floorPost above).
+      const fed = e.target.closest('[data-floor-edit]');
+      if (fed) {
+        const cur = (lastData?.society_floor ?? []).find(f => f.path === fed.dataset.floorEdit);
+        if (!cur) return;
+        const before = { recursive: !!cur.recursive, modes: grantModeSet(cur.modes) };
+        floorEdit = { path: cur.path, generation: lastData?.standing_generation ?? 0, before,
+                      draft: { recursive: before.recursive, modes: new Set(before.modes) } };
+        err.hidden = true;
+        renderSocietyFloor(lastData);
+        return;
+      }
+      if (e.target.closest('[data-floor-edit-cancel]')) {
+        floorEdit = null; err.hidden = true;
+        renderSocietyFloor(lastData);
+        return;
+      }
+      const fsave = e.target.closest('[data-floor-edit-save]');
+      if (fsave && floorEdit) {
+        const sum = floorEditSummary(floorEdit);
+        if (sum.empty || sum.none) return;
+        const why = prompt(`Save this change to the society floor, for EVERY member?\n\n${floorEdit.path}\n${sum.lines.join('\n')}\n\n`
+          + (sum.widens ? 'This WIDENS what every member may reach or do.\n' : 'This only narrows.\n') + 'Reason (required):');
+        if (why === null) return;
+        if (!why.trim()) { err.textContent = 'a reason is required to change the floor'; err.hidden = false; return; }
+        fsave.disabled = true;
+        const ok = await floorPost('/api/scope/floor', {
+          path: floorEdit.path, reason: why, recursive: floorEdit.draft.recursive,
+          modes: grantModeLetters(floorEdit.draft.modes), expected_generation: floorEdit.generation,
+        }, 'floor edit', err);
+        // A refused Save keeps the draft: the entry and the staged edit both stay as they were.
+        if (ok) { floorEdit = null; renderSocietyFloor(lastData); } else fsave.disabled = false;
+        return;
+      }
+      const rm = e.target.closest('[data-floor-remove]');
+      if (rm) {
+        const p = rm.dataset.floorRemove;
+        const why = prompt(`Remove ${p} from the society floor?\n\nThis narrows EVERY member at once. Reason:`);
+        if (why === null) return;
+        rm.disabled = true;
+        if (!await floorPost('/api/scope/floor/remove', { path: p, reason: why }, 'floor remove', err)) rm.disabled = false;
+        return;
+      }
+      if (e.target.closest('#floor-add-btn')) {
+        const p = ($('floor-add-path')?.value ?? '').trim();
+        const why = ($('floor-add-reason')?.value ?? '').trim();
+        const modes = ['r', 'w', 'e', 'd'].filter(l => $(`floor-add-${l}`)?.checked).join('');
+        if (!p || !why) { err.textContent = 'a floor entry needs an absolute path and a reason'; err.hidden = false; return; }
+        if (!modes) { err.textContent = 'a floor entry needs at least one of r, w, e, d'; err.hidden = false; return; }
+        const body = { path: p, reason: why, recursive: !!$('floor-add-rec')?.checked, modes };
+        if (!confirm(`Add to the society floor, for EVERY member without a grant of its own there?\n\n${p}${body.recursive ? '/**' : ''}\nmodes: ${modes}`)) return;
+        if (await floorPost('/api/scope/floor', body, 'floor add', err)) {
+          $('floor-add-path').value = ''; $('floor-add-reason').value = '';
         }
         return;
       }

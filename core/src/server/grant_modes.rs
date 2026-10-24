@@ -96,6 +96,11 @@ impl Modes {
         self.0 & !before.0 != 0
     }
 
+    /// Everything either grants: what several grants covering one path add up to.
+    pub const fn union(self, other: Modes) -> Modes {
+        Modes(self.0 | other.0)
+    }
+
     pub fn iter(self) -> impl Iterator<Item = Mode> {
         Mode::ALL.into_iter().filter(move |m| self.contains(*m))
     }

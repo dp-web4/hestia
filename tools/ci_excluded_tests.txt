@@ -48,3 +48,4 @@ plugin-sdk/python/tests/conformance/test_conformance.py
 # upgrade-path.yml, which builds the daemon and checks out with fetch-depth 0. Its plumbing is
 # pinned hermetically by tools/upgrade_path_plumbing_test.py, which plugin-tests does run.
 tools/upgrade_path_test.py
+

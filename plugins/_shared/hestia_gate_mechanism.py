@@ -1209,6 +1209,11 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             # that serves a floor, and no deployed daemon did yet.
             "society_floor": [],
             "society_floor_digest": None,
+            # Read-only floor roots (dp, 2026-10-19: "the governed see the law"). Kept apart
+            # from `in_scope` because a grant carries reach and no mode (#1098 §2, #1345):
+            # an entry here admits READ acts only, and only in a core that knows the key.
+            "society_floor_read": [],
+            "in_scope_read": [],
             "generation": None,
             "expires_at": None,
         }
@@ -1284,13 +1289,26 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             # Absent on an older daemon, in which case every line below is a no-op and the
             # snapshot is exactly the pre-floor one: a member talking to a daemon that has no
             # floor gets no floor, rather than an error or a guess.
+            # `recursive` rides the floor entry since the floor learned subtrees; absent on
+            # an older daemon, which reads as exact — the floor's meaning before it existed.
             floor = scope.get("society_floor")
             if isinstance(floor, list):
                 for f in floor:
                     p = f.get("path") if isinstance(f, dict) else None
                     if isinstance(p, str) and p.strip():
                         snap["society_floor"].append(p.strip())
-                        snap["in_scope"].append(_scope_entry_for_grant(p))
+                        snap["in_scope"].append(
+                            _scope_entry_for_grant(p, f.get("recursive") is True))
+            # The READ-ONLY floor: the same mapping, into a list the core consults for read
+            # acts alone. Absent on an older daemon, so nothing extra is admitted.
+            floor_read = scope.get("society_floor_read")
+            if isinstance(floor_read, list):
+                for f in floor_read:
+                    p = f.get("path") if isinstance(f, dict) else None
+                    if isinstance(p, str) and p.strip():
+                        snap["society_floor_read"].append(p.strip())
+                        snap["in_scope_read"].append(
+                            _scope_entry_for_grant(p, f.get("recursive") is True))
             floor_digest = scope.get("society_floor_digest")
             if isinstance(floor_digest, str) and len(floor_digest) == 64:
                 snap["society_floor_digest"] = floor_digest

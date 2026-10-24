@@ -326,6 +326,36 @@
       }
     },
     {
+      "id": "society-floor",
+      "title": "Edit the society floor: what every member may do where none of its own grants reaches",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/scope/floor",
+        "POST /api/scope/floor/remove"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "after the dashboard's floor Edit row (hestia #1347)"
+        }
+      },
+      "obligations": [
+        "each floor entry is one row with the same r/w/e/d boxes and recursive (/**) control a grant has, DISABLED outside Edit; Edit stages the change and nothing is sent until Save, Cancel discards it (dp, 2026-10-23: 'we want granularity and edit'; Nova on #1347)",
+        "Save says in words what changes and whether it WIDENS (any added mode, or exact made recursive), asks for a reason every time because the change binds every member, and sends expected_generation so a store that moved since the edit was staged is refused (409) with nothing written",
+        "the surface says that a member's own grant decides wherever it reaches and the floor applies only where none does (PRD_ALLOWLISTS AC-1 as amended 2026-10-23: 'floor should not override the actual grants')",
+        "removing an entry narrows every member at once and asks for a reason"
+      ]
+    },
+    {
       "id": "scope-revoke",
       "title": "Revoke a live or standing grant",
       "place": "activity",
@@ -1003,14 +1033,6 @@
     {
       "route": "POST /api/agents/:id/ungovern",
       "why": "hardened for #1131 (a reason is required; the intent is recorded before any hook is touched; a failed terminal record is reported, not hidden). Still unsurfaced by choice: removing a gate is the one act no view offers until the owner decides it should"
-    },
-    {
-      "route": "POST /api/scope/floor",
-      "why": "the society floor: the widest escalation there is; CLI/operator-only until a surface is designed for it. A read-only view is wanted"
-    },
-    {
-      "route": "POST /api/scope/floor/remove",
-      "why": "as scope/floor"
     },
     {
       "route": "POST /api/scope/reroot",

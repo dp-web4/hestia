@@ -1,0 +1,322 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -235,6 +235,19 @@
+         "request was opened: no grant can name a path the gate cannot see. If the spelled-out "
+         "command then reaches outside your scope, its own refusal opens a request for that "
+         "path.",
++        ("hestia_request_scope",),
++    ),
++    # A PHANTOM REACH (hestia#1327, the #1313 pattern). A relative `cd` is composed under every
++    # earlier directory base, so `cd /ws && cd a && cd ../b` is also judged at `<cwd>/../b`, and
++    # every later relative word under that. When neither the refused path nor its parent exists,
++    # it names nothing a grant could be about, so it is NOT a scope-escalating rule: refused as
++    # before (the over-approximation is the safe direction), but no peer request is opened.
++    "mrh.command.nonexistent": Remedy(
++        "The refused path does not exist, and neither does its parent directory: most often a "
++        "relative cd composed under a directory the command never runs in. Spell the cd target "
++        "absolutely (or use git -C / an absolute path) and re-issue. No scope request was opened: "
++        "a grant cannot be about a path that names nothing. If the path is genuinely needed (the "
++        "command creates it), ask with hestia_request_scope (one path, with a reason).",
+         ("hestia_request_scope",),
+     ),
+     "mrh.command": Remedy(
+@@ -2468,6 +2481,19 @@
+     return False
+ 
+ 
++def _names_nothing(path: str) -> bool:
++    """Whether a refused reach is a PHANTOM (hestia#1327): neither it nor its parent directory
++    exists, so it names no object a grant could be about. `_dir_bases` composes a relative `cd`
++    under every earlier base, so `cd /ws && cd a && cd ../b` also judges `<cwd>/../b` and every
++    later relative word under it; each such spelling opened a peer request for nothing. The
++    parent rule keeps a NEW file in an existing directory (`echo x > /out/new.txt`) a real ask.
++    A glob probe (`dir/*`) is judged as its directory; a device path is never a phantom."""
++    p = path[:-2] if path.endswith("/*") else path
++    if p == "/dev" or p.startswith("/dev/"):
++        return False
++    return not os.path.lexists(p) and not os.path.lexists(os.path.dirname(p) or "/")
++
++
+ def _glob_probe(path: str) -> str:
+     """The path a glob is judged as: its literal directory plus a `*` child, so a glob reaches
+     only what a RECURSIVE grant (or temp/home) covers — an exact grant on one file under the
+@@ -3087,6 +3113,15 @@
+                     f"({offending[len(_UNMODELLED_PREFIX):-1]}). Nothing an expansion produces is "
+                     f"modelled, so no grant can cover it as written",
+                     target=refused or "",
++                )
++            elif outside and _names_nothing(refused):
++                # hestia#1327: its own rule, so nothing escalates (see REMEDIES).
++                return _deny(
++                    "mrh.command.nonexistent",
++                    f"'{event.tool}' command reaches outside your granted scope: '{offending}' "
++                    f"names nothing on disk (neither it nor its parent directory exists), so no "
++                    f"grant could be about it (granted: {'+'.join(scopes)}){hint}",
++                    target=refused,
+                 )
+             elif outside:
+                 what = f"'{offending}' is outside the workspace and no grant reaches it"
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 9430ffc67a2193a3712fe161218d2276fec0875a7d3f0331498604f53daa6abd  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -236,6 +236,19 @@
+         "request was opened: no grant can name a path the gate cannot see. If the spelled-out "
+         "command then reaches outside your scope, its own refusal opens a request for that "
+         "path.",
++        ("hestia_request_scope",),
++    ),
++    # A PHANTOM REACH (hestia#1327, the #1313 pattern). A relative `cd` is composed under every
++    # earlier directory base, so `cd /ws && cd a && cd ../b` is also judged at `<cwd>/../b`, and
++    # every later relative word under that. When neither the refused path nor its parent exists,
++    # it names nothing a grant could be about, so it is NOT a scope-escalating rule: refused as
++    # before (the over-approximation is the safe direction), but no peer request is opened.
++    "mrh.command.nonexistent": Remedy(
++        "The refused path does not exist, and neither does its parent directory: most often a "
++        "relative cd composed under a directory the command never runs in. Spell the cd target "
++        "absolutely (or use git -C / an absolute path) and re-issue. No scope request was opened: "
++        "a grant cannot be about a path that names nothing. If the path is genuinely needed (the "
++        "command creates it), ask with hestia_request_scope (one path, with a reason).",
+         ("hestia_request_scope",),
+     ),
+     "mrh.command": Remedy(
+@@ -2469,6 +2482,19 @@
+     return False
+ 
+ 
++def _names_nothing(path: str) -> bool:
++    """Whether a refused reach is a PHANTOM (hestia#1327): neither it nor its parent directory
++    exists, so it names no object a grant could be about. `_dir_bases` composes a relative `cd`
++    under every earlier base, so `cd /ws && cd a && cd ../b` also judges `<cwd>/../b` and every
++    later relative word under it; each such spelling opened a peer request for nothing. The
++    parent rule keeps a NEW file in an existing directory (`echo x > /out/new.txt`) a real ask.
++    A glob probe (`dir/*`) is judged as its directory; a device path is never a phantom."""
++    p = path[:-2] if path.endswith("/*") else path
++    if p == "/dev" or p.startswith("/dev/"):
++        return False
++    return not os.path.lexists(p) and not os.path.lexists(os.path.dirname(p) or "/")
++
++
+ def _glob_probe(path: str) -> str:
+     """The path a glob is judged as: its literal directory plus a `*` child, so a glob reaches
+     only what a RECURSIVE grant (or temp/home) covers — an exact grant on one file under the
+@@ -3088,6 +3114,15 @@
+                     f"({offending[len(_UNMODELLED_PREFIX):-1]}). Nothing an expansion produces is "
+                     f"modelled, so no grant can cover it as written",
+                     target=refused or "",
++                )
++            elif outside and _names_nothing(refused):
++                # hestia#1327: its own rule, so nothing escalates (see REMEDIES).
++                return _deny(
++                    "mrh.command.nonexistent",
++                    f"'{event.tool}' command reaches outside your granted scope: '{offending}' "
++                    f"names nothing on disk (neither it nor its parent directory exists), so no "
++                    f"grant could be about it (granted: {'+'.join(scopes)}){hint}",
++                    target=refused,
+                 )
+             elif outside:
+                 what = f"'{offending}' is outside the workspace and no grant reaches it"
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "9430ffc67a2193a3712fe161218d2276fec0875a7d3f0331498604f53daa6abd",
++      "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "93af94f009b78fcee5a51fe56ee2a4a201f8dffe8f5d0a170bd1e7d739d81946"
++  "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "93af94f009b78fcee5a51fe56ee2a4a201f8dffe8f5d0a170bd1e7d739d81946",
++    "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "9430ffc67a2193a3712fe161218d2276fec0875a7d3f0331498604f53daa6abd"
++        "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "c092d8790364af982c2ad5a8005ee4f876b07ededfddacff25b049c3ea9bbf52"
++  "gt_version": "220148268d3a9e47c29aad377c19e8eab7bc0f561aafddcac133fd0dc7a55e7d"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "93af94f009b78fcee5a51fe56ee2a4a201f8dffe8f5d0a170bd1e7d739d81946",
++    "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "9430ffc67a2193a3712fe161218d2276fec0875a7d3f0331498604f53daa6abd"
++        "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "483ba06e216b286b64ae183cc153eb2f8caef6fa16cb24d08c788322fb238010"
++  "gt_version": "106b12929ac2ab452be1025ee93756bbed08201b278cd93848706c75b301e364"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "93af94f009b78fcee5a51fe56ee2a4a201f8dffe8f5d0a170bd1e7d739d81946",
++    "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "9430ffc67a2193a3712fe161218d2276fec0875a7d3f0331498604f53daa6abd"
++        "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "c8ae1d3d0fb73f6c19acc1ac0e828341451c3b4a81e5e2b366479e1bd1afa70a"
++  "gt_version": "79c5a7f3f3823b3d976a823c4ea8999e272a909e98e3e1733bad8be569e20abc"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "93af94f009b78fcee5a51fe56ee2a4a201f8dffe8f5d0a170bd1e7d739d81946",
++    "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "9430ffc67a2193a3712fe161218d2276fec0875a7d3f0331498604f53daa6abd"
++        "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "c1d966993b019369301cf2ce4cca5f05977eab93f0893db78172a7aeb88f2712"
++  "gt_version": "55197b22043388e7755e7934eaf1118dfe94164bbc6b153d4ba3504b6b360a03"
+ }
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -1255,6 +1255,57 @@
+         stub.close()
+ 
+ 
++def test_a_reach_that_names_nothing_opens_no_scope_request(m, g, wc, home):
++    """hestia#1327: `_dir_bases` composes a relative `cd` under every earlier base, so a fired
++    session whose cwd is outside the grant judges `cd /ws && ls a/b; cd a` at `<cwd>/a/a/b`, a
++    path that does not exist; each such PHANTOM opened a peer scope request for nothing. A refused
++    reach where neither the path nor its parent exists is refused under `mrh.command.nonexistent`,
++    which does not escalate (the #1313 pattern). A real path, a new file in an existing directory
++    and a glob over an existing directory still escalate."""
++    rule = "mrh.command.nonexistent"
++    phantom = "/etc/hestia-1327-phantom/deeper/x"     # nearest existing ancestor /etc: a reach
++    stub = Stub(Policy(scope_claim=lambda p: "approved"))
++    try:
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {phantom}"}, home)
++        check("phantom-is-refused-under-its-rule", d.decision == "deny" and d.rule == rule, d)
++        check("phantom-opens-no-request", stub.named("hestia_scope_claim") == [] and not d.escalation_id,
++              (stub.named("hestia_scope_claim"), d))
++        check("phantom-reason-names-the-path", phantom in d.reason and "names nothing" in d.reason, d.reason)
++        check("phantom-remedy-says-no-request", "No scope request was opened" in d.remedy
++              and "absolutely" in d.remedy, d.remedy)
++        check("phantom-target-is-the-path", d.target == phantom if hasattr(d, "target") else True, d)
++    finally:
++        stub.close()
++    # Still a real ask: an existing path, a new file in an existing directory, a glob over one.
++    for name, cmd in (("existing", "cat /etc/hostname"), ("new-file", "echo x > /etc/hestia-1327-new.txt"),
++                      ("glob", "ls /etc/*")):
++        stub = Stub(Policy())
++        try:
++            with _Env(m, stub.url, home):
++                d, _ = _decide(g, "claude-code", "Bash", {"command": cmd}, home)
++            check(f"phantom-{name}-still-escalates", d.decision == "deny" and d.rule == "mrh.command"
++                  and len(stub.named("hestia_scope_claim")) == 1 and d.escalation_id, (cmd, d))
++        finally:
++            stub.close()
++    # A mix asks nothing, in either order: the act cannot pass as written, so (as for #1313) no
++    # request is opened for the real path beside the phantom either.
++    stub = Stub(Policy())
++    try:
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {phantom} /etc/hostname"}, home)
++        check("phantom-first-mix-asks-nothing", d.rule == rule and stub.named("hestia_scope_claim") == [], d)
++    finally:
++        stub.close()
++    stub = Stub(Policy())
++    try:
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat /etc/hostname {phantom}"}, home)
++        check("real-first-mix-asks-nothing", d.rule == rule and stub.named("hestia_scope_claim") == [], d)
++    finally:
++        stub.close()
++
++
+ def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
+     """#1287 part 1 (2026-10-13): a seat put prose with `*` and quotes in R and passed "$R" as
+     `--reason`; the literal rule made the act a once-only scope request although nothing in it is a
+@@ -1718,6 +1769,7 @@
+     test_declared_egress_is_swept_and_never_scoped,
+     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
+     test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
++    test_a_reach_that_names_nothing_opens_no_scope_request,
+     test_prose_in_a_message_position_is_data_on_every_seat,
+     test_degraded_posture,
+     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -963,7 +963,8 @@
+         for name, cmd in deny:
+             ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
+             check(f"evaluate-denies:{name}", ve.blocks and ve.rule in (
+-                      "mrh.command", "mrh.command.unenumerated", "egress.secret"),
++                      "mrh.command", "mrh.command.unenumerated", "mrh.command.nonexistent",
++                      "egress.secret"),
+                   f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}")
+         # hestia#1313 (dp, 2026-10-14): an unenumerable reach is refused under its own rule, which
+         # does not escalate (no scope request is opened). The target still names the sentinel.
