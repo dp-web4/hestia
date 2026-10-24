@@ -4954,17 +4954,21 @@ fn cmd_chain_verify(home: &std::path::Path) -> AnyResult<()> {
     let (vault, passphrase) = open_vault_with_passphrase(home)?;
     let key = hestia::storage::storage_key(home, &passphrase)
         .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
-    let tmp = std::env::temp_dir().join(format!("hestia-chain-verify-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).context("creating snapshot dir")?;
-    let copy = tmp.join("witness.db");
-    let result = (|| -> AnyResult<hestia::storage::ChainVerification> {
+    // An exclusively created, owner-only directory (Codex review of #1322): never adopt a
+    // predictable pre-existing path, which a planted symlink could point at the live chain.
+    // Dropping `tmp` removes only the directory this call created.
+    let tmp = tempfile::Builder::new()
+        .prefix("hestia-chain-verify-")
+        .tempdir()
+        .context("creating private snapshot dir")?;
+    let copy = tmp.path().join("witness.db");
+    let v = (|| -> AnyResult<hestia::storage::ChainVerification> {
         hestia::storage::SqliteChainStore::backup_encrypted(home.join("witness.db"), &copy, key)
             .context("snapshotting the witness chain")?;
         let store = hestia::storage::SqliteChainStore::open(&copy, key)?;
         store.verify_chain()
-    })();
-    let _ = std::fs::remove_dir_all(&tmp);
-    let v = result?;
+    })()?;
+    drop(tmp);
     let sovereign = hestia::sovereign::Sovereign::persisted_lct_id(&vault);
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "link_intact": v.link_intact(),

@@ -452,6 +452,55 @@ fn migrate_plaintext_to_encrypted(path: &Path, key_hex: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a snapshot destination that is, or would replace, the source database or one of its
+/// SQLite side files, however it is spelled (Codex review of #1322). `backup_encrypted` deletes
+/// an existing destination before it opens the source, so a lexical comparison is not enough:
+/// a parent-directory symlink, a symlinked destination, or a hard link would make that delete
+/// unlink the live chain. Every check runs before any destructive step.
+fn refuse_snapshot_alias(source: &Path, destination: &Path) -> Result<()> {
+    let source_real = std::fs::canonicalize(source)
+        .with_context(|| format!("resolving chain snapshot source {}", source.display()))?;
+    if let Ok(meta) = std::fs::symlink_metadata(destination) {
+        anyhow::ensure!(
+            !meta.file_type().is_symlink(),
+            "chain snapshot destination {} is a symlink; refusing to replace it",
+            destination.display()
+        );
+    }
+    let name = destination
+        .file_name()
+        .with_context(|| format!("chain snapshot destination {} has no file name", destination.display()))?;
+    let parent = match destination.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let destination_real = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolving chain snapshot dir {}", parent.display()))?
+        .join(name);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut side = source_real.clone().into_os_string();
+        side.push(suffix);
+        anyhow::ensure!(
+            destination_real != Path::new(&side),
+            "chain snapshot destination {} resolves to the source {}",
+            destination.display(),
+            Path::new(&side).display()
+        );
+    }
+    #[cfg(unix)]
+    if let Ok(dest_meta) = std::fs::metadata(&destination_real) {
+        use std::os::unix::fs::MetadataExt;
+        let src_meta = std::fs::metadata(&source_real)?;
+        anyhow::ensure!(
+            (dest_meta.dev(), dest_meta.ino()) != (src_meta.dev(), src_meta.ino()),
+            "chain snapshot destination {} is a hard link to the source {}",
+            destination.display(),
+            source_real.display()
+        );
+    }
+    Ok(())
+}
+
 impl SqliteChainStore {
     /// Copy one consistent encrypted chain snapshot while its live daemon may
     /// continue appending in WAL mode.
@@ -477,6 +526,7 @@ impl SqliteChainStore {
                 format!("creating chain snapshot dir {}", parent.display())
             })?;
         }
+        refuse_snapshot_alias(source_path, destination_path)?;
         if destination_path.exists() {
             std::fs::remove_file(destination_path).with_context(|| {
                 format!(
@@ -675,10 +725,13 @@ impl SqliteChainStore {
         }
     }
 
-    /// The position from which this chain is signed, if it has ever been.
+    /// The position from which this chain must be signed, if it has ever been signed: the
+    /// earlier of the recorded boundary and the first surviving signature row (see
+    /// [`signing_boundary`]). Daemon startup and the CLI opener refuse to run without the
+    /// witness key when this is `Some`, so it must not trust the metadata row alone.
     pub fn signed_from(&self) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
-        meta_u64(&conn, META_SIGNED_FROM)
+        signing_boundary(&conn)
     }
 
     /// The chain's stable id (`hestia-chain:<genesis hash>`), once it has a genesis row.
@@ -914,9 +967,13 @@ impl SqliteChainStore {
         };
 
         // Downgrade refusal: a handle without the witness key must not extend a signed chain
-        // with an unsigned row (verification would report it as tampering, correctly).
+        // with an unsigned row (verification would report it as tampering, correctly). The
+        // boundary is read inside this transaction from both evidence sources, so neither a
+        // deleted metadata row nor a concurrent writer can slip an unsigned row past it. It is
+        // read for signed appends too: a malformed record refuses every append.
+        let boundary = signing_boundary(&tx)?;
         if signer.is_none() {
-            if let Some(from) = meta_u64(&tx, META_SIGNED_FROM)? {
+            if let Some(from) = boundary {
                 anyhow::bail!(
                     "witness chain refuses an unsigned append: rows from position {from} on are \
                      signed (#339), and this handle has no chain witness signer installed"
@@ -993,14 +1050,18 @@ impl SqliteChainStore {
                     signature,
                 ],
             )?;
+            // The boundary is recorded only when this row STARTS signing. If signatures already
+            // exist but the record is gone, writing this position would forge a later boundary
+            // and erase the verifier's evidence of the deletion; leave it missing instead.
+            if boundary.is_none() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO chain_meta (key, value) VALUES (?1, ?2)",
+                    params![META_SIGNED_FROM, chain_position.to_string()],
+                )?;
+            }
             tx.execute(
-                "INSERT OR IGNORE INTO chain_meta (key, value) VALUES (?1, ?2), (?3, ?4)",
-                params![
-                    META_SIGNED_FROM,
-                    chain_position.to_string(),
-                    META_CHAIN_ID,
-                    chain_id,
-                ],
+                "INSERT OR IGNORE INTO chain_meta (key, value) VALUES (?1, ?2)",
+                params![META_CHAIN_ID, chain_id],
             )?;
             new_chain_id = Some(chain_id);
         }
@@ -1785,11 +1846,21 @@ impl SqliteChainStore {
                 ));
             }
         }
-        if let (Some(first), Some(recorded)) = (v.first_signed_position, v.recorded_signed_from) {
-            if first != recorded && v.meta_mismatch.is_none() {
-                v.meta_mismatch = Some(format!(
-                    "chain_meta records signing from position {recorded}, first signature is at {first}"
-                ));
+        if v.meta_mismatch.is_none() {
+            match (v.first_signed_position, v.recorded_signed_from) {
+                (Some(first), Some(recorded)) if first != recorded => {
+                    v.meta_mismatch = Some(format!(
+                        "chain_meta records signing from position {recorded}, first signature is at {first}"
+                    ));
+                }
+                // The record is written in the same transaction as the first signature, so
+                // signatures without it mean the record was removed.
+                (Some(first), None) => {
+                    v.meta_mismatch = Some(format!(
+                        "chain_meta has no signed_from_position, but signatures begin at {first}"
+                    ));
+                }
+                _ => {}
             }
         }
         Ok(v)
@@ -1810,6 +1881,25 @@ fn meta_u64(conn: &Connection, key: &str) -> Result<Option<u64>> {
             .map(Some)
             .with_context(|| format!("chain_meta {key} is not a u64: {v:?}")),
     }
+}
+
+/// The position from which this chain must be signed, derived from BOTH persisted sources of
+/// evidence: the `signed_from_position` record and the signature rows themselves (Codex review
+/// of #1322). Either one alone is enough to make signing mandatory, so losing the metadata row
+/// while signatures survive (or the reverse) cannot reopen unsigned appends. The earlier of the
+/// two wins, because that is the conservative answer when they disagree. A malformed record is
+/// an error, never "unsigned".
+fn signing_boundary(conn: &Connection) -> Result<Option<u64>> {
+    let recorded = meta_u64(conn, META_SIGNED_FROM)?;
+    let first_signature: Option<i64> =
+        conn.query_row("SELECT MIN(chain_position) FROM chain_signatures", [], |r| r.get(0))?;
+    let first_signature = first_signature
+        .map(|p| u64::try_from(p).context("chain_signatures holds a negative position"))
+        .transpose()?;
+    Ok(match (recorded, first_signature) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    })
 }
 
 fn row_to_signature(row: &rusqlite::Row) -> rusqlite::Result<ChainSignatureRecord> {
@@ -2801,11 +2891,82 @@ mod tests {
         let before = store.verify_chain().unwrap();
         assert_eq!(before.recorded_signed_from, None);
         assert_eq!(before.signed_valid, 1);
-        assert!(before.signatures_authentic());
+        // The record is written with the first signature, so its absence is reported.
+        assert!(before.meta_mismatch.as_deref().is_some_and(|m| m.contains("no signed_from_position")));
+        assert!(!before.signatures_authentic());
+        // The predicate daemon startup and the CLI opener use sees the surviving signature.
+        assert_eq!(store.signed_from().unwrap(), Some(0));
         let result = store.append("evt", json!({"i": 1}), "lct:a");
         let after = store.verify_chain().unwrap();
         assert!(result.is_err(), "unsigned append succeeded after metadata loss; verification: {after:?}");
         assert_eq!(store.len().unwrap(), 1, "refusal must leave no additional row");
+    }
+
+    /// The reverse loss: signature rows gone, record intact. The record alone still refuses.
+    #[test]
+    fn missing_signature_rows_with_a_boundary_record_still_refuse_unsigned_appends() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "DELETE FROM chain_signatures");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(store.signed_from().unwrap(), Some(0));
+        assert!(store.append("evt", json!({"i": 1}), "lct:a").is_err());
+        assert_eq!(store.len().unwrap(), 1);
+    }
+
+    /// A malformed record is an error for every handle and every append, never "unsigned".
+    #[test]
+    fn malformed_boundary_metadata_refuses_every_append() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "UPDATE chain_meta SET value = 'zero' WHERE key = 'signed_from_position'");
+
+        let unsigned = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert!(unsigned.signed_from().is_err());
+        assert!(unsigned.append("evt", json!({"i": 1}), "lct:a").is_err());
+        drop(unsigned);
+        let signed = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        signed.install_witness_signer(w).unwrap();
+        assert!(signed.append("evt", json!({"i": 1}), "lct:a").is_err());
+        assert_eq!(signed.len().unwrap(), 1);
+    }
+
+    /// Record and signatures disagree: the earlier position wins, and the mismatch is reported.
+    #[test]
+    fn inconsistent_boundary_metadata_takes_the_earlier_position() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "UPDATE chain_meta SET value = '5' WHERE key = 'signed_from_position'");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(store.signed_from().unwrap(), Some(0));
+        assert!(store.verify_chain().unwrap().meta_mismatch.is_some());
+        assert!(store.append("evt", json!({"i": 2}), "lct:a").is_err());
+        assert_eq!(store.len().unwrap(), 2);
+    }
+
+    /// A signed append after the record was deleted must not write a new, later boundary:
+    /// that would forge the record and erase the verifier's evidence of the deletion.
+    #[test]
+    fn a_signed_append_does_not_rewrite_a_deleted_boundary() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "DELETE FROM chain_meta WHERE key = 'signed_from_position'");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        store.install_witness_signer(w).unwrap();
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        let v = store.verify_chain().unwrap();
+        assert_eq!((v.signed_valid, v.recorded_signed_from), (2, None));
+        assert!(v.meta_mismatch.is_some());
+        assert_eq!(store.signed_from().unwrap(), Some(0));
     }
 
     /// chain-verify uses a predictable temporary directory. If its parent is a symlink
@@ -2823,7 +2984,16 @@ mod tests {
         };
         let alias = dir.path().join("snapshot-alias");
         std::os::unix::fs::symlink(&source_dir, &alias).unwrap();
-        let result = SqliteChainStore::backup_encrypted(&source, alias.join("witness.db"), TEST_KEY);
+        // Without the alias refusal the helper unlinks the source and then backs the recreated
+        // file up onto itself, which never completes: bound the call so a regression FAILS.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (src, dst) = (source.clone(), alias.join("witness.db"));
+        std::thread::spawn(move || {
+            let _ = tx.send(SqliteChainStore::backup_encrypted(&src, dst, TEST_KEY));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("snapshot through a parent alias hung: the source was likely unlinked");
         let preserved = raw(&source).query_row(
             "SELECT hash FROM chain_entries WHERE chain_position = 0", [],
             |row| row.get::<_, String>(0),
@@ -2831,6 +3001,30 @@ mod tests {
         assert_eq!(preserved.ok().as_deref(), Some(expected_hash.as_str()),
             "snapshot replaced its source through a parent alias; backup result: {result:?}");
         assert!(result.is_err(), "aliased source/destination must be refused");
+    }
+
+    /// The same refusal for a symlinked destination file, a hard link, and the source's WAL.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_file_symlink_hard_link_and_side_file_destinations() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("witness.db");
+        let expected_hash = {
+            let store = SqliteChainStore::open(&source, TEST_KEY).unwrap();
+            store.append("evt", json!({"keep": true}), "lct:a").unwrap().hash
+        };
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let hard = dir.path().join("hard.db");
+        std::fs::hard_link(&source, &hard).unwrap();
+        for dest in [link, hard, dir.path().join("witness.db-wal")] {
+            let result = SqliteChainStore::backup_encrypted(&source, &dest, TEST_KEY);
+            assert!(result.is_err(), "{} was accepted as a destination", dest.display());
+        }
+        let preserved: String = raw(&source)
+            .query_row("SELECT hash FROM chain_entries WHERE chain_position = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(preserved, expected_hash);
     }
 
     /// #339 test 8: reopen preserves signatures, chain id, and signed-from.
