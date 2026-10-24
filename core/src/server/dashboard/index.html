@@ -4378,14 +4378,68 @@
   // plus the spec it will implement. Never-flatter (#435/#438): an empty-looking
   // panel here would claim "this entity has no channels" when the truth is that
   // nobody has built the view.
+  // CHANNEL SENDS (#1344, slice 1, SHADOW): the operator's view of what members asked to send
+  // over the channels bound for them. Nothing here has left the machine. "Mark answered" is how
+  // the operator says the bound recipient replied (no email ingress yet), which frees that
+  // member's unanswered budget; the daemon witnesses it, once only.
+  async function renderChannelSends() {
+    const el = $('channel-sends');
+    if (!el) return;
+    try {
+      const [ob, bd] = await Promise.all([
+        apiFetch('/api/channel/outbox?limit=100').then(r => r.json()),
+        apiFetch('/api/channel/binding').then(r => r.json()),
+      ]);
+      const rows = ob.outbox || [], binds = bd.bindings || [];
+      const when = t => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 16) + 'Z' : '';
+      const bindRows = binds.map(b => `<tr><td>${escapeHtml(b.member)}</td><td>${escapeHtml(b.channel_id)}</td>
+          <td>${escapeHtml(b.recipient_class)}</td><td>${escapeHtml(b.adapter)}</td>
+          <td>${escapeHtml(b.address)}</td><td>${escapeHtml(b.reason)}</td></tr>`).join('');
+      const obRows = rows.map(r => {
+        const state = r.would_deny ? 'would-deny (over budget)'
+          : r.answered_at ? `answered ${escapeHtml(when(r.answered_at))} by ${escapeHtml(r.answered_by || '?')}`
+          : `<button class="btn" data-channel-answer="${Number(r.id)}">Mark answered</button>`;
+        return `<tr><td>#${Number(r.id)}</td><td>${escapeHtml(when(r.created))}</td><td>${escapeHtml(r.member)}</td>
+          <td>${escapeHtml(r.channel_id)}</td><td style="white-space:pre-wrap">${escapeHtml(r.content)}</td><td>${state}</td></tr>`;
+      }).join('');
+      el.innerHTML = `
+        <h3>Channel sends <span class="pol-mode">shadow: nothing has left this machine</span></h3>
+        <p class="esc-note">Bindings (where each member's sends to a channel would go):</p>
+        ${binds.length ? `<table class="data"><tr><th>member</th><th>channel</th><th>class</th><th>adapter</th><th>address</th><th>reason</th></tr>${bindRows}</table>`
+                       : '<p class="esc-note">No channel is bound yet (<code>hestia channel bind</code>).</p>'}
+        <p class="esc-note">Outbox, newest first. A member may have 3 unanswered sends per channel per clock hour.</p>
+        ${rows.length ? `<table class="data"><tr><th>id</th><th>arrived</th><th>member</th><th>channel</th><th>message</th><th>state</th></tr>${obRows}</table>`
+                      : '<p class="esc-note">The outbox is empty.</p>'}`;
+    } catch (e) {
+      el.innerHTML = `<p class="esc-note">Channel sends could not be read: ${escapeHtml(e.message)}</p>`;
+    }
+  }
+
+  document.addEventListener('click', async (e) => {
+    const b = e.target && e.target.closest && e.target.closest('[data-channel-answer]');
+    if (!b) return;
+    const id = b.getAttribute('data-channel-answer');
+    if (!confirm(`Mark outbox #${id} answered? The recipient replied; this frees the member's budget. Once only.`)) return;
+    b.disabled = true;
+    try {
+      const res = await apiFetch(`/api/channel/outbox/${encodeURIComponent(id)}/answer`, { method: 'POST' });
+      const out = await res.json().catch(() => ({}));
+      // already-decided-409: answered elsewhere is not a failure; re-read and show it.
+      if (res.status === 409) { await renderChannelSends(); return; }
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      await renderChannelSends();
+    } catch (err) { b.disabled = false; alert(`mark answered failed: ${err.message}`); }
+  });
+
   function renderChannels() {
     const root = $('channels-body');
     if (!root) return;
     root.innerHTML = `
+      <div id="channel-sends"></div>
       <div class="devices-notice">
-        <strong>Not yet implemented.</strong> Channels is a reserved slot with a written
-        spec (PRD §5.9) and no machinery behind it yet. Nothing on this screen reads or
-        renders real channel state.
+        <strong>The rest is not yet implemented.</strong> Above: channel sends (#1344, shadow).
+        Everything else on this screen is a reserved slot with a written spec (PRD §5.9) and
+        no machinery behind it yet.
       </div>
       <div class="esc-note" style="margin-top:0.7rem">
         <p style="margin:0 0 0.5rem"><strong>What this screen will be:</strong> the gateway to every
@@ -4402,6 +4456,7 @@
         inquiry is itself a governed, witnessed act by the asker: others can learn who did what,
         and the asking leaves a trace.</p>
       </div>`;
+    renderChannelSends();
   }
 
   function renderDevices(data) {

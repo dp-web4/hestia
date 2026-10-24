@@ -967,6 +967,32 @@
         }
       },
       "notes": "Enrollment is probed per hub (GET /v1/hubs/{hub}/members/{me}/pubkey): only 200/404 set it; unreachable or any other answer is UNKNOWN, rendered amber, never 'not a member'. Withdraw is the member's own exit (web4#804); 'remove from list' only forgets a URL locally. Apply reuses POST /api/hub/join + PUT /api/hub/urls/active (hub-act, hub-urls)."
+    },
+    {
+      "id": "channel-sends",
+      "title": "Channel sends (#1344, shadow): the outbox, and marking a send answered",
+      "place": "activity",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "GET /api/channel/outbox",
+        "POST /api/channel/outbox/:id/answer",
+        "GET /api/channel/binding"
+      ],
+      "rules": [
+        "signed-in-only",
+        "already-decided-409"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "slice 1 of #1344 is shadow and operator-only; the app view follows with the delivery slice"
+        }
+      },
+      "notes": "Marking answered is an attestation (the bound recipient replied), not a permit: it frees the member's unanswered budget and is witnessed once (409 after). Nothing in the outbox has left the machine in this slice."
     }
   ],
   "unsurfaced": [
@@ -1029,6 +1055,10 @@
     {
       "route": "GET /.well-known/openid-credential-issuer",
       "why": "wallet-facing metadata"
+    },
+    {
+      "route": "POST /api/channel/binding",
+      "why": "channel bindings (#1344): set with `hestia channel bind` (operator-signed, reason required); the dashboard shows bindings read-only"
     }
   ],
   "known_gaps": []

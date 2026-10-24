@@ -249,6 +249,16 @@ enum SiteClass {
 }
 
 const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
+    // #1344 (2026-10-23, legion-claude): `tool_channel_send`. It NAMES the sender (the chain
+    // row's and outbox row's `member_lct`; `None` refuses, nothing recorded), and it GATES on a
+    // name: the unanswered budget (`would_deny`) counts the channel's rows whose member is the
+    // sender or `same_entity` with it. Keying the count on one LCT would have given each alias of
+    // a member its own budget, failing OPEN; `same_entity` (with the operator's alias records)
+    // is the repair the appeal pools use. Predicate, with the comparison pinned below.
+    ("server/handler.rs::tool_channel_send", &[
+        ".filter(|r| r.member == who.plugin_id || s.same_entity(&r.member, &who.plugin_id))",
+        "let Some(member_lct) = s.member_lct(&who.plugin_id) else {",
+    ], SiteClass::Predicate),
     ("server/handler.rs::gate_direct_tool", &[
         "let instance_lct = s.member_lct(&who.plugin_id);",
     ], SiteClass::Naming),
@@ -771,6 +781,10 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
 /// asserts the two agree, so a new Predicate site without a pinned
 /// comparison — or a pinned comparison at a Naming site — is red on arrival.
 const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
+    // #1344: the channel-send budget counts the sender's rows AND its aliases'.
+    ("server/handler.rs::tool_channel_send", &[
+        ".filter(|r| r.member == who.plugin_id || s.same_entity(&r.member, &who.plugin_id))",
+    ]),
     // #1232 (2026-10-11): the scope-request peer pool (excludes the asker's aliases) and the
     // peer decide's self-refusal. See their readings in the line census.
     ("server/handler.rs::scope_peer_pool", &[

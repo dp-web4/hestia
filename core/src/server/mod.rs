@@ -24,6 +24,7 @@ mod public_identity;
 pub mod retirement;
 pub mod standing_scope;
 pub mod transport_binding;
+pub mod channel;
 mod state;
 pub mod state_lock;
 pub mod published;
