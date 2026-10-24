@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 9430ffc67a2193a3712fe161218d2276fec0875a7d3f0331498604f53daa6abd  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -236,6 +236,19 @@ REMEDIES: dict[str, Remedy] = {
         "request was opened: no grant can name a path the gate cannot see. If the spelled-out "
         "command then reaches outside your scope, its own refusal opens a request for that "
         "path.",
+        ("hestia_request_scope",),
+    ),
+    # A PHANTOM REACH (hestia#1327, the #1313 pattern). A relative `cd` is composed under every
+    # earlier directory base, so `cd /ws && cd a && cd ../b` is also judged at `<cwd>/../b`, and
+    # every later relative word under that. When neither the refused path nor its parent exists,
+    # it names nothing a grant could be about, so it is NOT a scope-escalating rule: refused as
+    # before (the over-approximation is the safe direction), but no peer request is opened.
+    "mrh.command.nonexistent": Remedy(
+        "The refused path does not exist, and neither does its parent directory: most often a "
+        "relative cd composed under a directory the command never runs in. Spell the cd target "
+        "absolutely (or use git -C / an absolute path) and re-issue. No scope request was opened: "
+        "a grant cannot be about a path that names nothing. If the path is genuinely needed (the "
+        "command creates it), ask with hestia_request_scope (one path, with a reason).",
         ("hestia_request_scope",),
     ),
     "mrh.command": Remedy(
@@ -2469,6 +2482,19 @@ def _is_reach(path: str) -> bool:
     return False
 
 
+def _names_nothing(path: str) -> bool:
+    """Whether a refused reach is a PHANTOM (hestia#1327): neither it nor its parent directory
+    exists, so it names no object a grant could be about. `_dir_bases` composes a relative `cd`
+    under every earlier base, so `cd /ws && cd a && cd ../b` also judges `<cwd>/../b` and every
+    later relative word under it; each such spelling opened a peer request for nothing. The
+    parent rule keeps a NEW file in an existing directory (`echo x > /out/new.txt`) a real ask.
+    A glob probe (`dir/*`) is judged as its directory; a device path is never a phantom."""
+    p = path[:-2] if path.endswith("/*") else path
+    if p == "/dev" or p.startswith("/dev/"):
+        return False
+    return not os.path.lexists(p) and not os.path.lexists(os.path.dirname(p) or "/")
+
+
 def _glob_probe(path: str) -> str:
     """The path a glob is judged as: its literal directory plus a `*` child, so a glob reaches
     only what a RECURSIVE grant (or temp/home) covers — an exact grant on one file under the
@@ -3088,6 +3114,15 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                     f"({offending[len(_UNMODELLED_PREFIX):-1]}). Nothing an expansion produces is "
                     f"modelled, so no grant can cover it as written",
                     target=refused or "",
+                )
+            elif outside and _names_nothing(refused):
+                # hestia#1327: its own rule, so nothing escalates (see REMEDIES).
+                return _deny(
+                    "mrh.command.nonexistent",
+                    f"'{event.tool}' command reaches outside your granted scope: '{offending}' "
+                    f"names nothing on disk (neither it nor its parent directory exists), so no "
+                    f"grant could be about it (granted: {'+'.join(scopes)}){hint}",
+                    target=refused,
                 )
             elif outside:
                 what = f"'{offending}' is outside the workspace and no grant reaches it"
