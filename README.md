@@ -33,6 +33,8 @@ codebase keeps finding in itself: a check that reports success while measuring n
 > the baseline artifact; gate-consolidation status below was refreshed on 2026-08-23 against the
 > subsequently merged work and keeps repo state separate from live-install evidence.
 
+> **October 2026 (as of 2026-10-23):** since 2026-10-05 one shared gate serves every harness on the fleet: Claude Code, Codex and Kimi in daily use, Gemini on the same code path. Across the 8-machine fleet the gate has recorded over 500,000 governed acts. October work added scope requests decided by a peer (not by the requesting agent), read-tool classification, and closure and miswiring detection. The August audit and the gate-consolidation summary below are the dated baselines this builds on. The assurance grade is unchanged: **A1, cooperative and tamper-evident** (see the warning below).
+
 **Standards and public-sector reviewers:** the [standards review entry point](docs/STANDARDS_REVIEW.md) maps Hestia's identity, delegated authority, runtime governance, provenance, audit, non-repudiation, and allow/deny/revoke mechanisms into current NIST / NCCoE agent-identity vocabulary, with explicit A1/A2 assurance boundaries.
 
 > ### ⚠️ The gate stops accidents, not adversaries
