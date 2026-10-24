@@ -63,6 +63,14 @@ existing inert ingest operation.
 
 ## Bounded reads and evidence limits
 
+Command entries accept only `command`, optional `type: command`, an optional
+positive integer `timeout`, and optional string `statusMessage`. Unknown fields
+(including `args`, `env` or `commands`) refuse the candidate even if its target is
+otherwise known. These are the metadata shapes in the published templates, not
+a claim to support every harness extension. Timeout units and runtime enforcement
+remain harness-specific; the preflight does not interpret them. Noncanonical
+target paths are reported in `unresolved_targets` like other unsupported commands.
+
 Reads are descriptor-relative to the explicit store root and reject symlinks at
 or below it, special files and path traversal. Files are opened nonblocking and
 checked as regular files before reading. Limits are 1 MiB per closure JSON,
