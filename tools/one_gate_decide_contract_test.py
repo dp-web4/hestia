@@ -1255,6 +1255,57 @@ def test_an_unenumerated_reach_is_refused_with_rewrite_guidance(m, g, wc, home):
         stub.close()
 
 
+def test_a_reach_that_names_nothing_opens_no_scope_request(m, g, wc, home):
+    """hestia#1327: `_dir_bases` composes a relative `cd` under every earlier base, so a fired
+    session whose cwd is outside the grant judges `cd /ws && ls a/b; cd a` at `<cwd>/a/a/b`, a
+    path that does not exist; each such PHANTOM opened a peer scope request for nothing. A refused
+    reach where neither the path nor its parent exists is refused under `mrh.command.nonexistent`,
+    which does not escalate (the #1313 pattern). A real path, a new file in an existing directory
+    and a glob over an existing directory still escalate."""
+    rule = "mrh.command.nonexistent"
+    phantom = "/etc/hestia-1327-phantom/deeper/x"     # nearest existing ancestor /etc: a reach
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {phantom}"}, home)
+        check("phantom-is-refused-under-its-rule", d.decision == "deny" and d.rule == rule, d)
+        check("phantom-opens-no-request", stub.named("hestia_scope_claim") == [] and not d.escalation_id,
+              (stub.named("hestia_scope_claim"), d))
+        check("phantom-reason-names-the-path", phantom in d.reason and "names nothing" in d.reason, d.reason)
+        check("phantom-remedy-says-no-request", "No scope request was opened" in d.remedy
+              and "absolutely" in d.remedy, d.remedy)
+        check("phantom-target-is-the-path", d.target == phantom if hasattr(d, "target") else True, d)
+    finally:
+        stub.close()
+    # Still a real ask: an existing path, a new file in an existing directory, a glob over one.
+    for name, cmd in (("existing", "cat /etc/hostname"), ("new-file", "echo x > /etc/hestia-1327-new.txt"),
+                      ("glob", "ls /etc/*")):
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, "claude-code", "Bash", {"command": cmd}, home)
+            check(f"phantom-{name}-still-escalates", d.decision == "deny" and d.rule == "mrh.command"
+                  and len(stub.named("hestia_scope_claim")) == 1 and d.escalation_id, (cmd, d))
+        finally:
+            stub.close()
+    # A mix asks nothing, in either order: the act cannot pass as written, so (as for #1313) no
+    # request is opened for the real path beside the phantom either.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {phantom} /etc/hostname"}, home)
+        check("phantom-first-mix-asks-nothing", d.rule == rule and stub.named("hestia_scope_claim") == [], d)
+    finally:
+        stub.close()
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat /etc/hostname {phantom}"}, home)
+        check("real-first-mix-asks-nothing", d.rule == rule and stub.named("hestia_scope_claim") == [], d)
+    finally:
+        stub.close()
+
+
 def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
     """#1287 part 1 (2026-10-13): a seat put prose with `*` and quotes in R and passed "$R" as
     `--reason`; the literal rule made the act a once-only scope request although nothing in it is a
@@ -1718,6 +1769,7 @@ CONTRACT_TESTS = [
     test_declared_egress_is_swept_and_never_scoped,
     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
     test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
+    test_a_reach_that_names_nothing_opens_no_scope_request,
     test_prose_in_a_message_position_is_data_on_every_seat,
     test_degraded_posture,
     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
