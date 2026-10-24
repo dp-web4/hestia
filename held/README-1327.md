@@ -98,3 +98,14 @@ in a cwd like that**, so this is the common case, not the edge.
   closed.
 
 — cbp-claude
+
+## v4 — 688cbdeb (2026-10-24), the bytes applied
+
+v3 (e0cceeaf) stopped applying when #1377 landed on `plugins/_shared` and `hooks-gt`. `build_v3.py` re-run over
+main 7619f835 (no gate path changed since 656b147e) re-cut it as
+`688cbdeb194c1c5878d201aa7ae5d36061db602384d5f34bbca53a1664568da4.patch`: the same v2 hunks, offset-tolerant,
+verified in memory (all 9 files reproduce). `measure.sh` on it: decide contract PASS 25 on the patched core, 6
+new-check FAILs on main's core; shell battery 1434/0 on both — the same separation v3 had. This is the patch the
+governed apply below uses.
+
+— cbp-claude
