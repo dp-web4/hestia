@@ -436,8 +436,15 @@ impl StandingScopeStore {
     /// The gate unions `society_floor` with the member's grants, so an all-modes floor entry
     /// overlapping a narrowed grant would undo the narrowing there: it is WITHHELD for that
     /// member, and named. Fail closed: the member loses the floor's reach over that entry's
-    /// whole span, not just the overlap, until the gate enforces modes and can take the
-    /// member's grant first path by path (#1345 part B). A narrowed entry with read goes to
+    /// whole span, not just the overlap.
+    ///
+    /// THIS OUTLIVES MODE ENFORCEMENT (#1385). A gate that enforces modes (#1345 part B)
+    /// admits a narrowed grant by its own modes, but it still unions `society_floor` with the
+    /// member's grants: re-serving the entry would widen the narrowed grant back to all
+    /// modes in its subtree. The entry may be served again only once the gate itself caps the
+    /// floor by the member's own grants, path by path (dp 2026-10-24, #1386: the nearest
+    /// explicit grant decides; the floor applies only where no own grant reaches), and that
+    /// change needs its own review. A narrowed entry with read goes to
     /// `read` (admitted for read acts only), unless a narrowed grant overlapping it lacks
     /// read. Every other entry is withheld with its reason.
     pub fn floor_for<'a>(&'a self, narrowed: &[(String, bool, crate::server::grant_modes::Modes)])
@@ -452,8 +459,8 @@ impl StandingScopeStore {
                 out.withheld.push(FloorWithheld {
                     path: f.path.clone(),
                     why: format!("your own grant on {p} allows only {m} there, and the floor does \
-                                  not override a member's grant; served again when your gate \
-                                  enforces modes"),
+                                  not override a member's grant; withheld until your gate caps \
+                                  the floor by your own grants (hestia #1386)"),
                 });
             } else if f.modes.is_all() {
                 out.reach.push(f);
@@ -1150,6 +1157,27 @@ mod tests {
         // An overlap is either direction: a grant ABOVE the floor entry clashes as well.
         let above = vec![("/w".to_string(), true, modes("r"))];
         assert!(s.floor_for(&above).reach.is_empty());
+    }
+
+    /// #1385 (Nova re-review of #1383): an all-modes floor entry on a parent and the
+    /// member's own r-only grant on a child. The entry is withheld, and the reason it gives
+    /// must not promise to end at mode enforcement: a gate that enforces modes still unions
+    /// the served floor with the member's grants, so re-serving would let a child write
+    /// through. floor_for takes no gate-version input, so nothing here can re-serve on
+    /// "modes enforced" alone.
+    #[test]
+    fn an_all_modes_parent_floor_stays_withheld_over_an_r_only_child_grant() {
+        let mut s = StandingScopeStore::default();
+        s.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        let child = vec![("/w/shared/forum".to_string(), true, modes("r"))];
+        let view = s.floor_for(&child);
+        assert!(view.reach.is_empty(), "the parent entry must not reach the child: {:?}",
+                view.reach.iter().map(|f| &f.path).collect::<Vec<_>>());
+        assert!(view.read.is_empty());
+        let w = view.withheld.iter().find(|w| w.path == "/w/shared").expect("named as withheld");
+        assert!(w.why.contains("/w/shared/forum") && w.why.contains("#1386"), "{}", w.why);
+        assert!(!w.why.contains("when your gate enforces modes"),
+                "the reason must not promise re-serving at mode enforcement: {}", w.why);
     }
 
     #[test]
