@@ -2787,6 +2787,52 @@ mod tests {
         let _ = tail;
     }
 
+    /// Losing only boundary metadata must not enable unsigned appends while signed rows
+    /// still exist. The verifier already recognizes this evidence; append must do so too.
+    #[test]
+    fn missing_boundary_metadata_does_not_allow_unsigned_extension() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "DELETE FROM chain_meta WHERE key = 'signed_from_position'");
+
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let before = store.verify_chain().unwrap();
+        assert_eq!(before.recorded_signed_from, None);
+        assert_eq!(before.signed_valid, 1);
+        assert!(before.signatures_authentic());
+        let result = store.append("evt", json!({"i": 1}), "lct:a");
+        let after = store.verify_chain().unwrap();
+        assert!(result.is_err(), "unsigned append succeeded after metadata loss; verification: {after:?}");
+        assert_eq!(store.len().unwrap(), 1, "refusal must leave no additional row");
+    }
+
+    /// chain-verify uses a predictable temporary directory. If its parent is a symlink
+    /// to the source directory, the snapshot helper must not unlink the source database.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_parent_alias_must_not_replace_source_chain() {
+        let dir = TempDir::new().unwrap();
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("witness.db");
+        let expected_hash = {
+            let store = SqliteChainStore::open(&source, TEST_KEY).unwrap();
+            store.append("evt", json!({"keep": true}), "lct:a").unwrap().hash
+        };
+        let alias = dir.path().join("snapshot-alias");
+        std::os::unix::fs::symlink(&source_dir, &alias).unwrap();
+        let result = SqliteChainStore::backup_encrypted(&source, alias.join("witness.db"), TEST_KEY);
+        let preserved = raw(&source).query_row(
+            "SELECT hash FROM chain_entries WHERE chain_position = 0", [],
+            |row| row.get::<_, String>(0),
+        );
+        assert_eq!(preserved.ok().as_deref(), Some(expected_hash.as_str()),
+            "snapshot replaced its source through a parent alias; backup result: {result:?}");
+        assert!(result.is_err(), "aliased source/destination must be refused");
+    }
+
     /// #339 test 8: reopen preserves signatures, chain id, and signed-from.
     #[test]
     fn reopen_preserves_signatures_and_chain_id() {
