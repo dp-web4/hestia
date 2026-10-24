@@ -62,7 +62,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
                      )
  
      # 2. Local replica — fail-closed fallback, marked stale.
-@@ -3040,6 +3080,86 @@
+@@ -3040,6 +3080,90 @@
              and path_in_scope(p, read_scopes, ws, profile, event.cwd))
  
  
@@ -77,7 +77,10 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +#:   - write_note is a being's append, edit and retire alike (one gate tool for three verbs):
 +#:     w, since an append must work on a write-only grant; its edit receipt quotes the being's
 +#:     own old text back, never more of the file;
-+#:   - a being's git_restore rewrites a file from history (w); git_clean deletes one (d).
++#:   - a being's git_restore rewrites a file from history (w); git_clean deletes one (d);
++#:   - a being's run reads its script (to stage a copy) and executes it: re. Its event carries
++#:     the script path only; what the run can reach inside its sandbox is mounted from the
++#:     being's grants by their own modes on SAGE's side (SAGE #521), never by this table.
 +#: Shell commands are NOT classified here: see _command_mode_need.
 +PATH_TOOL_MODES = {
 +    **{t: "r" for t in READ_ONLY_PATH_TOOLS},
@@ -86,6 +89,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +    "Edit": "rw", "MultiEdit": "rw", "NotebookEdit": "rw", "replace": "rw",
 +    "write_note": "w",
 +    "git_restore": "w", "git_clean": "d",
++    "run": "re",
 +}
 +
 +
@@ -149,7 +153,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
  def evaluate(event: NormalizedEvent, profile: HarnessProfile,
               workspace: Optional[str] = None,
               policy: Optional[AgentPolicy] = None) -> Verdict:
-@@ -3059,6 +3179,7 @@
+@@ -3059,6 +3183,7 @@
      pol = policy if policy is not None else resolve_agent_policy(profile)
      scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
      read_scopes = list(getattr(pol, "read_scope", ()) or ())
@@ -157,7 +161,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
      forbidden = forbidden_tokens(profile)
  
      # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
-@@ -3128,7 +3249,8 @@
+@@ -3128,7 +3253,8 @@
                  )
      for p in ([] if event.repos else event.paths):
          if (not path_in_scope(p, scopes, ws, profile, event.cwd)
@@ -167,7 +171,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
              # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
              # on any long path truncates away the very component that tripped the gate — the
              # member is handed a string that does not contain its own reason. That is the
-@@ -3140,7 +3262,8 @@
+@@ -3140,7 +3266,8 @@
              where = f"'{seg}' is not granted" if seg else "it is outside the workspace"
              # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
              absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
@@ -177,7 +181,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
              return _deny(
                  "mrh.path",
                  f"'{event.tool}' targets '{_elide(p)}' outside your granted scope: {where} "
-@@ -3153,9 +3276,16 @@
+@@ -3153,9 +3280,16 @@
                                                       home_markers=profile.home_markers)
          # A command that only READS may also reach the read-only roots, by a strict verb
          # allowlist (READ_ONLY_ROOT_VERBS): anything outside it refuses rather than leaks.
@@ -196,7 +200,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
                  forbidden=forbidden, home_markers=profile.home_markers)
          if not ok:
              # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
-@@ -3164,7 +3294,9 @@
+@@ -3164,7 +3298,9 @@
              # not rebuilt from the display token, which has the right repo and the wrong
              # depth (GPT review of #1003).
              unpriceable = bool(refused) and refused.startswith(UNPRICEABLE_PREFIX)

@@ -1,6 +1,8 @@
 # held: #1345 part B, grant modes at the gate
 
-**Patch:** `21aee7118f58a897273652ed1543795ccf183cab325d64dbfa3eb62b1c652994.patch`, built on cbp/floor-modes f4e671a9 (#1381).
+**Patch:** `daaca28580977a4a9ee385c1c9c3c923a1acfd5cf3d9ef40bce3247a9deaa81f.patch`, built on cbp/floor-modes f4e671a9 (#1381).
+
+**Superseded:** `21aee711….patch`, the first cut. It mapped no mode to `run`. Kept because the safety preset refuses `git rm` of a held patch.
 
 It touches 9 files:
 - `plugins/_shared/hestia_gate_core.py`
@@ -41,7 +43,8 @@ This change makes a narrowed grant admit exactly its modes.
   | `write_note` | w | A being's append, edit and retire share this one gate tool, and an append must work on a write-only grant. Its edit receipt quotes only the being's own old text. |
   | `git_restore` | w | |
   | `git_clean` | d | |
-  | anything not listed (including `run`, `Task`, MCP tools) | full rwed grant only | An unknown or new tool fails narrow. |
+  | a being's `run` | re | It reads its script to stage a copy, then executes it. What the run reaches inside its sandbox is mounted from the being's grants by their own modes on SAGE's side (SAGE #521). The gate is handed only the script path, never the bwrap line. |
+  | anything not listed (including `Task` and MCP tools) | full rwed grant only | An unknown or new tool fails narrow. |
 
 - **Path stage.** `evaluate` admits a path through a narrowed grant only when every mode the act needs is in the grant's modes, matched with the same `path_in_scope` as any grant.
 - **Command stage.** A shell command is not attributed per path yet:
@@ -53,18 +56,19 @@ This change makes a narrowed grant admit exactly its modes.
 
 ## Tests: `held/build-1345b/grant_modes_gate_test.py`
 
-It has 14 tests through the production composition: daemon answer, then `fetch_policy_snapshot`, then `resolve_agent_policy`, then `evaluate`.
-- **Patched core:** 14/14.
-- **Base core:** 11 fail and 3 pass.
+It has 15 tests through the production composition: daemon answer, then `fetch_policy_snapshot`, then `resolve_agent_policy`, then `evaluate`.
+- **Patched core:** 15/15.
+- **Base core:** 12 fail and 3 pass.
   - The 3 that pass are the invariants that must hold on both cores: a narrowed grant keeps the boundary of any grant, never admits a repo-named call, and full grants are unchanged.
   - Every admission test fails on the base. So every new row separates the two cores.
 
-What the 14 cover:
+What the 15 cover:
 - **Each mode set:**
   - `r` admits every reader and refuses every writer, including shell writes through redirects, `cp`, `sed -i`, `rm`, `tee`, interpreters, `sort -o` and `uniq IN OUT`;
   - `rw` refuses `git_clean` and names `d` as missing;
   - `w` appends but can't read;
   - `d` deletes only.
+- **`run`:** `re`, `rwe` and `red` admit it; `r`, `e` and `rw` refuse it, naming the missing mode.
 - **Tools with no nameable mode** need a full grant.
 - **Malformed rows** read as no grant, both in the mechanism and in the core.
 - **Boundaries:** a sibling prefix, the parent directory, and an exact narrowed grant's child are all refused.
@@ -88,7 +92,6 @@ Existing suites on the patched copies match the base core exactly:
 ## Not in this change (follow-ups)
 
 - **Per-path modes inside a shell line.** Write, delete and execute positions are classified by the closure but not yet mapped per path to modes, so any non-read command needs a full grant.
-- **`run` on an `e` grant.** The run command carries the sandbox mounts. Until the gate models them, SAGE must keep narrowed roots out of the run sandbox (it does today, per #521) and `run` needs a full grant.
 - **The gate-opened scope request should carry the mode the refused act needed**, so the decider sees "asks for w".
 - **The narrowed floor.** The daemon still withholds floor entries narrower than r (`floor_for`). With per-mode admission it could serve them by mode.
 - **SAGE's side.** `being_gate_client._granted_reach` should use `scope_roots_with_modes`, and the dispatcher's own confinement should require w for a write. Otherwise a narrowed grant the gate admits is refused at the dispatcher. That's a SAGE PR after this lands.

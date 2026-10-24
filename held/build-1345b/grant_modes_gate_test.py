@@ -193,11 +193,26 @@ def test_a_delete_only_grant_admits_only_delete():
             check(f"{tool}_refused", _verdict(prof, pol, ws, tool, path=f).blocks)
 
 
+def test_a_run_needs_read_and_execute_on_its_script():
+    """run reads its script to stage a copy and executes it: re. What the run reaches inside
+    its sandbox is SAGE's to mount by mode (#521), not this check's."""
+    with _Workspace() as ws:
+        f = _forum(ws) + "/probe.py"
+        for modes in ("re", "rwe", "red"):
+            prof, pol = _setup(ws, modes)
+            check(f"run_admitted_{modes}", not _verdict(prof, pol, ws, "run", path=f).blocks)
+        for modes, missing in (("r", "e"), ("e", "r"), ("rw", "e")):
+            prof, pol = _setup(ws, modes)
+            v = _verdict(prof, pol, ws, "run", path=f)
+            check(f"run_refused_{modes}", v.blocks and v.rule == "mrh.path", str(v))
+            check(f"run_names_missing_{missing}", f"(missing {missing})" in v.reason, v.reason)
+
+
 def test_a_tool_with_no_nameable_mode_needs_a_full_grant():
     with _Workspace() as ws:
         prof, pol = _setup(ws, "rwe")
         f = _forum(ws) + "/thread.md"
-        for tool in ("mystery_tool", "Task", "run", "channel_send"):
+        for tool in ("mystery_tool", "Task", "channel_send"):
             v = _verdict(prof, pol, ws, tool, path=f)
             check(f"{tool}_refused", v.blocks and v.rule == "mrh.path", str(v))
         v = _verdict(prof, pol, ws, "mystery_tool", path=f)
@@ -275,6 +290,7 @@ ALL = [
     test_a_read_write_grant_admits_writes_and_refuses_delete,
     test_a_write_only_grant_appends_but_cannot_read,
     test_a_delete_only_grant_admits_only_delete,
+    test_a_run_needs_read_and_execute_on_its_script,
     test_a_tool_with_no_nameable_mode_needs_a_full_grant,
     test_a_narrowed_grant_has_the_same_boundary_as_any_grant,
     test_a_narrowed_grant_never_admits_a_repo_named_call,
