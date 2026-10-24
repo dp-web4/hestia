@@ -4,6 +4,24 @@
 //! `prev_hash || timestamp_rfc3339 || event_type || event_data_json`,
 //! so any tamper to the JSON, timestamp, or type breaks the chain.
 //! The genesis entry's `prev_hash` is `"0" * 64`.
+//!
+//! ## Two predicates, not one (#339, B2)
+//!
+//! That legacy `hash` deliberately omits `signer_lct` and `chain_position`, so **link
+//! integrity** ([`SqliteChainStore::verify_integrity`]) cannot see a row whose named signer or
+//! coordinate was rewritten. It is kept unchanged — every receipt, appeal pointer and
+//! `deny_hash` addresses rows by it — and a second predicate is layered beside it:
+//!
+//! - **signature authenticity**: when a [`ChainWitnessSigner`] is installed, each new row is
+//!   Ed25519-signed, in the SAME transaction as its insert, over a versioned envelope
+//!   ([`hestia_wire::ChainSignatureV1Fields`]) binding chain id, position, row hash, the row's
+//!   `signer_lct`, the witness LCT, the witness public key and the policy generation. The
+//!   signature lives in the additive `chain_signatures` side table keyed by position; no
+//!   existing row is rewritten.
+//!
+//! [`SqliteChainStore::verify_chain`] reports both. Rows from before signing report
+//! `legacy_unsigned`. Once a chain has a signed row, an unsigned row at or after it is a
+//! downgrade and fails authenticity, and this store refuses to append one.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -11,8 +29,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+
+use hestia_wire::{
+    canonical_chain_signature_preimage, ChainSignatureV1Fields, CHAIN_SIGNATURE_VERSION_V1,
+};
+use web4_core::crypto::{KeyPair, PublicKey, SignatureBytes};
 
 /// One entry in the witness chain. Identical shape to the in-memory
 /// `state::ChainEntry`; re-exported via the storage module.
@@ -54,6 +78,265 @@ impl ChainRowRef<'_> {
     pub fn project<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
         serde_json::from_str(self.event_data).ok()
     }
+}
+
+// ------------------------------------------------------------------ B2 signed witness (#339)
+
+/// The policy generation recorded when no policy publication has been bound to the signer
+/// (CLI receiver passes, the window before the daemon's first publication). Explicit rather
+/// than empty so a reader can tell "witnessed outside any published law" from a bug.
+pub const POLICY_GENERATION_NONE: &str = "none";
+
+const CHAIN_ID_PREFIX: &str = "hestia-chain:";
+const META_CHAIN_ID: &str = "chain_id";
+const META_SIGNED_FROM: &str = "signed_from_position";
+const META_SIGNER_ALIAS_PREFIX: &str = "signer_alias:";
+/// How many individual signature failures a [`ChainVerification`] lists (all are counted).
+const MAX_LISTED_FAILURES: usize = 50;
+
+/// A chain's stable identity: derived from its genesis row's hash, so it needs no minting,
+/// survives copies and restarts, cannot be lost from a side table, and is recomputable by an
+/// external verifier from the chain alone. Two chains share it only if they share genesis.
+pub fn chain_id_for_genesis(genesis_hash: &str) -> String {
+    format!("{CHAIN_ID_PREFIX}{genesis_hash}")
+}
+
+/// The chain witness: who attests a row's ordering and inclusion (decision 0014 §6.1's
+/// chain-witness role, distinct from an actor signature over an act).
+///
+/// `witness_lct` must be the key-derived LCT of `keypair` (`web4_core::derive_lct_id`), which
+/// makes every signature self-certifying: a verifier checks the embedded public key derives the
+/// claimed witness LCT, with no registry lookup and no "whatever key the LCT has now" — a
+/// later rotation produces a new LCT and leaves old rows verifiable under the key they carry.
+pub struct ChainWitnessSigner {
+    keypair: KeyPair,
+    witness_lct: String,
+    public_key_hex: String,
+    /// Legacy signer strings recorded as this witness's LCT on new rows (the sovereign's
+    /// `phase1-placeholder` anchor). See [`SqliteChainStore::append`].
+    signer_aliases: Vec<String>,
+    policy_generation: Mutex<String>,
+}
+
+impl ChainWitnessSigner {
+    /// Fails unless `witness_lct` is the LCT derived from `keypair`'s public key.
+    pub fn new(keypair: KeyPair, witness_lct: &str) -> Result<Self> {
+        let derived = web4_core::derive_lct_id(&keypair.verifying_key());
+        anyhow::ensure!(
+            derived == witness_lct,
+            "chain witness LCT {witness_lct} is not derived from its signing key ({derived})"
+        );
+        let public_key_hex = hex::encode(keypair.public_key_bytes());
+        Ok(Self {
+            keypair,
+            witness_lct: witness_lct.to_string(),
+            public_key_hex,
+            signer_aliases: Vec::new(),
+            policy_generation: Mutex::new(POLICY_GENERATION_NONE.to_string()),
+        })
+    }
+
+    /// Record `alias` as a legacy name for this witness: a row appended with
+    /// `signer_lct == alias` is stored (and signed) under `witness_lct` instead.
+    pub fn with_signer_alias(mut self, alias: &str) -> Self {
+        if !alias.is_empty() && alias != self.witness_lct {
+            self.signer_aliases.push(alias.to_string());
+        }
+        self
+    }
+
+    pub fn witness_lct(&self) -> &str {
+        &self.witness_lct
+    }
+
+    pub fn public_key_hex(&self) -> &str {
+        &self.public_key_hex
+    }
+
+    pub fn signer_aliases(&self) -> &[String] {
+        &self.signer_aliases
+    }
+
+    /// Bind the policy generation subsequent rows are witnessed under.
+    pub fn set_policy_generation(&self, generation: &str) {
+        let g = if generation.is_empty() { POLICY_GENERATION_NONE } else { generation };
+        *self.policy_generation.lock().unwrap() = g.to_string();
+    }
+
+    pub fn policy_generation(&self) -> String {
+        self.policy_generation.lock().unwrap().clone()
+    }
+
+    fn canonical_signer(&self, signer_lct: &str) -> String {
+        if self.signer_aliases.iter().any(|a| a == signer_lct) {
+            self.witness_lct.clone()
+        } else {
+            signer_lct.to_string()
+        }
+    }
+}
+
+/// One row's chain-witness signature, as stored in `chain_signatures`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainSignatureRecord {
+    pub chain_position: u64,
+    /// The legacy `hash` of the row this signature was made for.
+    pub row_hash: String,
+    pub signature_version: u32,
+    pub chain_id: String,
+    pub witness_lct: String,
+    /// Lowercase hex Ed25519 public key (the signing-time key identity).
+    pub witness_public_key: String,
+    pub policy_generation: String,
+    /// Lowercase hex Ed25519 signature over the v1 preimage.
+    pub signature: String,
+}
+
+/// The v1 preimage for a row as it stands. Every row-side field comes from the ROW (or the
+/// chain), never from the signature record, so rewriting the row breaks the signature.
+fn signature_preimage(
+    chain_id: &str,
+    chain_position: u64,
+    row_hash: &str,
+    signer_lct: &str,
+    witness_lct: &str,
+    witness_public_key: &str,
+    policy_generation: &str,
+) -> Vec<u8> {
+    let position = chain_position.to_string();
+    canonical_chain_signature_preimage(&ChainSignatureV1Fields {
+        chain_id,
+        chain_position: &position,
+        row_hash,
+        signer_lct,
+        witness_lct,
+        witness_public_key,
+        policy_generation,
+    })
+}
+
+/// Verify one row's signature record against the row it is attached to and the chain's
+/// derived id. `Err` carries a human-readable reason. Pure: no store access.
+pub fn verify_row_signature(
+    chain_id: &str,
+    chain_position: u64,
+    row_hash: &str,
+    signer_lct: &str,
+    rec: &ChainSignatureRecord,
+) -> std::result::Result<(), String> {
+    if rec.signature_version != CHAIN_SIGNATURE_VERSION_V1 {
+        return Err(format!("unknown signature_version {}", rec.signature_version));
+    }
+    if rec.row_hash != row_hash {
+        return Err("signature was made for a different row hash".into());
+    }
+    if rec.chain_id != chain_id {
+        return Err(format!("signature names chain {} but the row is in {chain_id}", rec.chain_id));
+    }
+    let pk_bytes: [u8; 32] = hex::decode(&rec.witness_public_key)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or("witness_public_key is not 32 hex bytes")?;
+    let pk = PublicKey::from_bytes(&pk_bytes).map_err(|e| format!("witness_public_key: {e}"))?;
+    if web4_core::derive_lct_id(&pk) != rec.witness_lct {
+        return Err("witness_lct is not derived from witness_public_key".into());
+    }
+    let sig_bytes: [u8; 64] = hex::decode(&rec.signature)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or("signature is not 64 hex bytes")?;
+    let pre = signature_preimage(
+        chain_id,
+        chain_position,
+        row_hash,
+        signer_lct,
+        &rec.witness_lct,
+        &rec.witness_public_key,
+        &rec.policy_generation,
+    );
+    pk.verify(&pre, &SignatureBytes::from_bytes(sig_bytes))
+        .map_err(|_| "Ed25519 signature does not verify over the row's v1 envelope".to_string())
+}
+
+/// Per-row authenticity verdict, as [`SqliteChainStore::verify_chain`] classifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureState {
+    /// Written before signing began; passes link integrity only.
+    LegacyUnsigned,
+    /// Carries a v1 signature that verifies.
+    Valid,
+    /// Carries a signature that does not verify.
+    Invalid,
+    /// No signature at or after the point the chain became signed: a downgrade.
+    MissingAfterSigned,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignatureFailure {
+    pub chain_position: u64,
+    pub state: SignatureState,
+    pub reason: String,
+}
+
+/// Rows attested by one witness key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WitnessKeyUse {
+    pub witness_lct: String,
+    pub rows: u64,
+    pub first_position: u64,
+    pub last_position: u64,
+}
+
+/// Both predicates over one consistent snapshot. Evidence, not a verdict: which witness keys a
+/// relying party accepts is theirs to decide (`witnesses` lists every key that signed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainVerification {
+    pub length: u64,
+    /// Derived from the genesis row; `None` for an empty chain.
+    pub chain_id: Option<String>,
+    /// What `chain_meta` records (informational; a mismatch is reported in `meta_mismatch`).
+    pub recorded_chain_id: Option<String>,
+    /// Link integrity: the first break, if any (the walk continues past it for signatures).
+    pub link_break: Option<String>,
+    pub legacy_unsigned: u64,
+    pub signed_valid: u64,
+    pub signature_failures: u64,
+    /// The first [`MAX_LISTED_FAILURES`] failures.
+    pub failures: Vec<SignatureFailure>,
+    /// First position carrying a signature row.
+    pub first_signed_position: Option<u64>,
+    /// What `chain_meta` records as the position signing began.
+    pub recorded_signed_from: Option<u64>,
+    /// Signature rows at positions with no chain row.
+    pub orphan_signatures: u64,
+    pub meta_mismatch: Option<String>,
+    /// Keyed by witness public key hex.
+    pub witnesses: BTreeMap<String, WitnessKeyUse>,
+}
+
+impl ChainVerification {
+    /// Predicate 1: the legacy hash chain links from genesis to tail.
+    pub fn link_intact(&self) -> bool {
+        self.link_break.is_none()
+    }
+
+    /// Predicate 2: every row that should carry a signature carries a valid one.
+    pub fn signatures_authentic(&self) -> bool {
+        self.signature_failures == 0 && self.orphan_signatures == 0 && self.meta_mismatch.is_none()
+    }
+}
+
+/// What [`SqliteChainStore::install_witness_signer`] did with the chain it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessInstall {
+    /// Empty chain: installed, signing starts at genesis with no unsigned prefix.
+    Fresh,
+    /// Chain already carries signing evidence: installed, signing continues.
+    AlreadySigned,
+    /// Unsigned rows and no signing evidence: NOT installed, appends stay unsigned until the
+    /// migration decision is made (see `activate_signing_on_legacy_chain`).
+    LegacyDeferred,
 }
 
 /// Witness chain persisted to SQLite. Locking is internal so the store
@@ -108,6 +391,14 @@ pub struct SqliteChainStore {
     derivations: crate::derivation_cache::DerivationCache,
     /// The highest chain length any read has observed (see `read_high_water`).
     read_high_water: AtomicU64,
+    /// The chain witness (#339). `None` = this handle appends unsigned rows, which it may only
+    /// do on a chain that has never been signed.
+    signer: RwLock<Option<Arc<ChainWitnessSigner>>>,
+    /// Set only by [`SqliteChainStore::activate_signing_on_legacy_chain`]: this handle may start
+    /// signing a chain that already holds unsigned rows (establish a boundary past genesis).
+    legacy_activation: AtomicBool,
+    /// Cached chain id, once a genesis row exists.
+    chain_id: Mutex<Option<String>>,
 }
 
 impl Drop for SqliteChainStore {
@@ -176,6 +467,55 @@ fn migrate_plaintext_to_encrypted(path: &Path, key_hex: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a snapshot destination that is, or would replace, the source database or one of its
+/// SQLite side files, however it is spelled (Codex review of #1322). `backup_encrypted` deletes
+/// an existing destination before it opens the source, so a lexical comparison is not enough:
+/// a parent-directory symlink, a symlinked destination, or a hard link would make that delete
+/// unlink the live chain. Every check runs before any destructive step.
+fn refuse_snapshot_alias(source: &Path, destination: &Path) -> Result<()> {
+    let source_real = std::fs::canonicalize(source)
+        .with_context(|| format!("resolving chain snapshot source {}", source.display()))?;
+    if let Ok(meta) = std::fs::symlink_metadata(destination) {
+        anyhow::ensure!(
+            !meta.file_type().is_symlink(),
+            "chain snapshot destination {} is a symlink; refusing to replace it",
+            destination.display()
+        );
+    }
+    let name = destination
+        .file_name()
+        .with_context(|| format!("chain snapshot destination {} has no file name", destination.display()))?;
+    let parent = match destination.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let destination_real = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolving chain snapshot dir {}", parent.display()))?
+        .join(name);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut side = source_real.clone().into_os_string();
+        side.push(suffix);
+        anyhow::ensure!(
+            destination_real != Path::new(&side),
+            "chain snapshot destination {} resolves to the source {}",
+            destination.display(),
+            Path::new(&side).display()
+        );
+    }
+    #[cfg(unix)]
+    if let Ok(dest_meta) = std::fs::metadata(&destination_real) {
+        use std::os::unix::fs::MetadataExt;
+        let src_meta = std::fs::metadata(&source_real)?;
+        anyhow::ensure!(
+            (dest_meta.dev(), dest_meta.ino()) != (src_meta.dev(), src_meta.ino()),
+            "chain snapshot destination {} is a hard link to the source {}",
+            destination.display(),
+            source_real.display()
+        );
+    }
+    Ok(())
+}
+
 impl SqliteChainStore {
     /// Copy one consistent encrypted chain snapshot while its live daemon may
     /// continue appending in WAL mode.
@@ -201,6 +541,7 @@ impl SqliteChainStore {
                 format!("creating chain snapshot dir {}", parent.display())
             })?;
         }
+        refuse_snapshot_alias(source_path, destination_path)?;
         if destination_path.exists() {
             std::fs::remove_file(destination_path).with_context(|| {
                 format!(
@@ -302,8 +643,40 @@ impl SqliteChainStore {
                 entry_hash     TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_chain_event_key_position
-                 ON chain_event_keys(chain_position);",
+                 ON chain_event_keys(chain_position);
+
+             -- B2 (#339): ADDITIVE. Existing rows are never rewritten; a row written before
+             -- signing simply has no row here and verifies as legacy_unsigned. The signature
+             -- commits in the same transaction as its row (see append_inner).
+             CREATE TABLE IF NOT EXISTS chain_signatures (
+                chain_position     INTEGER PRIMARY KEY,
+                row_hash           TEXT NOT NULL,
+                signature_version  INTEGER NOT NULL,
+                chain_id           TEXT NOT NULL,
+                witness_lct        TEXT NOT NULL,
+                witness_public_key TEXT NOT NULL,
+                policy_generation  TEXT NOT NULL,
+                signature          TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS chain_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+             );",
         )?;
+        let genesis: Option<String> = conn
+            .query_row(
+                "SELECT hash FROM chain_entries ORDER BY chain_position ASC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let chain_id = genesis.as_deref().map(chain_id_for_genesis);
+        if let Some(id) = &chain_id {
+            conn.execute(
+                "INSERT OR IGNORE INTO chain_meta (key, value) VALUES (?1, ?2)",
+                params![META_CHAIN_ID, id],
+            )?;
+        }
         let read_conn = Connection::open(&path).with_context(|| {
             format!(
                 "opening witness-chain read connection at {}",
@@ -331,7 +704,100 @@ impl SqliteChainStore {
             durability,
             derivations: crate::derivation_cache::DerivationCache::new(),
             read_high_water: AtomicU64::new(0),
+            signer: RwLock::new(None),
+            legacy_activation: AtomicBool::new(false),
+            chain_id: Mutex::new(chain_id),
         })
+    }
+
+    /// Install the chain witness on a chain that is EMPTY (signing starts at genesis, no
+    /// boundary) or ALREADY SIGNED (continue, or rotate: rows already signed keep verifying under
+    /// the key they carry). Replaces any previous signer and records its aliases in `chain_meta`
+    /// so a reader can resolve legacy `signer_lct` strings on older rows.
+    ///
+    /// A chain holding unsigned rows and no signing evidence is a LEGACY chain: the signer is NOT
+    /// installed, nothing is written, and this handle keeps appending unsigned rows. Starting to
+    /// sign such a chain records a boundary after an unsigned prefix, which is the migration
+    /// decision Decision 0014 §6 leaves open (archive-and-sign-from-genesis vs keep the prefix)
+    /// — so it is a separate, explicit call ([`Self::activate_signing_on_legacy_chain`]), never a
+    /// side effect of opening the store (Codex review of #1322).
+    pub fn install_witness_signer(&self, signer: Arc<ChainWitnessSigner>) -> Result<WitnessInstall> {
+        let mode = {
+            let conn = self.conn.lock().unwrap();
+            let mode = if signing_boundary(&conn)?.is_some() {
+                WitnessInstall::AlreadySigned
+            } else if conn
+                .query_row("SELECT 1 FROM chain_entries LIMIT 1", [], |_| Ok(()))
+                .optional()?
+                .is_none()
+            {
+                WitnessInstall::Fresh
+            } else {
+                WitnessInstall::LegacyDeferred
+            };
+            if mode == WitnessInstall::LegacyDeferred {
+                return Ok(mode);
+            }
+            record_signer_aliases(&conn, &signer)?;
+            mode
+        };
+        *self.signer.write().unwrap() = Some(signer);
+        Ok(mode)
+    }
+
+    /// The explicit legacy activation: install `signer` on a chain that already holds unsigned
+    /// rows, so the next append records `signed_from_position` after them and everything earlier
+    /// stays `legacy_unsigned`. No daemon or CLI path calls this; it exists so the migration
+    /// decision can be made (and tested) as its own authorized change.
+    pub fn activate_signing_on_legacy_chain(&self, signer: Arc<ChainWitnessSigner>) -> Result<()> {
+        {
+            let conn = self.conn.lock().unwrap();
+            record_signer_aliases(&conn, &signer)?;
+        }
+        self.legacy_activation.store(true, Ordering::Release);
+        *self.signer.write().unwrap() = Some(signer);
+        Ok(())
+    }
+
+    /// The installed chain witness, if any.
+    pub fn witness_signer(&self) -> Option<Arc<ChainWitnessSigner>> {
+        self.signer.read().unwrap().clone()
+    }
+
+    /// Bind the policy generation the installed witness signs subsequent rows under. A no-op
+    /// without a signer.
+    pub fn set_policy_generation(&self, generation: &str) {
+        if let Some(s) = self.signer.read().unwrap().as_ref() {
+            s.set_policy_generation(generation);
+        }
+    }
+
+    /// The position from which this chain must be signed, if it has ever been signed: the
+    /// earlier of the recorded boundary and the first surviving signature row (see
+    /// [`signing_boundary`]). Daemon startup and the CLI opener refuse to run without the
+    /// witness key when this is `Some`, so it must not trust the metadata row alone.
+    pub fn signed_from(&self) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        signing_boundary(&conn)
+    }
+
+    /// The chain's stable id (`hestia-chain:<genesis hash>`), once it has a genesis row.
+    pub fn chain_id(&self) -> Option<String> {
+        self.chain_id.lock().unwrap().clone()
+    }
+
+    /// The chain-witness signature attached to the row at `chain_position`, if any.
+    pub fn signature_for(&self, chain_position: u64) -> Result<Option<ChainSignatureRecord>> {
+        let conn = self.observed(&self.read_conn)?;
+        conn.query_row(
+            "SELECT chain_position, row_hash, signature_version, chain_id, witness_lct,
+                    witness_public_key, policy_generation, signature
+               FROM chain_signatures WHERE chain_position = ?1",
+            params![chain_position as i64],
+            row_to_signature,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// DURABLE READS: a request that reads chain rows may reply with them, so it must not reply
@@ -424,8 +890,13 @@ impl SqliteChainStore {
         Ok(h.unwrap_or_else(|| GENESIS_PREV_HASH.to_string()))
     }
 
-    /// Append a new entry. `signer_lct` is the sovereign LCT for now;
-    /// Session 4 may sign with the Ed25519 key bound to it.
+    /// Append a new entry.
+    ///
+    /// With a [`ChainWitnessSigner`] installed, the row is signed in the same transaction as
+    /// its insert (#339), and a `signer_lct` equal to one of the signer's recorded aliases (the
+    /// sovereign's legacy `phase1-placeholder` anchor) is stored as the witness's real,
+    /// key-derived LCT — the alias itself is recorded in `chain_meta`. Without a signer the
+    /// row is appended unsigned, which is refused once the chain has any signed row.
     pub fn append(
         &self,
         event_type: &str,
@@ -486,6 +957,16 @@ impl SqliteChainStore {
             !self.durability.poisoned(),
             "witness chain refuses appends: an fsync failed and the daemon must restart"
         );
+        let signer = self.signer.read().unwrap().clone();
+        let signer_lct: String = match &signer {
+            Some(s) => s.canonical_signer(signer_lct),
+            None => signer_lct.to_string(),
+        };
+        let signer_lct = signer_lct.as_str();
+        let same_signer = |recorded: &str| match &signer {
+            Some(s) => s.canonical_signer(recorded) == signer_lct,
+            None => recorded == signer_lct,
+        };
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -507,7 +988,7 @@ impl SqliteChainStore {
                 anyhow::ensure!(
                     entry.event_type == event_type
                         && entry.event_data == event_data
-                        && entry.signer_lct == signer_lct,
+                        && same_signer(&entry.signer_lct),
                     "witness event_key '{key}' was replayed with a different fact"
                 );
                 // A replay answers with a row that may be committed but not yet fsynced: the
@@ -532,9 +1013,37 @@ impl SqliteChainStore {
             }
         };
 
+        // Downgrade refusal: a handle without the witness key must not extend a signed chain
+        // with an unsigned row (verification would report it as tampering, correctly). The
+        // boundary is read inside this transaction from both evidence sources, so neither a
+        // deleted metadata row nor a concurrent writer can slip an unsigned row past it. It is
+        // read for signed appends too: a malformed record refuses every append.
+        let boundary = signing_boundary(&tx)?;
+        if signer.is_none() {
+            if let Some(from) = boundary {
+                anyhow::bail!(
+                    "witness chain refuses an unsigned append: rows from position {from} on are \
+                     signed (#339), and this handle has no chain witness signer installed"
+                );
+            }
+        } else if boundary.is_none()
+            && chain_position > 0
+            && !self.legacy_activation.load(Ordering::Acquire)
+        {
+            // The signer was installed on an empty chain, and another handle has since appended
+            // unsigned rows. Signing now would establish a boundary after an unsigned prefix —
+            // the legacy activation — as a side effect of a race. Refuse instead.
+            anyhow::bail!(
+                "witness chain refuses to start signing at position {chain_position}: the chain \
+                 holds unsigned rows and no signing boundary, and starting one there is the \
+                 explicit legacy activation (activate_signing_on_legacy_chain), not an append"
+            );
+        }
+
         let timestamp = Utc::now();
         let event_json = serde_json::to_string(&event_data)?;
         let hash = compute_hash(&prev_hash, &timestamp, event_type, &event_json);
+        let mut new_chain_id: Option<String> = None;
 
         tx.execute(
             "INSERT INTO chain_entries
@@ -557,7 +1066,76 @@ impl SqliteChainStore {
                 params![key, chain_position as i64, hash],
             )?;
         }
+        if let Some(signer) = &signer {
+            // The chain id is the genesis hash: this row's own when it IS genesis. Read inside
+            // the transaction when not cached, so another handle's genesis is seen.
+            let cached = self.chain_id.lock().unwrap().clone();
+            let chain_id = match cached {
+                Some(id) => id,
+                None if chain_position == 0 => chain_id_for_genesis(&hash),
+                None => {
+                    let g: String = tx.query_row(
+                        "SELECT hash FROM chain_entries ORDER BY chain_position ASC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    chain_id_for_genesis(&g)
+                }
+            };
+            let policy_generation = signer.policy_generation();
+            let pre = signature_preimage(
+                &chain_id,
+                chain_position,
+                &hash,
+                signer_lct,
+                signer.witness_lct(),
+                signer.public_key_hex(),
+                &policy_generation,
+            );
+            let signature = signer.keypair.sign(&pre).to_hex();
+            tx.execute(
+                "INSERT INTO chain_signatures
+                    (chain_position, row_hash, signature_version, chain_id, witness_lct,
+                     witness_public_key, policy_generation, signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    chain_position as i64,
+                    hash,
+                    CHAIN_SIGNATURE_VERSION_V1,
+                    chain_id,
+                    signer.witness_lct(),
+                    signer.public_key_hex(),
+                    policy_generation,
+                    signature,
+                ],
+            )?;
+            // The boundary is recorded only when this row STARTS signing. If signatures already
+            // exist but the record is gone, writing this position would forge a later boundary
+            // and erase the verifier's evidence of the deletion; leave it missing instead.
+            if boundary.is_none() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO chain_meta (key, value) VALUES (?1, ?2)",
+                    params![META_SIGNED_FROM, chain_position.to_string()],
+                )?;
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO chain_meta (key, value) VALUES (?1, ?2)",
+                params![META_CHAIN_ID, chain_id],
+            )?;
+            new_chain_id = Some(chain_id);
+        }
         tx.commit()?;
+        if let Some(id) = new_chain_id {
+            let mut cached = self.chain_id.lock().unwrap();
+            if cached.is_none() {
+                *cached = Some(id);
+            }
+        } else if chain_position == 0 {
+            let mut cached = self.chain_id.lock().unwrap();
+            if cached.is_none() {
+                *cached = Some(chain_id_for_genesis(&hash));
+            }
+        }
         self.len.fetch_add(1, Ordering::Release);
         self.durability.note_commit();
         super::durability::note_appended(&self.durability, chain_position + 1);
@@ -1182,6 +1760,228 @@ impl SqliteChainStore {
         }
         Ok(count)
     }
+
+    /// Both predicates — link integrity and signature authenticity (#339) — over one read
+    /// snapshot, streamed (no `event_data` is parsed). Unlike [`Self::verify_integrity`] it does
+    /// not stop at the first problem: a link break is recorded and the signature walk
+    /// continues, so a report says everything wrong with the chain, not only the first thing.
+    ///
+    /// Downgrade rule: once a row carrying a signature has been seen — or from the position
+    /// `chain_meta` records signing began, whichever is earlier — every later row must carry a
+    /// valid signature. Stripping signatures from the TAIL together with the meta record is
+    /// not detectable from inside the chain; that needs an external checkpoint of a signed
+    /// head (#328).
+    pub fn verify_chain(&self) -> Result<ChainVerification> {
+        let conn = self.observed(&self.read_conn)?;
+        let recorded_chain_id = meta_string(&conn, META_CHAIN_ID)?;
+        let recorded_signed_from = meta_u64(&conn, META_SIGNED_FROM)?;
+        let orphan_signatures: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chain_signatures s
+              WHERE NOT EXISTS (SELECT 1 FROM chain_entries e
+                                 WHERE e.chain_position = s.chain_position)",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
+                    e.signer_lct, e.timestamp,
+                    s.chain_position, s.row_hash, s.signature_version, s.chain_id, s.witness_lct,
+                    s.witness_public_key, s.policy_generation, s.signature
+               FROM chain_entries e
+               LEFT JOIN chain_signatures s ON s.chain_position = e.chain_position
+              ORDER BY e.chain_position ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut v = ChainVerification {
+            length: 0,
+            chain_id: None,
+            recorded_chain_id,
+            link_break: None,
+            legacy_unsigned: 0,
+            signed_valid: 0,
+            signature_failures: 0,
+            failures: Vec::new(),
+            first_signed_position: None,
+            recorded_signed_from,
+            orphan_signatures: orphan_signatures.max(0) as u64,
+            meta_mismatch: None,
+            witnesses: BTreeMap::new(),
+        };
+        let fail = |v: &mut ChainVerification, pos: u64, state: SignatureState, reason: String| {
+            v.signature_failures += 1;
+            if v.failures.len() < MAX_LISTED_FAILURES {
+                v.failures.push(SignatureFailure { chain_position: pos, state, reason });
+            }
+        };
+        let mut prev = GENESIS_PREV_HASH.to_string();
+        let mut seen_signed = false;
+        while let Some(row) = rows.next()? {
+            let pos = row.get::<_, i64>(0)? as u64;
+            let hash: String = row.get(1)?;
+            let prev_hash: String = row.get(2)?;
+            let event_type: String = row.get(3)?;
+            let event_data: String = row.get(4)?;
+            let signer_lct: String = row.get(5)?;
+            let timestamp: String = row.get(6)?;
+            if v.chain_id.is_none() {
+                v.chain_id = Some(chain_id_for_genesis(&hash));
+            }
+            v.length += 1;
+
+            // Predicate 1: link integrity (the legacy formula, unchanged).
+            if v.link_break.is_none() {
+                if prev_hash != prev {
+                    v.link_break = Some(format!("position {pos}: prev_hash mismatch"));
+                } else {
+                    match DateTime::parse_from_rfc3339(&timestamp) {
+                        Ok(ts) => {
+                            let recomputed = compute_hash(
+                                &prev_hash,
+                                &ts.with_timezone(&Utc),
+                                &event_type,
+                                &event_data,
+                            );
+                            if recomputed != hash {
+                                v.link_break = Some(format!("position {pos}: hash mismatch"));
+                            }
+                        }
+                        Err(e) => {
+                            v.link_break = Some(format!("position {pos}: bad timestamp: {e}"));
+                        }
+                    }
+                }
+            }
+            prev = hash.clone();
+
+            // Predicate 2: signature authenticity.
+            let sig_pos: Option<i64> = row.get(7)?;
+            if sig_pos.is_some() {
+                let rec = ChainSignatureRecord {
+                    chain_position: pos,
+                    row_hash: row.get(8)?,
+                    signature_version: row.get::<_, i64>(9)?.try_into().unwrap_or(u32::MAX),
+                    chain_id: row.get(10)?,
+                    witness_lct: row.get(11)?,
+                    witness_public_key: row.get(12)?,
+                    policy_generation: row.get(13)?,
+                    signature: row.get(14)?,
+                };
+                seen_signed = true;
+                v.first_signed_position.get_or_insert(pos);
+                let chain_id = v.chain_id.clone().unwrap_or_default();
+                match verify_row_signature(&chain_id, pos, &hash, &signer_lct, &rec) {
+                    Ok(()) => {
+                        v.signed_valid += 1;
+                        let w = v
+                            .witnesses
+                            .entry(rec.witness_public_key.clone())
+                            .or_insert_with(|| WitnessKeyUse {
+                                witness_lct: rec.witness_lct.clone(),
+                                rows: 0,
+                                first_position: pos,
+                                last_position: pos,
+                            });
+                        w.rows += 1;
+                        w.last_position = pos;
+                    }
+                    Err(reason) => fail(&mut v, pos, SignatureState::Invalid, reason),
+                }
+            } else if seen_signed || recorded_signed_from.is_some_and(|from| pos >= from) {
+                fail(
+                    &mut v,
+                    pos,
+                    SignatureState::MissingAfterSigned,
+                    "unsigned row at or after the point this chain became signed (downgrade)"
+                        .into(),
+                );
+            } else {
+                v.legacy_unsigned += 1;
+            }
+        }
+        if let (Some(derived), Some(recorded)) = (&v.chain_id, &v.recorded_chain_id) {
+            if derived != recorded {
+                v.meta_mismatch = Some(format!(
+                    "chain_meta records chain id {recorded}, genesis derives {derived}"
+                ));
+            }
+        }
+        if v.meta_mismatch.is_none() {
+            match (v.first_signed_position, v.recorded_signed_from) {
+                (Some(first), Some(recorded)) if first != recorded => {
+                    v.meta_mismatch = Some(format!(
+                        "chain_meta records signing from position {recorded}, first signature is at {first}"
+                    ));
+                }
+                // The record is written in the same transaction as the first signature, so
+                // signatures without it mean the record was removed.
+                (Some(first), None) => {
+                    v.meta_mismatch = Some(format!(
+                        "chain_meta has no signed_from_position, but signatures begin at {first}"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(v)
+    }
+}
+
+fn meta_string(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT value FROM chain_meta WHERE key = ?1", params![key], |r| r.get(0))
+        .optional()
+        .map_err(Into::into)
+}
+
+fn meta_u64(conn: &Connection, key: &str) -> Result<Option<u64>> {
+    match meta_string(conn, key)? {
+        None => Ok(None),
+        Some(v) => v
+            .parse::<u64>()
+            .map(Some)
+            .with_context(|| format!("chain_meta {key} is not a u64: {v:?}")),
+    }
+}
+
+/// The position from which this chain must be signed, derived from BOTH persisted sources of
+/// evidence: the `signed_from_position` record and the signature rows themselves (Codex review
+/// of #1322). Either one alone is enough to make signing mandatory, so losing the metadata row
+/// while signatures survive (or the reverse) cannot reopen unsigned appends. The earlier of the
+/// two wins, because that is the conservative answer when they disagree. A malformed record is
+/// an error, never "unsigned".
+fn record_signer_aliases(conn: &Connection, signer: &ChainWitnessSigner) -> Result<()> {
+    for alias in signer.signer_aliases() {
+        conn.execute(
+            "INSERT OR REPLACE INTO chain_meta (key, value) VALUES (?1, ?2)",
+            params![format!("{META_SIGNER_ALIAS_PREFIX}{alias}"), signer.witness_lct()],
+        )?;
+    }
+    Ok(())
+}
+
+fn signing_boundary(conn: &Connection) -> Result<Option<u64>> {
+    let recorded = meta_u64(conn, META_SIGNED_FROM)?;
+    let first_signature: Option<i64> =
+        conn.query_row("SELECT MIN(chain_position) FROM chain_signatures", [], |r| r.get(0))?;
+    let first_signature = first_signature
+        .map(|p| u64::try_from(p).context("chain_signatures holds a negative position"))
+        .transpose()?;
+    Ok(match (recorded, first_signature) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    })
+}
+
+fn row_to_signature(row: &rusqlite::Row) -> rusqlite::Result<ChainSignatureRecord> {
+    Ok(ChainSignatureRecord {
+        chain_position: row.get::<_, i64>(0)? as u64,
+        row_hash: row.get(1)?,
+        signature_version: row.get::<_, i64>(2)?.try_into().unwrap_or(u32::MAX),
+        chain_id: row.get(3)?,
+        witness_lct: row.get(4)?,
+        witness_public_key: row.get(5)?,
+        policy_generation: row.get(6)?,
+        signature: row.get(7)?,
+    })
 }
 
 fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<Result<ChainEntry>> {
@@ -1922,5 +2722,498 @@ mod tests {
         let err = store.verify_integrity().unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("integrity broken"), "got: {msg}");
+    }
+
+    // ------------------------------------------------------------ B2 signed witness (#339)
+
+    fn witness(seed: u8) -> Arc<ChainWitnessSigner> {
+        let kp = KeyPair::from_secret_bytes(&[seed; 32]);
+        let lct = web4_core::derive_lct_id(&kp.verifying_key());
+        Arc::new(
+            ChainWitnessSigner::new(kp, &lct)
+                .unwrap()
+                .with_signer_alias("lct:web4:hestia:sovereign:phase1-placeholder"),
+        )
+    }
+
+    fn raw(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "key", hex::encode(TEST_KEY)).unwrap();
+        conn
+    }
+
+    fn signed_store(dir: &TempDir) -> (PathBuf, SqliteChainStore, Arc<ChainWitnessSigner>) {
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let w = witness(1);
+        store.install_witness_signer(w.clone()).unwrap();
+        (path, store, w)
+    }
+
+    /// A witness LCT that is not derived from the key is refused at construction.
+    #[test]
+    fn a_witness_lct_must_derive_from_its_key() {
+        let kp = KeyPair::from_secret_bytes(&[1; 32]);
+        assert!(ChainWitnessSigner::new(kp, "lct:web4:mb32:bnotmine").is_err());
+    }
+
+    /// #339 test 1: a signed row passes link integrity AND signature authenticity, and the
+    /// sovereign's placeholder anchor is recorded as the witness's real LCT.
+    #[test]
+    fn signed_rows_pass_both_predicates_and_name_the_real_lct() {
+        let dir = TempDir::new().unwrap();
+        let (_path, store, w) = signed_store(&dir);
+        w.set_policy_generation("policy:sha256:abc");
+        let e0 = store
+            .append("evt", json!({"i": 0}), "lct:web4:hestia:sovereign:phase1-placeholder")
+            .unwrap();
+        let e1 = store.append("evt", json!({"i": 1}), "lct:web4:mb32:brouter").unwrap();
+        assert_eq!(e0.signer_lct, w.witness_lct(), "the anchor alias is stored as the real LCT");
+        assert_eq!(e1.signer_lct, "lct:web4:mb32:brouter", "other signers are left as named");
+        assert_eq!(store.verify_integrity().unwrap(), 2, "legacy link hash is unchanged");
+
+        let v = store.verify_chain().unwrap();
+        assert!(v.link_intact() && v.signatures_authentic(), "{v:?}");
+        assert_eq!((v.length, v.signed_valid, v.legacy_unsigned), (2, 2, 0));
+        assert_eq!(v.chain_id.as_deref(), Some(chain_id_for_genesis(&e0.hash).as_str()));
+        assert_eq!(v.witnesses[w.public_key_hex()].rows, 2);
+        let rec = store.signature_for(1).unwrap().unwrap();
+        assert_eq!(rec.policy_generation, "policy:sha256:abc");
+        assert_eq!(rec.row_hash, e1.hash);
+        assert_eq!(store.signed_from().unwrap(), Some(0));
+    }
+
+    fn tamper(path: &Path, sql: &str) {
+        raw(path).execute_batch(sql).unwrap();
+    }
+
+    fn failure_states(store: &SqliteChainStore) -> Vec<(u64, SignatureState)> {
+        store.verify_chain().unwrap().failures.iter().map(|f| (f.chain_position, f.state)).collect()
+    }
+
+    /// #339 test 2 — the regression this issue exists for: rewriting ONLY `signer_lct` leaves
+    /// the legacy hash valid, and the signature must fail.
+    #[test]
+    fn rewriting_signer_lct_breaks_the_signature_but_not_the_link() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        tamper(&path, "UPDATE chain_entries SET signer_lct = 'lct:forged' WHERE chain_position = 1");
+        let v = store.verify_chain().unwrap();
+        assert!(v.link_intact(), "the legacy hash does not cover signer_lct");
+        assert!(!v.signatures_authentic());
+        assert_eq!(failure_states(&store), vec![(1, SignatureState::Invalid)]);
+    }
+
+    /// #339 test 3: moving a signed row to another coordinate fails its signature. Moving the
+    /// tail row (and its signature) to position 7 keeps prev-hash order intact, so only the
+    /// signature can see it.
+    #[test]
+    fn rewriting_chain_position_breaks_the_signature() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        tamper(
+            &path,
+            "UPDATE chain_entries SET chain_position = 7 WHERE chain_position = 1;
+             UPDATE chain_signatures SET chain_position = 7 WHERE chain_position = 1;",
+        );
+        let v = store.verify_chain().unwrap();
+        assert!(v.link_intact(), "order is unchanged, so the link walk passes");
+        assert_eq!(failure_states(&store), vec![(7, SignatureState::Invalid)]);
+    }
+
+    /// #339 test 4: an event_data edit fails link integrity, and the signature (whose row_hash
+    /// field is the stored hash) is reported on the same walk rather than hidden behind it.
+    #[test]
+    fn rewriting_event_data_breaks_the_link() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        tamper(&path, r#"UPDATE chain_entries SET event_data = '{"i":99}' WHERE chain_position = 0"#);
+        let v = store.verify_chain().unwrap();
+        assert!(!v.link_intact());
+        assert!(v.link_break.as_deref().unwrap().contains("hash mismatch"));
+    }
+
+    /// #339 test 5: a signed row carried into a different chain fails — its envelope bound the
+    /// genesis-derived id of the chain it was signed in.
+    #[test]
+    fn a_signed_row_moved_to_another_chain_fails() {
+        let dir = TempDir::new().unwrap();
+        let (_p, a, _w) = signed_store(&dir);
+        a.append("evt", json!({"chain": "a"}), "lct:a").unwrap();
+        let row = a.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        let rec = a.signature_for(1).unwrap().unwrap();
+        let other_chain = chain_id_for_genesis(&"f".repeat(64));
+        assert!(verify_row_signature(&a.chain_id().unwrap(), 1, &row.hash, "lct:a", &rec).is_ok());
+        assert!(verify_row_signature(&other_chain, 1, &row.hash, "lct:a", &rec).is_err());
+        // Even if the record is relabelled to claim the other chain, the signature fails.
+        let relabelled = ChainSignatureRecord { chain_id: other_chain.clone(), ..rec };
+        let err = verify_row_signature(&other_chain, 1, &row.hash, "lct:a", &relabelled).unwrap_err();
+        assert!(err.contains("Ed25519"), "{err}");
+    }
+
+    /// #339 test 6: key rotation. Rows keep verifying under the key they carry; a witness key
+    /// swapped into a record (or a key that does not derive the claimed LCT) fails.
+    #[test]
+    fn rotation_keeps_old_rows_and_key_mismatch_is_detected() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, w1) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        let w2 = witness(2);
+        store.install_witness_signer(w2.clone()).unwrap();
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        let v = store.verify_chain().unwrap();
+        assert!(v.signatures_authentic(), "{v:?}");
+        assert_eq!(v.witnesses.len(), 2);
+        assert_eq!(v.witnesses[w1.public_key_hex()].last_position, 0);
+        assert_eq!(v.witnesses[w2.public_key_hex()].first_position, 1);
+
+        // Swap row 1's key for w1's: the key no longer derives the claimed witness LCT.
+        tamper(&path, &format!(
+            "UPDATE chain_signatures SET witness_public_key = '{}' WHERE chain_position = 1",
+            w1.public_key_hex()));
+        let f = store.verify_chain().unwrap().failures;
+        assert!(f[0].reason.contains("not derived"), "{f:?}");
+        // Swap key AND LCT consistently: the signature was made by w2, so it fails.
+        tamper(&path, &format!(
+            "UPDATE chain_signatures SET witness_lct = '{}' WHERE chain_position = 1",
+            w1.witness_lct()));
+        let f = store.verify_chain().unwrap().failures;
+        assert!(f[0].reason.contains("Ed25519"), "{f:?}");
+    }
+
+    /// #339 test 7: an unsigned historical chain stays readable as legacy_unsigned with its
+    /// hashes unchanged. Installing a witness does NOT activate it (#1322 review): appends stay
+    /// unsigned and no boundary is written. Only the explicit activation starts signing, at the
+    /// next append.
+    #[test]
+    fn legacy_rows_stay_legacy_and_signing_begins_after_them() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let legacy: Vec<String> = {
+            let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+            (0..3).map(|i| store.append("evt", json!({"i": i}), "lct:old").unwrap().hash).collect()
+        };
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let v = store.verify_chain().unwrap();
+        assert_eq!((v.legacy_unsigned, v.signed_valid), (3, 0));
+        assert!(v.link_intact() && v.signatures_authentic());
+        assert_eq!(store.install_witness_signer(witness(1)).unwrap(), WitnessInstall::LegacyDeferred);
+        assert!(store.witness_signer().is_none(), "a legacy chain is not activated by install");
+        store.append("evt", json!({"i": 3}), "lct:new").unwrap();
+        assert_eq!(store.signed_from().unwrap(), None, "no boundary was established");
+        let v = store.verify_chain().unwrap();
+        assert_eq!((v.legacy_unsigned, v.signed_valid, v.recorded_signed_from), (4, 0, None));
+
+        store.activate_signing_on_legacy_chain(witness(1)).unwrap();
+        store.append("evt", json!({"i": 4}), "lct:new").unwrap();
+        let v = store.verify_chain().unwrap();
+        assert_eq!((v.legacy_unsigned, v.signed_valid, v.first_signed_position), (4, 1, Some(4)));
+        assert_eq!(v.recorded_signed_from, Some(4));
+        assert!(v.signatures_authentic(), "{v:?}");
+        let now: Vec<String> = store.read_from(0, 3).unwrap().into_iter().map(|e| e.hash).collect();
+        assert_eq!(now, legacy, "no historical row was rewritten");
+        assert_eq!(store.chain_id(), Some(chain_id_for_genesis(&legacy[0])));
+    }
+
+    /// The activation cannot happen by race either (#1322 review): a witness installed while the
+    /// chain was empty must not start signing after another handle wrote unsigned rows, since
+    /// that would record a boundary after an unsigned prefix. Checked inside the append tx.
+    #[test]
+    fn a_witness_installed_on_an_empty_chain_does_not_activate_a_legacy_prefix() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let signed = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(signed.install_witness_signer(witness(1)).unwrap(), WitnessInstall::Fresh);
+        let unsigned = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        unsigned.append("evt", json!({"i": 0}), "lct:old").unwrap();
+        let err = signed.append("evt", json!({"i": 1}), "lct:new").unwrap_err();
+        assert!(format!("{err}").contains("explicit legacy activation"), "{err}");
+        let fresh = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(fresh.len().unwrap(), 1, "the refused append left nothing behind");
+        assert_eq!(fresh.signed_from().unwrap(), None);
+        // Fresh and already-signed installs are unaffected.
+        let dir2 = TempDir::new().unwrap();
+        let (path2, store2, _w) = signed_store(&dir2);
+        store2.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store2);
+        let again = SqliteChainStore::open(&path2, TEST_KEY).unwrap();
+        assert_eq!(again.install_witness_signer(witness(1)).unwrap(), WitnessInstall::AlreadySigned);
+        again.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        assert!(again.verify_chain().unwrap().signatures_authentic());
+    }
+
+    /// Downgrade, two ways: a handle without the key refuses to append to a signed chain, and an
+    /// unsigned row planted after a signed one (with a correct legacy hash, so the link walk
+    /// passes) is reported as MissingAfterSigned. Stripping a mid-chain signature likewise.
+    #[test]
+    fn a_downgrade_to_unsigned_rows_is_refused_and_detected() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        let tail = store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        drop(store);
+
+        let unsigned = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let err = unsigned.append("evt", json!({"i": 2}), "lct:a").unwrap_err();
+        assert!(format!("{err}").contains("refuses an unsigned append"), "{err}");
+        assert_eq!(unsigned.len().unwrap(), 2, "the refused append left nothing behind");
+
+        // Plant a correctly-linked unsigned row at position 2.
+        let last = unsigned.read_from(1, 1).unwrap().remove(0);
+        let ts = Utc::now();
+        let data = r#"{"i":2}"#;
+        let h = compute_hash(&last.hash, &ts, "evt", data);
+        raw(&path).execute(
+            "INSERT INTO chain_entries VALUES (2, ?1, ?2, 'evt', ?3, 'lct:a', ?4)",
+            params![h, last.hash, data, ts.to_rfc3339()],
+        ).unwrap();
+        let v = unsigned.verify_chain().unwrap();
+        assert!(v.link_intact(), "{v:?}");
+        assert_eq!(failure_states(&unsigned), vec![(2, SignatureState::MissingAfterSigned)]);
+
+        // Strip the signature from the genesis row too: the meta record still says position 0.
+        tamper(&path, "DELETE FROM chain_signatures WHERE chain_position = 0");
+        let states = failure_states(&unsigned);
+        assert!(states.contains(&(0, SignatureState::MissingAfterSigned)), "{states:?}");
+        let _ = tail;
+    }
+
+    /// Losing only boundary metadata must not enable unsigned appends while signed rows
+    /// still exist. The verifier already recognizes this evidence; append must do so too.
+    #[test]
+    fn missing_boundary_metadata_does_not_allow_unsigned_extension() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "DELETE FROM chain_meta WHERE key = 'signed_from_position'");
+
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let before = store.verify_chain().unwrap();
+        assert_eq!(before.recorded_signed_from, None);
+        assert_eq!(before.signed_valid, 1);
+        // The record is written with the first signature, so its absence is reported.
+        assert!(before.meta_mismatch.as_deref().is_some_and(|m| m.contains("no signed_from_position")));
+        assert!(!before.signatures_authentic());
+        // The predicate daemon startup and the CLI opener use sees the surviving signature.
+        assert_eq!(store.signed_from().unwrap(), Some(0));
+        let result = store.append("evt", json!({"i": 1}), "lct:a");
+        let after = store.verify_chain().unwrap();
+        assert!(result.is_err(), "unsigned append succeeded after metadata loss; verification: {after:?}");
+        assert_eq!(store.len().unwrap(), 1, "refusal must leave no additional row");
+    }
+
+    /// The reverse loss: signature rows gone, record intact. The record alone still refuses.
+    #[test]
+    fn missing_signature_rows_with_a_boundary_record_still_refuse_unsigned_appends() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "DELETE FROM chain_signatures");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(store.signed_from().unwrap(), Some(0));
+        assert!(store.append("evt", json!({"i": 1}), "lct:a").is_err());
+        assert_eq!(store.len().unwrap(), 1);
+    }
+
+    /// A malformed record is an error for every handle and every append, never "unsigned".
+    #[test]
+    fn malformed_boundary_metadata_refuses_every_append() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "UPDATE chain_meta SET value = 'zero' WHERE key = 'signed_from_position'");
+
+        let unsigned = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert!(unsigned.signed_from().is_err());
+        assert!(unsigned.append("evt", json!({"i": 1}), "lct:a").is_err());
+        drop(unsigned);
+        let signed = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        // Installing classifies the chain from the same boundary read, so it fails closed too
+        // (daemon startup refuses); a signer installed by other means still cannot append.
+        assert!(signed.install_witness_signer(w.clone()).is_err());
+        signed.activate_signing_on_legacy_chain(w).unwrap();
+        assert!(signed.append("evt", json!({"i": 1}), "lct:a").is_err());
+        assert_eq!(signed.len().unwrap(), 1);
+    }
+
+    /// Record and signatures disagree: the earlier position wins, and the mismatch is reported.
+    #[test]
+    fn inconsistent_boundary_metadata_takes_the_earlier_position() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "UPDATE chain_meta SET value = '5' WHERE key = 'signed_from_position'");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(store.signed_from().unwrap(), Some(0));
+        assert!(store.verify_chain().unwrap().meta_mismatch.is_some());
+        assert!(store.append("evt", json!({"i": 2}), "lct:a").is_err());
+        assert_eq!(store.len().unwrap(), 2);
+    }
+
+    /// A signed append after the record was deleted must not write a new, later boundary:
+    /// that would forge the record and erase the verifier's evidence of the deletion.
+    #[test]
+    fn a_signed_append_does_not_rewrite_a_deleted_boundary() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        drop(store);
+        tamper(&path, "DELETE FROM chain_meta WHERE key = 'signed_from_position'");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        store.install_witness_signer(w).unwrap();
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        let v = store.verify_chain().unwrap();
+        assert_eq!((v.signed_valid, v.recorded_signed_from), (2, None));
+        assert!(v.meta_mismatch.is_some());
+        assert_eq!(store.signed_from().unwrap(), Some(0));
+    }
+
+    /// chain-verify uses a predictable temporary directory. If its parent is a symlink
+    /// to the source directory, the snapshot helper must not unlink the source database.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_parent_alias_must_not_replace_source_chain() {
+        let dir = TempDir::new().unwrap();
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("witness.db");
+        let expected_hash = {
+            let store = SqliteChainStore::open(&source, TEST_KEY).unwrap();
+            store.append("evt", json!({"keep": true}), "lct:a").unwrap().hash
+        };
+        let alias = dir.path().join("snapshot-alias");
+        std::os::unix::fs::symlink(&source_dir, &alias).unwrap();
+        // Without the alias refusal the helper unlinks the source and then backs the recreated
+        // file up onto itself, which never completes: bound the call so a regression FAILS.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (src, dst) = (source.clone(), alias.join("witness.db"));
+        std::thread::spawn(move || {
+            let _ = tx.send(SqliteChainStore::backup_encrypted(&src, dst, TEST_KEY));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("snapshot through a parent alias hung: the source was likely unlinked");
+        let preserved = raw(&source).query_row(
+            "SELECT hash FROM chain_entries WHERE chain_position = 0", [],
+            |row| row.get::<_, String>(0),
+        );
+        assert_eq!(preserved.ok().as_deref(), Some(expected_hash.as_str()),
+            "snapshot replaced its source through a parent alias; backup result: {result:?}");
+        assert!(result.is_err(), "aliased source/destination must be refused");
+    }
+
+    /// The same refusal for a symlinked destination file, a hard link, and the source's WAL.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_file_symlink_hard_link_and_side_file_destinations() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("witness.db");
+        let expected_hash = {
+            let store = SqliteChainStore::open(&source, TEST_KEY).unwrap();
+            store.append("evt", json!({"keep": true}), "lct:a").unwrap().hash
+        };
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        let hard = dir.path().join("hard.db");
+        std::fs::hard_link(&source, &hard).unwrap();
+        for dest in [link, hard, dir.path().join("witness.db-wal")] {
+            let result = SqliteChainStore::backup_encrypted(&source, &dest, TEST_KEY);
+            assert!(result.is_err(), "{} was accepted as a destination", dest.display());
+        }
+        let preserved: String = raw(&source)
+            .query_row("SELECT hash FROM chain_entries WHERE chain_position = 0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(preserved, expected_hash);
+    }
+
+    /// #339 test 8: reopen preserves signatures, chain id, and signed-from.
+    #[test]
+    fn reopen_preserves_signatures_and_chain_id() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        let id = store.chain_id().unwrap();
+        drop(store);
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(store.chain_id(), Some(id.clone()));
+        store.install_witness_signer(w).unwrap();
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        let v = store.verify_chain().unwrap();
+        assert_eq!(v.recorded_chain_id, Some(id));
+        assert_eq!((v.signed_valid, v.recorded_signed_from), (2, Some(0)));
+        assert!(v.signatures_authentic(), "{v:?}");
+    }
+
+    /// #339 test 9: the signature commits with its row or not at all. A failing signature
+    /// insert rolls the row back, and the cached length does not move.
+    #[test]
+    fn a_failed_signature_insert_leaves_no_row_behind() {
+        let dir = TempDir::new().unwrap();
+        let (path, store, _w) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), "lct:a").unwrap();
+        tamper(&path, "CREATE TRIGGER no_sig BEFORE INSERT ON chain_signatures
+                       BEGIN SELECT RAISE(ABORT, 'injected'); END;");
+        assert!(store.append("evt", json!({"i": 1}), "lct:a").is_err());
+        assert_eq!(store.len().unwrap(), 1);
+        let n: i64 = raw(&path).query_row("SELECT COUNT(*) FROM chain_entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "the row must not commit without its signature");
+        tamper(&path, "DROP TRIGGER no_sig;");
+        store.append("evt", json!({"i": 1}), "lct:a").unwrap();
+        assert!(store.verify_chain().unwrap().signatures_authentic());
+    }
+
+    /// An idempotent replay across the upgrade: a key first witnessed under the placeholder
+    /// anchor replays cleanly once the signer maps that anchor to the real LCT.
+    #[test]
+    fn append_once_replay_treats_the_anchor_alias_as_the_same_signer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let anchor = "lct:web4:hestia:sovereign:phase1-placeholder";
+        let first = {
+            let s = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+            s.append_once("k1", "evt", json!({"n": 1}), anchor).unwrap().0
+        };
+        let s = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        s.activate_signing_on_legacy_chain(witness(1)).unwrap();
+        let (again, inserted) = s.append_once("k1", "evt", json!({"n": 1}), anchor).unwrap();
+        assert!(!inserted);
+        assert_eq!(again.hash, first.hash);
+    }
+
+    /// #339 test 10: a pinned signature from a fixed key over the wire golden fields. Ed25519 is
+    /// deterministic, so this pins the "sign the preimage directly" choice end to end.
+    #[test]
+    fn the_chain_signature_golden_signature_is_pinned() {
+        let kp = KeyPair::from_secret_bytes(&[0x42; 32]);
+        let pre = signature_preimage(
+            &format!("hestia-chain:{}", "1".repeat(64)),
+            42,
+            &"2".repeat(64),
+            "lct:web4:mb32:bsigner",
+            "lct:web4:mb32:bwitness",
+            &"3".repeat(64),
+            &format!("policy:sha256:{}", "4".repeat(64)),
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&pre)),
+            "4264c2847d2326043dffd34d94946c1d334abddd1c9b9791caca69e12c6eab8d",
+            "must equal hestia-wire's golden vector"
+        );
+        // Reproduced independently (Python `cryptography`, Ed25519 over the same bytes).
+        assert_eq!(
+            kp.sign(&pre).to_hex(),
+            "dbfb719edc9ccc95830dd8cf0e37bff4bb05f700f099e73acb942ec6f176bbab\
+             6eb7b9e9bb0b72c66fe933ccaa40b65df3e9ef1c9cf9992478a2f083d03d4a0c"
+        );
     }
 }

@@ -892,6 +892,45 @@ impl ServerState {
             "[hestia] sovereign LCT {} (self-issued bootstrap, placeholder strength)",
             sovereign.lct_id()
         );
+        // B2 (#339): the Society key witnesses the chain. On an empty or already-signed chain,
+        // every row appended from here on is signed in its own insert transaction, and rows
+        // appended "as the sovereign" name the real key-derived LCT (the anchor string above is
+        // recorded as its alias). A LEGACY chain (unsigned rows, no signing evidence) is left
+        // unsigned: activating it is the separate migration decision (#1322 review), never a
+        // side effect of startup. A chain that is already signed and a key that cannot be
+        // recovered is a refusal to start: the alternative is a daemon whose every append
+        // fails, or a silent downgrade.
+        match crate::sovereign::Sovereign::chain_witness_signer(&vault) {
+            Ok(signer) if signer.witness_lct() == sovereign.lct_id() => {
+                if chain_store.install_witness_signer(Arc::new(signer))?
+                    == crate::storage::WitnessInstall::LegacyDeferred
+                {
+                    eprintln!(
+                        "[hestia] WARNING: witness chain is LEGACY UNSIGNED ({} rows, no signing \
+                         boundary); chain signing is NOT activated and rows this boot are \
+                         UNSIGNED. Activation is a pending migration decision (#339/#1322).",
+                        chain_store.len()?
+                    );
+                }
+            }
+            other => {
+                let why = match other {
+                    Ok(signer) => format!(
+                        "persisted witness LCT {} is not the loaded sovereign {}",
+                        signer.witness_lct(),
+                        sovereign.lct_id()
+                    ),
+                    Err(e) => format!("{e:#}"),
+                };
+                if let Some(from) = chain_store.signed_from()? {
+                    anyhow::bail!(
+                        "witness chain is signed from position {from} but the chain witness key \
+                         is unavailable ({why}); refusing to start rather than downgrade"
+                    );
+                }
+                eprintln!("[hestia] WARNING: witness chain rows will be UNSIGNED this boot: {why}");
+            }
+        }
         // Phase-1 mirror: the constellation roles as Role LCT entities, with
         // VAULT-STABLE identities (same LCT across restarts; secrets sealed).
         let role_registry = crate::role_registry::load_or_mint_registry(
@@ -2329,7 +2368,10 @@ impl super::state_lock::Publish for ServerState {
     fn initial_snapshot(&mut self) -> Self::Snapshot {
         let _ = self.take_policy_dirty();
         self.sessions.apply_pending();
-        self.build_publication()
+        let p = self.build_publication();
+        // B2 (#339): rows are witnessed under the generation of the law in force.
+        self.chain_store.set_policy_generation(&p.policy_generation());
+        p
     }
 
     fn on_release(&mut self, slot: &std::sync::RwLock<Arc<Self::Snapshot>>) {
@@ -2349,6 +2391,9 @@ impl super::state_lock::Publish for ServerState {
             // Build outside the slot's write lock; swap (and apply staged session changes)
             // inside it, so a reader sees one consistent (directory, publication) pair.
             let fresh = if dirty { Some(Arc::new(self.build_publication())) } else { None };
+            if let Some(f) = &fresh {
+                self.chain_store.set_policy_generation(&f.policy_generation());
+            }
             let mut w = slot.write().unwrap_or_else(|p| p.into_inner());
             self.sessions.apply_pending();
             if let Some(f) = fresh {
@@ -2404,6 +2449,59 @@ mod tests {
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = ServerState::open(vault, dir.path(), "p").unwrap();
         (dir, state)
+    }
+
+    /// B2 (#339): the daemon's chain rows are witnessed by the Society key, name the real
+    /// key-derived sovereign LCT rather than the placeholder anchor, and bind the published
+    /// policy generation — which moves when the law does.
+    #[test]
+    fn daemon_rows_are_signed_by_the_society_under_the_policy_generation() {
+        use super::super::state_lock::Publish;
+        let (_dir, mut state) = make_state();
+        let snap = state.initial_snapshot();
+        let gen0 = snap.policy_generation();
+        assert!(gen0.starts_with("policy:sha256:"), "{gen0}");
+        let e = state.append_chain("evt", serde_json::json!({"n": 1})).unwrap();
+        assert_eq!(e.signer_lct, state.sovereign.lct_id());
+        assert_ne!(e.signer_lct, state.sovereign_lct, "the anchor is an alias, not the signer");
+        let rec = state.chain_store.signature_for(e.chain_position).unwrap().unwrap();
+        assert_eq!(rec.witness_lct, state.sovereign.lct_id());
+        assert_eq!(rec.policy_generation, gen0);
+        let v = state.chain_store.verify_chain().unwrap();
+        assert!(v.link_intact() && v.signatures_authentic(), "{v:?}");
+
+        // A law change moves the generation the next row is witnessed under.
+        let mut cfg = state.policy_engine.config().clone();
+        cfg.enforce = !cfg.enforce;
+        *state.policy_engine = crate::policy::PolicyEngine::new(cfg);
+        let gen1 = state.build_publication().policy_generation();
+        assert_ne!(gen0, gen1);
+        state.chain_store.set_policy_generation(&gen1);
+        let e2 = state.append_chain("evt", serde_json::json!({"n": 2})).unwrap();
+        let rec2 = state.chain_store.signature_for(e2.chain_position).unwrap().unwrap();
+        assert_eq!(rec2.policy_generation, gen1);
+    }
+
+    /// #1322 review: daemon startup on a LEGACY chain (unsigned rows, never signed) must not
+    /// establish a signing boundary. The witness is not installed, appends stay unsigned, and
+    /// activation is left to the explicit migration call.
+    #[test]
+    fn startup_on_a_legacy_chain_does_not_establish_a_signing_boundary() {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        {
+            let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+            let legacy = SqliteChainStore::open(dir.path().join("witness.db"), key).unwrap();
+            legacy.append("evt", serde_json::json!({"n": 0}), "lct:old").unwrap();
+        }
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
+        assert!(state.chain_store.witness_signer().is_none());
+        let e = state.append_chain("evt", serde_json::json!({"n": 1})).unwrap();
+        assert!(state.chain_store.signature_for(e.chain_position).unwrap().is_none());
+        assert_eq!(state.chain_store.signed_from().unwrap(), None);
+        let v = state.chain_store.verify_chain().unwrap();
+        assert_eq!((v.legacy_unsigned, v.signed_valid), (state.chain_store.len().unwrap(), 0));
+        assert!(v.link_intact() && v.signatures_authentic(), "{v:?}");
     }
 
     fn ctx_for(role: &'static str) -> crate::reputation::RepContext<'static> {
