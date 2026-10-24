@@ -93,11 +93,15 @@ different candidate, member, actor, reason or prior ID refuses. An identical pen
 retry discovers pending state; it is not an implicit authorization to resume it.
 Explicit resume/reconciliation must recheck current authority.
 
-Abandonment is terminal once its valid bound row is durable, even if the vault
-close has not happened yet. It binds the reservation generation and observes the
+Abandonment is terminal once its valid bound row is durable before selection, even
+if the vault close has not happened yet. It binds the reservation generation and observes the
 unchanged prior at that generation. Selection must refuse it; reconciliation may
 only close it as abandoned. Abandonment is not deletion of the reservation. A
-selected operation cannot be labelled abandoned to conceal its effect. Changing a selected
+selected operation cannot be labelled abandoned to conceal its effect. For a
+selected operation, abandonment evidence is valid only in the half-open interval
+`[reservation_floor, selected.outcome_floor)`. A row appended at or after the
+selection frontier is invalid abandonment evidence: retain it in the chain, but
+do not let it block closure with a valid applied receipt. Changing a selected
 certification back requires a new authorized operation naming its actual prior.
 
 ## Crash/recovery matrix
@@ -115,6 +119,7 @@ certification back requires a new authorized operation naming its actual prior.
 | Effect append/save interrupted | Selection, durable effect receipt, pending/closed record | Report/reconcile actual state; do not reselect blindly |
 | Abandon after durable intent | Durable abandonment plus unchanged prior selection | Close explicitly; do not erase authorization history |
 | Durable abandonment before vault close | Bound terminal row and pending reservation | Refuse selection; explicit close may finish abandonment |
+| Abandonment row after selection | Row position and saved selection frontier | Refuse abandonment; allow valid applied closure and a subsequent operation, including after restart |
 | Missing/invalid authorization on restart | Selected reference and unavailable/invalid evidence | Reader refuses; no fallback to “latest” or to an older selection |
 | Concurrent or stale request | Member reservation, expected prior, vault generation | Reject without mutation; no two pending operations per member |
 

@@ -140,8 +140,10 @@ class Model:
         return self.append(Row("authorization", self.memory["pending"],
                                reservation_generation=self.memory["reservation"][0]))
 
-    def has_abandonment(self, request, generation, floor):
-        for position in range(floor, self.durable):
+    def has_abandonment(self, request, generation, floor, ceiling=None):
+        # A row appended after selection cannot abandon that persisted effect.
+        end = self.durable if ceiling is None else min(self.durable, ceiling)
+        for position in range(floor, end):
             try:
                 row = self.evidence(position, "abandoned", request, generation, floor)
                 self.require(row.authorization is None and row.observed_generation == generation)
@@ -208,7 +210,8 @@ class Model:
             self.require(position > selected.authorization
                          and row.authorization == selected.authorization
                          and row.observed_generation == selected.generation
-                         and not self.has_abandonment(request, generation, floor))
+                         and not self.has_abandonment(request, generation, floor,
+                                                     selected.outcome_floor))
         else:
             self.require(request.prior == self.selected_id())
             outcome = "abandoned"
@@ -402,6 +405,35 @@ class ContractTests(unittest.TestCase):
         m.flush()
         with self.assertRaises(Refused):
             m.finish(pos)
+
+    def test_post_selection_abandonment_cannot_strand_member(self):
+        for restart in (False, True):
+            for offset in (0, 1):
+                with self.subTest(restart=restart, offset=offset):
+                    m, authorization = self.prepared()
+                    m.select(authorization)
+                    selected = m.readable_selection()
+                    if offset:
+                        m.append(Row("unrelated", R))
+                    abandoned = m.append(Row("abandoned", R, reservation_generation=1,
+                                             observed_generation=1))
+                    self.assertEqual(abandoned, selected.outcome_floor + offset)
+                    effect = m.observe()
+                    m.flush()
+                    if restart:
+                        m.restart()
+                    before = deepcopy(m.__dict__)
+                    with self.assertRaises(Refused):
+                        m.finish(abandoned)
+                    self.assertEqual(m.__dict__, before)
+                    m.finish(effect)
+                    self.assertEqual(m.begin(R), "applied")
+                    self.assertIsNone(m.disk["pending"])
+                    self.assertEqual(m.readable_selection(), selected)
+                    self.assertEqual(m.rows[abandoned].kind, "abandoned")
+                    successor = replace(R, operation="op-2", candidate="candidate-2",
+                                        prior=R.operation)
+                    self.assertEqual(m.begin(successor), "pending")
 
     def test_lost_final_response_is_idempotent_and_does_not_reselect_old_version(self):
         m = self.completed()
