@@ -94,7 +94,7 @@ Existing suites on the patched copies match the base core exactly:
 - **Per-path modes inside a shell line.** Write, delete and execute positions are classified by the closure but not yet mapped per path to modes, so any non-read command needs a full grant.
 - **The gate-opened scope request should carry the mode the refused act needed**, so the decider sees "asks for w".
 - **The narrowed floor.** The daemon still withholds floor entries narrower than r (`floor_for`). With per-mode admission it could serve them by mode.
-- **SAGE's side.** `being_gate_client._granted_reach` should use `scope_roots_with_modes`, and the dispatcher's own confinement should require w for a write. Otherwise a narrowed grant the gate admits is refused at the dispatcher. That's a SAGE PR after this lands.
+- **SAGE's side.** `being_gate_client._granted_reach` should use `scope_roots_with_modes`, and the dispatcher's own confinement should require w for a write. Otherwise a narrowed grant the gate admits is refused at the dispatcher. That's SAGE #533 (draft, inert until this is applied).
 
 ## Rebuild and measure
 
