@@ -1,8 +1,12 @@
 # held: #1345 part B, grant modes at the gate
 
-**Patch:** `daaca28580977a4a9ee385c1c9c3c923a1acfd5cf3d9ef40bce3247a9deaa81f.patch`, built on cbp/floor-modes f4e671a9 (#1381).
+**Patch:** `e333aa410c61e80e086d5cea038fce7cf80eb4ad6f16a0e62a21191bed58e27b.patch`, built on cbp/floor-modes 7299da97 (#1381 re-applied over main 97d3861e).
 
-**Superseded:** `21aee711….patch`, the first cut. It mapped no mode to `run`. Kept because the safety preset refuses `git rm` of a held patch.
+**Superseded:**
+- `daaca285….patch`, the same change built on f4e671a9. #1374 then changed the hooks-gt manifests on main, and the stack was re-applied. The gate sources are byte-identical; only the manifest digests differ.
+- `21aee711….patch`, the first cut. It mapped no mode to `run`.
+
+Both are kept because the safety preset refuses `git rm` of a held patch.
 
 It touches 9 files:
 - `plugins/_shared/hestia_gate_core.py`
