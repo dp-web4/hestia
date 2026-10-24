@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "d647f2fbfd8f3843f81142fa01625b496d2149b5ee1f42cffee7e2b605d0d4a1",
+      "sha256": "cb7f5833f591f8ec646f75f7a7b0cd10ada3c464c61a582217b5750374af9a12",
       "source": "plugins/kimi/hooks/hooks.json"
     },
     {
@@ -33,7 +33,7 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "a685c2ca8b43f87b7210425bebb981190049563fb0fd78c315f0f7e5e124cddb",
+    "gt_version": "93af94f009b78fcee5a51fe56ee2a4a201f8dffe8f5d0a170bd1e7d739d81946",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -45,7 +45,7 @@
       },
       {
         "path": "hestia_governance_closure.py",
-        "sha256": "1c5c413502e82fe3e84e19959f32ce378f69a3a08661172df9e9e020407359c7"
+        "sha256": "1f9a167c9793a1a416307b346b1013b343b421135675a5302a8b9deb60615e94"
       },
       {
         "path": "hestia_shell_classifier.py",
@@ -61,6 +61,22 @@
       }
     ]
   },
-  "requires": [],
-  "gt_version": "c33342882af9188213cadd46f7f628043098d758071e7470f7a0d567474aaebb"
+  "requires": [
+    {
+      "unit": "member-mesh",
+      "path": "hestia-mesh.py",
+      "sha256": "79db46f592c5b9f3d32260485578d6c0c8603f75ec12130beedee5573da4d1ce"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "prompt-disposition-watch.sh",
+      "sha256": "23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "session-mesh-inbox.sh",
+      "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+    }
+  ],
+  "gt_version": "c1d966993b019369301cf2ce4cca5f05977eab93f0893db78172a7aeb88f2712"
 }

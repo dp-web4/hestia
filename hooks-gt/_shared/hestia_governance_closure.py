@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 1c5c413502e82fe3e84e19959f32ce378f69a3a08661172df9e9e020407359c7  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 1f9a167c9793a1a416307b346b1013b343b421135675a5302a8b9deb60615e94  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -327,6 +327,12 @@ LITERAL_FLOOR = Closure(
                                      # the pre-consolidation gate allowed exactly that, because
                                      # it protected known filenames, not the directory)
         ("hestia", "hooks"),
+        # The member mesh's FIRE FLAGS ($HESTIA_HOME/mesh-fire.d/<member>, #1373/#1374): a flag there turns a
+        # print-only watcher into one that launches a headless CLI for that member. install-watchers.sh checks
+        # owner/mode/symlinks, but every governed member runs as the operator's UID, so only the gate can tell
+        # the operator's flag from a member's. Creating, changing or removing anything in/under it is a closure
+        # write (Nova's release gate on #1374: "a file's mere presence should not convey operator authority").
+        ("mesh-fire.d",),
     ),
     files_anywhere=(
         "hestia_gate_core.py",

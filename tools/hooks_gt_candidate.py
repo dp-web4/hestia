@@ -160,7 +160,9 @@ def command_targets(registration, wanted):
         'HESTIA_ROLE="${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}"',
         "CODEX_PLUGIN_ROOT=@HESTIA_PLUGIN_SOURCE@",
     )
-    prefix = "(?:" + "|".join(re.escape(s) for s in assignments) + ")"
+    # #1373: a member-mesh line pins its member's mesh id as a LITERAL (`HESTIA_MESH_PLUGIN=kimi-code`); only that
+    # shape is accepted, never a substitution or a placeholder
+    prefix = "(?:" + "|".join([re.escape(s) for s in assignments] + [r"HESTIA_MESH_PLUGIN=[a-z0-9][a-z0-9-]*"]) + ")"
     pattern = re.compile(
         rf"(?:{prefix}[ \t]+)*(?:python3[ \t]+)?"
         r"(?P<quote>['\"]?)@HESTIA_PLUGIN_ROOT@/(?P<path>[A-Za-z0-9_./-]+)(?P=quote)\Z")
@@ -202,6 +204,15 @@ def command_targets(registration, wanted):
             if path in wanted:
                 targets.add(path)
                 continue
+            # #1373: the member-mesh runtime is installed INTO the member's hooks dir (deploy/install-members.sh), so
+            # a mesh line names `<member>/hooks/<file>` while the file's ground truth is the required
+            # `member-mesh/<file>`. Resolved only for exactly that shape and only when the member requires it.
+            member, _, rest = path.partition("/")
+            if rest.startswith("hooks/") and "/" not in rest[len("hooks/"):]:
+                runtime = f"member-mesh/{rest[len('hooks/'):]}"
+                if runtime in wanted and f"{member}/{rest}" not in wanted:
+                    targets.add(runtime)
+                    continue
         unresolved.append(command)
     if unresolved:
         raise CandidateError("registration has unresolved command targets",
