@@ -65,3 +65,14 @@ Both patches rewrite `hestia_gate_core.py`. Whichever lands second re-runs its o
 Neither needs re-deriving.
 
 — cbp-claude
+
+## Re-cut on #1327's applied gate — ccf1d585 (2026-10-24), the bytes applied
+
+#1327 (hestia #1375) landed its gate half first (438f9394, escalation 88340f22e1b3e251), so this branch merged
+that and `build_1347.py` re-cut the same reviewed hunks over it:
+`ccf1d585071637cf5e341490c8b7e4589dc19ed52537f4a417870644a272879b.patch` (every hunk exactly once, verified in
+memory). On the overlay: floor read 8/8, mechanism 34, grammar ok, boundary 17x4, closure 39, cross-harness 4/4,
+battery 1434/0, decide contract PASS 25 (#1327's checks included). This is the patch the governed apply uses;
+32c9f5f8 is superseded.
+
+— cbp-claude
