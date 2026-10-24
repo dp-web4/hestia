@@ -282,7 +282,67 @@ def test_readers_mapped_to_r_are_closure_readers():
     check("r_tools_are_closure_readers", not missing, f"mapped to r but a closure writer: {missing}")
 
 
+def test_a_narrowed_workspace_direct_root_is_projected_end_to_end():
+    """nomad review of #1383, point 2. A recursive grant on `<ws>/<name>` maps to the bare
+    repo NAME (`_scope_entry_for_grant`), so narrowing cbp-being's `governance/**` to r makes
+    the entry `governance`. The gate admitted it, but `scope_roots_with_modes` dropped it, and
+    every consumer that confines after the gate (SAGE's dispatcher, its run mounts) refused
+    what the gate admitted. Daemon row -> snapshot -> policy -> evaluate -> projection."""
+    with _Workspace() as ws:
+        gov = ws + "/governance"
+        snap = _snapshot(ws, by_mode=[_grant(gov, "r")])
+        check("bare_name_entry", snap.get("in_scope_modes") == [{"entry": "governance", "modes": "r"}],
+              str(snap.get("in_scope_modes")))
+        prof, pol = _policy(snap)
+        target = gov + "/hestia/x.py"
+        check("read_admitted", not _verdict(prof, pol, ws, "Read", path=target).blocks)
+        v = _verdict(prof, pol, ws, "Write", path=target)
+        check("write_refused", v.blocks, str(v))
+        check("refusal_does_not_say_not_granted", "is not granted" not in v.reason, v.reason)
+        check("refusal_names_missing_mode", "missing w" in v.reason, v.reason)
+        roots = core.scope_roots_with_modes(pol, ws)
+        check("projected", (os.path.realpath(gov), True, "r") in roots, str(roots))
+        # Only the granted name: a sibling repo is not projected, and a full repo-name scope
+        # (declarative, resolved by the consumer) is still not listed here.
+        check("only_that_root", len(roots) == 1, str(roots))
+
+
+def test_an_all_modes_floor_never_widens_a_narrowed_child_grant():
+    """Nova re-review of #1383 / #1385. An all-modes floor entry on a parent, an own r-only
+    grant on a child: a write in the child must be refused. The daemon withholds the
+    overlapping floor entry (floor_for) and names it in `society_floor_withheld`; served that
+    way the gate admits the read and refuses the write. The second half pins WHY the
+    withholding must outlive part B: this gate unions a served floor with the member's grants,
+    so a daemon that re-served the entry would widen the child back to rwed (#1385, #1386)."""
+    with _Workspace() as ws:
+        parent, child = ws + "/shared-context", _forum(ws)
+        target = child + "/note.md"
+        floor = [{"path": parent, "recursive": True}]
+
+        # As the daemon serves it: the overlapping entry is absent from `society_floor`.
+        withheld = _snapshot(ws, by_mode=[_grant(child, "r")])
+        prof, pol = _policy(withheld)
+        check("as_served_read_admitted", not _verdict(prof, pol, ws, "Read", path=target).blocks)
+        check("as_served_child_write_refused", _verdict(prof, pol, ws, "Write", path=target).blocks)
+        check("as_served_sibling_write_refused",
+              _verdict(prof, pol, ws, "Write", path=parent + "/other/x.md").blocks)
+
+        fake = mt._std_stub(ws, generation=3)
+        fake.extra["hestia_scope_status"]["grants_by_mode"] = [_grant(child, "r")]
+        fake.extra["hestia_scope_status"]["society_floor"] = floor
+        m._discover_endpoint = lambda: "http://fake/mcp"
+        m._McpHttp = lambda ep, dl: fake
+        reserved = m.fetch_policy_snapshot("cbp-being", use_cache=False)
+        prof, pol = _policy(reserved)
+        check("if_reserved_the_union_widens_the_child",
+              not _verdict(prof, pol, ws, "Write", path=target).blocks,
+              "if this starts refusing, the gate caps the floor itself (#1386) and the "
+              "daemon's withholding may be revisited under #1385; until then it must stay")
+
+
 ALL = [
+    test_a_narrowed_workspace_direct_root_is_projected_end_to_end,
+    test_an_all_modes_floor_never_widens_a_narrowed_child_grant,
     test_narrowed_rows_map_to_in_scope_modes_and_never_to_in_scope,
     test_malformed_mode_rows_read_as_no_grant,
     test_modes_are_canonicalised_not_trusted_in_order,
