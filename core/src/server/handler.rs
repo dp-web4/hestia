@@ -6966,11 +6966,14 @@ async fn tool_channel_send(state: &SharedState, args: &Value) -> ToolResult {
             None,
         ));
     };
+    // A DIFFERENT CODE FROM AN UNKNOWN SESSION (SAGE #529 review): a caller reconnects once on
+    // `channel_unattributed`, which cures a stale session and nothing else. A member with no
+    // member LCT stays one after a reconnect, so it must not share the code a retry keys on.
     let Some(member_lct) = s.member_lct(&who.plugin_id) else {
         return Ok(hestia_error_envelope(
-            "hestia.channel_unattributed",
+            "hestia.channel_no_member_lct",
             "this member has no member LCT, so its sends cannot be counted against it; nothing \
-             was recorded",
+             was recorded, and reconnecting will not change that",
             None,
         ));
     };
@@ -32469,6 +32472,22 @@ mod channel_send_tests {
     async fn outbox_len(state: &SharedState) -> usize {
         let s = state.lock().await;
         s.inbox_store.channel_outbox_list(None, 500).unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn a_member_without_a_member_lct_gets_its_own_code_not_the_retryable_one() {
+        // `channel_unattributed` is what a caller reconnects on (SAGE #529); a synthetic member
+        // has no member LCT, a reconnect cannot cure that, so it answers a code of its own.
+        let (_d, state) = test_state().await;
+        let c = tool_connect(&state, &json!({"plugin_id": "fuzz-runner", "host_agent": "t", "synthetic": true}))
+            .await
+            .unwrap();
+        let sid = c["sessionId"].as_str().unwrap().to_string();
+        bind(&state, "fuzz-runner", "dp").await;
+        let out = send(&state, &sid, "dp", "hi").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_no_member_lct", "{out}");
+        assert!(events(&state, "channel_send").await.is_empty());
+        assert_eq!(outbox_len(&state).await, 0);
     }
 
     #[tokio::test]
