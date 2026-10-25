@@ -1214,6 +1214,11 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             # an entry here admits READ acts only, and only in a core that knows the key.
             "society_floor_read": [],
             "in_scope_read": [],
+            # Grants NARROWED below all four modes (hestia #1345 part B), as
+            # {"entry": <in_scope spelling>, "modes": "r"|"rw"|...}. Apart from `in_scope` for
+            # the same reason as `in_scope_read`: a core that predates this key ignores it and
+            # admits nothing for them, so narrowing never widens on an older gate.
+            "in_scope_modes": [],
             "generation": None,
             "expires_at": None,
         }
@@ -1266,6 +1271,26 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                         })
                         snap["scope_grants"].append(p.strip())
                         snap["in_scope"].append(_scope_entry_for_grant(p, rec))
+            # NARROWED grants (hestia #1345 part B). Since #1370 the two lists above carry only
+            # full-mode grants, and `grants_by_mode` carries every grant with its modes. Only
+            # the narrowed rows are taken from it (a full-mode row is already in `in_scope`),
+            # through the same `_scope_entry_for_grant` mapping. Absent on an older daemon:
+            # a no-op. A row whose modes are not a non-empty subset of "rwed" is skipped, so
+            # malformed data reads as no grant.
+            by_mode = scope.get("grants_by_mode")
+            if isinstance(by_mode, list):
+                for g in by_mode:
+                    if not isinstance(g, dict):
+                        continue
+                    p, modes = g.get("path"), g.get("modes")
+                    if not (isinstance(p, str) and p.strip() and isinstance(modes, str)):
+                        continue
+                    if not modes or modes == "rwed" or any(m not in "rwed" for m in modes):
+                        continue
+                    snap["in_scope_modes"].append({
+                        "entry": _scope_entry_for_grant(p, bool(g.get("recursive"))),
+                        "modes": "".join(m for m in "rwed" if m in modes),
+                    })
             # CERTIFICATION, issued by the authority (Sprint F R1): the standing store's
             # monotonic generation ("WHICH policy is this copy") and the daemon's honor
             # horizon for it. Booleans are excluded deliberately — isinstance(True, int)
