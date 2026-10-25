@@ -1,4 +1,7 @@
 #!/usr/bin/env sh
+if [ "${HESTIA_MESH_DIGEST:-}" = 1 ]; then
+  exec python3 "$(dirname "$0")/session-digest.py"
+fi
 # UserPromptSubmit hook (any member): surface NEW disposition notices mid-session (#366).
 #
 # PROVENANCE. Built by kimi-code on 2026-08-27 for #366 and run from its own hooks dir for a

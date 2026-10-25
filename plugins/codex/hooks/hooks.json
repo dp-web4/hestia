@@ -3,6 +3,7 @@
   "_paths_note": "Replace @HESTIA_HOME@, @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ at install time (deploy/register-members.py does: @HESTIA_HOME@ is the deploying environment's HESTIA_HOME as an absolute path, refused when unset -- the gate and the witness load the seat projection through it, #1242). HESTIA_ROLE is passed through with install.default_role as its default (codex declares none: the token is dropped and the daemon default applies). @HESTIA_PLUGIN_SOURCE@ is the deployed plugin directory: hydrate.sh reads instance/identity.seed.json from CODEX_PLUGIN_ROOT, and the installer does not copy the seed under the dest. The deployer owns the lines it installs and rewrites them to this template on each deploy (dp 2026-10-06). The public repository carries no operator-specific workspace path.",
   "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the registration this template becomes (seconds; an entry without one is refused, since Codex's default is not documented here) and decides inside start + timeout - 1.5 s, so it always fails closed before Codex kills it (Codex marks a timed-out hook failed and the tool call continues, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
   "_member_mesh": "#1373 (dp 2026-10-23: the mesh is 'a standard part of what hestia does, fleet-wide, and installation should be automatic'). The member-mesh pair, rendered like every other line here: SessionStart surfaces this member's pending mesh notices (session-mesh-inbox.sh), UserPromptSubmit surfaces a ruling that lands mid-session (prompt-disposition-watch.sh, #366). HESTIA_MESH_PLUGIN is PINNED on the line because #108 removed the CLI's default: an unpinned line is a DARK member (plugins/member-mesh/install.sh's refusal), and a pin rendered by the deployer can never be missing. The role is the same pass-through as the gate's. Both scripts and their CLI (hestia-mesh.py, an install.companions entry) are installed beside each other by install-members.sh, because both call $(dirname $0)/hestia-mesh.py. A host whose mesh lines were registered by hand elsewhere keeps them: a same-named line at another target is FOREIGN and never rewritten or duplicated.",
+  "_session_digest": "#1389 B: HESTIA_MESH_DIGEST=1 makes the existing SessionStart/UserPromptSubmit wrappers share a per-session, non-consuming all-kind digest with PostToolUse. This preserves ownership keys and avoids duplicate startup readers. Missing session id disables visibly; PostToolUse polls at most once per 30 seconds. Requires the member-mesh runtime session-digest.py installed beside hestia-mesh.py. No ack, drain, or idle wake.",
   "hooks": {
     "PreToolUse": [
       {
@@ -31,13 +32,23 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HESTIA_MESH_PLUGIN=codex HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" @HESTIA_PLUGIN_ROOT@/codex/hooks/session-mesh-inbox.sh",
+            "command": "HESTIA_MESH_PLUGIN=codex HESTIA_MESH_DIGEST=1 HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" @HESTIA_PLUGIN_ROOT@/codex/hooks/session-mesh-inbox.sh",
             "timeout": 15
           }
         ]
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_MESH_PLUGIN=codex HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" python3 @HESTIA_PLUGIN_ROOT@/codex/hooks/session-digest.py",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "matcher": ".*",
         "hooks": [
@@ -71,7 +82,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HESTIA_MESH_PLUGIN=codex HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" @HESTIA_PLUGIN_ROOT@/codex/hooks/prompt-disposition-watch.sh",
+            "command": "HESTIA_MESH_PLUGIN=codex HESTIA_MESH_DIGEST=1 HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" @HESTIA_PLUGIN_ROOT@/codex/hooks/prompt-disposition-watch.sh",
             "timeout": 5
           }
         ]

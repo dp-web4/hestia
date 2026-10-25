@@ -123,7 +123,9 @@ def _mesh_cmd(member: str, dest, base: str, role: str | None = _ROLE_DEFAULT) ->
     """The mesh line as the shared renderer must write it: the member's pinned mesh id, the launch role
     pass-through when the member declares a default (codex declares none: the token is dropped)."""
     r = f'HESTIA_ROLE="${{HESTIA_ROLE:-{role}}}" ' if role else ""
-    return f"HESTIA_MESH_PLUGIN={_MESH_ID[member]} {r}{dest}/{base}"
+    opt = "HESTIA_MESH_DIGEST=1 " if member in ("codex", "claude-code") and base in _MESH_FILES else ""
+    interpreter = "python3 " if base == "session-digest.py" else ""
+    return f"HESTIA_MESH_PLUGIN={_MESH_ID[member]} {opt}{r}{interpreter}{dest}/{base}"
 
 
 def _registered(out: str, member: str) -> list[str]:
@@ -178,6 +180,8 @@ def _install(tmp: Path, member: str, *bases: str) -> Path:
     declared dest, so the registrar -- which never registers a target that is not on disk -- will."""
     d = tmp.joinpath(*DEST[member])
     d.mkdir(parents=True, exist_ok=True)
+    if member in ("codex", "claude-code") and any(b in _MESH_FILES for b in bases):
+        bases = (*bases, "session-digest.py")  # shared runtime companion installed with the wrappers
     for b in bases:
         (d / b).write_text(f"# installed {b}\n")
     return d
@@ -228,8 +232,8 @@ def test_thor_case_registers_only_the_missing_witness():
         assert "REGISTERED codex: PostToolUse/witness.py" in r.stdout, r.stdout
         # exactly the missing hooks registered, and nothing already present was touched
         assert _registered(r.stdout, "codex") == sorted(
-            ["PostToolUse/witness.py"] + [f"{_MESH_EVENTS[b]}/{b}" for b in _MESH_FILES]), r.stdout
-        assert r.stdout.count("REGISTERED codex") == 3, r.stdout
+            ["PostToolUse/witness.py", "PostToolUse/session-digest.py"] + [f"{_MESH_EVENTS[b]}/{b}" for b in _MESH_FILES]), r.stdout
+        assert r.stdout.count("REGISTERED codex") == 4, r.stdout
         after = cfg.read_text()
         # the mesh lines carry codex's pinned mesh id; codex declares no default role, so no role token
         hooks_dir = tmp / ".codex" / "hooks"
@@ -541,7 +545,7 @@ def test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existi
         # and the member-mesh pair the #1373 template adds; nothing else
         for b in _MESH_FILES:
             assert f"REGISTERED claude-code: {_MESH_EVENTS[b]}/{b}" in r.stdout, r.stdout
-        assert len(_registered(r.stdout, "claude-code")) == 2 + len(_READER_EVENTS) + len(_MESH_FILES), r.stdout
+        assert len(_registered(r.stdout, "claude-code")) == 3 + len(_READER_EVENTS) + len(_MESH_FILES), r.stdout
         assert "REGISTERED claude-code: PostToolUse/witness.py" not in r.stdout, \
             "the witness was already registered (at another path) and must not be duplicated"
         assert "FOREIGN claude-code: PostToolUse/witness.py is registered at /elsewhere/hestia/witness.py" in r.stdout, r.stdout
@@ -554,7 +558,7 @@ def test_claude_code_template_registers_the_gate_and_law_inject_beside_an_existi
                        f'python3 {dest}/pre_tool_use.py', reader], pre
         assert data["hooks"]["PreToolUse"][0]["matcher"] == "*"
         posts = [h["command"] for g in data["hooks"]["PostToolUse"] for h in g["hooks"]]
-        assert posts == ["python3 /elsewhere/hestia/witness.py", reader], posts
+        assert posts == ["python3 /elsewhere/hestia/witness.py", _mesh_cmd("claude-code", dest, "session-digest.py"), reader], posts
         starts = [h["command"] for g in data["hooks"]["SessionStart"] for h in g["hooks"]]
         assert starts[0].startswith("/home/u/.local/bin/hestia-agent-inventory") and starts[1] == f"python3 {dest}/law_inject.py", starts
         assert starts[2:] == [_mesh_cmd("claude-code", dest, "session-mesh-inbox.sh")], starts
@@ -577,7 +581,7 @@ def test_claude_code_template_on_an_empty_settings_registers_every_hook_once_ins
         data = json.loads(text)
         got = {ev: [h["command"].split("/")[-1] for g in gs for h in g["hooks"]] for ev, gs in data["hooks"].items()}
         assert got == {"PreToolUse": ["pre_tool_use.py", "disposition_deliver.py"],
-                       "PostToolUse": ["witness.py", "disposition_deliver.py"],
+                       "PostToolUse": ["session-digest.py", "witness.py", "disposition_deliver.py"],
                        "UserPromptSubmit": ["disposition_deliver.py", "prompt-disposition-watch.sh"],
                        "SessionStart": ["law_inject.py", "session-mesh-inbox.sh"]}, got
         # the mesh pair (#1373) renders with claude-code's pinned mesh id and the launch-role pass-through,
@@ -601,7 +605,7 @@ def test_a_target_not_on_disk_is_pending_never_registered():
         assert r.returncode == 9, (r.returncode, r.stdout)
         # one PENDING per (event, file): gate, witness, law_inject, the reader on three events, and
         # (since #1373) the member-mesh pair, session-mesh-inbox.sh + prompt-disposition-watch.sh: 8
-        assert r.stdout.count("PENDING claude-code") == 8 and "REGISTERED" not in r.stdout, r.stdout
+        assert r.stdout.count("PENDING claude-code") == 9 and "REGISTERED" not in r.stdout, r.stdout
         for b in _MESH_FILES:
             assert f"PENDING claude-code: {_MESH_EVENTS[b]}/{b}" in r.stdout, r.stdout
         assert "every templated hook is registered" not in r.stdout
@@ -621,7 +625,7 @@ def test_plan_names_every_hook_to_add_with_its_target():
         # one row per (event, file), as codex's observe.sh already has: the reader rides three
         # events, and install-members.sh keys its plan by member/basename, so it installs it once
         # (#1373: and one row for each of the member-mesh pair)
-        want = [["claude-code", b, f"{dest}/{b}"] for b in _CC_FILES + ("disposition_deliver.py",) * 2 + _MESH_FILES]
+        want = [["claude-code", b, f"{dest}/{b}"] for b in _CC_FILES + ("disposition_deliver.py",) * 2 + _MESH_FILES + ("session-digest.py",)]
         assert sorted(rows) == sorted(want), rows
         assert not (tmp / ".claude" / "settings.json").exists() and not (tmp / ".claude" / "hooks").exists(), "--plan wrote something"
 
@@ -975,7 +979,7 @@ def test_mixed_installed_and_missing_targets_exit_pending():
         assert r.returncode == 9, (r.returncode, r.stdout)
         assert "REGISTERED claude-code: PostToolUse/witness.py" in r.stdout, r.stdout
         # gate, law_inject, reader x3, and (#1373) the member-mesh pair: 7
-        assert r.stdout.count("PENDING claude-code") == 7, r.stdout
+        assert r.stdout.count("PENDING claude-code") == 8, r.stdout
         assert "every templated hook is registered" not in r.stdout
         data = json.loads((tmp / ".claude" / "settings.json").read_text())
         assert list(data["hooks"]) == ["PostToolUse"], data
@@ -1211,14 +1215,14 @@ def test_install_members_end_to_end_in_an_isolated_home():
         # #1373: the member-mesh runtime (RUNTIME_MANIFEST.txt: the pair and the CLI both of them run as
         # $(dirname $0)/hestia-mesh.py), in the directory session-mesh-inbox.sh runs from -- with the plugin's bytes
         mesh_src = REPO / "plugins" / "member-mesh"
-        for b in _MESH_FILES + ("hestia-mesh.py",):
+        for b in _MESH_FILES + ("hestia-mesh.py", "session-digest.py"):
             assert (dest / b).read_bytes() == (mesh_src / b).read_bytes(), b
-        for b in _MESH_FILES + ("hestia-mesh.py",):
+        for b in _MESH_FILES + ("hestia-mesh.py", "session-digest.py"):
             assert f"wrote {b} (member mesh) -> {dest}" in out, out[-3000:]
         data = json.loads((home / ".claude" / "settings.json").read_text())
         targets = [RM.target_path(h["command"]) for gs in data["hooks"].values() for g in gs for h in g["hooks"]]
         assert sorted(os.path.basename(x) for x in targets) == sorted(
-            ["law_inject.py", "pre_tool_use.py", "witness.py"] + ["disposition_deliver.py"] * 3 + list(_MESH_FILES)), targets
+            ["law_inject.py", "pre_tool_use.py", "witness.py", "session-digest.py"] + ["disposition_deliver.py"] * 3 + list(_MESH_FILES)), targets
         assert all(os.path.isfile(x) for x in targets), "a registration points at a file that is not on disk"
         assert "hestia-mesh.py" not in {os.path.basename(x) for x in targets}, "the mesh CLI is installed, never registered"
         mesh_cmds = sorted(h["command"] for gs in data["hooks"].values() for g in gs for h in g["hooks"]
@@ -1228,7 +1232,7 @@ def test_install_members_end_to_end_in_an_isolated_home():
         # the authority manifest records every file where it actually went, the mesh runtime included
         auth = json.loads((Path(env["HESTIA_HOME"]) / "current-build.json").read_text())
         files = {f["file"]: f for m in auth["members"] if m["member"] == "claude-code" for f in m["files"]}
-        for b in _MESH_FILES + ("hestia-mesh.py",):
+        for b in _MESH_FILES + ("hestia-mesh.py", "session-digest.py"):
             assert b in files, (b, sorted(files))
             assert files[b]["path"] == str(dest / b), files[b]
             assert files[b]["sha256"] == hashlib.sha256((mesh_src / b).read_bytes()).hexdigest(), files[b]
@@ -1645,8 +1649,8 @@ GEMINI_REAL = {
 }
 
 _REAL_FILES = {   # every hook the template registers is installed, incl. the #1373 mesh pair (gemini has none)
-    "claude-code": ((".claude", "settings.json"), _CC_FILES + _MESH_FILES),
-    "codex": ((".codex", "config.toml"), ("pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh") + _MESH_FILES),
+    "claude-code": ((".claude", "settings.json"), _CC_FILES + _MESH_FILES + ("session-digest.py",)),
+    "codex": ((".codex", "config.toml"), ("pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh") + _MESH_FILES + ("session-digest.py",)),
     "kimi": ((".kimi-code", "config.toml"), ("pre_tool_use.py", "witness.py", "observe.sh", "hydrate.sh") + _MESH_FILES),
     "gemini": ((".gemini", "settings.json"), ("before_tool.py", "witness.py", "observe.sh", "hydrate.sh")),
 }
@@ -2023,7 +2027,7 @@ def test_the_reconcile_adds_the_disposition_reader_to_a_host_that_lacks_it():
                 "/w/hestia/plugins/member-mesh/prompt-disposition-watch.sh") in r.stdout, r.stdout
         assert "REGISTERED claude-code: UserPromptSubmit/prompt-disposition-watch.sh" not in r.stdout, r.stdout
         assert _registered(r.stdout, "claude-code") == sorted(
-            [f"{ev}/disposition_deliver.py" for ev in _READER_EVENTS] + ["SessionStart/session-mesh-inbox.sh"]), r.stdout
+            [f"{ev}/disposition_deliver.py" for ev in _READER_EVENTS] + ["SessionStart/session-mesh-inbox.sh", "PostToolUse/session-digest.py"]), r.stdout
         assert "REWROTE" not in r.stdout and "REMOVED" not in r.stdout, \
             "the lines this host already carried were the template's; only the reader and the inbox are new: " + r.stdout
         data = json.loads(cfg.read_text())
@@ -2064,7 +2068,8 @@ def test_shipped_member_templates_register_the_mesh_pair_pinned():
             assert len(hs) == 1, (m, b, hs)
             ev, h = hs[0]
             assert ev == _MESH_EVENTS[b], (m, b, ev)
-            assert h["command"] == (f'HESTIA_MESH_PLUGIN={mid} HESTIA_ROLE="${{HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}}" '
+            opt = "HESTIA_MESH_DIGEST=1 " if m in ("codex", "claude-code") else ""
+            assert h["command"] == (f'HESTIA_MESH_PLUGIN={mid} {opt}HESTIA_ROLE="${{HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}}" '
                                     f"@HESTIA_PLUGIN_ROOT@/{m}/hooks/{b}"), (m, h["command"])
             assert h["timeout"] == (15 if b == "session-mesh-inbox.sh" else 5), (m, b, h)
         assert spec.get("mesh_member") == mid, (m, spec.get("mesh_member"))
@@ -2072,8 +2077,14 @@ def test_shipped_member_templates_register_the_mesh_pair_pinned():
         assert "companions" not in spec, (m, spec.get("companions"))
         runtime = [l.strip() for l in (REPO / "plugins" / "member-mesh" / "RUNTIME_MANIFEST.txt").read_text().splitlines()
                    if l.strip() and not l.lstrip().startswith("#")]
-        assert sorted(runtime) == sorted(_MESH_FILES + ("hestia-mesh.py",)), runtime
-        assert spec.get("requires") == [f"member-mesh/{b}" for b in _MESH_FILES + ("hestia-mesh.py",)], (m, spec.get("requires"))
+        assert sorted(runtime) == sorted(_MESH_FILES + ("hestia-mesh.py", "session-digest.py")), runtime
+        extra = ("session-digest.py",) if m in ("codex", "claude-code") else ()
+        assert spec.get("requires") == [f"member-mesh/{b}" for b in _MESH_FILES + ("hestia-mesh.py",) + extra], (m, spec.get("requires"))
+        if extra:
+            hs = [(ev, h) for ev, gs in doc["hooks"].items() for g in gs for h in g["hooks"]
+                  if h["command"].endswith('/session-digest.py')]
+            assert len(hs) == 1 and hs[0][0] == "PostToolUse", (m, hs)
+            assert hs[0][1]['timeout'] == 5 and f'HESTIA_MESH_PLUGIN={mid} ' in hs[0][1]['command'], (m, hs)
         for b in runtime:
             assert (REPO / "plugins" / "member-mesh" / b).is_file(), b
 

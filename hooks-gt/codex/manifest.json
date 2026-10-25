@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "a8157d20a130aefbf073872e25c9a3978406b5376472eabc05a2213208e84b72",
+      "sha256": "4a84107b6db8ab55142de6924365b7673126732520c492a3a163fe05857c3823",
       "source": "plugins/codex/hooks/hooks.json"
     },
     {
@@ -70,13 +70,18 @@
     {
       "unit": "member-mesh",
       "path": "prompt-disposition-watch.sh",
-      "sha256": "23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0"
+      "sha256": "2ee10c03d7201731a8507f5f96014b1527510231667a225b71755cda06493166"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "session-digest.py",
+      "sha256": "3585d5c3b4c92015c5a0a528e1928df6d6bdfe933709f13a88330055147a9259"
     },
     {
       "unit": "member-mesh",
       "path": "session-mesh-inbox.sh",
-      "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+      "sha256": "33fb4f84b8e1fa9b75b94bb9fc2217a83877e8fa968b9730ac54149133b86003"
     }
   ],
-  "gt_version": "997e6e007ea6a07783f3636258b20aa4d976209ec142c92467a13238a868d78a"
+  "gt_version": "996de5622020cd059076a49bb8d8d5d16bcd0140d7e40089c124f9a44517c2f8"
 }
