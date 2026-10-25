@@ -459,6 +459,11 @@ class AgentPolicy:
     #: 2026-10-19, "the governed see the law" — every member reads the governance snapshot).
     #: Consulted by evaluate() only for an act that is a read; never widens a write.
     read_scope: tuple = ()
+    #: Grants NARROWED to fewer than all four modes (hestia #1345 part B), as
+    #: ``((entry, modes), ...)`` with `entry` parsed like `scope` and `modes` a subset of
+    #: "rwed". Consulted by evaluate() only for an act whose mode it can name, and only when
+    #: every mode that act needs is in the grant's. A full-mode grant stays in `scope`.
+    mode_scope: tuple = ()
     #: Where this policy was resolved from, carried so a reader never has to guess which store
     #: won. A policy that cannot say where it came from is not auditable.
     source: str = "unresolved"
@@ -756,6 +761,40 @@ def _parse_scope_entries(entries) -> tuple:
     return tuple(s for s in out if s.strip("."))
 
 
+#: The four grant modes (hestia #1345), in their canonical order.
+GRANT_MODES = "rwed"
+
+
+def _parse_mode_scope(raw) -> tuple:
+    """`[{"entry": "path:/x/**", "modes": "r"}, ...]` -> `(("path:/x/**", "r"), ...)`.
+
+    Each entry is parsed exactly as an `in_scope` entry is (one entry, one parse), and its
+    modes are reduced to letters of "rwed" in canonical order. Anything malformed is dropped,
+    whole: bad data here reads as NO narrowed grant, never as a traceback and never as reach.
+    An entry whose modes are empty, or carry a letter outside "rwed", is dropped rather than
+    trimmed: a mode set nobody wrote must not be repaired into one that admits something.
+    A bare `*` is never honoured here: a narrowed grant names a place."""
+    if not isinstance(raw, list):
+        return ()
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        entry, modes = item.get("entry"), item.get("modes")
+        if not isinstance(entry, str) or not isinstance(modes, str) or not modes:
+            continue
+        if any(m not in GRANT_MODES for m in modes):
+            continue
+        try:
+            parsed = _parse_scope_entries([entry])
+        except Exception:
+            continue
+        if len(parsed) != 1 or parsed[0] == AgentPolicy.UNSCOPED:
+            continue
+        out.append((parsed[0], "".join(m for m in GRANT_MODES if m in modes)))
+    return tuple(out)
+
+
 #: A `path:` grant that ends in this reaches its whole subtree; a bare one reaches exactly
 #: its path (dp, 2026-09-08: "the exact path is useful, and is preferred as default.
 #: recursive should be an option"). Spelled in the entry so an older consumer fails closed.
@@ -925,6 +964,7 @@ def resolve_agent_policy(profile: HarnessProfile,
                         member_id=profile.member_id, scope=parsed, source="vault",
                         generation=gen, expires_at=exp,
                         read_scope=tuple(read_parsed or ()),
+                        mode_scope=_parse_mode_scope(got.get("in_scope_modes")),
                     )
 
     # 2. Local replica — fail-closed fallback, marked stale.
@@ -3040,6 +3080,107 @@ def _read_only_admits(event: NormalizedEvent, p: str, read_scopes: list, ws: str
             and path_in_scope(p, read_scopes, ws, profile, event.cwd))
 
 
+#: What the PATH of each tool's act needs, in grant modes (hestia #1345 part B). A narrowed
+#: grant admits an act only when every mode listed here is in the grant's modes; a tool NOT
+#: listed has no nameable mode and is admitted by full (rwed) grants alone, so an unknown or
+#: new tool fails narrow. Deliberately per tool, not per argument:
+#:   - every READ_ONLY_PATH_TOOLS reader needs r; so do a being's composed reads, whose `path`
+#:     is their read target (the governance closure reads them the same way, _COMPOSED_READ_TOOLS);
+#:   - Write / write_file create or replace and need w;
+#:   - Edit-family tools read the old text to replace it, and answer with it, so they need rw;
+#:   - write_note is a being's append, edit and retire alike (one gate tool for three verbs):
+#:     w, since an append must work on a write-only grant; its edit receipt quotes the being's
+#:     own old text back, never more of the file;
+#:   - a being's git_restore rewrites a file from history (w); git_clean deletes one (d);
+#:   - a being's run reads its script (to stage a copy) and executes it: re. Its event carries
+#:     the script path only; what the run can reach inside its sandbox is mounted from the
+#:     being's grants by their own modes on SAGE's side (SAGE #521), never by this table.
+#: Shell commands are NOT classified here: see _command_mode_need.
+PATH_TOOL_MODES = {
+    **{t: "r" for t in READ_ONLY_PATH_TOOLS},
+    "search": "r", "git_read": "r",
+    "Write": "w", "write_file": "w",
+    "Edit": "rw", "MultiEdit": "rw", "NotebookEdit": "rw", "replace": "rw",
+    "write_note": "w",
+    "git_restore": "w", "git_clean": "d",
+    "run": "re",
+}
+
+
+def act_path_modes(event: NormalizedEvent) -> str:
+    """The modes this act needs on each path it names, or "" when none can be named (then
+    only a full grant admits it)."""
+    return PATH_TOOL_MODES.get(event.tool, "")
+
+
+def _command_mode_need(command: str) -> str:
+    """The modes a shell command needs on every path it reaches: "r" for a command made only
+    of READ_ONLY_ROOT_VERBS (the same strict allowlist the read-only floor uses), "" for every
+    other command. Write, delete and execute positions inside a shell line are not attributed
+    per path yet, so a command that does more than read is admitted by full grants alone: a
+    narrowed grant never widens a command it cannot fully classify."""
+    return "r" if _read_only_root_command(command) else ""
+
+
+def _mode_entries(mode_scopes, need: str) -> list:
+    """The narrowed grants whose modes include every mode in `need` ([] for an empty need)."""
+    if not need:
+        return []
+    return [entry for entry, modes in mode_scopes if all(m in modes for m in need)]
+
+
+def _mode_admits(event: NormalizedEvent, p: str, mode_scopes, ws: str,
+                 profile: HarnessProfile) -> bool:
+    """Does a narrowed grant admit this path for this act's modes?"""
+    entries = _mode_entries(mode_scopes, act_path_modes(event))
+    return bool(entries) and path_in_scope(p, entries, ws, profile, event.cwd)
+
+
+def _mode_hint(p: str, need: str, mode_scopes, ws: str, profile: HarnessProfile,
+               cwd: Optional[str]) -> str:
+    """When a narrowed grant DOES reach the path but lacks a mode the act needs, say which:
+    "granted r, this act needs w" (the refusal #1345 asks for). Empty otherwise."""
+    held = "".join(sorted({m for entry, modes in mode_scopes
+                           if path_in_scope(p, [entry], ws, profile, cwd) for m in modes},
+                          key=GRANT_MODES.index))
+    if not held:
+        return ""
+    wants = need or GRANT_MODES
+    missing = "".join(m for m in wants if m not in held)
+    what = (f"needs {wants}" if need else
+            "has no mode the gate can name, so only a grant of all four modes (rwed) admits it")
+    return (f" Your grant here is narrowed to {held}; this act {what}"
+            + (f" (missing {missing})." if need else "."))
+
+
+def scope_roots_with_modes(policy: AgentPolicy, workspace: str) -> tuple:
+    """``((root, recursive, modes), ...)`` for every `path:` grant the policy holds: full
+    grants as "rwed", narrowed ones with their modes (#1345 part B). For a consumer that
+    confines an act itself after the gate (a dispatcher, a sandbox), so it honours the same
+    modes the gate does.
+
+    A NARROWED grant on a workspace-direct root arrives as a bare repo NAME
+    (`_scope_entry_for_grant` maps a recursive grant on `<ws>/<name>` that way), and it is
+    listed here as the recursive root `<ws>/<name>` with its modes. Leaving it out made the
+    gate admit it while every consumer of this list refused it: cbp-being's `governance/**`
+    is exactly that shape (nomad review of #1383, point 2). Every `mode_scope` entry comes
+    from the daemon's grant rows, so a name here is always a grant. A FULL repo-name entry in
+    `policy.scope` is still not listed: that list also carries declarative repo scope, and a
+    consumer resolves granted names itself (SAGE `_repo_name_roots`)."""
+    out = [(r, rec, GRANT_MODES) for r, rec in _scope_roots_with_reach(list(policy.scope), workspace)]
+    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+    for entry, modes in getattr(policy, "mode_scope", ()) or ():
+        if entry.startswith("path:"):
+            out += [(r, rec, modes) for r, rec in _scope_roots_with_reach([entry], workspace)]
+        elif entry and "/" not in entry and "\\" not in entry and entry not in (".", "..", "*"):
+            # Resolved like a `path:` root (realpath), so a repo that is a symlink on some
+            # machine confines to the same place the gate's path check resolves.
+            root = os.path.realpath(os.path.join(ws, entry)).replace("\\", "/").rstrip("/")
+            if root:
+                out.append((root, True, modes))
+    return tuple(out)
+
+
 def evaluate(event: NormalizedEvent, profile: HarnessProfile,
              workspace: Optional[str] = None,
              policy: Optional[AgentPolicy] = None) -> Verdict:
@@ -3059,6 +3200,7 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     pol = policy if policy is not None else resolve_agent_policy(profile)
     scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
     read_scopes = list(getattr(pol, "read_scope", ()) or ())
+    mode_scopes = list(getattr(pol, "mode_scope", ()) or ())
     forbidden = forbidden_tokens(profile)
 
     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
@@ -3128,7 +3270,8 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                 )
     for p in ([] if event.repos else event.paths):
         if (not path_in_scope(p, scopes, ws, profile, event.cwd)
-                and not _read_only_admits(event, p, read_scopes, ws, profile)):
+                and not _read_only_admits(event, p, read_scopes, ws, profile)
+                and not _mode_admits(event, p, mode_scopes, ws, profile)):
             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
             # on any long path truncates away the very component that tripped the gate — the
             # member is handed a string that does not contain its own reason. That is the
@@ -3137,13 +3280,18 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             # `deny_names_the_offending_target` once the test workspace moved off /tmp and
             # the paths got long enough to truncate.
             seg = _offending_segment(p, ws, event.cwd)
-            where = f"'{seg}' is not granted" if seg else "it is outside the workspace"
             # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
             absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
-            hint = _exact_grant_hint(absolute, scopes, ws)
+            mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
+            # A narrowed grant that REACHES the path is a grant: the refusal must not open by
+            # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
+            where = ("a grant reaches it, but not in the mode this act needs" if mode_hint
+                     else f"'{seg}' is not granted" if seg else "it is outside the workspace")
+            hint = _exact_grant_hint(absolute, scopes, ws) + mode_hint
+            lead = "beyond your grant's modes" if mode_hint else "outside your granted scope"
             return _deny(
                 "mrh.path",
-                f"'{event.tool}' targets '{_elide(p)}' outside your granted scope: {where} "
+                f"'{event.tool}' targets '{_elide(p)}' {lead}: {where} "
                 f"(granted: {'+'.join(scopes)}){hint}",
                 target=os.path.normpath(os.path.expanduser(absolute)).replace("\\", "/"),
             )
@@ -3153,9 +3301,16 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                                                      home_markers=profile.home_markers)
         # A command that only READS may also reach the read-only roots, by a strict verb
         # allowlist (READ_ONLY_ROOT_VERBS): anything outside it refuses rather than leaks.
-        if not ok and read_scopes and _read_only_root_command(event.command):
+        # And the narrowed grants that hold every mode the command needs (#1345 part B): for
+        # now that is r for the same strict read-only allowlist, and nothing for any other
+        # command. One retry over all of them, so a read crossing the floor and a narrowed
+        # grant is judged as one act.
+        cmd_need = _command_mode_need(event.command)
+        extra = ((read_scopes if cmd_need == "r" else [])
+                 + _mode_entries(mode_scopes, cmd_need))
+        if not ok and extra:
             ok, offending, refused = command_scope_reach(
-                event.command, scopes + read_scopes, ws, event.cwd,
+                event.command, scopes + extra, ws, event.cwd,
                 forbidden=forbidden, home_markers=profile.home_markers)
         if not ok:
             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
@@ -3164,7 +3319,9 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             # not rebuilt from the display token, which has the right repo and the wrong
             # depth (GPT review of #1003).
             unpriceable = bool(refused) and refused.startswith(UNPRICEABLE_PREFIX)
-            hint = _exact_grant_hint(refused, scopes, ws) if refused and not unpriceable else ""
+            hint = (_exact_grant_hint(refused, scopes, ws)
+                    + _mode_hint(refused, cmd_need, mode_scopes, ws, profile, event.cwd)
+                    if refused and not unpriceable else "")
             wsn = ws.replace("\\", "/").rstrip("/")
             outside = bool(refused) and not unpriceable and not (refused == wsn or
                                                                   refused.startswith(wsn + "/"))

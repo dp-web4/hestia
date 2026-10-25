@@ -63,7 +63,7 @@ This change makes a narrowed grant admit exactly its modes.
 - **Refusals name the missing mode.** When a narrowed grant reaches the path but lacks a mode, the deny says so: "Your grant here is narrowed to r; this act needs w (missing w)." That's the refusal #1345 asked for.
 - **`scope_roots_with_modes(policy, ws)`** returns `(root, recursive, modes)` for every path grant, full ones as rwed. A consumer that confines an act after the gate (SAGE's dispatcher and its run sandbox) can honour the same modes.
 
-## Tests: `held/build-1345b/grant_modes_gate_test.py`
+## Tests: `tools/grant_modes_gate_test.py` (moved from held/build-1345b/ when applied, 2026-10-25)
 
 It has 17 tests through the production composition: daemon answer, then `fetch_policy_snapshot`, then `resolve_agent_policy`, then `evaluate`.
 - **v2 core:** 17/17.
