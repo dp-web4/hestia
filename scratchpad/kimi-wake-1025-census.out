@@ -1,0 +1,109 @@
+i_owe rows: 59
+31799 scope scope-71521578bcb2 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+31842 scope scope-ae50b7282a74 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31846 scope scope-e4df87c10f9d from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31848 scope scope-92ba5f690503 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31850 scope scope-5b246d344859 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31852 scope scope-3a919b5b278b from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31854 scope scope-d83c4f086981 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31856 scope scope-0c63dbc54476 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31858 scope scope-dd851eae5800 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31902 scope scope-e035433944ae from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31950 esc a9e31fdbc9c5bf8f from=cbp-being -> {"escalation_id": "a9e31fdbc9c5bf8f", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+31963 scope scope-0374d8085961 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+31966 scope scope-4c9f344b4055 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+31977 scope scope-f28aaf28d4eb from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+31981 scope scope-b004f65a5356 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+31992 scope scope-a88b84b2f4ed from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32011 esc 67c28cbec57da307 from=cbp-being -> {"escalation_id": "67c28cbec57da307", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+32019 esc 564997afc0c09c4e from=cbp-being -> {"escalation_id": "564997afc0c09c4e", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+32055 esc 78a348717cb556bf from=claude-code -> {"escalation_id": "78a348717cb556bf", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+32066 scope scope-a86ecd4e494e from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32068 scope scope-7bb5174953e1 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32104 scope scope-4d6e5478c872 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32106 scope scope-806b838875dc from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32113 scope scope-fd5e41046175 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32136 scope scope-effcd2ffbe58 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32144 scope scope-c68ae54e1994 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32166 scope scope-bea962f74b2d from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32189 esc 381fd2da4b190cde from=cbp-being -> {"escalation_id": "381fd2da4b190cde", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+32203 esc 88340f22e1b3e251 from=claude-code -> {"escalation_id": "88340f22e1b3e251", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+32218 esc de1f77995d0c720a from=claude-code -> {"escalation_id": "de1f77995d0c720a", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+32253 scope scope-b71051a48f85 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32274 scope scope-42872994c391 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32281 scope scope-8b48c9fd94ca from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32308 scope scope-e731a2e7e703 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32310 scope scope-a3c149b22cf7 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32312 scope scope-ce5af12aec6b from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32323 esc 5ef4909c068bdb32 from=claude-code -> {"escalation_id": "5ef4909c068bdb32", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+32335 esc 27482a76ec19898e from=claude-code -> {"escalation_id": "27482a76ec19898e", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+32354 scope scope-1fecac87c877 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32358 scope scope-0a0f73593ada from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32373 scope scope-a1c561ebd976 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32383 scope scope-7a8956a12291 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32391 scope scope-bbdb7e1f49d8 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32399 scope scope-7e4843d3e567 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32406 scope scope-03252c062da7 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32423 scope scope-06c8c79a7b5c from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32425 scope scope-28f1094dd758 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32427 scope scope-8eabe0d329cb from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32482 scope scope-74ba6e17550e from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32504 scope scope-9b0c5967f716 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32530 scope scope-0fdd4ae77bee from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32550 scope scope-6f197c8d626e from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32557 scope scope-7ba9c1e68855 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32566 scope scope-6b2e6baf510a from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32579 scope scope-83a9d2b9280a from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32585 scope scope-d0d51dd66555 from=claude-code -> NOT-IN-MAP
+   0 requests visible
+32600 esc 0ecc09dbaf245f2a from=claude-code -> {"escalation_id": "0ecc09dbaf245f2a", "found": false, "note": "no escalation with that id is live on this daemon. An id that has been reaped is indistinguishable here from one that never existed \u2014 read the chain by id if you need to tell those apart"}
+32614 scope scope-3aa359101717 from=cbp-being -> NOT-IN-MAP
+   8 requests visible
+32626 scope scope-67121de07b8c from=cbp-being -> NOT-IN-MAP
+   8 requests visible
