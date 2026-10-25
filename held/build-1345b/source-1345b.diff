@@ -62,7 +62,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
                      )
  
      # 2. Local replica — fail-closed fallback, marked stale.
-@@ -3040,6 +3080,90 @@
+@@ -3040,6 +3080,107 @@
              and path_in_scope(p, read_scopes, ws, profile, event.cwd))
  
  
@@ -143,17 +143,34 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +    """``((root, recursive, modes), ...)`` for every `path:` grant the policy holds: full
 +    grants as "rwed", narrowed ones with their modes (#1345 part B). For a consumer that
 +    confines an act itself after the gate (a dispatcher, a sandbox), so it honours the same
-+    modes the gate does. Repo-name grants are not path roots and are not listed."""
++    modes the gate does.
++
++    A NARROWED grant on a workspace-direct root arrives as a bare repo NAME
++    (`_scope_entry_for_grant` maps a recursive grant on `<ws>/<name>` that way), and it is
++    listed here as the recursive root `<ws>/<name>` with its modes. Leaving it out made the
++    gate admit it while every consumer of this list refused it: cbp-being's `governance/**`
++    is exactly that shape (nomad review of #1383, point 2). Every `mode_scope` entry comes
++    from the daemon's grant rows, so a name here is always a grant. A FULL repo-name entry in
++    `policy.scope` is still not listed: that list also carries declarative repo scope, and a
++    consumer resolves granted names itself (SAGE `_repo_name_roots`)."""
 +    out = [(r, rec, GRANT_MODES) for r, rec in _scope_roots_with_reach(list(policy.scope), workspace)]
++    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
 +    for entry, modes in getattr(policy, "mode_scope", ()) or ():
-+        out += [(r, rec, modes) for r, rec in _scope_roots_with_reach([entry], workspace)]
++        if entry.startswith("path:"):
++            out += [(r, rec, modes) for r, rec in _scope_roots_with_reach([entry], workspace)]
++        elif entry and "/" not in entry and "\\" not in entry and entry not in (".", "..", "*"):
++            # Resolved like a `path:` root (realpath), so a repo that is a symlink on some
++            # machine confines to the same place the gate's path check resolves.
++            root = os.path.realpath(os.path.join(ws, entry)).replace("\\", "/").rstrip("/")
++            if root:
++                out.append((root, True, modes))
 +    return tuple(out)
 +
 +
  def evaluate(event: NormalizedEvent, profile: HarnessProfile,
               workspace: Optional[str] = None,
               policy: Optional[AgentPolicy] = None) -> Verdict:
-@@ -3059,6 +3183,7 @@
+@@ -3059,6 +3200,7 @@
      pol = policy if policy is not None else resolve_agent_policy(profile)
      scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
      read_scopes = list(getattr(pol, "read_scope", ()) or ())
@@ -161,7 +178,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
      forbidden = forbidden_tokens(profile)
  
      # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
-@@ -3128,7 +3253,8 @@
+@@ -3128,7 +3270,8 @@
                  )
      for p in ([] if event.repos else event.paths):
          if (not path_in_scope(p, scopes, ws, profile, event.cwd)
@@ -171,17 +188,29 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
              # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
              # on any long path truncates away the very component that tripped the gate — the
              # member is handed a string that does not contain its own reason. That is the
-@@ -3140,7 +3266,8 @@
-             where = f"'{seg}' is not granted" if seg else "it is outside the workspace"
+@@ -3137,13 +3280,18 @@
+             # `deny_names_the_offending_target` once the test workspace moved off /tmp and
+             # the paths got long enough to truncate.
+             seg = _offending_segment(p, ws, event.cwd)
+-            where = f"'{seg}' is not granted" if seg else "it is outside the workspace"
              # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
              absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
 -            hint = _exact_grant_hint(absolute, scopes, ws)
-+            hint = (_exact_grant_hint(absolute, scopes, ws)
-+                    + _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd))
++            mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
++            # A narrowed grant that REACHES the path is a grant: the refusal must not open by
++            # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
++            where = ("a grant reaches it, but not in the mode this act needs" if mode_hint
++                     else f"'{seg}' is not granted" if seg else "it is outside the workspace")
++            hint = _exact_grant_hint(absolute, scopes, ws) + mode_hint
++            lead = "beyond your grant's modes" if mode_hint else "outside your granted scope"
              return _deny(
                  "mrh.path",
-                 f"'{event.tool}' targets '{_elide(p)}' outside your granted scope: {where} "
-@@ -3153,9 +3280,16 @@
+-                f"'{event.tool}' targets '{_elide(p)}' outside your granted scope: {where} "
++                f"'{event.tool}' targets '{_elide(p)}' {lead}: {where} "
+                 f"(granted: {'+'.join(scopes)}){hint}",
+                 target=os.path.normpath(os.path.expanduser(absolute)).replace("\\", "/"),
+             )
+@@ -3153,9 +3301,16 @@
                                                       home_markers=profile.home_markers)
          # A command that only READS may also reach the read-only roots, by a strict verb
          # allowlist (READ_ONLY_ROOT_VERBS): anything outside it refuses rather than leaks.
@@ -200,7 +229,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
                  forbidden=forbidden, home_markers=profile.home_markers)
          if not ok:
              # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
-@@ -3164,7 +3298,9 @@
+@@ -3164,7 +3319,9 @@
              # not rebuilt from the display token, which has the right repo and the wrong
              # depth (GPT review of #1003).
              unpriceable = bool(refused) and refused.startswith(UNPRICEABLE_PREFIX)

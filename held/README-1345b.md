@@ -1,12 +1,17 @@
 # held: #1345 part B, grant modes at the gate
 
-**Patch:** `e333aa410c61e80e086d5cea038fce7cf80eb4ad6f16a0e62a21191bed58e27b.patch`, built on cbp/floor-modes 7299da97 (#1381 re-applied over main 97d3861e).
+**Patch:** `63edd85253afaf5265ffd2fba8b8a9dfb539464c922799992b3392d78b84d6fd.patch` (v2), built on main 62dcb09b (#1383 merged with the v1 held files only; nothing applied).
+
+**v2 versus v1 (`e333aa41`).** Two changes, both answering the review on #1383. Nothing else moved:
+1. **`scope_roots_with_modes` now lists a narrowed grant on a workspace-direct root** (nomad, point 2). A recursive grant on `<ws>/<name>` maps to the bare repo name `<name>` (`_scope_entry_for_grant`). v1 admitted it at the gate but left it out of this list, which SAGE's dispatcher and run mounts consume. So narrowing cbp-being's `governance/**` to `r` would have been admitted by the gate and refused by SAGE. It is now listed as the recursive root `<ws>/<name>` with its modes. Full repo-name scope is still not listed, because that list also carries declarative repo scope, which the consumer resolves itself.
+2. **The path-stage refusal no longer contradicts itself.** When a narrowed grant reaches the path but lacks a mode, v1 said "outside your granted scope: '<seg>' is not granted … Your grant here is narrowed to r". v2 says "beyond your grant's modes: a grant reaches it, but not in the mode this act needs … (missing w)".
 
 **Superseded:**
-- `daaca285….patch`, the same change built on f4e671a9. #1374 then changed the hooks-gt manifests on main, and the stack was re-applied. The gate sources are byte-identical; only the manifest digests differ.
+- `e333aa41….patch` (v1), as above.
+- `daaca285….patch`, the same change built on f4e671a9. #1374 then changed the hooks-gt manifests on main, and the stack was re-applied. The gate sources are byte-identical to v1; only the manifest digests differ.
 - `21aee711….patch`, the first cut. It mapped no mode to `run`.
 
-Both are kept because the safety preset refuses `git rm` of a held patch.
+All are kept because the safety preset refuses `git rm` of a held patch.
 
 It touches 9 files:
 - `plugins/_shared/hestia_gate_core.py`
@@ -60,13 +65,21 @@ This change makes a narrowed grant admit exactly its modes.
 
 ## Tests: `held/build-1345b/grant_modes_gate_test.py`
 
-It has 15 tests through the production composition: daemon answer, then `fetch_policy_snapshot`, then `resolve_agent_policy`, then `evaluate`.
-- **Patched core:** 15/15.
-- **Base core:** 12 fail and 3 pass.
+It has 17 tests through the production composition: daemon answer, then `fetch_policy_snapshot`, then `resolve_agent_policy`, then `evaluate`.
+- **v2 core:** 17/17.
+- **v1 core (`e333aa41`):** 16/17. The workspace-direct projection test fails, which is the defect v2 fixes.
+- **Base core:** 14 fail and 3 pass.
   - The 3 that pass are the invariants that must hold on both cores: a narrowed grant keeps the boundary of any grant, never admits a repo-named call, and full grants are unchanged.
   - Every admission test fails on the base. So every new row separates the two cores.
 
-What the 15 cover:
+Added in v2:
+- **A narrowed workspace-direct root, end to end** (nomad, point 2). `governance/**` at `r` becomes the entry `governance`. Read is admitted. Write is refused without the words "is not granted" and names `missing w`. `scope_roots_with_modes` lists `(<ws>/governance, True, "r")` and nothing else.
+- **An all-modes parent floor never widens an `r`-only child grant** (Nova, #1385).
+  - Served the way the daemon serves it, with the parent entry withheld by `floor_for`, the child read is admitted and a child write and a sibling write are refused.
+  - The second half pins why the withholding must outlive part B: if the entry were re-served, this gate's union would admit the child write. If that assertion ever starts refusing, the gate caps the floor itself (#1386), and only then may the daemon side be revisited.
+  - The daemon half is a Rust test in the #1385 change: `an_all_modes_parent_floor_stays_withheld_over_an_r_only_child_grant`.
+
+What the first 15 cover:
 - **Each mode set:**
   - `r` admits every reader and refuses every writer, including shell writes through redirects, `cp`, `sed -i`, `rm`, `tee`, interpreters, `sort -o` and `uniq IN OUT`;
   - `rw` refuses `git_clean` and names `d` as missing;
@@ -93,12 +106,22 @@ Existing suites on the patched copies match the base core exactly:
 - shell-scope battery 1434/0
 - decide contract 25 (+ shim parity 29x4)
 
+## A being's `run` while it holds an `r`-only grant (nomad, point 3)
+
+SAGE composes `run` into a sandbox line (`run_command`) that names every grant it mounts, `r`-only grants as `--ro-bind`. Whether that line is judged depends on the stage:
+- **Single gate (live since #934 / #1231).** `being_gate_client.gate()` hands `decide()` the being's raw arguments, with the script `path` rooted in its home. The composed line is recorded on the verdict as `command` but never judged. The act is the `run` tool on the script path, which needs `re` (`PATH_TOOL_MODES`). cbp-being's home grant is `rwe`, so it is admitted. An `r`-only grant mounted read-only is not part of the judged act, and never forces a full grant.
+- **Legacy local-law stage** (only if the single gate fails to import). `core.evaluate` judges the composed line at the command stage. `bwrap` is not a read-only verb, so `_command_mode_need` is `""` and only full grants admit the paths the line names. While an `r`-only grant is mounted, a run is refused there. That fallback fails closed, never open. The cost is that runs stop until the single gate is back, which is visible and reported.
+
+So point 3 is settled, and nothing in this change needed to move. A SAGE composition test for both stages belongs with SAGE #533, which is what feeds `r`-only grants into the mounts.
+
 ## Not in this change (follow-ups)
 
 - **Per-path modes inside a shell line.** Write, delete and execute positions are classified by the closure but not yet mapped per path to modes, so any non-read command needs a full grant.
 - **The gate-opened scope request should carry the mode the refused act needed**, so the decider sees "asks for w".
 - **The narrowed floor.** The daemon still withholds floor entries narrower than r (`floor_for`). With per-mode admission it could serve them by mode.
-- **SAGE's side.** `being_gate_client._granted_reach` should use `scope_roots_with_modes`, and the dispatcher's own confinement should require w for a write. Otherwise a narrowed grant the gate admits is refused at the dispatcher. That's SAGE #533 (draft, inert until this is applied).
+- **SAGE's side.** `being_gate_client._granted_reach` should use `scope_roots_with_modes`, and the dispatcher's own confinement should require w for a write. Otherwise a narrowed grant the gate admits is refused at the dispatcher. That's SAGE #533 (draft, inert until this is applied). With v2, a narrowed workspace-direct grant reaches #533 through `scope_roots_with_modes`, so #533's `_repo_name_roots` needs no change for it.
+- **Nearest explicit grant decides (#1386).** This change is still union semantics among a member's own grants: a narrowed grant nested under a full one is ignored. dp ruled on 2026-10-24 that the nearest explicit grant decides.
+- **Floor withholding wording (#1385).** The daemon change ships separately and needs no gate edit.
 
 ## Rebuild and measure
 
