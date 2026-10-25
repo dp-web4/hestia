@@ -1098,6 +1098,12 @@ PY
 }
 
 drain() { mesh_rpc hestia_member_inbox; }
+# #1389 A: PRINT-ONLY MUST NOT CONSUME. With no fire command there is no wake to hand a drained list to, and the
+# drained primer sits outside every seat's MRH; the member's live session reaches its mail only through its own hooks
+# (session-mesh-inbox.sh, prompt-disposition-watch.sh), which PEEK. Draining here emptied the inbox they read (Thor,
+# 2026-10-24: peek {"total": 0} while this journal showed the notices). So print-only peeks, and peek-new.py keeps
+# only notices not reported before (seen ids in $STATE, per member): each is journalled once and stays queued.
+peek_new() { mesh_rpc hestia_member_inbox '{"peek": true}' | python3 "$WATCH_DIR/peek-new.py" "$STATE/peeked-$PLUGIN.ids"; }
 unanswered() { mesh_rpc hestia_member_unanswered "{\"older_than_secs\": $STALE_AFTER}"; }
 # The journal wants the 6h floor; `primer_spent` asks for a floor of ZERO so the fold it
 # reads is the complete debt rather than the stale tail. Asked-for-and-zero, not absent:
@@ -1953,7 +1959,11 @@ while true; do
     retire_discharged_primers
     LAST_SWEEP=$NOW
   fi
-  OUT=$(drain || echo '{"total":0}')
+  if [ -n "$FIRE" ]; then
+    OUT=$(drain || echo '{"total":0}')
+  else
+    OUT=$(peek_new || echo '{"total":0}')  # #1389 A: print-only never consumes
+  fi
   N=$(echo "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
   if [ "$N" -gt 0 ]; then
     PRIMER=$(mktemp "$PRIMERS/notice-XXXXXX.json")
