@@ -54,3 +54,4 @@ tools/upgrade_path_test.py
 # so it fails against the tree until the governed apply. It moves to tools/ at the apply and this
 # line goes, as floor_read_only_test.py did for #1347.
 held/build-1345b/grant_modes_gate_test.py
+held/build-1386/grant_precedence_gate_test.py
