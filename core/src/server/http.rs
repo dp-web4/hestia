@@ -5957,10 +5957,13 @@ async fn scope_standing_promote(
     if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "promotion of a live grant") {
         return refusal;
     }
+    // A grant this button already promoted (#1400) is found too, so a second press answers
+    // "already standing" below instead of "no live grant".
     let Some(live) = s
         .scope_requests
         .values()
-        .find(|r| r.plugin_id == plugin_id && r.reach_path() == path && r.is_live(now))
+        .find(|r| r.plugin_id == plugin_id && r.reach_path() == path
+                  && (r.is_live(now) || (r.ext.promoted_at.is_some() && r.revoked.is_none())))
         .cloned()
     else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -5989,6 +5992,14 @@ async fn scope_standing_promote(
             "granted_at": existing.granted_at,
             "standing_generation": s.standing_scope.generation,
             "note": "this grant is already standing; nothing was appended to the chain",
+        })));
+    }
+    if live.ext.promoted_at.is_some() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "that live grant was already promoted, and the standing grant it became is \
+                      no longer in force as it was (revoked, expired or edited); nothing to \
+                      promote — grant it again through /api/scope/grant if it is wanted",
+            "promoted_from_request": live.id,
         })));
     }
     // A STANDING TWIN WITH OTHER MODES (#1345). `add` replaces by (member, path), so promoting
@@ -6075,6 +6086,8 @@ async fn scope_standing_promote(
         "standing_expires_at": expires_at,
         "standing_generation": s.standing_scope.generation,
         "intent": intent.hash,
+        // #1400: the live grant is retired as promoted, after this record, in the same act.
+        "live_superseded": live.id,
     })) {
         Ok(e) => e,
         Err(e) => {
@@ -6093,6 +6106,12 @@ async fn scope_standing_promote(
             };
         }
     };
+    // CONVERT, NOT COPY (#1400, legion-claude for dp): the standing row now carries this reach
+    // and names the live request as its provenance, so the live grant is retired as PROMOTED.
+    // Left in force, it was a live twin the standing grant's Edit refused until it lapsed.
+    if let Some(r) = s.scope_requests.get_mut(&live.id) {
+        r.ext.promoted_at = Some(now);
+    }
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true,
         "plugin_id": plugin_id,
@@ -6102,8 +6121,8 @@ async fn scope_standing_promote(
         "generation": s.standing_scope.generation,
         "witnessEntryHash": success.hash,
         "durability": "STANDING — written to the vault; survives restart; revocable via \
-                       /api/scope/standing/revoke. The live grant remains until it lapses, or \
-                       until POST /api/scope/revoke withdraws it.",
+                       /api/scope/standing/revoke. The live grant it came from is retired as \
+                       promoted: the standing grant carries its reach from here.",
     })))
 }
 
@@ -6404,14 +6423,22 @@ async fn scope_standing_edit(
             return refusal;
         }
     }
+    // A live twin PROMOTED INTO this standing row (same request id: "make standing" before
+    // #1400 left it in force) is the same grant, not a second one: it is retired as promoted
+    // with this edit, after the terminal record. Any other live twin still refuses.
+    let mut superseded: Option<String> = None;
     if let Some(twin) = s.scope_requests.values()
         .find(|r| r.plugin_id == plugin_id && r.reach_path() == path && r.is_live(now))
     {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "error": format!("a LIVE grant on this path ({}) would stay in force beside the edited \
-                              one; revoke it (or let it lapse) first. Nothing was written.", twin.id),
-            "live_twin": twin.id,
-        })));
+        if before.request_id.as_deref() == Some(twin.id.as_str()) {
+            superseded = Some(twin.id.clone());
+        } else {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": format!("a LIVE grant on this path ({}) would stay in force beside the edited \
+                                  one; revoke it (or let it lapse) first. Nothing was written.", twin.id),
+                "live_twin": twin.id,
+            })));
+        }
     }
     let row = |g: &crate::server::standing_scope::StandingGrant| serde_json::json!({
         "path": g.path, "recursive": g.recursive, "modes": g.modes,
@@ -6431,6 +6458,7 @@ async fn scope_standing_edit(
             "via": "operator_session",
             "identity": "the same standing row, rewritten in place: granted_at, granted_by, \
                          request_id and expires_at are the original grant's",
+            "live_superseded": superseded,
         });
         if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
             for (k, val) in e { o.insert(k.clone(), val.clone()); }
@@ -6488,6 +6516,11 @@ async fn scope_standing_edit(
             };
         }
     };
+    if let Some(id) = &superseded {
+        if let Some(r) = s.scope_requests.get_mut(id) {
+            r.ext.promoted_at = Some(now);
+        }
+    }
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true,
         "plugin_id": plugin_id,
@@ -6497,6 +6530,7 @@ async fn scope_standing_edit(
         "widens_on": {"modes": widens_modes, "reach": widens_reach},
         "generation": s.standing_scope.generation,
         "witnessEntryHash": success.hash,
+        "live_superseded": superseded,
     })))
 }
 
@@ -10890,13 +10924,19 @@ mod disposition_tests {
     async fn revoking_a_live_grant_names_a_standing_grant_that_still_covers_it() {
         let (_dir, state) = test_state().await;
         let now = crate::server::gate_escalation::now_secs();
+        // A standing grant decided on its own, and a separate live grant on the same path. (Built
+        // directly: since #1400 "make standing" retires the live grant it promotes, so a promote
+        // no longer leaves a live grant in force beside its standing copy.)
         {
             let mut s = state.lock().await;
             s.scope_requests.insert("scope-live-s".into(), live_req("scope-live-s", "/x/tree", now));
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/x/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "a separate standing grant".into(),
+                expires_at: None, request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
+            })).unwrap();
         }
-        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
-            "plugin_id": "kimi-code", "path": "/x/tree"}))).await.into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
         let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-live-s"})))
             .await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -12015,6 +12055,70 @@ mod disposition_tests {
             "recursive": false, "modes": "r", "expected_generation": gen})).await;
         assert_eq!(st, StatusCode::CONFLICT, "{out}");
         assert_eq!(out["live_twin"], "scope-twin");
+    }
+
+    /// #1400 (legion-claude for dp): "make standing" then Edit failed, because the promoted live
+    /// grant stayed in force as a live twin. Promotion now retires it as PROMOTED (not revoked:
+    /// nothing was taken from the member), and the edit goes through.
+    #[tokio::test]
+    async fn a_promoted_grant_can_be_edited_and_its_live_source_reads_promoted() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-9".into(), live_req("scope-live-9", "/z/tree", now));
+        }
+        let (st, out) = promote(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/z/tree"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        {
+            let s = state.lock().await;
+            let r = &s.scope_requests["scope-live-9"];
+            assert!(!r.is_live(now), "the live grant is no longer a grant in force beside its standing copy");
+            assert_eq!(r.status(now), "promoted");
+            assert!(r.revoked.is_none(), "promotion is not a revocation");
+            let ok = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_granted").unwrap();
+            assert_eq!(ok.event_data["live_superseded"], "scope-live-9");
+        }
+        // The promoted live grant is not a grant to revoke: the standing row carries the reach.
+        let resp = scope_live_revoke(State(state.clone()), None,
+            Json(serde_json::json!({"request_id": "scope-live-9"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "nothing live to revoke after a promotion");
+        // A second press still answers "already standing", not "no live grant".
+        let (st, out) = promote(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/z/tree"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["status"], "already_standing");
+        let gen = state.lock().await.standing_scope.generation;
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/z/tree",
+            "recursive": false, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::OK, "the converted grant edits as standing: {out}");
+    }
+
+    /// A grant promoted BEFORE #1400 left its live source in force. The edit treats that twin as
+    /// the same grant (its id is the standing row's request_id), retires it as promoted with the
+    /// edit, and says so.
+    #[tokio::test]
+    async fn an_edit_supersedes_the_live_grant_promoted_into_it() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-old".into(), live_req("scope-old", "/z/old", now));
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/z/old".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "promoted before #1400".into(),
+                expires_at: None, request_id: Some("scope-old".into()), recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
+            })).unwrap();
+        }
+        let gen = state.lock().await.standing_scope.generation;
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/z/old",
+            "recursive": false, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["live_superseded"], "scope-old");
+        let s = state.lock().await;
+        assert_eq!(s.scope_requests["scope-old"].status(now), "promoted");
+        let done = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_grant_edited").unwrap();
+        assert_eq!(done.event_data["live_superseded"], "scope-old");
     }
 
     /// The direct grant and the decide path accept modes; once refuses them.

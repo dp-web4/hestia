@@ -230,6 +230,14 @@ pub struct ScopeRequestExt {
     /// `recursive`; all four by default, which is what every live grant meant before.
     #[serde(default, skip_serializing_if = "crate::server::grant_modes::is_all")]
     pub modes: crate::server::grant_modes::Modes,
+    /// When the operator's "make standing" converted this live grant into a standing one
+    /// (#1400). From then on the standing row carries the reach, with this request's id as its
+    /// provenance, and this record is no longer a grant in force: not revoked (nothing was taken
+    /// from the member, so no revocation notice), but PROMOTED. Before this, the live grant
+    /// stayed in force beside its standing copy until it lapsed, and the standing grant's Edit
+    /// refused it as a live twin: "converted, then could not be edited".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at: Option<u64>,
 }
 
 impl ScopeRequestExt {
@@ -303,6 +311,7 @@ impl ScopeRequest {
         // window would pass). PRD_ALLOWLISTS §5.2: "no code path for session or permanent calls
         // the claim verb" — and, the converse, no one-time answer is served as policy.
         self.granted == Some(true) && now < self.expires_at && self.revoked.is_none() && !self.ext.once
+            && self.ext.promoted_at.is_none()
     }
 
     /// The path a live grant reaches from: the operator's chosen breadth, else the asked path.
@@ -344,6 +353,10 @@ impl ScopeRequest {
     pub fn status(&self, now: u64) -> &'static str {
         if self.revoked.is_some() {
             return "revoked";
+        }
+        if self.ext.promoted_at.is_some() {
+            // #1400: carried on by the standing grant that names this request as its provenance.
+            return "promoted";
         }
         if self.ext.once && (self.ext.spent_at.is_some() || self.ext.reservation_lapsed(now)) {
             return "spent";
