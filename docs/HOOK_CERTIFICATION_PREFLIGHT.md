@@ -94,7 +94,9 @@ live-verification responsibilities, not properties of this candidate digest.
 ## Remaining slices
 
 **3b — Authority-bearing per-member certification.** Add an operator-gated action
-that names the reviewed candidate digest and expected prior certification. Reuse
+following the proposed [commit and recovery contract](HOOK_CERTIFICATION_COMMIT_CONTRACT.md)
+(executable design model only; the runtime path is not implemented). The action
+names the reviewed candidate digest and expected prior certification. Reuse
 the witnessed operator identity boundary; neither filesystem presence nor a
 caller-supplied member string is authority. Revalidate the candidate, reject stale
 review/concurrent replacement, and commit the member's version, file digests,
