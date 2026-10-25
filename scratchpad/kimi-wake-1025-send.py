@@ -91,11 +91,11 @@ PLAN = [
   ";kimi-concurs:record-id-joined-to-root-builds-nonexistent-path,read-hestia://scope-pointer-with-memory_read;via=kimi-code"),
  (32281, "cbp-being", S+"scope-8b48c9fd94ca"+PD+";arrived-terminal:refused-peer-claude-code-041611Z"
   ";kimi-concurs:live-working-copy-out-of-grant(dp#561),searchable-snapshot-in-grant;via=kimi-code"),
- (32308, "claude-code", S+"scope-e731a2e7e703"+PD+";arrived-terminal:window-lapsed-by-063254Z(no-terminal-event;pull-only)"
+ (32308, "claude-code", S+"scope-e731a2e7e703"+PD+";arrived-terminal:window-lapsed-by-20261024T133254Z(no-terminal-event;pull-only)"
   ";kimi-concurs:systemctl/run-user-probe-of-operator-service-state-outside-member-mrh;via=kimi-code"),
- (32310, "claude-code", S+"scope-a3c149b22cf7"+PD+";arrived-terminal:window-lapsed-by-063254Z(no-terminal-event;pull-only)"
+ (32310, "claude-code", S+"scope-a3c149b22cf7"+PD+";arrived-terminal:window-lapsed-by-20261024T133254Z(no-terminal-event;pull-only)"
   ";kimi-concurs:same-act-as-e731a2e7e703(dual-petition-same-invocation);via=kimi-code"),
- (32312, "claude-code", S+"scope-ce5af12aec6b"+PD+";arrived-terminal:window-lapsed-by-063301Z(no-terminal-event;pull-only)"
+ (32312, "claude-code", S+"scope-ce5af12aec6b"+PD+";arrived-terminal:window-lapsed-by-20261024T133301Z(no-terminal-event;pull-only)"
   ";kimi-concurs:grep-of-sage-sources+~/.config/systemd-listing-outside-member-mrh;via=kimi-code"),
  (32323, "claude-code", E+"5ef4909c068bdb32"+CD+";arrived-terminal:operator-approved-071537Z,claimed-071549Z,landed-d8f0e7ef"
   ";kimi-concurs:sovereign-ruling;codex-dissent-was-evidence-binding(truncated-act,null-hash),not-defect;via=kimi-code"),
@@ -143,9 +143,13 @@ PLAN = [
   ";kimi-concurs:doubled-path-nonexistent(hestia/governance/...),bare-petition;via=kimi-code"),
  (32626, "cbp-being", S+"scope-67121de07b8c"+PD+";arrived-terminal:refused-peer-claude-code-084531Z"
   ";kimi-concurs:doubled-root(hestia/-prefixed-to-governance/),in-grant-README-named;via=kimi-code"),
+ (32113, "claude-code", S+"scope-fd5e41046175"+PD+";correction-to-kimi-review_done-qid-32760:lapse-time-is-20261024T065616Z-not-2356Z"
+  "(misread-8h-window-as-1h);verdict-unchanged(grep-of-/home/dp/.hestia-outside-mrh);via=kimi-code"),
 ]
 
-BATCHES = {0: slice(0, 25), 1: slice(25, 50), 2: slice(50, 58)}
+# the 32113 correction entry (last in PLAN) rides reply + a distinct op-id;
+# everything else is review_done with the batch op-id
+BATCHES = {0: slice(0, 25), 1: slice(25, 50), 2: slice(50, 58), 3: slice(30, 58), 4: slice(58, 59)}
 
 def main():
     batch = int(sys.argv[1])
@@ -155,10 +159,13 @@ def main():
     sent = 0
     for nid, to, ptr in items:
         assert len(ptr.encode()) <= 512 and "\n" not in ptr and "\r" not in ptr, (nid, len(ptr.encode()))
+        correction = ";correction-to-kimi-" in ptr
         out = hm.rpc(h, "hestia_member_notify", {
-            "session_id": s, "to_plugin_id": to, "kind": "review_done",
+            "session_id": s, "to_plugin_id": to,
+            "kind": "reply" if correction else "review_done",
             "pointer_uri": ptr, "in_reply_to": nid,
-            "operation_id": f"kimi-wake-1025-rd-{nid}"})
+            "operation_id": (f"kimi-wake-1025-fix-{nid}" if correction
+                             else f"kimi-wake-1025-rd-{nid}")})
         rec = {k: out.get(k) for k in
                ("queued_id", "binding_verified", "recipient_liveness",
                 "witnessEntryHash", "replayed", "unbound_notice")}
