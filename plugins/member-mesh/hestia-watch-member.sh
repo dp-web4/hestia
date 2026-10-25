@@ -2053,7 +2053,9 @@ json.dump(d,sys.stdout)
         fi
       fi
     else
-      python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  {n['kind']} from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"
+      # #1389 C: the journal line is the only trace a print-only seat can read, so it carries the notice id (and the
+      # id it answers) — without it a reply cannot be bound. `from <sender>:` stays adjacent for line readers.
+      python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  id={n.get('id','?')} {n['kind']}\"+(f\" re={n['in_reply_to']}\" if n.get('in_reply_to') else '')+f\" from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"
     fi
   elif [ -n "$FIRE" ]; then
     # No fresh mail this tick: spend it on ONE retained list, if any is due. The inbox
