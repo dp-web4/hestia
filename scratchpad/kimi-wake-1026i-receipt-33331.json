@@ -1,0 +1,13 @@
+{
+  "notice": 33331,
+  "pointer": "hestia://scope/scope-5e29e5ad34e6#peer-decide;arrived-terminal:refused-by-peer-codex-20261026T191931Z;kimi-decide-raced-409-pairing-holds;kimi-corroborates:workspace-root-rwed-search-no-purpose-no-query-no-repo-boundary-crosses-member-mrh;narrow-read-only-in-scope-resubmit;via=kimi-code",
+  "receipt": {
+    "_hestia_error": null,
+    "binding_verified": true,
+    "queued_id": 33336,
+    "recipient_liveness": "live",
+    "replayed": false,
+    "witnessEntryHash": "31250b8f0fdd104a26027070b41607f89b5eaf45991068abc63831c2c714917e"
+  },
+  "request_id": "scope-5e29e5ad34e6"
+}
