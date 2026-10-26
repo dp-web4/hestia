@@ -1,6 +1,6 @@
 # held: hestia #1386 (part C), the nearest explicit grant decides
 
-**Patch:** `0f34c83d6fe6b05da6309ea6744dd974e302fcd4ef9cadde1448d2c9c7bc45d4.patch`, cut by `build_1386.py` on main `95d6d0b7` (part B active since #1397; #1393 merged). Supersedes `86bdf413…` (cut before #1393 landed). It changes the gate core only (`plugins/_shared/hestia_gate_core.py`, its hooks-gt copy and the 5 manifests); the mechanism is untouched.
+**Patch (v2):** `74d6c840bb8452420554eb5ec798e503304fa3b68110cf66b524727e15b56cd4.patch`, cut by `build_1386.py` on main `95d6d0b7`. Supersedes `0f34c83d…` (v1), which judged only the path an act names: nomad's HOLD showed an act on a parent reaching a narrowed child (`Grep proj` reading a write-only child; `find proj -exec sed -i …` rewriting a read-only one). v2 adds the descendant check below.
 
 **Not applied.** It needs an operator-approved escalation for the governed write, after review of the design (#1386) and this code.
 
@@ -22,6 +22,10 @@ The deepest node covering a path decides it. An exact grant covers only its own 
 **Fast path.** Nothing is computed unless some narrowed grant lies at or beneath another grant node (`_precedence_matters`). Without that nesting, the nearest grant is the union, and every verdict is exactly part B's. The fleet has no such nesting today.
 
 **The floor.** All-modes floor entries ride `scopes` like the member's own full grants. That's safe because the daemon withholds any floor entry that overlaps a narrowed grant in either direction (`floor_for`, pinned by #1387). With part C the gate would also cap a re-served entry by itself. The two guards are independent, and removing either is its own reviewed change.
+
+## v2: an act on a parent cannot reach a narrower child
+
+An admitted act that can reach below the path it names must also satisfy every narrowed grant node strictly beneath that path (`_narrowed_beneath`); otherwise it is refused, naming the child. Only `SINGLE_TARGET_TOOLS` (Read, read_file, NotebookRead, Write, write_file, Edit, MultiEdit, NotebookEdit, replace, write_note, run) are exempt, because they act on exactly the path they name. Every other tool (Grep/Glob/search and the other directory readers, git_restore/git_clean, any unknown tool) and every shell line is checked: for a shell line, each reached path's narrowed descendants. This matches SAGE #533's run mounts under the nearest rule (a stricter child is bound after its parent; a child without `r` is masked).
 
 ## Shell commands
 

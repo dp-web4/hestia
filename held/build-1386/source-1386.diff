@@ -1,7 +1,7 @@
 diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
 --- a/plugins/_shared/hestia_gate_core.py
 +++ b/plugins/_shared/hestia_gate_core.py
-@@ -3205,6 +3205,134 @@
+@@ -3220,6 +3220,165 @@
      return tuple(out)
  
  
@@ -89,6 +89,37 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +    return None if best < 0 else "".join(m for m in GRANT_MODES if m in held)
 +
 +
++#: Tools whose act reaches exactly the one path they name, never beneath it (#1394 v2). Every
++#: other tool -- Grep/Glob/search and the other directory readers, git_restore/git_clean, any tool
++#: not listed here, and every shell line -- is treated as able to reach below a named directory.
++SINGLE_TARGET_TOOLS = frozenset({"Read", "read_file", "NotebookRead", "Write", "write_file", "Edit",
++                                 "MultiEdit", "NotebookEdit", "replace", "write_note", "run"})
++
++
++def _narrowed_beneath(path: str, narrowed, cwd: Optional[str]) -> list:
++    """``[(root, modes), ...]`` for every narrowed grant node strictly beneath `path`.
++
++    nomad's HOLD on #1394: part C judged the path an act NAMES, so with rwed on `proj/**` and a
++    narrowed `proj/sub/**`, `Grep proj` read a write-only child and `find proj -exec sed -i ...`
++    rewrote a read-only one -- the parent's grant admitted the named path, and the act reached the
++    child anyway. An act that can reach below what it names answers to these nodes too."""
++    lex, real = _candidate_spellings(path, cwd)
++    out = []
++    for root, _rec, modes, spelling in narrowed:
++        cand = real if spelling == "real" else lex
++        if root != cand and root.startswith(cand.rstrip("/") + "/"):
++            out.append((root, modes))
++    return out
++
++
++def _beneath_hint(child: str, modes: str, need: str) -> str:
++    missing = "".join(m for m in need if m not in modes)
++    return (f" This act can reach below the path it names, and {child} beneath it is narrowed to "
++            f"{modes}; the act needs {need} there (missing {missing}). A grant on the parent does not "
++            f"carry it into a narrower child: the nearest explicit grant decides (hestia #1386). Name "
++            f"paths that avoid the child, or act on the child within its own modes.")
++
++
 +def _precedence_hint(near: str, need: str) -> str:
 +    missing = "".join(m for m in need if m not in near)
 +    return (f" The nearest grant here is narrowed to {near}; this act needs {need} (missing "
@@ -136,7 +167,10 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
  def evaluate(event: NormalizedEvent, profile: HarnessProfile,
               workspace: Optional[str] = None,
               policy: Optional[AgentPolicy] = None) -> Verdict:
-@@ -3296,7 +3424,19 @@
+@@ -3313,10 +3472,28 @@
+                     f"scope (granted: {'+'.join(scopes)}); a repository is reached only by a qualified "
+                     f"grant '{need}' (a path grant, even recursive, does not reach a remote repository)",
+                 )
 +    full_nodes, narrowed_nodes = _grant_nodes(scopes, mode_scopes, ws)
 +    precedence = _precedence_matters(full_nodes, narrowed_nodes)
      for p in ([] if event.repos else event.paths):
@@ -155,11 +189,17 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +            need = act_path_modes(event) or GRANT_MODES
 +            if near is not None and not all(m in near for m in need):
 +                admitted, capped = False, _precedence_hint(near, need)
++            elif event.tool not in SINGLE_TARGET_TOOLS:
++                # #1394 v2: the act may reach below p; every narrowed node beneath it decides too.
++                for child, cmodes in _narrowed_beneath(p, narrowed_nodes, event.cwd):
++                    if not all(m in cmodes for m in need):
++                        admitted, capped = False, _beneath_hint(child, cmodes, need)
++                        break
 +        if not admitted:
              # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
              # on any long path truncates away the very component that tripped the gate — the
              # member is handed a string that does not contain its own reason. That is the
-@@ -3307,7 +3447,8 @@
+@@ -3327,7 +3504,8 @@
              seg = _offending_segment(p, ws, event.cwd)
              # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
              absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
@@ -169,7 +209,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
              # A narrowed grant that REACHES the path is a grant: the refusal must not open by
              # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
              where = ("a grant reaches it, but not in the mode this act needs" if mode_hint
-@@ -3337,6 +3478,29 @@
+@@ -3357,6 +3535,38 @@
              ok, offending, refused = command_scope_reach(
                  event.command, scopes + extra, ws, event.cwd,
                  forbidden=forbidden, home_markers=profile.home_markers)
@@ -196,6 +236,15 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +                        f"'{event.tool}' command reaches '{_elide(rp)}' beyond your grant's modes:"
 +                        f"{_precedence_hint(near, cneed)}",
 +                        target=rp)
++                # #1394 v2: a shell line can recurse below any path it names (grep -r, find, cp -r,
++                # chmod -R, a glob). Every narrowed node beneath a reached path decides too.
++                for child, cmodes in _narrowed_beneath(rp, narrowed_nodes, event.cwd):
++                    if not all(m in cmodes for m in cneed):
++                        return _deny(
++                            "mrh.command",
++                            f"'{event.tool}' command reaches '{_elide(rp)}', which holds a narrower "
++                            f"grant beneath it:{_beneath_hint(child, cmodes, cneed)}",
++                            target=child)
          if not ok:
              # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
              # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is

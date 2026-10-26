@@ -138,7 +138,54 @@ def test_nearest_grant_modes_is_the_gates_answer_for_consumers():
         check("none", core.nearest_grant_modes(pol, ws, ws + "/hestia/x") is None)
 
 
+def test_an_act_on_the_parent_cannot_reach_a_narrower_child():
+    """nomad's HOLD on #1394 (Nova corroborated): the act was judged by the path it NAMED, so an act
+    aimed at the parent reached the narrowed child. His table, both child shapes, with the direct
+    controls that already held."""
+    with g._Workspace() as ws:
+        proj = _world(ws)
+        secret = proj + "/sub/secret.md"
+        # a write-only drop under a full parent
+        prof, pol = _pol(ws, narrowed=[(proj + "/sub", "w", True)], full=[_full(proj)])
+        check("w_child_direct_read_refused", _blocks(prof, pol, ws, "Read", secret))
+        v = g._verdict(prof, pol, ws, "Grep", path=proj)
+        check("w_child_grep_on_parent_refused", v.blocks, str(v))
+        check("names_the_child", "sub" in v.reason and "#1386" in v.reason, v.reason)
+        check("w_child_recursive_grep_refused", _blocks(prof, pol, ws, "Bash", command=f"grep -r child {proj}"))
+        check("w_child_cat_refused", _blocks(prof, pol, ws, "Bash", command=f"cat {secret}"))
+        check("w_child_write_in_child_ok", not _blocks(prof, pol, ws, "Write", secret))
+        check("parent_file_read_still_ok", not _blocks(prof, pol, ws, "Read", proj + "/other/x.md"))
+        # a read-only child under a full parent
+        prof, pol = _pol(ws, narrowed=[(proj + "/sub", "r", True)], full=[_full(proj)])
+        check("r_child_direct_write_refused", _blocks(prof, pol, ws, "Write", secret))
+        v = g._verdict(prof, pol, ws, "Bash",
+                       command=f"find {proj} -name '*.md' -exec sed -i s/a/b/ {{}} +")
+        check("r_child_find_sed_on_parent_refused", v.blocks, str(v))
+        check("r_child_grep_on_parent_ok", not _blocks(prof, pol, ws, "Grep", proj),
+              "a reader over the parent may read an r child")
+        check("r_child_git_clean_parent_refused", _blocks(prof, pol, ws, "git_clean", proj))
+
+
+def test_a_reserved_floor_still_cannot_widen_a_child_through_its_parent():
+    """The floor rides `scopes` as full nodes, safe because the daemon withholds an overlapping floor
+    entry (#1387). If that withholding were reverted, the gate must still refuse an ancestor act
+    that reaches a narrowed child: the child is a node beneath any floor entry above it."""
+    with g._Workspace() as ws:
+        parent, child = ws + "/shared-context", ws + "/shared-context/forum"
+        fake = mt._std_stub(ws, generation=3)
+        fake.extra["hestia_scope_status"]["grants_by_mode"] = [g._grant(child, "w")]
+        fake.extra["hestia_scope_status"]["society_floor"] = [{"path": parent, "recursive": True}]
+        m._discover_endpoint = lambda: "http://fake/mcp"
+        m._McpHttp = lambda ep, dl: fake
+        snap = m.fetch_policy_snapshot("cbp-being", use_cache=False)
+        prof, pol = g._policy(snap)
+        check("reserved_floor_grep_parent_refused", _blocks(prof, pol, ws, "Grep", parent))
+        check("reserved_floor_direct_child_read_refused", _blocks(prof, pol, ws, "Read", child + "/n.md"))
+
+
 ALL = [
+    test_an_act_on_the_parent_cannot_reach_a_narrower_child,
+    test_a_reserved_floor_still_cannot_widen_a_child_through_its_parent,
     test_a_narrowed_child_caps_a_full_parent,
     test_a_read_only_umbrella_does_not_erase_a_full_child,
     test_the_nearest_decides_between_two_narrowed_grants_not_their_union,
