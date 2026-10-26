@@ -427,6 +427,80 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     ev = G.NormalizedEvent(tool="Bash", command=f"cat {sibling}/loot", cwd=ws)
     check("shell_path_prefix_sibling_is_not_a_descendant", G.evaluate(ev, narrow, ws).blocks)
 
+    # #1392: a REPOSITORY-NAMED event (an MCP connector call: `dp-web4/repo` -> repos=["repo"]). A live recursive
+    # workspace grant admitted every file of the repo and refused the repo by name (`mrh.repo`), and request_scope
+    # filed nothing (it honours containment). v1 and v2 let a recursive path grant stand in for the repository;
+    # both widened local authority into remote access, so v3 requires an operator-recorded qualified grant.
+    # v3 (Nova's HOLD on PR #1393): NOTHING local stands in for a remote repository. v2 read the checkout's own
+    # `origin`, which the member can write under the same recursive grant, so a checkout or origin created after
+    # the grant minted remote authority (the #1281 class). Only a QUALIFIED `repo:<owner>/<name>` grant reaches a
+    # repository; the bare literal name keeps its legacy owner-agnostic meaning. Every case is baseline vs
+    # candidate under UNCHANGED operator grants, driven through the REAL normalizer so the owner is not lost.
+    import hestia_single_gate as S
+
+    def checkout(base, name, origin=None):
+        d = os.path.join(base, name)
+        os.makedirs(os.path.join(d, ".git"), exist_ok=True)
+        cfg = '[core]\n\tbare = false\n' + (f'[remote "origin"]\n\turl = {origin}\n' if origin else "")
+        with open(os.path.join(d, ".git", "config"), "w") as fh:
+            fh.write(cfg)
+        return d
+
+    READ, WRITE = "mcp__github__fetch_pr", "mcp__github__create_pull_request"
+
+    def mcp(full, key="repo_full_name", cwd=None, tool=READ):
+        return S.normalized_event(S.GateEvent(tool=tool, tool_input={key: full}, cwd=cwd or ws))
+
+    nev = mcp("dp-web4/repo")
+    check("normalizer_keeps_the_full_remote_identity", nev.repos == ["repo"] and nev.repo_full == ["dp-web4/repo"],
+          f"{nev.repos} {nev.repo_full}")
+    # 1. a recursive PATH grant reaches no remote repository, even with a checkout whose origin IS that remote
+    checkout(ws, "repo", "git@github.com:dp-web4/repo.git")
+    for tool in (READ, WRITE):
+        v = G.evaluate(mcp("dp-web4/repo", tool=tool), root, ws)
+        check(f"recursive_path_grant_reaches_no_remote_repository[{tool}]",
+              v.blocks and v.rule == "mrh.repo" and "repo:dp-web4/repo" in v.reason, v.reason)
+    for grant in (["path:" + repo + "/**"], [root_entry], ["path:" + repo]):
+        v = G.evaluate(mcp("dp-web4/repo"), _profile(_workspace(), grant), ws)
+        check(f"path_grant_{grant[0][-3:]!r}_reaches_no_remote_repository", v.blocks, v.reason)
+    # 2. mint-after-grant: a checkout CREATED, or an origin EDITED, after the grant adds no remote authority
+    checkout(ws, "minted-1393", "https://github.com/any-owner/minted-1393.git")
+    v = G.evaluate(mcp("any-owner/minted-1393"), root, ws)
+    check("checkout_created_after_the_grant_mints_nothing", v.blocks, v.reason)
+    checkout(ws, "repo", "https://github.com/evil-owner/repo.git")
+    for tool in (READ, WRITE):
+        v = G.evaluate(mcp("evil-owner/repo", tool=tool), root, ws)
+        check(f"origin_edited_after_the_grant_mints_nothing[{tool}]", v.blocks, v.reason)
+    # 3. the QUALIFIED grant: reads and writes admitted; owner AND name compared, case-insensitively
+    qual = _profile(_workspace(), ["repo:dp-web4/repo"])
+    for tool in (READ, WRITE):
+        v = G.evaluate(mcp("dp-web4/repo", tool=tool), qual, ws)
+        check(f"qualified_repo_grant_admits[{tool}]", v.decision == "allow", v.reason)
+    v = G.evaluate(mcp("DP-Web4/Repo"), qual, ws)
+    check("qualified_repo_grant_is_case_insensitive", v.decision == "allow", v.reason)
+    v = G.evaluate(mcp("unrelated-owner/repo"), qual, ws)
+    check("qualified_grant_same_basename_DIFFERENT_OWNER_refused", v.blocks, v.reason)
+    v = G.evaluate(mcp("dp-web4/other-1393"), qual, ws)
+    check("qualified_grant_other_name_refused", v.blocks, v.reason)
+    v = G.evaluate(mcp("repo", key="repo"), qual, ws)
+    check("ownerless_call_not_matched_by_a_qualified_grant", v.blocks, v.reason)
+    v = G.evaluate(mcp("dp-web4/repo"), _profile(_workspace(), ["path:dp-web4/repo"]), ws)
+    check("a_path_entry_is_never_a_repository", v.blocks, v.reason)
+    # 4. refresh and revocation: the operator's grant list is the only input
+    v = G.evaluate(mcp("dp-web4/repo"), _profile(_workspace(), ["repo:dp-web4/repo"]), ws)
+    check("refreshed_qualified_grant_still_admits", v.decision == "allow", v.reason)
+    revoked = _profile(_workspace(), ["path:" + ws + "/**"])
+    v = G.evaluate(mcp("dp-web4/repo"), revoked, ws)
+    check("revoking_the_qualified_entry_removes_the_reach", v.blocks, v.reason)
+    # 5. the legacy literal name keeps its meaning (owner-agnostic: a compatibility exception, flagged separately)
+    v = G.evaluate(mcp("unrelated-owner/repo"), _profile(_workspace(), ["repo"]), ws)
+    check("literal_name_grant_keeps_its_legacy_meaning", v.decision == "allow", v.reason)
+    # 6. a non-plain identity never matches anything
+    for bad in ("dp-web4/..", "../repo", "a/b/c", "dp-web4/"):
+        for prof in (root, qual):
+            v = G.evaluate(mcp(bad), prof, ws)
+            check(f"non_plain_identity_refused_{bad!r}", v.blocks, v.reason)
+
 
 def test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly():
     """#953 (third instance: thor 2026-09-30, a venv interpreter under the recursive workspace grant).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 8a538a808f97a48a341fd7b22936baaced842ffa2c12e54567d4606a6230bfce  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 3e0b3aac2b2af5c67d60e88cb2d856aa87317bdb4f7971bafbfa423da9d3975a  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -267,11 +267,13 @@ REMEDIES: dict[str, Remedy] = {
     # member is not sent asking for "a path" it never named. Added Sprint D (§6.D): before
     # this, that call site authored its own sentence, naming the request_scope phantom.
     "mrh.repo": Remedy(
-        "Adjust to work within scope. If the repository is genuinely needed, ask for it with "
-        "hestia_request_scope (one repo, with a reason) — a human decides, the grant is "
-        "memory-only and expires. An appeal cannot deliver a repo — hestia_appeal disputes "
+        "Adjust to work within scope. If the repository is genuinely needed, the OPERATOR must "
+        "grant it as a qualified entry `repo:<owner>/<name>` (the deny names it); a path grant, "
+        "even recursive, never reaches a remote repository. A scope request cannot yet carry a "
+        "repository (the scope store holds paths; #1392 follow-up), so ask the operator rather "
+        "than filing one. An appeal cannot deliver a repo — hestia_appeal disputes "
         "whether the deny was right, which is a different question.",
-        ("hestia_request_scope", "hestia_appeal"),
+        ("hestia_appeal",),
     ),
     # ── egress ───────────────────────────────────────────────────────────────────────────
     #
@@ -511,6 +513,10 @@ class NormalizedEvent:
     #: (the 2026-07-26 false-deny class). Sprint F: this moved the last shim-side scope
     #: decision (codex's mcp_repo check) into the one law.
     repos: list = field(default_factory=list)
+    #: The FULL remote identity (`owner/name`) of each entry in `repos`, index-aligned ("" when the call carried
+    #: no owner). #1392: a name alone cannot be bound to a checkout -- `other-owner/hestia` and `dp-web4/hestia`
+    #: both reduce to `hestia` -- so the recursive-grant admission binds on this, never on the bare name.
+    repo_full: list = field(default_factory=list)
     command: Optional[str] = None               # shell command, if any
     cwd: Optional[str] = None
     raw: dict = field(default_factory=dict)     # kept for witnessing, never for deciding
@@ -867,6 +873,39 @@ def _within_path_grant(path: str, scopes, workspace: str) -> bool:
     candidate = os.path.realpath(os.path.normpath(path)).replace("\\", "/").rstrip("/")
     return any(candidate == root or (recursive and candidate.startswith(root + "/"))
                for root, recursive in _scope_roots_with_reach(scopes, workspace))
+
+
+_PLAIN_REPO_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _qualified_repo(s) -> Optional[tuple]:
+    """``(owner, name)`` lower-cased when ``s`` is exactly `owner/name` of plain segments (neither `.` nor `..`),
+    else None. A `path:` entry is never a repository."""
+    if not isinstance(s, str) or s.startswith("path:") or s.count("/") != 1:
+        return None
+    owner, name = s.split("/")
+    for seg in (owner, name):
+        if seg in (".", "..") or not _PLAIN_REPO_SEGMENT.match(seg):
+            return None
+    return (owner.lower(), name.lower())
+
+
+def _qualified_repo_granted(full: str, scopes) -> bool:
+    """#1392 v3: whether remote repository ``full`` (`owner/name`) is granted by a QUALIFIED repository entry.
+
+    The grant boundary spells a repository grant `repo:<owner>/<name>`; `_parse_scope_entries` strips the `repo:`
+    prefix, so the entry reaches here as `owner/name`. It is compared by owner AND name, case-insensitively,
+    against the call's own full identity.
+
+    Nothing local stands in for a remote repository. v1 joined the owner-stripped name onto the workspace (it
+    admitted `unrelated-owner/hestia`). v2 read the checkout's `origin` from `.git/config` when each call was
+    judged; that file is member-writable under the very recursive grant that triggered the binding, so a checkout
+    created or re-pointed after the grant minted remote authority (Nova's HOLD on PR #1393, the #1281 class).
+    Remote identity now comes only from an operator/peer-governed grant: a recursive `path:` grant reaches local
+    files, never a remote repository. The legacy bare-name grant keeps its owner-agnostic meaning at the call
+    site (a compatibility exception, flagged for its own review)."""
+    want = _qualified_repo(full)
+    return bool(want) and any(_qualified_repo(s) == want for s in scopes)
 
 
 def _exact_grant_hint(path: str, scopes, workspace: str) -> str:
@@ -3262,12 +3301,18 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     # `paths` are repo-relative and must not be re-scoped — egress above already saw
     # them); file paths use path-scope; shell commands use command-scope.
     if event.repos:
-        for rname in event.repos:
-            if rname not in scopes:
+        fulls = list(getattr(event, "repo_full", None) or [])
+        for i, rname in enumerate(event.repos):
+            full = fulls[i] if i < len(fulls) and isinstance(fulls[i], str) else ""
+            # #1392 v3: the legacy literal name keeps its (owner-agnostic) meaning; otherwise only a QUALIFIED
+            # `repo:<owner>/<name>` grant reaches a remote repository. No local state stands in for it.
+            if rname not in scopes and not _qualified_repo_granted(full, scopes):
+                need = f"repo:{full}" if _qualified_repo(full) else f"repo:<owner>/{rname}"
                 return _deny(
                     "mrh.repo",
-                    f"'{event.tool}' targets repository '{rname}' outside your granted "
-                    f"scope (granted: {'+'.join(scopes)})",
+                    f"'{event.tool}' targets repository '{full or rname}' outside your granted "
+                    f"scope (granted: {'+'.join(scopes)}); a repository is reached only by a qualified "
+                    f"grant '{need}' (a path grant, even recursive, does not reach a remote repository)",
                 )
     for p in ([] if event.repos else event.paths):
         if (not path_in_scope(p, scopes, ws, profile, event.cwd)

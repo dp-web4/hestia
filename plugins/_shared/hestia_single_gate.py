@@ -654,6 +654,19 @@ def _mcp_repo(tool: str, tool_input: Any) -> Optional[str]:
     return None
 
 
+def _mcp_repo_full(tool: str, tool_input: Any) -> str:
+    """The FULL `owner/name` of the repository an MCP call names, read from the same keys as `_mcp_repo`, or "" when
+    the value carries no owner (#1392). Kept beside the bare name: the recursive-grant admission binds on it."""
+    if not (isinstance(tool, str) and tool.startswith("mcp__")) or not isinstance(tool_input, dict):
+        return ""
+    for key in ("repository_full_name", "repo_full_name", "repository", "repo"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            v = value.strip().rstrip("/")
+            return v if v.count("/") == 1 else ""
+    return ""
+
+
 def normalized_event(event: GateEvent) -> core.NormalizedEvent:
     """The core's view of the act. An apply_patch body is CONTENT: its targets are scoped,
     the body is never scanned as a command (the 2026-07-23 review false-deny class)."""
@@ -665,6 +678,8 @@ def normalized_event(event: GateEvent) -> core.NormalizedEvent:
         tool=event.tool,
         paths=list(dict.fromkeys(paths)),
         repos=[repo] if repo else [],
+        # #1392: keep the FULL remote identity next to the bare name; the recursive-grant admission binds on it.
+        repo_full=[_mcp_repo_full(event.tool, ti)] if repo else [],
         command=None if patch or (isinstance(event.tool, str) and event.tool.lower() == "apply_patch")
         else _command_text(ti),
         cwd=event.cwd,
