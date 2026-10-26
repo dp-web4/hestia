@@ -73,7 +73,17 @@ def _policy(snap, member="cbp-being"):
     return prof, core.resolve_agent_policy(prof, vault_reader=lambda _m: snap)
 
 
-def _verdict(prof, pol, ws, tool, path=None, command=None, repos=None):
+def _materialize(path):
+    """Create `path` (and its directories) if it is missing: these rows test an EXISTING
+    off-limits path; existence first (hestia #1411) refuses a missing one as nonexistent."""
+    if path and not os.path.lexists(path):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        open(path, "a").close()
+
+
+def _verdict(prof, pol, ws, tool, path=None, command=None, repos=None, materialize=True):
+    if materialize:
+        _materialize(path)
     ev = core.NormalizedEvent(tool=tool, paths=[path] if path else [], command=command,
                               repos=repos or [])
     return core.evaluate(ev, prof, ws, policy=pol)
