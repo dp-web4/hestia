@@ -4459,10 +4459,16 @@
           ${live ? '' : `<button class="grant-act" data-edit-member="${
             escapeHtml(String(g.plugin_id))}" data-edit-path="${
             escapeHtml(String(g.path))}" title="change this grant's path, reach and r/w/e/d together; nothing changes until Save">edit</button>`}
+          ${live ? '' : `<button class="grant-act" data-dup-member="${
+            escapeHtml(String(g.plugin_id))}" data-dup-path="${
+            escapeHtml(String(g.path))}"
+            title="give another member the same grant (path, reach, modes, term); ${
+            escapeHtml(memberName(g.plugin_id ?? '?'))} keeps this one">duplicate</button>`}
           ${live ? '' : `<button class="grant-act" data-move-member="${
             escapeHtml(String(g.plugin_id))}" data-move-path="${
             escapeHtml(String(g.path))}" data-move-recursive="${g.recursive ? 'true' : 'false'}"
-            title="give this same grant to a different member, in one act — the repair for a mistyped id">reassign</button>`}
+            title="MOVE this grant to a different member: ${
+            escapeHtml(memberName(g.plugin_id ?? '?'))} LOSES it (the repair for a mistyped id). To keep it and give another member the same grant, use duplicate">move</button>`}
         </div>`;
     }).join('');
   }
@@ -6602,7 +6608,11 @@
           err.textContent = 'reassign: no other member has connected to this daemon yet.';
           err.hidden = false; return;
         }
-        const to = prompt(`Reassign this ${rec ? 'recursive' : 'exact'} grant from "${from}" to which member?\n\n${p2}\n\n`
+        // #1399: this MOVES the grant. Said in the prompt, not left to the button's name: an
+        // operator read "assign" as a copy and claude-code lost its toolchain grant.
+        const to = prompt(`MOVE this ${rec ? 'recursive' : 'exact'} grant from "${from}" to which member?\n\n${p2}\n\n`
+          + `"${from}" will LOSE this grant. To keep it and give another member the same grant, `
+          + `cancel and use "duplicate".\n\n`
           + `Members this daemon has actually seen:\n  ${seen.join('\n  ')}\n\n`
           + `Type the destination id exactly:`);
         if (to === null) return;
@@ -6627,6 +6637,61 @@
         } catch (e2) {
           err.textContent = `reassign failed: ${e2.message}`;
           err.hidden = false; mv.disabled = false;
+        }
+        return;
+      }
+
+      // DUPLICATE (#1399, legion-claude for dp): the same grant (path, reach, modes, term) for
+      // another member, the holder keeping theirs. "The operator gives a being the same toolchain
+      // reach its seat already has" is the common case, and "assign" moved it instead. One
+      // operator grant through the same door as the grant form (/api/scope/grant), bound with
+      // `expected_existing: null`, so a grant the destination already holds on that path is
+      // refused rather than silently replaced.
+      const dup = e.target.closest('[data-dup-member]');
+      if (dup) {
+        const from = dup.dataset.dupMember, p2 = dup.dataset.dupPath;
+        const g = (lastData?.scope_grants ?? []).find(x => x.lifetime === 'standing'
+          && x.plugin_id === from && x.path === p2);
+        if (!g) return;
+        const seen = [...knownMembers.keys()].filter(id => id !== from);
+        if (!seen.length) {
+          err.textContent = 'duplicate: no other member has connected to this daemon yet.';
+          err.hidden = false; return;
+        }
+        const modes = grantModeLetters(grantModeSet(g.modes));
+        const term = (g.secs_remaining === null || g.secs_remaining === undefined)
+          ? 'until revoked' : `${escFmtAge(g.secs_remaining)} left`;
+        const to = prompt(`DUPLICATE this grant for another member ("${from}" keeps it):\n\n`
+          + `${p2}${g.recursive ? '/**' : ''}  modes ${modes}  ${term}\n\n`
+          + `Members this daemon has actually seen:\n  ${seen.join('\n  ')}\n\n`
+          + `Type the member id exactly:`);
+        if (to === null) return;
+        const dest = to.trim();
+        if (!dest) return;
+        if (!knownMembers.has(dest)) {
+          err.textContent = `duplicate refused: "${dest}" is not a member this daemon has seen.`;
+          err.hidden = false; return;
+        }
+        const why = prompt(`Reason (required — this widens ${dest}'s reach):`,
+          `same grant as ${from}${g.reason ? ': ' + g.reason : ''}`);
+        if (why === null || !why.trim()) return;
+        dup.disabled = true; err.hidden = true;
+        try {
+          const body = { plugin_id: dest, path: p2, recursive: !!g.recursive, modes,
+                         reason: why, expected_existing: null };
+          if (g.secs_remaining !== null && g.secs_remaining !== undefined) {
+            body.expires_in_secs = Math.max(1, Math.floor(g.secs_remaining));
+          }
+          const r = await apiFetch('/api/scope/grant', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const o = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(o?.error || `HTTP ${r.status}`);
+          await tick(); renderScopeGrants(lastData);
+        } catch (e2) {
+          err.textContent = `duplicate failed: ${e2.message}`;
+          err.hidden = false; dup.disabled = false;
         }
         return;
       }
