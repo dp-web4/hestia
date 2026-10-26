@@ -1,0 +1,26 @@
+{
+  "33391": {
+    "pointer": "hestia://scope/scope-fe1638af32f6#peer-decide;arrived-terminal:refused-by-peer-codex-20261026T212314Z;kimi-decide-raced-409-pairing-holds;kimi-corroborates:hestia_scope_decision.json-and-governance-dir-nonexistent-rwed-for-read-no-purpose;resubmit-correct-path-read-only-with-task;via=kimi-code",
+    "receipt": {
+      "_hestia_error": null,
+      "binding_verified": true,
+      "queued_id": 33404,
+      "recipient_liveness": "dormant",
+      "replayed": false,
+      "witnessEntryHash": "c428c5f5568fe9623bcbe7d2230e6b2ffdb03520741bae9d00bb3f505598dc21"
+    },
+    "request_id": "scope-fe1638af32f6"
+  },
+  "33394": {
+    "pointer": "hestia://scope/scope-13a40fa75754#peer-decide;arrived-terminal:refused-by-peer-codex-20261026T212314Z;kimi-decide-raced-409-pairing-holds;kimi-corroborates:roster.json-and-governance-dir-nonexistent-rwed-for-read-no-purpose;resubmit-correct-path-read-only-with-task;via=kimi-code",
+    "receipt": {
+      "_hestia_error": null,
+      "binding_verified": true,
+      "queued_id": 33405,
+      "recipient_liveness": "dormant",
+      "replayed": false,
+      "witnessEntryHash": "6f87823f2b954ae6d62f621e4ef362b1f7538a6ef1ee9e62bcfcda07ba6e715b"
+    },
+    "request_id": "scope-13a40fa75754"
+  }
+}
