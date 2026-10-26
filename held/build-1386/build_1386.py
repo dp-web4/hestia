@@ -94,7 +94,9 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     patched = {}
     for path, name in SOURCES.items():
-        patched[path] = apply_offset_tolerant(path, change[path], blob(path).decode())
+        # Part C changes the core only: a source with no section passes through unchanged.
+        patched[path] = (apply_offset_tolerant(path, change[path], blob(path).decode())
+                         if path in change else blob(path).decode())
         (OUT / name).write_text(patched[path], encoding="utf-8")
 
     sys.path.insert(0, str(WT / "tools"))

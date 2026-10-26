@@ -1,10 +1,8 @@
 # held: hestia #1386 (part C), the nearest explicit grant decides
 
-**Status: source and tests only. No patch yet.** The patch can only be cut on a base where part B is applied, because part C's hunks are written against part B's code. Order:
-1. #1393 merges.
-2. Part B v3 is re-cut and activated (governed escalation).
-3. `python3 -I held/build-1386/build_1386.py <worktree at main> <out>` cuts part C's patch.
-4. Part C's governed escalation.
+**Patch:** `86bdf41309c1b6dddcca593e77de2b5a9aa568fcdf00429f74e69397d322cc26.patch`, cut by `build_1386.py` on main `047d91ef` (part B active since #1397), merged into this branch at `fad8b38f`. It changes the gate core only (`plugins/_shared/hestia_gate_core.py`, its hooks-gt copy and the 5 manifests); the mechanism is untouched.
+
+**Not applied.** It needs an operator-approved escalation for the governed write, after review of the design (#1386) and this code.
 
 ## The rule
 
