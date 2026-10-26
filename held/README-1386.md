@@ -1,6 +1,6 @@
 # held: hestia #1386 (part C), the nearest explicit grant decides
 
-**Patch:** `86bdf41309c1b6dddcca593e77de2b5a9aa568fcdf00429f74e69397d322cc26.patch`, cut by `build_1386.py` on main `047d91ef` (part B active since #1397), merged into this branch at `fad8b38f`. It changes the gate core only (`plugins/_shared/hestia_gate_core.py`, its hooks-gt copy and the 5 manifests); the mechanism is untouched.
+**Patch:** `0f34c83d6fe6b05da6309ea6744dd974e302fcd4ef9cadde1448d2c9c7bc45d4.patch`, cut by `build_1386.py` on main `95d6d0b7` (part B active since #1397; #1393 merged). Supersedes `86bdf413…` (cut before #1393 landed). It changes the gate core only (`plugins/_shared/hestia_gate_core.py`, its hooks-gt copy and the 5 manifests); the mechanism is untouched.
 
 **Not applied.** It needs an operator-approved escalation for the governed write, after review of the design (#1386) and this code.
 

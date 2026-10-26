@@ -136,10 +136,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
  def evaluate(event: NormalizedEvent, profile: HarnessProfile,
               workspace: Optional[str] = None,
               policy: Optional[AgentPolicy] = None) -> Verdict:
-@@ -3293,10 +3421,22 @@
-                     f"'{event.tool}' targets repository '{rname}' outside your granted "
-                     f"scope (granted: {'+'.join(scopes)})",
-                 )
+@@ -3296,7 +3424,19 @@
 +    full_nodes, narrowed_nodes = _grant_nodes(scopes, mode_scopes, ws)
 +    precedence = _precedence_matters(full_nodes, narrowed_nodes)
      for p in ([] if event.repos else event.paths):
