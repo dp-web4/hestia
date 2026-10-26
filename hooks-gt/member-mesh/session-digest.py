@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: a1e715d836194834e21db3d53da61b22d69c7a3850072073434c936aa5093114  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 62404f7a60158a3ecb23b1d9fce4cd1f3329799d113c2fc3a2b48751baeab96d  (published ground truth; manifest: hooks-gt)
 """Non-consuming session context from the member's queued Hestia notices (#1389 B)."""
 import fcntl
 from contextlib import contextmanager
@@ -217,7 +217,8 @@ def run(event, member, sid, agent, root):
     path = root / (key + '.json')
     with cursor_lock(root, key, event) as lock:
         if lock is None:
-            return ''
+            return ('HESTIA MESH UNKNOWN: cursor lock busy; inbox not read, not empty or approval. '
+                    'No cursor advanced; retry on the next eligible hook invocation.')
         try:
             state, warning = read_state(path)
         except (ValueError, OSError) as e:

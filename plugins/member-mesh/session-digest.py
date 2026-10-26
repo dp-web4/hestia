@@ -216,7 +216,8 @@ def run(event, member, sid, agent, root):
     path = root / (key + '.json')
     with cursor_lock(root, key, event) as lock:
         if lock is None:
-            return ''
+            return ('HESTIA MESH UNKNOWN: cursor lock busy; inbox not read, not empty or approval. '
+                    'No cursor advanced; retry on the next eligible hook invocation.')
         try:
             state, warning = read_state(path)
         except (ValueError, OSError) as e:

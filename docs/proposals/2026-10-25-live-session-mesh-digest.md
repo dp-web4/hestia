@@ -29,4 +29,6 @@ A classified timeout (child TimeoutExpired or CLI Undetermined/rc4) emits UNKNOW
 
 Cursor/lock pairs unused for seven days are pruned best-effort at SessionStart with a100ms sweep budget. A registry lock serializes per-session lock opens with cleanup unlinks; active per-session locks are skipped. This prevents simultaneous holders of separate lock inodes for the same cursor. Live cursor activity refreshes the lock timestamp even on a throttled call. Pruning is local presentation-state maintenance, not queue acknowledgment or deletion.
 
+Review1626 correction: a busy registry or session cursor lock emits UNKNOWN at every supported event rather than silence. It makes no query and changes no cursor; the next eligible hook can retry. This preserves the original nonblocking lock and timeout budgets.
+
 Revision validation is recorded with the commit/review handoff rather than assumed from the original implementation's12 digest and58 registration tests. The expanded digest suite exercises persistence failures, newest-first arrival priority, workflow advice, unchanged child/template budgets, real child timeout/recovery under the5s deadline, bounded early retry, busy locks and pruning under a held cursor. Live client registration and additionalContext delivery still require post-deployment verification; unit JSON checks alone do not prove the model received it.

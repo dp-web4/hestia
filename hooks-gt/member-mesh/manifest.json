@@ -17,7 +17,7 @@
     },
     {
       "path": "session-digest.py",
-      "sha256": "a1e715d836194834e21db3d53da61b22d69c7a3850072073434c936aa5093114",
+      "sha256": "62404f7a60158a3ecb23b1d9fce4cd1f3329799d113c2fc3a2b48751baeab96d",
       "source": "plugins/member-mesh/session-digest.py"
     },
     {
@@ -28,5 +28,5 @@
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "54ba70419eefd547cf7046ed37040cf0cf437237db87ca638ed5444b4939eb19"
+  "gt_version": "4234156f2789c2305b95d02ea7ae2cc9032e8bc32b975ccb09cf38d75aa5484e"
 }

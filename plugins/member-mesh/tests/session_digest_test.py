@@ -219,13 +219,22 @@ class DigestTests(unittest.TestCase):
         self.assertFalse(stale.with_suffix('.lock').exists())
         self.assertTrue(active.exists())
 
-    def test_busy_registry_and_cursor_never_query_or_emit(self):
+    def test_busy_registry_and_cursor_emit_unknown_without_query_or_state_change(self):
         self.call(rows=[notice()])
         root=self.root/'session-digest'
+        before = {p.name:p.read_bytes() for p in root.glob('*.json')}
         for p in [root/'.registry.lock', next(root.glob('*.json')).with_suffix('.lock')]:
             with p.open('a') as held:
                 d.fcntl.flock(held, d.fcntl.LOCK_EX|d.fcntl.LOCK_NB)
-                self.assertEqual(self.call(rows=[notice(2)]), ('',0))
+                for event in d.EVENTS:
+                    text, calls = self.call(event=event, rows=[notice(2)])
+                    self.assertEqual(calls, 0)
+                    self.assertIn('UNKNOWN', text)
+                    self.assertIn('lock busy', text)
+                    self.assertIn('not empty or approval', text)
+                    self.assertIn('next eligible hook', text)
+                self.assertEqual({p.name:p.read_bytes() for p in root.glob('*.json')}, before)
+        self.assertIn('"id": 2,', self.call(rows=[notice(2)])[0])
 
     def test_throttle_only_post_tool_and_handles_clock_rollback(self):
         self.call(rows=[notice()])
