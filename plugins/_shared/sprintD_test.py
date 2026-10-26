@@ -201,12 +201,19 @@ def main():
     check("core_has_mrh_repo_rule", "mrh.repo" in core.REMEDIES)
     if "mrh.repo" in core.REMEDIES:
         r = core.REMEDIES["mrh.repo"]
-        # #1392 v3 (Nova, PR #1393): the scope store holds paths, so request_scope cannot carry a repository;
-        # the truthful remedy names the operator's qualified `repo:<owner>/<name>` grant, and appeal stays.
+        # #1402: neither the operator nor member can create repository grants yet.
+        # The interim channel requires pre-existing operator authority; appeal stays.
         check("mrh_repo_declares_its_tools", set(r.tools) == {"hestia_appeal"})
         v = core._deny("mrh.repo", "probe")
         check("mrh_repo_deny_renders_remedy",
-              v.blocks and "OPERATOR must grant" in v.remedy and "repo:<owner>/<name>" in v.remedy)
+              v.blocks and "repo:<owner>/<name>" in v.remedy
+              and "cannot yet be recorded" in v.remedy
+              and "operator or requested by a member" in v.remedy)
+        check("mrh_repo_alternate_channel_requires_existing_authority",
+              "operator has already authorized" in v.remedy
+              and "logged-in shell CLI" in v.remedy
+              and "existing authority and gates" in v.remedy
+              and "does not authorize another channel or a retry" in v.remedy)
     # The authenticated path still grants nothing on absent data (the semantics the shims
     # now stand on — a regression here would silently widen both shims).
     pol = core.resolve_agent_policy(

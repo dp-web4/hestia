@@ -266,11 +266,14 @@ REMEDIES: dict[str, Remedy] = {
     # member is not sent asking for "a path" it never named. Added Sprint D (§6.D): before
     # this, that call site authored its own sentence, naming the request_scope phantom.
     "mrh.repo": Remedy(
-        "Adjust to work within scope. If the repository is genuinely needed, the OPERATOR must "
-        "grant it as a qualified entry `repo:<owner>/<name>` (the deny names it); a path grant, "
-        "even recursive, never reaches a remote repository. A scope request cannot yet carry a "
-        "repository (the scope store holds paths; #1392 follow-up), so ask the operator rather "
-        "than filing one. An appeal cannot deliver a repo — hestia_appeal disputes "
+        "Adjust to work within scope. Remote access requires a qualified entry "
+        "`repo:<owner>/<name>` (the deny names it); a path grant, even recursive, never "
+        "reaches a remote repository. Repository grants cannot yet be recorded by the "
+        "operator or requested by a member (#1402). If the operator has already authorized "
+        "the repository operation through the logged-in shell CLI (for example, gh), use "
+        "that channel within its existing authority and gates. This refusal does not "
+        "authorize another channel or a retry of a refused act. An appeal cannot deliver "
+        "a repo — hestia_appeal disputes "
         "whether the deny was right, which is a different question.",
         ("hestia_appeal",),
     ),
