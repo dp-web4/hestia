@@ -27,7 +27,8 @@ both, but no comment announced it, so the PR read as stalled at `f7f8aa9`:
    the raw spelling.
 2. **`id()` reuse:** the mark holds `(obj, repeated)` and the lookup checks `mark[0] is obj`.
 
-**Separation (run_decide.sh, main's tree with overlays):**
+**Separation** (`run_decide.sh <main worktree> <build out dir> [gate]`, i.e. main's tree with the
+build's neutral copies overlaid):
 - re-cut gate: **PASS, 27 decide() contract tests (+ shim-parity 29x4)**;
 - `f7f8aa9`'s gate: FAILS `p1-quoted-*` (4 rows), `json-agreeing-duplicate-*` (3) and
   `json-overwritten-objects-id-reuse-still-binds`, among others. Its other failures come from

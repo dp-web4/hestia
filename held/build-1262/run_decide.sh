@@ -1,10 +1,13 @@
 #!/bin/bash
-# The #1262 decide() contract against main's tree with the resolved gate and kimi shim overlaid.
-# argv1 (optional): gate copy to overlay (default: the resolved one)
-B=/tmp/claude-1000/-home-dp-ai-workspace/9261dc9a-1703-4964-9e72-a076bd468aca/scratchpad/b1262
-GATE="${1:-$B/sg_rev.py}"
-cd /home/dp/ai-workspace/hestia/scratchpad/s1262-base || exit 2
-export HESTIA_CONTRACT_REPO=/home/dp/ai-workspace/hestia/scratchpad/s1262-base
+# The #1262 decide() contract against a main worktree with build_1262.py's neutral copies overlaid.
+# argv: <main worktree> <build out dir> [gate copy to overlay instead of <out>/sg_rev.py]
+# Run the worktree from under the shared checkout, not /tmp (a /tmp fixture is implicitly granted).
+WT="$1"
+OUT="$2"
+GATE="${3:-$OUT/sg_rev.py}"
+[ -d "$WT" ] && [ -d "$OUT" ] || { echo "usage: $0 <main worktree> <build out dir> [gate]" >&2; exit 2; }
+cd "$WT" || exit 2
+export HESTIA_CONTRACT_REPO="$WT"
 export HESTIA_CONTRACT_OVERLAY="{\"hestia_single_gate\": \"$GATE\"}"
-export HESTIA_CONTRACT_SHIMS="{\"kimi\": \"$B/km_shim.py\"}"
-timeout 900 python3 "$B/decide_test.py" 2>&1 | tail -25
+export HESTIA_CONTRACT_SHIMS="{\"kimi\": \"$OUT/km_shim.py\"}"
+timeout 900 python3 "$OUT/decide_test.py" 2>&1 | tail -25
