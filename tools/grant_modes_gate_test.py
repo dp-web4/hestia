@@ -10,7 +10,7 @@ evaluate() admits a path for an act only when every mode the act needs is in the
 Driven through the production composition: a daemon answer -> fetch_policy_snapshot ->
 resolve_agent_policy -> evaluate. Nothing here hand-authors a scope entry.
 
-Held until the governed apply; then moves to tools/ like floor_read_only_test.py did.
+Applied 2026-10-25 under escalation 40ce2df6aba45389; moved here from held/build-1345b/
 
 Run: python3 tools/grant_modes_gate_test.py
 """

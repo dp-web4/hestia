@@ -14,7 +14,8 @@ import pathlib
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "build-1345b"))
+# Part B's harness, moved to tools/ when part B was activated (#1397).
+sys.path.insert(0, str(HERE.parents[1] / "tools"))
 import grant_modes_gate_test as g  # noqa: E402
 
 core, m, mt, check = g.core, g.m, g.mt, g.check
