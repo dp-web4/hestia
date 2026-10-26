@@ -9,3 +9,4 @@
 session-mesh-inbox.sh
 prompt-disposition-watch.sh
 hestia-mesh.py
+session-digest.py

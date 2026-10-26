@@ -159,6 +159,7 @@ def command_targets(registration, wanted):
         "HESTIA_HOME=@HESTIA_HOME@", "HESTIA_WORKSPACE=@HESTIA_WORKSPACE@",
         'HESTIA_ROLE="${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}"',
         "CODEX_PLUGIN_ROOT=@HESTIA_PLUGIN_SOURCE@",
+        "HESTIA_MESH_DIGEST=1",
     )
     # #1373: a member-mesh line pins its member's mesh id as a LITERAL (`HESTIA_MESH_PLUGIN=kimi-code`); only that
     # shape is accepted, never a substitution or a placeholder

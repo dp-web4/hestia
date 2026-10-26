@@ -23,6 +23,9 @@
 #      settings.json/config.toml rather than inheriting it from whatever launched the
 #      session; a watcher exports it, an interactive shell does not), HESTIA_MESH_HOST_AGENT.
 DIR="$(dirname "$0")"
+if [ "${HESTIA_MESH_DIGEST:-}" = 1 ]; then
+  exec python3 "$DIR/session-digest.py"
+fi
 # mktemp, not $$: the predictable name is pre-creatable as a symlink by anyone sharing
 # the box, and this script writes to it and then rm -f's it. Fail-open applies here too
 # — if mktemp is missing we take the predictable path rather than lose the inbox, since

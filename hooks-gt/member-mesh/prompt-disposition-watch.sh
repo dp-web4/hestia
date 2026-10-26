@@ -1,5 +1,8 @@
 #!/usr/bin/env sh
-# hestia-gt-sha256: 23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 2ee10c03d7201731a8507f5f96014b1527510231667a225b71755cda06493166  (published ground truth; manifest: hooks-gt)
+if [ "${HESTIA_MESH_DIGEST:-}" = 1 ]; then
+  exec python3 "$(dirname "$0")/session-digest.py"
+fi
 # UserPromptSubmit hook (any member): surface NEW disposition notices mid-session (#366).
 #
 # PROVENANCE. Built by kimi-code on 2026-08-27 for #366 and run from its own hooks dir for a

@@ -4,6 +4,7 @@
   "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the registration this template becomes (seconds; Claude Code's default for an entry without one is 60) and decides inside start + timeout - 1.5 s, so it always fails closed before Claude Code kills it (a hook timeout is a non-blocking error there: the tool runs, i.e. fail-open). 10 s absorbs one cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
   "_disposition_reader": "disposition_deliver.py (PRD_DISPOSITION_DELIVERY R4/R4a, #845, #849) renders the daemon's ruling on the asker's own hook stream, so an asker learns 'approved, re-issue the same act' without the operator relaying it in chat. PreToolUse and PostToolUse are the ports that reach a SUBAGENT (every tool call it makes fires them, carrying the parent's session_id plus its own agent_id, measured on Claude Code 2.1.290, 2026-10-06); UserPromptSubmit reaches only the interactive parent idle at its prompt. PreToolUse renders on the asker's very next call; PostToolUse catches a ruling that lands during a long call. It is a stat on one file and fails silent, so 3 s, the witness's budget. It carries HESTIA_HOME because the lane lives in the daemon's home, and no HESTIA_ROLE because it loads no seat projection. Before this entry the reader shipped in expects.json and no host registered it (CBP's deploy log: 'skip disposition_deliver.py - not registered on this host'), so every ruling still went by hand.",
   "_member_mesh": "#1373 (dp 2026-10-23: the mesh is 'a standard part of what hestia does, fleet-wide, and installation should be automatic'). The member-mesh pair, rendered like every other line here: SessionStart surfaces this member's pending mesh notices (session-mesh-inbox.sh), UserPromptSubmit surfaces a ruling that lands mid-session (prompt-disposition-watch.sh, #366). HESTIA_MESH_PLUGIN is PINNED on the line because #108 removed the CLI's default: an unpinned line is a DARK member (plugins/member-mesh/install.sh's refusal), and a pin rendered by the deployer can never be missing. The role is the same pass-through as the gate's. Both scripts and their CLI (hestia-mesh.py, an install.companions entry) are installed beside each other by install-members.sh, because both call $(dirname $0)/hestia-mesh.py. A host whose mesh lines were registered by hand elsewhere keeps them: a same-named line at another target is FOREIGN and never rewritten or duplicated.",
+  "_session_digest": "#1389 B: HESTIA_MESH_DIGEST=1 makes the existing SessionStart/UserPromptSubmit wrappers share a per-session, non-consuming all-kind digest with PostToolUse. This preserves ownership keys and avoids duplicate startup readers. Missing session id disables visibly; PostToolUse polls at most once per 30 seconds. Requires the member-mesh runtime session-digest.py installed beside hestia-mesh.py. No ack, drain, or idle wake.",
   "hooks": {
     "PreToolUse": [
       {
@@ -28,6 +29,16 @@
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HESTIA_MESH_PLUGIN=claude-code HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" python3 @HESTIA_PLUGIN_ROOT@/claude-code/hooks/session-digest.py",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "matcher": "*",
         "hooks": [
@@ -63,7 +74,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HESTIA_MESH_PLUGIN=claude-code HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" @HESTIA_PLUGIN_ROOT@/claude-code/hooks/prompt-disposition-watch.sh",
+            "command": "HESTIA_MESH_PLUGIN=claude-code HESTIA_MESH_DIGEST=1 HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" @HESTIA_PLUGIN_ROOT@/claude-code/hooks/prompt-disposition-watch.sh",
             "timeout": 5
           }
         ]
@@ -83,7 +94,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "HESTIA_MESH_PLUGIN=claude-code HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" @HESTIA_PLUGIN_ROOT@/claude-code/hooks/session-mesh-inbox.sh",
+            "command": "HESTIA_MESH_PLUGIN=claude-code HESTIA_MESH_DIGEST=1 HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\" @HESTIA_PLUGIN_ROOT@/claude-code/hooks/session-mesh-inbox.sh",
             "timeout": 15
           }
         ]

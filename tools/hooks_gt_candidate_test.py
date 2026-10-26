@@ -232,6 +232,18 @@ class CandidateTests(unittest.TestCase):
                     c.command_targets({"hooks": {"SessionStart": [{"command": command}]}}, wanted)
                 self.assertEqual(caught.exception.unresolved_targets, [command])
 
+    def test_digest_opt_in_is_literal_and_does_not_allow_shell_syntax(self):
+        target = "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"
+        self.set_registration({"hooks": {"Event": [{"command":
+            "HESTIA_MESH_DIGEST=1 " + target}]}})
+        self.assertEqual(self.get()["command_targets"], ["beta/hooks/worker.py"])
+        for value in ("0", "$(id)", "@DIGEST@", "1; echo injected"):
+            with self.subTest(value=value):
+                self.set_registration({"hooks": {"Event": [{"command":
+                    "HESTIA_MESH_DIGEST=" + value + " " + target}]}})
+                with self.assertRaises(c.CandidateError):
+                    self.get()
+
     def test_all_nested_command_targets_are_checked(self):
         self.set_registration({"hooks": {"Event": [{"hooks": [
             {"type": "command", "command": "@HESTIA_PLUGIN_ROOT@/beta/hooks/worker.py"},

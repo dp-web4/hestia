@@ -12,16 +12,21 @@
     },
     {
       "path": "prompt-disposition-watch.sh",
-      "sha256": "23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0",
+      "sha256": "2ee10c03d7201731a8507f5f96014b1527510231667a225b71755cda06493166",
       "source": "plugins/member-mesh/prompt-disposition-watch.sh"
     },
     {
+      "path": "session-digest.py",
+      "sha256": "62404f7a60158a3ecb23b1d9fce4cd1f3329799d113c2fc3a2b48751baeab96d",
+      "source": "plugins/member-mesh/session-digest.py"
+    },
+    {
       "path": "session-mesh-inbox.sh",
-      "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61",
+      "sha256": "33fb4f84b8e1fa9b75b94bb9fc2217a83877e8fa968b9730ac54149133b86003",
       "source": "plugins/member-mesh/session-mesh-inbox.sh"
     }
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "a79f31cbb721be14728c63f32c85d8d0b5142d58836396e5ed7af688d216a60e"
+  "gt_version": "4234156f2789c2305b95d02ea7ae2cc9032e8bc32b975ccb09cf38d75aa5484e"
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# hestia-gt-sha256: 022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 33fb4f84b8e1fa9b75b94bb9fc2217a83877e8fa968b9730ac54149133b86003  (published ground truth; manifest: hooks-gt)
 # SessionStart hook (any member): PEEK the member-mesh inbox, surface pending notices as
 # session context. Non-consuming — mail survives early-dying sessions; the member DRAINS
 # explicitly after acting.
@@ -24,6 +24,9 @@
 #      settings.json/config.toml rather than inheriting it from whatever launched the
 #      session; a watcher exports it, an interactive shell does not), HESTIA_MESH_HOST_AGENT.
 DIR="$(dirname "$0")"
+if [ "${HESTIA_MESH_DIGEST:-}" = 1 ]; then
+  exec python3 "$DIR/session-digest.py"
+fi
 # mktemp, not $$: the predictable name is pre-creatable as a symlink by anyone sharing
 # the box, and this script writes to it and then rm -f's it. Fail-open applies here too
 # — if mktemp is missing we take the predictable path rather than lose the inbox, since
