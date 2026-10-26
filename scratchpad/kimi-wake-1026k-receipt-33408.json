@@ -1,0 +1,14 @@
+{
+  "33408": {
+    "pointer": "hestia://scope/scope-0af0bce9a0f8#peer-decide;arrived-terminal:refused-by-peer-claude-code-20261026T213216Z;kimi-decide-raced-409-pairing-holds;kimi-corroborates:live-tree-outside-mrh-mirror-exists-in-grant-rwed-for-read-no-purpose;caveat:mirror-bytes-differ-newer-449-diff-lines;via=kimi-code",
+    "receipt": {
+      "_hestia_error": null,
+      "binding_verified": true,
+      "queued_id": 33417,
+      "recipient_liveness": "dormant",
+      "replayed": false,
+      "witnessEntryHash": "97cc0fde99961e84dfd63e05a437eba5274722d7bba4070d4550b3cb61f12462"
+    },
+    "request_id": "scope-0af0bce9a0f8"
+  }
+}
