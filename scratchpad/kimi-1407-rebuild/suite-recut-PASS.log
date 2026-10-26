@@ -1,0 +1,6 @@
+  cold-member decide (12 s caller budget): allow gate.allow in 4.62s
+  cold-member decide (2 s caller deadline): deny gate.degraded in 1.51s (record committed)
+  over-budget decide: deny society.unreachable in 7.01s (record committed)
+  5 s registration, cold member: deny gate.degraded in 2.63s
+  (real-daemon arm skipped: HESTIA_DECIDE_CONTRACT_ENDPOINT unset)
+PASS: 27 decide() contract tests (+ shim-parity 29x4)

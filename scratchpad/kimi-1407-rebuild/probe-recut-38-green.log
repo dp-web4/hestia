@@ -1,0 +1,43 @@
+gate under test: /home/dp/ai-workspace/hestia/scratchpad/kimi-1407-rebuild/sg_rev.py
+hook: /tmp/kimi-1407-probe-pvt2y88_/pre_tool_use.py
+row   verdict note
+P01   PASS    canonical 3s accepted; margin floor 0.5
+P02   PASS    canonical 10s accepted; margin 1.5
+P03   PASS    canonical 30s accepted; margin capped 1.5
+P04   PASS    2s rejected MISWIRED naming the envelope
+P05   PASS    31s rejected MISWIRED naming the envelope (never clamped)
+P06   PASS    timeout omitted -> MISWIRED (missing is not a default)
+P07   PASS    omitted + vendor default present in harness data -> still MISWIRED
+P08   PASS    TOML `timeout = 5e0` binds and normalizes to 5.0
+P09   PASS    TOML `timeout = +5` binds and normalizes to 5.0
+P10   PASS    JSON inline entry object binds structurally
+P11   PASS    the same timeout text in an unparseable file naming the hook -> MISWIRED
+P12   PASS    untimed exact target + timed sibling: MISWIRED, sibling's value never borrowed
+P13   PASS    malformed JSON naming the hook -> MISWIRED
+P14   PASS    a config naming the hook with no parser available -> MISWIRED
+P15   PASS    a no-parser config NOT naming the hook drops (no MISWIRED, no binding)
+P16   PASS    a duplicate key in this hook's own entry, AGREEING -> MISWIRED naming the key
+P17   PASS    two files each binding this hook exactly, same timeout -> MISWIRED duplicate/conflicting
+P18   PASS    HESTIA_HOOK_TIMEOUT_S=5 joins the min against a 15s registration
+P19   PASS    HESTIA_HOOK_TIMEOUT_S=25 never lengthens a 15s registration
+P20   PASS    HESTIA_HOOK_TIMEOUT_S=abc is MISWIRED evidence, not a deadline
+P21   PASS    HESTIA_HOOK_TIMEOUT_S alone (no registration) binds the declared value
+P22   PASS    HESTIA_HOOK_TIMEOUT_S=-3 is evidence, never a deadline
+P23   PASS    no registration anywhere -> plain no-registration reason, NOT MISWIRED
+P24   PASS    a broken config NOT naming the hook is ignored outright
+R01   PASS    exact absolute binding -> bound (P1 control)
+R02   PASS    relative `./base` spelling beside a longer exact binding -> MISWIRED, not dropped
+R03   PASS    a FOREIGN absolute path bearing the basename -> MISWIRED (names, does not bind)
+R04   PASS    glued `;` spelling MISWIRES (it really runs the hook under sh)
+R05   PASS    glued `&&` spelling MISWIRES
+R06   PASS    glued pipe spelling MISWIRES
+R07   PASS    subshell-glued spelling MISWIRES
+R08   PASS    `base.bak` DROPS — a longer name containing the basename is a different file
+R09   PASS    `xbase` / `base5` DROP — prefix/suffix glued alphanumerics are different files
+R10   PASS    quote-split spelling `./pre_tool_'use'.py` MISWIRES (shell removes the quotes)
+R11   PASS    backslash-escaped spelling MISWIRES (shell removes the backslash)
+R12   PASS    a duplicate key in ANOTHER hook's entry leaves this hook's clean binding alone
+R13   PASS    an ENCLOSING agreeing duplicate (whole group repeated identically) -> MISWIRED
+R14   PASS    overwritten duplicate objects' recycled ids hang nothing on a clean registration (B1)
+
+38 rows (24 protocol + 14 P1/P2), 38 green, 0 red
