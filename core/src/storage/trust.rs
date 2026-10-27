@@ -988,7 +988,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let baseline = dir.path().join(BASELINE_DIR);
         let permissions = std::fs::metadata(&baseline).unwrap().permissions();
-        std::fs::set_permissions(&baseline, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&baseline, std::fs::Permissions::from_mode(0o0)).unwrap();
         let directory_error = std::fs::read_dir(&baseline).err().map(|e| e.kind());
         let reopened = TrustStore::open(dir.path(), KEY).unwrap();
         let recovery = reopened.recover(11);
