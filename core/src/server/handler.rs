@@ -25186,7 +25186,7 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
         return Err(anyhow::anyhow!("reason is too thin — the asker reads it"));
     }
     let session_id_arg = optional_session_id(args);
-    let (arbiter, asker, basis) = {
+    let (arbiter, asker, basis, req_subtree) = {
         let s = state.lock().await;
         let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
             return Err(anyhow::anyhow!(
@@ -25246,17 +25246,20 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
             "origin": if req.ext.gate.is_some() { "gate_deny" } else { "member_request" },
             "eligibility": "arbiter::eligibility_for (NOT-SAME)",
         });
-        (arb.plugin_id, req.plugin_id.clone(), basis)
+        let req_subtree = req.ext.gate.as_ref().is_some_and(|g| g.subtree);
+        (arb.plugin_id, req.plugin_id.clone(), basis, req_subtree)
     };
     let mut body = json!({ "request_id": request_id, "reason": reason });
     match decision.as_str() {
         "refuse" => {
             body["granted"] = json!(false);
             // A peer may make a refusal STANDING (hestia#1417): it widens nothing. Lifting
-            // one stays the operator's.
+            // one stays the operator's. Its REACH is the request's, never the peer's (Nova on
+            // #1418): a peer refuses the ask presented, exact unless the gate-opened act was
+            // itself a subtree glob, and cannot invent a broader durable prohibition.
             if args.get("standing").and_then(Value::as_bool).unwrap_or(false) {
                 body["standing"] = json!(true);
-                body["recursive"] = json!(args.get("recursive").and_then(Value::as_bool).unwrap_or(false));
+                body["recursive"] = json!(req_subtree);
             }
         }
         "once" => { body["granted"] = json!(true); body["once"] = json!(true); }

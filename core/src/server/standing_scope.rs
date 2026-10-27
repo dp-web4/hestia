@@ -186,8 +186,12 @@ pub struct StandingScopeStore {
     pub refusals: Vec<StandingRefusal>,
 }
 
-/// One standing refusal: this member may not reach this path, durably, until the operator
-/// lifts it (hestia#1417). Never widens anything, so a NOT-SAME peer may record one.
+/// One standing refusal (hestia#1417): the member's ASK for this path is refused, durably, until
+/// the operator lifts it. It refuses the ask, not the reach (nomad on #1418): the gate's claim
+/// and `request_scope` answer from it and open nothing, while a grant that covers the path
+/// answers before it, and a STANDING grant that covers it lifts it explicitly (`add`). A refusal
+/// as a node in the nearest-grant walk (#1386) is the follow-up. Never widens anything, so a
+/// NOT-SAME peer may record one, with the reach of the request it was asked to rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandingRefusal {
     pub member: String,
@@ -706,7 +710,20 @@ impl StandingScopeStore {
     /// Add (or replace, keyed by `(member, path)`) a grant. Replacement rather than
     /// duplication, because two records for one path would make "revoked" ambiguous —
     /// and the superseded grant's history lives in the witness chain, not here.
+    /// The standing refusals of `member` that `grant` covers: the ones a standing grant lifts
+    /// (nomad on #1418: the record must not say "closed" while the door is open).
+    pub fn refusals_covered_by(&self, grant: &StandingGrant) -> Vec<StandingRefusal> {
+        self.refusals.iter()
+            .filter(|r| r.member == grant.member && grant.covers(&r.path))
+            .cloned()
+            .collect()
+    }
+
     pub fn add(&mut self, grant: StandingGrant) {
+        // A standing grant that covers a standing refusal LIFTS it in the same act, so the store
+        // never says closed where a grant has opened the door. `commit_standing_scope` witnesses
+        // each lifted row (`scope_refusal_lifted`, by: grant) after the commit lands.
+        self.refusals.retain(|r| !(r.member == grant.member && grant.covers(&r.path)));
         self.grants
             .retain(|g| !(g.member == grant.member && g.path == grant.path));
         self.grants.push(grant);

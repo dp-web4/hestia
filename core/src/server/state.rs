@@ -1457,11 +1457,38 @@ impl ServerState {
         let mut candidate = self.standing_scope.clone();
         mutate(&mut candidate);
         crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &candidate)?;
+        // Standing refusals the mutation removed by GRANTING over them (`StandingScopeStore::add`),
+        // witnessed after the commit so the record never says closed where the door is open
+        // (nomad on #1418). A refusal removed by the explicit lift route is witnessed by that
+        // route's own two-phase rows, not here.
+        let lifted: Vec<crate::server::standing_scope::StandingRefusal> = self.standing_scope.refusals.iter()
+            .filter(|old| !candidate.refusals.iter().any(|n| n.member == old.member && n.path == old.path))
+            .filter(|old| candidate.grants.iter().any(|g| g.member == old.member && g.covers(&old.path)))
+            .cloned()
+            .collect();
         *self.standing_scope = candidate;
         // The vault now holds exactly what memory holds, so any earlier revoke-persist
         // failure has been overtaken: the synced state is the tighter one plus this
         // committed mutation.
         self.standing_scope_dirty = false;
+        for r in lifted {
+            let by = self.standing_scope.grants.iter()
+                .find(|g| g.member == r.member && g.covers(&r.path))
+                .map(|g| format!("grant {}", g.request_id.clone().unwrap_or_else(|| g.path.clone())))
+                .unwrap_or_else(|| "grant".into());
+            self.append_chain("scope_refusal_lifted", serde_json::json!({
+                "plugin_id": r.member,
+                "subject_instance_lct": self.member_lct(&r.member),
+                "path": r.path,
+                "recursive": r.recursive,
+                "lifted_by": by,
+                "via": "covering_standing_grant",
+                "refused_by": r.refused_by,
+                "refused_at": r.refused_at,
+                "reason": r.reason,
+                "standing_generation": self.standing_scope.generation,
+            }))?;
+        }
         Ok(())
     }
 
