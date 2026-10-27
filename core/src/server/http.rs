@@ -5866,7 +5866,11 @@ async fn scope_refusal_lift(
         return (StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "no standing refusal of record for that (plugin_id, path)"})));
     };
-    let entry = match s.append_chain("scope_refusal_lifted", serde_json::json!({
+    // TWO-PHASE (Nova on #1418): the first row is an INTENT, not a success. A `lifted` row
+    // written before the vault commit would, on a failed commit, leave the chain asserting a
+    // lift that never happened while the refusal still stood. The success row is appended only
+    // after the commit landed, carrying the intent's hash.
+    let record = serde_json::json!({
         "plugin_id": plugin_id,
         "subject_instance_lct": s.member_lct(&plugin_id),
         "path": path,
@@ -5877,7 +5881,8 @@ async fn scope_refusal_lift(
         "refused_by": row.refused_by,
         "refused_at": row.refused_at,
         "standing_generation": s.standing_scope.generation + 1,
-    })) {
+    });
+    let intent = match s.append_chain("scope_refusal_lift_intent", record.clone()) {
         Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
                           Json(serde_json::json!({"error": format!("witness append failed, nothing lifted: {e}")}))),
@@ -5888,8 +5893,23 @@ async fn scope_refusal_lift(
     }) {
         return (StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("vault write failed, the refusal still stands: {e}"),
-                                        "witnessEntryHash": entry.hash})));
+                                        "state": "the chain holds the INTENT and no scope_refusal_lifted",
+                                        "intentEntryHash": intent.hash})));
     }
+    let mut success = record;
+    success["intent"] = serde_json::json!(intent.hash);
+    let entry = match s.append_chain("scope_refusal_lifted", success) {
+        Ok(e) => e,
+        Err(e) => {
+            // The lift is live but its success is unrecorded: restore the refusal so the record
+            // and the store agree (the intent row says what was attempted).
+            let _ = s.commit_standing_scope(|st| { st.refusals.push(row.clone()); st.generation += 1; });
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("lift committed but its success could not be \
+                                                               witnessed ({e}); the refusal was restored"),
+                                            "intentEntryHash": intent.hash})));
+        }
+    };
     // Lifting means "asking again is welcome now": the window-bound refusal on the request this
     // stood on (and any other refused ask for the path) would otherwise still answer `refused`
     // until its 8 h window ran out, and the lift would look like it did nothing.
@@ -12909,6 +12929,134 @@ mod disposition_tests {
         assert_eq!(pr["decided_by"], "peer:kimi-code", "{pr}");
         let s = state.lock().await;
         assert_eq!(s.standing_scope.refusal_for("codex", &p2).unwrap().refused_by, "peer:kimi-code");
+    }
+
+    /// Nova on #1418 (1): a peer's standing refusal takes its reach from the REQUEST it was asked
+    /// to rule. An exact-file request refused standing leaves the file's siblings open; a subtree
+    /// request (`<dir>/*`) refused standing closes the subtree.
+    #[tokio::test]
+    async fn a_peers_standing_refusal_has_the_reach_of_the_request_it_rules() {
+        let (dir, state) = test_state().await;
+        let one = dir.path().join("one");
+        let two = dir.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        for f in [one.join("a.txt"), one.join("b.txt"), two.join("c.txt")] { std::fs::write(f, "x").unwrap(); }
+        let asker = connect(&state, "codex").await;
+        let kimi = connect(&state, "kimi-code").await;
+        // Exact file: the refusal is exact, the sibling still opens.
+        let a = one.join("a.txt").to_str().unwrap().to_string();
+        let (pid, _, _) = proven_claim(&state, "codex", &asker, &a).await;
+        let pr = peer(&state, &kimi, serde_json::json!({
+            "request_id": &pid, "decision": "refuse", "standing": true, "reason": "peer: not this file"})).await;
+        assert_eq!(pr["decided_by"], "peer:kimi-code", "{pr}");
+        assert_eq!(pr["recursive"], false, "an exact request refuses exactly: {pr}");
+        {
+            let s = state.lock().await;
+            let row = s.standing_scope.refusal_for("codex", &a).expect("standing refusal on a.txt");
+            assert!(!row.recursive, "the peer refused one file, not its directory");
+        }
+        let b = one.join("b.txt").to_str().unwrap().to_string();
+        let sibling = claim(&state, "codex", &b, &format!("cat {b}"), false).await;
+        assert_eq!(sibling["verdict"], "opened", "the sibling is not refused: {sibling}");
+        // Subtree request: the refusal has the subtree's reach.
+        let (pid2, _, _) = proven_claim(&state, "codex", &asker, &format!("{}/*", two.to_str().unwrap())).await;
+        let pr2 = peer(&state, &kimi, serde_json::json!({
+            "request_id": &pid2, "decision": "refuse", "standing": true, "reason": "peer: not this tree"})).await;
+        assert_eq!(pr2["decided_by"], "peer:kimi-code", "{pr2}");
+        assert_eq!(pr2["recursive"], true, "a subtree request refuses the subtree: {pr2}");
+        let c = two.join("c.txt").to_str().unwrap().to_string();
+        let under = claim(&state, "codex", &c, &format!("cat {c}"), false).await;
+        assert_eq!(under["verdict"], "refused", "{under}");
+        assert_eq!(under["standing"], true, "{under}");
+    }
+
+    /// Nova on #1418 (2): the lift is two-phase. A vault write that fails leaves the chain holding
+    /// a `scope_refusal_lift_intent` and NO `scope_refusal_lifted`, and the refusal still stands;
+    /// the successful lift's `lifted` row names its intent.
+    #[tokio::test]
+    async fn a_failed_lift_leaves_an_intent_and_the_refusal_standing() {
+        let (dir, state) = test_state().await;
+        let f = dir.path().join("held.txt");
+        std::fs::write(&f, "x").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        let r = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        let id = r["request_id"].as_str().unwrap().to_string();
+        let (st, out) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true, "reason": "closed"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        async fn kinds(state: &SharedState) -> Vec<String> {
+            state.lock().await.recent_chain(200).into_iter().map(|e| e.event_type).collect()
+        }
+        let before = kinds(&state).await;
+        let lifted_before = before.iter().filter(|k| *k == "scope_refusal_lifted").count();
+        // Inject: a directory where the vault's atomic-write temp file must go (the seam the
+        // state.rs durable-grant test uses). Only the vault fails; the chain stays writable.
+        std::fs::create_dir(dir.path().join("v.enc.tmp")).unwrap();
+        let resp = scope_refusal_lift(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "codex", "path": &p, "reason": "lifting"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p).is_some(),
+                "a failed commit leaves the refusal standing");
+        let after = kinds(&state).await;
+        assert_eq!(after.iter().filter(|k| *k == "scope_refusal_lifted").count(), lifted_before,
+                   "no row may claim a lift that never landed");
+        assert_eq!(after.iter().filter(|k| *k == "scope_refusal_lift_intent").count(),
+                   before.iter().filter(|k| *k == "scope_refusal_lift_intent").count() + 1,
+                   "the attempt is on the record as an INTENT");
+        // The same act is still answered from the record.
+        let again = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_eq!(again["verdict"], "refused", "{again}");
+        // Remove the injection: the lift lands, and its success row names its intent.
+        std::fs::remove_dir(dir.path().join("v.enc.tmp")).unwrap();
+        let resp = scope_refusal_lift(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "codex", "path": &p, "reason": "lifting"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.standing_scope.refusal_for("codex", &p).is_none());
+        let chain = s.recent_chain(200);
+        let lifted = chain.iter().filter(|e| e.event_type == "scope_refusal_lifted").last()
+            .expect("the success row");
+        let intent_hash = lifted.event_data["intent"].as_str().expect("names its intent");
+        assert!(chain.iter().any(|e| e.event_type == "scope_refusal_lift_intent" && e.hash == intent_hash),
+                "the named intent is on the chain");
+    }
+
+    /// nomad on #1418 (b): a standing grant that covers a standing refusal lifts it EXPLICITLY in
+    /// the same act, so the store never says closed where a grant has opened the door, and the
+    /// chain says who lifted it (the grant), not just that it is gone.
+    #[tokio::test]
+    async fn a_covering_standing_grant_lifts_the_refusal_explicitly() {
+        let (dir, state) = test_state().await;
+        let sub = dir.path().join("tree");
+        std::fs::create_dir_all(&sub).unwrap();
+        let f = sub.join("held.txt");
+        std::fs::write(&f, "x").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        let _sid = connect(&state, "codex").await; // `scope_grant` grants only to a member that has connected
+        let r = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        let id = r["request_id"].as_str().unwrap().to_string();
+        let (st, out) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true, "reason": "closed for now"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p).is_some());
+        // The operator grants the tree standing: the refusal under it is lifted, witnessed.
+        let resp = scope_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "codex", "path": sub.to_str().unwrap(), "recursive": true,
+            "reason": "the tree is theirs now"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.standing_scope.refusal_for("codex", &p).is_none(), "the covering grant lifted it");
+        let lifted = s.recent_chain(200).into_iter()
+            .filter(|e| e.event_type == "scope_refusal_lifted").last()
+            .expect("the lift is witnessed, not silent");
+        assert_eq!(lifted.event_data["path"], p);
+        assert_eq!(lifted.event_data["via"], "covering_standing_grant");
+        assert!(lifted.event_data["lifted_by"].as_str().unwrap().starts_with("grant"), "{}", lifted.event_data);
+        assert_eq!(lifted.event_data["reason"], "closed for now");
+        drop(s);
+        let open = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_ne!(open["verdict"], "refused", "the door is open: {open}");
     }
 
     /// Codex reviews of #1232, P2: RESERVE is all-or-none through the real handler's batch
