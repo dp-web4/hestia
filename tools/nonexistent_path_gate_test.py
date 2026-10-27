@@ -16,7 +16,11 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import grant_modes_gate_test as g  # noqa: E402
 
-core, m, check = g.core, g.m, g.check
+core, m = g.core, g.m
+
+
+def check(name, cond, detail=""):
+    assert cond, f"{name} — {detail}"
 
 
 def _pol(ws):
@@ -96,8 +100,62 @@ def test_a_granted_read_of_a_nonexistent_path_is_not_refused_by_the_gate():
         check("allowed", not v.blocks, str(v))
 
 
+def test_the_hint_is_withheld_when_the_grant_is_exact():
+    # codex/kimi on #1412: an EXACT grant on the root does not reach a child, so a hint that
+    # names the child would send the member to a second refusal
+    with g._Workspace() as ws:
+        real = _world(ws)
+        snap = g._snapshot(ws, by_mode=[g._grant(ws + "/governance", "r", False)])
+        prof, pol = g._policy(snap)
+        v = g._verdict(prof, pol, ws, "Read", path=ws + "/hestia/governance/hestia/hooks-gt/_shared/gate.py",
+                       materialize=False)
+        check("rule", v.rule == "mrh.path.nonexistent", v.rule)
+        check("no_hint_for_exact", "did you mean" not in v.reason, v.reason)
+        check("real_exists", os.path.exists(real))
+
+
+def test_the_hint_is_withheld_when_the_candidate_escapes_its_grant_by_symlink():
+    # codex/kimi on #1412: lexists is true for a symlink whose target is outside the grant;
+    # confirming it would be an existence oracle for a path the member may not read
+    with g._Workspace() as ws:
+        _world(ws)
+        outside = ws + "/hestia/outside.txt"
+        open(outside, "w").close()
+        os.symlink(outside, ws + "/governance/hestia/hooks-gt/_shared/link.txt")
+        prof, pol = _pol(ws)
+        v = g._verdict(prof, pol, ws, "Read", path=ws + "/hestia/governance/hestia/hooks-gt/_shared/link.txt",
+                       materialize=False)
+        check("rule", v.rule == "mrh.path.nonexistent", v.rule)
+        check("no_hint_for_escaping_symlink", "did you mean" not in v.reason, v.reason)
+
+
+
+TESTS = [
+    test_a_read_of_a_nonexistent_path_says_so_and_escalates_nothing,
+    test_an_existing_off_limits_path_is_still_the_ordinary_scope_refusal,
+    test_a_write_creating_a_file_in_an_existing_dir_is_still_a_real_ask,
+    test_a_write_into_a_new_directory_is_still_a_real_ask,
+    test_a_nonexistent_read_with_no_matching_grant_has_no_hint,
+    test_a_granted_read_of_a_nonexistent_path_is_not_refused_by_the_gate,
+    test_the_hint_is_withheld_when_the_grant_is_exact,
+    test_the_hint_is_withheld_when_the_candidate_escapes_its_grant_by_symlink,
+]
+
 if __name__ == "__main__":
-    tests = [f for n, f in sorted(globals().items()) if n.startswith("test_")]
-    for t in tests:
-        t()
-    print(f"PASS: {len(tests)} nonexistent-path tests")
+    listed = {t.__name__ for t in TESTS}
+    defined = {k for k in globals() if k.startswith("test_")}
+    if listed != defined:
+        print(f"TESTS is stale: missing {sorted(defined - listed)}, extra {sorted(listed - defined)}")
+        sys.exit(1)
+    failed = []
+    for t in TESTS:
+        try:
+            t()
+            print("PASS", t.__name__)
+        except AssertionError as e:
+            failed.append(t.__name__)
+            print("FAIL", t.__name__, "::", e)
+    if failed:
+        print(f"FAILURES: {failed}")
+        sys.exit(1)
+    print(f"PASS: {len(TESTS)} nonexistent-path tests")

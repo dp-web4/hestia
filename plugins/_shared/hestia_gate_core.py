@@ -948,12 +948,16 @@ def _exact_grant_hint(path: str, scopes, workspace: str) -> str:
             f"only an operator can make it so")
 
 
-def _did_you_mean(path: str, scopes, workspace: str) -> str:
+def _did_you_mean(path: str, scopes, workspace: str, admits=None) -> str:
     """The existing path, inside one of the member's own grants, that a nonexistent `path` most
     likely meant (hestia#1411), as a clause; "" when there is none. A grant root's basename found
     as a segment of `path` re-roots the rest of `path` under that grant: the doubled root
     `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when that
-    candidate exists, so the hint never names another path that is not there."""
+    candidate exists AND `admits(candidate)` says the read it suggests would pass (codex/kimi on
+    #1412): under an EXACT grant a child is not reachable, so naming it sends the member to a
+    second refusal; a symlink under a recursive grant that resolves outside it exists but is not
+    readable, so naming it would confirm a path beyond the grant. `admits` is the read path's own
+    admission, so the hint and the read cannot disagree."""
     target = os.path.normpath(os.path.expanduser(path)).replace("\\", "/").rstrip("/")
     ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
     # `path:` grants resolve as everywhere else; a bare entry (`governance`) is a workspace dir
@@ -972,7 +976,16 @@ def _did_you_mean(path: str, scopes, workspace: str) -> str:
             cand = root
         else:
             continue
-        if cand != target and os.path.lexists(cand):
+        if cand == target or not os.path.lexists(cand):
+            continue
+        # The candidate must RESOLVE inside the grant root as well as exist: a symlink under the
+        # root that points outside it lexists, and a bare repo-name entry is judged lexically by
+        # the read path, so the hint checks containment itself and stays stricter than the read.
+        real = os.path.realpath(cand).replace("\\", "/")
+        root_real = os.path.realpath(root).replace("\\", "/").rstrip("/")
+        if not (real == root_real or real.startswith(root_real + "/")):
+            continue
+        if admits is None or admits(cand):
             return f"; did you mean '{cand}'? It exists, inside your grant path:{root}"
     return ""
 
@@ -3383,7 +3396,7 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                     f"(granted: {'+'.join(scopes)})"
                     # every grant the member holds, narrowed and read-floor ones included: the
                     # being's snapshot grant is a narrowed `r` grant, absent from `scopes`
-                    f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws)}",
+                    f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws, admits=lambda c: path_in_scope(c, scopes, ws, profile, event.cwd) or _read_only_admits(event, c, read_scopes, ws, profile) or _mode_admits(event, c, mode_scopes, ws, profile))}",
                     target=norm,
                 )
             mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
