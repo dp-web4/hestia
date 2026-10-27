@@ -24021,16 +24021,52 @@ const READ_ONLY_PATH_TOOLS: &[&str] = &[
     "read_file", "read_many_files", "search", "search_file_content",
 ];
 
-/// The refusal text for an ask about a path that does not exist (hestia#1411), naming the
-/// existing path inside one of the member's own grants that it most likely meant. A grant root's
-/// basename found as a segment of `path` re-roots the rest of `path` under that grant: the doubled
-/// root `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when
-/// that candidate exists, so the hint never names another path that is not there.
-fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> String {
+/// The roots this member's grants and the society floor name: every live and standing grant
+/// root plus every floor root. Where a member's asks are judged to be "about its own space"
+/// (`in_members_space`) and where a did-you-mean candidate may be re-rooted.
+fn member_roots(s: &crate::server::state::ServerState, plugin_id: &str) -> Vec<String> {
     let mut roots: Vec<String> = s.live_scope_grants(plugin_id).iter()
         .map(|r| r.reach_path().to_string()).collect();
     roots.extend(s.live_standing_grants(plugin_id).iter().map(|g| g.path.clone()));
     roots.extend(s.standing_scope.floor.iter().map(|f| f.path.clone()));
+    roots
+}
+
+/// Whether `path` lies inside a root the member holds some grant on, or inside that root's
+/// parent directory (nomad on #1415, option (a)). The existence-first decline answers "does not
+/// exist" without filing anything, which outside the member's own space would be an existence
+/// oracle over the whole host (`~/.ssh/...`, another member's home). Inside it, the information
+/// is already the member's: the doubled root `<ws>/hestia/governance/...` sits beside its
+/// `<ws>/governance` grant, under the same parent. Outside it, the ask files as before, so the
+/// operator still sees a probe.
+fn in_members_space(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> bool {
+    let p = path.trim_end_matches('/');
+    member_roots(s, plugin_id).iter().any(|root| {
+        let root = root.trim_end_matches('/');
+        let parent = root.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let under = |r: &str| !r.is_empty() && (p == r || p.starts_with(&format!("{r}/")));
+        under(root) || under(parent)
+    })
+}
+
+/// `Path::try_exists` read the way a gate must: an error (an unreadable parent, a dangling or
+/// looping link) is NOT "absent". Only a definite `Ok(false)` is (nomad on #1415, point 2).
+fn definitely_absent(path: &str) -> bool {
+    matches!(std::path::Path::new(path).try_exists(), Ok(false))
+}
+
+/// The refusal text for an ask about a path that does not exist (hestia#1411), naming the
+/// existing path inside one of the member's own grants that it most likely meant. A grant root's
+/// basename found as a segment of `path` re-roots the rest of `path` under that grant: the doubled
+/// root `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when
+/// the candidate exists, RESOLVES inside its root (a symlink beneath the root that points outside
+/// it exists but is not the member's to read), and the member is admitted to READ it there by its
+/// effective grants (an exact grant does not reach a child; a floor row may not give this member
+/// read) — the same repair the gate's hint got on #1412 (Nova, nomad). The hint can never name a
+/// path the follow-up read would refuse.
+fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> String {
+    let now = crate::server::gate_escalation::now_secs();
+    let roots = member_roots(s, plugin_id);
     let target = path.trim_end_matches('/');
     let hint = roots.iter().find_map(|root| {
         let root = root.trim_end_matches('/');
@@ -24043,7 +24079,19 @@ fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &s
         } else {
             return None;
         };
-        (cand != target && std::path::Path::new(&cand).exists()).then_some(cand)
+        if cand == target {
+            return None;
+        }
+        let real = std::fs::canonicalize(&cand).ok()?;
+        let root_real = std::fs::canonicalize(root).ok()?;
+        if !(real == root_real || real.starts_with(&root_real)) {
+            return None;
+        }
+        let real_s = real.to_string_lossy().to_string();
+        let read = crate::server::grant_modes::Modes::READ;
+        let admitted = s.has_scope_grant_for(plugin_id, &real_s, read)
+            || s.standing_scope.effective_modes(plugin_id, &real_s, now).is_some_and(|m| m.includes(read));
+        admitted.then_some(cand)
     });
     let mut out = format!("{path} does not exist: there is nothing there to grant, so no request was \
                            opened (nothing reaches the operator's queue)");
@@ -24118,7 +24166,7 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
     // new directory, is a real ask (dp: "how is mkdir or a new file write handled"). Nothing is
     // filed and nothing is witnessed: there is no decision for anyone to make.
     let create = args.get("create").and_then(Value::as_bool).unwrap_or(false);
-    if !create && !std::path::Path::new(&path).exists() {
+    if !create && definitely_absent(&path) && in_members_space(&s, &plugin_id, &path) {
         return Ok(json!({
             "status": "not_filed",
             "reason": "nonexistent",
@@ -24615,7 +24663,8 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     // be creating the path, so only read tools are declined here.
     if unpriceable.is_none() && !subtree && rule == "mrh.path"
         && READ_ONLY_PATH_TOOLS.contains(&tool.as_str())
-        && !std::path::Path::new(&path).exists()
+        && definitely_absent(&path)
+        && in_members_space(&s, &plugin_id, &path)
     {
         return Ok(json!({
             "verdict": "not_opened",
@@ -32869,11 +32918,26 @@ mod existence_first_tests {
         state.lock().await.scope_requests.len()
     }
 
+    /// The being's shape: a standing read grant on `<ws>/governance`, so a doubled-root ask under
+    /// `<ws>/hestia/governance/...` lies inside the member's own space (nomad on #1415, option a).
+    async fn grant_governance(state: &SharedState, dir: &tempfile::TempDir) -> String {
+        let root = dir.path().join("governance");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::READ,
+        });
+        root
+    }
+
     #[tokio::test]
     async fn a_request_for_a_nonexistent_path_is_not_filed() {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
         let sid = session(&state).await;
+        grant_governance(&state, &dir).await;
         let missing = dir.path().join("hestia/governance/x.py");
         let before = pending(&state).await;
         let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
@@ -32934,6 +32998,7 @@ mod existence_first_tests {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
         let sid = session(&state).await;
+        grant_governance(&state, &dir).await;
         let missing = dir.path().join("hestia/governance/x.py");
         let claim = |tool: &str| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
             "path": missing.to_str().unwrap(), "rule": "mrh.path", "tool_name": tool,
@@ -32947,15 +33012,108 @@ mod existence_first_tests {
         assert_eq!(w["verdict"], "opened", "a write may be creating it: {w}");
     }
 
-    /// The daemon's read-tool list must be the gate's (READ_ONLY_PATH_TOOLS plus every
-    /// PATH_TOOL_MODES entry that needs exactly r); checked against the gate source in the tree.
+    /// The daemon's read-tool list must EQUAL the gate's (READ_ONLY_PATH_TOOLS ∪ every
+    /// PATH_TOOL_MODES entry that needs exactly r), parsed from the gate source in the tree
+    /// (nomad/Nova on #1415: a one-directional contains check let a new gate read tool regress).
     #[test]
     fn read_tools_match_the_gate() {
         let core = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/_shared/hestia_gate_core.py"))
             .expect("gate core in the tree");
-        for t in READ_ONLY_PATH_TOOLS {
-            assert!(core.contains(&format!("\"{t}\"")), "{t} is not a tool the gate names");
+        fn quoted(block: &str) -> std::collections::BTreeSet<String> {
+            let mut out = std::collections::BTreeSet::new();
+            let mut rest = block;
+            while let Some(i) = rest.find('"') {
+                let after = &rest[i + 1..];
+                let Some(j) = after.find('"') else { break };
+                out.insert(after[..j].to_string());
+                rest = &after[j + 1..];
+            }
+            out
         }
+        let ro_start = core.find("READ_ONLY_PATH_TOOLS = frozenset({").expect("READ_ONLY_PATH_TOOLS");
+        let ro_block = &core[ro_start..core[ro_start..].find("})").map(|k| ro_start + k).unwrap()];
+        let mut gate = quoted(ro_block);
+        let pm_start = core.find("PATH_TOOL_MODES = {").expect("PATH_TOOL_MODES");
+        let pm_block = &core[pm_start..core[pm_start..].find("\n}").map(|k| pm_start + k).unwrap()];
+        // Entries come several to a line (`"search": "r", "git_read": "r",`): split on commas
+        // first, then each `"name": "modes"` pair on its colon.
+        for line in pm_block.lines() {
+            for piece in line.split(',') {
+                let t = piece.trim();
+                if let Some((name, modes)) = t.split_once(':') {
+                    let name = name.trim().trim_matches('"');
+                    let modes = modes.trim().trim_matches('"');
+                    if modes == "r" && !name.is_empty() && !name.contains(' ') && !name.contains('{') {
+                        gate.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        let daemon: std::collections::BTreeSet<String> = READ_ONLY_PATH_TOOLS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(daemon, gate, "daemon READ_ONLY_PATH_TOOLS must equal the gate's read set");
+    }
+
+    #[tokio::test]
+    async fn the_hint_is_withheld_when_the_member_could_not_read_the_candidate() {
+        // Nova/nomad on #1415: the gate's #1412 repair, applied to the daemon's hint.
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("governance/hestia")).unwrap();
+        std::fs::write(ws.join("governance/hestia/gate.py"), "x").unwrap();
+        let root = ws.join("governance").to_str().unwrap().to_string();
+        let grant = |recursive: bool| crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive,
+            modes: crate::server::grant_modes::Modes::READ,
+        };
+        let doubled = ws.join("hestia/governance/hestia/gate.py").to_str().unwrap().to_string();
+        let ask = |state: &SharedState, sid: &str, p: &str| {
+            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p, "reason": "to read the gate scoring model"});
+            let st = state.clone();
+            async move { tool_request_scope(&st, &b).await.unwrap() }
+        };
+        // 1. an EXACT grant on the root: the child is not readable, so no hint
+        state.lock().await.standing_scope.grants.push(grant(false));
+        let r = ask(&state, &sid, &doubled).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        // 2. recursive: the hint comes back
+        state.lock().await.standing_scope.grants.clear();
+        state.lock().await.standing_scope.grants.push(grant(true));
+        let r = ask(&state, &sid, &doubled).await;
+        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        // 3. a symlink under the root that escapes it: exists, resolves outside, no hint
+        std::fs::create_dir_all(ws.join("hestia")).unwrap();
+        std::fs::write(ws.join("hestia/outside.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(ws.join("hestia/outside.txt"), ws.join("governance/hestia/link.txt")).unwrap();
+        let r = ask(&state, &sid, ws.join("hestia/governance/hestia/link.txt").to_str().unwrap()).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        // 4. a floor row that gives this member no read: no hint
+        state.lock().await.standing_scope.grants.clear();
+        state.lock().await.standing_scope.floor.push(crate::server::standing_scope::FloorEntry {
+            path: root.clone(), added_at: 0, added_by: "operator".into(), reason: "floor".into(),
+            recursive: true, modes: crate::server::grant_modes::Modes::parse("w").unwrap(),
+        });
+        let r = ask(&state, &sid, &doubled).await;
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_outside_the_members_space_still_files() {
+        // nomad on #1415, point 1: "does not exist" is answered silently only inside the member's
+        // own space; a probe of the host elsewhere files as before, so the operator sees it.
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let probe = elsewhere.join("secrets/id_ed25519");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": probe.to_str().unwrap(), "reason": "probing for a key file"})).await.unwrap();
+        assert_eq!(r["status"], "pending", "a probe outside every grant root's parent files: {r}");
     }
 }
