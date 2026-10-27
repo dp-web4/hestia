@@ -24114,9 +24114,23 @@ fn resolve_through_existing_ancestor(path: &str) -> Option<std::path::PathBuf> {
             }
             return Some(out);
         }
+        // Climb only past a component that is genuinely ABSENT. An entry that exists but did not
+        // canonicalize is a dangling or looping link, or unreadable: treating it as a missing
+        // ordinary component would re-root its name under the parent and make "does the link's
+        // outside target exist" decide Under versus Outside (Nova, nomad on #1415). None here is
+        // "not Under", so the ask files either way.
+        match std::fs::symlink_metadata(cur) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
         tail.push(cur.file_name()?.to_os_string());
         cur = cur.parent()?;
     }
+}
+
+/// Whether `path` is an existing symlink (dangling or not), without following it.
+fn is_symlink(path: &str) -> bool {
+    std::fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false)
 }
 
 /// Whether the gate's own law lets `plugin_id` READ at `real` (a resolved path): the NEAREST of
@@ -24172,7 +24186,10 @@ fn space_of(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) 
             .unwrap_or_else(|_| root.to_string());
         real == root_real || (*recursive && real.starts_with(&format!("{root_real}/")))
     });
-    let exact_self = roots.iter().any(|(root, _)| root.trim_end_matches('/') == p);
+    // The exact-identity arm never follows a link either: an exactly granted path that is itself
+    // a (dangling) symlink is not Under by identity, since answering from it would answer for
+    // the link's target (nomad on #1415).
+    let exact_self = !is_symlink(p) && roots.iter().any(|(root, _)| root.trim_end_matches('/') == p);
     let under = match resolve_through_existing_ancestor(p).map(|r| r.to_string_lossy().to_string()) {
         Some(real) if inside(&real) => read_admitted_nearest(s, plugin_id, &real, now),
         _ => exact_self && read_admitted_nearest(s, plugin_id, p, now),
@@ -33113,6 +33130,73 @@ mod existence_first_tests {
         assert_eq!(r["status"], "not_filed", "{r}");
         assert_eq!(r["reason"], "nonexistent", "{r}");
         assert_eq!(pending(&state).await, before);
+    }
+
+    /// Nova and nomad on #1415, the dangling-link arm: under an `r` root, `alias -> <outside>/present`
+    /// and `alias2 -> <outside>/absent` are both links; whether the OUTSIDE target exists must not
+    /// decide Under versus Outside. Asks for `alias`, `alias/x`, `alias2`, `alias2/x` all file,
+    /// identically, on request_scope and on the claim route; an exactly granted dangling link is
+    /// not Under by identity either.
+    #[tokio::test]
+    async fn a_dangling_link_under_a_root_is_not_under() {
+        use crate::server::grant_modes::Modes;
+        use crate::server::standing_scope::StandingGrant;
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        let (r, outside) = (ws.join("r"), ws.join("outside"));
+        std::fs::create_dir_all(&r).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("present"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.join("present"), r.join("alias")).unwrap();
+        std::os::unix::fs::symlink(outside.join("absent"), r.join("alias2")).unwrap();
+        std::os::unix::fs::symlink(outside.join("gone"), ws.join("xlink")).unwrap(); // exactly granted, dangling
+        let grant = |path: &std::path::Path, recursive: bool| StandingGrant {
+            member: "cbp-being".into(), path: path.to_str().unwrap().into(), granted_at: 0,
+            granted_by: "operator".into(), reason: "t".into(), expires_at: None, request_id: None,
+            recursive, modes: Modes::ALL,
+        };
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.grants.push(grant(&r, true));
+            s.standing_scope.grants.push(grant(&ws.join("xlink"), false));
+        }
+        let strip = |v: &serde_json::Value, p: &str| serde_json::to_string(v).unwrap().replace(p, "<P>");
+        let ask = |p: String| {
+            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p,
+                           "reason": "a path under a root I hold, which may be a link"});
+            let st = state.clone();
+            async move { tool_request_scope(&st, &b).await.unwrap() }
+        };
+        // Both links sit lexically under the recursive grant, so the answer is the grant's
+        // (`already_granted`), the same for the live and the dangling link: never a quiet
+        // `not_filed` that would say whether the OUTSIDE target exists.
+        let answer = |rel: &'static str| {
+            let p = r.join(rel).to_str().unwrap().to_string();
+            let st = ask.clone();
+            async move { let v = st(p.clone()).await; (v["status"].clone(), strip(&v, &p)) }
+        };
+        for (live, dangling) in [("alias", "alias2"), ("alias/x", "alias2/x")] {
+            let (sa, ta) = answer(live).await;
+            let (sb, tb) = answer(dangling).await;
+            assert_ne!(sa, "not_filed", "{live}: {ta}");
+            assert_ne!(sb, "not_filed", "{dangling}: {tb}");
+            assert_eq!(ta, tb, "the live and the dangling link must answer identically:\n{ta}\n{tb}");
+        }
+        // The claim route (read tool): identical for both links, and never `not_opened`.
+        let claim = |p: &std::path::Path| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
+            "path": p.to_str().unwrap(), "rule": "mrh.path", "tool_name": "read_file",
+            "act": format!("read_file -> {}", p.display()), "act_digest": "d".repeat(64)});
+        let a = tool_scope_claim(&state, &claim(&r.join("alias/y"))).await.unwrap();
+        let b = tool_scope_claim(&state, &claim(&r.join("alias2/y"))).await.unwrap();
+        assert_ne!(a["verdict"], "not_opened", "{a}");
+        // `request_key` is derived from the path; everything else must be the same for both links.
+        for k in ["verdict", "detail", "permits", "reason"] {
+            assert_eq!(a[k], b[k], "{k} differs between the live and the dangling link:\n{a}\n{b}");
+        }
+        let v = ask(ws.join("xlink").to_str().unwrap().to_string()).await;
+        assert_ne!(v["status"], "not_filed", "an exactly granted dangling link is not stat-followed: {v}");
     }
 
     /// Nova and nomad on #1415, the last class: a quiet answer may depend only on what the member
