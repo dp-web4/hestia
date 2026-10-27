@@ -212,6 +212,24 @@ impl PolicyPublication {
     pub fn live_standing_grants(&self, plugin_id: &str) -> Vec<&StandingGrant> {
         self.standing_scope.live_paths_for(plugin_id, crate::server::gate_escalation::now_secs())
     }
+    /// Explicit repository grants remain separate from legacy filesystem reach.
+    pub fn repository_grants(&self, plugin_id: &str, now: u64) -> Vec<Value> {
+        self.standing_scope.live_for(plugin_id, now).into_iter().filter_map(|g| {
+            let super::grant_target::GrantTarget::Repository(repo) = &g.target else {
+                return None;
+            };
+            Some(json!({
+                "repo": repo,
+                "entry": repo.scope_entry(),
+                "modes": g.modes,
+                "granted_at": g.granted_at,
+                "granted_by": g.granted_by,
+                "reason": g.reason,
+                "expires_at": g.expires_at,
+                "request_id": g.request_id,
+            }))
+        }).collect()
+    }
     /// Register this publication with the current request's durability scope: its reply must not
     /// precede the durability of the chain entries the publication reflects.
     pub fn observe(&self) {

@@ -1591,7 +1591,16 @@ impl ServerState {
     /// memory-tighter-than-vault window so the HTTP surface can tell a legitimate retry
     /// from a typo.
     pub fn apply_standing_revoke(&mut self, member: &str, path: &str) -> Result<()> {
-        self.standing_scope.revoke(member, path);
+        self.apply_standing_target_revoke(member, &super::grant_target::GrantTarget::Path {
+            path: path.to_owned(), recursive: false,
+        })
+    }
+
+    /// Typed counterpart with the same tighten-first, retryable persistence contract.
+    pub fn apply_standing_target_revoke(
+        &mut self, member: &str, target: &super::grant_target::GrantTarget,
+    ) -> Result<()> {
+        self.standing_scope.revoke_target(member, target);
         match self.persist_standing_scope() {
             Ok(()) => {
                 self.standing_scope_dirty = false;

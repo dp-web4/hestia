@@ -469,6 +469,7 @@ class AgentPolicy:
     #: "rwed". Consulted by evaluate() only for an act whose mode it can name, and only when
     #: every mode that act needs is in the grant's. A full-mode grant stays in `scope`.
     mode_scope: tuple = ()
+    repository_scope: tuple = ()
     #: Where this policy was resolved from, carried so a reader never has to guess which store
     #: won. A policy that cannot say where it came from is not auditable.
     source: str = "unresolved"
@@ -887,9 +888,51 @@ def _qualified_repo(s) -> Optional[tuple]:
         return None
     owner, name = s.split("/")
     for seg in (owner, name):
-        if seg in (".", "..") or not _PLAIN_REPO_SEGMENT.match(seg):
+        if seg in (".", "..") or not _PLAIN_REPO_SEGMENT.fullmatch(seg):
             return None
     return (owner.lower(), name.lower())
+
+
+def _repository_grant_scope(raw, now: int) -> tuple:
+    """Validate the dedicated daemon channel; never turn repository rows into path scope."""
+    if not isinstance(raw, list):
+        return ()
+    out = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        repo, entry, modes = row.get("repo"), row.get("entry"), row.get("modes")
+        identity = _qualified_repo(repo)
+        if not identity or entry != "repo:" + "/".join(identity):
+            continue
+        if not isinstance(modes, str) or not modes or any(m not in GRANT_MODES for m in modes):
+            continue
+        expiry = row.get("expires_at")
+        if expiry is not None and (type(expiry) is not int or expiry <= now):
+            continue
+        out.append(("/".join(identity), "".join(m for m in GRANT_MODES if m in modes), expiry))
+    return tuple(out)
+
+
+# Exact known reader operations only. Unknown servers/verbs and all mutations require
+# a full grant until their semantics have been reviewed; no prefix-based inference.
+REPOSITORY_TOOL_MODES = {
+    "mcp__github__fetch_pr": "r",
+    "mcp__github__get_file_contents": "r",
+    "mcp__github__get_commit": "r",
+    "mcp__github__list_commits": "r",
+    "mcp__github__list_branches": "r",
+}
+
+
+def _repository_mode_admits(event, full, policy) -> bool:
+    if (policy.stale or policy.generation is None or policy.expires_at is None
+            or now_secs() >= policy.expires_at):
+        return False
+    need = REPOSITORY_TOOL_MODES.get(event.tool, GRANT_MODES)
+    return any((expiry is None or now_secs() < expiry)
+               and all(m in modes for m in need) and _qualified_repo_granted(full, [entry])
+               for entry, modes, expiry in policy.repository_scope)
 
 
 def _qualified_repo_granted(full: str, scopes) -> bool:
@@ -1007,6 +1050,8 @@ def resolve_agent_policy(profile: HarnessProfile,
                         generation=gen, expires_at=exp,
                         read_scope=tuple(read_parsed or ()),
                         mode_scope=_parse_mode_scope(got.get("in_scope_modes")),
+                        repository_scope=_repository_grant_scope(got.get("repository_grants"), now_secs())
+                        if gen is not None and exp is not None else (),
                     )
 
     # 2. Local replica — fail-closed fallback, marked stale.
@@ -3308,7 +3353,8 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             full = fulls[i] if i < len(fulls) and isinstance(fulls[i], str) else ""
             # #1392 v3: the legacy literal name keeps its (owner-agnostic) meaning; otherwise only a QUALIFIED
             # `repo:<owner>/<name>` grant reaches a remote repository. No local state stands in for it.
-            if rname not in scopes and not _qualified_repo_granted(full, scopes):
+            if (rname not in scopes and not _qualified_repo_granted(full, scopes)
+                    and not _repository_mode_admits(event, full, pol)):
                 need = f"repo:{full}" if _qualified_repo(full) else f"repo:<owner>/{rname}"
                 return _deny(
                     "mrh.repo",
