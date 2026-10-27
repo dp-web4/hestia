@@ -12,6 +12,7 @@ pub mod evidence;
 pub mod gate_escalation;
 pub mod governance_ledger;
 pub mod grant_modes;
+pub mod grant_target;
 pub mod repository_target;
 mod handler;
 mod http;
