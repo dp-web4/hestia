@@ -22,10 +22,8 @@ use web4_core::crypto::KeyPair;
 use web4_core::lct::{EntityType, Lct};
 use web4_core::{Attestation, CitizenshipRecord, PublicKey};
 
-/// The purpose string hestia vouches under (`member_registry::vouch_witnessing_key`).
-/// Test-local on purpose: it is a bare literal in both repos today, which is the
-/// whole of C4. When `WITNESS_KEY_PURPOSE` is exported, this becomes an import.
-const HESTIA_WITNESS_PURPOSE: &str = "witnessing";
+/// The purpose string hestia vouches under: web4-core's exported constant, imported (C4).
+use hestia::witness::WITNESS_KEY_PURPOSE as HESTIA_WITNESS_PURPOSE;
 
 fn subject() -> String {
     Lct::new(EntityType::AiSoftware, None).0.lct_id()
@@ -235,25 +233,20 @@ fn c3_second_precision_is_the_only_ts_that_survives_a_lossy_hop() {
     );
 }
 
-/// **C4 — the purpose string is a cross-repo literal with two spellings.**
+/// **C4 — the purpose string is ONE constant across both repos.**
 ///
-/// hestia vouches and resolves `"witnessing"` (`member_registry.rs`, `cli.rs`).
-/// web4-core's `OperationalKey::purpose` doc comment says `e.g. "witness"`, and
-/// so do its tests. A hub-side resolver written from web4-core's own example
-/// resolves `None` for every real witness and reports "quorum not met" — a
-/// spelling mismatch wearing the costume of a governance failure.
-///
-/// Should move to: `WITNESS_KEY_PURPOSE` exported from web4-core, with the doc
-/// comment and tests using it. This test is pinned to `HESTIA_WITNESS_PURPOSE`
-/// so it follows the constant once it exists.
+/// It was a bare literal in each: hestia vouched and resolved `"witnessing"`, while
+/// web4-core's doc comment and tests said `"witness"`. A hub-side resolver written from
+/// that example resolved `None` for every real witness and reported "quorum not met".
+/// web4-core now exports `WITNESS_PURPOSE`; hestia's `WITNESS_KEY_PURPOSE` is that
+/// constant, re-exported, so a resolver on either side keys on the same value.
 #[test]
-fn c4_the_other_purpose_spelling_resolves_to_nothing() {
+fn c4_the_witness_purpose_is_web4_cores_constant() {
+    assert_eq!(HESTIA_WITNESS_PURPOSE, web4_core::WITNESS_PURPOSE, "one constant, both repos");
     let (lct, _binding) = onboarded(&KeyPair::generate());
-    assert!(lct.operational_key_for(HESTIA_WITNESS_PURPOSE).is_some());
-    assert!(
-        lct.operational_key_for("witness").is_none(),
-        "MEASURED: web4-core's documented spelling resolves None against a real vouch"
-    );
+    assert!(lct.operational_key_for(web4_core::WITNESS_PURPOSE).is_some());
+    // the old documented spelling still resolves nothing, which is why it is a constant now
+    assert!(lct.operational_key_for("witness").is_none());
 }
 
 /// **C5 — the subject id is inside the signed bytes, and two id spaces are live.**

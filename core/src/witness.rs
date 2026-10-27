@@ -163,7 +163,11 @@ pub fn is_canonical_lct_id(id: &str) -> bool {
 /// cross-repo fix is to export it from web4-core (the shared-derivation
 /// discipline already used for `derive_lct_id` and `opkey_message`, and for the
 /// same reason).
-pub const WITNESS_KEY_PURPOSE: &str = "witnessing";
+//
+// Now exported by web4-core (`web4_core::WITNESS_PURPOSE`, "witnessing") and imported here,
+// as member_registry.rs already does: one constant across both repos, so the spellings
+// cannot drift (C4).
+pub use web4_core::WITNESS_PURPOSE as WITNESS_KEY_PURPOSE;
 
 /// An OFFLINE, self-authenticating resolver of witness signing keys.
 ///
