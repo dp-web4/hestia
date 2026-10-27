@@ -12690,6 +12690,64 @@ mod disposition_tests {
                 "the operator's revoke ends the peer's grant");
     }
 
+    /// A member-filed ask (hestia#1409): a NOT-SAME peer may REFUSE a session-attributed one;
+    /// it may not grant one, the asker may not refuse its own, and an asserted asker's ask is
+    /// not peer-decidable in either direction (clause 0).
+    #[tokio::test]
+    async fn scope_peer_decide_refuses_a_member_filed_ask_but_never_grants_one() {
+        let (dir, state) = test_state().await;
+        let asker = connect(&state, "codex").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let f = dir.path().join("member-filed.txt");
+        std::fs::write(&f, "x").unwrap();
+        let ask = serde_json::json!({
+            "plugin_id": "codex", "session_id": asker.clone(), "path": f.to_str().unwrap(),
+            "reason": "a member-filed ask, for the peer-refusal test"});
+        let id = crate::server::handler::tool_request_scope(&state, &ask).await.unwrap()
+            ["request_id"].as_str().unwrap().to_string();
+        assert_eq!(state.lock().await.scope_requests[&id].ext.asker_basis,
+                   Some(crate::arbiter::AskerBasis::Session), "a session-attributed filing");
+        for d in ["once", "session", "standing"] {
+            let g = peer(&state, &kimi, serde_json::json!({
+                "request_id": &id, "decision": d, "reason": "a peer may not grant this"})).await;
+            assert_eq!(g["_hestia_error"]["code"], "hestia.scope_peer_decide_member_filed", "{d}: {g}");
+        }
+        let own = peer(&state, &asker, serde_json::json!({
+            "request_id": &id, "decision": "refuse", "reason": "withdrawing my own"})).await;
+        assert_eq!(own["_hestia_error"]["code"], "hestia.scope_peer_decide_self", "{own}");
+        assert_eq!(state.lock().await.scope_requests[&id].granted, None, "nothing decided yet");
+        let r = peer(&state, &kimi, serde_json::json!({
+            "request_id": &id, "decision": "refuse",
+            "reason": "already in your grant at governance/hestia; nothing to add"})).await;
+        assert_eq!(r["decided_by"], "peer:kimi-code", "{r}");
+        assert_eq!(r["peer_basis"]["origin"], "member_request", "{r}");
+        {
+            let s = state.lock().await;
+            let req = &s.scope_requests[&id];
+            assert_eq!(req.granted, Some(false));
+            assert_eq!(req.decided_by.as_deref(), Some("peer:kimi-code"));
+            assert!(req.decision_reason.as_deref().unwrap().contains("already in your grant"));
+        }
+        // ASSERTED (no session): a peer cannot refuse it either; the operator still can.
+        let a = crate::server::handler::tool_request_scope(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": f.to_str().unwrap(),
+            "reason": "an asserted member-filed ask"})).await.unwrap();
+        let aid = a["request_id"].as_str().unwrap().to_string();
+        assert_eq!(state.lock().await.scope_requests[&aid].ext.asker_basis,
+                   Some(crate::arbiter::AskerBasis::Asserted));
+        let p = peer(&state, &kimi, serde_json::json!({
+            "request_id": &aid, "decision": "refuse", "reason": "a peer refusing an asserted ask"})).await;
+        assert_eq!(p["_hestia_error"]["code"], "hestia.scope_peer_decide_ineligible", "{p}");
+        let (st, _) = decide(&state, serde_json::json!({
+            "request_id": &aid, "granted": false, "reason": "operator refuses"})).await;
+        assert_eq!(st, StatusCode::OK);
+        // A session that belongs to another member cannot file in codex's name.
+        let m = crate::server::handler::tool_request_scope(&state, &serde_json::json!({
+            "plugin_id": "codex", "session_id": kimi, "path": f.to_str().unwrap(),
+            "reason": "filing under another member's name"})).await.unwrap();
+        assert_eq!(m["_hestia_error"]["code"], "hestia.scope_request_asker_mismatch", "{m}");
+    }
+
     /// Codex reviews of #1232, P2: RESERVE is all-or-none through the real handler's batch
     /// branch, binds to the complete-act digest, opens nothing, and is idempotent per op_key;
     /// COMMIT spends exactly the reserved approvals once, witnessed as one row.

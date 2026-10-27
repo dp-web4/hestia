@@ -24053,9 +24053,9 @@ fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &s
     out
 }
 
-async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
+pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
-    use crate::server::state::{normalize_scope_path, ScopeRequest, SCOPE_REQUEST_TTL_SECS};
+    use crate::server::state::{normalize_scope_path, ScopeRequest, ScopeRequestExt, SCOPE_REQUEST_TTL_SECS};
 
     let plugin_id = require_string(args, "plugin_id")?;
     let role = optional_string(args, "role").unwrap_or_default();
@@ -24095,6 +24095,23 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
 
     let now = now_secs();
     let mut s = state.lock().await;
+
+    // ATTRIBUTION (hestia#1409), the same rule as `hestia_scope_claim`: a resolved session names
+    // the member, and an asserted id that disagrees with it is refused rather than believed.
+    // Without a session the id is asserted (A1) and recorded as such, so no peer can later
+    // treat a name a caller typed as a proven asker.
+    let asker_basis = match resolve_attributed_caller(&s, optional_session_id(args).as_deref()) {
+        Some(who) if who.plugin_id != plugin_id => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_request_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing was filed",
+                Some(json!({ "asserted": plugin_id, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(_) => crate::arbiter::AskerBasis::Session,
+        None => crate::arbiter::AskerBasis::Asserted,
+    };
 
     // EXISTENCE FIRST (hestia#1411). A request names no mode, so a path that does not exist is
     // refused unless the member says it is creating it (`create: true`): a new file, even in a
@@ -24150,7 +24167,8 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
         decided_at: None,
         decision_reason: None,
         recursive: false,
-        revoked: None, ext: Default::default(),
+        revoked: None,
+        ext: ScopeRequestExt { asker_basis: Some(asker_basis), ..Default::default() },
     };
     s.scope_requests.insert(id.clone(), req);
 
@@ -24926,10 +24944,19 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
                 "no such scope request (memory-only: it may have expired or the daemon \
                  restarted, #908 / #1233)", Some(json!({ "request_id": request_id }))));
         };
-        let Some(gate) = req.ext.gate.as_ref() else {
-            return Ok(hestia_error_envelope("hestia.scope_peer_decide_member_filed",
-                "peers decide GATE-OPENED scope requests; a member-filed ask is the operator's \
-                 (or a delegated seat's `hestia scope arbitrate`)", None));
+        // A MEMBER-FILED ask (hestia#1409; dp 2026-10-14: "the human does not need to be in
+        // that loop"): a NOT-SAME peer may REFUSE it, which widens nothing; granting it stays
+        // the operator's (or a delegated seat's `hestia scope arbitrate`). Measured on
+        // cbp-being, 2026-10-26: nine asks for paths already in its grant, or not on disk,
+        // each waiting on the operator because no peer could close them.
+        let asker_basis = match req.ext.gate.as_ref() {
+            Some(gate) => gate.asker_basis,
+            None if decision == "refuse" => req.ext.asker_basis.unwrap_or_default(),
+            None => {
+                return Ok(hestia_error_envelope("hestia.scope_peer_decide_member_filed",
+                    "peers may only REFUSE a member-filed scope request; granting one is the \
+                     operator's (or a delegated seat's `hestia scope arbitrate`)", None));
+            }
         };
         if arb.plugin_id == req.plugin_id || s.same_entity(&arb.plugin_id, &req.plugin_id) {
             return Ok(hestia_error_envelope("hestia.scope_peer_decide_self",
@@ -24940,7 +24967,7 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
                           else { Disposition::ForAppellant };
         let parties = AppealParties {
             appellant: &req.plugin_id,
-            appellant_basis: gate.asker_basis,
+            appellant_basis: asker_basis,
             deny_adjudicator: None,
             arbiter: &arb.plugin_id,
         };
@@ -24958,8 +24985,9 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
         let basis = json!({
             "arbiter": arb.plugin_id,
             "asker": req.plugin_id,
-            "asker_basis": gate.asker_basis,
+            "asker_basis": asker_basis,
             "independence": independence,
+            "origin": if req.ext.gate.is_some() { "gate_deny" } else { "member_request" },
             "eligibility": "arbiter::eligibility_for (NOT-SAME)",
         });
         (arb.plugin_id, req.plugin_id.clone(), basis)
