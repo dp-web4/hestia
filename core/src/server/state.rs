@@ -2685,7 +2685,9 @@ mod tests {
     #[test]
     fn confer_citizenship_records_a_birth_cert_in_the_ledger_only_on_quorum() {
         let (_dir, state) = make_state();
-        let subject = "lct:web4:mb32:bsubjectcitizen";
+        // a real key-derived subject (R6): the readable stand-in had a 14-char body where a derived id has 52
+        let subject_id = web4_core::derive_lct_id(&web4_core::crypto::KeyPair::generate().verifying_key());
+        let subject = subject_id.as_str();
         let w: Vec<web4_core::crypto::KeyPair> = (0..3)
             .map(|_| web4_core::crypto::KeyPair::generate())
             .collect();
