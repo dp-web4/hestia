@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 746b83f0b1d00bbd39fdc225a08fa8193d8a30a7dd430aeb1a73398a07617c40  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -1071,7 +1071,7 @@ def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = N
     snap = _fetch_policy_snapshot_uncached(plugin_id, host_agent, host_session_id,
                                            declares_review_door=declares_review_door,
                                            deadline=deadline)
-    if use_cache and snap is not None:
+    if snap is not None:
         _POLICY_SNAPSHOT_CACHE[plugin_id] = snap
     return snap
 
@@ -1220,6 +1220,7 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             # the same reason as `in_scope_read`: a core that predates this key ignores it and
             # admits nothing for them, so narrowing never widens on an older gate.
             "in_scope_modes": [],
+            "repository_grants": [],
             "generation": None,
             "expires_at": None,
         }
@@ -1292,6 +1293,11 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                         "entry": _scope_entry_for_grant(p, bool(g.get("recursive"))),
                         "modes": "".join(m for m in "rwed" if m in modes),
                     })
+            # Keep repository authority in its own domain. Core validates identity,
+            # modes and expiry; no row is allowed to become local path authority.
+            repositories = scope.get("repository_grants")
+            if isinstance(repositories, list):
+                snap["repository_grants"] = repositories
             # CERTIFICATION, issued by the authority (Sprint F R1): the standing store's
             # monotonic generation ("WHICH policy is this copy") and the daemon's honor
             # horizon for it. Booleans are excluded deliberately — isinstance(True, int)
