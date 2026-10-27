@@ -24016,7 +24016,7 @@ mod invitation_note_contract_tests {
 /// nonexistent paths because there is nothing to escalate - it's just noise". The tools whose
 /// act on a path only READS it: the gate's `READ_ONLY_PATH_TOOLS` plus every tool its
 /// `PATH_TOOL_MODES` maps to exactly `r` (kept in step by `read_tools_match_the_gate`).
-const READ_ONLY_PATH_TOOLS: &[&str] = &[
+pub(crate) const READ_ONLY_PATH_TOOLS: &[&str] = &[
     "Glob", "Grep", "LS", "NotebookRead", "Read", "git_read", "glob", "list_directory",
     "read_file", "read_many_files", "search", "search_file_content",
 ];
