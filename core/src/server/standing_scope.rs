@@ -512,8 +512,16 @@ impl StandingScopeStore {
             g.granted_at,
             g.expires_at.map(|e| e.to_string()).unwrap_or_default()
         );
-        // MODES ARE AUTHORITY (#1345), so the digest must see a narrowed grant. An all-modes
-        // grant keeps its pre-#1345 row exactly, so no existing digest moves on upgrade.
+        // Recursion changes reach even if a corrupt projection retains the generation.
+        // Preserve exact-grant rows byte-for-byte; recursive rows intentionally move
+        // on upgrade so the audit can distinguish exact from subtree authority.
+        let row = if g.recursive {
+            format!("{row}\u{1f}recursive=true")
+        } else {
+            row
+        };
+        // MODES ARE AUTHORITY (#1345), so the digest must see a narrowed grant.
+        // Exact all-modes grants keep their pre-#1345 row exactly.
         if g.modes.is_all() {
             row
         } else {
@@ -600,6 +608,14 @@ impl StandingScopeStore {
                         out.push(format!(
                             "CHANGED grant {} -> {}: granted_at runtime {} vs vault {}",
                             k.0, k.1, g.granted_at, v.granted_at
+                        ));
+                    }
+                    // WHERE IT MAY REACH. Subtree authority is not an exact-path grant,
+                    // even when every other field (including generation) agrees.
+                    if g.recursive != v.recursive {
+                        out.push(format!(
+                            "CHANGED grant {} -> {}: recursive runtime {} vs vault {}",
+                            k.0, k.1, g.recursive, v.recursive
                         ));
                     }
                     // WHAT IT MAY DO. A mode the vault never authorised is a widening; a
@@ -1515,3 +1531,82 @@ mod mode_tests {
     }
 }
 
+
+#[cfg(test)]
+mod recursion_audit_tests {
+    use super::*;
+    use crate::server::grant_modes::Modes;
+
+    fn store(recursive: bool, modes: Modes) -> StandingScopeStore {
+        StandingScopeStore {
+            generation: 7,
+            grants: vec![StandingGrant {
+                member: "member".into(),
+                path: "/workspace/project".into(),
+                granted_at: 10,
+                granted_by: "operator".into(),
+                reason: "test".into(),
+                expires_at: Some(100),
+                request_id: None,
+                recursive,
+                modes,
+            }],
+            floor: vec![],
+        }
+    }
+
+    #[test]
+    fn recursive_drift_moves_digest_even_at_identical_generation() {
+        for modes in [Modes::ALL, Modes::READ] {
+            let exact = store(false, modes);
+            let subtree = store(true, modes);
+            assert_eq!(exact.generation, subtree.generation);
+            assert!(!exact.grants[0].covers("/workspace/project/child"));
+            assert!(subtree.grants[0].covers("/workspace/project/child"));
+            assert_ne!(exact.authority_digest(), subtree.authority_digest());
+        }
+    }
+
+    #[test]
+    fn recursive_drift_is_named_in_both_directions() {
+        let exact = store(false, Modes::ALL);
+        let subtree = store(true, Modes::ALL);
+        for (runtime, vault, detail) in [
+            (&subtree, &exact, "recursive runtime true vs vault false"),
+            (&exact, &subtree, "recursive runtime false vs vault true"),
+        ] {
+            let drift = runtime.divergence_from(vault);
+            assert_eq!(drift.len(), 1, "{drift:?}");
+            assert!(drift[0].contains(detail), "{drift:?}");
+            assert!(drift[0].starts_with("CHANGED grant member -> /workspace/project:"));
+        }
+    }
+
+    #[test]
+    fn legacy_exact_rows_keep_their_digest_bytes() {
+        for modes in [Modes::ALL, Modes::READ] {
+            let exact = store(false, modes);
+            let mut row = "grant\u{1f}member\u{1f}/workspace/project\u{1f}10\u{1f}100".to_owned();
+            if !modes.is_all() {
+                row.push_str("\u{1f}modes=r");
+            }
+            assert_eq!(StandingScopeStore::grant_row(&exact.grants[0]), row);
+            let mut hash = Sha256::new();
+            hash.update(7_u64.to_be_bytes());
+            hash.update((row.len() as u64).to_be_bytes());
+            hash.update(row.as_bytes());
+            assert_eq!(exact.authority_digest(), hex::encode(hash.finalize()));
+        }
+    }
+
+    #[test]
+    fn recursive_reload_and_noop_preserve_audit_identity() {
+        let original = store(true, Modes::READ);
+        let reloaded: StandingScopeStore =
+            serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        assert_eq!(original.authority_digest(), reloaded.authority_digest());
+        assert!(original.divergence_from(&reloaded).is_empty());
+        assert!(reloaded.has_live_for("member", "/workspace/project/child", 99, Modes::READ));
+        assert!(!reloaded.has_live_for("member", "/workspace/project/child", 100, Modes::READ));
+    }
+}
