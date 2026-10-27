@@ -1,0 +1,241 @@
+STOP: reached 2026-10-18T22:38:37.214510103+00:00 after 140124 entries (older than the request)
+{
+ "pos": null,
+ "ts": "2026-10-27T08:26:55.825711583+00:00",
+ "eventType": "outcome",
+ "hash": "c9e8536afcb4317e",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T08:26:42.388791784+00:00",
+ "eventType": "policy_allow",
+ "hash": "53c90a437594ecc3",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T08:25:09.543634136+00:00",
+ "eventType": "outcome",
+ "hash": "833b2cdb63797531",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "codex"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T08:25:09.343658346+00:00",
+ "eventType": "member_notice",
+ "hash": "fdc6b3157555f6b5",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T08:25:09.203849716+00:00",
+ "eventType": "policy_allow",
+ "hash": "e54d6b847d52a1c6",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "codex",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T08:07:09.058182594+00:00",
+ "eventType": "outcome",
+ "hash": "e06ba51eee9a4512",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T08:07:08.696353279+00:00",
+ "eventType": "policy_allow",
+ "hash": "ee6193e25a7a79dc",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:53:12.778951428+00:00",
+ "eventType": "outcome",
+ "hash": "dd749497b2e34e7f",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:53:12.506570751+00:00",
+ "eventType": "member_notice",
+ "hash": "2b3222d4d9d002db",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:53:12.408782584+00:00",
+ "eventType": "policy_allow",
+ "hash": "d5e8b7698991ae10",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:51:49.306885223+00:00",
+ "eventType": "outcome",
+ "hash": "f74bcd6f931a248f",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:51:49.123668641+00:00",
+ "eventType": "member_notice",
+ "hash": "3c8808a22ec38075",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:51:49.007705618+00:00",
+ "eventType": "policy_allow",
+ "hash": "6fb8e2aa824f45ee",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:51:42.849582033+00:00",
+ "eventType": "scope_refused",
+ "hash": "44459bbf6440f663",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "request_id": "scope-f21489a368ff",
+  "plugin_id": "cbp-being",
+  "decision_reason": "Refused: /home/dp/ai-workspace/hestia is the shared WRITABLE working tree, and dp refused the same path at dp#412 (scope-2e3dffe29569). Member source reads go to the read-only snapshot /home/dp/ai-workspace/governance/hestia (directive 2026-10-19), and a read there is grantable by any peer. Re-issue the read against that path, naming one file and the task it supports.",
+  "path": "/home/dp/ai-workspace/hestia",
+  "grant_path": "/home/dp/ai-workspace/hestia",
+  "once": false,
+  "expires_at": 1792590533,
+  "origin": "gate_deny"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:50:12.905706127+00:00",
+ "eventType": "outcome",
+ "hash": "cdbcfd42435284c9",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "codex"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:50:12.702500863+00:00",
+ "eventType": "member_notice",
+ "hash": "a29acbc93ff6b5d4",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:50:12.547408928+00:00",
+ "eventType": "policy_allow",
+ "hash": "b458f5040df74eb2",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "plugin_id": "codex",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-21T05:48:53.201403075+00:00",
+ "eventType": "scope_requested",
+ "hash": "d35c48ce403ec8a5",
+ "hits": [
+  "scope-f21489a368ff"
+ ],
+ "fields": {
+  "request_id": "scope-f21489a368ff",
+  "plugin_id": "cbp-being",
+  "path": "/home/dp/ai-workspace/hestia",
+  "path_as_asked": "/home/dp/ai-workspace/hestia",
+  "reason": "opened by the gate on a refused read_file (mrh.path); act: read_file -> /home/dp/ai-workspace/hestia",
+  "expires_at": 1792590533,
+  "act": "read_file -> /home/dp/ai-workspace/hestia",
+  "rule": "mrh.path",
+  "origin": "gate_deny",
+  "invited_peers": [
+   "claude-code",
+   "codex",
+   "kimi-code"
+  ]
+ }
+}
