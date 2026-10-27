@@ -174,6 +174,44 @@ pub struct StandingScopeStore {
     /// identical. One list, consulted for everyone, cannot drift.
     #[serde(default)]
     pub floor: Vec<FloorEntry>,
+    /// STANDING REFUSALS (hestia#1417). A refusal used to live only as long as its request's
+    /// window (8 h), so a member re-asking for one off-limits path minted a fresh request, and
+    /// a fresh operator card, every window: measured 87 refused acts and 17 request ids for
+    /// one `(member, path)` in three days. A refusal the operator (or a NOT-SAME peer) marks
+    /// standing is durable like a grant: the gate's claim answers `refused` from this row and
+    /// opens nothing, `request_scope` for the path is not filed, and the member reads the
+    /// closed door in its own scope status. Lifted only by the operator; a later grant that
+    /// covers the path answers before it and so lifts it in effect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refusals: Vec<StandingRefusal>,
+}
+
+/// One standing refusal: this member may not reach this path, durably, until the operator
+/// lifts it (hestia#1417). Never widens anything, so a NOT-SAME peer may record one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandingRefusal {
+    pub member: String,
+    /// Normalised absolute path (`state::normalize_scope_path`).
+    pub path: String,
+    /// Whether the refusal covers the whole subtree under `path`.
+    #[serde(default)]
+    pub recursive: bool,
+    pub refused_at: u64,
+    /// `operator`, or `peer:<member>`.
+    #[serde(default)]
+    pub refused_by: String,
+    /// Why — the deciding seat's words, served back to the member on every re-ask.
+    #[serde(default)]
+    pub reason: String,
+    /// The request this refusal was decided on, for provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl StandingRefusal {
+    pub fn covers(&self, path: &str) -> bool {
+        covers_path(&self.path, self.recursive, path)
+    }
 }
 
 /// What the daemon found where the standing authority should be, at launch.
@@ -362,6 +400,12 @@ pub struct FloorForMember<'a> {
 }
 
 impl StandingScopeStore {
+    /// The standing refusal covering `path` for `member`, if any (hestia#1417). Exact match
+    /// always; the subtree only when the refusal is recursive, the grants' own rule.
+    pub fn refusal_for(&self, member: &str, path: &str) -> Option<&StandingRefusal> {
+        self.refusals.iter().find(|r| r.member == member && r.covers(path))
+    }
+
     /// Every live standing grant this member holds, oldest first. Expired grants are
     /// filtered HERE, at the read, so no serving surface can leak one by forgetting to.
     pub fn live_for(&self, member: &str, now: u64) -> Vec<&StandingGrant> {
@@ -1390,6 +1434,7 @@ mod tests {
                 generation: 7,
                 grants: vec![grant("codex", "/w/web4", 1, None)],
                 floor: Vec::new(),
+                refusals: Vec::new(),
             })
             .unwrap(),
         )
