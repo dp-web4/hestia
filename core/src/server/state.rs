@@ -194,6 +194,12 @@ pub struct ScopeRequestExt {
     /// `Some` when the gate opened this request on a refusal; `None` when the member filed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateDenyOrigin>,
+    /// For a MEMBER-FILED ask: whether the asker was resolved from a live session when it was
+    /// recorded, or merely asserted (hestia#1409). A gate-opened request carries this on
+    /// `gate.asker_basis`. A NOT-SAME peer may REFUSE a session-attributed member-filed ask;
+    /// granting one stays the operator's. Rows written before this field read as asserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asker_basis: Option<crate::arbiter::AskerBasis>,
     /// The operator answered ONE-TIME: this exact act (`gate.act_digest`), once, inside the
     /// claim window. Never a live grant: it is not served in `live_grants`, so no snapshot
     /// carries it; only `hestia_scope_claim` can spend it.
