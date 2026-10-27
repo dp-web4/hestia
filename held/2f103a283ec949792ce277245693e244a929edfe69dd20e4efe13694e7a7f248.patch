@@ -1,0 +1,220 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -948,12 +948,16 @@
+             f"only an operator can make it so")
+ 
+ 
+-def _did_you_mean(path: str, scopes, workspace: str) -> str:
++def _did_you_mean(path: str, scopes, workspace: str, admits=None) -> str:
+     """The existing path, inside one of the member's own grants, that a nonexistent `path` most
+     likely meant (hestia#1411), as a clause; "" when there is none. A grant root's basename found
+     as a segment of `path` re-roots the rest of `path` under that grant: the doubled root
+     `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when that
+-    candidate exists, so the hint never names another path that is not there."""
++    candidate exists AND `admits(candidate)` says the read it suggests would pass (codex/kimi on
++    #1412): under an EXACT grant a child is not reachable, so naming it sends the member to a
++    second refusal; a symlink under a recursive grant that resolves outside it exists but is not
++    readable, so naming it would confirm a path beyond the grant. `admits` is the read path's own
++    admission, so the hint and the read cannot disagree."""
+     target = os.path.normpath(os.path.expanduser(path)).replace("\\", "/").rstrip("/")
+     ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+     # `path:` grants resolve as everywhere else; a bare entry (`governance`) is a workspace dir
+@@ -972,7 +976,16 @@
+             cand = root
+         else:
+             continue
+-        if cand != target and os.path.lexists(cand):
++        if cand == target or not os.path.lexists(cand):
++            continue
++        # The candidate must RESOLVE inside the grant root as well as exist: a symlink under the
++        # root that points outside it lexists, and a bare repo-name entry is judged lexically by
++        # the read path, so the hint checks containment itself and stays stricter than the read.
++        real = os.path.realpath(cand).replace("\\", "/")
++        root_real = os.path.realpath(root).replace("\\", "/").rstrip("/")
++        if not (real == root_real or real.startswith(root_real + "/")):
++            continue
++        if admits is None or admits(cand):
+             return f"; did you mean '{cand}'? It exists, inside your grant path:{root}"
+     return ""
+ 
+@@ -3383,7 +3396,7 @@
+                     f"(granted: {'+'.join(scopes)})"
+                     # every grant the member holds, narrowed and read-floor ones included: the
+                     # being's snapshot grant is a narrowed `r` grant, absent from `scopes`
+-                    f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws)}",
++                    f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws, admits=lambda c: path_in_scope(c, scopes, ws, profile, event.cwd) or _read_only_admits(event, c, read_scopes, ws, profile) or _mode_admits(event, c, mode_scopes, ws, profile))}",
+                     target=norm,
+                 )
+             mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: c05eefac928759cb0f3a3d41d63754ab2480fd35d7fae52747b6232a23b44f3d  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -949,12 +949,16 @@
+             f"only an operator can make it so")
+ 
+ 
+-def _did_you_mean(path: str, scopes, workspace: str) -> str:
++def _did_you_mean(path: str, scopes, workspace: str, admits=None) -> str:
+     """The existing path, inside one of the member's own grants, that a nonexistent `path` most
+     likely meant (hestia#1411), as a clause; "" when there is none. A grant root's basename found
+     as a segment of `path` re-roots the rest of `path` under that grant: the doubled root
+     `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when that
+-    candidate exists, so the hint never names another path that is not there."""
++    candidate exists AND `admits(candidate)` says the read it suggests would pass (codex/kimi on
++    #1412): under an EXACT grant a child is not reachable, so naming it sends the member to a
++    second refusal; a symlink under a recursive grant that resolves outside it exists but is not
++    readable, so naming it would confirm a path beyond the grant. `admits` is the read path's own
++    admission, so the hint and the read cannot disagree."""
+     target = os.path.normpath(os.path.expanduser(path)).replace("\\", "/").rstrip("/")
+     ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+     # `path:` grants resolve as everywhere else; a bare entry (`governance`) is a workspace dir
+@@ -973,7 +977,16 @@
+             cand = root
+         else:
+             continue
+-        if cand != target and os.path.lexists(cand):
++        if cand == target or not os.path.lexists(cand):
++            continue
++        # The candidate must RESOLVE inside the grant root as well as exist: a symlink under the
++        # root that points outside it lexists, and a bare repo-name entry is judged lexically by
++        # the read path, so the hint checks containment itself and stays stricter than the read.
++        real = os.path.realpath(cand).replace("\\", "/")
++        root_real = os.path.realpath(root).replace("\\", "/").rstrip("/")
++        if not (real == root_real or real.startswith(root_real + "/")):
++            continue
++        if admits is None or admits(cand):
+             return f"; did you mean '{cand}'? It exists, inside your grant path:{root}"
+     return ""
+ 
+@@ -3384,7 +3397,7 @@
+                     f"(granted: {'+'.join(scopes)})"
+                     # every grant the member holds, narrowed and read-floor ones included: the
+                     # being's snapshot grant is a narrowed `r` grant, absent from `scopes`
+-                    f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws)}",
++                    f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws, admits=lambda c: path_in_scope(c, scopes, ws, profile, event.cwd) or _read_only_admits(event, c, read_scopes, ws, profile) or _mode_admits(event, c, mode_scopes, ws, profile))}",
+                     target=norm,
+                 )
+             mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "c05eefac928759cb0f3a3d41d63754ab2480fd35d7fae52747b6232a23b44f3d",
++      "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "64953bc6de401c6e5a36d629a52c99a9e6094d670780856bb3c1403447943fbb"
++  "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "64953bc6de401c6e5a36d629a52c99a9e6094d670780856bb3c1403447943fbb",
++    "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "c05eefac928759cb0f3a3d41d63754ab2480fd35d7fae52747b6232a23b44f3d"
++        "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "1f081f15b1f5db86026e57d6acbbd5d7ae18a1b36652076d7f7b536fca23b18f"
++  "gt_version": "fba879472e5ad5ab4cca15ef085f35da58826c761db9bca4c0da4dd5641775a3"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "64953bc6de401c6e5a36d629a52c99a9e6094d670780856bb3c1403447943fbb",
++    "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "c05eefac928759cb0f3a3d41d63754ab2480fd35d7fae52747b6232a23b44f3d"
++        "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "d6f462ee6c07ecb245922b963d392722db893596296785a2a73b65fe07ce88a9"
++  "gt_version": "afea9e20893bc296d0d8090b63a89bc44f38a1ba558f9912e7e769c2db109fdf"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "64953bc6de401c6e5a36d629a52c99a9e6094d670780856bb3c1403447943fbb",
++    "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "c05eefac928759cb0f3a3d41d63754ab2480fd35d7fae52747b6232a23b44f3d"
++        "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "d4b8bcc247658a10edddb807ce1495328e84539b8b3e779faf2479b840755e96"
++  "gt_version": "f4a112028ddf487ed3107728f01c4b6ee030524460bbd22f86fc69ca3249c4c8"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "64953bc6de401c6e5a36d629a52c99a9e6094d670780856bb3c1403447943fbb",
++    "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "c05eefac928759cb0f3a3d41d63754ab2480fd35d7fae52747b6232a23b44f3d"
++        "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "0266246a9c61625fa8dd18d4f6f41449cb96f3fed7d74e2750961e46dac11e04"
++  "gt_version": "4155c6d74080517447eb9d44bc7a3bb571dae7f6da523c9ca004729d032b9894"
+ }

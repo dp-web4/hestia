@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 3e0b3aac2b2af5c67d60e88cb2d856aa87317bdb4f7971bafbfa423da9d3975a  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -243,6 +243,20 @@ REMEDIES: dict[str, Remedy] = {
     # every later relative word under that. When neither the refused path nor its parent exists,
     # it names nothing a grant could be about, so it is NOT a scope-escalating rule: refused as
     # before (the over-approximation is the safe direction), but no peer request is opened.
+    # EXISTENCE FIRST (dp, 2026-10-26, hestia#1411: "we should not be doing escalations on
+    # nonexistent paths because there is nothing to escalate - it's just noise"; "we should be
+    # checking existence first"). A path tool that READS a path that does not exist, or acts on
+    # one whose parent does not exist either, names nothing a grant could be about. Measured on
+    # cbp-being: nine operator cards for `<ws>/hestia/governance/...`, a doubled root carried in
+    # its own journal, while the refusal said "'hestia' is not granted" and never "not there".
+    # Not a scope-escalating rule, so the single gate opens nothing.
+    "mrh.path.nonexistent": Remedy(
+        "The path does not exist, so there is nothing to grant and no scope request was opened. "
+        "Check the spelling against what you already hold: if the refusal names a path inside "
+        "one of your grants, that is the one you meant. (Only reads are refused this way: "
+        "creating a path is judged as an ordinary write.)",
+        ("hestia_scope_status",),
+    ),
     "mrh.command.nonexistent": Remedy(
         "The refused path does not exist, and neither does its parent directory: most often a "
         "relative cd composed under a directory the command never runs in. Spell the cd target "
@@ -933,6 +947,48 @@ def _exact_grant_hint(path: str, scopes, workspace: str) -> str:
     return (f"; note: your grant path:{root} is EXACT — it reaches that path itself and nothing "
             f"beneath it. A recursive grant (path:{root}{RECURSIVE_SUFFIX}) would reach this; "
             f"only an operator can make it so")
+
+
+def _did_you_mean(path: str, scopes, workspace: str, admits=None) -> str:
+    """The existing path, inside one of the member's own grants, that a nonexistent `path` most
+    likely meant (hestia#1411), as a clause; "" when there is none. A grant root's basename found
+    as a segment of `path` re-roots the rest of `path` under that grant: the doubled root
+    `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when that
+    candidate exists AND `admits(candidate)` says the read it suggests would pass (codex/kimi on
+    #1412): under an EXACT grant a child is not reachable, so naming it sends the member to a
+    second refusal; a symlink under a recursive grant that resolves outside it exists but is not
+    readable, so naming it would confirm a path beyond the grant. `admits` is the read path's own
+    admission, so the hint and the read cannot disagree."""
+    target = os.path.normpath(os.path.expanduser(path)).replace("\\", "/").rstrip("/")
+    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+    # `path:` grants resolve as everywhere else; a bare entry (`governance`) is a workspace dir
+    roots = [r for r, _rec in _scope_roots_with_reach(scopes, workspace)]
+    roots += [f"{ws}/{s.strip('/')}" for s in scopes
+              if isinstance(s, str) and s and ":" not in s and not os.path.isabs(s)]
+    for root in roots:
+        base = os.path.basename(root)
+        if not base:
+            continue
+        marker = "/" + base + "/"
+        i = target.find(marker)
+        if i >= 0:
+            cand = root + target[i + len(marker) - 1:]
+        elif target.endswith("/" + base):
+            cand = root
+        else:
+            continue
+        if cand == target or not os.path.lexists(cand):
+            continue
+        # The candidate must RESOLVE inside the grant root as well as exist: a symlink under the
+        # root that points outside it lexists, and a bare repo-name entry is judged lexically by
+        # the read path, so the hint checks containment itself and stays stricter than the read.
+        real = os.path.realpath(cand).replace("\\", "/")
+        root_real = os.path.realpath(root).replace("\\", "/").rstrip("/")
+        if not (real == root_real or real.startswith(root_real + "/")):
+            continue
+        if admits is None or admits(cand):
+            return f"; did you mean '{cand}'? It exists, inside your grant path:{root}"
+    return ""
 
 
 def resolve_agent_policy(profile: HarnessProfile,
@@ -3328,6 +3384,22 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             seg = _offending_segment(p, ws, event.cwd)
             # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
             absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
+            # EXISTENCE FIRST (hestia#1411): a READ of nothing is refused as such, with no scope
+            # request (see REMEDIES). Only reads: an act that writes may be creating the path, and
+            # a new file in a new directory is a real ask (dp, 2026-10-26: "how is mkdir or a new
+            # file write handled"), so it keeps the ordinary refusal and its request.
+            norm = os.path.normpath(os.path.expanduser(absolute)).replace("\\", "/")
+            if act_path_modes(event) == "r" and not os.path.lexists(norm):
+                return _deny(
+                    "mrh.path.nonexistent",
+                    f"'{event.tool}' targets '{_elide(p)}', which does not exist: there is nothing "
+                    f"there to grant, so no scope request was opened "
+                    f"(granted: {'+'.join(scopes)})"
+                    # every grant the member holds, narrowed and read-floor ones included: the
+                    # being's snapshot grant is a narrowed `r` grant, absent from `scopes`
+                    f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws, admits=lambda c: path_in_scope(c, scopes, ws, profile, event.cwd) or _read_only_admits(event, c, read_scopes, ws, profile) or _mode_admits(event, c, mode_scopes, ws, profile))}",
+                    target=norm,
+                )
             mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
             # A narrowed grant that REACHES the path is a grant: the refusal must not open by
             # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
