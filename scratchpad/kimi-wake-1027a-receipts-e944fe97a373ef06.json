@@ -1,0 +1,60 @@
+{
+  "factor": {
+    "argument": "Independent review of held patch e1b2dba5 (base 6e7c2a3c; landed as ce40a647 while I reviewed \u2014 operator-approved 01:01:52Z over codex's dissent). GT plane verified CLEAN: hooks_gt.check on the worktree shows zero #1411 findings (committed core digests to the manifest's c05eefac under the canonical header-zeroing rule), all five manifests' gt_version recompute exactly, applied tree is byte-identical to the held patch's post-image, and the applied gate-core suite passes. Feature shape verified behaviorally: a read of a nonexistent path denies as mrh.path.nonexistent and opens no scope request; existing out-of-scope reads and any write keep the ordinary mrh.path path. DISSENT, seconding codex with independent reproduction (in-memory exec of the applied module, synthetic fixtures): _did_you_mean checks os.path.lexists only and never grant coverage. (1) Under an exact path:<root> grant, a read of <ws>/hestia/<base>/child.txt draws 'did you mean <root>/child.txt \u2014 inside your grant path:<root>' while _within_path_grant is False and the follow-up read denies mrh.path: false authorization guidance. (2) Under a recursive grant, a symlink escaping the root draws the hint for <root>/link/note.txt though realpath containment fails: the hint probes and discloses existence beyond the member's grants. Narrow trigger (the grant root's basename must appear as a path segment), no access bypass \u2014 the read stays denied \u2014 so this is a follow-up repair, not a revert: validate the candidate with the gate's own coverage test (exact/recursive + realpath containment) before the lexists/hint, and add exact-grant-descendant and escaping-symlink regression tests.",
+    "bar": "single_approver",
+    "bar_met_if_decided_now": true,
+    "corroborated": false,
+    "dissent": true,
+    "escalation_id": "e944fe97a373ef06",
+    "factors_present": [
+      {
+        "argument": "Reviewed exact held patch SHA256 e1b2dba5c17d7f9b8dde378734f9c39629c6bdab164abf952711a1485477d357 and its build-1411 README against base 95d6d0b7; no gate-core commits appear in that worktree HEAD..origin/main. Dissent on this patch: _did_you_mean discards the recursive flag from _scope_roots_with_reach and checks lexists without checking candidate grant coverage or resolving symlink containment. Independently executed the exact added helper in memory with synthetic fixtures: (1) an exact path:<root> grant suggests <root>/child.txt as inside your grant even though _within_path_grant returns False; (2) a recursive path:<root>/** grant suggests <root>/link/note.txt when link resolves outside the grant, again with _within_path_grant False. The read remains denied, so this is false authorization guidance and out-of-grant existence probing, not a demonstrated access bypass. Validate candidate read coverage using actual grant reach and resolved containment before testing existence/emitting the hint, and add exact-grant and escaping-symlink regression cases. The missing-path refusal goal is reasonable; this peer evidence is not a ruling or scope grant. No governed patch applied.",
+        "at": 1793062390,
+        "by": "codex",
+        "channel": "peer_member",
+        "dissent": true,
+        "independence": "cross_vendor",
+        "role": "role:constellation:member"
+      },
+      {
+        "at": 1793062912,
+        "by": "operator",
+        "channel": "operator_session",
+        "dissent": false,
+        "independence": null,
+        "role": "role:constellation:sovereign"
+      },
+      {
+        "argument": "Independent review of held patch e1b2dba5 (base 6e7c2a3c; landed as ce40a647 while I reviewed \u2014 operator-approved 01:01:52Z over codex's dissent). GT plane verified CLEAN: hooks_gt.check on the worktree shows zero #1411 findings (committed core digests to the manifest's c05eefac under the canonical header-zeroing rule), all five manifests' gt_version recompute exactly, applied tree is byte-identical to the held patch's post-image, and the applied gate-core suite passes. Feature shape verified behaviorally: a read of a nonexistent path denies as mrh.path.nonexistent and opens no scope request; existing out-of-scope reads and any write keep the ordinary mrh.path path. DISSENT, seconding codex with independent reproduction (in-memory exec of the applied module, synthetic fixtures): _did_you_mean checks os.path.lexists only and never grant coverage. (1) Under an exact path:<root> grant, a read of <ws>/hestia/<base>/child.txt draws 'did you mean <root>/child.txt \u2014 inside your grant path:<root>' while _within_path_grant is False and the follow-up read denies mrh.path: false authorization guidance. (2) Under a recursive grant, a symlink escaping the root draws the hint for <root>/link/note.txt though realpath containment fails: the hint probes and discloses existence beyond the member's grants. Narrow trigger (the grant root's basename must appear as a path segment), no access bypass \u2014 the read stays denied \u2014 so this is a follow-up repair, not a revert: validate the candidate with the gate's own coverage test (exact/recursive + realpath containment) before the lexists/hint, and add exact-grant-descendant and escaping-symlink regression tests.",
+        "at": 1793063522,
+        "by": "kimi-code",
+        "channel": "peer_member",
+        "dissent": true,
+        "independence": "cross_vendor",
+        "role": "role:constellation:interactive-dev"
+      }
+    ],
+    "note": "your dissent is ON THE RECORD as evidence for review \u2014 never a veto: the sovereign decision stands or lands regardless, with your argument visible to the decider",
+    "recorded": true,
+    "stance": "dissent",
+    "witnessEntryHash": "f2d50b782ce61168170d718762b74e0e5d373ae5deb06b3304f4d95d4a385f58"
+  },
+  "review_done": {
+    "binding_verified": true,
+    "egress_queued_to": null,
+    "in_reply_to": 33454,
+    "kind": "review_done",
+    "operation_id": "kimi-review-33454-e944fe97a373ef06",
+    "queued_id": 33507,
+    "recipient_liveness": "live",
+    "recipient_liveness_evidence": {
+      "first_seen": "2026-07-25T20:02:54.855593864+00:00",
+      "last_inbox_touch": "2026-10-27T01:11:52.027457852+00:00",
+      "live_within_secs": 300,
+      "mailbox_reads": 77033
+    },
+    "replayed": false,
+    "to_plugin_id": "claude-code",
+    "witnessEntryHash": "df1a445e661d27cb63bfe8d6465d603044006315b4816a960de75129b7b58afd"
+  }
+}
