@@ -210,11 +210,29 @@ pub struct StandingRefusal {
     /// The request this refusal was decided on, for provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// What the refused ASK was for (Nova on #1418): `r` when the gate opened it for a read-only
+    /// tool, otherwise every mode. A standing grant lifts the refusal only when its modes include
+    /// these, so a `w`-only grant over a refused read leaves the refusal standing (the read is
+    /// still unauthorized, and the gate still answers it from the record instead of re-asking).
+    /// Absent on rows written before this field: read as every mode, the conservative side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<crate::server::grant_modes::Modes>,
 }
 
 impl StandingRefusal {
     pub fn covers(&self, path: &str) -> bool {
         covers_path(&self.path, self.recursive, path)
+    }
+
+    /// The modes the refused ask needed (every mode when unrecorded).
+    pub fn asked_modes(&self) -> crate::server::grant_modes::Modes {
+        self.modes.unwrap_or(crate::server::grant_modes::Modes::ALL)
+    }
+
+    /// Whether `grant` opens what this refusal closed: it covers the path AND its modes include
+    /// the modes the ask needed. Only such a grant lifts the refusal.
+    pub fn lifted_by(&self, grant: &StandingGrant) -> bool {
+        grant.member == self.member && grant.covers(&self.path) && grant.modes.includes(self.asked_modes())
     }
 }
 
@@ -710,20 +728,19 @@ impl StandingScopeStore {
     /// Add (or replace, keyed by `(member, path)`) a grant. Replacement rather than
     /// duplication, because two records for one path would make "revoked" ambiguous —
     /// and the superseded grant's history lives in the witness chain, not here.
-    /// The standing refusals of `member` that `grant` covers: the ones a standing grant lifts
-    /// (nomad on #1418: the record must not say "closed" while the door is open).
-    pub fn refusals_covered_by(&self, grant: &StandingGrant) -> Vec<StandingRefusal> {
-        self.refusals.iter()
-            .filter(|r| r.member == grant.member && grant.covers(&r.path))
-            .cloned()
-            .collect()
+    /// The standing refusals that `grant` lifts: the member's, covered by the grant, in the modes
+    /// the ask needed (nomad on #1418: the record must not say "closed" while the door is open;
+    /// Nova: a `w`-only grant opens no read, so it lifts no refused read).
+    pub fn refusals_lifted_by(&self, grant: &StandingGrant) -> Vec<StandingRefusal> {
+        self.refusals.iter().filter(|r| r.lifted_by(grant)).cloned().collect()
     }
 
     pub fn add(&mut self, grant: StandingGrant) {
-        // A standing grant that covers a standing refusal LIFTS it in the same act, so the store
-        // never says closed where a grant has opened the door. `commit_standing_scope` witnesses
-        // each lifted row (`scope_refusal_lifted`, by: grant) after the commit lands.
-        self.refusals.retain(|r| !(r.member == grant.member && grant.covers(&r.path)));
+        // A standing grant that OPENS what a standing refusal closed (path AND modes) LIFTS it in
+        // the same act, so the store never says closed where a grant has opened the door.
+        // `commit_standing_scope` witnesses each lifted row (`scope_refusal_lifted`, by: grant)
+        // after the commit lands. A narrower grant (w-only over a refused read) lifts nothing.
+        self.refusals.retain(|r| !r.lifted_by(&grant));
         self.grants
             .retain(|g| !(g.member == grant.member && g.path == grant.path));
         self.grants.push(grant);

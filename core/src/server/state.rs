@@ -622,6 +622,14 @@ pub struct ServerState {
     /// Never persisted: a restart reloads the vault copy, at which point memory and vault
     /// agree again (the grant resurrects, visibly, and a fresh revoke takes the normal path).
     pub standing_scope_dirty: bool,
+    /// TEST SEAMS for the two-phase witness arms that no external injection can time: a chain
+    /// append that fails for the named event types only (so an intent lands and its success row
+    /// does not), and a `persist_standing_scope` that fails (the memory-first rollback's vault
+    /// write). Compiled out of the daemon.
+    #[cfg(test)]
+    pub chain_fault_on: std::collections::HashSet<String>,
+    #[cfg(test)]
+    pub vault_fault_on_persist: bool,
     /// Moves on every policy republish (`server::published`).
     pub publication_version: u64,
     /// The vault policy-list generation the current publication was built from.
@@ -1063,6 +1071,10 @@ impl ServerState {
             standing_projection_audit: crate::server::published::Watched::new(None),
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
+            #[cfg(test)]
+            chain_fault_on: std::collections::HashSet::new(),
+            #[cfg(test)]
+            vault_fault_on_persist: false,
             publication_version: 0,
             published_lists_gen: u64::MAX,
             transport_bindings,
@@ -1434,6 +1446,10 @@ impl ServerState {
     /// entry points below — `commit_standing_scope` for widenings, `apply_standing_revoke`
     /// for tightenings — which encode what a failed persist means for each direction.
     pub fn persist_standing_scope(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.vault_fault_on_persist {
+            anyhow::bail!("injected vault fault (test seam)");
+        }
         crate::vault::save_doc(
             &mut self.vault,
             "scope",
@@ -1463,7 +1479,7 @@ impl ServerState {
         // route's own two-phase rows, not here.
         let lifted: Vec<crate::server::standing_scope::StandingRefusal> = self.standing_scope.refusals.iter()
             .filter(|old| !candidate.refusals.iter().any(|n| n.member == old.member && n.path == old.path))
-            .filter(|old| candidate.grants.iter().any(|g| g.member == old.member && g.covers(&old.path)))
+            .filter(|old| candidate.grants.iter().any(|g| old.lifted_by(g)))
             .cloned()
             .collect();
         *self.standing_scope = candidate;
@@ -1473,7 +1489,7 @@ impl ServerState {
         self.standing_scope_dirty = false;
         for r in lifted {
             let by = self.standing_scope.grants.iter()
-                .find(|g| g.member == r.member && g.covers(&r.path))
+                .find(|g| r.lifted_by(g))
                 .map(|g| format!("grant {}", g.request_id.clone().unwrap_or_else(|| g.path.clone())))
                 .unwrap_or_else(|| "grant".into());
             self.append_chain("scope_refusal_lifted", serde_json::json!({
@@ -1828,6 +1844,10 @@ impl ServerState {
         event_type: &str,
         event_data: serde_json::Value,
     ) -> Result<ChainEntry> {
+        #[cfg(test)]
+        if self.chain_fault_on.contains(event_type) {
+            anyhow::bail!("injected chain fault on {event_type} (test seam)");
+        }
         super::state_lock::time_section("chain.append", || {
             self.chain_store
                 .append(event_type, event_data, &self.sovereign_lct)

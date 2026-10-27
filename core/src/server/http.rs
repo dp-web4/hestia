@@ -3730,6 +3730,14 @@ pub(crate) async fn scope_decide_as(
     // the member exactly where a window-bound refusal would: refused for this request, and
     // free to re-ask after it, which the response says.
     if standing && !granted {
+        // What the ask was FOR: a read when the gate opened it for a read-only tool, else every
+        // mode (a member-filed ask names no tool; the conservative side). A later standing grant
+        // lifts the refusal only when its modes include these (Nova on #1418).
+        let asked = match gate_origin.as_ref() {
+            Some(g) if crate::server::handler::READ_ONLY_PATH_TOOLS.contains(&g.tool.as_str()) =>
+                crate::server::grant_modes::Modes::READ,
+            _ => crate::server::grant_modes::Modes::ALL,
+        };
         let refusal = crate::server::standing_scope::StandingRefusal {
             member: plugin_id.clone(),
             path: path.clone(),
@@ -3738,6 +3746,7 @@ pub(crate) async fn scope_decide_as(
             refused_by: decider.by.clone(),
             reason: reason.clone(),
             request_id: Some(request_id.clone()),
+            modes: Some(asked),
         };
         if let Err(e) = s.commit_standing_scope(|st| {
             st.refusals.retain(|r| !(r.member == refusal.member && r.path == refusal.path));
@@ -5901,13 +5910,44 @@ async fn scope_refusal_lift(
     let entry = match s.append_chain("scope_refusal_lifted", success) {
         Ok(e) => e,
         Err(e) => {
-            // The lift is live but its success is unrecorded: restore the refusal so the record
-            // and the store agree (the intent row says what was attempted).
-            let _ = s.commit_standing_scope(|st| { st.refusals.push(row.clone()); st.generation += 1; });
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("lift committed but its success could not be \
-                                                               witnessed ({e}); the refusal was restored"),
-                                            "intentEntryHash": intent.hash})));
+            // The lift is live but its success is unrecorded: the chain holds an intent and no
+            // `lifted`, which every reader takes as "not lifted", so the store must say the same.
+            // Restore the refusal MEMORY-FIRST (the tighter state, which cannot fail and is what
+            // the gate answers from), then persist. Nova on #1418: never claim a restoration the
+            // vault did not take. A failed persist is reported as what it is: memory tighter than
+            // the vault, the `standing_scope_dirty` window a failed revoke-persist uses, which a
+            // restart would reopen (the vault copy wins) and the next successful persist closes.
+            s.standing_scope.refusals.push(row.clone());
+            s.standing_scope.generation += 1;
+            match s.persist_standing_scope() {
+                Ok(()) => {
+                    s.standing_scope_dirty = false;
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("lift committed but its success could not be witnessed ({e}); \
+                                                  the refusal was restored, in memory and in the vault"),
+                                "state": "restored",
+                                "intentEntryHash": intent.hash})));
+                }
+                Err(e2) => {
+                    s.standing_scope_dirty = true;
+                    tracing::error!(plugin_id = %plugin_id, path = %path, intent = %intent.hash,
+                        "scope refusal lift: success unwitnessed ({e}) AND rollback persist failed ({e2}): \
+                         the refusal stands in memory, the vault holds the lift, repair required");
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("lift committed but its success could not be witnessed ({e}), \
+                                                  and restoring the refusal to the vault failed ({e2})"),
+                                "state": "UNKNOWN_REPAIR_REQUIRED",
+                                "detail": "the refusal stands in MEMORY and the gate answers from it; the VAULT \
+                                           still holds the lift and the chain holds only the intent, so a \
+                                           restart would reopen the door. Repair: once the vault is writable, \
+                                           any standing-scope write (a revoke retry, a decide) re-persists \
+                                           memory; or decide a later ask standing:false→true again.",
+                                "standing_scope_dirty": true,
+                                "intentEntryHash": intent.hash})));
+                }
+            }
         }
     };
     // Lifting means "asking again is welcome now": the window-bound refusal on the request this
@@ -13057,6 +13097,159 @@ mod disposition_tests {
         drop(s);
         let open = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
         assert_ne!(open["verdict"], "refused", "the door is open: {open}");
+    }
+
+    async fn lift(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = scope_refusal_lift(State(state.clone()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    // `grant(state, body)` (scope_grant → (status, body)) is the helper defined earlier in this module.
+
+    async fn lifted_rows(state: &SharedState) -> usize {
+        state.lock().await.recent_chain(300).iter().filter(|e| e.event_type == "scope_refusal_lifted").count()
+    }
+
+    /// Nova on #1418 (residual 2): a standing grant lifts a refusal only when it opens what the
+    /// refusal closed, path AND modes. A `w`-only grant over a refused READ leaves the refusal
+    /// standing (the read is still unauthorized); an `r` grant lifts it. A refused ask whose modes
+    /// are not known (a Bash act, a member-filed ask) is lifted only by an all-modes grant.
+    #[tokio::test]
+    async fn a_grant_narrower_than_the_refused_ask_lifts_nothing() {
+        let (dir, state) = test_state().await;
+        let _sid = connect(&state, "codex").await;
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let f = tree.join("held.txt");
+        std::fs::write(&f, "x").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        // A READ, refused standing: the refusal records `r`.
+        let act = format!("Read {p}");
+        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
+            "act": &act, "act_digest": digest_of(&act), "spend": false,
+            "host_session_id": "sess-under-test"})).await.unwrap();
+        let id = r["request_id"].as_str().expect(&format!("opened: {r}")).to_string();
+        let (st, out) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true, "reason": "not this file"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(state.lock().await.standing_scope.refusal_for("codex", &p).unwrap().asked_modes(),
+                   crate::server::grant_modes::Modes::READ);
+        let rows = lifted_rows(&state).await;
+        // w-only over the tree: covers the path, opens no read, lifts nothing, witnesses nothing.
+        let (st, out) = grant(&state, serde_json::json!({"plugin_id": "codex", "path": tree.to_str().unwrap(),
+            "recursive": true, "modes": "w", "reason": "they may write here"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p).is_some(),
+                "a w-only grant must not lift a refused read");
+        assert_eq!(lifted_rows(&state).await, rows, "no lift row for a lift that did not happen");
+        // The refused read is still answered from the record, not re-asked.
+        let again = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
+            "act": &act, "act_digest": digest_of(&act), "spend": false,
+            "host_session_id": "sess-under-test"})).await.unwrap();
+        assert_eq!(again["verdict"], "refused", "{again}");
+        assert_eq!(again["standing"], true, "{again}");
+        // `r` over the tree opens what was closed: lifted, witnessed.
+        let (st, out) = grant(&state, serde_json::json!({"plugin_id": "codex", "path": tree.to_str().unwrap(),
+            "recursive": true, "modes": "r", "reason": "they may read here"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p).is_none());
+        assert_eq!(lifted_rows(&state).await, rows + 1);
+        // An ask of unknown modes (a Bash act): only an all-modes grant lifts it.
+        let tree2 = dir.path().join("tree2");
+        std::fs::create_dir_all(&tree2).unwrap();
+        let f2 = tree2.join("x.txt");
+        std::fs::write(&f2, "x").unwrap();
+        let p2 = f2.to_str().unwrap().to_string();
+        let r = claim(&state, "codex", &p2, &format!("Write -> {p2}"), false).await;
+        let id2 = r["request_id"].as_str().unwrap().to_string();
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &id2, "granted": false, "standing": true, "reason": "closed"})).await.0, StatusCode::OK);
+        assert_eq!(state.lock().await.standing_scope.refusal_for("codex", &p2).unwrap().asked_modes(),
+                   crate::server::grant_modes::Modes::ALL);
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "codex", "path": tree2.to_str().unwrap(),
+            "recursive": true, "modes": "rwe", "reason": "most of it"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p2).is_some(), "rwe is not rwed");
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "codex", "path": tree2.to_str().unwrap(),
+            "recursive": true, "reason": "all of it"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p2).is_none());
+    }
+
+    /// Nova on #1418 (residual 1): when the lift's SUCCESS row cannot be witnessed, the refusal
+    /// is restored memory-first and persisted, and the response says which of the two happened.
+    /// Arm A: the persist lands → `restored`, vault and memory agree, the chain holds the intent
+    /// and no `lifted`. Arm B: the persist fails too → `UNKNOWN_REPAIR_REQUIRED`, the refusal
+    /// stands in memory (the gate still answers from it), `standing_scope_dirty` is set, and
+    /// nothing claims a restoration the vault did not take. Then, with both faults cleared, the
+    /// lift lands and names its intent.
+    #[tokio::test]
+    async fn a_lift_whose_success_cannot_be_witnessed_says_what_it_restored() {
+        let (dir, state) = test_state().await;
+        let f = dir.path().join("held.txt");
+        std::fs::write(&f, "x").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        let r = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        let id = r["request_id"].as_str().unwrap().to_string();
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true, "reason": "closed"})).await.0, StatusCode::OK);
+        async fn intents(state: &SharedState) -> usize {
+            state.lock().await.recent_chain(300).iter().filter(|e| e.event_type == "scope_refusal_lift_intent").count()
+        }
+        let (lifted0, intents0) = (lifted_rows(&state).await, intents(&state).await);
+        // Arm A: the success row faults, the rollback persists.
+        state.lock().await.chain_fault_on.insert("scope_refusal_lifted".into());
+        let (st, out) = lift(&state, serde_json::json!({"plugin_id": "codex", "path": &p, "reason": "lifting"})).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{out}");
+        assert_eq!(out["state"], "restored", "{out}");
+        {
+            let s = state.lock().await;
+            assert!(s.standing_scope.refusal_for("codex", &p).is_some(), "restored in memory");
+            assert!(!s.standing_scope_dirty, "the vault took the restoration");
+            let vault: crate::server::standing_scope::StandingScopeStore =
+                crate::vault::load_doc(&s.vault, "scope", "standing", "standing-scope.json").unwrap();
+            assert!(vault.refusals.iter().any(|r| r.member == "codex" && r.path == p), "restored in the vault");
+        }
+        assert_eq!(lifted_rows(&state).await, lifted0, "nothing claims a lift");
+        assert_eq!(intents(&state).await, intents0 + 1, "the attempt is on the record");
+        let again = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_eq!(again["verdict"], "refused", "{again}");
+        // Arm B: the success row faults AND the rollback's persist faults.
+        state.lock().await.vault_fault_on_persist = true;
+        let (st, out) = lift(&state, serde_json::json!({"plugin_id": "codex", "path": &p, "reason": "lifting"})).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{out}");
+        assert_eq!(out["state"], "UNKNOWN_REPAIR_REQUIRED", "{out}");
+        assert_eq!(out["standing_scope_dirty"], true, "{out}");
+        assert!(out["intentEntryHash"].as_str().is_some(), "{out}");
+        {
+            let s = state.lock().await;
+            assert!(s.standing_scope.refusal_for("codex", &p).is_some(), "memory keeps the tighter state");
+            assert!(s.standing_scope_dirty, "memory tighter than the vault is declared, not hidden");
+            let vault: crate::server::standing_scope::StandingScopeStore =
+                crate::vault::load_doc(&s.vault, "scope", "standing", "standing-scope.json").unwrap();
+            assert!(!vault.refusals.iter().any(|r| r.member == "codex" && r.path == p),
+                    "the vault holds the lift: the response must not say restored");
+        }
+        assert_eq!(lifted_rows(&state).await, lifted0, "still nothing claims a lift");
+        let again = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_eq!(again["verdict"], "refused", "the gate answers from memory: {again}");
+        // Faults cleared: the lift lands and its success names its intent.
+        {
+            let mut s = state.lock().await;
+            s.chain_fault_on.clear();
+            s.vault_fault_on_persist = false;
+        }
+        let (st, out) = lift(&state, serde_json::json!({"plugin_id": "codex", "path": &p, "reason": "lifting"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let s = state.lock().await;
+        assert!(s.standing_scope.refusal_for("codex", &p).is_none());
+        assert!(!s.standing_scope_dirty, "a successful commit closes the window");
+        drop(s);
+        assert_eq!(lifted_rows(&state).await, lifted0 + 1);
     }
 
     /// Codex reviews of #1232, P2: RESERVE is all-or-none through the real handler's batch
