@@ -24020,7 +24020,19 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
 
     let plugin_id = require_string(args, "plugin_id")?;
     let role = optional_string(args, "role").unwrap_or_default();
-    let raw_path = require_string(args, "path")?;
+    // Reject ambiguous target selectors before consulting grants or writing a request.
+    // Repository request persistence/decision wiring is a subsequent #1402 slice;
+    // fail explicitly until it exists rather than laundering a repo ask into a path.
+    let target = super::grant_target::GrantTarget::from_request_args(args)
+        .map_err(anyhow::Error::msg)?;
+    let raw_path = match target {
+        super::grant_target::GrantTarget::Path { path, .. } => path,
+        super::grant_target::GrantTarget::Repository(_) => {
+            return Err(anyhow::anyhow!(
+                "repository member requests are not implemented yet; an operator may create an explicit repository standing grant"
+            ));
+        }
+    };
     // REQUIRED, and the reason the escalation channel had to be fixed twice: dp, 2026-08-02 —
     // "the escalations currently don't provide enough information to actually make an informed
     // decision." An operator staring at a member id and a path fragment is being asked to
@@ -32129,6 +32141,36 @@ mod durable_reads_tests {
     use super::*;
     use crate::storage::durability::durable_scope;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn member_request_target_preflight_preserves_path_and_refuses_ambiguity() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        for selectors in [
+            json!({"path":"/tmp/request-target", "repo":"owner/repo"}),
+            json!({"path":"/tmp/request-target", "repo":null}),
+            json!({"repo":"owner/repo"}),
+            json!({"repo":"repo"}),
+            json!({"path":"/tmp/request-target", "recursive":true}),
+        ] {
+            let before = tool_query_history(&state, &json!({"filter":{"limit":100}})).await.unwrap();
+            let mut args = selectors;
+            args["plugin_id"] = json!("codex");
+            args["reason"] = json!("inspect the requested evidence");
+            assert!(tool_request_scope(&state, &args).await.is_err());
+            assert!(state.lock().await.scope_requests.is_empty());
+            let after = tool_query_history(&state, &json!({"filter":{"limit":100}})).await.unwrap();
+            assert_eq!(before, after, "invalid target appended a witness");
+        }
+        let result = tool_request_scope(&state, &json!({
+            "plugin_id":"codex", "path":"/tmp/request-target",
+            "reason":"inspect the requested evidence"
+        })).await.unwrap();
+        assert_eq!(result["status"], "pending");
+        assert_eq!(result["path"], "/tmp/request-target");
+        assert_eq!(result["permits_read"], false);
+        assert_eq!(state.lock().await.scope_requests.len(), 1);
+    }
 
     /// Readers of all three kinds — the published snapshot (`scope_status`), the chain
     /// (`query_history`) and in-memory state (`hestia://scope/<id>`) — do not return while what

@@ -16,6 +16,30 @@ pub enum GrantTarget {
 }
 
 impl GrantTarget {
+    /// Parse a member's narrow ask without treating unrelated request metadata as
+    /// target fields. Presence (including null) matters: never discard a second
+    /// selector and accidentally ask for a different domain. Breadth is decided
+    /// by the operator; this parser cannot request a recursive grant.
+    pub fn from_request_args(args: &serde_json::Value) -> Result<Self, String> {
+        let object = args.as_object().ok_or("scope request must be an object")?;
+        if object.contains_key("path") == object.contains_key("repo") {
+            return Err("scope request requires exactly one of path or repo".into());
+        }
+        if object
+            .get("recursive")
+            .is_some_and(|v| v != &serde_json::Value::Bool(false))
+        {
+            return Err("scope request breadth is decided by the operator".into());
+        }
+        let mut target = serde_json::Map::new();
+        for key in ["path", "repo"] {
+            if let Some(value) = object.get(key) {
+                target.insert(key.into(), value.clone());
+            }
+        }
+        serde_json::from_value(serde_json::Value::Object(target)).map_err(|e| e.to_string())
+    }
+
     /// Identity within one member's grants. Recursion is mutable reach, not a
     /// second identity: replacing an exact grant with a subtree must replace the
     /// same row. Callers must still compare the member separately.
@@ -87,6 +111,53 @@ impl From<GrantTarget> for TargetWire {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn member_request_keeps_domain_and_ignores_only_metadata() {
+        let path = GrantTarget::from_request_args(&json!({
+            "path":"/work/file", "plugin_id":"member", "reason":"need evidence"
+        }))
+        .unwrap();
+        assert_eq!(path.as_path(), Some(("/work/file", false)));
+        let repo = GrantTarget::from_request_args(&json!({
+            "repo":"OWNER/Repo", "plugin_id":"member", "recursive":false
+        }))
+        .unwrap();
+        assert_eq!(
+            repo,
+            GrantTarget::Repository(RepositoryTarget::parse("owner/repo").unwrap())
+        );
+        assert_eq!(repo.as_path(), None);
+        assert!(!repo.same_identity(&GrantTarget::Repository(
+            RepositoryTarget::parse("other/repo").unwrap()
+        )));
+    }
+
+    #[test]
+    fn member_request_rejects_ambiguous_selectors_and_member_breadth() {
+        for args in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"repo":null}),
+            json!({"path":null}),
+            json!({"path":"/a", "repo":null}),
+            json!({"path":null, "repo":"owner/repo"}),
+            json!({"path":"/a", "repo":"owner/repo"}),
+            json!({"repo":"repo"}),
+            json!({"repo":"owner/*"}),
+            json!({"repo":"https://github.com/owner/repo"}),
+            json!({"path":"/a", "recursive":true}),
+            json!({"repo":"owner/repo", "recursive":true}),
+            json!({"path":"/a", "recursive":null}),
+            json!({"path":"/a", "recursive":"false"}),
+        ] {
+            assert!(
+                GrantTarget::from_request_args(&args).is_err(),
+                "accepted {args}"
+            );
+        }
+    }
 
     #[test]
     fn identity_ignores_reach_but_equality_retains_it() {
