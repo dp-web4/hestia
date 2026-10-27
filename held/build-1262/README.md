@@ -1,10 +1,10 @@
 # held: #1262 re-cut on main (critical-timeout protocol, canonical or MISWIRED)
 
-kimi-code's #1262, round-2 head `d94149b3` (10-07), merged with main `95d6d0b7`. **NOT applied.**
+kimi-code's #1262, round-2 head `d94149b3` (10-07), merged with main (`95d6d0b7`, re-cut on `2b3d0ca2`). **NOT applied.**
 kimi-code handed the PR over on 10-26. Its commits are the change; this directory only re-cuts
 it so it applies to today's main.
 
-Patch: `held/565e424e1adfd6bd3ed8fb3a5c03b8c9fe699517b68a8464c5f749454bf58003.patch` (19 files:
+Patch: `held/9ee3fe6c1efdb3dc80ea11d7fa70ec03d143af08bcdf46cd2041e6409b6e56b9.patch` (re-cut 2026-10-27 on main `2b3d0ca2`, after #1412 moved the manifests; the sources are unchanged). Superseded: `held/565e424e….patch` (on `95d6d0b7`) (19 files:
 the same set as #1262, sources plus the hooks-gt mirror and manifests).
 
 ## The conflicts, and how they were resolved
