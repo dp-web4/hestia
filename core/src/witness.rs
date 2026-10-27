@@ -37,6 +37,121 @@ use web4_core::{
     Attestation, AttestationType, BIRTH_WITNESS_QUORUM, BirthCertificate, BirthContext, PublicKey,
 };
 
+/// The canonical, key-derived LCT id prefix ([`web4_core::lct::derive_lct_id`],
+/// canon §2.3): `lct:web4:mb32:` plus the `b` multibase tag for RFC 4648
+/// base32-lowercase-no-pad.
+pub const CANONICAL_LCT_ID_PREFIX: &str = "lct:web4:mb32:b";
+
+/// The base32 body length of a derived id: SHA-256 is 32 bytes = 256 bits, and
+/// `ceil(256 / 5) = 52` characters with no padding.
+pub const CANONICAL_LCT_ID_BODY_LEN: usize = 52;
+
+/// The only two characters a derived id can end with. 52 base32 characters hold
+/// 260 bits; a 256-bit digest supplies 256, so the final character's low **four
+/// bits are padding and are always zero** — leaving alphabet index 0 (`a`) or 16
+/// (`q`). Measured over 20 000 random digests: exactly these two, ~50/50. This
+/// is the clause that rejects a hand-typed, truncated or transcribed id that
+/// already passed prefix, length and alphabet.
+const CANONICAL_LCT_ID_TAIL: [char; 2] = ['a', 'q'];
+
+/// Why a subject id is not the canonical, key-derived form [`attest`] will sign.
+///
+/// Each variant names what to hand it instead, because every one of these is
+/// otherwise indistinguishable at the far end: an attestation over a
+/// non-canonical subject is well-formed, correctly signed, and structurally
+/// incapable of ever verifying — and the verifier reports it as the generic
+/// "quorum not met".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectIdError {
+    /// `lct:web4:member:{uuid}` — a real id in the *membership* space. The hub
+    /// keys membership on `Uuid` and the registry keys on the derived id; the
+    /// two are linked only by pubkey equality, and nothing checks it.
+    MembershipIdSpace(String),
+    /// Not the `lct:web4:mb32:` space at all.
+    WrongSpace(String),
+    /// Right space, wrong body length.
+    BodyLength { got: usize },
+    /// A character outside the base32-lowercase-no-pad alphabet (`a-z2-7`).
+    Alphabet { ch: char },
+    /// 52 well-formed base32 characters whose final character carries non-zero
+    /// padding bits — so it is not the encoding of any 32-byte digest.
+    PaddingBits { last: char },
+}
+
+impl std::fmt::Display for SubjectIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MembershipIdSpace(id) => write!(
+                f,
+                "subject '{id}' is a membership id, not a published LCT id — attestations are \
+                 signed over the registry's key-derived `{CANONICAL_LCT_ID_PREFIX}…` id. Look the \
+                 member up in the registry and pass its published `lct_id`."
+            ),
+            Self::WrongSpace(id) => write!(
+                f,
+                "subject '{id}' is not a key-derived LCT id (expected the \
+                 `{CANONICAL_LCT_ID_PREFIX}…` form)"
+            ),
+            Self::BodyLength { got } => write!(
+                f,
+                "subject id body is {got} characters, expected {CANONICAL_LCT_ID_BODY_LEN} \
+                 (a truncated or elongated id)"
+            ),
+            Self::Alphabet { ch } => write!(
+                f,
+                "subject id contains '{ch}', which is outside base32-lowercase-no-pad (a-z2-7)"
+            ),
+            Self::PaddingBits { last } => write!(
+                f,
+                "subject id ends in '{last}': a 32-byte digest leaves four zero padding bits, so \
+                 the last character is always 'a' or 'q'. This id cannot encode any digest."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubjectIdError {}
+
+/// **R6.** Accept `subject_lct_id` only if it is the canonical, key-derived form
+/// [`web4_core::lct::derive_lct_id`] produces; otherwise say precisely why.
+///
+/// This is a **refusal, not a translation**, and it cannot be a translation:
+/// there is no mapping from `lct:web4:member:{uuid}` back to the key-derived id
+/// without the key, and inventing one would be exactly the id-forgery the
+/// derived form exists to prevent. The check is *syntactic* — it cannot prove an
+/// id IS someone's derived id (that needs the pubkey), only refuse ids that
+/// provably are not anyone's.
+///
+/// Four clauses: the `lct:web4:mb32:b` prefix, a 52-character body, the
+/// base32-lowercase-no-pad alphabet, and the two-value tail
+/// ([`CANONICAL_LCT_ID_TAIL`]) that falls out of encoding exactly 256 bits.
+pub fn canonical_subject_id(subject_lct_id: &str) -> Result<&str, SubjectIdError> {
+    let Some(body) = subject_lct_id.strip_prefix(CANONICAL_LCT_ID_PREFIX) else {
+        return Err(if subject_lct_id.starts_with("lct:web4:member:") {
+            SubjectIdError::MembershipIdSpace(subject_lct_id.to_string())
+        } else {
+            SubjectIdError::WrongSpace(subject_lct_id.to_string())
+        });
+    };
+    if body.chars().count() != CANONICAL_LCT_ID_BODY_LEN {
+        return Err(SubjectIdError::BodyLength { got: body.chars().count() });
+    }
+    if let Some(ch) = body.chars().find(|c| !matches!(c, 'a'..='z' | '2'..='7')) {
+        return Err(SubjectIdError::Alphabet { ch });
+    }
+    let last = body.chars().next_back().expect("52 characters, checked above");
+    if !CANONICAL_LCT_ID_TAIL.contains(&last) {
+        return Err(SubjectIdError::PaddingBits { last });
+    }
+    Ok(subject_lct_id)
+}
+
+/// `true` iff `id` passes [`canonical_subject_id`]. The predicate HUB's witness
+/// roster keys on — one mapping, not two (HUB's R6 note, 2026-08-21).
+pub fn is_canonical_lct_id(id: &str) -> bool {
+    canonical_subject_id(id).is_ok()
+}
+
 /// The `OperationalKey::purpose` under which a member vouches the key it signs
 /// witness attestations with. Named once here because the literal is load-bearing
 /// across a repo boundary and fails SILENTLY when it drifts: `verify_quorum`'s
@@ -182,6 +297,9 @@ pub struct QuorumReport {
     pub unresolved_witness: Vec<String>,
     pub bad_signature: Vec<String>,
     pub duplicate_witness: Vec<String>,
+    /// R6: why the subject itself is not the canonical key-derived id, if it is not.
+    /// When set, nothing is counted: no attestation over it can ever be evidence.
+    pub subject_refused: Option<SubjectIdError>,
     /// A different witness id whose key another counted witness already holds (R1).
     pub shared_key: Vec<String>,
     pub distinct_valid: Vec<String>,
@@ -201,9 +319,13 @@ impl QuorumReport {
             unresolved_witness: Vec::new(),
             bad_signature: Vec::new(),
             duplicate_witness: Vec::new(),
+            subject_refused: canonical_subject_id(subject_lct_id).err(),
             shared_key: Vec::new(),
             distinct_valid: Vec::new(),
         };
+        if r.subject_refused.is_some() {
+            return r;
+        }
         let mut distinct = Distinct::default();
         for a in attestations {
             if a.attestation_type != AttestationType::Existence {
@@ -238,6 +360,9 @@ impl QuorumReport {
             self.attestations_supplied,
             self.distinct_valid.len()
         );
+        if let Some(why) = &self.subject_refused {
+            out.push_str(&format!("\n  the subject cannot be attested: {why}"));
+        }
         if self.wrong_type > 0 {
             out.push_str(&format!("\n  {} not of type Existence", self.wrong_type));
         }
@@ -306,6 +431,11 @@ pub fn valid_distinct_existence<'a, F>(
 where
     F: Fn(&str) -> Option<PublicKey>,
 {
+    // R6: an attestation over a subject that is not the key-derived form can never be
+    // anyone's citizenship evidence; QuorumReport names it as the cause.
+    if canonical_subject_id(subject_lct_id).is_err() {
+        return Vec::new();
+    }
     let mut distinct = Distinct::default();
     attestations
         .iter()
@@ -366,6 +496,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A real key-derived subject id (R6). The readable stand-in `lct:web4:mb32:bsubject` has a
+    /// 7-character body where a derived id has 52: the corpus demonstrated the defect R6 refuses.
+    fn canonical_subject() -> String {
+        web4_core::derive_lct_id(&web4_core::crypto::KeyPair::generate().verifying_key())
+    }
+
     use super::*;
     use web4_core::crypto::KeyPair;
 
@@ -440,7 +576,8 @@ mod tests {
 
     #[test]
     fn quorum_report_separates_no_answer_from_no_resolution() {
-        let subject = "lct:web4:mb32:bsubject";
+        let subject_id = canonical_subject();
+        let subject = subject_id.as_str();
         let seats: Vec<_> = (0..3).map(|_| witness_seat()).collect();
         let atts: Vec<_> = seats
             .iter()
@@ -474,7 +611,8 @@ mod tests {
 
     #[test]
     fn quorum_report_names_duplicates_and_bad_signatures() {
-        let subject = "lct:web4:mb32:bsubject";
+        let subject_id = canonical_subject();
+        let subject = subject_id.as_str();
         let seats: Vec<_> = (0..2).map(|_| witness_seat()).collect();
         let set =
             WitnessSet::from_documents(seats.iter().map(|(l, _, id)| (id.clone(), l.clone())));
@@ -526,7 +664,8 @@ mod tests {
 
     #[test]
     fn quorum_counts_distinct_valid_witnesses_only() {
-        let subject = "lct:web4:mb32:bsubject";
+        let subject_id = canonical_subject();
+        let subject = subject_id.as_str();
         let w: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
         let wid: Vec<String> = (0..3).map(|i| format!("lct:web4:member:w{i}")).collect();
         let resolver = {
@@ -559,7 +698,8 @@ mod tests {
 
     #[test]
     fn build_birth_certificate_is_quorum_gated() {
-        let subject = "lct:web4:mb32:bsubject";
+        let subject_id = canonical_subject();
+        let subject = subject_id.as_str();
         let w: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
         let wid: Vec<String> = (0..3).map(|i| format!("lct:web4:member:w{i}")).collect();
         let resolver = {
@@ -611,7 +751,8 @@ mod tests {
 
     #[test]
     fn invalid_and_unresolvable_witnesses_do_not_count() {
-        let subject = "lct:web4:mb32:bsubject";
+        let subject_id = canonical_subject();
+        let subject = subject_id.as_str();
         let good = KeyPair::generate();
         let forger = KeyPair::generate();
         // one valid, and one whose recorded witness id resolves to a DIFFERENT key

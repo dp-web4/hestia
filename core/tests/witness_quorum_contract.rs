@@ -280,3 +280,32 @@ fn c5_an_attestation_over_the_other_id_space_can_never_verify() {
         "MEASURED: and worthless under the id the registry knows"
     );
 }
+
+/// **R6 — a subject that is not the canonical key-derived id is refused by name**, at the
+/// CLI before the vault, and in the quorum: the authority counts nothing over it and the
+/// report says why, instead of a bare "quorum not met".
+#[test]
+fn r6_a_non_canonical_subject_is_refused_with_its_reason() {
+    use hestia::witness::{canonical_subject_id, is_canonical_lct_id, SubjectIdError};
+    let real = web4_core::derive_lct_id(&KeyPair::generate().verifying_key());
+    assert!(is_canonical_lct_id(&real), "a derived id passes: {real}");
+    assert!(matches!(canonical_subject_id("lct:web4:member:1b4e28ba-2fa1-11d2-883f-0016d3cca427"),
+                     Err(SubjectIdError::MembershipIdSpace(_))));
+    assert!(matches!(canonical_subject_id("lct:web4:role:citizen"), Err(SubjectIdError::WrongSpace(_))));
+    assert!(matches!(canonical_subject_id("lct:web4:mb32:bsubject"), Err(SubjectIdError::BodyLength { got: 7 })));
+    // 52 well-formed characters whose last carries non-zero padding bits ('b' is neither 'a' nor 'q')
+    let bad_tail = format!("{}b", &real[..real.len() - 1]);
+    assert!(matches!(canonical_subject_id(&bad_tail), Err(SubjectIdError::PaddingBits { last: 'b' })));
+
+    // three independent witnesses over a stand-in subject: nothing counts, and the cause is named
+    let ts = fixed_ts();
+    let ops: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+    let registry: Vec<Lct> = ops.iter().map(|op| onboarded(op).0).collect();
+    let stand_in = "lct:web4:mb32:bsubject";
+    let atts: Vec<Attestation> = registry.iter().zip(&ops)
+        .map(|(m, op)| hestia::witness::attest(stand_in, &m.lct_id(), ts, op)).collect();
+    let report = hestia::witness::QuorumReport::assess(stand_in, &atts, resolver(&registry));
+    assert!(report.subject_refused.is_some() && report.distinct_valid.is_empty(), "{report:?}");
+    assert!(report.explain().contains("cannot be attested"), "{}", report.explain());
+    assert!(hestia::witness::valid_distinct_existence(stand_in, &atts, resolver(&registry)).is_empty());
+}

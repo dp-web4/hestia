@@ -1916,6 +1916,12 @@ fn cmd_witness_attest(
     out: Option<String>,
 ) -> AnyResult<()> {
     use hestia::hub::MemberKeySource;
+    // R6, BEFORE the vault: an unattended session gets the reason, not the tty-only passphrase
+    // prompt, and a signature over a subject that is not a key-derived id is never made (it is
+    // well-formed, signed, and can never verify, reported far away as "quorum not met").
+    if let Err(why) = hestia::witness::canonical_subject_id(subject_lct_id) {
+        anyhow::bail!("not attesting: {why}");
+    }
     let vault = open_vault(home)?;
     let store = HubStore::load(&vault)?;
     // Resolve which connection's pinned key witnesses (the operational key the
