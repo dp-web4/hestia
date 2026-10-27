@@ -260,6 +260,20 @@ def _strip_prose(src):
     return "\n".join(out)
 
 
+def _scratch_base():
+    """Allow restricted runners to put fixtures in their writable checkout.
+
+    Resolve before checking: a symlink into a globally allowed temporary root would
+    make scope assertions vacuous just like using that root directly.
+    """
+    base = os.path.realpath(os.environ.get(
+        "HESTIA_GATE_TEST_BASE", os.path.expanduser("~/.cache/hestia-gate-core-tests")))
+    if any(base == root or base.startswith(root + "/") for root in ("/tmp", "/var/tmp")):
+        raise ValueError("gate test fixtures must be outside globally allowed temp roots")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
 def _workspace():
     """A scratch workspace that is NOT under /tmp.
 
@@ -267,8 +281,7 @@ def _workspace():
     allowed wholesale and every scope assertion passes for the wrong reason — five green
     checks that measured nothing. Exactly the null-state twin: a pass bit-identical to 'the
     gate is not running'."""
-    base = os.path.expanduser("~/.cache/hestia-gate-core-tests")
-    os.makedirs(base, exist_ok=True)
+    base = _scratch_base()
     ws = tempfile.mkdtemp(dir=base)
     assert not ws.startswith(("/tmp", "/var/tmp")), ws
     return ws
@@ -688,7 +701,7 @@ def test_home_marker_is_a_path_boundary_not_a_substring():
 
     # A symlinked home dir matches under both its lexical and resolved spellings
     # (markers resolve via expanduser AND realpath).
-    base = os.path.expanduser("~/.cache/hestia-gate-core-tests")
+    base = _scratch_base()
     real = tempfile.mkdtemp(dir=base)
     link = os.path.join(base, f"link-{os.path.basename(real)}")
     os.symlink(real, link)

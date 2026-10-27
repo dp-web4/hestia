@@ -1445,6 +1445,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
                 "expires_at": g.expires_at,
             }), g.modes))
             .collect::<Vec<_>>(),
+        "repository_grants": p.repository_grants(&who.plugin_id, crate::server::gate_escalation::now_secs()),
         "law": statements,
     });
 
@@ -1496,6 +1497,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // hash covers, for both grant lists.
         "scope_grants": out.get("scope_grants").cloned().unwrap_or(Value::Null),
         "standing_grants": out.get("standing_grants").cloned().unwrap_or(Value::Null),
+        "repository_grants": out.get("repository_grants").cloned().unwrap_or(Value::Null),
         "law": out.get("law").cloned().unwrap_or(Value::Null),
         // Quote THIS to say which law you read: it covers every layer, every bound list,
         // and the redaction applied to you. `society_policy_hash` is kept only because
@@ -24168,7 +24170,7 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         for r in s.live_scope_grants(&plugin_id) {
             horizon = horizon.min(r.expires_at);
         }
-        for g in s.live_standing_grants(&plugin_id) {
+        for g in s.standing_scope.live_for(&plugin_id, now) {
             if let Some(e) = g.expires_at {
                 horizon = horizon.min(e);
             }
@@ -24303,6 +24305,8 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // EVERY live and standing grant with what it lets the member DO (#1345). See the
         // fail-closed note above: the two lists before this one hold only all-modes grants.
         "grants_by_mode": grants_by_mode,
+        // A mode-aware explicit repository channel; never path or floor reach.
+        "repository_grants": s.repository_grants(&plugin_id, now),
         // CERTIFICATION, issued by the authority — the two fields the plugin gate's
         // certified-replica logic (AgentPolicy) has demanded since 2026-08-04 with nothing
         // issuing them: WHICH policy this is (the standing store's monotonic generation,
@@ -27017,6 +27021,81 @@ mod standing_scope_surface_tests {
                    (json!("r"), json!(true), json!("standing")));
         assert_eq!(find("/w/live-r.md")["channel"], "live");
         assert_eq!(find("/w/full")["modes"], "rwed");
+    }
+
+    #[tokio::test]
+    async fn repository_operating_law_carries_and_hashes_mode_changes() {
+        use crate::server::{grant_target::GrantTarget, repository_target::RepositoryTarget};
+        let (_d, state) = test_state().await;
+        let connected = tool_connect(&state, &json!({"plugin_id":"codex", "host_agent":"test"})).await.unwrap();
+        let args = json!({"session_id":connected["sessionId"]});
+        let before = tool_operating_law(&state, &args).await.unwrap();
+        assert_eq!(before["repository_grants"], json!([]));
+        let now = crate::server::gate_escalation::now_secs();
+        let mut grant = standing("codex", "/unused", now, None);
+        grant.target = GrantTarget::Repository(RepositoryTarget::parse("owner/repo").unwrap());
+        grant.modes = crate::server::grant_modes::Modes::READ;
+        state.lock().await.standing_scope.add(grant.clone());
+        let read = tool_operating_law(&state, &args).await.unwrap();
+        assert_ne!(before["law_hash"], read["law_hash"]);
+        assert_eq!(read["repository_grants"][0]["entry"], "repo:owner/repo");
+        assert_eq!(read["repository_grants"][0]["modes"], "r");
+        assert_eq!(read["standing_grants"], before["standing_grants"]);
+        grant.modes = crate::server::grant_modes::Modes::ALL;
+        state.lock().await.standing_scope.add(grant.clone());
+        let full = tool_operating_law(&state, &args).await.unwrap();
+        assert_ne!(read["law_hash"], full["law_hash"]);
+        assert_eq!(full["repository_grants"][0]["modes"], "rwed");
+        state.lock().await.standing_scope.revoke_target("codex", &grant.target);
+        let revoked = tool_operating_law(&state, &args).await.unwrap();
+        assert_eq!(revoked["repository_grants"], json!([]));
+        assert_eq!(before["law_hash"], revoked["law_hash"]);
+    }
+
+    #[tokio::test]
+    async fn repository_projection_is_separate_expiring_and_revocable() {
+        use crate::server::{grant_target::GrantTarget, repository_target::RepositoryTarget};
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let target = GrantTarget::Repository(RepositoryTarget::parse("Owner/Repo").unwrap());
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.add(standing("codex", "owner/repo", now, None));
+            for (member, repo, expiry) in [
+                ("codex", "Owner/Repo", now + 60),
+                ("codex", "owner/expired", now - 1),
+                ("kimi-code", "other/private", now + 1),
+            ] {
+                let mut g = standing(member, "/unused", now, Some(expiry));
+                g.target = GrantTarget::Repository(RepositoryTarget::parse(repo).unwrap());
+                g.modes = crate::server::grant_modes::Modes::READ;
+                s.standing_scope.add(g);
+            }
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id":"codex"})).await.unwrap();
+        let repos = out["repository_grants"].as_array().unwrap();
+        assert_eq!(repos.len(), 1, "expired and other-member rows must be absent");
+        assert_eq!(repos[0]["repo"], "owner/repo");
+        assert_eq!(repos[0]["entry"], "repo:owner/repo");
+        assert_eq!(repos[0]["modes"], "r");
+        assert!(repos[0].get("path").is_none());
+        assert_eq!(out["snapshot_expires_at"], now + 60);
+        assert_eq!(out["standing_grants"].as_array().unwrap().len(), 1);
+        assert_eq!(out["grants_by_mode"].as_array().unwrap().len(), 1);
+        assert_eq!(out["grants_by_mode"][0]["path"], "owner/repo");
+        assert_eq!(out["grants_by_mode"][0]["modes"], "rwed");
+        let published = state.published();
+        assert!(published.repository_grants("codex", now + 60).is_empty());
+        assert!(published.repository_grants("unknown", now).is_empty());
+        {
+            let mut s = state.lock().await;
+            assert!(s.standing_scope.revoke_target("codex", &target));
+        }
+        let revoked = tool_scope_status(&state, &json!({"plugin_id":"codex"})).await.unwrap();
+        assert!(revoked["repository_grants"].as_array().unwrap().is_empty());
+        assert!(revoked["generation"].as_u64() > out["generation"].as_u64());
+        assert_eq!(revoked["standing_grants"], out["standing_grants"]);
+        assert!(revoked["snapshot_expires_at"].as_u64().unwrap() > now + 60);
     }
 
     #[tokio::test]

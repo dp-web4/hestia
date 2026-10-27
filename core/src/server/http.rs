@@ -4690,6 +4690,7 @@ fn grant_binding_of(v: &serde_json::Value) -> serde_json::Value {
 
 async fn scope_grant(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let plugin_id = body
@@ -4704,7 +4705,7 @@ async fn scope_grant(
         .unwrap_or("")
         .trim()
         .to_string();
-    if plugin_id.is_empty() || raw_path.is_empty() {
+    if plugin_id.is_empty() || (raw_path.is_empty() && !body.as_object().is_some_and(|b| b.contains_key("repo"))) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "plugin_id and path are required"})),
@@ -4730,22 +4731,43 @@ async fn scope_grant(
             })),
         );
     }
-    // #722: a relative `path:` grant can never match under #597 prefix containment — reject at the
-    // write site rather than store dead weight the seat reads as a workspace-wide grant it lacks.
-    if let Err(msg) = crate::server::state::require_absolute_grant_path(&path) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": msg})),
-        );
+    // Repository authority is explicit and owner-qualified; never inferred from a path.
+    let target = if body.get("repo").is_some() {
+        if body.get("path").is_some() || body.get("recursive").is_some_and(|v| v != &serde_json::json!(false)) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "repo excludes path and recursive reach"})));
+        }
+        let repo = match body.get("repo").and_then(|v| v.as_str())
+            .and_then(|v| crate::server::repository_target::RepositoryTarget::parse(v).ok()) {
+            Some(repo) => repo,
+            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "repo must be a qualified owner/name"}))),
+        };
+        if body.get("expected_existing").is_none() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "repository grant requires expected_existing (null for a new row)"})));
+        }
+        crate::server::grant_target::GrantTarget::Repository(repo)
+    } else {
+        if let Err(msg) = crate::server::state::require_absolute_grant_path(&path) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+        }
+        crate::server::grant_target::GrantTarget::Path {
+            path: path.clone(),
+            recursive: body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false),
+        }
+    };
+    if matches!(&target, crate::server::grant_target::GrantTarget::Repository(_))
+        && !gate.as_ref().is_some_and(|g| g.operator.as_ref().is_some_and(|v| !v.is_empty())
+            && g.gate_entry_hash.as_ref().is_some_and(|v| !v.is_empty())) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "repository grant requires a witnessed operator session"})));
     }
+    let recursive = target.as_path().is_some_and(|(_, recursive)| recursive);
     let now = crate::server::gate_escalation::now_secs();
-    let expires_at: Option<u64> = body
-        .get("expires_in_secs")
-        .and_then(|v| v.as_u64())
-        .filter(|w| *w > 0)
-        .map(|w| now + w);
-    // Exact by default; the operator opts into the subtree (dp, 2026-09-08).
-    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    let expires_at = match body.get("expires_in_secs") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_u64().filter(|w| *w > 0).and_then(|w| now.checked_add(w)) {
+            Some(expiry) => Some(expiry),
+            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "expires_in_secs must be positive and fit the clock"}))),
+        },
+    };
     // All four by default, today's meaning; the operator narrows explicitly (#1345).
     let modes = match modes_arg(&body) {
         Ok(m) => m,
@@ -4825,8 +4847,21 @@ async fn scope_grant(
     // callers keep working, and say nothing about what they saw.
     if let Some(expected) = body.get("expected_existing") {
         let now_b = crate::server::gate_escalation::now_secs();
-        let current = standing_grant_binding(&s.standing_scope.grants, &plugin_id, &path, now_b);
-        if grant_binding_of(expected) != current {
+        let (current, expected) = match &target {
+            crate::server::grant_target::GrantTarget::Path { .. } => (
+                standing_grant_binding(&s.standing_scope.grants, &plugin_id, &path, now_b),
+                grant_binding_of(expected),
+            ),
+            crate::server::grant_target::GrantTarget::Repository(_) => (
+                s.standing_scope.grants.iter()
+                    .find(|g| g.member == plugin_id && g.target.same_identity(&target)
+                        && g.expires_at.is_none_or(|e| now_b < e))
+                    .map(|g| serde_json::to_value(g).expect("standing grant serializes"))
+                    .unwrap_or(serde_json::Value::Null),
+                expected.clone(),
+            ),
+        };
+        if expected != current {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -4841,7 +4876,7 @@ async fn scope_grant(
         .standing_scope
         .grants
         .iter()
-        .any(|g| g.member == plugin_id && g.target.as_path().is_some_and(|(p, _)| p == path));
+        .any(|g| g.member == plugin_id && g.target.same_identity(&target));
 
     // ORDER: INTENT → COMMIT → SUCCESS, via the one function that owns it
     // (`witness_and_commit_standing_grant`). This used to append `scope_granted` and THEN
@@ -4850,7 +4885,7 @@ async fn scope_grant(
     // believe, with nothing to contradict it. GPT caught it on #462 and was right; I had
     // documented the outcome and called it "the safe direction, and legible", which was true
     // only against the OTHER ordering and did the work of a mechanism with a word.
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         // NULL, and load-bearing: this grant answered no ask. A reader that finds a
         // request_id here is looking at a ratification; one that finds null is looking at
         // an act the operator originated.
@@ -4876,11 +4911,23 @@ async fn scope_grant(
                        restart; revocable via /api/scope/standing/revoke; identity.json is \
                        untouched",
     });
+    if let crate::server::grant_target::GrantTarget::Repository(repo) = &target {
+        let row = record.as_object_mut().expect("record object");
+        row.remove("path");
+        row.remove("path_as_asked");
+        row.insert("repo".into(), serde_json::json!(repo));
+        row.insert("target_kind".into(), serde_json::json!("repository"));
+        row.insert("granted_by".into(), serde_json::json!(gate_operator(&gate)));
+        row.insert("durability".into(), serde_json::json!("STANDING — stored in the vault; survives restart and remains bounded by expires_at"));
+    }
+    record = stamp_gate(record, &gate);
     let grant = crate::server::standing_scope::StandingGrant {
         member: plugin_id.clone(),
-            target: crate::server::grant_target::GrantTarget::Path { path: path.clone(), recursive },
+            target: target.clone(),
         granted_at: now,
-        granted_by: "operator".to_string(),
+        granted_by: if matches!(&target, crate::server::grant_target::GrantTarget::Repository(_)) {
+            gate_operator(&gate)
+        } else { "operator".to_string() },
         reason: reason.clone(),
         expires_at,
         // None, for the same reason `request_id` is null in the record above.
@@ -4939,7 +4986,8 @@ async fn scope_grant(
         Json(serde_json::json!({
             "ok": true,
             "plugin_id": plugin_id,
-            "path": path,
+            "target": target,
+            "path": target.as_path().map(|(p, _)| p),
             "standing": true,
             "expires_at": expires_at,
             "generation": s.standing_scope.generation,
@@ -4948,7 +4996,7 @@ async fn scope_grant(
             // grant fails to help someone.
             "member_known": member_known,
             "note": if member_known {
-                "granted — durable until revoked or expiry; the gate consults it immediately"
+                "granted — durable until revoked or expiry; enforcement depends on the target projection"
             } else {
                 "GRANTED, BUT NO MEMBER BY THAT plugin_id HAS EVER CONNECTED to this daemon. \
                  That is legitimate if you are granting ahead of a first connect, and it is \
@@ -5807,6 +5855,7 @@ async fn scope_live_revoke(
 
 async fn scope_standing_revoke(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let plugin_id = body
@@ -5821,7 +5870,7 @@ async fn scope_standing_revoke(
         .unwrap_or("")
         .trim()
         .to_string();
-    if plugin_id.is_empty() || raw_path.is_empty() {
+    if plugin_id.is_empty() || (raw_path.is_empty() && body.get("repo").is_none()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "plugin_id and path are required"})),
@@ -5835,12 +5884,37 @@ async fn scope_standing_revoke(
         .trim()
         .to_string();
 
+    use crate::server::grant_target::GrantTarget;
+    let target = if let Some(repo) = body.get("repo") {
+        if body.get("path").is_some() || body.get("recursive").is_some() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"repo excludes path and recursive"})));
+        }
+        let Some(repo) = repo.as_str().and_then(|r| crate::server::repository_target::RepositoryTarget::parse(r).ok()) else {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"repo must be qualified owner/name"})));
+        };
+        if !gate.as_ref().is_some_and(|g| g.operator.as_ref().is_some_and(|v| !v.is_empty())
+            && g.gate_entry_hash.as_ref().is_some_and(|v| !v.is_empty())) {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"repository revoke requires a witnessed operator session"})));
+        }
+        GrantTarget::Repository(repo)
+    } else {
+        GrantTarget::Path { path: path.clone(), recursive: false }
+    };
     let mut s = state.lock().await;
-    let in_memory = s
-        .standing_scope
-        .grants
-        .iter()
-        .any(|g| g.member == plugin_id && g.target.as_path().is_some_and(|(p, _)| p == path));
+    let current = s.standing_scope.grants.iter()
+        .find(|g| g.member == plugin_id && g.target.same_identity(&target));
+    let in_memory = current.is_some();
+    if matches!(&target, GrantTarget::Repository(_)) {
+        let expected = body.get("expected_existing");
+        let parsed = expected.cloned().and_then(|v|
+            serde_json::from_value::<crate::server::standing_scope::StandingGrant>(v).ok());
+        if !parsed.as_ref().is_some_and(|g| g.member == plugin_id && g.target.same_identity(&target)) {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"repository revoke requires the exact existing typed row"})));
+        }
+        if current.is_some_and(|g| Some(serde_json::to_value(g).expect("grant serializes")).as_ref() != expected) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({"error":"standing grant changed; refresh before revoking"})));
+        }
+    }
     // 404 only when the store is CONSISTENT and holds no such grant — a typo, bounded here.
     // While `standing_scope_dirty` is set, memory is tighter than the vault (a prior revoke's
     // vault write failed after the row left memory), so a row absent from memory may still be
@@ -5853,9 +5927,23 @@ async fn scope_standing_revoke(
         );
     }
 
-    let entry = match s.append_chain(
-        "scope_standing_revoked",
-        serde_json::json!({
+    // A missing row cannot be compared in memory. Bind recovery to the exact durable
+    // revoke receipt returned on failure, rather than treating the global dirty bit as
+    // evidence that this particular row was ever revoked.
+    if !in_memory && matches!(&target, GrantTarget::Repository(_)) {
+        let receipt = body.get("retry_witness").and_then(|v| v.as_str())
+            .and_then(|hash| s.chain_store.read_by_hash(hash).ok().flatten());
+        if !receipt.as_ref().is_some_and(|e| e.event_type == "scope_standing_revoked"
+            && e.event_data["plugin_id"] == plugin_id
+            && e.event_data["target"] == serde_json::to_value(&target).expect("target serializes")
+            && e.event_data.get("expected_existing") == body.get("expected_existing")
+            && e.event_data["authorized_by_gate"].as_str().is_some_and(|v| !v.is_empty())) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({"error":
+                "dirty repository retry requires retry_witness from the matching failed revoke"})));
+        }
+    }
+
+    let mut record = serde_json::json!({
             "plugin_id": plugin_id,
             "subject_instance_lct": s.member_lct(&plugin_id),
             "path": path,
@@ -5870,8 +5958,17 @@ async fn scope_standing_revoke(
             } else {
                 s.standing_scope.generation
             },
-        }),
-    ) {
+        });
+    if let GrantTarget::Repository(repo) = &target {
+        let obj = record.as_object_mut().expect("record object");
+        obj.remove("path");
+        obj.insert("target".into(), serde_json::to_value(&target).expect("target serializes"));
+        obj.insert("repo".into(), serde_json::json!(repo.as_str()));
+        obj.insert("expected_existing".into(), body["expected_existing"].clone());
+        obj.insert("revoked_by".into(), serde_json::json!(gate.as_ref().and_then(|g| g.operator.as_ref())));
+        obj.insert("authorized_by_gate".into(), serde_json::json!(gate.as_ref().and_then(|g| g.gate_entry_hash.as_ref())));
+    }
+    let entry = match s.append_chain("scope_standing_revoked", record) {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -5884,7 +5981,7 @@ async fn scope_standing_revoke(
     };
 
     // Remove-from-memory-first, then persist; idempotent so the failure mode is retryable.
-    if let Err(e) = s.apply_standing_revoke(&plugin_id, &path) {
+    if let Err(e) = s.apply_standing_target_revoke(&plugin_id, &target) {
         // Memory is already the tighter state; keep it. The vault still holds the grant, so
         // a restart would resurrect a widening — said loudly, and THIS EXACT CALL is the
         // retry (the dirty flag keeps the door open even though the row has left memory).
@@ -5896,6 +5993,8 @@ async fn scope_standing_revoke(
                      successful retry would resurrect this grant; RETRY this same revoke to \
                      persist the removal"
                 ),
+                "retry_witness": entry.hash,
+                "retry_instruction": "for repository recovery resend the exact row plus retry_witness",
                 "witnessEntryHash": entry.hash,
             })),
         );
@@ -5906,7 +6005,8 @@ async fn scope_standing_revoke(
         Json(serde_json::json!({
             "ok": true,
             "plugin_id": plugin_id,
-            "path": path,
+            "path": target.as_path().map(|(p, _)| p),
+            "target": target,
             "retry_sync": !in_memory,
             "generation": s.standing_scope.generation,
             "witnessEntryHash": entry.hash,
@@ -11224,8 +11324,350 @@ mod disposition_tests {
             "plugin_id": id, "host_agent": "test"})).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn repository_operator_creation_preflights_and_witness() {
+        use crate::server::{repository_target::RepositoryTarget, grant_modes::Modes};
+        let (_dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        let base = serde_json::json!({"plugin_id":"codex", "repo":"Owner/Repo",
+            "reason":"reviewed read", "modes":"r", "expected_existing":null});
+        let denied = scope_grant(State(state.clone()), None, Json(base.clone())).await.into_response();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let before = snapshot(&*state.lock().await);
+        for delta in [
+            serde_json::json!({"path":"/work/repo"}),
+            serde_json::json!({"path":null}),
+            serde_json::json!({"repo":"repo"}),
+            serde_json::json!({"repo":null}),
+            serde_json::json!({"recursive":true}),
+            serde_json::json!({"expires_in_secs":18446744073709551615u64}),
+            serde_json::json!({"modes":"invalid"}),
+            serde_json::json!({"plugin_id":"unseen"}),
+        ] {
+            let mut body = base.clone();
+            body.as_object_mut().unwrap().extend(delta.as_object().unwrap().clone());
+            let (status, reply) = repo_grant(&state, body).await;
+            assert!(status.is_client_error(), "{reply}");
+            assert_eq!(snapshot(&*state.lock().await), before);
+        }
+        let mut unbound = base.clone();
+        unbound.as_object_mut().unwrap().remove("expected_existing");
+        assert_eq!(repo_grant(&state, unbound).await.0, StatusCode::BAD_REQUEST);
+        let (status, reply) = repo_grant(&state, base.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        let repo = RepositoryTarget::parse("owner/repo").unwrap();
+        let foreign = RepositoryTarget::parse("other/repo").unwrap();
+        {
+            let s = state.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            assert!(s.standing_scope.has_live_repository_for("codex", &repo, now, Modes::READ));
+            assert!(!s.standing_scope.has_live_repository_for("codex", &foreign, now, Modes::READ));
+            assert!(!s.standing_scope.has_live_repository_for("codex", &repo, now, Modes::ALL));
+            assert!(s.live_standing_grants("codex").is_empty());
+            assert!(!s.has_scope_grant("codex", "/work/repo"));
+            let chain = s.recent_chain(10);
+            for kind in ["scope_grant_intent", "scope_granted"] {
+                let row = chain.iter().find(|e| e.event_type == kind).unwrap();
+                assert_eq!(row.event_data["repo"], "owner/repo");
+                assert_eq!(row.event_data["granted_by"], "lct:web4:operator:test");
+                assert_eq!(row.event_data["authorized_by_gate"], "test-gate-witness");
+                assert!(row.event_data.get("path").is_none());
+                assert!(row.event_data["request_id"].is_null());
+            }
+        }
+        let after = snapshot(&*state.lock().await);
+        assert_eq!(repo_grant(&state, base.clone()).await.0, StatusCode::CONFLICT);
+        assert_eq!(snapshot(&*state.lock().await), after);
+        let current = serde_json::to_value(&state.lock().await.standing_scope.grants[0]).unwrap();
+        let mut replace = base;
+        replace["expected_existing"] = current;
+        replace["reason"] = serde_json::json!("new reviewed reason");
+        assert_eq!(repo_grant(&state, replace).await.0, StatusCode::OK);
+        assert_eq!(state.lock().await.standing_scope.grants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repository_operator_creation_incomplete_witness_and_retired_refuse() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        let body = serde_json::json!({"plugin_id":"codex", "repo":"owner/repo",
+            "reason":"reviewed read", "modes":"r", "expected_existing":null});
+        let before = snapshot(&*state.lock().await);
+        for (operator, hash) in [(None, Some("receipt")), (Some("operator"), None),
+            (Some(""), Some("receipt")), (Some("operator"), Some(""))] {
+            let gate = super::super::operator_auth::GateWitness {
+                operator: operator.map(String::from), provenance: None,
+                gate_entry_hash: hash.map(String::from),
+            };
+            let response = scope_grant(State(state.clone()), Some(axum::Extension(gate)),
+                Json(body.clone())).await.into_response();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(snapshot(&*state.lock().await), before);
+        }
+        for expiry in [serde_json::json!(0), serde_json::json!(-1), serde_json::json!("60"), serde_json::json!(1.5)] {
+            let mut invalid = body.clone(); invalid["expires_in_secs"] = expiry;
+            assert_eq!(repo_grant(&state, invalid).await.0, StatusCode::BAD_REQUEST);
+            assert_eq!(snapshot(&*state.lock().await), before);
+        }
+        let (status, reply) = retire(&state, "codex", serde_json::json!({
+            "reason":"test retirement", "ref":"test", "confirm_active":true})).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        let retired = snapshot(&*state.lock().await);
+        let mut ahead = body; ahead["grant_ahead_of_connect"] = serde_json::json!(true);
+        assert!(repo_grant(&state, ahead).await.0.is_client_error());
+        assert_eq!(snapshot(&*state.lock().await), retired);
+    }
+
+    #[tokio::test]
+    async fn repository_operator_creation_terminal_failure_and_restart() {
+        use crate::server::{repository_target::RepositoryTarget, grant_modes::Modes};
+        let (dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        let body = serde_json::json!({"plugin_id":"codex", "repo":"owner/repo",
+            "reason":"reviewed read", "modes":"r", "expected_existing":null,
+            "expires_in_secs":600});
+        let before = { let s = state.lock().await; (s.standing_scope.grants.clone(), s.standing_scope.generation) };
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_repo_terminal BEFORE INSERT ON chain_entries
+            WHEN NEW.event_type = 'scope_granted'
+            BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let (status, failure) = repo_grant(&state, body.clone()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failure["state"], "grant IS in force; chain holds only the intent");
+        assert!(failure["intentEntryHash"].as_str().is_some_and(|h| !h.is_empty()));
+        {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.grants.len(), before.0.len() + 1);
+            assert_eq!(s.standing_scope.generation, before.1 + 1);
+            assert!(s.recent_chain(20).iter().any(|e| e.event_type == "scope_grant_intent"));
+            assert!(!s.recent_chain(20).iter().any(|e| e.event_type == "scope_granted"));
+        }
+        conn.execute_batch("DROP TRIGGER fail_repo_terminal").unwrap();
+        drop(conn); drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        assert_eq!(state.lock().await.standing_scope.grants.len(), 1,
+            "LiveButUnconfirmed is durable, not rolled back");
+        assert_eq!(repo_grant(&state, body.clone()).await.0, StatusCode::CONFLICT,
+            "a new-row retry must not silently replace the committed grant");
+        let mut replacement = body;
+        replacement["expected_existing"] = serde_json::to_value(&state.lock().await.standing_scope.grants[0]).unwrap();
+        assert_eq!(repo_grant(&state, replacement).await.0, StatusCode::OK);
+        let saved = state.lock().await.standing_scope.grants.clone();
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.grants, saved, "created typed row survives encrypted reload");
+        let repo = RepositoryTarget::parse("owner/repo").unwrap();
+        let expiry = saved[0].expires_at.unwrap();
+        assert!(s.standing_scope.has_live_repository_for("codex", &repo, expiry - 1, Modes::READ));
+        assert!(!s.standing_scope.has_live_repository_for("codex", &repo, expiry, Modes::READ));
+        assert!(s.live_standing_grants("codex").is_empty(), "no filesystem projection");
+    }
+
+    #[tokio::test]
+    async fn repository_operator_revoke_binding_failure_retry_and_restart() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        for repo in ["owner/repo", "other/repo"] {
+            assert_eq!(repo_grant(&state, serde_json::json!({"plugin_id":"codex",
+                "repo":repo,"reason":"test","modes":"r","expected_existing":null})).await.0, StatusCode::OK);
+        }
+        assert_eq!(grant(&state, serde_json::json!({"plugin_id":"codex",
+            "path":"/work/repo","reason":"separate path"})).await.0, StatusCode::OK);
+        let expected = serde_json::to_value(&state.lock().await.standing_scope.grants[0]).unwrap();
+        let body = serde_json::json!({"plugin_id":"codex","repo":"owner/repo","expected_existing":expected});
+        let before = snapshot(&*state.lock().await);
+        let ungated = scope_standing_revoke(State(state.clone()), None, Json(body.clone())).await.into_response();
+        assert_eq!(ungated.status(), StatusCode::UNAUTHORIZED);
+        for delta in [serde_json::json!({"expected_existing":null}), serde_json::json!({"repo":"other/repo"}),
+            serde_json::json!({"path":"/work/repo"}), serde_json::json!({"recursive":false})] {
+            let mut b = body.clone(); b.as_object_mut().unwrap().extend(delta.as_object().unwrap().clone());
+            assert!(repo_revoke(&state,b).await.0.is_client_error());
+            assert_eq!(snapshot(&*state.lock().await),before);
+        }
+        let mut stale = body.clone(); stale["expected_existing"]["reason"] = serde_json::json!("stale");
+        assert_eq!(repo_revoke(&state,stale).await.0,StatusCode::CONFLICT);
+        assert_eq!(snapshot(&*state.lock().await),before);
+        // Failure removes only the named typed row in memory, then a bound retry persists it.
+        std::fs::set_permissions(dir.path(),std::fs::Permissions::from_mode(0o555)).unwrap();
+        let (code, failure) = repo_revoke(&state,body.clone()).await;
+        std::fs::set_permissions(dir.path(),std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(code,StatusCode::INTERNAL_SERVER_ERROR);
+        let generation = {
+            let s=state.lock().await;
+            assert!(s.standing_scope_dirty);
+            assert_eq!(s.standing_scope.grants.len(),2);
+            assert!(s.has_scope_grant("codex","/work/repo"));
+            s.standing_scope.generation
+        };
+        assert_eq!(repo_revoke(&state,body.clone()).await.0,StatusCode::CONFLICT);
+        let mut body=body;
+        body["retry_witness"]=failure["retry_witness"].clone();
+        let mut wrong=body.clone(); wrong["expected_existing"]["reason"]=serde_json::json!("wrong receipt row");
+        assert_eq!(repo_revoke(&state,wrong).await.0,StatusCode::CONFLICT);
+        let mut wrong=body.clone(); wrong["retry_witness"]=serde_json::json!("unknown");
+        assert_eq!(repo_revoke(&state,wrong).await.0,StatusCode::CONFLICT);
+        let (code, reply)=repo_revoke(&state,body.clone()).await;
+        assert_eq!(code,StatusCode::OK,"{reply}"); assert_eq!(reply["retry_sync"],true);
+        assert_eq!(state.lock().await.standing_scope.generation,generation);
+        assert!(!state.lock().await.standing_scope_dirty);
+        assert_eq!(repo_revoke(&state,body).await.0,StatusCode::NOT_FOUND);
+        drop(state);
+        let vault=Vault::open(dir.path().join("v.enc"),"p".into()).unwrap();
+        let state=crate::server::build_state(vault,dir.path(),"p").unwrap();
+        let s=state.lock().await;
+        assert_eq!(s.standing_scope.grants.len(),2);
+        assert!(s.standing_scope.grants.iter().all(|g| !matches!(&g.target,
+            crate::server::grant_target::GrantTarget::Repository(r) if r.as_str()=="owner/repo")));
+        let rows=s.recent_chain(30);
+        let record=rows.iter().find(|e|e.event_type=="scope_standing_revoked").unwrap();
+        assert_eq!(record.event_data["repo"],"owner/repo");
+        assert_eq!(record.event_data["authorized_by_gate"],"test-gate-witness");
+        assert_eq!(record.event_data["revoked_by"],"lct:web4:operator:test");
+        assert!(record.event_data.get("path").is_none());
+    }
+
+    #[tokio::test]
+    async fn repository_operator_revoke_witness_failure_and_legacy_path() {
+        let (dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        assert_eq!(repo_grant(&state, serde_json::json!({"plugin_id":"codex",
+            "repo":"owner/repo","reason":"test","modes":"r","expected_existing":null})).await.0, StatusCode::OK);
+        seed_grant(&state, "codex", "/work/repo", true).await;
+        let expected = serde_json::to_value(&state.lock().await.standing_scope.grants[0]).unwrap();
+        let body = serde_json::json!({"plugin_id":"codex","repo":"owner/repo","expected_existing":expected});
+        let before = snapshot(&*state.lock().await);
+        let vault_before = std::fs::read(dir.path().join("v.enc")).unwrap();
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_repo_revoke BEFORE INSERT ON chain_entries
+            WHEN NEW.event_type = 'scope_standing_revoked'
+            BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let (status, reply) = repo_revoke(&state, body.clone()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply}");
+        assert_eq!(snapshot(&*state.lock().await), before);
+        assert!(!state.lock().await.standing_scope_dirty);
+        assert_eq!(std::fs::read(dir.path().join("v.enc")).unwrap(), vault_before);
+        conn.execute_batch("DROP TRIGGER fail_repo_revoke").unwrap();
+        drop(conn);
+        let response = scope_standing_revoke(State(state.clone()), None,
+            Json(serde_json::json!({"plugin_id":"codex","path":"/work/repo"}))).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            assert!(!s.has_scope_grant("codex", "/work/repo/child"));
+            assert_eq!(s.standing_scope.grants.len(), 1);
+            assert_eq!(serde_json::to_value(&s.standing_scope.grants[0]).unwrap(), body["expected_existing"]);
+        }
+        assert_eq!(repo_revoke(&state, body).await.0, StatusCode::OK);
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        assert!(state.lock().await.standing_scope.grants.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repository_operator_http_authorization_and_bound_receipts() {
+        std::env::remove_var("HESTIA_OPERATOR_DEV_TOKEN");
+        let (_dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let bind = format!("127.0.0.1:{port}");
+        let served = state.clone();
+        let server = tokio::spawn(async move { let _ = super::serve_with_callback(served, &bind, None).await; });
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let mut up = false;
+        for _ in 0..600 {
+            if client.get(format!("{base}/api/scope/requests")).send().await.is_ok() { up = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(up);
+        let body = serde_json::json!({"plugin_id":"codex","repo":"owner/repo",
+            "reason":"http test","modes":"r","expected_existing":null});
+        for route in ["/api/scope/grant", "/api/scope/standing/revoke"] {
+            for token in [None, Some("not-a-session")] {
+                let before = { let s = state.lock().await; (s.standing_scope.grants.clone(), s.standing_scope.generation) };
+                let mut request = client.post(format!("{base}{route}")).json(&body);
+                if let Some(token) = token { request = request.bearer_auth(token); }
+                assert_eq!(request.send().await.unwrap().status(), reqwest::StatusCode::UNAUTHORIZED);
+                let s = state.lock().await;
+                assert_eq!((s.standing_scope.grants.clone(), s.standing_scope.generation), before);
+            }
+        }
+        let kp = web4_core::crypto::KeyPair::generate();
+        let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
+        {
+            let mut s = state.lock().await;
+            let mut policy = s.vault.policy().clone();
+            policy.operator_access.push(crate::vault::OperatorIdentity {
+                lct_id:lct_id.clone(), public_key_hex:hex::encode(kp.public_key_bytes()), label:"test operator".into() });
+            s.vault.set_policy(policy).unwrap(); s.reload_policy();
+        }
+        let ch: serde_json::Value = client.post(format!("{base}/api/operator/challenge"))
+            .send().await.unwrap().json().await.unwrap();
+        let challenge = ch["challenge"].as_str().unwrap();
+        let session: serde_json::Value = client.post(format!("{base}/api/operator/session"))
+            .json(&serde_json::json!({"lct_id":lct_id,"challenge":challenge,
+                "signature":kp.sign(challenge.as_bytes()).to_hex()}))
+            .send().await.unwrap().json().await.unwrap();
+        let token = session["token"].as_str().unwrap();
+        let created = client.post(format!("{base}/api/scope/grant")).bearer_auth(token).json(&body).send().await.unwrap();
+        assert_eq!(created.status(), reqwest::StatusCode::OK);
+        let row = serde_json::to_value(&state.lock().await.standing_scope.grants[0]).unwrap();
+        let revoke_body = serde_json::json!({"plugin_id":"codex","repo":"owner/repo","expected_existing":row});
+        for unauthorized in [None, Some("not-a-session")] {
+            let mut request = client.post(format!("{base}/api/scope/standing/revoke")).json(&revoke_body);
+            if let Some(bearer) = unauthorized { request = request.bearer_auth(bearer); }
+            assert_eq!(request.send().await.unwrap().status(), reqwest::StatusCode::UNAUTHORIZED);
+            assert_eq!(serde_json::to_value(&state.lock().await.standing_scope.grants[0]).unwrap(), row);
+        }
+        let revoked = client.post(format!("{base}/api/scope/standing/revoke")).bearer_auth(token)
+            .json(&serde_json::json!({"plugin_id":"codex","repo":"owner/repo","expected_existing":row})).send().await.unwrap();
+        assert_eq!(revoked.status(), reqwest::StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.standing_scope.grants.is_empty());
+        let rows = s.chain_store.read_recent(80).unwrap();
+        for (event, route, actor) in [("scope_granted", "POST /api/scope/grant", "granted_by"),
+            ("scope_standing_revoked", "POST /api/scope/standing/revoke", "revoked_by")] {
+            let act = rows.iter().find(|e| e.event_type == event).unwrap();
+            assert_eq!(act.event_data[actor], lct_id);
+            let gate = rows.iter().find(|e| Some(e.hash.as_str()) == act.event_data["authorized_by_gate"].as_str()).unwrap();
+            assert_eq!(gate.event_type, "operator_gate");
+            let data = gate.event_data.to_string();
+            assert!(data.contains(route), "{data}"); assert!(data.contains(&lct_id));
+        }
+        drop(s); server.abort();
+    }
+
+    async fn repo_revoke(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let gate=super::super::operator_auth::GateWitness {operator:Some("lct:web4:operator:test".into()),
+            provenance:None,gate_entry_hash:Some("test-gate-witness".into())};
+        let resp=scope_standing_revoke(State(state.clone()),Some(axum::Extension(gate)),Json(body)).await.into_response();
+        let status=resp.status();
+        let bytes=axum::body::to_bytes(resp.into_body(),1<<20).await.unwrap();
+        (status,serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn repo_grant(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let gate = super::super::operator_auth::GateWitness {
+            operator: Some("lct:web4:operator:test".into()), provenance: None,
+            gate_entry_hash: Some("test-gate-witness".into()),
+        };
+        let resp = scope_grant(State(state.clone()), Some(axum::Extension(gate)), Json(body)).await.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
     async fn grant(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
-        let resp = scope_grant(State(state.clone()), Json(body)).await.into_response();
+        let resp = scope_grant(State(state.clone()), None, Json(body)).await.into_response();
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
