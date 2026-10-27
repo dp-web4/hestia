@@ -643,6 +643,18 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_live_revoke", &[
         "\"subject_instance_lct\": s.member_lct(&req.plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-10-27 (cbp-claude, hestia#1417: a refusal can stand like a grant). The
+    // operator's lift of a standing refusal, the third sibling of the two revokes above.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `scope_refusal_lifted`
+    // chain entry — the member whose standing refusal the operator just lifted. `plugin_id`
+    // is operator-typed, exactly as in `scope_standing_revoke`; a typo 404s on the
+    // `refusals` lookup before this line runs. (2) Compared to decide control flow? No — the
+    // lift keys on the store's `(member, path)` strings; the derived LCT is serialised into
+    // the witness entry and read by nothing. Naming, like its siblings.
+    ("server/http.rs::scope_refusal_lift", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
     // ADDED 2026-09-08 (legion-claude, dp's "make standing" / "make recursive" buttons).
     // The census went red on the full `cargo test` after `--lib` was green — the exact
     // trap this file's header describes, and the reason the branch was not pushed on
