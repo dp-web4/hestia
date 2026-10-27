@@ -1,0 +1,623 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -3276,6 +3276,165 @@
+     return tuple(out)
+ 
+ 
++# ---- #1386: THE NEAREST EXPLICIT GRANT DECIDES ------------------------------------------------
++# dp, 2026-10-24: "if a specific path is reachable via an explicit grant, then that grant prevails
++# for that path (basically standing as separate governance path from nested). for paths with no
++# direct grant, the shortest nested grant applies" -- "if explicit grant, use explicit grant; else
++# traverse to ../ and repeat". Part B admitted a path through ANY covering grant (a union), so an
++# `r` grant on `a/b/**` beneath a full `a/**` admitted writes to `a/b`: the narrowing an operator
++# chose was silently widened by a broader grant above it. Here every grant is a NODE; the deepest
++# node covering a path decides it, with its modes (grants on one node union). A path no grant node
++# covers keeps today's order (the read-only floor for readers, then refusal), and the member's home
++# and temp roots stay unconditional. The floor's all-modes entries ride `scopes` like the member's
++# own full grants: safe here because the daemon withholds any floor entry overlapping a narrowed
++# grant in either direction (floor_for, #1385/#1387), so a served floor entry is never the node
++# above or below a narrowed one.
++
++def _plain_repo_name(name) -> bool:
++    """A bare workspace-repo name (one segment), as `_scope_entry_for_grant` writes for a
++    recursive grant on `<ws>/<name>`."""
++    return (isinstance(name, str) and bool(name) and "/" not in name and "\\" not in name
++            and name not in (".", "..", AgentPolicy.UNSCOPED))
++
++
++def _grant_nodes(scopes, mode_scopes, workspace: str) -> tuple:
++    """``(full, narrowed)``: each a list of ``(root, recursive, modes, spelling)``.
++
++    `spelling` says which form of a candidate path the node is compared with, mirroring the check
++    that admits it today: "real" for `path:` roots (`_within_path_grant` compares realpaths),
++    "lex" for repo-name entries (`path_in_scope`'s segment rule is lexical)."""
++    wsl = workspace.replace("\\", "/").rstrip("/")
++    full = [(r, rec, GRANT_MODES, "real") for r, rec in _scope_roots_with_reach(list(scopes), workspace)]
++    repos, _ = _scope_parts(scopes, workspace)
++    full += [(wsl + "/" + n, True, GRANT_MODES, "lex") for n in repos if _plain_repo_name(n)]
++    narrowed = []
++    for entry, modes in mode_scopes or ():
++        if not isinstance(entry, str):
++            continue
++        if entry.startswith("path:"):
++            narrowed += [(r, rec, modes, "real") for r, rec in _scope_roots_with_reach([entry], workspace)]
++        elif _plain_repo_name(entry):
++            narrowed.append((wsl + "/" + entry, True, modes, "lex"))
++    return full, narrowed
++
++
++def _precedence_matters(full, narrowed) -> bool:
++    """Whether some narrowed grant lies at or beneath ANOTHER grant node. Only then can the nearest
++    grant differ from the union part B judges by; otherwise every check below is skipped and the
++    verdict is exactly part B's."""
++    nodes = full + narrowed
++    for i, (root, _rec, _md, _k) in enumerate(narrowed):
++        for j, (r2, rec2, _m2, _k2) in enumerate(nodes):
++            if j == len(full) + i:
++                continue
++            if root == r2 or (rec2 and root.startswith(r2 + "/")):
++                return True
++    return False
++
++
++def _candidate_spellings(path: str, cwd: Optional[str]) -> tuple:
++    """``(lexical, real)`` for a candidate path, resolved the way `path_in_scope` resolves it."""
++    c = path.replace("\\", "/")
++    if c.startswith("~"):
++        c = os.path.expanduser(c).replace("\\", "/")
++    elif not c.startswith("/"):
++        c = os.path.join((cwd or os.getcwd()).replace("\\", "/"), c)
++    lex = os.path.normpath(c).replace("\\", "/").rstrip("/")
++    return lex, os.path.realpath(lex).replace("\\", "/").rstrip("/")
++
++
++def _nearest_grant(path: str, nodes, cwd: Optional[str]) -> Optional[str]:
++    """The modes of the nearest grant node covering `path` (grants on one node union), or None
++    when no grant node covers it. An exact grant covers only its own path; walking up, only
++    recursive grants apply."""
++    lex, real = _candidate_spellings(path, cwd)
++    best, held = -1, set()
++    for root, rec, modes, spelling in nodes:
++        cand = real if spelling == "real" else lex
++        if cand == root or (rec and cand.startswith(root + "/")):
++            depth = root.count("/")
++            if depth > best:
++                best, held = depth, set(modes)
++            elif depth == best:
++                held |= set(modes)
++    return None if best < 0 else "".join(m for m in GRANT_MODES if m in held)
++
++
++#: Tools whose act reaches exactly the one path they name, never beneath it (#1394 v2). Every
++#: other tool -- Grep/Glob/search and the other directory readers, git_restore/git_clean, any tool
++#: not listed here, and every shell line -- is treated as able to reach below a named directory.
++SINGLE_TARGET_TOOLS = frozenset({"Read", "read_file", "NotebookRead", "Write", "write_file", "Edit",
++                                 "MultiEdit", "NotebookEdit", "replace", "write_note", "run"})
++
++
++def _narrowed_beneath(path: str, narrowed, cwd: Optional[str]) -> list:
++    """``[(root, modes), ...]`` for every narrowed grant node strictly beneath `path`.
++
++    nomad's HOLD on #1394: part C judged the path an act NAMES, so with rwed on `proj/**` and a
++    narrowed `proj/sub/**`, `Grep proj` read a write-only child and `find proj -exec sed -i ...`
++    rewrote a read-only one -- the parent's grant admitted the named path, and the act reached the
++    child anyway. An act that can reach below what it names answers to these nodes too."""
++    lex, real = _candidate_spellings(path, cwd)
++    out = []
++    for root, _rec, modes, spelling in narrowed:
++        cand = real if spelling == "real" else lex
++        if root != cand and root.startswith(cand.rstrip("/") + "/"):
++            out.append((root, modes))
++    return out
++
++
++def _beneath_hint(child: str, modes: str, need: str) -> str:
++    missing = "".join(m for m in need if m not in modes)
++    return (f" This act can reach below the path it names, and {child} beneath it is narrowed to "
++            f"{modes}; the act needs {need} there (missing {missing}). A grant on the parent does not "
++            f"carry it into a narrower child: the nearest explicit grant decides (hestia #1386). Name "
++            f"paths that avoid the child, or act on the child within its own modes.")
++
++
++def _precedence_hint(near: str, need: str) -> str:
++    missing = "".join(m for m in need if m not in near)
++    return (f" The nearest grant here is narrowed to {near}; this act needs {need} (missing "
++            f"{missing}). A broader grant above it does not apply here: the nearest explicit "
++            f"grant decides (hestia #1386).")
++
++
++def _command_reached_paths(cmd: str, workspace: str, cwd: Optional[str], forbidden,
++                           home_markers) -> Optional[list]:
++    """Every path the command checker resolves for `cmd` (beyond home and temp roots), or None
++    when they cannot all be named within the gate's budget. Enumerated with the SAME resolver
++    that admits the command (`command_scope_reach`): each refusal names the path it refused, which
++    is then granted exactly (recursively, if exact is refused again) and the check re-run. No
++    second parser, so no second opinion about what a command reaches."""
++    got, extra = [], []
++    for _ in range(2 * SCOPE_JUDGE_BUDGET + 2):
++        ok, offending, refused = command_scope_reach(cmd, extra, workspace, cwd,
++                                                     forbidden=forbidden, home_markers=home_markers)
++        if ok:
++            return got
++        if (not refused or offending == _INCOMPLETE or refused.startswith(UNPRICEABLE_PREFIX)
++                or len(got) > SCOPE_JUDGE_BUDGET):
++            return None
++        if refused in got:
++            rec = "path:" + refused.rstrip("/") + RECURSIVE_SUFFIX
++            if rec in extra:
++                return None
++            extra.append(rec)
++            continue
++        got.append(refused)
++        extra.append("path:" + refused)
++    return None
++
++
++def nearest_grant_modes(policy: AgentPolicy, workspace: str, path: str,
++                        cwd: Optional[str] = None) -> Optional[str]:
++    """The gate's own answer for one path (#1386): the modes of the nearest grant covering it,
++    or None when no grant covers it. For a consumer that confines after the gate (SAGE's
++    dispatcher, its run mounts, the reach answer), so it decides exactly as the gate does."""
++    full, narrowed = _grant_nodes(list(policy.scope), list(getattr(policy, "mode_scope", ()) or ()),
++                                  workspace)
++    return _nearest_grant(path, full + narrowed, cwd)
++
++
+ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
+              workspace: Optional[str] = None,
+              policy: Optional[AgentPolicy] = None) -> Verdict:
+@@ -3369,10 +3528,28 @@
+                     f"scope (granted: {'+'.join(scopes)}); a repository is reached only by a qualified "
+                     f"grant '{need}' (a path grant, even recursive, does not reach a remote repository)",
+                 )
++    full_nodes, narrowed_nodes = _grant_nodes(scopes, mode_scopes, ws)
++    precedence = _precedence_matters(full_nodes, narrowed_nodes)
+     for p in ([] if event.repos else event.paths):
+-        if (not path_in_scope(p, scopes, ws, profile, event.cwd)
+-                and not _read_only_admits(event, p, read_scopes, ws, profile)
+-                and not _mode_admits(event, p, mode_scopes, ws, profile)):
++        admitted = (path_in_scope(p, scopes, ws, profile, event.cwd)
++                    or _read_only_admits(event, p, read_scopes, ws, profile)
++                    or _mode_admits(event, p, mode_scopes, ws, profile))
++        capped = ""
++        # #1386: when a narrowed grant sits at or beneath another grant, the NEAREST grant covering
++        # this path decides; it can only narrow what the union admitted. Home and temp roots are
++        # admitted before any grant and stay so.
++        if admitted and precedence and not path_in_scope(p, [], ws, profile, event.cwd):
++            near = _nearest_grant(p, full_nodes + narrowed_nodes, event.cwd)
++            need = act_path_modes(event) or GRANT_MODES
++            if near is not None and not all(m in near for m in need):
++                admitted, capped = False, _precedence_hint(near, need)
++            elif event.tool not in SINGLE_TARGET_TOOLS:
++                # #1394 v2: the act may reach below p; every narrowed node beneath it decides too.
++                for child, cmodes in _narrowed_beneath(p, narrowed_nodes, event.cwd):
++                    if not all(m in cmodes for m in need):
++                        admitted, capped = False, _beneath_hint(child, cmodes, need)
++                        break
++        if not admitted:
+             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
+             # on any long path truncates away the very component that tripped the gate — the
+             # member is handed a string that does not contain its own reason. That is the
+@@ -3399,7 +3576,8 @@
+                     f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws, admits=lambda c: path_in_scope(c, scopes, ws, profile, event.cwd) or _read_only_admits(event, c, read_scopes, ws, profile) or _mode_admits(event, c, mode_scopes, ws, profile))}",
+                     target=norm,
+                 )
+-            mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
++            mode_hint = capped or _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile,
++                                             event.cwd)
+             # A narrowed grant that REACHES the path is a grant: the refusal must not open by
+             # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
+             where = ("a grant reaches it, but not in the mode this act needs" if mode_hint
+@@ -3429,6 +3607,38 @@
+             ok, offending, refused = command_scope_reach(
+                 event.command, scopes + extra, ws, event.cwd,
+                 forbidden=forbidden, home_markers=profile.home_markers)
++        if ok and precedence:
++            # #1386 for a shell line: every path it reaches takes its nearest grant. A command on
++            # the read-only allowlist needs r there; any other command needs a full grant, as in
++            # part B. A line whose reach cannot be named in full is refused here rather than
++            # guessed at (fail narrow), and only while a narrowed grant is nested.
++            reached = _command_reached_paths(event.command, ws, event.cwd, forbidden,
++                                             profile.home_markers)
++            cneed = cmd_need or GRANT_MODES
++            if reached is None:
++                return _deny(
++                    "mrh.command",
++                    f"'{event.tool}' command: a grant of yours is narrowed beneath a broader one, so "
++                    f"every path this command reaches must be judged by the nearest grant, and its "
++                    f"reach could not be named in full (hestia #1386). Split it into commands that "
++                    f"each name their paths.")
++            for rp in reached:
++                near = _nearest_grant(rp, full_nodes + narrowed_nodes, event.cwd)
++                if near is not None and not all(m in near for m in cneed):
++                    return _deny(
++                        "mrh.command",
++                        f"'{event.tool}' command reaches '{_elide(rp)}' beyond your grant's modes:"
++                        f"{_precedence_hint(near, cneed)}",
++                        target=rp)
++                # #1394 v2: a shell line can recurse below any path it names (grep -r, find, cp -r,
++                # chmod -R, a glob). Every narrowed node beneath a reached path decides too.
++                for child, cmodes in _narrowed_beneath(rp, narrowed_nodes, event.cwd):
++                    if not all(m in cmodes for m in cneed):
++                        return _deny(
++                            "mrh.command",
++                            f"'{event.tool}' command reaches '{_elide(rp)}', which holds a narrower "
++                            f"grant beneath it:{_beneath_hint(child, cmodes, cneed)}",
++                            target=child)
+         if not ok:
+             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
+             # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: a5897ad9a212af1e41952e5d4588d9f7413e9c400f94a855ffc39c8e4e080e9c  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -3277,6 +3277,165 @@
+     return tuple(out)
+ 
+ 
++# ---- #1386: THE NEAREST EXPLICIT GRANT DECIDES ------------------------------------------------
++# dp, 2026-10-24: "if a specific path is reachable via an explicit grant, then that grant prevails
++# for that path (basically standing as separate governance path from nested). for paths with no
++# direct grant, the shortest nested grant applies" -- "if explicit grant, use explicit grant; else
++# traverse to ../ and repeat". Part B admitted a path through ANY covering grant (a union), so an
++# `r` grant on `a/b/**` beneath a full `a/**` admitted writes to `a/b`: the narrowing an operator
++# chose was silently widened by a broader grant above it. Here every grant is a NODE; the deepest
++# node covering a path decides it, with its modes (grants on one node union). A path no grant node
++# covers keeps today's order (the read-only floor for readers, then refusal), and the member's home
++# and temp roots stay unconditional. The floor's all-modes entries ride `scopes` like the member's
++# own full grants: safe here because the daemon withholds any floor entry overlapping a narrowed
++# grant in either direction (floor_for, #1385/#1387), so a served floor entry is never the node
++# above or below a narrowed one.
++
++def _plain_repo_name(name) -> bool:
++    """A bare workspace-repo name (one segment), as `_scope_entry_for_grant` writes for a
++    recursive grant on `<ws>/<name>`."""
++    return (isinstance(name, str) and bool(name) and "/" not in name and "\\" not in name
++            and name not in (".", "..", AgentPolicy.UNSCOPED))
++
++
++def _grant_nodes(scopes, mode_scopes, workspace: str) -> tuple:
++    """``(full, narrowed)``: each a list of ``(root, recursive, modes, spelling)``.
++
++    `spelling` says which form of a candidate path the node is compared with, mirroring the check
++    that admits it today: "real" for `path:` roots (`_within_path_grant` compares realpaths),
++    "lex" for repo-name entries (`path_in_scope`'s segment rule is lexical)."""
++    wsl = workspace.replace("\\", "/").rstrip("/")
++    full = [(r, rec, GRANT_MODES, "real") for r, rec in _scope_roots_with_reach(list(scopes), workspace)]
++    repos, _ = _scope_parts(scopes, workspace)
++    full += [(wsl + "/" + n, True, GRANT_MODES, "lex") for n in repos if _plain_repo_name(n)]
++    narrowed = []
++    for entry, modes in mode_scopes or ():
++        if not isinstance(entry, str):
++            continue
++        if entry.startswith("path:"):
++            narrowed += [(r, rec, modes, "real") for r, rec in _scope_roots_with_reach([entry], workspace)]
++        elif _plain_repo_name(entry):
++            narrowed.append((wsl + "/" + entry, True, modes, "lex"))
++    return full, narrowed
++
++
++def _precedence_matters(full, narrowed) -> bool:
++    """Whether some narrowed grant lies at or beneath ANOTHER grant node. Only then can the nearest
++    grant differ from the union part B judges by; otherwise every check below is skipped and the
++    verdict is exactly part B's."""
++    nodes = full + narrowed
++    for i, (root, _rec, _md, _k) in enumerate(narrowed):
++        for j, (r2, rec2, _m2, _k2) in enumerate(nodes):
++            if j == len(full) + i:
++                continue
++            if root == r2 or (rec2 and root.startswith(r2 + "/")):
++                return True
++    return False
++
++
++def _candidate_spellings(path: str, cwd: Optional[str]) -> tuple:
++    """``(lexical, real)`` for a candidate path, resolved the way `path_in_scope` resolves it."""
++    c = path.replace("\\", "/")
++    if c.startswith("~"):
++        c = os.path.expanduser(c).replace("\\", "/")
++    elif not c.startswith("/"):
++        c = os.path.join((cwd or os.getcwd()).replace("\\", "/"), c)
++    lex = os.path.normpath(c).replace("\\", "/").rstrip("/")
++    return lex, os.path.realpath(lex).replace("\\", "/").rstrip("/")
++
++
++def _nearest_grant(path: str, nodes, cwd: Optional[str]) -> Optional[str]:
++    """The modes of the nearest grant node covering `path` (grants on one node union), or None
++    when no grant node covers it. An exact grant covers only its own path; walking up, only
++    recursive grants apply."""
++    lex, real = _candidate_spellings(path, cwd)
++    best, held = -1, set()
++    for root, rec, modes, spelling in nodes:
++        cand = real if spelling == "real" else lex
++        if cand == root or (rec and cand.startswith(root + "/")):
++            depth = root.count("/")
++            if depth > best:
++                best, held = depth, set(modes)
++            elif depth == best:
++                held |= set(modes)
++    return None if best < 0 else "".join(m for m in GRANT_MODES if m in held)
++
++
++#: Tools whose act reaches exactly the one path they name, never beneath it (#1394 v2). Every
++#: other tool -- Grep/Glob/search and the other directory readers, git_restore/git_clean, any tool
++#: not listed here, and every shell line -- is treated as able to reach below a named directory.
++SINGLE_TARGET_TOOLS = frozenset({"Read", "read_file", "NotebookRead", "Write", "write_file", "Edit",
++                                 "MultiEdit", "NotebookEdit", "replace", "write_note", "run"})
++
++
++def _narrowed_beneath(path: str, narrowed, cwd: Optional[str]) -> list:
++    """``[(root, modes), ...]`` for every narrowed grant node strictly beneath `path`.
++
++    nomad's HOLD on #1394: part C judged the path an act NAMES, so with rwed on `proj/**` and a
++    narrowed `proj/sub/**`, `Grep proj` read a write-only child and `find proj -exec sed -i ...`
++    rewrote a read-only one -- the parent's grant admitted the named path, and the act reached the
++    child anyway. An act that can reach below what it names answers to these nodes too."""
++    lex, real = _candidate_spellings(path, cwd)
++    out = []
++    for root, _rec, modes, spelling in narrowed:
++        cand = real if spelling == "real" else lex
++        if root != cand and root.startswith(cand.rstrip("/") + "/"):
++            out.append((root, modes))
++    return out
++
++
++def _beneath_hint(child: str, modes: str, need: str) -> str:
++    missing = "".join(m for m in need if m not in modes)
++    return (f" This act can reach below the path it names, and {child} beneath it is narrowed to "
++            f"{modes}; the act needs {need} there (missing {missing}). A grant on the parent does not "
++            f"carry it into a narrower child: the nearest explicit grant decides (hestia #1386). Name "
++            f"paths that avoid the child, or act on the child within its own modes.")
++
++
++def _precedence_hint(near: str, need: str) -> str:
++    missing = "".join(m for m in need if m not in near)
++    return (f" The nearest grant here is narrowed to {near}; this act needs {need} (missing "
++            f"{missing}). A broader grant above it does not apply here: the nearest explicit "
++            f"grant decides (hestia #1386).")
++
++
++def _command_reached_paths(cmd: str, workspace: str, cwd: Optional[str], forbidden,
++                           home_markers) -> Optional[list]:
++    """Every path the command checker resolves for `cmd` (beyond home and temp roots), or None
++    when they cannot all be named within the gate's budget. Enumerated with the SAME resolver
++    that admits the command (`command_scope_reach`): each refusal names the path it refused, which
++    is then granted exactly (recursively, if exact is refused again) and the check re-run. No
++    second parser, so no second opinion about what a command reaches."""
++    got, extra = [], []
++    for _ in range(2 * SCOPE_JUDGE_BUDGET + 2):
++        ok, offending, refused = command_scope_reach(cmd, extra, workspace, cwd,
++                                                     forbidden=forbidden, home_markers=home_markers)
++        if ok:
++            return got
++        if (not refused or offending == _INCOMPLETE or refused.startswith(UNPRICEABLE_PREFIX)
++                or len(got) > SCOPE_JUDGE_BUDGET):
++            return None
++        if refused in got:
++            rec = "path:" + refused.rstrip("/") + RECURSIVE_SUFFIX
++            if rec in extra:
++                return None
++            extra.append(rec)
++            continue
++        got.append(refused)
++        extra.append("path:" + refused)
++    return None
++
++
++def nearest_grant_modes(policy: AgentPolicy, workspace: str, path: str,
++                        cwd: Optional[str] = None) -> Optional[str]:
++    """The gate's own answer for one path (#1386): the modes of the nearest grant covering it,
++    or None when no grant covers it. For a consumer that confines after the gate (SAGE's
++    dispatcher, its run mounts, the reach answer), so it decides exactly as the gate does."""
++    full, narrowed = _grant_nodes(list(policy.scope), list(getattr(policy, "mode_scope", ()) or ()),
++                                  workspace)
++    return _nearest_grant(path, full + narrowed, cwd)
++
++
+ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
+              workspace: Optional[str] = None,
+              policy: Optional[AgentPolicy] = None) -> Verdict:
+@@ -3370,10 +3529,28 @@
+                     f"scope (granted: {'+'.join(scopes)}); a repository is reached only by a qualified "
+                     f"grant '{need}' (a path grant, even recursive, does not reach a remote repository)",
+                 )
++    full_nodes, narrowed_nodes = _grant_nodes(scopes, mode_scopes, ws)
++    precedence = _precedence_matters(full_nodes, narrowed_nodes)
+     for p in ([] if event.repos else event.paths):
+-        if (not path_in_scope(p, scopes, ws, profile, event.cwd)
+-                and not _read_only_admits(event, p, read_scopes, ws, profile)
+-                and not _mode_admits(event, p, mode_scopes, ws, profile)):
++        admitted = (path_in_scope(p, scopes, ws, profile, event.cwd)
++                    or _read_only_admits(event, p, read_scopes, ws, profile)
++                    or _mode_admits(event, p, mode_scopes, ws, profile))
++        capped = ""
++        # #1386: when a narrowed grant sits at or beneath another grant, the NEAREST grant covering
++        # this path decides; it can only narrow what the union admitted. Home and temp roots are
++        # admitted before any grant and stay so.
++        if admitted and precedence and not path_in_scope(p, [], ws, profile, event.cwd):
++            near = _nearest_grant(p, full_nodes + narrowed_nodes, event.cwd)
++            need = act_path_modes(event) or GRANT_MODES
++            if near is not None and not all(m in near for m in need):
++                admitted, capped = False, _precedence_hint(near, need)
++            elif event.tool not in SINGLE_TARGET_TOOLS:
++                # #1394 v2: the act may reach below p; every narrowed node beneath it decides too.
++                for child, cmodes in _narrowed_beneath(p, narrowed_nodes, event.cwd):
++                    if not all(m in cmodes for m in need):
++                        admitted, capped = False, _beneath_hint(child, cmodes, need)
++                        break
++        if not admitted:
+             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
+             # on any long path truncates away the very component that tripped the gate — the
+             # member is handed a string that does not contain its own reason. That is the
+@@ -3400,7 +3577,8 @@
+                     f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws, admits=lambda c: path_in_scope(c, scopes, ws, profile, event.cwd) or _read_only_admits(event, c, read_scopes, ws, profile) or _mode_admits(event, c, mode_scopes, ws, profile))}",
+                     target=norm,
+                 )
+-            mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
++            mode_hint = capped or _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile,
++                                             event.cwd)
+             # A narrowed grant that REACHES the path is a grant: the refusal must not open by
+             # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
+             where = ("a grant reaches it, but not in the mode this act needs" if mode_hint
+@@ -3430,6 +3608,38 @@
+             ok, offending, refused = command_scope_reach(
+                 event.command, scopes + extra, ws, event.cwd,
+                 forbidden=forbidden, home_markers=profile.home_markers)
++        if ok and precedence:
++            # #1386 for a shell line: every path it reaches takes its nearest grant. A command on
++            # the read-only allowlist needs r there; any other command needs a full grant, as in
++            # part B. A line whose reach cannot be named in full is refused here rather than
++            # guessed at (fail narrow), and only while a narrowed grant is nested.
++            reached = _command_reached_paths(event.command, ws, event.cwd, forbidden,
++                                             profile.home_markers)
++            cneed = cmd_need or GRANT_MODES
++            if reached is None:
++                return _deny(
++                    "mrh.command",
++                    f"'{event.tool}' command: a grant of yours is narrowed beneath a broader one, so "
++                    f"every path this command reaches must be judged by the nearest grant, and its "
++                    f"reach could not be named in full (hestia #1386). Split it into commands that "
++                    f"each name their paths.")
++            for rp in reached:
++                near = _nearest_grant(rp, full_nodes + narrowed_nodes, event.cwd)
++                if near is not None and not all(m in near for m in cneed):
++                    return _deny(
++                        "mrh.command",
++                        f"'{event.tool}' command reaches '{_elide(rp)}' beyond your grant's modes:"
++                        f"{_precedence_hint(near, cneed)}",
++                        target=rp)
++                # #1394 v2: a shell line can recurse below any path it names (grep -r, find, cp -r,
++                # chmod -R, a glob). Every narrowed node beneath a reached path decides too.
++                for child, cmodes in _narrowed_beneath(rp, narrowed_nodes, event.cwd):
++                    if not all(m in cmodes for m in cneed):
++                        return _deny(
++                            "mrh.command",
++                            f"'{event.tool}' command reaches '{_elide(rp)}', which holds a narrower "
++                            f"grant beneath it:{_beneath_hint(child, cmodes, cneed)}",
++                            target=child)
+         if not ok:
+             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
+             # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d",
++      "sha256": "a5897ad9a212af1e41952e5d4588d9f7413e9c400f94a855ffc39c8e4e080e9c",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6"
++  "gt_version": "7cb601a3c1b3ca31658fa017f8804548ba6da50b4c03b778ce69f0eadfe18535"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6",
++    "gt_version": "7cb601a3c1b3ca31658fa017f8804548ba6da50b4c03b778ce69f0eadfe18535",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d"
++        "sha256": "a5897ad9a212af1e41952e5d4588d9f7413e9c400f94a855ffc39c8e4e080e9c"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "fba879472e5ad5ab4cca15ef085f35da58826c761db9bca4c0da4dd5641775a3"
++  "gt_version": "081e11cca7962d8bdbf2104df13579723b123127ba759317aa59e0f8d352a733"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6",
++    "gt_version": "7cb601a3c1b3ca31658fa017f8804548ba6da50b4c03b778ce69f0eadfe18535",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d"
++        "sha256": "a5897ad9a212af1e41952e5d4588d9f7413e9c400f94a855ffc39c8e4e080e9c"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "afea9e20893bc296d0d8090b63a89bc44f38a1ba558f9912e7e769c2db109fdf"
++  "gt_version": "f856283d84b414c3d250d9151e9ee9e060837ca1b7d71004b139e412707ad89e"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6",
++    "gt_version": "7cb601a3c1b3ca31658fa017f8804548ba6da50b4c03b778ce69f0eadfe18535",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d"
++        "sha256": "a5897ad9a212af1e41952e5d4588d9f7413e9c400f94a855ffc39c8e4e080e9c"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "f4a112028ddf487ed3107728f01c4b6ee030524460bbd22f86fc69ca3249c4c8"
++  "gt_version": "7fcc8df0c3c057ed71c51bfa70deeff90b631e6e226bac5f92a620bfa7a24f3c"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "909ebb8ebdae028c3f0e5a453612857a11a527521304d02cd3adcb9033b55bf6",
++    "gt_version": "7cb601a3c1b3ca31658fa017f8804548ba6da50b4c03b778ce69f0eadfe18535",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d"
++        "sha256": "a5897ad9a212af1e41952e5d4588d9f7413e9c400f94a855ffc39c8e4e080e9c"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "4155c6d74080517447eb9d44bc7a3bb571dae7f6da523c9ca004729d032b9894"
++  "gt_version": "f26f2934e364253cc43a5c7bf988b46f14d13bd2d80ea9493e457357f6f60f66"
+ }

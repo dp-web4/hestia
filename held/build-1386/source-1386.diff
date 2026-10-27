@@ -199,10 +199,9 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
              # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
              # on any long path truncates away the very component that tripped the gate — the
              # member is handed a string that does not contain its own reason. That is the
-@@ -3327,7 +3504,8 @@
-             seg = _offending_segment(p, ws, event.cwd)
-             # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
-             absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
+@@ -3343,7 +3520,8 @@
+                     target=norm,
+                 )
 -            mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
 +            mode_hint = capped or _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile,
 +                                             event.cwd)

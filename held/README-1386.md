@@ -61,3 +61,6 @@ The 9 cover:
 Part B's held test `test_an_all_modes_floor_never_widens_a_narrowed_child_grant` is now core-aware. Its last assertion expects the union to widen on part B, and the gate to cap a re-served floor entry on part C. Part B's 17 pass on both cores.
 
 Existing suites on the part C copies match the base: see the PR description for the run.
+
+
+**Re-cut 2026-10-27** on main `2b3d0ca2` (after #1412): patch `803ad5fa…` (previous v2 `74d6c840…` on `95d6d0b7`, superseded). One hunk of `source-1386.diff` was re-based: #1412 inserted its existence-first block between `absolute = …` and `mode_hint = …`, so the hunk that makes `mode_hint = capped or _mode_hint(…)` now anchors on the end of that block; the change itself is byte-identical. Verified on the new main with the core overlaid: grant_precedence 11, grant_modes 17 (the branch's core-aware floor row merged with main's #1412 fixtures), nonexistent_path 8, floor 8, sprintD 91, sprintF 10, mechanism 34, seat boundary 17×4, closure 39, battery 1434/0, decide contract 25 (+29×4).
