@@ -53,3 +53,9 @@ tools/upgrade_path_test.py
 # Held with #1345 part B (grant modes at the gate): it tests a gate core that is not applied yet,
 # so it fails against the tree until the governed apply. It moves to tools/ at the apply and this
 # line goes, as floor_read_only_test.py did for #1347.
+
+
+# Held with #1398 (the write half, hestia #1421): it tests a gate core and mechanism that are not
+# applied yet, stacked on part C (#1394) and the read half (#1406), so it fails against the tree until
+# the governed apply. It moves to tools/ at the apply and this line goes.
+held/build-1398w/floor_write_gate_test.py
