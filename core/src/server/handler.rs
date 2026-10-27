@@ -24139,6 +24139,21 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
         }));
     }
 
+    // A STANDING REFUSAL covering the path (hestia#1417): the door is closed until the operator
+    // lifts it, so the ask is not filed and the member is told why, in the decider's words.
+    if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+        return Ok(json!({
+            "status": "refused_standing",
+            "path": path,
+            "refused_by": r.refused_by,
+            "refused_at": r.refused_at,
+            "reason": r.reason,
+            "note": "a standing refusal covers this path: nothing was filed and nothing reaches \
+                     the operator's queue. It stands until the operator lifts it; the reason is \
+                     the one recorded when it was refused",
+        }));
+    }
+
     // Derived, not random — same construction as the escalation store, so an id is reproducible
     // from the record that minted it. The request count is in the digest so a member re-asking
     // for the same path in the same second gets a distinct record rather than overwriting its
@@ -24359,6 +24374,13 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // The DURABLE list, additive beside live_grants (Sprint F R1): operator-promoted
         // standing grants from the vault-persisted store. Expired grants are filtered in
         // the store's read, so nothing served here is past its horizon.
+        // STANDING REFUSALS this member is under (hestia#1417): the governed see the closed
+        // door and the deciding seat's reason, instead of re-trying it every window.
+        "refused_standing": s.standing_scope.refusals.iter()
+            .filter(|r| r.member == plugin_id)
+            .map(|r| json!({"path": r.path, "recursive": r.recursive, "refused_at": r.refused_at,
+                            "refused_by": r.refused_by, "reason": r.reason}))
+            .collect::<Vec<_>>(),
         "standing_grants": standing_all
             .iter()
             .filter(|g| g.modes.is_all())
@@ -24682,6 +24704,21 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         }));
     }
 
+    // (3b) A STANDING REFUSAL (hestia#1417): the operator or a NOT-SAME peer closed this door
+    // durably. Answered from the record, nothing opened, nothing new witnessed: before this a
+    // refusal lasted one window and the next act minted a fresh request and a fresh card.
+    if unpriceable.is_none() {
+        if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+            return Ok(json!({
+                "verdict": "refused", "permits": false, "path": path, "request_key": key,
+                "standing": true, "refused_by": r.refused_by, "refused_at": r.refused_at,
+                "detail": format!("refused, standing (by {}): {}. Re-issuing opens no request; \
+                                   only the operator can lift this",
+                                  r.refused_by, if r.reason.is_empty() { "no reason given" } else { &r.reason }),
+            }));
+        }
+    }
+
     // (4) REFUSED inside its window — re-issuing does not reopen it.
     let refused = s
         .scope_requests
@@ -24994,7 +25031,15 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
     };
     let mut body = json!({ "request_id": request_id, "reason": reason });
     match decision.as_str() {
-        "refuse" => { body["granted"] = json!(false); }
+        "refuse" => {
+            body["granted"] = json!(false);
+            // A peer may make a refusal STANDING (hestia#1417): it widens nothing. Lifting
+            // one stays the operator's.
+            if args.get("standing").and_then(Value::as_bool).unwrap_or(false) {
+                body["standing"] = json!(true);
+                body["recursive"] = json!(args.get("recursive").and_then(Value::as_bool).unwrap_or(false));
+            }
+        }
         "once" => { body["granted"] = json!(true); body["once"] = json!(true); }
         "session" | "standing" => {
             body["granted"] = json!(true);
