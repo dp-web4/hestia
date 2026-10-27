@@ -43,6 +43,7 @@
 //!     carrying `generation` + a daemon-issued expiry can be honoured within bounds, and a
 //!     copy that cannot say which policy it is grants nothing.
 
+use super::grant_target::GrantTarget;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -63,15 +64,15 @@ pub const STANDING_SNAPSHOT_TTL_SECS: u64 = 8 * 3600;
 /// check is one vault read and two digests.
 pub const PROJECTION_VERIFY_INTERVAL_SECS: u64 = 900;
 
-/// One standing grant: this member may reach this path (a repo root or a file), durably,
+/// One standing grant: this member may reach this explicit target, durably,
 /// until it expires or an operator revokes it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandingGrant {
     /// The member (caller-asserted plugin_id, like every other id here — HST-005).
     pub member: String,
-    /// Normalised absolute path (see `state::normalize_scope_path`). A repo ROOT here is
-    /// what the plugin gate maps to a repo-name grant; a deeper path stays a file grant.
-    pub path: String,
+    /// Explicit domain; repository names never become filesystem reach.
+    #[serde(flatten)]
+    pub target: GrantTarget,
     pub granted_at: u64,
     /// The operator identity from the challenge-signed session that decided it.
     #[serde(default)]
@@ -88,16 +89,6 @@ pub struct StandingGrant {
     /// provenance pairing the standing widening with the member's original stated need.
     #[serde(default)]
     pub request_id: Option<String>,
-    /// Whether this grant covers the whole SUBTREE under `path`, or exactly `path`.
-    ///
-    /// EXACT IS THE DEFAULT, on dp's word (2026-09-08): "the exact path is useful, and is
-    /// preferred as default. recursive should be an option." Every grant written before
-    /// this field existed deserialises as exact, so nothing an operator already read
-    /// silently widens. Recursion is a separate, explicit, witnessed act — the operator
-    /// reads the word "recursive" and chooses it — which is what makes it safe to have
-    /// at all: the concern in `has_live` was never subtrees, it was UNREAD widening.
-    #[serde(default)]
-    pub recursive: bool,
     /// What the holder may DO at the path it reaches: read / write / execute / delete (#1345).
     ///
     /// ALL BY DEFAULT, for the same reason `recursive` defaults to exact: every grant written
@@ -117,7 +108,9 @@ impl StandingGrant {
     /// Does this grant reach `path`? Exact match always; the subtree only when `recursive`.
     /// Containment is at the separator, so `/a/b` never covers `/a/bc`.
     pub fn covers(&self, path: &str) -> bool {
-        covers_path(&self.path, self.recursive, path)
+        self.target
+            .as_path()
+            .is_some_and(|(root, recursive)| covers_path(root, recursive, path))
     }
 }
 
@@ -255,12 +248,15 @@ impl GrantEdit {
 
     /// Does `after` reach any path `before` did not? Modes aside.
     pub fn widens_reach(before: &StandingGrant, after: &StandingGrant) -> bool {
-        if after.recursive {
-            // a subtree is inside the old reach only when the old grant was a subtree that
-            // contains it
-            !(before.recursive && covers_path(&before.path, true, &after.path))
-        } else {
-            !before.covers(&after.path)
+        match (before.target.as_path(), after.target.as_path()) {
+            (Some((bp, br)), Some((ap, ar))) => {
+                if ar {
+                    !(br && covers_path(bp, true, ap))
+                } else {
+                    !covers_path(bp, br, ap)
+                }
+            }
+            _ => !before.target.same_identity(&after.target),
         }
     }
 }
@@ -269,7 +265,9 @@ impl GrantEdit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditRefused {
     /// The store moved since the editor read it.
-    Moved { current: u64 },
+    Moved {
+        current: u64,
+    },
     NoSuchGrant,
     /// The staged row equals the stored one: Save with nothing changed is not a mutation.
     NoChange,
@@ -374,6 +372,32 @@ impl StandingScopeStore {
         live
     }
 
+    /// Legacy filesystem projections must never stringify repository authority.
+    /// Keep expiry and ordering identical to the all-domain read.
+    pub fn live_paths_for(&self, member: &str, now: u64) -> Vec<&StandingGrant> {
+        self.live_for(member, now)
+            .into_iter()
+            .filter(|g| g.target.as_path().is_some())
+            .collect()
+    }
+
+    /// Explicit repository membership: filesystem grants and the society floor
+    /// never supply remote repository authority.
+    pub fn has_live_repository_for(
+        &self,
+        member: &str,
+        repo: &super::repository_target::RepositoryTarget,
+        now: u64,
+        needed: crate::server::grant_modes::Modes,
+    ) -> bool {
+        self.grants.iter().any(|g| {
+            g.member == member
+                && g.is_live(now)
+                && matches!(&g.target, GrantTarget::Repository(held) if held == repo)
+                && g.modes.includes(needed)
+        })
+    }
+
     /// Membership by the grant's OWN rule: exact for an exact grant, subtree for a grant an
     /// operator explicitly made recursive. This used to be exact-only, with the comment
     /// "prefix matching would silently widen what the operator read" — still true, and
@@ -387,9 +411,15 @@ impl StandingScopeStore {
     /// `has_live` asks for ALL modes, and that is the safe reading for every caller that does
     /// not know what the act will do: "a grant covers this path" used to mean "the member may
     /// do anything there", and a read-only grant must never answer that question yes.
-    pub fn has_live_for(&self, member: &str, path: &str, now: u64,
-                        needed: crate::server::grant_modes::Modes) -> bool {
-        self.effective_modes(member, path, now).is_some_and(|m| m.includes(needed))
+    pub fn has_live_for(
+        &self,
+        member: &str,
+        path: &str,
+        now: u64,
+        needed: crate::server::grant_modes::Modes,
+    ) -> bool {
+        self.effective_modes(member, path, now)
+            .is_some_and(|m| m.includes(needed))
     }
 
     /// What `member` may do at `path`, or None for nothing.
@@ -401,8 +431,12 @@ impl StandingScopeStore {
     /// all-modes floor entry silently undo an operator's narrowing of one member's grant.
     /// Several of the member's grants covering one path add up (their union); several floor
     /// entries covering it add up the same way. Expired grants never count.
-    pub fn effective_modes(&self, member: &str, path: &str, now: u64)
-                           -> Option<crate::server::grant_modes::Modes> {
+    pub fn effective_modes(
+        &self,
+        member: &str,
+        path: &str,
+        now: u64,
+    ) -> Option<crate::server::grant_modes::Modes> {
         let own = self
             .grants
             .iter()
@@ -427,7 +461,9 @@ impl StandingScopeStore {
     /// "is X granted" (for an act of unknown mode, that question means all modes); whether
     /// a given member may use any entry is `effective_modes`.
     pub fn floor_allows(&self, path: &str) -> bool {
-        self.floor.iter().any(|f| f.modes.is_all() && f.covers(path))
+        self.floor
+            .iter()
+            .any(|f| f.modes.is_all() && f.covers(path))
     }
 
     /// The floor as ONE member's mode-blind gate may enforce it, given that member's
@@ -447,8 +483,10 @@ impl StandingScopeStore {
     /// change needs its own review. A narrowed entry with read goes to
     /// `read` (admitted for read acts only), unless a narrowed grant overlapping it lacks
     /// read. Every other entry is withheld with its reason.
-    pub fn floor_for<'a>(&'a self, narrowed: &[(String, bool, crate::server::grant_modes::Modes)])
-                         -> FloorForMember<'a> {
+    pub fn floor_for<'a>(
+        &'a self,
+        narrowed: &[(String, bool, crate::server::grant_modes::Modes)],
+    ) -> FloorForMember<'a> {
         use crate::server::grant_modes::Mode;
         let mut out = FloorForMember::default();
         for f in &self.floor {
@@ -458,9 +496,11 @@ impl StandingScopeStore {
             if let Some((p, _, m)) = clash {
                 out.withheld.push(FloorWithheld {
                     path: f.path.clone(),
-                    why: format!("your own grant on {p} allows only {m} there, and the floor does \
+                    why: format!(
+                        "your own grant on {p} allows only {m} there, and the floor does \
                                   not override a member's grant; withheld until your gate caps \
-                                  the floor by your own grants (hestia #1386)"),
+                                  the floor by your own grants (hestia #1386)"
+                    ),
                 });
             } else if f.modes.is_all() {
                 out.reach.push(f);
@@ -469,8 +509,11 @@ impl StandingScopeStore {
             } else {
                 out.withheld.push(FloorWithheld {
                     path: f.path.clone(),
-                    why: format!("this floor entry allows {} without read; a mode-blind gate \
-                                  cannot enforce that, so it waits for one that can", f.modes),
+                    why: format!(
+                        "this floor entry allows {} without read; a mode-blind gate \
+                                  cannot enforce that, so it waits for one that can",
+                        f.modes
+                    ),
                 });
             }
         }
@@ -508,14 +551,22 @@ impl StandingScopeStore {
         let row = format!(
             "grant\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
             g.member,
-            g.path,
+            match &g.target {
+                GrantTarget::Path { path, .. } => path.as_str(),
+                GrantTarget::Repository(repo) => repo.as_str(),
+            },
             g.granted_at,
             g.expires_at.map(|e| e.to_string()).unwrap_or_default()
         );
         // Recursion changes reach even if a corrupt projection retains the generation.
         // Preserve exact-grant rows byte-for-byte; recursive rows intentionally move
         // on upgrade so the audit can distinguish exact from subtree authority.
-        let row = if g.recursive {
+        let row = if matches!(g.target, GrantTarget::Repository(_)) {
+            format!("repository:{row}")
+        } else {
+            row
+        };
+        let row = if g.target.as_path().is_some_and(|(_, recursive)| recursive) {
             format!("{row}\u{1f}recursive=true")
         } else {
             row
@@ -568,16 +619,25 @@ impl StandingScopeStore {
                 self.generation, vault.generation
             ));
         }
-        // Identity is (member, path): that is what "the same grant" means to an operator.
+        // Identity includes member, domain and target; recursion is mutable reach.
         // Every other field is a property OF that grant, and one that moved is neither a
         // phantom nor a loss but a rewrite, which needs its own name or a reader concludes
         // the grant was untouched.
-        fn ident(g: &StandingGrant) -> (&str, &str) {
-            (g.member.as_str(), g.path.as_str())
+        fn ident(g: &StandingGrant) -> (&str, String, bool) {
+            match &g.target {
+                GrantTarget::Path { path, .. } => {
+                    (g.member.as_str(), format!("path:{path:?}"), false)
+                }
+                GrantTarget::Repository(repo) => (
+                    g.member.as_str(),
+                    format!("repository:{:?}", repo.as_str()),
+                    true,
+                ),
+            }
         }
-        let runtime_by_ident: std::collections::BTreeMap<(&str, &str), &StandingGrant> =
+        let runtime_by_ident: std::collections::BTreeMap<(&str, String, bool), &StandingGrant> =
             self.grants.iter().map(|g| (ident(g), g)).collect();
-        let vault_by_ident: std::collections::BTreeMap<(&str, &str), &StandingGrant> =
+        let vault_by_ident: std::collections::BTreeMap<(&str, String, bool), &StandingGrant> =
             vault.grants.iter().map(|g| (ident(g), g)).collect();
 
         for (k, g) in &runtime_by_ident {
@@ -592,7 +652,8 @@ impl StandingScopeStore {
                     // drift, and this is the field the re-review caught the report missing.
                     if g.expires_at != v.expires_at {
                         let show = |e: Option<u64>| {
-                            e.map(|x| x.to_string()).unwrap_or_else(|| "never".to_string())
+                            e.map(|x| x.to_string())
+                                .unwrap_or_else(|| "never".to_string())
                         };
                         out.push(format!(
                             "CHANGED grant {} -> {}: expires_at runtime {} vs vault {}",
@@ -612,10 +673,13 @@ impl StandingScopeStore {
                     }
                     // WHERE IT MAY REACH. Subtree authority is not an exact-path grant,
                     // even when every other field (including generation) agrees.
-                    if g.recursive != v.recursive {
+                    if g.target.as_path().map(|(_, r)| r) != v.target.as_path().map(|(_, r)| r) {
                         out.push(format!(
                             "CHANGED grant {} -> {}: recursive runtime {} vs vault {}",
-                            k.0, k.1, g.recursive, v.recursive
+                            k.0,
+                            k.1,
+                            g.target.as_path().is_some_and(|(_, r)| r),
+                            v.target.as_path().is_some_and(|(_, r)| r)
                         ));
                     }
                     // WHAT IT MAY DO. A mode the vault never authorised is a widening; a
@@ -680,7 +744,7 @@ impl StandingScopeStore {
     /// and the superseded grant's history lives in the witness chain, not here.
     pub fn add(&mut self, grant: StandingGrant) {
         self.grants
-            .retain(|g| !(g.member == grant.member && g.path == grant.path));
+            .retain(|g| !(g.member == grant.member && g.target.same_identity(&grant.target)));
         self.grants.push(grant);
         self.generation += 1;
     }
@@ -691,8 +755,15 @@ impl StandingScopeStore {
     pub fn set_recursive(&mut self, member: &str, path: &str, recursive: bool) -> bool {
         let mut changed = false;
         for g in self.grants.iter_mut() {
-            if g.member == member && g.path == path && g.recursive != recursive {
-                g.recursive = recursive;
+            if g.member == member
+                && g.target
+                    .as_path()
+                    .is_some_and(|(p, r)| p == path && r != recursive)
+            {
+                g.target = GrantTarget::Path {
+                    path: path.to_owned(),
+                    recursive,
+                };
                 changed = true;
             }
         }
@@ -718,31 +789,67 @@ impl StandingScopeStore {
     /// and moves nothing, generation included. A destination that already holds the path is
     /// refused rather than merged: which reach wins is an operator's call, and the operator
     /// has `revoke` and `set_recursive` to make it explicitly.
-    pub fn reassign(&mut self, from: &str, path: &str, to: &str, now: u64,
-                    reason: &str) -> Result<StandingGrant, ReassignRefused> {
+    pub fn reassign(
+        &mut self,
+        from: &str,
+        path: &str,
+        to: &str,
+        now: u64,
+        reason: &str,
+    ) -> Result<StandingGrant, ReassignRefused> {
+        self.reassign_target(
+            from,
+            &GrantTarget::Path {
+                path: path.to_owned(),
+                recursive: false,
+            },
+            to,
+            now,
+            reason,
+        )
+    }
+
+    /// Typed storage mutation; exposed operator endpoints remain path-only until
+    /// their preflight and witness payloads understand repository targets.
+    pub fn reassign_target(
+        &mut self,
+        from: &str,
+        target: &GrantTarget,
+        to: &str,
+        now: u64,
+        reason: &str,
+    ) -> Result<StandingGrant, ReassignRefused> {
         if from == to {
             return Err(ReassignRefused::SameMember);
         }
-        let Some(src) = self.grants.iter().find(|g| g.member == from && g.path == path).cloned()
+        let Some(src) = self
+            .grants
+            .iter()
+            .find(|g| g.member == from && g.target.same_identity(target))
+            .cloned()
         else {
             return Err(ReassignRefused::NoSuchGrant);
         };
-        if self.grants.iter().any(|g| g.member == to && g.path == path) {
+        if self
+            .grants
+            .iter()
+            .any(|g| g.member == to && g.target.same_identity(target))
+        {
             return Err(ReassignRefused::DestinationHoldsPath);
         }
         let moved = StandingGrant {
             member: to.to_string(),
-            path: src.path.clone(),
+            target: src.target.clone(),
             granted_at: now,
             granted_by: "operator".into(),
             reason: reason.to_string(),
             expires_at: src.expires_at,
             request_id: None,
-            recursive: src.recursive,
             // Copied with the reach: a reassign moves a grant, it never re-decides one.
             modes: src.modes,
         };
-        self.grants.retain(|g| !(g.member == from && g.path == path));
+        self.grants
+            .retain(|g| !(g.member == from && g.target.same_identity(target)));
         self.grants.push(moved.clone());
         self.generation += 1;
         Ok(moved)
@@ -764,25 +871,40 @@ impl StandingScopeStore {
     /// `expected_generation` is the store generation the editor SAW: if anything moved since,
     /// the edit is refused, because the before→after summary the operator approved was
     /// computed against a store that no longer exists.
-    pub fn edit(&mut self, member: &str, path: &str, expected_generation: u64,
-                change: GrantEdit) -> Result<(StandingGrant, StandingGrant), EditRefused> {
+    pub fn edit(
+        &mut self,
+        member: &str,
+        path: &str,
+        expected_generation: u64,
+        change: GrantEdit,
+    ) -> Result<(StandingGrant, StandingGrant), EditRefused> {
         if self.generation != expected_generation {
-            return Err(EditRefused::Moved { current: self.generation });
+            return Err(EditRefused::Moved {
+                current: self.generation,
+            });
         }
-        let Some(idx) = self.grants.iter().position(|g| g.member == member && g.path == path)
+        let Some(idx) = self
+            .grants
+            .iter()
+            .position(|g| g.member == member && g.target.as_path().is_some_and(|(p, _)| p == path))
         else {
             return Err(EditRefused::NoSuchGrant);
         };
         let before = self.grants[idx].clone();
         let mut after = before.clone();
-        after.path = change.path;
-        after.recursive = change.recursive;
+        after.target = GrantTarget::Path {
+            path: change.path,
+            recursive: change.recursive,
+        };
         after.modes = change.modes;
         if after == before {
             return Err(EditRefused::NoChange);
         }
-        if after.path != before.path
-            && self.grants.iter().any(|g| g.member == member && g.path == after.path)
+        if !after.target.same_identity(&before.target)
+            && self
+                .grants
+                .iter()
+                .any(|g| g.member == member && g.target.same_identity(&after.target))
         {
             return Err(EditRefused::DestinationHoldsPath);
         }
@@ -807,7 +929,12 @@ impl StandingScopeStore {
     ///
     /// A grant whose new path equals its old one does not count as moved, so a re-root onto
     /// the same root is not a mutation and the generation does not step.
-    pub fn reroot(&mut self, from: &str, to: &str, member: Option<&str>) -> Vec<(String, String, String)> {
+    pub fn reroot(
+        &mut self,
+        from: &str,
+        to: &str,
+        member: Option<&str>,
+    ) -> Vec<(String, String, String)> {
         let mut moved = Vec::new();
         for g in self.grants.iter_mut() {
             if let Some(m) = member {
@@ -815,7 +942,10 @@ impl StandingScopeStore {
                     continue;
                 }
             }
-            let Some(rest) = path_under(&g.path, from) else {
+            let GrantTarget::Path { path, .. } = &mut g.target else {
+                continue;
+            };
+            let Some(rest) = path_under(path, from) else {
                 continue;
             };
             let new_path = if rest.is_empty() {
@@ -823,11 +953,11 @@ impl StandingScopeStore {
             } else {
                 format!("{}/{}", to.trim_end_matches('/'), rest)
             };
-            if new_path == g.path {
+            if new_path == *path {
                 continue;
             }
-            moved.push((g.member.clone(), g.path.clone(), new_path.clone()));
-            g.path = new_path;
+            moved.push((g.member.clone(), path.clone(), new_path.clone()));
+            *path = new_path;
         }
         if !moved.is_empty() {
             self.generation += 1;
@@ -838,10 +968,22 @@ impl StandingScopeStore {
     /// Remove a grant. Returns whether anything was removed; the generation moves only
     /// when the store actually changed, so the counter never claims a mutation that did
     /// not happen.
+    /// Revoke by root path, whether the matching path grant is exact or recursive.
+    /// Repository targets with the same spelling are unaffected.
     pub fn revoke(&mut self, member: &str, path: &str) -> bool {
+        self.revoke_target(
+            member,
+            &GrantTarget::Path {
+                path: path.to_owned(),
+                recursive: false,
+            },
+        )
+    }
+
+    pub fn revoke_target(&mut self, member: &str, target: &GrantTarget) -> bool {
         let before = self.grants.len();
         self.grants
-            .retain(|g| !(g.member == member && g.path == path));
+            .retain(|g| !(g.member == member && g.target.same_identity(target)));
         let removed = self.grants.len() != before;
         if removed {
             self.generation += 1;
@@ -875,8 +1017,16 @@ mod reach_tests {
 
     fn g(path: &str, recursive: bool) -> StandingGrant {
         StandingGrant {
-            member: "m".into(), path: path.into(), granted_at: 1, granted_by: "op".into(),
-            reason: "r".into(), expires_at: None, request_id: None, recursive,
+            member: "m".into(),
+            target: GrantTarget::Path {
+                path: path.into(),
+                recursive,
+            },
+            granted_at: 1,
+            granted_by: "op".into(),
+            reason: "r".into(),
+            expires_at: None,
+            request_id: None,
             modes: crate::server::grant_modes::Modes::ALL,
         }
     }
@@ -886,9 +1036,16 @@ mod reach_tests {
         let mut st = StandingScopeStore::default();
         for (member, path) in paths {
             st.add(StandingGrant {
-                member: (*member).into(), path: (*path).into(), granted_at: 1,
-                granted_by: "op".into(), reason: "r".into(), expires_at: None,
-                request_id: None, recursive: false,
+                member: (*member).into(),
+                target: GrantTarget::Path {
+                    path: (*path).into(),
+                    recursive: false,
+                },
+                granted_at: 1,
+                granted_by: "op".into(),
+                reason: "r".into(),
+                expires_at: None,
+                request_id: None,
                 modes: crate::server::grant_modes::Modes::ALL,
             });
         }
@@ -907,13 +1064,30 @@ mod reach_tests {
         ]);
         let gen0 = st.generation;
         let moved = st.reroot("/old/ws", "/new/ws", None);
-        assert_eq!(moved.len(), 3, "the three under the old root moved: {moved:?}");
+        assert_eq!(
+            moved.len(),
+            3,
+            "the three under the old root moved: {moved:?}"
+        );
         assert_eq!(st.generation, gen0 + 1, "one mutation, one generation step");
-        let paths: Vec<&str> = st.grants.iter().map(|g| g.path.as_str()).collect();
-        assert!(paths.contains(&"/new/ws"), "the root grant itself re-roots: {paths:?}");
+        let paths: Vec<&str> = st
+            .grants
+            .iter()
+            .map(|g| g.target.as_path().unwrap().0)
+            .collect();
+        assert!(
+            paths.contains(&"/new/ws"),
+            "the root grant itself re-roots: {paths:?}"
+        );
         assert!(paths.contains(&"/new/ws/repo-a"), "{paths:?}");
-        assert!(paths.contains(&"/new/ws/repo-b/sub"), "depth is preserved: {paths:?}");
-        assert!(paths.contains(&"/elsewhere/keep"), "an unrelated grant is untouched: {paths:?}");
+        assert!(
+            paths.contains(&"/new/ws/repo-b/sub"),
+            "depth is preserved: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/elsewhere/keep"),
+            "an unrelated grant is untouched: {paths:?}"
+        );
     }
 
     /// THE FALSIFIER FOR THE WHOLE OPERATION. With `starts_with`, re-rooting `/old/ws` also
@@ -928,23 +1102,31 @@ mod reach_tests {
         ]);
         let moved = st.reroot("/old/ws", "/new/ws", None);
         assert_eq!(moved.len(), 1, "only the exact root moved: {moved:?}");
-        let paths: Vec<&str> = st.grants.iter().map(|g| g.path.as_str()).collect();
-        assert!(paths.contains(&"/old/ws-archive/secrets"), "sibling untouched: {paths:?}");
+        let paths: Vec<&str> = st
+            .grants
+            .iter()
+            .map(|g| g.target.as_path().unwrap().0)
+            .collect();
+        assert!(
+            paths.contains(&"/old/ws-archive/secrets"),
+            "sibling untouched: {paths:?}"
+        );
         assert!(paths.contains(&"/old/wsx"), "sibling untouched: {paths:?}");
     }
 
     /// Scoped to one member, the peers' matching grants stay where they are.
     #[test]
     fn reroot_scoped_to_one_member_leaves_peers_alone() {
-        let mut st = store_with(&[
-            ("claude-code", "/old/ws/a"),
-            ("codex", "/old/ws/a"),
-        ]);
+        let mut st = store_with(&[("claude-code", "/old/ws/a"), ("codex", "/old/ws/a")]);
         let moved = st.reroot("/old/ws", "/new/ws", Some("claude-code"));
         assert_eq!(moved.len(), 1, "{moved:?}");
         assert_eq!(moved[0].0, "claude-code");
         let codex = st.grants.iter().find(|g| g.member == "codex").unwrap();
-        assert_eq!(codex.path, "/old/ws/a", "a peer's identical path is not swept up");
+        assert_eq!(
+            codex.target.as_path().unwrap().0,
+            "/old/ws/a",
+            "a peer's identical path is not swept up"
+        );
     }
 
     /// A re-root that matches nothing is NOT a mutation: no generation movement, so a
@@ -988,13 +1170,19 @@ mod reach_tests {
     fn exact_by_default_subtree_only_when_asked_never_a_sibling() {
         let exact = g("/w/tree", false);
         assert!(exact.covers("/w/tree"));
-        assert!(!exact.covers("/w/tree/sub"), "exact must not reach the subtree");
+        assert!(
+            !exact.covers("/w/tree/sub"),
+            "exact must not reach the subtree"
+        );
         assert!(!exact.covers("/w"), "nor the parent");
 
         let rec = g("/w/tree", true);
         assert!(rec.covers("/w/tree"));
         assert!(rec.covers("/w/tree/sub/deep/file.py"));
-        assert!(!rec.covers("/w/treeful"), "a recursive grant never covers a sibling with the same prefix");
+        assert!(
+            !rec.covers("/w/treeful"),
+            "a recursive grant never covers a sibling with the same prefix"
+        );
         assert!(!rec.covers("/w"), "nor its parent");
         assert!(!rec.covers("/other"));
     }
@@ -1003,9 +1191,10 @@ mod reach_tests {
     /// operator already read silently widens when the daemon upgrades.
     #[test]
     fn a_pre_existing_grant_deserialises_as_exact() {
-        let old = r#"{"member":"m","path":"/w/tree","granted_at":1,"granted_by":"op","reason":"r"}"#;
+        let old =
+            r#"{"member":"m","path":"/w/tree","granted_at":1,"granted_by":"op","reason":"r"}"#;
         let grant: StandingGrant = serde_json::from_str(old).unwrap();
-        assert!(!grant.recursive);
+        assert!(!grant.target.as_path().unwrap().1);
         assert!(!grant.covers("/w/tree/sub"));
     }
 
@@ -1016,23 +1205,41 @@ mod reach_tests {
     #[test]
     fn reassign_carries_the_reach_shape_in_one_mutation_and_refuses_cleanly() {
         let mut st = StandingScopeStore::default();
-        st.add(g("/w/tree", true));                       // member "m", recursive
+        st.add(g("/w/tree", true)); // member "m", recursive
         st.grants[0].expires_at = Some(9_999_999_999);
         let gen0 = st.generation;
         let before = st.clone();
 
         // Refusals: nothing moves, generation included.
-        assert_eq!(st.reassign("m", "/w/tree", "m", 5, "r"), Err(ReassignRefused::SameMember));
-        assert_eq!(st.reassign("m", "/w/nope", "n", 5, "r"), Err(ReassignRefused::NoSuchGrant));
-        assert_eq!(st.reassign("ghost", "/w/tree", "n", 5, "r"), Err(ReassignRefused::NoSuchGrant));
+        assert_eq!(
+            st.reassign("m", "/w/tree", "m", 5, "r"),
+            Err(ReassignRefused::SameMember)
+        );
+        assert_eq!(
+            st.reassign("m", "/w/nope", "n", 5, "r"),
+            Err(ReassignRefused::NoSuchGrant)
+        );
+        assert_eq!(
+            st.reassign("ghost", "/w/tree", "n", 5, "r"),
+            Err(ReassignRefused::NoSuchGrant)
+        );
         assert_eq!(st.grants, before.grants, "a refusal is a pure read");
         assert_eq!(st.generation, gen0, "a refusal moves no generation");
 
         // The move: one row out, one row in, recursive and expiry copied, generation +1.
-        let moved = st.reassign("m", "/w/tree", "n", 5, "typo repair").expect("moves");
+        let moved = st
+            .reassign("m", "/w/tree", "n", 5, "typo repair")
+            .expect("moves");
         assert_eq!(moved.member, "n");
-        assert!(moved.recursive, "a recursive source stays recursive at the destination");
-        assert_eq!(moved.expires_at, Some(9_999_999_999), "expiry travels with the grant");
+        assert!(
+            moved.target.as_path().unwrap().1,
+            "a recursive source stays recursive at the destination"
+        );
+        assert_eq!(
+            moved.expires_at,
+            Some(9_999_999_999),
+            "expiry travels with the grant"
+        );
         assert_eq!(moved.reason, "typo repair");
         assert_eq!(st.generation, gen0 + 1, "one mutation, one generation step");
         assert_eq!(st.grants.len(), 1, "no residue on the source member");
@@ -1040,11 +1247,17 @@ mod reach_tests {
 
         // The destination already holds the path: refused, not merged — even for an exact
         // source under a recursive destination.
-        st.add(g("/w/tree", false));                      // member "m" again, exact
+        st.add(g("/w/tree", false)); // member "m" again, exact
         let gen1 = st.generation;
-        assert_eq!(st.reassign("m", "/w/tree", "n", 5, "r"), Err(ReassignRefused::DestinationHoldsPath));
+        assert_eq!(
+            st.reassign("m", "/w/tree", "n", 5, "r"),
+            Err(ReassignRefused::DestinationHoldsPath)
+        );
         assert_eq!(st.generation, gen1);
-        assert!(st.has_live("n", "/w/tree/child", 5), "the destination's reach is untouched");
+        assert!(
+            st.has_live("n", "/w/tree/child", 5),
+            "the destination's reach is untouched"
+        );
     }
 
     #[test]
@@ -1056,9 +1269,15 @@ mod reach_tests {
         assert!(st.set_recursive("m", "/w/tree", true));
         assert_eq!(st.generation, gen0 + 1);
         assert!(st.has_live("m", "/w/tree/x", 5));
-        assert!(!st.set_recursive("m", "/w/tree", true), "already recursive: no change");
+        assert!(
+            !st.set_recursive("m", "/w/tree", true),
+            "already recursive: no change"
+        );
         assert_eq!(st.generation, gen0 + 1, "and the generation did not move");
-        assert!(!st.set_recursive("m", "/nope", true), "no grant of record: no change");
+        assert!(
+            !st.set_recursive("m", "/nope", true),
+            "no grant of record: no change"
+        );
         assert!(st.set_recursive("m", "/w/tree", false));
         assert!(!st.has_live("m", "/w/tree/x", 5), "back to exact");
     }
@@ -1073,14 +1292,17 @@ mod tests {
     fn grant(member: &str, path: &str, at: u64, expires_at: Option<u64>) -> StandingGrant {
         StandingGrant {
             member: member.into(),
-            path: path.into(),
+            target: GrantTarget::Path {
+                path: path.into(),
+                recursive: false,
+            },
             granted_at: at,
             granted_by: "operator".into(),
             reason: "test".into(),
             expires_at,
             request_id: None,
-        recursive: false,
-        modes: crate::server::grant_modes::Modes::ALL,
+
+            modes: crate::server::grant_modes::Modes::ALL,
         }
     }
 
@@ -1104,8 +1326,11 @@ mod tests {
     #[test]
     fn a_read_only_floor_entry_answers_reads_and_nothing_more() {
         let mut s = StandingScopeStore::default();
-        s.floor_add(FloorEntry { recursive: true, modes: modes("r"),
-                                 ..floor("/w/governance/hestia", 1) });
+        s.floor_add(FloorEntry {
+            recursive: true,
+            modes: modes("r"),
+            ..floor("/w/governance/hestia", 1)
+        });
         let file = "/w/governance/hestia/core/src/lib.rs";
         assert!(!s.floor_allows("/w/governance/hestia"));
         assert!(!s.floor_allows(file));
@@ -1122,26 +1347,66 @@ mod tests {
     #[test]
     fn a_members_own_grant_decides_where_it_reaches_and_the_floor_fills_the_rest() {
         let mut s = StandingScopeStore::default();
-        s.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
-        s.add(StandingGrant { recursive: true, modes: modes("r"),
-                              ..grant("kimi-code", "/w/shared/law", 2, None) });
+        s.floor_add(FloorEntry {
+            recursive: true,
+            ..floor("/w/shared", 1)
+        });
+        s.add(StandingGrant {
+            target: GrantTarget::Path {
+                path: "/w/shared/law".into(),
+                recursive: true,
+            },
+            modes: modes("r"),
+            ..grant("kimi-code", "/w/shared/law", 2, None)
+        });
         let law = "/w/shared/law/x.md";
-        assert_eq!(s.effective_modes("kimi-code", law, 3), Some(modes("r")),
-                   "the floor's rwed does not override kimi's r-only grant");
+        assert_eq!(
+            s.effective_modes("kimi-code", law, 3),
+            Some(modes("r")),
+            "the floor's rwed does not override kimi's r-only grant"
+        );
         assert!(!s.has_live_for("kimi-code", law, 3, modes("w")));
-        assert!(s.has_live("codex", law, 3), "codex holds no grant there: the floor applies");
-        assert!(s.has_live("kimi-code", "/w/shared/other.md", 3), "outside kimi's grant: floor");
+        assert!(
+            s.has_live("codex", law, 3),
+            "codex holds no grant there: the floor applies"
+        );
+        assert!(
+            s.has_live("kimi-code", "/w/shared/other.md", 3),
+            "outside kimi's grant: floor"
+        );
 
         let mut t = StandingScopeStore::default();
-        t.floor_add(FloorEntry { recursive: true, modes: modes("r"), ..floor("/w/gov", 1) });
-        t.add(StandingGrant { recursive: true, ..grant("codex", "/w/gov/mine", 2, None) });
-        assert!(t.has_live("codex", "/w/gov/mine/a", 3), "a read floor does not narrow a grant");
+        t.floor_add(FloorEntry {
+            recursive: true,
+            modes: modes("r"),
+            ..floor("/w/gov", 1)
+        });
+        t.add(StandingGrant {
+            target: GrantTarget::Path {
+                path: "/w/gov/mine".into(),
+                recursive: true,
+            },
+            ..grant("codex", "/w/gov/mine", 2, None)
+        });
+        assert!(
+            t.has_live("codex", "/w/gov/mine/a", 3),
+            "a read floor does not narrow a grant"
+        );
         assert!(!t.has_live("kimi-code", "/w/gov/mine/a", 3));
         // An expired grant is no grant: the floor applies again.
         let mut u = StandingScopeStore::default();
-        u.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
-        u.add(StandingGrant { recursive: true, modes: modes("r"),
-                              ..grant("kimi-code", "/w/shared/law", 2, Some(5)) });
+        u.floor_add(FloorEntry {
+            recursive: true,
+            ..floor("/w/shared", 1)
+        });
+        u.add(StandingGrant {
+            target: GrantTarget::Path {
+                path: "/w/shared/law".into(),
+                recursive: true,
+            },
+            modes: modes("r"),
+            ..grant("kimi-code", "/w/shared/law", 2, Some(5))
+        });
         assert!(u.has_live("kimi-code", law, 6));
     }
 
@@ -1151,9 +1416,19 @@ mod tests {
     #[test]
     fn floor_for_withholds_what_would_override_a_narrowed_grant_and_names_it() {
         let mut s = StandingScopeStore::default();
-        s.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
-        s.floor_add(FloorEntry { recursive: true, modes: modes("r"), ..floor("/w/gov", 1) });
-        s.floor_add(FloorEntry { modes: modes("w"), ..floor("/w/drop", 1) });
+        s.floor_add(FloorEntry {
+            recursive: true,
+            ..floor("/w/shared", 1)
+        });
+        s.floor_add(FloorEntry {
+            recursive: true,
+            modes: modes("r"),
+            ..floor("/w/gov", 1)
+        });
+        s.floor_add(FloorEntry {
+            modes: modes("w"),
+            ..floor("/w/drop", 1)
+        });
         s.floor_add(floor("/w/plain", 1));
         let none = s.floor_for(&[]);
         let paths = |v: &Vec<&FloorEntry>| v.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
@@ -1164,9 +1439,21 @@ mod tests {
 
         let narrowed = vec![("/w/shared/law".to_string(), true, modes("r"))];
         let kimi = s.floor_for(&narrowed);
-        assert_eq!(paths(&kimi.reach), vec!["/w/plain"], "the overlapping rwed entry is withheld");
-        assert!(kimi.withheld.iter().any(|w| w.path == "/w/shared" && w.why.contains("/w/shared/law")));
-        assert_eq!(paths(&kimi.read), vec!["/w/gov"], "a read entry beside an r grant stays");
+        assert_eq!(
+            paths(&kimi.reach),
+            vec!["/w/plain"],
+            "the overlapping rwed entry is withheld"
+        );
+        assert!(
+            kimi.withheld
+                .iter()
+                .any(|w| w.path == "/w/shared" && w.why.contains("/w/shared/law"))
+        );
+        assert_eq!(
+            paths(&kimi.read),
+            vec!["/w/gov"],
+            "a read entry beside an r grant stays"
+        );
         // A narrowed grant without read under a read-only floor entry withholds that too.
         let wonly = vec![("/w/gov/x".to_string(), false, modes("w"))];
         assert!(s.floor_for(&wonly).read.is_empty());
@@ -1184,25 +1471,48 @@ mod tests {
     #[test]
     fn an_all_modes_parent_floor_stays_withheld_over_an_r_only_child_grant() {
         let mut s = StandingScopeStore::default();
-        s.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        s.floor_add(FloorEntry {
+            recursive: true,
+            ..floor("/w/shared", 1)
+        });
         let child = vec![("/w/shared/forum".to_string(), true, modes("r"))];
         let view = s.floor_for(&child);
-        assert!(view.reach.is_empty(), "the parent entry must not reach the child: {:?}",
-                view.reach.iter().map(|f| &f.path).collect::<Vec<_>>());
+        assert!(
+            view.reach.is_empty(),
+            "the parent entry must not reach the child: {:?}",
+            view.reach.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
         assert!(view.read.is_empty());
-        let w = view.withheld.iter().find(|w| w.path == "/w/shared").expect("named as withheld");
-        assert!(w.why.contains("/w/shared/forum") && w.why.contains("#1386"), "{}", w.why);
-        assert!(!w.why.contains("when your gate enforces modes"),
-                "the reason must not promise re-serving at mode enforcement: {}", w.why);
+        let w = view
+            .withheld
+            .iter()
+            .find(|w| w.path == "/w/shared")
+            .expect("named as withheld");
+        assert!(
+            w.why.contains("/w/shared/forum") && w.why.contains("#1386"),
+            "{}",
+            w.why
+        );
+        assert!(
+            !w.why.contains("when your gate enforces modes"),
+            "the reason must not promise re-serving at mode enforcement: {}",
+            w.why
+        );
     }
 
     #[test]
     fn a_recursive_floor_entry_covers_its_subtree_at_the_separator() {
         let mut s = StandingScopeStore::default();
-        s.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        s.floor_add(FloorEntry {
+            recursive: true,
+            ..floor("/w/shared", 1)
+        });
         assert!(s.floor_allows("/w/shared"));
         assert!(s.floor_allows("/w/shared/a/b.md"));
-        assert!(!s.floor_allows("/w/shared-not"), "containment is at the separator");
+        assert!(
+            !s.floor_allows("/w/shared-not"),
+            "containment is at the separator"
+        );
         // And an exact entry stays exact: the field defaults to the narrower meaning.
         let mut e = StandingScopeStore::default();
         e.floor_add(floor("/w/shared", 1));
@@ -1222,11 +1532,20 @@ mod tests {
         assert_eq!(legacy.floor_digest(), hex::encode(hasher.finalize()));
 
         let mut rec = StandingScopeStore::default();
-        rec.floor_add(FloorEntry { recursive: true, ..floor("/w/shared", 1) });
+        rec.floor_add(FloorEntry {
+            recursive: true,
+            ..floor("/w/shared", 1)
+        });
         let mut ro = StandingScopeStore::default();
-        ro.floor_add(FloorEntry { modes: modes("r"), ..floor("/w/shared", 1) });
+        ro.floor_add(FloorEntry {
+            modes: modes("r"),
+            ..floor("/w/shared", 1)
+        });
         let mut rw = StandingScopeStore::default();
-        rw.floor_add(FloorEntry { modes: modes("rw"), ..floor("/w/shared", 1) });
+        rw.floor_add(FloorEntry {
+            modes: modes("rw"),
+            ..floor("/w/shared", 1)
+        });
         assert_ne!(legacy.floor_digest(), rec.floor_digest());
         assert_ne!(legacy.floor_digest(), ro.floor_digest());
         assert_ne!(rec.floor_digest(), ro.floor_digest());
@@ -1264,7 +1583,11 @@ mod tests {
         ];
         let spelt: std::collections::BTreeSet<String> =
             entries.iter().map(FloorEntry::spelling).collect();
-        assert_eq!(spelt.len(), entries.len(), "two distinct entries spelt alike: {spelt:?}");
+        assert_eq!(
+            spelt.len(),
+            entries.len(),
+            "two distinct entries spelt alike: {spelt:?}"
+        );
         for pair in [(1usize, 4usize), (2, 5), (3, 6), (1, 10)] {
             let mut a = StandingScopeStore::default();
             a.floor_add(entries[pair.0].clone());
@@ -1285,9 +1608,13 @@ mod tests {
         assert!(!e.recursive);
         assert!(e.modes.is_all());
         let back = serde_json::to_value(&e).unwrap();
-        assert!(back.get("modes").is_none(), "an all-modes entry is written without the field");
-        let r: FloorEntry = serde_json::from_str(
-            r#"{"path":"/w/x","added_at":1,"recursive":true,"modes":"r"}"#).unwrap();
+        assert!(
+            back.get("modes").is_none(),
+            "an all-modes entry is written without the field"
+        );
+        let r: FloorEntry =
+            serde_json::from_str(r#"{"path":"/w/x","added_at":1,"recursive":true,"modes":"r"}"#)
+                .unwrap();
         assert_eq!(r.modes, modes("r"));
     }
 
@@ -1348,7 +1675,7 @@ mod tests {
         assert_eq!(live.len(), 2, "before expiry both serve");
         let live = s.live_for("codex", 100);
         assert_eq!(live.len(), 1, "at expiry the bounded grant is gone");
-        assert_eq!(live[0].path, "/w/hestia");
+        assert_eq!(live[0].target.as_path().unwrap().0, "/w/hestia");
         assert!(!s.has_live("codex", "/w/web4", 100));
         assert!(s.has_live("codex", "/w/hestia", 100));
         // Another member's grants are never mixed in.
@@ -1370,8 +1697,14 @@ mod tests {
         store.add(grant("kimi-code", "/w/private", 43, Some(9_999_999_999)));
         store.revoke("kimi-code", "/w/private");
         assert_eq!(store.generation, 3);
-        crate::vault::save_doc(&mut vault, "scope", "standing", "standing-scope.json", &store)
-            .unwrap();
+        crate::vault::save_doc(
+            &mut vault,
+            "scope",
+            "standing",
+            "standing-scope.json",
+            &store,
+        )
+        .unwrap();
         drop(store);
         drop(vault);
 
@@ -1384,10 +1717,54 @@ mod tests {
             "the generation is part of the policy and must survive with it"
         );
         assert_eq!(reloaded.grants.len(), 1);
-        assert_eq!(reloaded.grants[0].path, "/w/web4");
+        assert_eq!(reloaded.grants[0].target.as_path().unwrap().0, "/w/web4");
         assert_eq!(reloaded.grants[0].granted_at, 42);
         assert_eq!(reloaded.grants[0].expires_at, None);
         assert!(reloaded.has_live("kimi-code", "/w/web4", u64::MAX - 1));
+    }
+
+    #[test]
+    fn mixed_targets_survive_encrypted_vault_reload() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("typed.enc");
+        let mut vault = Vault::init(file.clone(), "p".into()).unwrap();
+        let mut store = StandingScopeStore::default();
+        store.add(grant("codex", "/work", 1, None));
+        let mut repository = grant("codex", "/unused", 2, Some(100));
+        repository.target = GrantTarget::Repository(
+            super::super::repository_target::RepositoryTarget::parse("owner/repo").unwrap(),
+        );
+        repository.modes = crate::server::grant_modes::Modes::READ;
+        store.add(repository);
+        crate::vault::save_doc(
+            &mut vault,
+            "scope",
+            "standing",
+            "standing-scope.json",
+            &store,
+        )
+        .unwrap();
+        drop(vault);
+        let vault = Vault::open(file, "p".into()).unwrap();
+        let loaded: StandingScopeStore =
+            crate::vault::load_doc(&vault, "scope", "standing", "standing-scope.json").unwrap();
+        assert_eq!(loaded.grants, store.grants);
+        assert_eq!(loaded.generation, store.generation);
+        assert_eq!(loaded.authority_digest(), store.authority_digest());
+        assert_eq!(loaded.live_paths_for("codex", 99).len(), 1);
+        let repo = super::super::repository_target::RepositoryTarget::parse("owner/repo").unwrap();
+        assert!(loaded.has_live_repository_for(
+            "codex",
+            &repo,
+            99,
+            crate::server::grant_modes::Modes::READ
+        ));
+        assert!(!loaded.has_live_repository_for(
+            "codex",
+            &repo,
+            100,
+            crate::server::grant_modes::Modes::READ
+        ));
     }
 
     /// An older install's plaintext `standing-scope.json` (the shape this PR's brief
@@ -1417,8 +1794,14 @@ mod tests {
         assert_eq!(loaded.grants.len(), 1);
 
         // First save migrates: the vault holds it, the sidecar is removed.
-        crate::vault::save_doc(&mut vault, "scope", "standing", "standing-scope.json", &loaded)
-            .unwrap();
+        crate::vault::save_doc(
+            &mut vault,
+            "scope",
+            "standing",
+            "standing-scope.json",
+            &loaded,
+        )
+        .unwrap();
         assert!(!legacy.exists(), "the plaintext sidecar must be retired");
     }
 }
@@ -1431,9 +1814,17 @@ mod mode_tests {
 
     fn g(member: &str, path: &str, recursive: bool, modes: &str) -> StandingGrant {
         StandingGrant {
-            member: member.into(), path: path.into(), granted_at: 7, granted_by: "op".into(),
-            reason: "because".into(), expires_at: None, request_id: Some("scope-1".into()),
-            recursive, modes: Modes::parse(modes).unwrap(),
+            member: member.into(),
+            target: GrantTarget::Path {
+                path: path.into(),
+                recursive,
+            },
+            granted_at: 7,
+            granted_by: "op".into(),
+            reason: "because".into(),
+            expires_at: None,
+            request_id: Some("scope-1".into()),
+            modes: Modes::parse(modes).unwrap(),
         }
     }
 
@@ -1443,7 +1834,10 @@ mod mode_tests {
         let back: StandingGrant = serde_json::from_str(old).unwrap();
         assert_eq!(back.modes, Modes::ALL, "an unmoded grant narrowed silently");
         let written = serde_json::to_value(&back).unwrap();
-        assert!(written.get("modes").is_none(), "an all-modes grant must serialise as before: {written}");
+        assert!(
+            written.get("modes").is_none(),
+            "an all-modes grant must serialise as before: {written}"
+        );
         let narrowed = serde_json::to_value(g("m", "/w", true, "r")).unwrap();
         assert_eq!(narrowed["modes"], "r");
     }
@@ -1457,16 +1851,27 @@ mod mode_tests {
         let row = "grant\u{1f}m\u{1f}/w\u{1f}7\u{1f}".to_string();
         assert_eq!(StandingScopeStore::grant_row(&legacy.grants[0]), row);
         legacy.grants[0].modes = Modes::READ;
-        assert_ne!(st.authority_digest(), legacy.authority_digest(), "a narrowed grant must move the digest");
+        assert_ne!(
+            st.authority_digest(),
+            legacy.authority_digest(),
+            "a narrowed grant must move the digest"
+        );
         let d = legacy.divergence_from(&st);
-        assert!(d.iter().any(|l| l.contains("modes runtime r vs vault rwed")), "{d:?}");
+        assert!(
+            d.iter()
+                .any(|l| l.contains("modes runtime r vs vault rwed")),
+            "{d:?}"
+        );
     }
 
     #[test]
     fn a_read_only_grant_never_answers_has_live_for_an_unknown_act() {
         let mut st = StandingScopeStore::default();
         st.add(g("m", "/w", true, "r"));
-        assert!(!st.has_live("m", "/w/x", 10), "has_live means all modes; r alone must not answer it");
+        assert!(
+            !st.has_live("m", "/w/x", 10),
+            "has_live means all modes; r alone must not answer it"
+        );
         assert!(st.has_live_for("m", "/w/x", 10, Modes::READ));
         assert!(!st.has_live_for("m", "/w/x", 10, Modes::parse("w").unwrap()));
     }
@@ -1485,17 +1890,48 @@ mod mode_tests {
         st.add(g("m", "/w/a", false, "rwed"));
         st.add(g("other", "/w/a", false, "rwed"));
         let gen = st.generation;
-        let (before, after) = st.edit("m", "/w/a", gen, GrantEdit {
-            path: "/w/b".into(), recursive: true, modes: Modes::READ }).unwrap();
+        let (before, after) = st
+            .edit(
+                "m",
+                "/w/a",
+                gen,
+                GrantEdit {
+                    path: "/w/b".into(),
+                    recursive: true,
+                    modes: Modes::READ,
+                },
+            )
+            .unwrap();
         assert_eq!(st.generation, gen + 1, "one edit, one generation step");
-        assert_eq!((before.path.as_str(), after.path.as_str()), ("/w/a", "/w/b"));
+        assert_eq!(
+            (
+                before.target.as_path().unwrap().0,
+                after.target.as_path().unwrap().0
+            ),
+            ("/w/a", "/w/b")
+        );
         let mine: Vec<_> = st.grants.iter().filter(|x| x.member == "m").collect();
-        assert_eq!(mine.len(), 1, "the old path must not stay live beside the new one");
-        assert_eq!((mine[0].granted_at, mine[0].reason.as_str(), mine[0].request_id.as_deref()),
-                   (7, "because", Some("scope-1")), "provenance is the original grant's");
-        assert!(mine[0].recursive && mine[0].modes == Modes::READ);
-        assert!(st.grants.iter().any(|x| x.member == "other" && x.path == "/w/a"),
-                "another member's grant on the old path is untouched");
+        assert_eq!(
+            mine.len(),
+            1,
+            "the old path must not stay live beside the new one"
+        );
+        assert_eq!(
+            (
+                mine[0].granted_at,
+                mine[0].reason.as_str(),
+                mine[0].request_id.as_deref()
+            ),
+            (7, "because", Some("scope-1")),
+            "provenance is the original grant's"
+        );
+        assert!(mine[0].target.as_path().unwrap().1 && mine[0].modes == Modes::READ);
+        assert!(
+            st.grants
+                .iter()
+                .any(|x| x.member == "other" && x.target.as_path().unwrap().0 == "/w/a"),
+            "another member's grant on the old path is untouched"
+        );
     }
 
     #[test]
@@ -1505,13 +1941,43 @@ mod mode_tests {
         st.add(g("m", "/w/b", false, "rw"));
         let gen = st.generation;
         let snap = st.grants.clone();
-        let same = GrantEdit { path: "/w/a".into(), recursive: false, modes: Modes::parse("rw").unwrap() };
-        assert_eq!(st.edit("m", "/w/a", gen, same.clone()), Err(EditRefused::NoChange));
-        assert_eq!(st.edit("m", "/w/a", gen - 1, GrantEdit { modes: Modes::READ, ..same.clone() }),
-                   Err(EditRefused::Moved { current: gen }));
-        assert_eq!(st.edit("m", "/w/zz", gen, same.clone()), Err(EditRefused::NoSuchGrant));
-        assert_eq!(st.edit("m", "/w/a", gen, GrantEdit { path: "/w/b".into(), ..same }),
-                   Err(EditRefused::DestinationHoldsPath));
+        let same = GrantEdit {
+            path: "/w/a".into(),
+            recursive: false,
+            modes: Modes::parse("rw").unwrap(),
+        };
+        assert_eq!(
+            st.edit("m", "/w/a", gen, same.clone()),
+            Err(EditRefused::NoChange)
+        );
+        assert_eq!(
+            st.edit(
+                "m",
+                "/w/a",
+                gen - 1,
+                GrantEdit {
+                    modes: Modes::READ,
+                    ..same.clone()
+                }
+            ),
+            Err(EditRefused::Moved { current: gen })
+        );
+        assert_eq!(
+            st.edit("m", "/w/zz", gen, same.clone()),
+            Err(EditRefused::NoSuchGrant)
+        );
+        assert_eq!(
+            st.edit(
+                "m",
+                "/w/a",
+                gen,
+                GrantEdit {
+                    path: "/w/b".into(),
+                    ..same
+                }
+            ),
+            Err(EditRefused::DestinationHoldsPath)
+        );
         assert_eq!((st.generation, st.grants.clone()), (gen, snap));
     }
 
@@ -1519,18 +1985,41 @@ mod mode_tests {
     fn widening_is_named_on_each_axis() {
         let base = g("m", "/w/a", true, "r");
         let w = |path: &str, rec: bool, modes: &str| g("m", path, rec, modes);
-        assert!(!GrantEdit::widens(&base, &w("/w/a/sub", true, "r")), "a subtree of a recursive grant narrows");
-        assert!(!GrantEdit::widens(&base, &w("/w/a", false, "r")), "recursive to exact narrows");
-        assert!(GrantEdit::widens(&base, &w("/w/a", true, "rw")), "an added mode widens");
-        assert!(GrantEdit::widens(&base, &w("/w/b", true, "r")), "a sibling path widens");
-        assert!(GrantEdit::widens(&base, &w("/w", true, "r")), "the parent widens");
+        assert!(
+            !GrantEdit::widens(&base, &w("/w/a/sub", true, "r")),
+            "a subtree of a recursive grant narrows"
+        );
+        assert!(
+            !GrantEdit::widens(&base, &w("/w/a", false, "r")),
+            "recursive to exact narrows"
+        );
+        assert!(
+            GrantEdit::widens(&base, &w("/w/a", true, "rw")),
+            "an added mode widens"
+        );
+        assert!(
+            GrantEdit::widens(&base, &w("/w/b", true, "r")),
+            "a sibling path widens"
+        );
+        assert!(
+            GrantEdit::widens(&base, &w("/w", true, "r")),
+            "the parent widens"
+        );
         let exact = g("m", "/w/a", false, "rw");
-        assert!(GrantEdit::widens_reach(&exact, &w("/w/a", true, "rw")), "exact to recursive widens");
-        assert!(!GrantEdit::widens(&exact, &w("/w/a", false, "r")), "dropping a mode only narrows");
-        assert!(GrantEdit::widens(&exact, &w("/w/a", false, "rd")), "swapping w for d still widens");
+        assert!(
+            GrantEdit::widens_reach(&exact, &w("/w/a", true, "rw")),
+            "exact to recursive widens"
+        );
+        assert!(
+            !GrantEdit::widens(&exact, &w("/w/a", false, "r")),
+            "dropping a mode only narrows"
+        );
+        assert!(
+            GrantEdit::widens(&exact, &w("/w/a", false, "rd")),
+            "swapping w for d still widens"
+        );
     }
 }
-
 
 #[cfg(test)]
 mod recursion_audit_tests {
@@ -1542,13 +2031,16 @@ mod recursion_audit_tests {
             generation: 7,
             grants: vec![StandingGrant {
                 member: "member".into(),
-                path: "/workspace/project".into(),
+                target: GrantTarget::Path {
+                    path: "/workspace/project".into(),
+                    recursive,
+                },
                 granted_at: 10,
                 granted_by: "operator".into(),
                 reason: "test".into(),
                 expires_at: Some(100),
                 request_id: None,
-                recursive,
+
                 modes,
             }],
             floor: vec![],
@@ -1578,7 +2070,7 @@ mod recursion_audit_tests {
             let drift = runtime.divergence_from(vault);
             assert_eq!(drift.len(), 1, "{drift:?}");
             assert!(drift[0].contains(detail), "{drift:?}");
-            assert!(drift[0].starts_with("CHANGED grant member -> /workspace/project:"));
+            assert!(drift[0].starts_with("CHANGED grant member -> path:\"/workspace/project\":"));
         }
     }
 
@@ -1608,5 +2100,268 @@ mod recursion_audit_tests {
         assert!(original.divergence_from(&reloaded).is_empty());
         assert!(reloaded.has_live_for("member", "/workspace/project/child", 99, Modes::READ));
         assert!(!reloaded.has_live_for("member", "/workspace/project/child", 100, Modes::READ));
+    }
+}
+
+#[cfg(test)]
+mod typed_storage_tests {
+    use crate::server::{
+        grant_modes::Modes, grant_target::GrantTarget, repository_target::RepositoryTarget,
+        standing_scope::*,
+    };
+    fn grant(target: GrantTarget) -> StandingGrant {
+        StandingGrant {
+            member: "m".into(),
+            target,
+            granted_at: 1,
+            granted_by: "operator".into(),
+            reason: "test".into(),
+            expires_at: Some(100),
+            request_id: None,
+            modes: Modes::READ,
+        }
+    }
+    fn repo(name: &str) -> GrantTarget {
+        GrantTarget::Repository(RepositoryTarget::parse(name).unwrap())
+    }
+    fn path(name: &str, recursive: bool) -> GrantTarget {
+        GrantTarget::Path {
+            path: name.into(),
+            recursive,
+        }
+    }
+    #[test]
+    fn mixed_store_roundtrip_preserves_domains_modes_expiry_generation() {
+        let mut s = StandingScopeStore::default();
+        s.add(grant(repo("owner/repo")));
+        s.add(grant(path("owner/repo", true)));
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let r: StandingScopeStore = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(r.grants, s.grants);
+        assert_eq!(r.generation, 2);
+        assert_eq!(r.authority_digest(), s.authority_digest());
+        assert!(r.divergence_from(&s).is_empty());
+        assert_eq!(r.live_for("m", 99).len(), 2);
+        assert!(r.live_for("m", 100).is_empty());
+        assert!(r.live_for("other", 99).is_empty());
+    }
+    #[test]
+    fn legacy_row_defaults_and_wire_are_preserved() {
+        let r: StandingGrant =
+            serde_json::from_str(r#"{"member":"m","path":"/w","granted_at":1}"#).unwrap();
+        assert_eq!(r.target, path("/w", false));
+        assert_eq!(r.modes, Modes::ALL);
+        let v = serde_json::to_value(r).unwrap();
+        assert_eq!(v["path"], "/w");
+        assert_eq!(v["recursive"], false);
+        assert!(v.get("target").is_none());
+        assert!(v.get("repo").is_none());
+        assert!(v.get("modes").is_none());
+    }
+    #[test]
+    fn malformed_or_ambiguous_rows_refuse() {
+        for selectors in [
+            r#""repo":"owner/repo","path":"/w""#,
+            r#""repo":"owner/repo","recursive":true"#,
+            r#""repo":"bare""#,
+            r#""repo":null"#,
+        ] {
+            let raw = format!("{{\"member\":\"m\",\"granted_at\":1,{selectors}}}");
+            assert!(
+                serde_json::from_str::<StandingGrant>(&raw).is_err(),
+                "{raw}"
+            );
+        }
+    }
+    #[test]
+    fn repository_does_not_reach_paths_or_floor_or_reroot() {
+        let mut s = StandingScopeStore::default();
+        s.add(grant(repo("owner/repo")));
+        assert!(!s.has_live_for("m", "owner/repo", 1, Modes::READ));
+        assert!(!s.has_live_for("m", "owner/repo/child", 1, Modes::READ));
+        let before = s.clone();
+        assert!(s.reroot("owner", "other", None).is_empty());
+        assert_eq!(s.grants, before.grants);
+        assert_eq!(s.generation, before.generation);
+        assert!(!s.set_recursive("m", "owner/repo", true));
+        assert!(!s.revoke("m", "owner/repo"));
+        assert_eq!(
+            s.reassign("m", "owner/repo", "n", 2, "move"),
+            Err(ReassignRefused::NoSuchGrant)
+        );
+        assert_eq!(
+            s.edit(
+                "m",
+                "owner/repo",
+                s.generation,
+                GrantEdit {
+                    path: "/w".into(),
+                    recursive: true,
+                    modes: Modes::ALL
+                }
+            ),
+            Err(EditRefused::NoSuchGrant)
+        );
+        assert!(s.floor_for(&[]).reach.is_empty());
+        assert_eq!(s.generation, before.generation);
+    }
+    #[test]
+    fn replacement_and_revoke_are_domain_and_owner_specific() {
+        let mut s = StandingScopeStore::default();
+        s.add(grant(repo("owner/repo")));
+        s.add(grant(repo("other/repo")));
+        s.add(grant(path("owner/repo", false)));
+        s.add(grant(repo("OWNER/REPO")));
+        assert_eq!(s.grants.len(), 3);
+        s.add(grant(path("owner/repo", true)));
+        assert_eq!(s.grants.len(), 3);
+        assert!(s.revoke_target("m", &repo("owner/repo")));
+        assert_eq!(s.grants.len(), 2);
+        assert!(s.grants.iter().any(|g| g.target == repo("other/repo")));
+        assert!(s.has_live_for("m", "owner/repo/child", 99, Modes::READ));
+        let gen = s.generation;
+        assert!(!s.revoke_target("m", &repo("owner/repo")));
+        assert_eq!(s.generation, gen);
+    }
+    #[test]
+    fn repository_audit_detects_domain_owner_modes_and_expiry() {
+        let mut s = StandingScopeStore::default();
+        s.add(grant(repo("owner/repo")));
+        for target in [path("owner/repo", false), repo("other/repo")] {
+            let mut r = s.clone();
+            r.grants[0].target = target;
+            assert_ne!(r.authority_digest(), s.authority_digest());
+            let d = r.divergence_from(&s);
+            assert_eq!(d.len(), 2, "{d:?}");
+        }
+        let mut r = s.clone();
+        r.grants[0].modes = Modes::ALL;
+        assert_ne!(r.authority_digest(), s.authority_digest());
+        assert!(r.divergence_from(&s).iter().any(|x| x.contains("modes")));
+        r = s.clone();
+        r.grants[0].expires_at = None;
+        assert_ne!(r.authority_digest(), s.authority_digest());
+        assert!(
+            r.divergence_from(&s)
+                .iter()
+                .any(|x| x.contains("expires_at"))
+        );
+    }
+    #[test]
+    fn path_mutations_preserve_legacy_behavior() {
+        let mut s = StandingScopeStore::default();
+        s.add(grant(path("/old/a", false)));
+        assert!(s.set_recursive("m", "/old/a", true));
+        assert_eq!(s.reroot("/old", "/new", None).len(), 1);
+        assert!(s.has_live_for("m", "/new/a/child", 99, Modes::READ));
+        assert!(!s.has_live("m", "/new/a/child", 99));
+        assert!(!s.has_live_for("m", "/new/a/child", 100, Modes::READ));
+        let moved = s.reassign("m", "/new/a", "n", 2, "move").unwrap();
+        assert_eq!(moved.target, path("/new/a", true));
+        assert_eq!(moved.modes, Modes::READ);
+        let gen = s.generation;
+        s.edit(
+            "n",
+            "/new/a",
+            gen,
+            GrantEdit {
+                path: "/next".into(),
+                recursive: false,
+                modes: Modes::ALL,
+            },
+        )
+        .unwrap();
+        assert!(!s.has_live("n", "/new/a", 2));
+        assert!(s.has_live("n", "/next", 2));
+        assert!(s.revoke("n", "/next"));
+    }
+    #[test]
+    fn repository_lookup_has_own_modes_expiry_owner_and_member() {
+        let mut s = StandingScopeStore::default();
+        s.add(grant(repo("owner/repo")));
+        let r = RepositoryTarget::parse("owner/repo").unwrap();
+        assert!(s.has_live_repository_for("m", &r, 99, Modes::READ));
+        assert!(!s.has_live_repository_for("m", &r, 100, Modes::READ));
+        assert!(!s.has_live_repository_for("m", &r, 99, Modes::ALL));
+        assert!(!s.has_live_repository_for("other", &r, 99, Modes::READ));
+        assert!(!s.has_live_repository_for(
+            "m",
+            &RepositoryTarget::parse("foreign/repo").unwrap(),
+            99,
+            Modes::READ
+        ));
+        s.revoke_target("m", &repo("owner/repo"));
+        s.add(grant(path("owner/repo", true)));
+        assert!(!s.has_live_repository_for("m", &r, 99, Modes::READ));
+    }
+    #[test]
+    fn typed_reassign_preserves_target_and_refuses_collision_without_mutation() {
+        let mut s = StandingScopeStore::default();
+        s.add(grant(repo("owner/repo")));
+        let g = s
+            .reassign_target("m", &repo("owner/repo"), "n", 5, "move")
+            .unwrap();
+        assert_eq!(g.target, repo("owner/repo"));
+        assert_eq!(g.modes, Modes::READ);
+        assert_eq!(g.expires_at, Some(100));
+        assert_eq!(s.generation, 2);
+        s.add(grant(repo("owner/repo")));
+        let before = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            s.reassign_target("m", &repo("owner/repo"), "n", 6, "collision"),
+            Err(ReassignRefused::DestinationHoldsPath)
+        );
+        assert_eq!(serde_json::to_value(&s).unwrap(), before);
+        assert_eq!(
+            s.reassign_target("m", &repo("owner/repo"), "m", 6, "same"),
+            Err(ReassignRefused::SameMember)
+        );
+        assert_eq!(serde_json::to_value(&s).unwrap(), before);
+    }
+
+    #[test]
+    fn colliding_display_names_keep_two_audit_identities() {
+        let mut s = StandingScopeStore::default();
+        s.add(grant(path("repo:owner/x", false)));
+        s.add(grant(repo("owner/x")));
+        let empty = StandingScopeStore {
+            generation: s.generation,
+            ..Default::default()
+        };
+        let changes = s.divergence_from(&empty);
+        assert_eq!(changes.len(), 2, "{changes:?}");
+        assert_ne!(
+            changes[0], changes[1],
+            "human-readable domain labels must differ"
+        );
+        let mut just_path = s.clone();
+        just_path.grants.pop();
+        assert_ne!(s.authority_digest(), just_path.authority_digest());
+        let mut just_repo = s.clone();
+        just_repo.grants.remove(0);
+        assert_ne!(s.authority_digest(), just_repo.authority_digest());
+        assert_eq!(s.live_paths_for("m", 1).len(), 1);
+    }
+    #[test]
+    fn path_projection_preserves_order_owner_and_expiry_without_repo_floor_narrowing() {
+        let mut s = StandingScopeStore::default();
+        let mut later = grant(path("/w/later", true));
+        later.granted_at = 5;
+        s.add(later);
+        s.add(grant(repo("owner/repo")));
+        s.add(grant(path("/w/first", false)));
+        let paths = s.live_paths_for("m", 99);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].target, path("/w/first", false));
+        assert!(s.live_paths_for("m", 100).is_empty());
+        assert!(s.live_paths_for("other", 99).is_empty());
+        let narrowed: Vec<_> = paths
+            .iter()
+            .filter(|g| !g.modes.is_all())
+            .filter_map(|g| g.target.as_path().map(|(p, r)| (p.to_owned(), r, g.modes)))
+            .collect();
+        assert_eq!(narrowed.len(), 2);
+        assert!(narrowed.iter().all(|(p, _, _)| p.starts_with("/w/")));
+        assert_eq!(paths.iter().filter_map(|g| g.expires_at).min(), Some(100));
     }
 }

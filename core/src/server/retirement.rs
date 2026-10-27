@@ -56,6 +56,9 @@ pub struct RetiredMember {
     /// blind one. Recorded, NOT restored -- see `reinstate`.
     #[serde(default)]
     pub revoked_paths: Vec<String>,
+    /// Typed authority inventory; absent on legacy retirement records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_targets: Vec<super::grant_target::GrantTarget>,
     /// True when the operator overrode the recently-acted guard.
     #[serde(default)]
     pub was_active: bool,
@@ -120,11 +123,14 @@ pub fn load(vault: &crate::vault::Vault) -> RetirementStore {
         .unwrap_or_default()
 }
 
-pub fn save(
-    vault: &mut crate::vault::Vault,
-    store: &RetirementStore,
-) -> anyhow::Result<()> {
-    crate::vault::save_doc(vault, RETIRED_NAMESPACE, RETIRED_DOC, RETIRED_LEGACY_FILE, store)
+pub fn save(vault: &mut crate::vault::Vault, store: &RetirementStore) -> anyhow::Result<()> {
+    crate::vault::save_doc(
+        vault,
+        RETIRED_NAMESPACE,
+        RETIRED_DOC,
+        RETIRED_LEGACY_FILE,
+        store,
+    )
 }
 
 #[cfg(test)]
@@ -138,9 +144,27 @@ mod tests {
             reason: "typo".into(),
             evidence_ref: "dp 2026-09-08".into(),
             revoked_paths: vec![],
+            revoked_targets: vec![],
             was_active: false,
             retired_by: String::new(),
         }
+    }
+
+    #[test]
+    fn legacy_retirement_defaults_and_typed_history_roundtrip() {
+        let legacy = serde_json::to_value(rec("codex")).unwrap();
+        assert!(legacy.get("revoked_targets").is_none());
+        let mut record: RetiredMember = serde_json::from_value(legacy).unwrap();
+        assert!(record.revoked_targets.is_empty());
+        record
+            .revoked_targets
+            .push(super::super::grant_target::GrantTarget::Repository(
+                super::super::repository_target::RepositoryTarget::parse("owner/repo").unwrap(),
+            ));
+        let decoded: RetiredMember =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert_eq!(decoded, record);
+        assert!(decoded.revoked_paths.is_empty());
     }
 
     #[test]
@@ -150,10 +174,20 @@ mod tests {
         s.retire(rec("caude-code"));
         assert_eq!(s.ids(), vec!["Claude-code", "caude-code"]);
         let g = s.generation;
-        s.retire(RetiredMember { reason: "restated".into(), ..rec("Claude-code") });
-        assert_eq!(s.retired.len(), 2, "a restatement replaces, it does not stack");
+        s.retire(RetiredMember {
+            reason: "restated".into(),
+            ..rec("Claude-code")
+        });
+        assert_eq!(
+            s.retired.len(),
+            2,
+            "a restatement replaces, it does not stack"
+        );
         assert_eq!(s.get("Claude-code").unwrap().reason, "restated");
-        assert!(s.generation > g, "a reader ordering two snapshots must see that this happened");
+        assert!(
+            s.generation > g,
+            "a reader ordering two snapshots must see that this happened"
+        );
     }
 
     #[test]

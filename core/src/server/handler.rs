@@ -1438,7 +1438,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         "standing_grants": p.live_standing_grants(&who.plugin_id)
             .iter()
             .map(|g| with_modes(json!({
-                "path": g.path,
+                "path": g.target.as_path().expect("path-only standing projection").0,
                 "granted_by": g.granted_by,
                 "reason": g.reason,
                 "granted_at": g.granted_at,
@@ -16618,7 +16618,7 @@ mod tests {
                 retired_at: crate::server::gate_escalation::now_secs(),
                 reason: "probe residue — never a real seat".into(),
                 evidence_ref: "test".into(),
-                revoked_paths: vec![],
+                revoked_paths: vec![], revoked_targets: vec![],
                 was_active: false,
                 retired_by: "lct:web4:operator:test".into(),
             });
@@ -16767,7 +16767,7 @@ mod tests {
                 retired_at: 1,
                 reason: "probe residue".into(),
                 evidence_ref: "test".into(),
-                revoked_paths: vec![],
+                revoked_paths: vec![], revoked_targets: vec![],
                 was_active: false,
                 retired_by: "op".into(),
             });
@@ -21050,7 +21050,7 @@ mod appeal_tests {
                 retired_at: 1,
                 reason: "probe residue".into(),
                 evidence_ref: "test".into(),
-                revoked_paths: vec![],
+                revoked_paths: vec![], revoked_targets: vec![],
                 was_active: true,
                 retired_by: "op".into(),
             });
@@ -24240,8 +24240,8 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         }))
         .chain(standing_all.iter().map(|g| json!({
             "channel": "standing",
-            "path": g.path,
-            "recursive": g.recursive,
+            "path": g.target.as_path().expect("path-only standing projection").0,
+            "recursive": g.target.as_path().expect("path-only standing projection").1,
             "modes": g.modes,
             "expires_at": g.expires_at,
             "granted_by": g.granted_by,
@@ -24258,7 +24258,7 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         .filter(|r| !r.ext.modes.is_all())
         .map(|r| (r.reach_path().to_string(), r.recursive, r.ext.modes))
         .chain(standing_all.iter().filter(|g| !g.modes.is_all())
-               .map(|g| (g.path.clone(), g.recursive, g.modes)))
+               .filter_map(|g| g.target.as_path().map(|(path, recursive)| (path.to_owned(), recursive, g.modes))))
         .collect();
     let floor_view = s.standing_scope.floor_for(&narrowed);
     let floor_row = |f: &crate::server::standing_scope::FloorEntry| json!({
@@ -24288,7 +24288,7 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
             .iter()
             .filter(|g| g.modes.is_all())
             .map(|g| json!({
-                "path": g.path,
+                "path": g.target.as_path().expect("path-only standing projection").0,
                 "granted_at": g.granted_at,
                 "granted_by": g.granted_by,
                 "reason": g.reason,
@@ -24297,7 +24297,7 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 // Exact by default; a subtree only when an operator said so. The consumer
                 // spells a recursive grant `path:<root>/**` and treats a bare `path:` as
                 // exact, so this field is what decides whether a child path is reachable.
-                "recursive": g.recursive,
+                "recursive": g.target.as_path().expect("path-only standing projection").1,
             }))
             .collect::<Vec<_>>(),
         // EVERY live and standing grant with what it lets the member DO (#1345). See the
@@ -26974,13 +26974,12 @@ mod standing_scope_surface_tests {
     fn standing(plugin: &str, path: &str, at: u64, expires_at: Option<u64>) -> StandingGrant {
         StandingGrant {
             member: plugin.into(),
-            path: path.into(),
+            target: crate::server::grant_target::GrantTarget::Path { path: path.into(), recursive: false },
             granted_at: at,
             granted_by: "operator".into(),
             reason: "durable test grant".into(),
             expires_at,
             request_id: Some("scope-test01".into()),
-        recursive: false,
         modes: crate::server::grant_modes::Modes::ALL,
         }
     }
@@ -27004,7 +27003,7 @@ mod standing_scope_surface_tests {
             s.standing_scope.add(standing("kimi-code", "/w/full", now, None));
             let mut ro = standing("kimi-code", "/w/gov", now, None);
             ro.modes = crate::server::grant_modes::Modes::READ;
-            ro.recursive = true;
+            if let crate::server::grant_target::GrantTarget::Path { recursive, .. } = &mut ro.target { *recursive = true; }
             s.standing_scope.add(ro);
         }
         let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
@@ -27154,7 +27153,7 @@ mod standing_scope_surface_tests {
                 ..Default::default()
             });
             let mut g = standing("kimi-code", "/w/shared/law", now, None);
-            g.recursive = true;
+            if let crate::server::grant_target::GrantTarget::Path { recursive, .. } = &mut g.target { *recursive = true; }
             g.modes = crate::server::grant_modes::Modes::READ;
             s.standing_scope.add(g);
         }
@@ -27428,7 +27427,7 @@ mod standing_scope_surface_tests {
                 st.grants[0].member = "kimi-code".into()
             })),
             ("path", Box::new(|st: &mut StandingScopeStore| {
-                st.grants[0].path = "/w/elsewhere".into()
+                if let crate::server::grant_target::GrantTarget::Path { path, .. } = &mut st.grants[0].target { *path = "/w/elsewhere".into(); }
             })),
             ("extra grant", Box::new(|st: &mut StandingScopeStore| {
                 st.add(standing("codex", "/w/extra", now, None))
@@ -29659,13 +29658,12 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
         let standing_prior = s.standing_scope.clone();
         let grant = crate::server::standing_scope::StandingGrant {
             member: member.clone(),
-            path: path.clone(),
+            target: crate::server::grant_target::GrantTarget::Path { path: path.clone(), recursive: false },
             granted_at: now,
             granted_by: granted_by.clone(),
             reason: reason.clone(),
             expires_at: None,
             request_id: Some(request_id.clone()),
-            recursive: false,
             modes: crate::server::grant_modes::Modes::ALL,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
