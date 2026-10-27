@@ -128,6 +128,47 @@ impl WitnessSet {
     }
 }
 
+/// One witness, counted once — by its id AND by the key it resolves to (R1).
+///
+/// `hestia witness onboard` vouches the hub CONNECTION's member key, not a
+/// per-member one, so three members onboarded on one seat carry ONE key on three
+/// LCTs, and `witness attest --as` signs all three with it. Distinct by id alone,
+/// that passed as a quorum: the canon's "three entries that are one witness are
+/// not a quorum" held at the id layer while the independence it protects lives at
+/// the key layer. Both [`valid_distinct_existence`] (the authority) and
+/// [`QuorumReport::assess`] (its diagnostic mirror) admit through this, so the two
+/// can never disagree about which attestations were kept (claude's rebase hazard
+/// on #572). Membership is tested BEFORE inserting, so a dropped attestation seeds
+/// neither set. Distinct keys >= 3 implies distinct ids >= 3: the key set is the
+/// stricter test; the id set names the duplicate.
+#[derive(Default)]
+struct Distinct {
+    ids: std::collections::BTreeSet<String>,
+    keys: std::collections::BTreeSet<[u8; 32]>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    New,
+    SameWitness,
+    SharedKey,
+}
+
+impl Distinct {
+    fn admit(&mut self, witness: &str, key: &PublicKey) -> Admit {
+        let k = key.to_bytes();
+        if self.ids.contains(witness) {
+            return Admit::SameWitness;
+        }
+        if self.keys.contains(&k) {
+            return Admit::SharedKey;
+        }
+        self.ids.insert(witness.to_string());
+        self.keys.insert(k);
+        Admit::New
+    }
+}
+
 /// Why a quorum did not form — the legible half of a fail-closed refusal.
 ///
 /// `build_birth_certificate` returns a bare `None`, which is correct for the
@@ -141,6 +182,8 @@ pub struct QuorumReport {
     pub unresolved_witness: Vec<String>,
     pub bad_signature: Vec<String>,
     pub duplicate_witness: Vec<String>,
+    /// A different witness id whose key another counted witness already holds (R1).
+    pub shared_key: Vec<String>,
     pub distinct_valid: Vec<String>,
 }
 
@@ -158,9 +201,10 @@ impl QuorumReport {
             unresolved_witness: Vec::new(),
             bad_signature: Vec::new(),
             duplicate_witness: Vec::new(),
+            shared_key: Vec::new(),
             distinct_valid: Vec::new(),
         };
-        let mut seen = std::collections::BTreeSet::new();
+        let mut distinct = Distinct::default();
         for a in attestations {
             if a.attestation_type != AttestationType::Existence {
                 r.wrong_type += 1;
@@ -174,11 +218,11 @@ impl QuorumReport {
                 r.bad_signature.push(a.witness.clone());
                 continue;
             }
-            if !seen.insert(a.witness.clone()) {
-                r.duplicate_witness.push(a.witness.clone());
-                continue;
+            match distinct.admit(&a.witness, &pk) {
+                Admit::SameWitness => r.duplicate_witness.push(a.witness.clone()),
+                Admit::SharedKey => r.shared_key.push(a.witness.clone()),
+                Admit::New => r.distinct_valid.push(a.witness.clone()),
             }
-            r.distinct_valid.push(a.witness.clone());
         }
         r
     }
@@ -206,6 +250,11 @@ impl QuorumReport {
         for w in &self.duplicate_witness {
             out.push_str(&format!(
                 "\n  duplicate — a second attestation from {w} adds nothing (distinct witnesses, not distinct signatures)"
+            ));
+        }
+        for w in &self.shared_key {
+            out.push_str(&format!(
+                "\n  same key — {w} resolves to a key another counted witness already signed with; one key is one witness, however many LCTs carry it (onboard each witness on its own constellation)"
             ));
         }
         out
@@ -248,16 +297,16 @@ pub fn valid_distinct_existence<'a, F>(
 where
     F: Fn(&str) -> Option<PublicKey>,
 {
-    let mut seen = std::collections::BTreeSet::new();
+    let mut distinct = Distinct::default();
     attestations
         .iter()
         .filter(|a| a.attestation_type == AttestationType::Existence)
         .filter(|a| {
-            // distinct witness: keep only the first valid one per witness id
-            resolve_witness_pubkey(&a.witness)
-                .map(|pk| a.verify(subject_lct_id, &pk))
-                .unwrap_or(false)
-                && seen.insert(a.witness.clone())
+            // distinct witness: the first valid one per witness id AND per resolved key (R1)
+            match resolve_witness_pubkey(&a.witness) {
+                Some(pk) if a.verify(subject_lct_id, &pk) => distinct.admit(&a.witness, &pk) == Admit::New,
+                _ => false,
+            }
         })
         .collect()
 }

@@ -54,22 +54,23 @@ fn resolver(registry: &[Lct]) -> impl Fn(&str) -> Option<PublicKey> + '_ {
     }
 }
 
-/// **C1 — distinctness is over the witness ID STRING, not the signing KEY.**
+/// **C1 — distinctness is over the signing KEY as well as the witness id (R1).**
 ///
 /// `hestia witness onboard <plugin_id>` vouches
 /// `member_signing_keypair(vault, &conn.member_key_source)` — a function of the
 /// hub CONNECTION, not of `plugin_id`. Onboarding three members of one
 /// constellation against one connection therefore vouches ONE key onto three
-/// LCTs, and `witness attest --as` signs all three with it. Three witness ids,
-/// one signer, quorum met: the canon's "three entries that are one witness are
-/// not a quorum" holds at the id layer and not at the key layer, where the
-/// independence it is protecting actually lives.
+/// LCTs, and `witness attest --as` signs all three with it. Until R1 that was a
+/// passing quorum: the canon's "three entries that are one witness are not a
+/// quorum" held at the id layer and not at the key layer, where the
+/// independence it protects lives.
 ///
-/// Should move to: dedup on the RESOLVED KEY as well as the id — in the
-/// producer (`valid_distinct_existence`) so a certificate like this is never
-/// built, and in the verifier's stated contract so an existing one is caught.
+/// Now the producer (`valid_distinct_existence`) and its diagnostic mirror
+/// (`QuorumReport::assess`) both dedup on the resolved key: no certificate is
+/// built, and the report names the shared key as the cause instead of a bare
+/// "quorum not met". (The verifier half is web4-core's, HUB's R2.)
 #[test]
-fn c1_three_witness_ids_backed_by_one_key_currently_pass() {
+fn c1_three_witness_ids_backed_by_one_key_are_one_witness() {
     let sid = subject();
     let ts = fixed_ts();
     let shared_op = KeyPair::generate();
@@ -79,7 +80,7 @@ fn c1_three_witness_ids_backed_by_one_key_currently_pass() {
         .map(|m| hestia::witness::attest(&sid, &m.lct_id(), ts, &shared_op))
         .collect();
 
-    let (certificate, attestations) = hestia::witness::build_birth_certificate(
+    let built = hestia::witness::build_birth_certificate(
         &sid,
         "lct:web4:role:citizen",
         "lct:web4:society:test",
@@ -87,22 +88,25 @@ fn c1_three_witness_ids_backed_by_one_key_currently_pass() {
         &atts,
         ts,
         resolver(&registry),
-    )
-    .expect("the producer builds this certificate today");
-    let record = CitizenshipRecord { certificate, attestations };
-
-    let distinct_keys: std::collections::BTreeSet<String> = record
-        .attestations
-        .iter()
-        .filter_map(|a| resolver(&registry)(&a.witness).map(|k| k.to_hex()))
-        .collect();
-
-    assert_eq!(record.certificate.birth_witnesses.len(), 3, "three declared witnesses");
-    assert_eq!(distinct_keys.len(), 1, "backed by exactly one signing key");
-    assert!(
-        record.verify_quorum(&sid, resolver(&registry)),
-        "MEASURED (to be fixed): the quorum passes on three spellings of one key"
     );
+    assert!(built.is_none(), "three spellings of one key are not a quorum: no certificate is built");
+
+    let report = hestia::witness::QuorumReport::assess(&sid, &atts, resolver(&registry));
+    assert_eq!(report.distinct_valid.len(), 1, "one key counts once: {report:?}");
+    assert_eq!(report.shared_key.len(), 2, "the other two are named as the same key: {report:?}");
+    assert!(report.duplicate_witness.is_empty(), "they are different ids, not repeats: {report:?}");
+    assert!(!report.quorum_met());
+    assert!(report.explain().contains("same key"), "{}", report.explain());
+
+    // three witnesses with three keys still make a quorum
+    let ops: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+    let registry: Vec<Lct> = ops.iter().map(|op| onboarded(op).0).collect();
+    let atts: Vec<Attestation> = registry
+        .iter()
+        .zip(&ops)
+        .map(|(m, op)| hestia::witness::attest(&sid, &m.lct_id(), ts, op))
+        .collect();
+    assert!(hestia::witness::QuorumReport::assess(&sid, &atts, resolver(&registry)).quorum_met());
 }
 
 /// **C2 — declared-witness coverage is checked against a LIVE resolver, so more
