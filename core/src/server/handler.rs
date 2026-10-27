@@ -24024,11 +24024,15 @@ const READ_ONLY_PATH_TOOLS: &[&str] = &[
 /// The roots this member's grants and the society floor name: every live and standing grant
 /// root plus every floor root. Where a member's asks are judged to be "about its own space"
 /// (`in_members_space`) and where a did-you-mean candidate may be re-rooted.
-fn member_roots(s: &crate::server::state::ServerState, plugin_id: &str) -> Vec<String> {
-    let mut roots: Vec<String> = s.live_scope_grants(plugin_id).iter()
-        .map(|r| r.reach_path().to_string()).collect();
-    roots.extend(s.live_standing_grants(plugin_id).iter().map(|g| g.path.clone()));
-    roots.extend(s.standing_scope.floor.iter().map(|f| f.path.clone()));
+/// Every root the member holds some grant on, WITH its reach: `(root, recursive)`. An exact grant
+/// covers only its own path (part B and C, #1386: the parent is not reach), so a consumer that
+/// asks "is this path under a root" must honour the flag, or an exact grant on a broad directory
+/// would make its whole subtree answerable (nomad on #1415).
+fn member_roots(s: &crate::server::state::ServerState, plugin_id: &str) -> Vec<(String, bool)> {
+    let mut roots: Vec<(String, bool)> = s.live_scope_grants(plugin_id).iter()
+        .map(|r| (r.reach_path().to_string(), r.recursive)).collect();
+    roots.extend(s.live_standing_grants(plugin_id).iter().map(|g| (g.path.clone(), g.recursive)));
+    roots.extend(s.standing_scope.floor.iter().map(|f| (f.path.clone(), f.recursive)));
     roots
 }
 
@@ -24055,9 +24059,9 @@ fn reroot_onto(root: &str, target: &str) -> Option<String> {
 /// read) — the gate's #1412 repair, applied here (Nova, nomad on #1415). This ONE predicate both
 /// draws the hint and bounds the silent decline, so the decline can never be quiet about a path
 /// the hint would not name.
-fn rerooted_in_reach(s: &crate::server::state::ServerState, plugin_id: &str, roots: &[String],
+fn rerooted_in_reach(s: &crate::server::state::ServerState, plugin_id: &str, roots: &[(String, bool)],
                      target: &str, now: u64) -> Option<String> {
-    roots.iter().find_map(|root| {
+    roots.iter().find_map(|(root, _recursive)| {
         let root = root.trim_end_matches('/');
         let cand = reroot_onto(root, target)?;
         if cand == target {
@@ -24098,9 +24102,11 @@ enum SpaceAnswer {
 fn space_of(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> SpaceAnswer {
     let p = path.trim_end_matches('/');
     let roots = member_roots(s, plugin_id);
-    let under = roots.iter().any(|root| {
+    // An EXACT root is Under only for itself; a RECURSIVE one for its subtree too (nomad on
+    // #1415: the children of an exact grant are not the member's to stat).
+    let under = roots.iter().any(|(root, recursive)| {
         let root = root.trim_end_matches('/');
-        !root.is_empty() && (p == root || p.starts_with(&format!("{root}/")))
+        !root.is_empty() && (p == root || (*recursive && p.starts_with(&format!("{root}/"))))
     });
     if under {
         return SpaceAnswer::Under;
@@ -32990,6 +32996,40 @@ mod existence_first_tests {
         assert_eq!(r["status"], "not_filed", "{r}");
         assert_eq!(r["reason"], "nonexistent", "{r}");
         assert_eq!(pending(&state).await, before);
+    }
+
+    /// nomad on #1415, the same class in the `Under` arm: an EXACT grant on a directory covers only
+    /// its own path, so its children are not stat-ed (they file); the root itself still is.
+    #[tokio::test]
+    async fn an_exact_grant_does_not_make_its_subtree_statable() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let d = dir.path().join("d");
+        std::fs::create_dir_all(&d).unwrap();
+        let e = dir.path().join("e"); // granted exactly, and absent
+        for (root, _) in [(&d, ()), (&e, ())] {
+            state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+                member: "cbp-being".into(), path: root.to_str().unwrap().into(), granted_at: 0,
+                granted_by: "operator".into(), reason: "exact".into(), expires_at: None,
+                request_id: None, recursive: false, modes: crate::server::grant_modes::Modes::ALL,
+            });
+        }
+        let ask = |p: String| {
+            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p,
+                           "reason": "a child of a directory I hold exactly"});
+            let st = state.clone();
+            async move { tool_request_scope(&st, &b).await.unwrap() }
+        };
+        let before = pending(&state).await;
+        let r = ask(d.join("absent.md").to_str().unwrap().to_string()).await;
+        assert_eq!(r["status"], "pending", "a child of an exact root is not Under, so it files: {r}");
+        let r = ask(d.to_str().unwrap().to_string()).await;
+        assert_eq!(r["status"], "already_granted", "the exact root itself: {r}");
+        let r = ask(e.to_str().unwrap().to_string()).await;
+        assert_eq!(r["status"], "not_filed", "the exact root itself may be stat-ed: {r}");
+        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert_eq!(pending(&state).await, before + 1);
     }
 
     /// nomad and Nova on #1415, the oracle through the target: a misrooted ask is answered from
