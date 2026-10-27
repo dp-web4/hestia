@@ -300,6 +300,7 @@ def test_path_and_command_scope():
     ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/granted/a.md"], cwd=ws)
     check("in_scope_path_allows", G.evaluate(ev, prof, ws).decision == "allow")
 
+    open(f"{ws}/notgranted/a.md", "w").close()  # exists: an off-limits path, not a missing one (hestia #1411)
     ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/notgranted/a.md"], cwd=ws)
     v = G.evaluate(ev, prof, ws)
     check("out_of_scope_path_denies", v.blocks and v.rule == "mrh.path")
@@ -360,6 +361,8 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
           repr(G._parse_scope_entries([root_entry])))
     # exact root grant: reaches the root, not what is under it
     root_exact = _profile(ws, [root_entry])
+    os.makedirs(deep, exist_ok=True)
+    open(os.path.join(deep, "note.md"), "a").close()  # exists: an off-limits path, not a missing one (hestia #1411)
     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "note.md")], cwd=ws)
     check("workspace_root_exact_grant_does_not_admit_descendant",
           G.evaluate(ev, root_exact, ws).blocks)
@@ -387,6 +390,7 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     ev = G.NormalizedEvent(tool="Read", paths=[deep], cwd=ws)
     check("deep_directory_exact_grant_admits_itself",
           G.evaluate(ev, exact, ws).decision == "allow")
+    open(os.path.join(deep, "child.txt"), "a").close()  # exists: an off-limits path, not a missing one (hestia #1411)
     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "child.txt")], cwd=ws)
     check("deep_directory_exact_grant_does_not_admit_child",
           G.evaluate(ev, exact, ws).blocks)
@@ -731,6 +735,8 @@ def test_scope_is_decided_after_normalisation_not_before():
         os.makedirs(os.path.join(ws, r), exist_ok=True)
     prof = _profile(ws, ["repo:granted"])
     escape = f"{ws}/granted/../notgranted/secret"
+    os.makedirs(f"{ws}/notgranted", exist_ok=True)
+    open(f"{ws}/notgranted/secret", "a").close()  # exists: an off-limits path, not a missing one (hestia #1411)
 
     # Positive controls FIRST: the grant must still work, or a deny-everything regression
     # would green every assertion below for the wrong reason.
