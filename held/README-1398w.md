@@ -49,6 +49,15 @@ as two grants nested, and should answer the same way.
   is part C's doing and part C's branch updates), nonexistent_path 8, floor read-only 8, sprintD 91/0,
   sprintF 10, mechanism 34, seat boundary 17x4, closure 39, battery 1434/0, decide contract 25 (+29x4).
 
+**Reach is not trust (nomad's probe on #1421).** An `rw` floor on a git-synced tree such as
+`shared-context/forum` means every member can WRITE there, so every member can plant content, including
+symlinks and instructions, that every being reads on its next beat. The symlink side is closed: a floor path
+is judged at its real target, so a link out of the floor is refused for write, edit and read, and a link into a
+tree the member holds `r` on is decided by that own grant. The content side is not a reach question at all:
+what a being reads from the forum is as trusted as its author, and an `rw` floor does not make it more so. This
+was already true through the live rwed grants the floor replaces; it is stated here so "rw floor" is never
+read as "safe to read as trusted".
+
 **Not in this change:** the daemon's `floor_for` withholding stays as it is (it protects mode-blind gates);
 whether it can be relaxed once every gate applies #1386 is #1385's question. SAGE's dispatcher parity for
 written floor paths (it sees read-floor roots as `r` since SAGE #533) is a follow-up on the SAGE side.
