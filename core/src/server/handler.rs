@@ -24076,23 +24076,47 @@ fn rerooted_in_reach(s: &crate::server::state::ServerState, plugin_id: &str, roo
     })
 }
 
-/// Whether `path` is about the member's own space (nomad on #1415): UNDER a root the member
-/// holds some grant on, or a doubled root that lands on something REAL in the member's reach
-/// (`rerooted_in_reach`: `<ws>/hestia/governance/hestia/gate.py` while holding `<ws>/governance`
-/// and `governance/hestia/gate.py` exists there). The existence-first decline answers "does not
-/// exist" without filing anything, which anywhere else would be an existence oracle over the
-/// host; there, the ask files as before and the operator sees the probe. Not a parent-directory
-/// rule (a grant on `<home>/notes` must not make `<home>`'s siblings count), and not a
-/// basename rule (a path merely containing a segment named like a root, `<elsewhere>/notes/x`,
-/// files: nothing real in the member's reach is what it meant).
-fn in_members_space(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> bool {
+/// Where an asked path stands relative to the member's own space (nomad and Nova on #1415).
+enum SpaceAnswer {
+    /// UNDER a root the member holds some grant on: the member could learn the path's existence
+    /// by itself, so the existence-first decline may stat it.
+    Under,
+    /// OUTSIDE every root, but a doubled root that re-roots onto something REAL and readable in
+    /// the member's reach (`<ws>/hestia/governance/hestia/gate.py` while holding `<ws>/governance`
+    /// and `governance/hestia/gate.py` exists there). Carries the candidate. The target itself
+    /// is NEVER stat-ed here: a quiet answer that depended on the target's existence would tell
+    /// the member whether `<prefix>` exists for any `<prefix>` on the host (an existing FILE
+    /// there gives ENOTDIR, which reads as present and files; a missing one gives NotFound and
+    /// is quiet) — an existence oracle, whatever bound is put on the candidate. So the answer
+    /// is computed from the candidate alone, and the member that truly means the outside path
+    /// says so once (`confirm: true`) and is filed without any look at the target.
+    Misrooted(String),
+    /// Everywhere else: files as before, so the operator sees the probe.
+    Outside,
+}
+
+fn space_of(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> SpaceAnswer {
     let p = path.trim_end_matches('/');
     let roots = member_roots(s, plugin_id);
     let under = roots.iter().any(|root| {
         let root = root.trim_end_matches('/');
         !root.is_empty() && (p == root || p.starts_with(&format!("{root}/")))
     });
-    under || rerooted_in_reach(s, plugin_id, &roots, p, crate::server::gate_escalation::now_secs()).is_some()
+    if under {
+        return SpaceAnswer::Under;
+    }
+    match rerooted_in_reach(s, plugin_id, &roots, p, crate::server::gate_escalation::now_secs()) {
+        Some(cand) => SpaceAnswer::Misrooted(cand),
+        None => SpaceAnswer::Outside,
+    }
+}
+
+/// The answer for a misrooted ask: names the in-reach path it most likely meant and the one
+/// way to insist. Depends on the candidate only (see `SpaceAnswer::Misrooted`).
+fn misrooted_detail(path: &str, cand: &str) -> String {
+    format!("{path} lies outside every grant you hold, and it re-roots onto {cand}, which exists \
+             inside one. Did you mean {cand}? It is in your reach now. If you really mean {path}, \
+             ask again with confirm: true and it will be filed")
 }
 
 /// `Path::try_exists` read the way a gate must: an error (an unreadable parent, a dangling or
@@ -24184,15 +24208,35 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
     // new directory, is a real ask (dp: "how is mkdir or a new file write handled"). Nothing is
     // filed and nothing is witnessed: there is no decision for anyone to make.
     let create = args.get("create").and_then(Value::as_bool).unwrap_or(false);
-    if !create && definitely_absent(&path) && in_members_space(&s, &plugin_id, &path) {
-        return Ok(json!({
-            "status": "not_filed",
-            "reason": "nonexistent",
-            "path": path,
-            "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
-            "next": "check the spelling against what you already hold; if you mean to CREATE \
-                     this path, ask again with create: true",
-        }));
+    // `confirm: true` says "I mean this outside path, not the in-reach one it re-roots onto":
+    // the ask is then filed without any look at the target (it buys an escalation, never a
+    // permission). The target is stat-ed only UNDER a root the member holds (see `SpaceAnswer`).
+    let confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    if !create {
+        match space_of(&s, &plugin_id, &path) {
+            SpaceAnswer::Under if definitely_absent(&path) => {
+                return Ok(json!({
+                    "status": "not_filed",
+                    "reason": "nonexistent",
+                    "path": path,
+                    "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
+                    "next": "check the spelling against what you already hold; if you mean to CREATE \
+                             this path, ask again with create: true",
+                }));
+            }
+            SpaceAnswer::Misrooted(cand) if !confirm => {
+                return Ok(json!({
+                    "status": "not_filed",
+                    "reason": "likely_misrooted",
+                    "path": path,
+                    "candidate": cand,
+                    "detail": misrooted_detail(&path, &cand),
+                    "next": "read the candidate, which you already hold; or ask again with \
+                             confirm: true if you mean this path and not the candidate",
+                }));
+            }
+            _ => {}
+        }
     }
 
     // An already-live grant answers the ask without a second act. Told plainly rather than
@@ -24679,18 +24723,34 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     // EXISTENCE FIRST (hestia#1411): a gate refusal of a READ of a path that does not exist opens
     // nothing, whichever gate sent it (one that predates the gate-side rule included). A write may
     // be creating the path, so only read tools are declined here.
+    // Same split as `tool_request_scope` (nomad, Nova on #1415): under a root the target is
+    // stat-ed; a doubled root onto a real, readable in-reach path is answered from that candidate
+    // ALONE, never by looking at the target; anything else opens as before.
     if unpriceable.is_none() && !subtree && rule == "mrh.path"
         && READ_ONLY_PATH_TOOLS.contains(&tool.as_str())
-        && definitely_absent(&path)
-        && in_members_space(&s, &plugin_id, &path)
     {
-        return Ok(json!({
-            "verdict": "not_opened",
-            "permits": false,
-            "path": path,
-            "reason": "nonexistent",
-            "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
-        }));
+        match space_of(&s, &plugin_id, &path) {
+            SpaceAnswer::Under if definitely_absent(&path) => {
+                return Ok(json!({
+                    "verdict": "not_opened",
+                    "permits": false,
+                    "path": path,
+                    "reason": "nonexistent",
+                    "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
+                }));
+            }
+            SpaceAnswer::Misrooted(cand) => {
+                return Ok(json!({
+                    "verdict": "not_opened",
+                    "permits": false,
+                    "path": path,
+                    "reason": "likely_misrooted",
+                    "candidate": cand,
+                    "detail": misrooted_detail(&path, &cand),
+                }));
+            }
+            _ => {}
+        }
     }
     let key = scope_request_key(&plugin_id, &path);
     let probe = if subtree { format!("{path}/*") } else { path.clone() };
@@ -32968,9 +33028,70 @@ mod existence_first_tests {
         let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
             "path": missing.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
         assert_eq!(r["status"], "not_filed", "{r}");
-        assert_eq!(r["reason"], "nonexistent", "{r}");
-        assert!(r["detail"].as_str().unwrap().contains("does not exist"), "{r}");
+        assert_eq!(r["reason"], "likely_misrooted", "{r}");
+        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
         assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
+        // UNDER a root, the target is stat-ed and a missing one is declined as nonexistent.
+        let under = dir.path().join("governance/no-such.py");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": under.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert_eq!(pending(&state).await, before);
+    }
+
+    /// nomad and Nova on #1415, the oracle through the target: a misrooted ask is answered from
+    /// the in-reach CANDIDATE alone, never by looking at the target, so `<f>/notes/y.md` with `<f>`
+    /// an existing file (a stat there gives ENOTDIR) and `<m>/notes/y.md` with `<m>` missing
+    /// (NotFound) give IDENTICAL answers; `confirm: true` files either, identically, and buys an
+    /// escalation, never a permission.
+    #[tokio::test]
+    async fn a_misrooted_ask_is_answered_from_the_candidate_alone() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        std::fs::write(home.join("notes/y.md"), "x").unwrap();
+        let notes = home.join("notes").to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: notes.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "notes".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::ALL,
+        });
+        let f = dir.path().join("f");
+        std::fs::write(&f, "a file, not a directory").unwrap();
+        let m = dir.path().join("m");
+        let via_file = f.join("notes/y.md").to_str().unwrap().to_string();
+        let via_missing = m.join("notes/y.md").to_str().unwrap().to_string();
+        let ask = |p: &str, confirm: bool| {
+            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p,
+                           "reason": "to read my note, by a path I think is right", "confirm": confirm});
+            let st = state.clone();
+            async move { tool_request_scope(&st, &b).await.unwrap() }
+        };
+        let strip = |v: &serde_json::Value, p: &str| serde_json::to_string(v).unwrap().replace(p, "<P>");
+        let (a, b) = (ask(&via_file, false).await, ask(&via_missing, false).await);
+        assert_eq!(a["status"], "not_filed", "{a}");
+        assert_eq!(a["reason"], "likely_misrooted", "{a}");
+        assert_eq!(a["candidate"], format!("{notes}/y.md"), "{a}");
+        assert_eq!(strip(&a, &via_file), strip(&b, &via_missing),
+                   "the answer must not depend on whether <prefix> exists:\n{a}\n{b}");
+        let before = pending(&state).await;
+        let (a, b) = (ask(&via_file, true).await, ask(&via_missing, true).await);
+        assert_eq!(a["status"], "pending", "confirm files it without a look at the target: {a}");
+        assert_eq!(b["status"], "pending", "{b}");
+        assert_eq!(pending(&state).await, before + 2);
+        // The claim route answers the same way for a read tool, from the candidate alone.
+        let claim = |p: &str| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
+            "path": p, "rule": "mrh.path", "tool_name": "read_file",
+            "act": format!("read_file -> {p}"), "act_digest": "b".repeat(64)});
+        let (a, b) = (tool_scope_claim(&state, &claim(&via_file)).await.unwrap(),
+                      tool_scope_claim(&state, &claim(&via_missing)).await.unwrap());
+        assert_eq!(a["verdict"], "not_opened", "{a}");
+        assert_eq!(a["reason"], "likely_misrooted", "{a}");
+        assert_eq!(strip(&a, &via_file), strip(&b, &via_missing), "{a}\n{b}");
+        assert_eq!(pending(&state).await, before + 2, "a claim never opens on a misrooted read");
     }
 
     /// nomad on #1415, point 1 through the re-root arm: a path that merely CONTAINS a segment
@@ -33071,7 +33192,7 @@ mod existence_first_tests {
         let before = pending(&state).await;
         let r = tool_scope_claim(&state, &claim("read_file")).await.unwrap();
         assert_eq!(r["verdict"], "not_opened", "{r}");
-        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert_eq!(r["reason"], "likely_misrooted", "the doubled root is answered from its candidate: {r}");
         assert_eq!(pending(&state).await, before, "a read of nothing opens nothing");
         let w = tool_scope_claim(&state, &claim("Write")).await.unwrap();
         assert_eq!(w["verdict"], "opened", "a write may be creating it: {w}");
