@@ -24012,6 +24012,47 @@ mod invitation_note_contract_tests {
 /// **Asking is not receiving.** This returns `pending` and permits nothing. Only the operator
 /// answers, only through the operator-gated HTTP surface, and an unanswered request expires into
 /// a refusal.
+/// EXISTENCE FIRST (dp, 2026-10-26, hestia#1411): "we should not be doing escalations on
+/// nonexistent paths because there is nothing to escalate - it's just noise". The tools whose
+/// act on a path only READS it: the gate's `READ_ONLY_PATH_TOOLS` plus every tool its
+/// `PATH_TOOL_MODES` maps to exactly `r` (kept in step by `read_tools_match_the_gate`).
+const READ_ONLY_PATH_TOOLS: &[&str] = &[
+    "Glob", "Grep", "LS", "NotebookRead", "Read", "git_read", "glob", "list_directory",
+    "read_file", "read_many_files", "search", "search_file_content",
+];
+
+/// The refusal text for an ask about a path that does not exist (hestia#1411), naming the
+/// existing path inside one of the member's own grants that it most likely meant. A grant root's
+/// basename found as a segment of `path` re-roots the rest of `path` under that grant: the doubled
+/// root `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when
+/// that candidate exists, so the hint never names another path that is not there.
+fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> String {
+    let mut roots: Vec<String> = s.live_scope_grants(plugin_id).iter()
+        .map(|r| r.reach_path().to_string()).collect();
+    roots.extend(s.live_standing_grants(plugin_id).iter().map(|g| g.path.clone()));
+    roots.extend(s.standing_scope.floor.iter().map(|f| f.path.clone()));
+    let target = path.trim_end_matches('/');
+    let hint = roots.iter().find_map(|root| {
+        let root = root.trim_end_matches('/');
+        let base = root.rsplit('/').next().filter(|b| !b.is_empty())?;
+        let marker = format!("/{base}/");
+        let cand = if let Some(i) = target.find(&marker) {
+            format!("{root}{}", &target[i + marker.len() - 1..])
+        } else if target.ends_with(&format!("/{base}")) {
+            root.to_string()
+        } else {
+            return None;
+        };
+        (cand != target && std::path::Path::new(&cand).exists()).then_some(cand)
+    });
+    let mut out = format!("{path} does not exist: there is nothing there to grant, so no request was \
+                           opened (nothing reaches the operator's queue)");
+    if let Some(c) = hint {
+        out.push_str(&format!(". Did you mean {c}? It exists, inside a grant you already hold"));
+    }
+    out
+}
+
 async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
     use crate::server::state::{normalize_scope_path, ScopeRequest, SCOPE_REQUEST_TTL_SECS};
@@ -24054,6 +24095,22 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
 
     let now = now_secs();
     let mut s = state.lock().await;
+
+    // EXISTENCE FIRST (hestia#1411). A request names no mode, so a path that does not exist is
+    // refused unless the member says it is creating it (`create: true`): a new file, even in a
+    // new directory, is a real ask (dp: "how is mkdir or a new file write handled"). Nothing is
+    // filed and nothing is witnessed: there is no decision for anyone to make.
+    let create = args.get("create").and_then(Value::as_bool).unwrap_or(false);
+    if !create && !std::path::Path::new(&path).exists() {
+        return Ok(json!({
+            "status": "not_filed",
+            "reason": "nonexistent",
+            "path": path,
+            "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
+            "next": "check the spelling against what you already hold; if you mean to CREATE \
+                     this path, ask again with create: true",
+        }));
+    }
 
     // An already-live grant answers the ask without a second act. Told plainly rather than
     // silently deduplicated, so a member never wonders whether its request went nowhere.
@@ -24511,6 +24568,21 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
             "detail": "a scope request names one absolute path below the root (or the gate's \
                        act-keyed unenumerated sentinel); the root itself is not grantable, so no \
                        request was opened",
+        }));
+    }
+    // EXISTENCE FIRST (hestia#1411): a gate refusal of a READ of a path that does not exist opens
+    // nothing, whichever gate sent it (one that predates the gate-side rule included). A write may
+    // be creating the path, so only read tools are declined here.
+    if unpriceable.is_none() && !subtree && rule == "mrh.path"
+        && READ_ONLY_PATH_TOOLS.contains(&tool.as_str())
+        && !std::path::Path::new(&path).exists()
+    {
+        return Ok(json!({
+            "verdict": "not_opened",
+            "permits": false,
+            "path": path,
+            "reason": "nonexistent",
+            "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
         }));
     }
     let key = scope_request_key(&plugin_id, &path);
@@ -32068,8 +32140,11 @@ mod durable_reads_tests {
 
         // Two writers that touch no other store: a scope request (a published policy input, an
         // in-memory row and a chain row) and a bare witnessed fact.
+        // The path exists: a request for a nonexistent one is not filed (hestia#1411).
+        let probe_path = dir.path().join("durable-read-probe.txt");
+        std::fs::write(&probe_path, "x").unwrap();
         let req = tool_request_scope(&state, &json!({"plugin_id": "codex", "session_id": sid,
-            "path": "/tmp/durable-read-probe.txt", "reason": "durable reads test"})).await.unwrap();
+            "path": probe_path.to_str().unwrap(), "reason": "durable reads test"})).await.unwrap();
         let request_id = req["request_id"].as_str().unwrap_or_else(|| panic!("{req}")).to_string();
         let fact = { state.lock().await.append_chain("battery_fact", json!({"n": 1})).unwrap() };
 
@@ -32700,5 +32775,114 @@ mod channel_send_tests {
         };
         assert!(refused, "channel_send is daemon-written only");
         assert!(events(&state, "channel_send").await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod existence_first_tests {
+    //! EXISTENCE FIRST (hestia#1411). dp, 2026-10-26: "we should not be doing escalations on
+    //! nonexistent paths because there is nothing to escalate - it's just noise". Measured on
+    //! cbp-being: nine operator cards for `<ws>/hestia/governance/...`, a doubled root, while the
+    //! member already held `<ws>/governance`.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+
+    async fn session(state: &SharedState) -> String {
+        tool_connect(state, &json!({"plugin_id": "cbp-being", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string()
+    }
+
+    async fn pending(state: &SharedState) -> usize {
+        state.lock().await.scope_requests.len()
+    }
+
+    #[tokio::test]
+    async fn a_request_for_a_nonexistent_path_is_not_filed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let missing = dir.path().join("hestia/governance/x.py");
+        let before = pending(&state).await;
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": missing.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert!(r["detail"].as_str().unwrap().contains("does not exist"), "{r}");
+        assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
+    }
+
+    #[tokio::test]
+    async fn create_true_keeps_a_new_path_a_real_ask() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let new = dir.path().join("notes/new-dir/new.md");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": new.to_str().unwrap(), "reason": "to write a new note there", "create": true}))
+            .await.unwrap();
+        assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
+    async fn an_existing_path_is_filed_as_before() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let f = dir.path().join("exists.md");
+        std::fs::write(&f, "x").unwrap();
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": f.to_str().unwrap(), "reason": "to read an existing file"})).await.unwrap();
+        assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
+    async fn the_refusal_names_the_path_inside_the_members_own_grant() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("governance/hestia")).unwrap();
+        std::fs::write(ws.join("governance/hestia/gate.py"), "x").unwrap();
+        let root = ws.join("governance").to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::ALL,
+        });
+        let doubled = ws.join("hestia/governance/hestia/gate.py");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": doubled.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        let want = format!("Did you mean {root}/hestia/gate.py?");
+        assert!(r["detail"].as_str().unwrap().contains(&want), "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_gate_claim_for_a_read_of_nothing_opens_nothing_but_a_write_still_does() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let missing = dir.path().join("hestia/governance/x.py");
+        let claim = |tool: &str| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
+            "path": missing.to_str().unwrap(), "rule": "mrh.path", "tool_name": tool,
+            "act": format!("{tool} -> x.py"), "act_digest": "a".repeat(64)});
+        let before = pending(&state).await;
+        let r = tool_scope_claim(&state, &claim("read_file")).await.unwrap();
+        assert_eq!(r["verdict"], "not_opened", "{r}");
+        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert_eq!(pending(&state).await, before, "a read of nothing opens nothing");
+        let w = tool_scope_claim(&state, &claim("Write")).await.unwrap();
+        assert_eq!(w["verdict"], "opened", "a write may be creating it: {w}");
+    }
+
+    /// The daemon's read-tool list must be the gate's (READ_ONLY_PATH_TOOLS plus every
+    /// PATH_TOOL_MODES entry that needs exactly r); checked against the gate source in the tree.
+    #[test]
+    fn read_tools_match_the_gate() {
+        let core = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/_shared/hestia_gate_core.py"))
+            .expect("gate core in the tree");
+        for t in READ_ONLY_PATH_TOOLS {
+            assert!(core.contains(&format!("\"{t}\"")), "{t} is not a tool the gate names");
+        }
     }
 }
