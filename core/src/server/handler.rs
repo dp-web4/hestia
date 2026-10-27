@@ -24099,15 +24099,84 @@ enum SpaceAnswer {
     Outside,
 }
 
+/// `path` resolved through its deepest EXISTING ancestor (`canonicalize`), with the missing tail
+/// re-appended; None when no ancestor can be resolved. The target of an existence-first ask is
+/// usually absent, so this is how an escaping symlink beneath a root is seen for what it is
+/// before anything is answered (Nova, nomad on #1415).
+fn resolve_through_existing_ancestor(path: &str) -> Option<std::path::PathBuf> {
+    let mut cur = std::path::Path::new(path);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            let mut out = real;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return Some(out);
+        }
+        tail.push(cur.file_name()?.to_os_string());
+        cur = cur.parent()?;
+    }
+}
+
+/// Whether the gate's own law lets `plugin_id` READ at `real` (a resolved path): the NEAREST of
+/// the member's own grants covering it decides, by the union of the grants at that depth (#1386,
+/// the rule part C applies at the gate); with no own grant covering it, the floor rows that do.
+/// `effective_modes` unions EVERY covering own grant, which would let a wide `r` admit a read
+/// inside a nearer `w`-only node (Nova on #1415, regression 3); this does not.
+fn read_admitted_nearest(s: &crate::server::state::ServerState, plugin_id: &str, real: &str, now: u64) -> bool {
+    use crate::server::grant_modes::Modes;
+    use crate::server::standing_scope::covers_path;
+    let canon = |root: &str| std::fs::canonicalize(root)
+        .map(|r| r.to_string_lossy().to_string())
+        .unwrap_or_else(|_| root.trim_end_matches('/').to_string());
+    let mut nodes: Vec<(String, bool, Modes)> = s.live_scope_grants(plugin_id).iter()
+        .map(|r| (canon(r.reach_path()), r.recursive, r.ext.modes)).collect();
+    nodes.extend(s.live_standing_grants(plugin_id).iter().map(|g| (canon(&g.path), g.recursive, g.modes)));
+    let covering: Vec<&(String, bool, Modes)> =
+        nodes.iter().filter(|(root, rec, _)| covers_path(root, *rec, real)).collect();
+    if let Some(best) = covering.iter().map(|(root, _, _)| root.matches('/').count()).max() {
+        let held = covering.iter()
+            .filter(|(root, _, _)| root.matches('/').count() == best)
+            .map(|(_, _, m)| *m)
+            .reduce(|a, b| a.union(b))
+            .unwrap_or(Modes::READ);
+        return held.includes(Modes::READ);
+    }
+    let _ = now;
+    s.standing_scope.floor.iter()
+        .filter(|f| covers_path(&canon(&f.path), f.recursive, real))
+        .map(|f| f.modes)
+        .reduce(|a, b| a.union(b))
+        .is_some_and(|m| m.includes(Modes::READ))
+}
+
 fn space_of(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> SpaceAnswer {
     let p = path.trim_end_matches('/');
     let roots = member_roots(s, plugin_id);
-    // An EXACT root is Under only for itself; a RECURSIVE one for its subtree too (nomad on
-    // #1415: the children of an exact grant are not the member's to stat).
-    let under = roots.iter().any(|(root, recursive)| {
+    let now = crate::server::gate_escalation::now_secs();
+    // UNDER means "the gate's own law would let this member READ here" (Nova, nomad on #1415),
+    // never "lexically beneath some root": the target is resolved through its deepest existing
+    // ancestor, must sit inside a root's resolved path (an escaping symlink fails), and the member
+    // must be READ-admitted there by the nearest grant (a w-only root, a w-only floor row, or an
+    // r grant shadowed by a nearer w-only node fails). Only then may the target be stat-ed, since
+    // the member could learn its existence itself. An EXACT grant on this very path, the path
+    // itself missing, is Under by the grant's own identity (if the member may read it).
+    let inside = |real: &str| roots.iter().any(|(root, recursive)| {
         let root = root.trim_end_matches('/');
-        !root.is_empty() && (p == root || (*recursive && p.starts_with(&format!("{root}/"))))
+        if root.is_empty() {
+            return false;
+        }
+        let root_real = std::fs::canonicalize(root)
+            .map(|r| r.to_string_lossy().to_string())
+            .unwrap_or_else(|_| root.to_string());
+        real == root_real || (*recursive && real.starts_with(&format!("{root_real}/")))
     });
+    let exact_self = roots.iter().any(|(root, _)| root.trim_end_matches('/') == p);
+    let under = match resolve_through_existing_ancestor(p).map(|r| r.to_string_lossy().to_string()) {
+        Some(real) if inside(&real) => read_admitted_nearest(s, plugin_id, &real, now),
+        _ => exact_self && read_admitted_nearest(s, plugin_id, p, now),
+    };
     if under {
         return SpaceAnswer::Under;
     }
@@ -33044,6 +33113,75 @@ mod existence_first_tests {
         assert_eq!(r["status"], "not_filed", "{r}");
         assert_eq!(r["reason"], "nonexistent", "{r}");
         assert_eq!(pending(&state).await, before);
+    }
+
+    /// Nova and nomad on #1415, the last class: a quiet answer may depend only on what the member
+    /// could READ for itself. A w-only root or floor row, an r root shadowed by a nearer w-only
+    /// node, an escaping symlink under an r root, and a w-only exact target all FILE, for an absent
+    /// and for an existing target alike (no differential), and the claim route opens for both.
+    #[tokio::test]
+    async fn a_quiet_answer_needs_read_at_the_resolved_path() {
+        use crate::server::grant_modes::Modes;
+        use crate::server::standing_scope::{FloorEntry, StandingGrant};
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        let mk = |rel: &str| { std::fs::create_dir_all(ws.join(rel)).unwrap(); ws.join(rel) };
+        let (w, wf, r, outside, f, fsub) = (mk("w"), mk("wf"), mk("r"), mk("outside"), mk("f"), mk("f/sub"));
+        for d in [&w, &wf, &outside, &fsub] { std::fs::write(d.join("existing.md"), "x").unwrap(); }
+        std::os::unix::fs::symlink(&outside, r.join("alias")).unwrap();
+        std::fs::write(ws.join("wx"), "x").unwrap();
+        let grant = |path: &std::path::Path, recursive: bool, modes: &str| StandingGrant {
+            member: "cbp-being".into(), path: path.to_str().unwrap().into(), granted_at: 0,
+            granted_by: "operator".into(), reason: "t".into(), expires_at: None, request_id: None,
+            recursive, modes: Modes::parse(modes).unwrap(),
+        };
+        let floor = |path: &std::path::Path, modes: &str| FloorEntry {
+            path: path.to_str().unwrap().into(), added_at: 0, added_by: "operator".into(),
+            reason: "floor".into(), recursive: true, modes: Modes::parse(modes).unwrap(),
+        };
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.grants.push(grant(&w, true, "w"));          // w-only recursive root
+            s.standing_scope.grants.push(grant(&r, true, "r"));          // r root holding an escaping alias
+            s.standing_scope.grants.push(grant(&fsub, true, "w"));       // nearer w-only node under an r floor
+            s.standing_scope.grants.push(grant(&ws.join("wx"), false, "w")); // w-only exact, existing
+            s.standing_scope.grants.push(grant(&ws.join("wm"), false, "w")); // w-only exact, missing
+            s.standing_scope.floor.push(floor(&wf, "w"));                // w-only floor row
+            s.standing_scope.floor.push(floor(&f, "r"));                 // r floor above the w-only node
+        }
+        let ask = |p: String| {
+            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p,
+                           "reason": "a path I believe I may read, asked by hand"});
+            let st = state.clone();
+            async move { tool_request_scope(&st, &b).await.unwrap()["status"].clone() }
+        };
+        let pairs = [
+            (w.join("absent.md"), w.join("existing.md")),
+            (wf.join("absent.md"), wf.join("existing.md")),
+            (r.join("alias/missing.md"), r.join("alias/existing.md")),
+            (fsub.join("absent.md"), fsub.join("existing.md")),
+            (ws.join("wm"), ws.join("wx")),
+        ];
+        for (absent, present) in &pairs {
+            let a = ask(absent.to_str().unwrap().to_string()).await;
+            let b = ask(present.to_str().unwrap().to_string()).await;
+            assert_eq!(a, "pending", "{} must file, not answer quietly", absent.display());
+            assert_eq!(b, "pending", "{} must file", present.display());
+        }
+        // The claim route (read tool) opens for both halves of a pair too.
+        let claim = |p: &std::path::Path| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
+            "path": p.to_str().unwrap(), "rule": "mrh.path", "tool_name": "read_file",
+            "act": format!("read_file -> {}", p.display()), "act_digest": "c".repeat(64)});
+        std::fs::write(w.join("existing2.md"), "x").unwrap(); // fresh paths: the asks above left requests pending
+        for p in [w.join("absent2.md"), w.join("existing2.md")] {
+            let v = tool_scope_claim(&state, &claim(&p)).await.unwrap();
+            assert_eq!(v["verdict"], "opened", "{v}");
+        }
+        // Controls: where the member may READ, an absent target is still declined quietly.
+        assert_eq!(ask(r.join("absent.md").to_str().unwrap().to_string()).await, "not_filed");
+        assert_eq!(ask(f.join("other-absent.md").to_str().unwrap().to_string()).await, "not_filed");
     }
 
     /// nomad on #1415, the same class in the `Under` arm: an EXACT grant on a directory covers only
