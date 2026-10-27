@@ -1,6 +1,6 @@
 # held: hestia #1398, a composed read is a read on the read-only floor
 
-**Patch:** `659414ee9f4ad49e185df53ddb26740bb696b87f8c983170e4e525d8071739a4.patch`, cut by `build-1398/build_1398.py` on main `95d6d0b7`. It changes `_read_only_admits` in the gate core only, plus its hooks-gt copy and the 5 manifests. **Not applied:** it needs an operator-approved escalation.
+**Patch:** `c544b4204f4b3de7df15f2555d68818fb9d5041dd97fc579c66755298c7c7b57.patch`, cut by `build-1398/build_1398.py` on main `95d6d0b7`. It changes `_read_only_admits` in the gate core only, plus its hooks-gt copy and the 5 manifests. **Not applied:** it needs an operator-approved escalation.
 
 **Why.** On 2026-10-25 dp put `shared-context/forum` on the society floor (recursive, `rw`). The daemon serves that read-only, because it's narrower than rwed. cbp-being's `search` of the forum was then refused `mrh.path`, which opened a scope request, and dp gave a live grant to get it working. A narrowed `r` grant on the same path has admitted that search since part B, so the floor's read rule and a grant's read rule disagreed.
 
@@ -29,3 +29,6 @@ Every writer is still refused.
 **Independent of part C (#1394):** part C doesn't edit `_read_only_admits`.
 
 **Not in this change:** serving a narrowed floor entry's `w` (the other half of #1398). That needs the daemon to serve narrowed floor rows by mode and the gate to admit them under #1386's precedence (the floor applies only where no own grant reaches).
+
+
+**Re-cut 2026-10-27** on main `2b3d0ca2` (after #1412): patch `c544b420…` (the previous `659414ee…` was on `95d6d0b7`; superseded). Sources unchanged, manifests regenerated. Verified on the new main: held test 1/1 (8 verdicts), grant_modes 17, floor 8, nonexistent_path 8, sprintD 91, sprintF 10, mechanism 34, seat boundary 17×4, closure 39, battery 1434/0, decide contract 25 (+29×4).
