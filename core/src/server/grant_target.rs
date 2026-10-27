@@ -15,6 +15,28 @@ pub enum GrantTarget {
     Repository(RepositoryTarget),
 }
 
+impl GrantTarget {
+    /// Identity within one member's grants. Recursion is mutable reach, not a
+    /// second identity: replacing an exact grant with a subtree must replace the
+    /// same row. Callers must still compare the member separately.
+    pub fn same_identity(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Path { path: a, .. }, Self::Path { path: b, .. }) => a == b,
+            (Self::Repository(a), Self::Repository(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Explicit path projection for containment, floor and reroot consumers.
+    /// A repository name is never converted into filesystem reach.
+    pub fn as_path(&self) -> Option<(&str, bool)> {
+        match self {
+            Self::Path { path, recursive } => Some((path, *recursive)),
+            Self::Repository(_) => None,
+        }
+    }
+}
+
 // Separate strict variants are deliberate: Option fields would conflate an absent
 // selector with an explicit null, and could silently accept path + repo:null.
 #[derive(Serialize, Deserialize)]
@@ -65,6 +87,62 @@ impl From<GrantTarget> for TargetWire {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn identity_ignores_reach_but_equality_retains_it() {
+        let exact = GrantTarget::Path {
+            path: "/work/repo".into(),
+            recursive: false,
+        };
+        let subtree = GrantTarget::Path {
+            path: "/work/repo".into(),
+            recursive: true,
+        };
+        assert!(exact.same_identity(&subtree));
+        assert!(subtree.same_identity(&exact));
+        assert_ne!(exact, subtree, "audit equality must retain recursive reach");
+        let child = GrantTarget::Path {
+            path: "/work/repo/child".into(),
+            recursive: false,
+        };
+        assert!(
+            !subtree.same_identity(&child),
+            "containment is not row identity"
+        );
+    }
+
+    #[test]
+    fn identity_distinguishes_domains_and_repository_owners() {
+        let repo = GrantTarget::Repository(RepositoryTarget::parse("owner/repo").unwrap());
+        let normalized = GrantTarget::Repository(RepositoryTarget::parse("OWNER/REPO").unwrap());
+        let foreign = GrantTarget::Repository(RepositoryTarget::parse("other/repo").unwrap());
+        assert!(repo.same_identity(&normalized));
+        assert!(!repo.same_identity(&foreign));
+        for recursive in [false, true] {
+            let path = GrantTarget::Path {
+                path: "owner/repo".into(),
+                recursive,
+            };
+            assert!(!repo.same_identity(&path));
+            assert!(!path.same_identity(&repo));
+        }
+    }
+
+    #[test]
+    fn path_projection_preserves_reach_and_excludes_repositories() {
+        for recursive in [false, true] {
+            let path = GrantTarget::Path {
+                path: "/work/repo".into(),
+                recursive,
+            };
+            assert_eq!(path.as_path(), Some(("/work/repo", recursive)));
+            let reloaded: GrantTarget =
+                serde_json::from_str(&serde_json::to_string(&path).unwrap()).unwrap();
+            assert_eq!(reloaded.as_path(), path.as_path());
+        }
+        let repo: GrantTarget = serde_json::from_str(r#"{"repo":"owner/repo"}"#).unwrap();
+        assert_eq!(repo.as_path(), None);
+    }
 
     #[test]
     fn legacy_path_defaults_exact_and_preserves_recursive() {

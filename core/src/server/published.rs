@@ -210,7 +210,7 @@ impl PolicyPublication {
                              crate::server::gate_escalation::now_secs())
     }
     pub fn live_standing_grants(&self, plugin_id: &str) -> Vec<&StandingGrant> {
-        self.standing_scope.live_for(plugin_id, crate::server::gate_escalation::now_secs())
+        self.standing_scope.live_paths_for(plugin_id, crate::server::gate_escalation::now_secs())
     }
     /// Register this publication with the current request's durability scope: its reply must not
     /// precede the durability of the chain entries the publication reflects.

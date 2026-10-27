@@ -3733,14 +3733,13 @@ pub(crate) async fn scope_decide_as(
         let grant = crate::server::standing_scope::StandingGrant {
             member: plugin_id.clone(),
             // The breadth the decider chose (the asked path or a directory above it).
-            path: reach_path.clone(),
+            target: crate::server::grant_target::GrantTarget::Path { path: reach_path.clone(), recursive },
             granted_at: now,
             // `operator`, or `peer:<member>` — the record names who ruled.
             granted_by: decider.by.clone(),
             reason: reason.clone(),
             expires_at: standing_expires_at,
             request_id: Some(request_id.clone()),
-            recursive,
             modes,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
@@ -4652,10 +4651,10 @@ fn standing_grant_binding(
 ) -> serde_json::Value {
     grants
         .iter()
-        .find(|g| g.member == member && g.path == path && g.expires_at.is_none_or(|e| now < e))
+        .find(|g| g.member == member && g.target.as_path().is_some_and(|(p, _)| p == path) && g.expires_at.is_none_or(|e| now < e))
         .map(|g| {
             serde_json::json!({
-                "reason": g.reason, "recursive": g.recursive, "granted_by": g.granted_by,
+                "reason": g.reason, "recursive": g.target.as_path().is_some_and(|(_, recursive)| recursive), "granted_by": g.granted_by,
                 "expires_at": g.expires_at, "request_id": g.request_id,
                 // #1345: what the operator was shown includes what the grant lets the member
                 // do, so a row narrowed or widened since the read is refused as moved.
@@ -4842,7 +4841,7 @@ async fn scope_grant(
         .standing_scope
         .grants
         .iter()
-        .any(|g| g.member == plugin_id && g.path == path);
+        .any(|g| g.member == plugin_id && g.target.as_path().is_some_and(|(p, _)| p == path));
 
     // ORDER: INTENT → COMMIT → SUCCESS, via the one function that owns it
     // (`witness_and_commit_standing_grant`). This used to append `scope_granted` and THEN
@@ -4879,14 +4878,13 @@ async fn scope_grant(
     });
     let grant = crate::server::standing_scope::StandingGrant {
         member: plugin_id.clone(),
-        path: path.clone(),
+            target: crate::server::grant_target::GrantTarget::Path { path: path.clone(), recursive },
         granted_at: now,
         granted_by: "operator".to_string(),
         reason: reason.clone(),
         expires_at,
         // None, for the same reason `request_id` is null in the record above.
         request_id: None,
-        recursive,
         modes,
     };
     let (intent_hash, entry_hash) = match s.witness_and_commit_standing_grant(grant, record) {
@@ -5785,7 +5783,7 @@ async fn scope_live_revoke(
         .standing_scope
         .grants
         .iter()
-        .any(|g| g.member == req.plugin_id && crate::server::standing_scope::covers_path(&g.path, g.recursive, &req.path)
+        .any(|g| g.member == req.plugin_id && g.covers(&req.path)
              && g.expires_at.is_none_or(|e| now < e));
     (
         StatusCode::OK,
@@ -5842,7 +5840,7 @@ async fn scope_standing_revoke(
         .standing_scope
         .grants
         .iter()
-        .any(|g| g.member == plugin_id && g.path == path);
+        .any(|g| g.member == plugin_id && g.target.as_path().is_some_and(|(p, _)| p == path));
     // 404 only when the store is CONSISTENT and holds no such grant — a typo, bounded here.
     // While `standing_scope_dirty` is set, memory is tighter than the vault (a prior revoke's
     // vault write failed after the row left memory), so a row absent from memory may still be
@@ -5981,14 +5979,14 @@ async fn scope_standing_promote(
     // pressing "make standing" on the recursive row must widen the standing grant (the store's
     // add() replaces by (member, path)) instead of answering a no-op.
     if let Some(existing) = s.standing_scope.grants.iter()
-        .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e)
-                  && (g.recursive || !live.recursive) && g.modes.includes(live.ext.modes))
+        .find(|g| g.member == plugin_id && g.target.as_path().is_some_and(|(p, _)| p == path) && g.expires_at.is_none_or(|e| now < e)
+                  && (g.target.as_path().is_some_and(|(_, recursive)| recursive) || !live.recursive) && g.modes.includes(live.ext.modes))
     {
         return (StatusCode::OK, Json(serde_json::json!({
             "status": "already_standing",
             "plugin_id": plugin_id,
             "path": path,
-            "recursive": existing.recursive,
+            "recursive": existing.target.as_path().is_some_and(|(_, recursive)| recursive),
             "granted_at": existing.granted_at,
             "standing_generation": s.standing_scope.generation,
             "note": "this grant is already standing; nothing was appended to the chain",
@@ -6007,7 +6005,7 @@ async fn scope_standing_promote(
     // grant lacks would lose it silently, a narrowing nobody chose. Which modes the durable
     // grant should carry is the operator's call, and Edit makes it explicitly.
     if let Some(twin) = s.standing_scope.grants.iter()
-        .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e)
+        .find(|g| g.member == plugin_id && g.target.as_path().is_some_and(|(p, _)| p == path) && g.expires_at.is_none_or(|e| now < e)
                   && g.modes != live.ext.modes)
     {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
@@ -6055,13 +6053,12 @@ async fn scope_standing_promote(
     let prior = s.standing_scope.clone();
     let grant = crate::server::standing_scope::StandingGrant {
         member: plugin_id.clone(),
-        path: path.clone(),
+            target: crate::server::grant_target::GrantTarget::Path { path: path.clone(), recursive: live.recursive },
         granted_at: now,
         granted_by: "operator".to_string(),
         reason: reason.clone(),
         expires_at,
         request_id: Some(live.id.clone()),
-        recursive: live.recursive,
         // Promotion changes how LONG a grant lasts, never what it allows (#1345).
         modes: live.ext.modes,
     };
@@ -6173,8 +6170,8 @@ async fn scope_standing_recursive(
     // already equals the request is a no-op, and a no-op mints no witness and moves no
     // generation. `set_recursive` is idempotent, but the record must be too.
     let standing_now: Option<bool> = s.standing_scope.grants.iter()
-        .find(|g| g.member == plugin_id && g.path == path && g.is_live(now))
-        .map(|g| g.recursive);
+        .find(|g| g.member == plugin_id && g.target.as_path().is_some_and(|(p, _)| p == path) && g.is_live(now))
+        .map(|g| g.target.as_path().is_some_and(|(_, recursive)| recursive));
     let live: Option<(String, bool)> = s.scope_requests.values()
         .find(|r| r.plugin_id == plugin_id && r.reach_path() == path && r.is_live(now))
         .map(|r| (r.id.clone(), r.recursive));
@@ -6368,7 +6365,7 @@ async fn scope_standing_edit(
 
     let mut s = state.lock().await;
     let Some(before) = s.standing_scope.grants.iter()
-        .find(|g| g.member == plugin_id && g.path == path && g.is_live(now)).cloned()
+        .find(|g| g.member == plugin_id && g.target.as_path().is_some_and(|(p, _)| p == path) && g.is_live(now)).cloned()
     else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "error": "no standing grant of record for that (plugin_id, path)"})));
@@ -6392,8 +6389,7 @@ async fn scope_standing_edit(
         }
     }
     let mut after = before.clone();
-    after.path = new_path.clone();
-    after.recursive = recursive;
+    after.target = crate::server::grant_target::GrantTarget::Path { path: new_path.clone(), recursive };
     after.modes = modes;
     if after == before {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
@@ -6403,13 +6399,13 @@ async fn scope_standing_edit(
     }
     // Every refusal the store would make is made HERE, before the intent row: a refused edit
     // must leave the chain as bit-identical as the store (O).
-    if after.path != before.path
-        && s.standing_scope.grants.iter().any(|g| g.member == plugin_id && g.path == after.path)
+    if new_path != path
+        && s.standing_scope.grants.iter().any(|g| g.member == plugin_id && g.target.as_path().is_some_and(|(p, _)| p == new_path))
     {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
             "error": format!("{plugin_id} already holds a separate grant on {}; revoke one of \
                               them first, so which reach wins is your explicit call. Nothing \
-                              was written.", after.path),
+                              was written.", new_path),
         })));
     }
     let widens_modes = after.modes.widens(before.modes);
@@ -6441,7 +6437,7 @@ async fn scope_standing_edit(
         }
     }
     let row = |g: &crate::server::standing_scope::StandingGrant| serde_json::json!({
-        "path": g.path, "recursive": g.recursive, "modes": g.modes,
+        "path": g.target.as_path().expect("path grant").0, "recursive": g.target.as_path().is_some_and(|(_, recursive)| recursive), "modes": g.modes,
     });
     let subject = s.member_lct(&plugin_id);
     let record = |kind: &str, extra: serde_json::Value| {
@@ -6626,7 +6622,7 @@ async fn scope_standing_reassign(
             "subject_instance_lct": subject_from,
             "destination_instance_lct": subject_to,
             "path": path,
-            "recursive": moved.recursive,
+            "recursive": moved.target.as_path().is_some_and(|(_, r)| r),
             "expires_at": moved.expires_at,
             "reason": reason,
             "changed_by": "operator",
@@ -6679,7 +6675,7 @@ async fn scope_standing_reassign(
         }
     };
     (StatusCode::OK, Json(serde_json::json!({
-        "ok": true, "plugin_id": from, "to": to, "path": path, "recursive": moved.recursive,
+        "ok": true, "plugin_id": from, "to": to, "path": path, "recursive": moved.target.as_path().is_some_and(|(_, r)| r),
         "generation": s.standing_scope.generation,
         "witnessEntryHash": success.hash,
     })))
@@ -7853,13 +7849,16 @@ async fn agent_retire(
     let now = crate::server::gate_escalation::now_secs();
     let retired_by = gate_operator(&gate);
     let held: Vec<String> = s.standing_scope.grants.iter()
-        .filter(|g| g.member == plugin_id).map(|g| g.path.clone()).collect();
+        .filter(|g| g.member == plugin_id).filter_map(|g| g.target.as_path().map(|(p, _)| p.to_owned())).collect();
+    let held_targets: Vec<_> = s.standing_scope.grants.iter()
+        .filter(|g| g.member == plugin_id).map(|g| g.target.clone()).collect();
     let record = serde_json::json!({
         "plugin_id": plugin_id,
         "subject_instance_lct": s.member_lct(&plugin_id),
         "reason": reason,
         "ref": evidence_ref,
         "revokes_standing_paths": held,
+        "revokes_standing_targets": held_targets,
         "acts_in_window": recent,
         "acts_measurable": measured.is_ok(),
         "window_hours": RETIRE_ACTIVE_WINDOW_HOURS,
@@ -7878,7 +7877,7 @@ async fn agent_retire(
     };
     let rec = crate::server::retirement::RetiredMember {
         plugin_id: plugin_id.clone(), retired_at: now, reason: reason.clone(),
-        evidence_ref: evidence_ref.clone(), revoked_paths: held.clone(), was_active: recent > 0,
+        evidence_ref: evidence_ref.clone(), revoked_paths: held.clone(), revoked_targets: held_targets.clone(), was_active: recent > 0,
         retired_by: retired_by.clone(),
     };
     let revoked = match s.commit_retirement(&reason, |st| { st.retire(rec); Some(plugin_id.clone()) }) {
@@ -7894,6 +7893,7 @@ async fn agent_retire(
     let mut done = record.clone();
     if let Some(m) = done.as_object_mut() {
         m.insert("revoked_standing_paths".into(), serde_json::json!(revoked.standing));
+        m.insert("revoked_standing_targets".into(), serde_json::json!(revoked.standing_targets));
         m.insert("revoked_live_paths".into(), serde_json::json!(revoked.live));
         m.insert("revoked_delegations".into(), serde_json::json!(revoked.delegations));
         m.insert("intent".into(), serde_json::json!(intent.hash));
@@ -7903,6 +7903,7 @@ async fn agent_retire(
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "retired": true,
         "revoked_standing_paths": revoked.standing,
+        "revoked_standing_targets": revoked.standing_targets,
         "revoked_live_paths": revoked.live,
         "revoked_delegations": revoked.delegations,
         "generation": gen,
@@ -7943,6 +7944,7 @@ async fn agent_reinstate(
         "was_retired_at": existing.retired_at,
         "was_retired_because": existing.reason,
         "paths_revoked_then_and_NOT_restored_now": existing.revoked_paths,
+        "targets_revoked_then_and_NOT_restored_now": existing.revoked_targets,
         "reinstated_by": gate_operator(&gate),
     });
     let intent = match s.append_chain("member_reinstate_intent", stamp_gate(record.clone(), &gate)) {
@@ -7959,6 +7961,7 @@ async fn agent_reinstate(
         "ok": true, "plugin_id": plugin_id, "retired": false,
         "generation": s.retired_members.generation,
         "grants_not_restored": existing.revoked_paths,
+        "targets_not_restored": existing.revoked_targets,
         "intentEntryHash": intent.hash,
         "witnessEntryHash": entry.map(|e| e.hash),
         "note": "the standing grants revoked at retirement were NOT restored — re-grant any that \
@@ -9370,8 +9373,8 @@ mod disposition_tests {
             "reason": "r", "recursive": false, "granted_by": "operator", "expires_at": null,
             "request_id": null, "secs_remaining": 12, "granted_at": 99});
         let g = crate::server::standing_scope::StandingGrant {
-            member: "m".into(), path: "/p".into(), granted_at: 1, granted_by: "operator".into(),
-            reason: "r".into(), expires_at: None, request_id: None, recursive: false,
+            member: "m".into(), target: crate::server::grant_target::GrantTarget::Path { path: "/p".into(), recursive: false }, granted_at: 1, granted_by: "operator".into(),
+            reason: "r".into(), expires_at: None, request_id: None,
             modes: crate::server::grant_modes::Modes::ALL,
         };
         assert_eq!(grant_binding_of(&row), standing_grant_binding(&[g.clone()], "m", "/p", 10));
@@ -10931,9 +10934,9 @@ mod disposition_tests {
             let mut s = state.lock().await;
             s.scope_requests.insert("scope-live-s".into(), live_req("scope-live-s", "/x/tree", now));
             s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
-                member: "kimi-code".into(), path: "/x/tree".into(), granted_at: now,
+                member: "kimi-code".into(), target: crate::server::grant_target::GrantTarget::Path { path: "/x/tree".into(), recursive: false }, granted_at: now,
                 granted_by: "operator".into(), reason: "a separate standing grant".into(),
-                expires_at: None, request_id: None, recursive: false,
+                expires_at: None, request_id: None,
                 modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
@@ -10969,11 +10972,11 @@ mod disposition_tests {
         assert_eq!(resp.status(), StatusCode::OK, "a live grant promotes");
         let s = state.lock().await;
         let g = s.standing_scope.grants.iter()
-            .find(|g| g.member == "kimi-code" && g.path == "/x/tree")
+            .find(|g| g.member == "kimi-code" && g.target.as_path().expect("path grant").0 == "/x/tree")
             .expect("a standing row now exists");
         assert_eq!(g.request_id.as_deref(), Some("scope-live-1"), "provenance travels");
         assert_eq!(g.reason, "watched it used well", "the live decision's reason is kept when none is given");
-        assert!(!g.recursive, "reach is carried, and the live grant was exact");
+        assert!(!g.target.as_path().is_some_and(|(_, recursive)| recursive), "reach is carried, and the live grant was exact");
         assert!(s.standing_scope.has_live("kimi-code", "/x/tree", now));
         let chain = s.recent_chain(20);
         let ok = chain.iter().find(|e| e.event_type == "scope_granted").expect("terminal record");
@@ -10997,7 +11000,7 @@ mod disposition_tests {
         let chain = s.recent_chain(40);
         assert_eq!(chain.iter().filter(|e| e.event_type == "scope_granted").count(), granted_rows,
                    "an idempotent press appends no scope_granted row");
-        assert_eq!(s.standing_scope.grants.iter().filter(|g| g.path == "/x/tree").count(), 1);
+        assert_eq!(s.standing_scope.grants.iter().filter(|g| g.target.as_path().expect("path grant").0 == "/x/tree").count(), 1);
     }
 
     /// The fold is by reach: a live grant that reaches MORE than its standing twin (subtree
@@ -11012,9 +11015,9 @@ mod disposition_tests {
         s.scope_requests.insert("scope-live-3".into(), wide);
         s.scope_requests.insert("scope-live-4".into(), live_req("scope-live-4", "/y/alone", now));
         s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
-            member: "kimi-code".into(), path: "/y/tree".into(), granted_at: now,
+            member: "kimi-code".into(), target: crate::server::grant_target::GrantTarget::Path { path: "/y/tree".into(), recursive: false }, granted_at: now,
             granted_by: "operator".into(), reason: "r".into(), expires_at: None,
-            request_id: None, recursive: false,
+            request_id: None,
             modes: crate::server::grant_modes::Modes::ALL,
         })).unwrap();
         let rows = s.dashboard_snapshot(20).scope_grants;
@@ -11036,9 +11039,9 @@ mod disposition_tests {
             &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
         assert_ne!(body["status"], "already_standing", "exact standing must not swallow a recursive promote: {body}");
         let s = state.lock().await;
-        let tree_grants: Vec<_> = s.standing_scope.grants.iter().filter(|g| g.path == "/y/tree").collect();
+        let tree_grants: Vec<_> = s.standing_scope.grants.iter().filter(|g| g.target.as_path().expect("path grant").0 == "/y/tree").collect();
         assert_eq!(tree_grants.len(), 1, "the store replaces by (member, path)");
-        assert!(tree_grants[0].recursive, "the standing grant now reaches the subtree");
+        assert!(tree_grants[0].target.as_path().unwrap().1, "the standing grant now reaches the subtree");
         let rows = s.dashboard_snapshot(20).scope_grants;
         let tree: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/tree").collect();
         assert_eq!(tree.len(), 1, "the recursive live row folds into the now-recursive standing row: {rows:?}");
@@ -11068,9 +11071,9 @@ mod disposition_tests {
             let mut s = state.lock().await;
             s.scope_requests.insert("scope-live-2".into(), live_req("scope-live-2", "/w/tree", now));
             s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
-                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                member: "kimi-code".into(), target: crate::server::grant_target::GrantTarget::Path { path: "/w/tree".into(), recursive: false }, granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
-                request_id: None, recursive: false,
+                request_id: None,
                 modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
             assert!(s.has_scope_grant("kimi-code", "/w/tree"));
@@ -11118,9 +11121,9 @@ mod disposition_tests {
         {
             let mut s = state.lock().await;
             s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
-                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                member: "kimi-code".into(), target: crate::server::grant_target::GrantTarget::Path { path: "/w/tree".into(), recursive: false }, granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
-                request_id: None, recursive: false,
+                request_id: None,
                 modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
@@ -11143,9 +11146,9 @@ mod disposition_tests {
         {
             let mut s = state.lock().await;
             s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
-                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                member: "kimi-code".into(), target: crate::server::grant_target::GrantTarget::Path { path: "/w/tree".into(), recursive: false }, granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
-                request_id: None, recursive: false,
+                request_id: None,
                 modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
@@ -11176,9 +11179,9 @@ mod disposition_tests {
         {
             let mut s = state.lock().await;
             s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
-                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                member: "kimi-code".into(), target: crate::server::grant_target::GrantTarget::Path { path: "/w/tree".into(), recursive: false }, granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
-                request_id: None, recursive: false,
+                request_id: None,
                 modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
@@ -11207,9 +11210,9 @@ mod disposition_tests {
         let now = crate::server::gate_escalation::now_secs();
         let mut s = state.lock().await;
         s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
-            member: member.into(), path: path.into(), granted_at: now,
+            member: member.into(), target: crate::server::grant_target::GrantTarget::Path { path: path.into(), recursive }, granted_at: now,
             granted_by: "operator".into(), reason: "r".into(), expires_at: None,
-            request_id: None, recursive,
+            request_id: None,
             modes: crate::server::grant_modes::Modes::ALL,
         })).unwrap();
     }
@@ -11481,6 +11484,41 @@ mod disposition_tests {
         }
         let (st, _) = reinstate(&state, "never-retired", serde_json::json!({"reason": "x"})).await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mixed_domain_snapshot_retirement_and_reinstate_keep_typed_history() {
+        use crate::server::{grant_target::GrantTarget, repository_target::RepositoryTarget};
+        let (_dir, state) = test_state().await;
+        register_member(&state, "codex").await;
+        let (status, body) = grant(&state, serde_json::json!({
+            "plugin_id":"codex", "path":"/work/path", "reason":"test"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let target = GrantTarget::Repository(RepositoryTarget::parse("owner/repo").unwrap());
+        {
+            let mut s = state.lock().await;
+            let mut repository = s.standing_scope.grants[0].clone();
+            repository.target = target.clone();
+            s.standing_scope.add(repository);
+            let rows = s.dashboard_snapshot(10).scope_grants;
+            assert_eq!(rows.len(), 1, "repository must not leak into path dashboard: {rows:?}");
+            assert_eq!(rows[0]["path"], "/work/path");
+        }
+        let (status, body) = retire(&state, "codex", serde_json::json!({"reason":"test", "ref":"control"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["revoked_standing_paths"], serde_json::json!(["/work/path"]));
+        assert_eq!(body["revoked_standing_targets"].as_array().unwrap().len(), 2);
+        {
+            let s = state.lock().await;
+            assert!(s.standing_scope.grants.is_empty());
+            let history = crate::server::retirement::load(&s.vault);
+            assert!(history.get("codex").unwrap().revoked_targets.contains(&target));
+        }
+        let (status, body) = reinstate(&state, "codex", serde_json::json!({"reason":"undo"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["grants_not_restored"], serde_json::json!(["/work/path"]));
+        assert_eq!(body["targets_not_restored"].as_array().unwrap().len(), 2);
+        assert!(state.lock().await.standing_scope.grants.is_empty());
     }
 
     async fn decide(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
@@ -11993,7 +12031,7 @@ mod disposition_tests {
         let s = state.lock().await;
         let mine: Vec<_> = s.standing_scope.grants.iter().filter(|g| g.member == "nomad-being").collect();
         assert_eq!(mine.len(), 1, "the old path stayed live beside the new one");
-        assert_eq!((mine[0].path.as_str(), mine[0].modes.as_letters()), ("/w/forum", "rw".to_string()));
+        assert_eq!((mine[0].target.as_path().unwrap().0, mine[0].modes.as_letters()), ("/w/forum", "rw".to_string()));
         assert_eq!(mine[0].reason, "read the law", "the row keeps its provenance");
     }
 
@@ -12104,9 +12142,9 @@ mod disposition_tests {
             let mut s = state.lock().await;
             s.scope_requests.insert("scope-old".into(), live_req("scope-old", "/z/old", now));
             s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
-                member: "kimi-code".into(), path: "/z/old".into(), granted_at: now,
+                member: "kimi-code".into(), target: crate::server::grant_target::GrantTarget::Path { path: "/z/old".into(), recursive: false }, granted_at: now,
                 granted_by: "operator".into(), reason: "promoted before #1400".into(),
-                expires_at: None, request_id: Some("scope-old".into()), recursive: false,
+                expires_at: None, request_id: Some("scope-old".into()),
                 modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
@@ -12133,7 +12171,7 @@ mod disposition_tests {
             "path": "/w/x", "reason": "bad", "modes": "q"})).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         let s = state.lock().await;
-        let g = s.standing_scope.grants.iter().find(|g| g.path == "/w/gov").unwrap();
+        let g = s.standing_scope.grants.iter().find(|g| g.target.as_path().expect("path grant").0 == "/w/gov").unwrap();
         assert_eq!(g.modes, crate::server::grant_modes::Modes::READ);
         assert!(!s.has_scope_grant("nomad-being", "/w/gov/law.rs"),
                 "a read-only grant answered an all-modes question");
@@ -12317,9 +12355,9 @@ mod disposition_tests {
             let now = crate::server::gate_escalation::now_secs();
             let mut s = state.lock().await;
             s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
-                member: "claude-code".into(), path: "/w/tree".into(), granted_at: now,
+                member: "claude-code".into(), target: crate::server::grant_target::GrantTarget::Path { path: "/w/tree".into(), recursive: false }, granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
-                request_id: None, recursive: false,
+                request_id: None,
                 modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
@@ -12642,8 +12680,8 @@ mod disposition_tests {
         assert_eq!(st["standing"], true, "{st}");
         let s = state.lock().await;
         let g = s.standing_scope.grants.iter().find(|g| g.member == "codex").expect("standing");
-        assert_eq!(g.path, "/srv/peer/tree");
-        assert!(g.recursive);
+        assert_eq!(g.target.as_path().expect("path grant").0, "/srv/peer/tree");
+        assert!(g.target.as_path().is_some_and(|(_, recursive)| recursive));
         assert_eq!(g.granted_by, "peer:kimi-code", "the standing grant names the peer");
         let granted = s.recent_chain(40).into_iter()
             .find(|e| e.event_type == "scope_granted" && e.event_data["standing"] == true).unwrap();
@@ -13055,8 +13093,8 @@ mod disposition_tests {
         {
             let s = state.lock().await;
             let g = s.standing_scope.grants.iter().find(|g| g.member == "kimi-code").expect("standing");
-            assert_eq!(g.path, "/home/someone/.local/state/hestia-mesh", "the chosen breadth");
-            assert!(g.recursive);
+            assert_eq!(g.target.as_path().expect("path grant").0, "/home/someone/.local/state/hestia-mesh", "the chosen breadth");
+            assert!(g.target.as_path().is_some_and(|(_, recursive)| recursive));
             assert_eq!(g.request_id.as_deref(), Some(id.as_str()));
             assert!(s.has_scope_grant("kimi-code", "/home/someone/.local/state/hestia-mesh/sent/k.jsonl"));
             assert!(!s.has_scope_grant("kimi-code", "/home/someone/.local/state/other"));

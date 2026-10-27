@@ -1880,24 +1880,24 @@ impl ServerState {
                         .and_then(|m| crate::server::grant_modes::Modes::parse(m).ok())
                         .unwrap_or_default();
                     !self.standing_scope.grants.iter().any(|g| {
-                        g.member == member && g.path == path
+                        g.member == member && g.target.as_path().is_some_and(|(p, _)| p == path)
                             && g.expires_at.is_none_or(|e| now < e)
-                            && (g.recursive || !live_recursive)
+                            && (g.target.as_path().is_some_and(|(_, r)| r) || !live_recursive)
                             && g.modes.includes(live_modes)
                     })
                 });
                 v.extend(self.standing_scope.grants.iter()
-                    .filter(|g| g.expires_at.is_none_or(|e| now < e))
+                    .filter(|g| g.expires_at.is_none_or(|e| now < e) && g.target.as_path().is_some())
                     .map(|g| {
                         serde_json::json!({
                             "lifetime": "standing",
                             "plugin_id": g.member,
-                            "path": g.path,
+                            "path": g.target.as_path().expect("path-only dashboard").0,
                             "reason": g.reason,
                             "requested_because": serde_json::Value::Null,
                             "granted_by": g.granted_by,
                             "request_id": g.request_id,
-                            "recursive": g.recursive,
+                            "recursive": g.target.as_path().is_some_and(|(_, r)| r),
                             "modes": g.modes,
                             // A peer's standing grant shows its NOT-SAME basis while the request
                             // it answered is still in memory (the chain row keeps it for good).

@@ -286,6 +286,8 @@ pub struct GateDenyOrigin {
 pub struct RetirementCommit {
     /// Durable, vault-held rows revoked.
     pub standing: Vec<String>,
+    /// Typed inventory includes repositories without mislabelling them as paths.
+    pub standing_targets: Vec<crate::server::grant_target::GrantTarget>,
     /// Session-scoped grants marked revoked.
     pub live: Vec<String>,
     /// Delegated-authority ids marked revoked -- the third channel a retired id must not keep.
@@ -1413,14 +1415,14 @@ impl ServerState {
             || self.standing_scope.has_live_for(plugin_id, &want, now, needed)
     }
 
-    /// Every live STANDING grant this member holds (durable row of the asymmetry).
+    /// Every live filesystem STANDING grant for the legacy path surfaces.
     /// Expiry is filtered at the read, in the store, so no serving surface can leak one.
     pub fn live_standing_grants(
         &self,
         plugin_id: &str,
     ) -> Vec<&crate::server::standing_scope::StandingGrant> {
         let now = crate::server::gate_escalation::now_secs();
-        self.standing_scope.live_for(plugin_id, now)
+        self.standing_scope.live_paths_for(plugin_id, now)
     }
 
     /// Write the standing-scope store back to its vault document. The vault's own save is
@@ -1719,14 +1721,18 @@ impl ServerState {
         let mut retired = self.retired_members.clone();
         let revoke_for = mutate(&mut retired);
         let mut standing: Vec<String> = Vec::new();
+        let mut standing_targets = Vec::new();
         if let Some(member) = revoke_for.as_deref() {
             let mut scope = self.standing_scope.clone();
-            for path in scope.grants.iter().filter(|g| g.member == member)
-                .map(|g| g.path.clone()).collect::<Vec<_>>()
+            for target in scope.grants.iter().filter(|g| g.member == member)
+                .map(|g| g.target.clone()).collect::<Vec<_>>()
             {
-                if scope.revoke(member, &path) { standing.push(path); }
+                if scope.revoke_target(member, &target) {
+                    if let Some((path, _)) = target.as_path() { standing.push(path.to_owned()); }
+                    standing_targets.push(target);
+                }
             }
-            if !standing.is_empty() {
+            if !standing_targets.is_empty() {
                 crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &scope)
                     .context("NOTHING changed: the standing-scope document did not persist")?;
                 *self.standing_scope = scope;
@@ -1765,14 +1771,14 @@ impl ServerState {
             }
         }
         crate::server::retirement::save(&mut self.vault, &retired).with_context(|| {
-            if standing.is_empty() && delegations.is_empty() {
+            if standing_targets.is_empty() && delegations.is_empty() {
                 "NOTHING changed: the retirement did not persist".to_string()
             } else {
                 // Names ONLY what landed. The live grants are revoked further down and have not
                 // been reached from here (cbp, #1106, finding 3).
                 format!("HALF landed: {} standing grant(s) and {} delegation(s) are revoked, and \
                          nothing else -- the retirement did not persist, and this id's live grants \
-                         are untouched; retry", standing.len(), delegations.len())
+                         are untouched; retry", standing_targets.len(), delegations.len())
             }
         })?;
         self.retired_members = retired;
@@ -1786,7 +1792,7 @@ impl ServerState {
             }
         }
         standing.sort(); live.sort(); delegations.sort();
-        Ok(RetirementCommit { standing, live, delegations })
+        Ok(RetirementCommit { standing, standing_targets, live, delegations })
     }
 
     /// Append a chain entry under the sovereign LCT.
@@ -2961,13 +2967,12 @@ mod tests {
     fn a_grant(member: &str, path: &str) -> crate::server::standing_scope::StandingGrant {
         crate::server::standing_scope::StandingGrant {
             member: member.into(),
-            path: path.into(),
+            target: crate::server::grant_target::GrantTarget::Path { path: path.into(), recursive: false },
             granted_at: 1_000,
             granted_by: "operator".into(),
             reason: "forced-failure fixture".into(),
             expires_at: None,
             request_id: None,
-        recursive: false,
         modes: crate::server::grant_modes::Modes::ALL,
         }
     }
