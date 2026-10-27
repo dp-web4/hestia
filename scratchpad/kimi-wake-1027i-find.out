@@ -1,0 +1,870 @@
+{
+ "pos": null,
+ "ts": "2026-10-27T07:04:48.633764798+00:00",
+ "eventType": "outcome",
+ "hash": "f2de9b9941f8df37",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:04:48.409393153+00:00",
+ "eventType": "member_notice",
+ "hash": "995514efd0b74543",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:04:48.233092022+00:00",
+ "eventType": "policy_allow",
+ "hash": "57ad7bd67fad1209",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:04:33.335695395+00:00",
+ "eventType": "outcome",
+ "hash": "0d0078eaa91b3254",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:04:32.946483498+00:00",
+ "eventType": "policy_allow",
+ "hash": "a6e5029a0c0d4653",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:03:55.787447227+00:00",
+ "eventType": "outcome",
+ "hash": "dd7ff78c86d49500",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:03:55.586457720+00:00",
+ "eventType": "member_notice",
+ "hash": "e540bf5cb3fe81ff",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:03:55.459882560+00:00",
+ "eventType": "policy_allow",
+ "hash": "8ddfe6bbf08ad05d",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:03:44.779240464+00:00",
+ "eventType": "outcome",
+ "hash": "50025fac2f3af903",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:03:44.588974358+00:00",
+ "eventType": "member_notice",
+ "hash": "c23ebe402c0209f4",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T07:03:44.471778481+00:00",
+ "eventType": "policy_allow",
+ "hash": "76a9f3d2611767d5",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:58:00.043020125+00:00",
+ "eventType": "outcome",
+ "hash": "a9b055320066d0da",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:57:59.473152777+00:00",
+ "eventType": "member_notice",
+ "hash": "8442c6daa8bf6466",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:57:59.230094800+00:00",
+ "eventType": "member_notice",
+ "hash": "0fb6a392887fbba7",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:57:44.846550925+00:00",
+ "eventType": "policy_allow",
+ "hash": "2c88cbda9eb638aa",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:57:38.544449368+00:00",
+ "eventType": "outcome",
+ "hash": "c630e93d94308fc6",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:57:37.837334551+00:00",
+ "eventType": "policy_allow",
+ "hash": "47dc3224722b47d8",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:56:06.303443490+00:00",
+ "eventType": "outcome",
+ "hash": "b296def45b372372",
+ "hits": [
+  "scope-05751db9f43f",
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:56:04.920326142+00:00",
+ "eventType": "policy_allow",
+ "hash": "67c1848686c9836c",
+ "hits": [
+  "scope-05751db9f43f",
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:23.369852465+00:00",
+ "eventType": "outcome",
+ "hash": "0f556279da238d72",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "codex"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:22.991217604+00:00",
+ "eventType": "member_notice",
+ "hash": "cb086315fffde6c1",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:22.824156180+00:00",
+ "eventType": "policy_allow",
+ "hash": "2674b3a51af66d00",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "codex",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:22.728872244+00:00",
+ "eventType": "outcome",
+ "hash": "2300c8e2fd54e152",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "codex"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:22.393759995+00:00",
+ "eventType": "member_notice",
+ "hash": "56afb9504de3af50",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:22.212063744+00:00",
+ "eventType": "policy_allow",
+ "hash": "0b88972d641fa6e8",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "codex",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:22.138681307+00:00",
+ "eventType": "outcome",
+ "hash": "823830f66db3900d",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "codex"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:21.827068352+00:00",
+ "eventType": "member_notice",
+ "hash": "d6473585399fc755",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:21.618943433+00:00",
+ "eventType": "policy_allow",
+ "hash": "bc9d7c82277c5ad2",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "codex",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:07.522886924+00:00",
+ "eventType": "scope_granted",
+ "hash": "01f93fbd90b61335",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "request_id": "scope-5f4ca2ff3f8f",
+  "plugin_id": "claude-code",
+  "decision_reason": "Approved once for the exact recorded read-only source-inspection command: four bounded excerpts from reference_f1a.py and a Python filename search for the retired- marker. The invocation establishes a concrete source investigation and contains no file mutation or external transmission. Approval is exact-act and single-use; no session or standing home-directory grant. Use a guarded directory change (cd ... && ...) for future commands so a failed cd cannot redirect relative reads.",
+  "path": "/home/dp",
+  "grant_path": "/home/dp",
+  "modes": "rwed",
+  "once": true,
+  "expires_at": 1793084707
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:01.616421963+00:00",
+ "eventType": "outcome",
+ "hash": "1c82477f9904450f",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:01.489788212+00:00",
+ "eventType": "outcome",
+ "hash": "396a191108286480",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:01.145078688+00:00",
+ "eventType": "policy_allow",
+ "hash": "8c916b24f25c581b",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:55:00.949748804+00:00",
+ "eventType": "policy_allow",
+ "hash": "ef01839e4d79cb99",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-27T06:53:09.332006044+00:00",
+ "eventType": "scope_requested",
+ "hash": "c6d28187d351fb62",
+ "hits": [
+  "scope-5f4ca2ff3f8f"
+ ],
+ "fields": {
+  "request_id": "scope-5f4ca2ff3f8f",
+  "plugin_id": "claude-code",
+  "path": "/home/dp",
+  "reason": "opened by the gate on a refused Bash (mrh.command); act: Bash: cd /tmp/sage565-cbp/sage/gateway; sed -n 55,80p reference_f1a.py; echo ----; sed -n 842,865p reference_f1a.py; echo ----; sed -n 992,1040p reference_f1a.py; echo ----; sed -n 1910,1925p reference_f1a.py; grep -rn \"retired-\" ../ --include=*.py -l | grep -v tests | head",
+  "expires_at": 1793112787
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:35:42.864897062+00:00",
+ "eventType": "outcome",
+ "hash": "c9688cd8635f1255",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:35:42.670060736+00:00",
+ "eventType": "member_notice",
+ "hash": "0470408ea3d6e76e",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:35:33.448064036+00:00",
+ "eventType": "outcome",
+ "hash": "f61b50ec28477f35",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:35:33.274441870+00:00",
+ "eventType": "member_notice",
+ "hash": "91a1eea2861a1840",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:35:33.161042535+00:00",
+ "eventType": "policy_allow",
+ "hash": "94872b719b8c20b2",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:35:25.902647826+00:00",
+ "eventType": "policy_allow",
+ "hash": "c0b8020c02a24644",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:34:50.998542003+00:00",
+ "eventType": "outcome",
+ "hash": "e259137e76b92b50",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "codex"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:34:50.786326192+00:00",
+ "eventType": "member_notice",
+ "hash": "cf979d6c5de4f0d2",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:34:50.658442364+00:00",
+ "eventType": "policy_allow",
+ "hash": "6cb74c9a28f9d812",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "codex",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:34:46.948884662+00:00",
+ "eventType": "outcome",
+ "hash": "def3d52e2b483f07",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:34:46.703193739+00:00",
+ "eventType": "policy_allow",
+ "hash": "93e550bfe5096b9a",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:34:45.943057021+00:00",
+ "eventType": "scope_granted",
+ "hash": "c49f8231ff00c822",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "request_id": "scope-2d21b66120c4",
+  "plugin_id": "cbp-being",
+  "decision_reason": "Approved one exact read of the tracked public Hestia gate source file. The request identifies a single source file, making the read bounded and reviewable. This grants no write access, recursive directory access, or standing scope.",
+  "path": "/home/dp/ai-workspace/hestia/plugins/_shared/hestia_single_gate.py",
+  "grant_path": "/home/dp/ai-workspace/hestia/plugins/_shared/hestia_single_gate.py",
+  "once": true,
+  "expires_at": 1792532685
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:33:50.602961352+00:00",
+ "eventType": "scope_requested",
+ "hash": "a00e3ace19d77063",
+ "hits": [
+  "scope-2d21b66120c4"
+ ],
+ "fields": {
+  "request_id": "scope-2d21b66120c4",
+  "plugin_id": "cbp-being",
+  "path": "/home/dp/ai-workspace/hestia/plugins/_shared/hestia_single_gate.py",
+  "reason": "opened by the gate on a refused read_file (mrh.path); act: read_file -> /home/dp/ai-workspace/hestia/plugins/_shared/hestia_single_gate.py",
+  "expires_at": 1792560830
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:29:02.652580942+00:00",
+ "eventType": "outcome",
+ "hash": "564aa506431c81e5",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:29:02.449968990+00:00",
+ "eventType": "member_notice",
+ "hash": "e16af25a17d6be4e",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:29:02.344952705+00:00",
+ "eventType": "policy_allow",
+ "hash": "d6cf41e34ecf0bee",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:25:30.538701903+00:00",
+ "eventType": "outcome",
+ "hash": "3cbd1d66f2d6621a",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:25:30.313802641+00:00",
+ "eventType": "policy_allow",
+ "hash": "ec6cf3c83c0a6153",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:25:22.418149952+00:00",
+ "eventType": "outcome",
+ "hash": "0ea9ef367e14f8b5",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:25:22.092659281+00:00",
+ "eventType": "member_notice",
+ "hash": "112411f62b69c2dd",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:25:21.779535836+00:00",
+ "eventType": "policy_allow",
+ "hash": "07c56756cc87b1ae",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:25:17.930262463+00:00",
+ "eventType": "outcome",
+ "hash": "93eef551f962ec52",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:25:17.387680656+00:00",
+ "eventType": "policy_allow",
+ "hash": "611e44af82121066",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:25:15.446009314+00:00",
+ "eventType": "outcome",
+ "hash": "5ee32280c1f3b704",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:25:15.032053744+00:00",
+ "eventType": "policy_allow",
+ "hash": "93107b463ff7edb0",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "kimi-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:24:52.989267+00:00",
+ "eventType": "outcome",
+ "hash": "9bc1dee6d2bf8365",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:24:32.369032801+00:00",
+ "eventType": "policy_allow",
+ "hash": "d631bc9f5a67ad49",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:24:28.865726532+00:00",
+ "eventType": "outcome",
+ "hash": "cf86b77548befb5a",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "codex"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:24:28.676183049+00:00",
+ "eventType": "member_notice",
+ "hash": "9418db0c2ae6b357",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {}
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:24:28.512195834+00:00",
+ "eventType": "policy_allow",
+ "hash": "a7d4c4341ba312d6",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "codex",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:24:23.408190457+00:00",
+ "eventType": "scope_refused",
+ "hash": "8857e720b65a6f2f",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "request_id": "scope-05751db9f43f",
+  "plugin_id": "cbp-being",
+  "decision_reason": "Refused as submitted: the requested read targets the workspace root, which contains repositories with different access scopes, and the petition supplies only the automatic gate-refusal reason. It identifies neither a specific file nor the task requiring it. Please identify the exact in-scope file and task purpose for a narrower review; this ruling makes no finding about conduct.",
+  "path": "/home/dp/ai-workspace",
+  "grant_path": "/home/dp/ai-workspace",
+  "once": false,
+  "expires_at": 1792560183
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:24:04.422287602+00:00",
+ "eventType": "outcome",
+ "hash": "3796040ad1833ff6",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code"
+ }
+}STOP: walk exhausted after 120000 entries
+
+{
+ "pos": null,
+ "ts": "2026-10-20T21:23:42.913735295+00:00",
+ "eventType": "policy_allow",
+ "hash": "834a11bf9e7499a5",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "plugin_id": "claude-code",
+  "decision": "allow",
+  "reason": "gate.allow"
+ }
+}
+{
+ "pos": null,
+ "ts": "2026-10-20T21:23:03.870228924+00:00",
+ "eventType": "scope_requested",
+ "hash": "9418a163c3b9643e",
+ "hits": [
+  "scope-05751db9f43f"
+ ],
+ "fields": {
+  "request_id": "scope-05751db9f43f",
+  "plugin_id": "cbp-being",
+  "path": "/home/dp/ai-workspace",
+  "reason": "opened by the gate on a refused read_file (mrh.path); act: read_file -> /home/dp/ai-workspace",
+  "expires_at": 1792560183
+ }
+}
