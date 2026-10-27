@@ -265,12 +265,21 @@ impl QuorumReport {
 /// using this member's OPERATIONAL keypair (the channel key the registry
 /// resolves — W1). `ts` is the observation time (the CLI passes `Utc::now`;
 /// tests pass a fixed instant for determinism).
+///
+/// **R4 — `ts` is truncated to whole seconds before signing.** `Attestation::message`
+/// renders `ts` with `SecondsFormat::AutoSi`, so the digit count follows the value:
+/// `Utc::now()` would sign nine fractional digits, and any hop that normalises to
+/// milliseconds (a JSON store, a JS client, a `TIMESTAMP(3)` column) would void the
+/// signature, reported far away as the generic "quorum not met" (C3). Truncating first
+/// makes that hop a no-op. The rendering is untouched, only the value, so no message
+/// version bump (HUB's note on #572).
 pub fn attest(
     subject_lct_id: &str,
     witness_lct_id: &str,
     ts: chrono::DateTime<chrono::Utc>,
     operational_keypair: &web4_core::crypto::KeyPair,
 ) -> Attestation {
+    let ts = chrono::SubsecRound::trunc_subsecs(ts, 0);
     Attestation::sign(
         subject_lct_id,
         witness_lct_id,

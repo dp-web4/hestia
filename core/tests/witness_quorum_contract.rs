@@ -199,9 +199,9 @@ fn c2_one_witness_rotating_voids_a_four_witness_certificate() {
 /// JSON store, a JS client, a `TIMESTAMP(3)` column — silently invalidates the
 /// signature, and the verifier reports the generic "quorum not met".
 ///
-/// Should move to: the producer truncates to whole seconds before signing.
-/// Measured below: a second-precision attestation survives both a JSON
-/// round-trip and a millisecond normalisation, because truncating it is a no-op.
+/// Now (R4) the producer truncates to whole seconds before signing, so an
+/// attestation made at `Utc::now()` survives both a JSON round-trip and a
+/// millisecond normalisation: truncating it again is a no-op.
 #[test]
 fn c3_second_precision_is_the_only_ts_that_survives_a_lossy_hop() {
     let sid = subject();
@@ -212,11 +212,12 @@ fn c3_second_precision_is_the_only_ts_that_survives_a_lossy_hop() {
     assert!(as_signed.verify(&sid, &op.verifying_key()), "verifies as signed");
 
     let mut lossy = as_signed.clone();
-    lossy.ts = Utc.timestamp_millis_opt(now.timestamp_millis()).unwrap();
+    lossy.ts = Utc.timestamp_millis_opt(as_signed.ts.timestamp_millis()).unwrap();  // the hop normalises what was signed
     assert!(
-        !lossy.verify(&sid, &op.verifying_key()),
-        "MEASURED: a millisecond hop breaks a nanosecond-precision attestation"
+        lossy.verify(&sid, &op.verifying_key()),
+        "R4: attest() truncated to whole seconds, so a millisecond hop changes nothing"
     );
+    assert_eq!(as_signed.ts.timestamp_subsec_nanos(), 0, "signed at whole-second precision");
 
     let truncated = hestia::witness::attest(
         &sid,
