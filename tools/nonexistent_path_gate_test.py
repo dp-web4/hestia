@@ -6,14 +6,14 @@ to escalate - it's just noise"; "we should be checking existence first"; and "th
 should only come on an existing path thats off limits". Measured on cbp-being: nine operator cards
 for `<ws>/hestia/governance/...`, a doubled root, while the refusal said "'hestia' is not granted".
 
-Run: python3 held/build-1411/nonexistent_path_gate_test.py
+Run: python3 tools/nonexistent_path_gate_test.py
 """
 import os
 import pathlib
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parents[1] / "tools"))
+sys.path.insert(0, str(HERE))
 import grant_modes_gate_test as g  # noqa: E402
 
 core, m, check = g.core, g.m, g.check
