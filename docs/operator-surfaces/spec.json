@@ -1039,6 +1039,10 @@
       "why": "rewrites the whole scope set; deliberately no UI"
     },
     {
+      "route": "POST /api/scope/standing/refusal/lift",
+      "why": "standing refusals (#1417): the operator's lift of a refusal that stands; no view offers it yet. The dashboard's scope pane should show refused_standing rows with a lift button (an additive follow-up to #1418)"
+    },
+    {
       "route": "GET /api/transport/binding",
       "why": "transport bindings (#1030): no surface yet; a read-only view is wanted"
     },
