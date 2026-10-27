@@ -24032,20 +24032,35 @@ fn member_roots(s: &crate::server::state::ServerState, plugin_id: &str) -> Vec<S
     roots
 }
 
-/// Whether `path` lies inside a root the member holds some grant on, or inside that root's
-/// parent directory (nomad on #1415, option (a)). The existence-first decline answers "does not
-/// exist" without filing anything, which outside the member's own space would be an existence
-/// oracle over the whole host (`~/.ssh/...`, another member's home). Inside it, the information
-/// is already the member's: the doubled root `<ws>/hestia/governance/...` sits beside its
-/// `<ws>/governance` grant, under the same parent. Outside it, the ask files as before, so the
-/// operator still sees a probe.
+/// The path a nonexistent `target` most likely meant, re-rooted onto `root`: a grant root's
+/// basename found as a segment of `target` re-roots the rest of `target` under that grant, so
+/// the doubled root `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. None
+/// when `target` does not name the root's basename at all.
+fn reroot_onto(root: &str, target: &str) -> Option<String> {
+    let root = root.trim_end_matches('/');
+    let base = root.rsplit('/').next().filter(|b| !b.is_empty())?;
+    let marker = format!("/{base}/");
+    if let Some(i) = target.find(&marker) {
+        Some(format!("{root}{}", &target[i + marker.len() - 1..]))
+    } else if target.ends_with(&format!("/{base}")) {
+        Some(root.to_string())
+    } else {
+        None
+    }
+}
+
+/// Whether `path` is about the member's own space (nomad on #1415): UNDER a root the member
+/// holds some grant on, or NAMING one (the path re-roots onto a grant root by the did-you-mean
+/// rule: `<ws>/hestia/governance/x` while holding `<ws>/governance`). The existence-first decline
+/// answers "does not exist" without filing anything, which anywhere else would be an existence
+/// oracle over the host; there, the ask files as before and the operator sees the probe. No
+/// parent-directory rule: a grant on `<home>/notes` must not make `<home>`'s siblings count.
 fn in_members_space(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> bool {
     let p = path.trim_end_matches('/');
     member_roots(s, plugin_id).iter().any(|root| {
         let root = root.trim_end_matches('/');
-        let parent = root.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let under = |r: &str| !r.is_empty() && (p == r || p.starts_with(&format!("{r}/")));
-        under(root) || under(parent)
+        let under = !root.is_empty() && (p == root || p.starts_with(&format!("{root}/")));
+        under || reroot_onto(root, p).is_some_and(|c| c != p)
     })
 }
 
@@ -24070,15 +24085,7 @@ fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &s
     let target = path.trim_end_matches('/');
     let hint = roots.iter().find_map(|root| {
         let root = root.trim_end_matches('/');
-        let base = root.rsplit('/').next().filter(|b| !b.is_empty())?;
-        let marker = format!("/{base}/");
-        let cand = if let Some(i) = target.find(&marker) {
-            format!("{root}{}", &target[i + marker.len() - 1..])
-        } else if target.ends_with(&format!("/{base}")) {
-            root.to_string()
-        } else {
-            return None;
-        };
+        let cand = reroot_onto(root, target)?;
         if cand == target {
             return None;
         }
@@ -33055,6 +33062,27 @@ mod existence_first_tests {
         });
         let r = ask(&state, &sid, &doubled).await;
         assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_grant_on_a_child_does_not_make_its_parents_siblings_the_members_space() {
+        // nomad on #1415: holding `<home>/notes` must not make a sibling of `<home>` (a credential
+        // directory, say) answer "does not exist" silently. It files.
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        let notes = home.join("notes").to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: notes, granted_at: 0, granted_by: "operator".into(),
+            reason: "notes".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::ALL,
+        });
+        let sibling = home.join("keys/id_ed25519");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": sibling.to_str().unwrap(), "reason": "probing beside my notes"})).await.unwrap();
+        assert_eq!(r["status"], "pending", "a sibling of the grant's parent is not the member's space: {r}");
     }
 
     #[tokio::test]
