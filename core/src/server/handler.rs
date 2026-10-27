@@ -24033,57 +24033,31 @@ fn member_roots(s: &crate::server::state::ServerState, plugin_id: &str) -> Vec<S
 }
 
 /// The path a nonexistent `target` most likely meant, re-rooted onto `root`: a grant root's
-/// basename found as a segment of `target` re-roots the rest of `target` under that grant, so
-/// the doubled root `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. None
-/// when `target` does not name the root's basename at all.
+/// basename found as an INTERIOR segment of `target` re-roots the rest of `target` under that
+/// grant, so the doubled root `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`.
+/// None when `target` does not name the root's basename that way. A `target` that merely ENDS
+/// with the basename (`<elsewhere>/governance`) is not re-rooted: its candidate would be the root
+/// itself, which always exists, so answering it silently would make "does there exist a
+/// `<elsewhere>/governance`" an oracle over the host for every `<elsewhere>` (nomad on #1415).
 fn reroot_onto(root: &str, target: &str) -> Option<String> {
     let root = root.trim_end_matches('/');
     let base = root.rsplit('/').next().filter(|b| !b.is_empty())?;
     let marker = format!("/{base}/");
-    if let Some(i) = target.find(&marker) {
-        Some(format!("{root}{}", &target[i + marker.len() - 1..]))
-    } else if target.ends_with(&format!("/{base}")) {
-        Some(root.to_string())
-    } else {
-        None
-    }
+    let i = target.find(&marker)?;
+    Some(format!("{root}{}", &target[i + marker.len() - 1..]))
 }
 
-/// Whether `path` is about the member's own space (nomad on #1415): UNDER a root the member
-/// holds some grant on, or NAMING one (the path re-roots onto a grant root by the did-you-mean
-/// rule: `<ws>/hestia/governance/x` while holding `<ws>/governance`). The existence-first decline
-/// answers "does not exist" without filing anything, which anywhere else would be an existence
-/// oracle over the host; there, the ask files as before and the operator sees the probe. No
-/// parent-directory rule: a grant on `<home>/notes` must not make `<home>`'s siblings count.
-fn in_members_space(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> bool {
-    let p = path.trim_end_matches('/');
-    member_roots(s, plugin_id).iter().any(|root| {
-        let root = root.trim_end_matches('/');
-        let under = !root.is_empty() && (p == root || p.starts_with(&format!("{root}/")));
-        under || reroot_onto(root, p).is_some_and(|c| c != p)
-    })
-}
-
-/// `Path::try_exists` read the way a gate must: an error (an unreadable parent, a dangling or
-/// looping link) is NOT "absent". Only a definite `Ok(false)` is (nomad on #1415, point 2).
-fn definitely_absent(path: &str) -> bool {
-    matches!(std::path::Path::new(path).try_exists(), Ok(false))
-}
-
-/// The refusal text for an ask about a path that does not exist (hestia#1411), naming the
-/// existing path inside one of the member's own grants that it most likely meant. A grant root's
-/// basename found as a segment of `path` re-roots the rest of `path` under that grant: the doubled
-/// root `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when
-/// the candidate exists, RESOLVES inside its root (a symlink beneath the root that points outside
-/// it exists but is not the member's to read), and the member is admitted to READ it there by its
+/// The existing, readable path inside the member's own reach that a nonexistent `target` most
+/// likely meant, or None: `target` re-roots onto one of `roots` (`reroot_onto`), the candidate
+/// EXISTS, RESOLVES inside its root (a symlink beneath the root that points outside it exists
+/// but is not the member's to read), and the member is admitted to READ it there by its
 /// effective grants (an exact grant does not reach a child; a floor row may not give this member
-/// read) — the same repair the gate's hint got on #1412 (Nova, nomad). The hint can never name a
-/// path the follow-up read would refuse.
-fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> String {
-    let now = crate::server::gate_escalation::now_secs();
-    let roots = member_roots(s, plugin_id);
-    let target = path.trim_end_matches('/');
-    let hint = roots.iter().find_map(|root| {
+/// read) — the gate's #1412 repair, applied here (Nova, nomad on #1415). This ONE predicate both
+/// draws the hint and bounds the silent decline, so the decline can never be quiet about a path
+/// the hint would not name.
+fn rerooted_in_reach(s: &crate::server::state::ServerState, plugin_id: &str, roots: &[String],
+                     target: &str, now: u64) -> Option<String> {
+    roots.iter().find_map(|root| {
         let root = root.trim_end_matches('/');
         let cand = reroot_onto(root, target)?;
         if cand == target {
@@ -24099,7 +24073,44 @@ fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &s
         let admitted = s.has_scope_grant_for(plugin_id, &real_s, read)
             || s.standing_scope.effective_modes(plugin_id, &real_s, now).is_some_and(|m| m.includes(read));
         admitted.then_some(cand)
+    })
+}
+
+/// Whether `path` is about the member's own space (nomad on #1415): UNDER a root the member
+/// holds some grant on, or a doubled root that lands on something REAL in the member's reach
+/// (`rerooted_in_reach`: `<ws>/hestia/governance/hestia/gate.py` while holding `<ws>/governance`
+/// and `governance/hestia/gate.py` exists there). The existence-first decline answers "does not
+/// exist" without filing anything, which anywhere else would be an existence oracle over the
+/// host; there, the ask files as before and the operator sees the probe. Not a parent-directory
+/// rule (a grant on `<home>/notes` must not make `<home>`'s siblings count), and not a
+/// basename rule (a path merely containing a segment named like a root, `<elsewhere>/notes/x`,
+/// files: nothing real in the member's reach is what it meant).
+fn in_members_space(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> bool {
+    let p = path.trim_end_matches('/');
+    let roots = member_roots(s, plugin_id);
+    let under = roots.iter().any(|root| {
+        let root = root.trim_end_matches('/');
+        !root.is_empty() && (p == root || p.starts_with(&format!("{root}/")))
     });
+    under || rerooted_in_reach(s, plugin_id, &roots, p, crate::server::gate_escalation::now_secs()).is_some()
+}
+
+/// `Path::try_exists` read the way a gate must: an error (an unreadable parent, a dangling or
+/// looping link) is NOT "absent". Only a definite `Ok(false)` is (nomad on #1415, point 2).
+fn definitely_absent(path: &str) -> bool {
+    matches!(std::path::Path::new(path).try_exists(), Ok(false))
+}
+
+/// The refusal text for an ask about a path that does not exist (hestia#1411), naming the
+/// existing path inside one of the member's own grants that it most likely meant
+/// (`rerooted_in_reach`: the doubled root `<ws>/hestia/governance/hestia/x` becomes
+/// `<ws>/governance/hestia/x`, offered only when that exists, resolves inside its root and the
+/// member may READ it there). The hint can never name a path the follow-up read would refuse.
+fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> String {
+    let now = crate::server::gate_escalation::now_secs();
+    let roots = member_roots(s, plugin_id);
+    let target = path.trim_end_matches('/');
+    let hint = rerooted_in_reach(s, plugin_id, &roots, target, now);
     let mut out = format!("{path} does not exist: there is nothing there to grant, so no request was \
                            opened (nothing reaches the operator's queue)");
     if let Some(c) = hint {
@@ -32948,6 +32959,10 @@ mod existence_first_tests {
         let state = open_state(&dir);
         let sid = session(&state).await;
         grant_governance(&state, &dir).await;
+        // The doubled root (`<ws>/hestia/governance/x.py` for `<ws>/governance/x.py`), the shape
+        // the being's asks took; the real file is in the member's reach, so the ask is about the
+        // member's own space and is answered quietly (nomad on #1415).
+        std::fs::write(dir.path().join("governance/x.py"), "x").unwrap();
         let missing = dir.path().join("hestia/governance/x.py");
         let before = pending(&state).await;
         let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
@@ -32956,6 +32971,45 @@ mod existence_first_tests {
         assert_eq!(r["reason"], "nonexistent", "{r}");
         assert!(r["detail"].as_str().unwrap().contains("does not exist"), "{r}");
         assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
+    }
+
+    /// nomad on #1415, point 1 through the re-root arm: a path that merely CONTAINS a segment
+    /// named like one of the member's roots (or a floor root) is not the member's space. Only a
+    /// doubled root that lands on something real and readable in the member's reach is quiet;
+    /// these all file, so "does not exist" is never a silent answer about `<elsewhere>`.
+    #[tokio::test]
+    async fn a_root_basename_elsewhere_does_not_make_the_path_the_members_space() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join("notes")).unwrap();
+        std::fs::write(home.join("notes/y.md"), "x").unwrap();
+        std::fs::create_dir_all(home.join("forum")).unwrap();
+        let notes = home.join("notes").to_str().unwrap().to_string();
+        let forum = home.join("forum").to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: notes, granted_at: 0, granted_by: "operator".into(),
+            reason: "notes".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::ALL,
+        });
+        state.lock().await.standing_scope.floor.push(crate::server::standing_scope::FloorEntry {
+            path: forum, added_at: 0, added_by: "operator".into(), reason: "floor".into(),
+            recursive: true, modes: crate::server::grant_modes::Modes::READ,
+        });
+        let elsewhere = dir.path().join("elsewhere");
+        for probe in [elsewhere.join("x/notes"), elsewhere.join("notes/x"), elsewhere.join("notes"),
+                      elsewhere.join("forum/z"), elsewhere.join("forum")] {
+            let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+                "path": probe.to_str().unwrap(), "reason": "probing a path named like one of my roots"})).await.unwrap();
+            assert_eq!(r["status"], "pending", "{} must file: {r}", probe.display());
+        }
+        // The control: the doubled root onto the REAL file is still quiet, with the hint.
+        let doubled = dir.path().join("x/notes/y.md");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": doubled.to_str().unwrap(), "reason": "to read my note"})).await.unwrap();
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
     }
 
     #[tokio::test]
@@ -33009,6 +33063,7 @@ mod existence_first_tests {
         let state = open_state(&dir);
         let sid = session(&state).await;
         grant_governance(&state, &dir).await;
+        std::fs::write(dir.path().join("governance/x.py"), "x").unwrap(); // the doubled root lands on it
         let missing = dir.path().join("hestia/governance/x.py");
         let claim = |tool: &str| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
             "path": missing.to_str().unwrap(), "rule": "mrh.path", "tool_name": tool,
@@ -33085,31 +33140,32 @@ mod existence_first_tests {
             let st = state.clone();
             async move { tool_request_scope(&st, &b).await.unwrap() }
         };
-        // 1. an EXACT grant on the root: the child is not readable, so no hint
+        // No hint means no quiet answer either: the one predicate that draws the hint bounds the
+        // decline (nomad on #1415, point 1), so each withheld case FILES and the operator sees it.
+        // 1. an EXACT grant on the root: the child is not readable, so no hint, and it files
         state.lock().await.standing_scope.grants.push(grant(false));
         let r = ask(&state, &sid, &doubled).await;
-        assert_eq!(r["status"], "not_filed", "{r}");
-        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
-        // 2. recursive: the hint comes back
+        assert_eq!(r["status"], "pending", "{r}");
+        // 2. recursive: the hint comes back, quietly
         state.lock().await.standing_scope.grants.clear();
         state.lock().await.standing_scope.grants.push(grant(true));
         let r = ask(&state, &sid, &doubled).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
         assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
-        // 3. a symlink under the root that escapes it: exists, resolves outside, no hint
+        // 3. a symlink under the root that escapes it: exists, resolves outside, no hint, files
         std::fs::create_dir_all(ws.join("hestia")).unwrap();
         std::fs::write(ws.join("hestia/outside.txt"), "x").unwrap();
         std::os::unix::fs::symlink(ws.join("hestia/outside.txt"), ws.join("governance/hestia/link.txt")).unwrap();
         let r = ask(&state, &sid, ws.join("hestia/governance/hestia/link.txt").to_str().unwrap()).await;
-        assert_eq!(r["status"], "not_filed", "{r}");
-        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
-        // 4. a floor row that gives this member no read: no hint
+        assert_eq!(r["status"], "pending", "{r}");
+        // 4. a floor row that gives this member no read: no hint, files
         state.lock().await.standing_scope.grants.clear();
         state.lock().await.standing_scope.floor.push(crate::server::standing_scope::FloorEntry {
             path: root.clone(), added_at: 0, added_by: "operator".into(), reason: "floor".into(),
             recursive: true, modes: crate::server::grant_modes::Modes::parse("w").unwrap(),
         });
         let r = ask(&state, &sid, &doubled).await;
-        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        assert_eq!(r["status"], "pending", "{r}");
     }
 
     #[tokio::test]
