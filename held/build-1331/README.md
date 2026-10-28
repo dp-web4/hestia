@@ -1,4 +1,10 @@
-# held: #1331 gaps (a)/(b), the secret rule judges a link's resolved target. **NOT applied.**
+# held: #1331 gaps (a)/(b), the secret rule judges a **named** link's resolved target. **NOT applied.**
+
+**Scope (nomad's review, 2026-10-28):** this covers a link that is **named** in the act: a path argument or a
+shell word, including chains and directory links. It does **not** cover shapes that reach a link without
+naming it: **globs** (`cat note?.txt`, `cat keys/*`), a **`cd` inside the line** followed by a relative
+word, and **recursive readers** that follow links (`grep -R`, `rg -L`, `find -L`, the `Grep`/`Glob` tools on a
+directory). main allows all of those too; they're recorded against #1331 as follow-ups.
 
 Patch: `held/4aa15bda249a5eb0973ad3369bb081446a528ecac5564a2c7209717ccbb87418.patch` (base `f9f29a23`). It covers the gate core, plus the hooks-gt mirror and the 5 manifests.
 
