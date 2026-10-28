@@ -1,0 +1,236 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -591,7 +591,52 @@
+     Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
+     return (list(event.paths) + list(event.repos)
+             + (egress_items(getattr(event, "egress", None)) or [])
+-            + ([egress_command_text(event.command)] if event.command else []))
++            + ([egress_command_text(event.command)] if event.command else [])
++            + link_targets(event))
++
++
++def link_targets(event: "NormalizedEvent") -> list:
++    """The resolved targets of the paths an act names, where a link makes them DIFFER from the name
++    (hestia #1331, gaps a/b). Measured on main f9f29a23 in-process (a fixture, no credential): inside a
++    granted repo, a link to a secret-NAMED file passed Gate 1a by a relative shell read and by `Read`
++    (absolute or relative), because the innate sweep judged the path AS NAMED. Absolute shell paths in
++    the workspace already had their target checked (the scope pass); this gives the one rule no grant
++    relaxes the same view, for every path argument and every shell word that names an existing path
++    (relative ones joined onto the event's cwd). A path that is not a link contributes nothing, so
++    an ordinary act's verdict cannot change. Never raises: an unreadable path adds nothing."""
++    words = list(event.paths)
++    if event.command:
++        try:
++            words += shlex.split(event.command)
++        except ValueError:
++            words += event.command.split()
++    cwd = getattr(event, "cwd", None)
++    out = []
++    for w in words:
++        if not isinstance(w, str) or not w:
++            continue
++        # a flag names a path only through its `=value` (`--input=notes.txt`); a bare flag names none
++        if w.startswith("-"):
++            if "=" not in w:
++                continue
++            cands = {w.split("=", 1)[1]}
++        else:
++            cands = {w, w.split("=", 1)[1]} if "=" in w else {w}
++        for cand in cands:
++            try:
++                base = os.path.expanduser(cand)
++                if not os.path.isabs(base):
++                    if not cwd:
++                        continue
++                    base = os.path.join(cwd, base)
++                if not os.path.lexists(base):
++                    continue
++                real = os.path.realpath(base)
++                if real != os.path.normpath(base):
++                    out.append(real)
++            except (OSError, ValueError):
++                continue
++    return out
+ 
+ 
+ #: A value a command's own contract makes TEXT, never a path it opens (hestia #1330). Keyed on the
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 8418e3e403c83b9e05b3ae0f55068281e431a938812935a7becaf334e44b3d0c  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -592,7 +592,52 @@
+     Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
+     return (list(event.paths) + list(event.repos)
+             + (egress_items(getattr(event, "egress", None)) or [])
+-            + ([egress_command_text(event.command)] if event.command else []))
++            + ([egress_command_text(event.command)] if event.command else [])
++            + link_targets(event))
++
++
++def link_targets(event: "NormalizedEvent") -> list:
++    """The resolved targets of the paths an act names, where a link makes them DIFFER from the name
++    (hestia #1331, gaps a/b). Measured on main f9f29a23 in-process (a fixture, no credential): inside a
++    granted repo, a link to a secret-NAMED file passed Gate 1a by a relative shell read and by `Read`
++    (absolute or relative), because the innate sweep judged the path AS NAMED. Absolute shell paths in
++    the workspace already had their target checked (the scope pass); this gives the one rule no grant
++    relaxes the same view, for every path argument and every shell word that names an existing path
++    (relative ones joined onto the event's cwd). A path that is not a link contributes nothing, so
++    an ordinary act's verdict cannot change. Never raises: an unreadable path adds nothing."""
++    words = list(event.paths)
++    if event.command:
++        try:
++            words += shlex.split(event.command)
++        except ValueError:
++            words += event.command.split()
++    cwd = getattr(event, "cwd", None)
++    out = []
++    for w in words:
++        if not isinstance(w, str) or not w:
++            continue
++        # a flag names a path only through its `=value` (`--input=notes.txt`); a bare flag names none
++        if w.startswith("-"):
++            if "=" not in w:
++                continue
++            cands = {w.split("=", 1)[1]}
++        else:
++            cands = {w, w.split("=", 1)[1]} if "=" in w else {w}
++        for cand in cands:
++            try:
++                base = os.path.expanduser(cand)
++                if not os.path.isabs(base):
++                    if not cwd:
++                        continue
++                    base = os.path.join(cwd, base)
++                if not os.path.lexists(base):
++                    continue
++                real = os.path.realpath(base)
++                if real != os.path.normpath(base):
++                    out.append(real)
++            except (OSError, ValueError):
++                continue
++    return out
+ 
+ 
+ #: A value a command's own contract makes TEXT, never a path it opens (hestia #1330). Keyed on the
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "8418e3e403c83b9e05b3ae0f55068281e431a938812935a7becaf334e44b3d0c",
++      "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "298d9e75e5f8dd77bdd3c6e7b3360073da70c800052d71d5d6c4f8322f956c8b"
++  "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "298d9e75e5f8dd77bdd3c6e7b3360073da70c800052d71d5d6c4f8322f956c8b",
++    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8418e3e403c83b9e05b3ae0f55068281e431a938812935a7becaf334e44b3d0c"
++        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "1aa1a679e94282b0d46d2e9c9db696605eb81533667948a12ac477d6e69ae909"
++  "gt_version": "d26f719f133a611cda3d6b91f724479478058885035e74bfb4842e628216f4d0"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "298d9e75e5f8dd77bdd3c6e7b3360073da70c800052d71d5d6c4f8322f956c8b",
++    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8418e3e403c83b9e05b3ae0f55068281e431a938812935a7becaf334e44b3d0c"
++        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "a3265b138ef643ade2ffe7a1611b442a8aa012e4f4f20a7476af7910faa9a578"
++  "gt_version": "cd9be17d272ee05c7d6789b4fb442a9e62e1259d15cbc112a449edbba3ecf064"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "298d9e75e5f8dd77bdd3c6e7b3360073da70c800052d71d5d6c4f8322f956c8b",
++    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8418e3e403c83b9e05b3ae0f55068281e431a938812935a7becaf334e44b3d0c"
++        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "ec24c7b97dcafb8f32f0e8299c1099f1ecac7530320f8edb4be92549c726e247"
++  "gt_version": "fa321587c9448ed240d3719ddc5770eed11c5dea953f24ad30f561ead887c8a0"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "298d9e75e5f8dd77bdd3c6e7b3360073da70c800052d71d5d6c4f8322f956c8b",
++    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8418e3e403c83b9e05b3ae0f55068281e431a938812935a7becaf334e44b3d0c"
++        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "53bd3cb6114c80a25712bc0b85c1869aee44516e7b2160620fc0f19cc4a6b28f"
++  "gt_version": "2a561c893e4cf9d3c16a247e2f60c4b27e9c3fa98c85073f5085617d06b091c0"
+ }

@@ -6,7 +6,13 @@ naming it: **globs** (`cat note?.txt`, `cat keys/*`), a **`cd` inside the line**
 word, and **recursive readers** that follow links (`grep -R`, `rg -L`, `find -L`, the `Grep`/`Glob` tools on a
 directory). main allows all of those too; they're recorded against #1331 as follow-ups.
 
-Patch: `held/4aa15bda249a5eb0973ad3369bb081446a528ecac5564a2c7209717ccbb87418.patch` (base `f9f29a23`). It covers the gate core, plus the hooks-gt mirror and the 5 manifests.
+Patch: `held/5e0e7b7932262d251dcccbbb48fe0345ba8ff5dcc8a7960741d207a3dbece8bc.patch` (base main `8f5bd7e2`, after #1427). It covers the gate core, plus the hooks-gt mirror and the 5 manifests. This is the one to apply.
+
+**Re-cut 2026-10-28** from `4aa15bda…` (base `f9f29a23`, kept beside it as a superseded record, like the other shas in `held/`). The only change is the `egress_blobs` anchor, which #1427 made `[egress_command_text(event.command)]`. `link_targets()` still reads the **raw** command, so a link named inside a commit message still has its target judged. That's deliberate: for an innate rule it errs toward refusal. Results on this base:
+- `link_target_check.py`: PASS, 6 link rows `egress.secret` and 3 ordinary rows unchanged. The control (main's core) FAILS as designed.
+- `tools/egress_prose_test.py` on the revised core: PASS 13/18, so the two changes compose.
+- `test_gate_core`: all checks pass.
+- Shell-scope battery: 1434/0.
 
 ## The defect
 The innate `egress.secret` rule (Gate 1a, `egress_blobs`) sweeps paths and the command **as named**. Measured in-process on main `f9f29a23`, through `tools/` fixtures. The "secret" is a fake file in a temp workspace whose path carries the innate `.ssh` token. Inside a granted repo, a link to it:

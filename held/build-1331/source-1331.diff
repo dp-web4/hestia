@@ -5,8 +5,8 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
      Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
      return (list(event.paths) + list(event.repos)
              + (egress_items(getattr(event, "egress", None)) or [])
--            + ([event.command] if event.command else []))
-+            + ([event.command] if event.command else [])
+-            + ([egress_command_text(event.command)] if event.command else []))
++            + ([egress_command_text(event.command)] if event.command else [])
 +            + link_targets(event))
 +
 +
@@ -54,4 +54,4 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +    return out
  
  
- @dataclass(frozen=True)
+ #: A value a command's own contract makes TEXT, never a path it opens (hestia #1330). Keyed on the

@@ -10,11 +10,11 @@ src = subprocess.check_output(["git", "show", f"HEAD:{rel}"], cwd=wt).decode()
 
 old = '''    return (list(event.paths) + list(event.repos)
             + (egress_items(getattr(event, "egress", None)) or [])
-            + ([event.command] if event.command else []))
+            + ([egress_command_text(event.command)] if event.command else []))
 '''
 new = '''    return (list(event.paths) + list(event.repos)
             + (egress_items(getattr(event, "egress", None)) or [])
-            + ([event.command] if event.command else [])
+            + ([egress_command_text(event.command)] if event.command else [])
             + link_targets(event))
 
 
