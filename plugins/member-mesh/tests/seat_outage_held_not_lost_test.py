@@ -35,6 +35,7 @@ daemon: the stub binds an ephemeral 127.0.0.1 port, and HESTIA_MESH_STATE is a t
 
 Usage: ./seat_outage_held_not_lost_test.py      (runtime ~60s, deliberate waits)
 """
+import fcntl
 import glob
 import json
 import os
@@ -284,6 +285,7 @@ echo "wake ran; replied to everything" > "$LOG"; exit 0
         # sweep forced to every second that happened mid-case, and read as a recovery that
         # never came (two flaky F/G runs while this file was being written).
         self.journal = os.path.join(self.tmp, "watch.log")
+        LIVE_RIGS.append(self)
 
     @property
     def out(self):
@@ -292,8 +294,6 @@ echo "wake ran; replied to everything" > "$LOG"; exit 0
                 return f.read()[-6000:]
         except FileNotFoundError:
             return ""
-
-        LIVE_RIGS.append(self)
 
     def set_mode(self, m):
         with open(self.mode, "w") as f:
@@ -312,14 +312,37 @@ echo "wake ran; replied to everything" > "$LOG"; exit 0
 
     def stopw(self):
         if self.proc:
-            os.killpg(self.proc.pid, signal.SIGTERM)
+            group = self.proc.pid
+            try:
+                os.killpg(group, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 self.proc.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                os.killpg(self.proc.pid, signal.SIGKILL)
+                pass
+            finally:
+                # Waiting for the leader does not reap its descendants. They can
+                # retain fd 9 and make the next watcher refuse the inherited lock.
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 self.proc.wait(timeout=20)
             self.proc = None
             self._jf.close()
+            # SIGKILL delivery is asynchronous: observe lock release before restart.
+            lock = os.path.join(self.state, f"watch-{PLUGIN}.lock")
+            with open(lock, "a") as f:
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("test watcher descendants retained the lock")
+                        time.sleep(0.01)
 
     def wait(self, pred, secs=20):
         # Bounded: every wait in this file has a deadline. Scaled (x3 by default) because a
@@ -589,7 +612,49 @@ def section_i():
         r.close()
 
 
+def section_j():
+    print("\n=== J. TEST WATCHER CLEANUP RELEASES DESCENDANT LOCKS ===")
+    r = Rig()
+    group = None
+    try:
+        check("J: the rig is registered for signal cleanup", r in LIVE_RIGS)
+        lock = os.path.join(r.state, f"watch-{PLUGIN}.lock")
+        ready = os.path.join(r.tmp, "child-ready")
+        # A leader that exits on TERM, with a child retaining its flock and
+        # ignoring TERM. No production watcher or live daemon is touched.
+        code = (
+            'import os,signal,time,fcntl,sys; f=open(sys.argv[1],"w"); '
+            'fcntl.flock(f,fcntl.LOCK_EX); p=os.fork(); '
+            'signal.signal(signal.SIGTERM,signal.SIG_IGN) if p==0 else None; '
+            'open(sys.argv[2],"w").close() if p==0 else None; time.sleep(30)'
+        )
+        r._jf = open(r.journal, "a")
+        r.proc = subprocess.Popen([sys.executable, "-c", code, lock, ready],
+                                  start_new_session=True, stdout=r._jf, stderr=r._jf)
+        group = r.proc.pid
+        if not r.wait(lambda: os.path.exists(ready), secs=1):
+            raise RuntimeError("test lock holder did not start")
+        r.stopw()
+        with open(lock, "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                released = True
+            except BlockingIOError:
+                released = False
+        check("J: stopw releases the lock before a restart", released)
+        r.stopw()  # Cleanup remains idempotent.
+    finally:
+        if group is not None:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        r.close()
+    check("J: close unregisters the rig", r not in LIVE_RIGS)
+
+
 def main():
+    section_j()
     section_a()
     if not extract("fire_class_unavailable"):
         print("\n(pre-fix watcher: running B as the sabotage arm)")
