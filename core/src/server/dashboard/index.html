@@ -3452,6 +3452,13 @@
   }
   setInterval(renderGeneratedAt, 30000);
 
+  // A click the daemon accepted, held until /api/dashboard shows it. The snapshot is served
+  // from the last refresh while the next one builds, so the poll right after the click can
+  // predate it; without this the button went back to "update" for a poll or two and then
+  // jumped to "updating…".
+  let deploymentPending = null; // { action: 'update' | 'check', at: ms, requestId?: string }
+  const DEPLOYMENT_PENDING_MAX_MS = 30000;
+
   function renderDeployment(deployment) {
     const d = deployment || { state: 'unknown', note: 'deployment status unavailable' };
     renderAutoUpdate(d.auto_update);
@@ -3469,10 +3476,24 @@
     const checkState = chk ? chk.state : (d.check_capable ? 'never' : 'none');
     const checked = chk && chk.at ? ` · checked ${fmt.stamp(chk.at)}` : '';
 
+    if (deploymentPending) {
+      const p = deploymentPending;
+      const shown = p.action === 'update'
+        ? (p.requestId ? d.update_request_id === p.requestId : updating)
+        : (checkState === 'requested' || checkState === 'checking'
+          // check times are whole seconds, so allow one second before the click
+          || Boolean(chk && chk.at && Date.parse(chk.at) >= p.at - 1000));
+      if (shown || Date.now() - p.at > DEPLOYMENT_PENDING_MAX_MS) deploymentPending = null;
+    }
+
     // [status text, colour class, button label, button action, button style]
     let view;
     if (state === 'unknown') {
       view = ['● update status unknown', 'unknown', null, null, ''];
+    } else if (deploymentPending) {
+      view = deploymentPending.action === 'update'
+        ? ['● updating…', 'unknown', 'updating…', null, 'quiet']
+        : ['● checking for updates…', 'unknown', 'checking…', null, 'quiet'];
     } else if (updating) {
       view = ['● updating…', 'unknown', updateState === 'held' ? 'update held' : 'updating…', null, 'quiet'];
     } else if (state === 'stale') {
@@ -3601,6 +3622,8 @@
           : await apiFetch('/api/operator/deployment/update', { method: 'POST' });
         const body = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+        deploymentPending = { action: checking ? 'check' : 'update', at: Date.now(),
+          requestId: body.request_id || undefined };
         btn.textContent = checking ? 'checking…' : 'updating…';
         $('live-status').textContent = checking ? 'checking for updates…' : 'updating…';
         // Re-read authoritative supervisor state rather than inventing a client-side result.
