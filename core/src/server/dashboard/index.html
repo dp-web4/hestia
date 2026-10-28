@@ -3456,7 +3456,12 @@
   // from the last refresh while the next one builds, so the poll right after the click can
   // predate it; without this the button went back to "update" for a poll or two and then
   // jumped to "updating…".
-  let deploymentPending = null; // { action: 'update' | 'check', at: ms, requestId?: string }
+  // An update is matched by the request_id the POST returned. A check has no id, so it is
+  // matched by the server's own stamp on the check (state and time) changing from what the
+  // last snapshot before the click showed. Never by comparing the browser's clock with the
+  // daemon's: viewed from another machine they differ (#1434 review).
+  let deploymentPending = null; // { action: 'update' | 'check', at: ms, requestId?, checkMark? }
+  let deploymentCheckMark = 'none'; // the last snapshot's check stamp
   const DEPLOYMENT_PENDING_MAX_MS = 30000;
 
   function renderDeployment(deployment) {
@@ -3475,16 +3480,17 @@
     const chk = d.check_capable ? (d.check || null) : null;
     const checkState = chk ? chk.state : (d.check_capable ? 'never' : 'none');
     const checked = chk && chk.at ? ` · checked ${fmt.stamp(chk.at)}` : '';
+    const checkMark = chk ? `${chk.state}|${chk.at || ''}` : 'none';
 
     if (deploymentPending) {
       const p = deploymentPending;
       const shown = p.action === 'update'
         ? (p.requestId ? d.update_request_id === p.requestId : updating)
-        : (checkState === 'requested' || checkState === 'checking'
-          // check times are whole seconds, so allow one second before the click
-          || Boolean(chk && chk.at && Date.parse(chk.at) >= p.at - 1000));
+        : (checkState === 'requested' || checkState === 'checking' || checkMark !== p.checkMark);
+      // Both times here are the browser's own, so this bound needs no clock agreement.
       if (shown || Date.now() - p.at > DEPLOYMENT_PENDING_MAX_MS) deploymentPending = null;
     }
+    deploymentCheckMark = checkMark;
 
     // [status text, colour class, button label, button action, button style]
     let view;
@@ -3616,6 +3622,9 @@
       btn.disabled = true;
       btn.textContent = checking ? 'checking…' : 'requesting…';
       btn.classList.remove('failed');
+      // Taken before the POST: a poll that lands while it is in flight may already show the
+      // check, and must count as the change rather than become the baseline.
+      const checkMarkAtClick = deploymentCheckMark;
       try {
         const res = checking
           ? await apiFetch('/api/operator/deployment/check', { method: 'POST' })
@@ -3623,7 +3632,7 @@
         const body = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
         deploymentPending = { action: checking ? 'check' : 'update', at: Date.now(),
-          requestId: body.request_id || undefined };
+          requestId: body.request_id || undefined, checkMark: checkMarkAtClick };
         btn.textContent = checking ? 'checking…' : 'updating…';
         $('live-status').textContent = checking ? 'checking for updates…' : 'updating…';
         // Re-read authoritative supervisor state rather than inventing a client-side result.

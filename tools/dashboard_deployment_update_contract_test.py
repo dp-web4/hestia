@@ -32,6 +32,10 @@ checks = {
         and 'd.update_request_id === p.requestId' in ui
         and 'requestId: body.request_id' in ui
         and 'DEPLOYMENT_PENDING_MAX_MS' in ui,
+    # A check has no id; it is matched by the server's stamp changing, never by comparing the
+    # browser's clock with the daemon's (#1434 review). Behaviour: dashboard_deployment_pending_test.mjs.
+    'UI matches a check click without comparing clocks': 'checkMark !== p.checkMark' in ui
+        and 'Date.parse(chk.at)' not in ui,
     'UI says up to date only from a check': "`● up to date${checked}`" in ui and "deployment current" not in ui,
     'supervisor records its verdict': 'deploy-check.tsv' in deploy and 'write_check_result up-to-date' in deploy
         and 'write_check_result available' in deploy,
