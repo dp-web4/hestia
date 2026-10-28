@@ -3558,34 +3558,20 @@ pub(crate) async fn scope_decide_as(
         );
     }
     // The breadth, validated against the ASKED path: equal, or an ancestor at a separator.
-    let reach_path: String = match grant_path_arg.as_deref() {
-        None => path.clone(),
-        Some(gp) if gp == path => path.clone(),
-        Some(gp) => {
-            let is_ancestor = gp.starts_with('/')
-                && gp != "/"
-                && crate::server::standing_scope::covers_path(gp, true, &path);
-            if !is_ancestor {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("grant_path must be the asked path ({path}) or a \
-                                          directory above it (and never the root); got {gp}")
-                    })),
-                );
-            }
-            if !recursive {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "a grant on a directory ABOVE the asked path must be recursive — \
-                                  an exact grant there would not reach what was asked"
-                    })),
-                );
-            }
-            gp.to_string()
-        }
+    // ScopeRequest storage is still path-only. The typed decision primitive is
+    // shared with the upcoming repository migration; do not infer a repository
+    // from the spelling of a path or enable repository requests here.
+    let asked_target = crate::server::grant_target::GrantTarget::Path {
+        path: path.clone(), recursive: false,
     };
+    let reach_target = match asked_target.decision_reach(grant_path_arg.as_deref(), recursive) {
+        Ok(target) => target,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": error}))),
+    };
+    let Some((reach_path, _)) = reach_target.as_path() else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "repository request decisions are not enabled"})));
+    };
+    let reach_path = reach_path.to_string();
     // A glob reach (`dir/*`) is covered only by a recursive grant; an exact grant would be
     // spent without ever admitting the act, so it is refused here with the reason.
     if granted && !once && !recursive && gate_origin.as_ref().is_some_and(|g| g.subtree) {

@@ -16,6 +16,43 @@ pub enum GrantTarget {
 }
 
 impl GrantTarget {
+    /// Resolve the decider's breadth without crossing target domains. Callers
+    /// normalize filesystem paths before this check, as for standing grants.
+    /// A repository's owner/name is immutable: path breadth is never meaningful
+    /// for it, even when the supplied text happens to equal the repository name.
+    pub fn decision_reach(
+        &self,
+        grant_path: Option<&str>,
+        recursive: bool,
+    ) -> Result<Self, String> {
+        match self {
+            Self::Repository(_) if recursive || grant_path.is_some() => {
+                Err("repository decisions cannot choose path breadth or recursion".into())
+            }
+            Self::Repository(_) => Ok(self.clone()),
+            Self::Path { path, .. } => {
+                let reach = grant_path.unwrap_or(path);
+                if reach != path {
+                    if !reach.starts_with('/')
+                        || reach == "/"
+                        || !super::standing_scope::covers_path(reach, true, path)
+                    {
+                        return Err(format!(
+                            "grant_path must be the asked path ({path}) or a directory above it (and never the root); got {reach}"
+                        ));
+                    }
+                    if !recursive {
+                        return Err("a grant on a directory ABOVE the asked path must be recursive — an exact grant there would not reach what was asked".into());
+                    }
+                }
+                Ok(Self::Path {
+                    path: reach.into(),
+                    recursive,
+                })
+            }
+        }
+    }
+
     /// Parse a member's narrow ask without treating unrelated request metadata as
     /// target fields. Presence (including null) matters: never discard a second
     /// selector and accidentally ask for a different domain. Breadth is decided
@@ -111,6 +148,58 @@ impl From<GrantTarget> for TargetWire {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn decision_reach_repository_never_uses_path_breadth() {
+        let target = GrantTarget::Repository(RepositoryTarget::parse("OWNER/Repo").unwrap());
+        assert_eq!(target.decision_reach(None, false).unwrap(), target);
+        assert!(target.decision_reach(None, true).is_err());
+        for path in ["owner/repo", "other/repo", "/owner", "", "/"] {
+            for recursive in [false, true] {
+                assert!(target.decision_reach(Some(path), recursive).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn decision_reach_path_preserves_existing_breadth_contract() {
+        let target = GrantTarget::Path {
+            path: "/work/tree/file".into(),
+            recursive: true,
+        };
+        // The decider chooses recursion; the request's old flag is not inherited.
+        assert_eq!(
+            target.decision_reach(None, false).unwrap().as_path(),
+            Some(("/work/tree/file", false))
+        );
+        assert_eq!(
+            target
+                .decision_reach(Some("/work/tree/file"), true)
+                .unwrap()
+                .as_path(),
+            Some(("/work/tree/file", true))
+        );
+        assert_eq!(
+            target
+                .decision_reach(Some("/work/tree"), true)
+                .unwrap()
+                .as_path(),
+            Some(("/work/tree", true))
+        );
+        assert!(target.decision_reach(Some("/work/tree"), false).is_err());
+        for path in [
+            "/",
+            "/work/tr",
+            "/elsewhere",
+            "work",
+            "/work/tree/file/child",
+        ] {
+            assert!(
+                target.decision_reach(Some(path), true).is_err(),
+                "accepted {path}"
+            );
+        }
+    }
 
     #[test]
     fn member_request_keeps_domain_and_ignores_only_metadata() {
