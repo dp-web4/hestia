@@ -19,6 +19,8 @@
 //! | TIGHTENING          | vault (`instance_overlays`)     | **yes**          |
 //! | LIVE loosening      | memory (`instance_grants`,      | **no**           |
 //! |                     |  `scope_requests`)              |                  |
+//! | EXPIRING loosening  | vault (`policy/expiring-grants`) | **until expiry** |
+//! |                     |  + memory (#1306)               |                  |
 //! | STANDING loosening  | vault (`scope/standing` doc)    | **yes**          |
 //!
 //! What keeps a DURABLE loosening safe where the memory-only rule used restart as the

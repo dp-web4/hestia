@@ -3162,10 +3162,19 @@ async fn policy_set_instance_grant(
         );
     }
     let now = crate::server::gate_escalation::now_secs();
-    let expires_at = body
-        .get("expires_in_secs")
-        .and_then(|v| v.as_u64())
-        .map(|s| now + s);
+    let expires_in = body.get("expires_in_secs").and_then(|v| v.as_u64());
+    // checked (nomad on #1430): `now + s` panicked in debug and wrapped in release on a huge `s`,
+    // making a grant already expired while the reply said it was kept until its expiry
+    let expires_at = match expires_in.map(|s| now.checked_add(s)) {
+        None => None,
+        Some(Some(e)) => Some(e),
+        Some(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "expires_in_secs is out of range"})),
+            );
+        }
+    };
 
     let mut s = state.lock().await;
 
@@ -3176,12 +3185,29 @@ async fn policy_set_instance_grant(
     //                 with everything else, which is exactly what a restriction should do. A
     //                 member restricted for cause must not be freed by a reboot.
     //   LOOSENING  -> in-memory grant. Substitutes the local baseline and dies with the daemon,
-    //                 so a permission nobody remembers to revoke expires on its own.
+    //                 so a permission nobody remembers to revoke expires on its own. ONE amendment
+    //                 (dp, 2026-10-28, #1306 option 2): a loosening WITH an expiry is also kept in
+    //                 the vault until that expiry, because a deploy's restart was revoking it hours
+    //                 early. Its end is still the operator's own bound, never inattention.
     //
     // Sending a tightening through the memory path would have made restrictions evaporate on
     // restart; sending a loosening through the vault would have made permissions permanent and
     // written to disk. Same control, opposite correct answers.
     let loosening = s.is_loosening(&preset);
+    // the durable kind is bounded (nomad's HOLD on #1430): a loosening that survives restarts may
+    // not outlast MAX_EXPIRING_LOOSENING_SECS. Refused, not clamped, so the operator knows.
+    let ceiling = crate::server::state::MAX_EXPIRING_LOOSENING_SECS;
+    if loosening && expires_in.is_some_and(|s| s > ceiling) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("a loosening that survives restarts may last at most {ceiling} s ({} days); \
+                                  ask for that or less, or make it a standing grant on the standing surface",
+                                 ceiling / 86400),
+                "max_expires_in_secs": ceiling,
+            })),
+        );
+    }
     // What this grant replaces, for the undo below if it cannot be recorded (#1131 class A, the
     // sibling the `let _` sweep missed: this route kept a failed append as an empty hash).
     let key = (plugin_id.clone(), role.clone());
@@ -3198,7 +3224,26 @@ async fn policy_set_instance_grant(
                 expires_at,
             },
         );
-        "memory-only — a daemon restart revokes it"
+        // #1306 (dp, 2026-10-28, option 2): a loosening WITH an expiry is kept in the vault too, so a
+        // deploy's restart does not revoke it before the operator's own bound; one without stays
+        // memory-only. Rewritten on every loosening, so a grant replaced by one without an expiry
+        // leaves the document as well. A write that fails undoes the grant: nothing half-durable.
+        let rows = s.expiring_grant_rows(None);
+        if let Err(e) = s.save_expiring_grants(&rows) {
+            match previous_grant.clone() {
+                Some(g) => { s.instance_grants.insert(key.clone(), g); }
+                None => { s.instance_grants.remove(&key); }
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("vault write failed ({e}); the grant is undone and nothing changed")})),
+            );
+        }
+        if expires_at.is_some() {
+            "vault until its expiry — a daemon restart does not revoke it; it lapses at expires_at"
+        } else {
+            "memory-only — a daemon restart revokes it (set an expiry to keep it across restarts)"
+        }
     } else {
         // A tightening is expressed as the preset's own rules laid over this member, so it
         // composes with society law by the ordinary fold rather than replacing it.
@@ -3240,11 +3285,13 @@ async fn policy_set_instance_grant(
                     Some(g) => { s.instance_grants.insert(key, g); }
                     None => { s.instance_grants.remove(&key); }
                 }
-                Ok(())
+                // and the vault back to what memory now holds (#1306)
+                let rows = s.expiring_grant_rows(None);
+                s.save_expiring_grants(&rows).map_err(|e| e.to_string())
             } else {
                 let r = s.vault.set_policy(previous_policy);
                 s.reload_policy();
-                r
+                r.map_err(|e| e.to_string())
             };
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "error": match undone {
@@ -3280,9 +3327,18 @@ async fn policy_revoke_instance_grant(
     let key = (plugin_id.clone(), role.clone());
     let had = s.instance_grants.contains_key(&key);
     if had {
-        // Witness FIRST, then remove — removing from memory cannot fail, so the order is exact,
-        // and a revoke that cannot be recorded is refused (the scope revoke's rule), never left
-        // unwitnessed (#1131 class A).
+        // #1306: the vault FIRST, without this grant. A revoke whose vault write failed would come
+        // back at the next restart, so it is refused before anything is recorded or removed.
+        let prior_rows = s.expiring_grant_rows(None);
+        let rows = s.expiring_grant_rows(Some(&key));
+        if let Err(e) = s.save_expiring_grants(&rows) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("the revoke could not be written to the vault ({e}); the grant is still in force — retry"),
+            })));
+        }
+        // Witness, then remove — removing from memory cannot fail, so the order is exact, and a
+        // revoke that cannot be recorded is refused (the scope revoke's rule), never left
+        // unwitnessed (#1131 class A); the vault is put back to what is still in force.
         if let Err(e) = s.append_chain(
             "policy_instance_grant_revoked",
             serde_json::json!({
@@ -3292,6 +3348,11 @@ async fn policy_revoke_instance_grant(
                 "via": "operator_session",
             }),
         ) {
+            if let Err(e2) = s.save_expiring_grants(&prior_rows) {
+                // the safe direction (the grant is lost at the next restart, not kept), but said
+                tracing::warn!("revoke unrecorded and the vault could not be restored ({e2:#}): \
+                                the grant stays in force until the next restart only");
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "error": format!("the revoke could not be recorded ({e}); the grant is still in force — retry"),
             })));
@@ -14614,6 +14675,82 @@ mod operator_vault_tests {
             .await.into_response();
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!state.lock().await.instance_grants.is_empty(), "a revoke stood unrecorded");
+    }
+
+    /// #1306 (dp, 2026-10-28, option 2): a loosening WITH an expiry survives a restart until that
+    /// expiry; one without does not; a revoke stays revoked; an expired row is never restored.
+    #[tokio::test]
+    async fn an_expiring_loosening_survives_a_restart_and_an_open_ended_one_does_not() {
+        async fn reopen(dir: &TempDir) -> SharedState {
+            let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+            crate::server::build_state(vault, dir.path(), "p").unwrap()
+        }
+        let key = |p: &str| (p.to_string(), "worker".to_string());
+        let (dir, state) = test_state().await;
+        let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r",
+            "expires_in_secs": 3600})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(body_json(r).await["durability"].as_str().unwrap().starts_with("vault until its expiry"));
+        let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "codex", "role": "worker", "preset": "permissive", "reason": "r"})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(body_json(r).await["durability"].as_str().unwrap().starts_with("memory-only"));
+        drop(state);
+
+        let state = reopen(&dir).await;
+        {
+            let s = state.lock().await;
+            let g = s.instance_grants.get(&key("kimi-code")).expect("the expiring loosening was not restored");
+            assert_eq!(g.preset, "permissive");
+            assert!(g.expires_at.is_some());
+            assert!(s.instance_grants.get(&key("codex")).is_none(), "an open-ended loosening outlived a restart");
+        }
+        // a revoke stays revoked across the next restart
+        let r = policy_revoke_instance_grant(State(state.clone()), Path(("kimi-code".into(), "worker".into())))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        drop(state);
+        let state = reopen(&dir).await;
+        assert!(state.lock().await.instance_grants.is_empty(), "a revoked grant came back");
+
+        // an expired row in the document is never restored
+        {
+            let mut s = state.lock().await;
+            let rows = vec![crate::server::state::ExpiringGrantRow {
+                plugin_id: "kimi-code".into(), role: "worker".into(),
+                grant: crate::server::state::InstanceGrant {
+                    preset: "permissive".into(), granted_by: "operator".into(), granted_at: 1,
+                    reason: "r".into(), expires_at: Some(2),
+                },
+            }];
+            s.save_expiring_grants(&rows).unwrap();
+        }
+        drop(state);
+        let state = reopen(&dir).await;
+        assert!(state.lock().await.instance_grants.is_empty(), "an expired loosening was restored");
+    }
+
+    #[tokio::test]
+    async fn an_expiring_loosening_past_the_ceiling_or_out_of_range_is_refused() {
+        let (_dir, state) = test_state().await;
+        let ceiling = crate::server::state::MAX_EXPIRING_LOOSENING_SECS;
+        for secs in [ceiling + 1, u64::MAX] {
+            let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+                "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r",
+                "expires_in_secs": secs})))
+                .await.into_response();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{secs}");
+            assert!(state.lock().await.instance_grants.is_empty(), "{secs} granted something");
+        }
+        // the ceiling itself is accepted
+        let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r",
+            "expires_in_secs": ceiling})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
     }
 
     #[tokio::test]

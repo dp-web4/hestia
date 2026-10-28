@@ -89,11 +89,13 @@ pub struct InFlightAction {
 
 /// An operator's scoped exception to society law for one `(plugin_id, role)`.
 ///
-/// Held in memory only — see `ServerState::instance_grants`. Carries WHO granted it and WHY,
+/// Held in memory — see `ServerState::instance_grants` — and, when it carries an expiry, ALSO in
+/// the vault (`EXPIRING_GRANTS_DOC`, dp 2026-10-28 on #1306) so a deploy's restart does not revoke
+/// it before the operator's own bound. Carries WHO granted it and WHY,
 /// because a loosening whose rationale is not recorded is indistinguishable after the fact from
 /// a misconfiguration, and this is the one control in the system that can widen what an agent
 /// may do.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstanceGrant {
     /// Preset the grant applies to this member instead of the society baseline.
     pub preset: String,
@@ -103,7 +105,42 @@ pub struct InstanceGrant {
     pub reason: String,
     /// Wall-clock expiry, when the operator set one. `None` means it lasts until revoked or
     /// until the daemon restarts — which it always eventually does, so no grant is permanent.
+    /// `Some` means it is ALSO kept in the vault and survives a restart until this second, and no
+    /// later: the bound the operator chose is the only thing that ends it short of a revoke.
     pub expires_at: Option<u64>,
+}
+
+/// The vault document holding the loosenings that carry an expiry: `(namespace, name, legacy file)`.
+///
+/// WHY (dp, 2026-10-28, #1306 option 2). A memory-only loosening was revoked by the next deploy's
+/// restart, and hestia-deploy restarts the daemon whenever main moves (every 4 h on the fleet), so an
+/// operator's per-member `permissive` lasted until an unrelated deploy, not a working day, and nothing
+/// said it had gone (dp, 10-13). The 2026-08-01 reason for memory-only still holds for a grant WITHOUT
+/// an expiry: a widening nobody remembers to revoke must not become permanent, and restart is what ends
+/// it. A grant WITH an expiry already has that end, set by the operator, so it can be durable without
+/// becoming permanent by inattention. Expired rows are never restored and are dropped on the next write.
+pub const EXPIRING_GRANTS_DOC: (&str, &str, &str) = ("policy", "expiring-grants", "expiring-grants.json");
+
+/// The longest an expiring loosening may last (nomad's HOLD on #1430). The durable kind's safety is
+/// "its end is the operator's own bound", which holds only if the bound is bounded: an
+/// `expires_in_secs` of a century would survive every restart, the permanence the 08-01 rule exists
+/// to prevent. Seven days covers "a working day" and a week away; longer is a STANDING decision, made
+/// on the standing surface, not a loosening that happens to outlive restarts. Refused above, never clamped.
+pub const MAX_EXPIRING_LOOSENING_SECS: u64 = 7 * 24 * 3600;
+
+/// One persisted expiring loosening: the key `ServerState::instance_grants` holds it under, and the grant.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExpiringGrantRow {
+    pub plugin_id: String,
+    pub role: String,
+    pub grant: InstanceGrant,
+}
+
+impl PartialEq for InstanceGrant {
+    fn eq(&self, o: &Self) -> bool {
+        (self.preset.as_str(), self.granted_by.as_str(), self.granted_at, self.reason.as_str(), self.expires_at)
+            == (o.preset.as_str(), o.granted_by.as_str(), o.granted_at, o.reason.as_str(), o.expires_at)
+    }
 }
 
 impl InstanceGrant {
@@ -399,7 +436,14 @@ pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
 /// | TIGHTENING          | vault (`instance_overlays`)         | **yes**          |
 /// | LIVE loosening      | memory (`instance_grants`,          | **no**           |
 /// |                     |  `scope_requests`)                  |                  |
+/// | EXPIRING loosening  | vault (`policy/expiring-grants`)    | **until expiry** |
+/// |                     |  + memory (`instance_grants`)       |                  |
 /// | STANDING loosening  | vault (`scope`/`standing` document) | **yes**          |
+///
+/// EXPIRING (dp, 2026-10-28, #1306 option 2): an operator's per-member preset loosening that carries
+/// an `expires_at` is restored after a restart until that second, because a deploy restarts the
+/// daemon every few hours and was revoking it early. It can't become permanent by inattention: its
+/// end is the operator's own bound. A loosening with no expiry is still LIVE (memory-only).
 ///
 /// The first two rows are the 2026-08-01 doctrine and are unchanged: a RESTRICTION has to be
 /// durable — a member restricted for cause must not be freed by a reboot — and a LIVE
@@ -1000,6 +1044,27 @@ impl ServerState {
                  messages to recipients nobody bound",
             )?
         };
+        // #1306: the expiring loosenings, restored only while live. Unreadable fails CLOSED the
+        // other way from standing scope: an unreadable store restores NOTHING (no widening comes
+        // back on a doubt) and the daemon still starts, because losing a loosening is the safe side.
+        let restored_grants: HashMap<(String, String), InstanceGrant> = {
+            let (ns, name, legacy) = EXPIRING_GRANTS_DOC;
+            let rows: Vec<ExpiringGrantRow> = crate::vault::load_doc(&vault, ns, name, legacy).unwrap_or_else(|e| {
+                tracing::warn!("expiring-grants store unreadable ({e:#}): no expiring loosening restored");
+                Vec::new()
+            });
+            let now = crate::server::gate_escalation::now_secs();
+            rows.into_iter()
+                .filter(|r| r.grant.expires_at.is_some() && r.grant.is_live(now))
+                .map(|r| {
+                    // said, not silent (nomad on #1430): after a deploy a reader can see a loosening is live
+                    tracing::info!(plugin_id = %r.plugin_id, role = %r.role, preset = %r.grant.preset,
+                                   expires_at = ?r.grant.expires_at,
+                                   "restored an expiring loosening from the vault (#1306)");
+                    ((r.plugin_id, r.role), r.grant)
+                })
+                .collect()
+        };
         let standing_doc_present = vault.get_document("scope", "standing").is_some();
         let standing_scope: crate::server::standing_scope::StandingScopeStore = {
             use anyhow::Context;
@@ -1055,10 +1120,11 @@ impl ServerState {
             policy_engine: crate::server::published::Watched::new(policy_engine),
             role_policy_engines: crate::server::published::Watched::new(role_policy_engines),
             instance_policy_engines: crate::server::published::Watched::new(instance_policy_engines),
-            // Empty at every startup, by design: grants do not survive a restart. Escalations
-            // DO — see the rehydrate call after construction. The two are opposite on purpose:
-            // a human's ruling must survive a deploy, a standing permission must not.
-            instance_grants: crate::server::published::Watched::new(HashMap::new()),
+            // Empty at every startup EXCEPT for loosenings that carry an expiry (#1306): those
+            // are restored from the vault until their own `expires_at`. A grant with no expiry
+            // still does not survive a restart: restart is what ends a widening nobody revokes.
+            // Escalations DO survive — see the rehydrate call after construction.
+            instance_grants: crate::server::published::Watched::new(restored_grants),
             // Same reasoning, same lifetime: a widening dies with the daemon.
             scope_requests: crate::server::published::Watched::new(HashMap::new()),
             // The deliberate exception (row 3): standing grants are durable and were just
@@ -1466,6 +1532,24 @@ impl ServerState {
     /// it, while the error text claimed the store was unchanged. Here unchangedness is a
     /// property of the construction: on any persist failure the live store was never
     /// touched, generation included, so there is nothing to claim and nothing to restore.
+    /// The live loosenings that carry an expiry, as the vault holds them, without `exclude` (a revoke
+    /// computes its candidate this way before anything changes). Sorted, so the document is stable.
+    pub fn expiring_grant_rows(&self, exclude: Option<&(String, String)>) -> Vec<ExpiringGrantRow> {
+        let now = crate::server::gate_escalation::now_secs();
+        let mut rows: Vec<ExpiringGrantRow> = self.instance_grants.iter()
+            .filter(|(k, g)| Some(*k) != exclude && g.expires_at.is_some() && g.is_live(now))
+            .map(|((p, r), g)| ExpiringGrantRow { plugin_id: p.clone(), role: r.clone(), grant: g.clone() })
+            .collect();
+        rows.sort_by(|a, b| (&a.plugin_id, &a.role).cmp(&(&b.plugin_id, &b.role)));
+        rows
+    }
+
+    /// Persist exactly `rows` as the expiring-grants document (#1306).
+    pub fn save_expiring_grants(&mut self, rows: &[ExpiringGrantRow]) -> Result<()> {
+        let (ns, name, legacy) = EXPIRING_GRANTS_DOC;
+        crate::vault::save_doc(&mut self.vault, ns, name, legacy, &rows.to_vec())
+    }
+
     pub fn commit_standing_scope<F>(&mut self, mutate: F) -> Result<()>
     where
         F: FnOnce(&mut crate::server::standing_scope::StandingScopeStore),
