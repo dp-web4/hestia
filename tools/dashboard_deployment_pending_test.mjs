@@ -33,7 +33,11 @@ function harness(skewMs) {
   });
   let snapshot = null;
   let postReply = { ok: true, status: 202, body: {} };
-  const apiFetch = async () => ({ ok: postReply.ok, status: postReply.status, json: async () => postReply.body });
+  let hold = null; // when set, the POST waits until the test calls release()
+  const apiFetch = async () => {
+    if (hold) await hold.promise;
+    return { ok: postReply.ok, status: postReply.status, json: async () => postReply.body };
+  };
   const api = new Function('$', 'fmt', 'renderAutoUpdate', 'apiFetch', 'tick', 'Date', `${code}
     return { render: renderDeployment, pending: () => deploymentPending };`)(
     $, { stamp: (s) => s }, () => {}, apiFetch, async () => api.render(snapshot), clock);
@@ -45,6 +49,8 @@ function harness(skewMs) {
     show(s) { snapshot = s; api.render(s); },
     reply(r) { postReply = r; },
     click: () => btn.handler(),
+    holdPost() { let release; hold = { promise: new Promise((r) => { release = r; }) }; hold.release = release; },
+    releasePost() { const h = hold; hold = null; h.release(); },
   };
 }
 
@@ -98,6 +104,21 @@ for (const [skewName, skew] of [['same clock', 0], ['browser 5 min behind', -FIV
     h.show({ ...before, update_state: 'requested', update_request_id: 'req-1' });
     expect(`[${skewName}] snapshot shows the request`, h, 'updating…', h.api.pending() === null);
   }
+}
+
+// A check that FINISHES while the POST is in flight: a poll lands mid-POST with the new
+// stamp. The baseline is the stamp from before the click, so the tick after the POST sees
+// the change and releases at once, instead of holding "checking…" for 30 s (legion review).
+{
+  const h = harness(0);
+  h.show({ ...base, check: { state: 'up-to-date', at: iso(DAEMON_T0 - 10000) } });
+  h.holdPost();
+  const clicked = h.click();
+  h.advance(3000);
+  h.show({ ...base, check: { state: 'up-to-date', at: h.stampNow() } }); // poll lands mid-POST
+  h.releasePost();
+  await clicked; // its tick re-renders the mid-POST snapshot
+  expect('check finished during the POST: released at once', h, 'check for updates', h.api.pending() === null);
 }
 
 // A failed POST sets no hold: the button offers a retry straight away.
