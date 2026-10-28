@@ -16,6 +16,89 @@ pub enum GrantTarget {
 }
 
 impl GrantTarget {
+    /// Stable request identity within a member, independent of decided breadth.
+    /// Keep legacy path keys byte-for-byte compatible with existing gate clients.
+    /// Repository keys have a distinct namespace and an unambiguous tuple encoding;
+    /// an equal-looking path must never find or consume a repository approval.
+    pub fn request_key(&self, plugin_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        match self {
+            Self::Path { path, .. } => {
+                h.update(
+                    format!("hestia:scope-request-key\u{1f}{plugin_id}\u{1f}{path}").as_bytes(),
+                );
+            }
+            Self::Repository(repo) => {
+                h.update(b"hestia:repository-scope-request-key\x1f");
+                // Both fields are strings: serialization cannot fail.
+                h.update(serde_json::to_vec(&(plugin_id, repo.as_str())).unwrap());
+            }
+        }
+        hex::encode(h.finalize())
+    }
+
+    /// Resolve the decider's breadth without crossing target domains. Callers
+    /// normalize filesystem paths before this check, as for standing grants.
+    /// A repository's owner/name is immutable: path breadth is never meaningful
+    /// for it, even when the supplied text happens to equal the repository name.
+    pub fn decision_reach(
+        &self,
+        grant_path: Option<&str>,
+        recursive: bool,
+    ) -> Result<Self, String> {
+        match self {
+            Self::Repository(_) if recursive || grant_path.is_some() => {
+                Err("repository decisions cannot choose path breadth or recursion".into())
+            }
+            Self::Repository(_) => Ok(self.clone()),
+            Self::Path { path, .. } => {
+                let reach = grant_path.unwrap_or(path);
+                if reach != path {
+                    if !reach.starts_with('/')
+                        || reach == "/"
+                        || !super::standing_scope::covers_path(reach, true, path)
+                    {
+                        return Err(format!(
+                            "grant_path must be the asked path ({path}) or a directory above it (and never the root); got {reach}"
+                        ));
+                    }
+                    if !recursive {
+                        return Err("a grant on a directory ABOVE the asked path must be recursive — an exact grant there would not reach what was asked".into());
+                    }
+                }
+                Ok(Self::Path {
+                    path: reach.into(),
+                    recursive,
+                })
+            }
+        }
+    }
+
+    /// Parse a member's narrow ask without treating unrelated request metadata as
+    /// target fields. Presence (including null) matters: never discard a second
+    /// selector and accidentally ask for a different domain. Breadth is decided
+    /// by the operator; this parser cannot request a recursive grant.
+    pub fn from_request_args(args: &serde_json::Value) -> Result<Self, String> {
+        let object = args.as_object().ok_or("scope request must be an object")?;
+        if object.contains_key("path") == object.contains_key("repo") {
+            return Err("scope request requires exactly one of path or repo".into());
+        }
+        if object
+            .get("recursive")
+            .is_some_and(|v| v != &serde_json::Value::Bool(false))
+        {
+            return Err("scope request breadth is decided by the operator".into());
+        }
+        let mut target = serde_json::Map::new();
+        for key in ["path", "repo"] {
+            if let Some(value) = object.get(key) {
+                target.insert(key.into(), value.clone());
+            }
+        }
+        serde_json::from_value(serde_json::Value::Object(target)).map_err(|e| e.to_string())
+    }
+
     /// Identity within one member's grants. Recursion is mutable reach, not a
     /// second identity: replacing an exact grant with a subtree must replace the
     /// same row. Callers must still compare the member separately.
@@ -87,6 +170,185 @@ impl From<GrantTarget> for TargetWire {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn request_key_matches_existing_python_gate_vectors() {
+        // Frozen outputs from plugins/_shared/hestia_gate_mechanism.py.
+        for (member, path, expected) in [
+            (
+                "codex",
+                "/work/file",
+                "043193feceb4a3813925dadb8137d7b691aa9a41bab993032e34764b84cbd420",
+            ),
+            (
+                "member-é",
+                "/work/雪",
+                "66fa807dbb62beb8ee3a8b31e71be81f11554e40bd7b6a068eaa29be01575d2b",
+            ),
+            (
+                "codex",
+                "owner/repo",
+                "9f3fc47e8fc51a5404f72d3ebe05b11882ff2f774da5cacd1e13c767d36ccb35",
+            ),
+        ] {
+            let target = GrantTarget::Path {
+                path: path.into(),
+                recursive: false,
+            };
+            assert_eq!(target.request_key(member), expected);
+        }
+    }
+
+    #[test]
+    fn request_keys_preserve_legacy_path_bytes_and_ignore_breadth() {
+        use sha2::{Digest, Sha256};
+        for member in ["codex", "other", "member\u{1f}separator", ""] {
+            for path in [
+                "/work/file",
+                "owner/repo",
+                "repo:owner/repo",
+                "",
+                "/a\u{1f}b",
+            ] {
+                let expected = hex::encode(Sha256::digest(
+                    format!("hestia:scope-request-key\u{1f}{member}\u{1f}{path}").as_bytes(),
+                ));
+                for recursive in [false, true] {
+                    assert_eq!(
+                        GrantTarget::Path {
+                            path: path.into(),
+                            recursive
+                        }
+                        .request_key(member),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_keys_bind_domain_member_and_canonical_repository() {
+        let repo = GrantTarget::Repository(RepositoryTarget::parse("OWNER/Repo").unwrap());
+        let canonical = GrantTarget::Repository(RepositoryTarget::parse("owner/repo").unwrap());
+        assert_eq!(repo.request_key("codex"), canonical.request_key("codex"));
+        let mut keys = std::collections::HashSet::new();
+        for member in ["codex", "other", "codex\u{1f}owner"] {
+            for name in ["owner/repo", "other/repo", "owner/other"] {
+                let repository = GrantTarget::Repository(RepositoryTarget::parse(name).unwrap());
+                assert!(keys.insert(repository.request_key(member)));
+                for path in [name.to_string(), format!("repo:{name}"), format!("/{name}")] {
+                    assert!(keys.insert(
+                        GrantTarget::Path {
+                            path,
+                            recursive: false
+                        }
+                        .request_key(member)
+                    ));
+                }
+            }
+        }
+        assert_eq!(keys.len(), 36);
+    }
+
+    #[test]
+    fn decision_reach_repository_never_uses_path_breadth() {
+        let target = GrantTarget::Repository(RepositoryTarget::parse("OWNER/Repo").unwrap());
+        assert_eq!(target.decision_reach(None, false).unwrap(), target);
+        assert!(target.decision_reach(None, true).is_err());
+        for path in ["owner/repo", "other/repo", "/owner", "", "/"] {
+            for recursive in [false, true] {
+                assert!(target.decision_reach(Some(path), recursive).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn decision_reach_path_preserves_existing_breadth_contract() {
+        let target = GrantTarget::Path {
+            path: "/work/tree/file".into(),
+            recursive: true,
+        };
+        // The decider chooses recursion; the request's old flag is not inherited.
+        assert_eq!(
+            target.decision_reach(None, false).unwrap().as_path(),
+            Some(("/work/tree/file", false))
+        );
+        assert_eq!(
+            target
+                .decision_reach(Some("/work/tree/file"), true)
+                .unwrap()
+                .as_path(),
+            Some(("/work/tree/file", true))
+        );
+        assert_eq!(
+            target
+                .decision_reach(Some("/work/tree"), true)
+                .unwrap()
+                .as_path(),
+            Some(("/work/tree", true))
+        );
+        assert!(target.decision_reach(Some("/work/tree"), false).is_err());
+        for path in [
+            "/",
+            "/work/tr",
+            "/elsewhere",
+            "work",
+            "/work/tree/file/child",
+        ] {
+            assert!(
+                target.decision_reach(Some(path), true).is_err(),
+                "accepted {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn member_request_keeps_domain_and_ignores_only_metadata() {
+        let path = GrantTarget::from_request_args(&json!({
+            "path":"/work/file", "plugin_id":"member", "reason":"need evidence"
+        }))
+        .unwrap();
+        assert_eq!(path.as_path(), Some(("/work/file", false)));
+        let repo = GrantTarget::from_request_args(&json!({
+            "repo":"OWNER/Repo", "plugin_id":"member", "recursive":false
+        }))
+        .unwrap();
+        assert_eq!(
+            repo,
+            GrantTarget::Repository(RepositoryTarget::parse("owner/repo").unwrap())
+        );
+        assert_eq!(repo.as_path(), None);
+        assert!(!repo.same_identity(&GrantTarget::Repository(
+            RepositoryTarget::parse("other/repo").unwrap()
+        )));
+    }
+
+    #[test]
+    fn member_request_rejects_ambiguous_selectors_and_member_breadth() {
+        for args in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"repo":null}),
+            json!({"path":null}),
+            json!({"path":"/a", "repo":null}),
+            json!({"path":null, "repo":"owner/repo"}),
+            json!({"path":"/a", "repo":"owner/repo"}),
+            json!({"repo":"repo"}),
+            json!({"repo":"owner/*"}),
+            json!({"repo":"https://github.com/owner/repo"}),
+            json!({"path":"/a", "recursive":true}),
+            json!({"repo":"owner/repo", "recursive":true}),
+            json!({"path":"/a", "recursive":null}),
+            json!({"path":"/a", "recursive":"false"}),
+        ] {
+            assert!(
+                GrantTarget::from_request_args(&args).is_err(),
+                "accepted {args}"
+            );
+        }
+    }
 
     #[test]
     fn identity_ignores_reach_but_equality_retains_it() {
