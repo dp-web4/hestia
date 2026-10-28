@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """hestia #1331 gaps (a)/(b): the innate egress.secret rule judges a link's resolved target. In-process,
 through tools/grant_modes_gate_test's fixtures; the "secret" is a FAKE file in a temp workspace whose path
-carries the innate token. Run: python3 held/build-1331/link_target_check.py <dir with core_rev.py | "">"""
+carries the innate token. Run: python3 tools/link_target_test.py
+Applied 2026-10-28 under escalation 1c97dca43e537cd1 and moved here from held/build-1331/link_target_check.py;
+with no argument it loads the real module (pass a dir holding core_rev.py to judge a revised copy)."""
 import importlib.util
 import os
 import pathlib
