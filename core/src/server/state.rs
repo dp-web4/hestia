@@ -121,6 +121,13 @@ pub struct InstanceGrant {
 /// becoming permanent by inattention. Expired rows are never restored and are dropped on the next write.
 pub const EXPIRING_GRANTS_DOC: (&str, &str, &str) = ("policy", "expiring-grants", "expiring-grants.json");
 
+/// The longest an expiring loosening may last (nomad's HOLD on #1430). The durable kind's safety is
+/// "its end is the operator's own bound", which holds only if the bound is bounded: an
+/// `expires_in_secs` of a century would survive every restart, the permanence the 08-01 rule exists
+/// to prevent. Seven days covers "a working day" and a week away; longer is a STANDING decision, made
+/// on the standing surface, not a loosening that happens to outlive restarts. Refused above, never clamped.
+pub const MAX_EXPIRING_LOOSENING_SECS: u64 = 7 * 24 * 3600;
+
 /// One persisted expiring loosening: the key `ServerState::instance_grants` holds it under, and the grant.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ExpiringGrantRow {
@@ -1035,7 +1042,13 @@ impl ServerState {
             let now = crate::server::gate_escalation::now_secs();
             rows.into_iter()
                 .filter(|r| r.grant.expires_at.is_some() && r.grant.is_live(now))
-                .map(|r| ((r.plugin_id, r.role), r.grant))
+                .map(|r| {
+                    // said, not silent (nomad on #1430): after a deploy a reader can see a loosening is live
+                    tracing::info!(plugin_id = %r.plugin_id, role = %r.role, preset = %r.grant.preset,
+                                   expires_at = ?r.grant.expires_at,
+                                   "restored an expiring loosening from the vault (#1306)");
+                    ((r.plugin_id, r.role), r.grant)
+                })
                 .collect()
         };
         let standing_doc_present = vault.get_document("scope", "standing").is_some();

@@ -3161,10 +3161,19 @@ async fn policy_set_instance_grant(
         );
     }
     let now = crate::server::gate_escalation::now_secs();
-    let expires_at = body
-        .get("expires_in_secs")
-        .and_then(|v| v.as_u64())
-        .map(|s| now + s);
+    let expires_in = body.get("expires_in_secs").and_then(|v| v.as_u64());
+    // checked (nomad on #1430): `now + s` panicked in debug and wrapped in release on a huge `s`,
+    // making a grant already expired while the reply said it was kept until its expiry
+    let expires_at = match expires_in.map(|s| now.checked_add(s)) {
+        None => None,
+        Some(Some(e)) => Some(e),
+        Some(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "expires_in_secs is out of range"})),
+            );
+        }
+    };
 
     let mut s = state.lock().await;
 
@@ -3184,6 +3193,20 @@ async fn policy_set_instance_grant(
     // restart; sending a loosening through the vault would have made permissions permanent and
     // written to disk. Same control, opposite correct answers.
     let loosening = s.is_loosening(&preset);
+    // the durable kind is bounded (nomad's HOLD on #1430): a loosening that survives restarts may
+    // not outlast MAX_EXPIRING_LOOSENING_SECS. Refused, not clamped, so the operator knows.
+    let ceiling = crate::server::state::MAX_EXPIRING_LOOSENING_SECS;
+    if loosening && expires_in.is_some_and(|s| s > ceiling) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("a loosening that survives restarts may last at most {ceiling} s ({} days); \
+                                  ask for that or less, or make it a standing grant on the standing surface",
+                                 ceiling / 86400),
+                "max_expires_in_secs": ceiling,
+            })),
+        );
+    }
     // What this grant replaces, for the undo below if it cannot be recorded (#1131 class A, the
     // sibling the `let _` sweep missed: this route kept a failed append as an empty hash).
     let key = (plugin_id.clone(), role.clone());
@@ -3324,7 +3347,11 @@ async fn policy_revoke_instance_grant(
                 "via": "operator_session",
             }),
         ) {
-            let _ = s.save_expiring_grants(&prior_rows);
+            if let Err(e2) = s.save_expiring_grants(&prior_rows) {
+                // the safe direction (the grant is lost at the next restart, not kept), but said
+                tracing::warn!("revoke unrecorded and the vault could not be restored ({e2:#}): \
+                                the grant stays in force until the next restart only");
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "error": format!("the revoke could not be recorded ({e}); the grant is still in force — retry"),
             })));
@@ -14142,6 +14169,26 @@ mod operator_vault_tests {
         drop(state);
         let state = reopen(&dir).await;
         assert!(state.lock().await.instance_grants.is_empty(), "an expired loosening was restored");
+    }
+
+    #[tokio::test]
+    async fn an_expiring_loosening_past_the_ceiling_or_out_of_range_is_refused() {
+        let (_dir, state) = test_state().await;
+        let ceiling = crate::server::state::MAX_EXPIRING_LOOSENING_SECS;
+        for secs in [ceiling + 1, u64::MAX] {
+            let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+                "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r",
+                "expires_in_secs": secs})))
+                .await.into_response();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{secs}");
+            assert!(state.lock().await.instance_grants.is_empty(), "{secs} granted something");
+        }
+        // the ceiling itself is accepted
+        let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r",
+            "expires_in_secs": ceiling})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
     }
 
     #[tokio::test]
