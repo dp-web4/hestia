@@ -24404,10 +24404,11 @@ pub const SCOPE_CLAIM_MAX_PENDING: usize = 32;
 /// The scope request key: member and resolved path. The gate computes the same string
 /// (`hestia_gate_mechanism.scope_request_key`) for its deny text; this one decides.
 pub fn scope_request_key(plugin_id: &str, path: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(format!("hestia:scope-request-key\u{1f}{plugin_id}\u{1f}{path}").as_bytes());
-    hex::encode(h.finalize())
+    super::grant_target::GrantTarget::Path {
+        path: path.into(),
+        recursive: false,
+    }
+    .request_key(plugin_id)
 }
 
 /// The act binding a ONE-TIME approval is spent against: a sha256 the GATE computes over the

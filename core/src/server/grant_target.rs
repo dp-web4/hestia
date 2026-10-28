@@ -16,6 +16,28 @@ pub enum GrantTarget {
 }
 
 impl GrantTarget {
+    /// Stable request identity within a member, independent of decided breadth.
+    /// Keep legacy path keys byte-for-byte compatible with existing gate clients.
+    /// Repository keys have a distinct namespace and an unambiguous tuple encoding;
+    /// an equal-looking path must never find or consume a repository approval.
+    pub fn request_key(&self, plugin_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        match self {
+            Self::Path { path, .. } => {
+                h.update(
+                    format!("hestia:scope-request-key\u{1f}{plugin_id}\u{1f}{path}").as_bytes(),
+                );
+            }
+            Self::Repository(repo) => {
+                h.update(b"hestia:repository-scope-request-key\x1f");
+                // Both fields are strings: serialization cannot fail.
+                h.update(serde_json::to_vec(&(plugin_id, repo.as_str())).unwrap());
+            }
+        }
+        hex::encode(h.finalize())
+    }
+
     /// Resolve the decider's breadth without crossing target domains. Callers
     /// normalize filesystem paths before this check, as for standing grants.
     /// A repository's owner/name is immutable: path breadth is never meaningful
@@ -148,6 +170,86 @@ impl From<GrantTarget> for TargetWire {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn request_key_matches_existing_python_gate_vectors() {
+        // Frozen outputs from plugins/_shared/hestia_gate_mechanism.py.
+        for (member, path, expected) in [
+            (
+                "codex",
+                "/work/file",
+                "043193feceb4a3813925dadb8137d7b691aa9a41bab993032e34764b84cbd420",
+            ),
+            (
+                "member-é",
+                "/work/雪",
+                "66fa807dbb62beb8ee3a8b31e71be81f11554e40bd7b6a068eaa29be01575d2b",
+            ),
+            (
+                "codex",
+                "owner/repo",
+                "9f3fc47e8fc51a5404f72d3ebe05b11882ff2f774da5cacd1e13c767d36ccb35",
+            ),
+        ] {
+            let target = GrantTarget::Path {
+                path: path.into(),
+                recursive: false,
+            };
+            assert_eq!(target.request_key(member), expected);
+        }
+    }
+
+    #[test]
+    fn request_keys_preserve_legacy_path_bytes_and_ignore_breadth() {
+        use sha2::{Digest, Sha256};
+        for member in ["codex", "other", "member\u{1f}separator", ""] {
+            for path in [
+                "/work/file",
+                "owner/repo",
+                "repo:owner/repo",
+                "",
+                "/a\u{1f}b",
+            ] {
+                let expected = hex::encode(Sha256::digest(
+                    format!("hestia:scope-request-key\u{1f}{member}\u{1f}{path}").as_bytes(),
+                ));
+                for recursive in [false, true] {
+                    assert_eq!(
+                        GrantTarget::Path {
+                            path: path.into(),
+                            recursive
+                        }
+                        .request_key(member),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn request_keys_bind_domain_member_and_canonical_repository() {
+        let repo = GrantTarget::Repository(RepositoryTarget::parse("OWNER/Repo").unwrap());
+        let canonical = GrantTarget::Repository(RepositoryTarget::parse("owner/repo").unwrap());
+        assert_eq!(repo.request_key("codex"), canonical.request_key("codex"));
+        let mut keys = std::collections::HashSet::new();
+        for member in ["codex", "other", "codex\u{1f}owner"] {
+            for name in ["owner/repo", "other/repo", "owner/other"] {
+                let repository = GrantTarget::Repository(RepositoryTarget::parse(name).unwrap());
+                assert!(keys.insert(repository.request_key(member)));
+                for path in [name.to_string(), format!("repo:{name}"), format!("/{name}")] {
+                    assert!(keys.insert(
+                        GrantTarget::Path {
+                            path,
+                            recursive: false
+                        }
+                        .request_key(member)
+                    ));
+                }
+            }
+        }
+        assert_eq!(keys.len(), 36);
+    }
 
     #[test]
     fn decision_reach_repository_never_uses_path_breadth() {
