@@ -24016,7 +24016,7 @@ mod invitation_note_contract_tests {
 /// nonexistent paths because there is nothing to escalate - it's just noise". The tools whose
 /// act on a path only READS it: the gate's `READ_ONLY_PATH_TOOLS` plus every tool its
 /// `PATH_TOOL_MODES` maps to exactly `r` (kept in step by `read_tools_match_the_gate`).
-const READ_ONLY_PATH_TOOLS: &[&str] = &[
+pub(crate) const READ_ONLY_PATH_TOOLS: &[&str] = &[
     "Glob", "Grep", "LS", "NotebookRead", "Read", "git_read", "glob", "list_directory",
     "read_file", "read_many_files", "search", "search_file_content",
 ];
@@ -24235,9 +24235,9 @@ fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &s
     out
 }
 
-async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
+pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
-    use crate::server::state::{normalize_scope_path, ScopeRequest, SCOPE_REQUEST_TTL_SECS};
+    use crate::server::state::{normalize_scope_path, ScopeRequest, ScopeRequestExt, SCOPE_REQUEST_TTL_SECS};
 
     let plugin_id = require_string(args, "plugin_id")?;
     let role = optional_string(args, "role").unwrap_or_default();
@@ -24277,6 +24277,23 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
 
     let now = now_secs();
     let mut s = state.lock().await;
+
+    // ATTRIBUTION (hestia#1409), the same rule as `hestia_scope_claim`: a resolved session names
+    // the member, and an asserted id that disagrees with it is refused rather than believed.
+    // Without a session the id is asserted (A1) and recorded as such, so no peer can later
+    // treat a name a caller typed as a proven asker.
+    let asker_basis = match resolve_attributed_caller(&s, optional_session_id(args).as_deref()) {
+        Some(who) if who.plugin_id != plugin_id => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_request_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing was filed",
+                Some(json!({ "asserted": plugin_id, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(_) => crate::arbiter::AskerBasis::Session,
+        None => crate::arbiter::AskerBasis::Asserted,
+    };
 
     // EXISTENCE FIRST (hestia#1411). A request names no mode, so a path that does not exist is
     // refused unless the member says it is creating it (`create: true`): a new file, even in a
@@ -24324,6 +24341,21 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
         }));
     }
 
+    // A STANDING REFUSAL covering the path (hestia#1417): the door is closed until the operator
+    // lifts it, so the ask is not filed and the member is told why, in the decider's words.
+    if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+        return Ok(json!({
+            "status": "refused_standing",
+            "path": path,
+            "refused_by": r.refused_by,
+            "refused_at": r.refused_at,
+            "reason": r.reason,
+            "note": "a standing refusal covers this path: nothing was filed and nothing reaches \
+                     the operator's queue. It stands until the operator lifts it; the reason is \
+                     the one recorded when it was refused",
+        }));
+    }
+
     // Derived, not random — same construction as the escalation store, so an id is reproducible
     // from the record that minted it. The request count is in the digest so a member re-asking
     // for the same path in the same second gets a distinct record rather than overwriting its
@@ -24352,7 +24384,8 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
         decided_at: None,
         decision_reason: None,
         recursive: false,
-        revoked: None, ext: Default::default(),
+        revoked: None,
+        ext: ScopeRequestExt { asker_basis: Some(asker_basis), ..Default::default() },
     };
     s.scope_requests.insert(id.clone(), req);
 
@@ -24543,6 +24576,13 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // The DURABLE list, additive beside live_grants (Sprint F R1): operator-promoted
         // standing grants from the vault-persisted store. Expired grants are filtered in
         // the store's read, so nothing served here is past its horizon.
+        // STANDING REFUSALS this member is under (hestia#1417): the governed see the closed
+        // door and the deciding seat's reason, instead of re-trying it every window.
+        "refused_standing": s.standing_scope.refusals.iter()
+            .filter(|r| r.member == plugin_id)
+            .map(|r| json!({"path": r.path, "recursive": r.recursive, "refused_at": r.refused_at,
+                            "refused_by": r.refused_by, "reason": r.reason}))
+            .collect::<Vec<_>>(),
         "standing_grants": standing_all
             .iter()
             .filter(|g| g.modes.is_all())
@@ -24883,6 +24923,21 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         }));
     }
 
+    // (3b) A STANDING REFUSAL (hestia#1417): the operator or a NOT-SAME peer closed this door
+    // durably. Answered from the record, nothing opened, nothing new witnessed: before this a
+    // refusal lasted one window and the next act minted a fresh request and a fresh card.
+    if unpriceable.is_none() {
+        if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+            return Ok(json!({
+                "verdict": "refused", "permits": false, "path": path, "request_key": key,
+                "standing": true, "refused_by": r.refused_by, "refused_at": r.refused_at,
+                "detail": format!("refused, standing (by {}): {}. Re-issuing opens no request; \
+                                   only the operator can lift this",
+                                  r.refused_by, if r.reason.is_empty() { "no reason given" } else { &r.reason }),
+            }));
+        }
+    }
+
     // (4) REFUSED inside its window — re-issuing does not reopen it.
     let refused = s
         .scope_requests
@@ -25131,7 +25186,7 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
         return Err(anyhow::anyhow!("reason is too thin — the asker reads it"));
     }
     let session_id_arg = optional_session_id(args);
-    let (arbiter, asker, basis) = {
+    let (arbiter, asker, basis, req_subtree) = {
         let s = state.lock().await;
         let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
             return Err(anyhow::anyhow!(
@@ -25145,10 +25200,19 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
                 "no such scope request (memory-only: it may have expired or the daemon \
                  restarted, #908 / #1233)", Some(json!({ "request_id": request_id }))));
         };
-        let Some(gate) = req.ext.gate.as_ref() else {
-            return Ok(hestia_error_envelope("hestia.scope_peer_decide_member_filed",
-                "peers decide GATE-OPENED scope requests; a member-filed ask is the operator's \
-                 (or a delegated seat's `hestia scope arbitrate`)", None));
+        // A MEMBER-FILED ask (hestia#1409; dp 2026-10-14: "the human does not need to be in
+        // that loop"): a NOT-SAME peer may REFUSE it, which widens nothing; granting it stays
+        // the operator's (or a delegated seat's `hestia scope arbitrate`). Measured on
+        // cbp-being, 2026-10-26: nine asks for paths already in its grant, or not on disk,
+        // each waiting on the operator because no peer could close them.
+        let asker_basis = match req.ext.gate.as_ref() {
+            Some(gate) => gate.asker_basis,
+            None if decision == "refuse" => req.ext.asker_basis.unwrap_or_default(),
+            None => {
+                return Ok(hestia_error_envelope("hestia.scope_peer_decide_member_filed",
+                    "peers may only REFUSE a member-filed scope request; granting one is the \
+                     operator's (or a delegated seat's `hestia scope arbitrate`)", None));
+            }
         };
         if arb.plugin_id == req.plugin_id || s.same_entity(&arb.plugin_id, &req.plugin_id) {
             return Ok(hestia_error_envelope("hestia.scope_peer_decide_self",
@@ -25159,7 +25223,7 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
                           else { Disposition::ForAppellant };
         let parties = AppealParties {
             appellant: &req.plugin_id,
-            appellant_basis: gate.asker_basis,
+            appellant_basis: asker_basis,
             deny_adjudicator: None,
             arbiter: &arb.plugin_id,
         };
@@ -25177,15 +25241,27 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
         let basis = json!({
             "arbiter": arb.plugin_id,
             "asker": req.plugin_id,
-            "asker_basis": gate.asker_basis,
+            "asker_basis": asker_basis,
             "independence": independence,
+            "origin": if req.ext.gate.is_some() { "gate_deny" } else { "member_request" },
             "eligibility": "arbiter::eligibility_for (NOT-SAME)",
         });
-        (arb.plugin_id, req.plugin_id.clone(), basis)
+        let req_subtree = req.ext.gate.as_ref().is_some_and(|g| g.subtree);
+        (arb.plugin_id, req.plugin_id.clone(), basis, req_subtree)
     };
     let mut body = json!({ "request_id": request_id, "reason": reason });
     match decision.as_str() {
-        "refuse" => { body["granted"] = json!(false); }
+        "refuse" => {
+            body["granted"] = json!(false);
+            // A peer may make a refusal STANDING (hestia#1417): it widens nothing. Lifting
+            // one stays the operator's. Its REACH is the request's, never the peer's (Nova on
+            // #1418): a peer refuses the ask presented, exact unless the gate-opened act was
+            // itself a subtree glob, and cannot invent a broader durable prohibition.
+            if args.get("standing").and_then(Value::as_bool).unwrap_or(false) {
+                body["standing"] = json!(true);
+                body["recursive"] = json!(req_subtree);
+            }
+        }
         "once" => { body["granted"] = json!(true); body["once"] = json!(true); }
         "session" | "standing" => {
             body["granted"] = json!(true);

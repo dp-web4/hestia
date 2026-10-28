@@ -174,6 +174,66 @@ pub struct StandingScopeStore {
     /// identical. One list, consulted for everyone, cannot drift.
     #[serde(default)]
     pub floor: Vec<FloorEntry>,
+    /// STANDING REFUSALS (hestia#1417). A refusal used to live only as long as its request's
+    /// window (8 h), so a member re-asking for one off-limits path minted a fresh request, and
+    /// a fresh operator card, every window: measured 87 refused acts and 17 request ids for
+    /// one `(member, path)` in three days. A refusal the operator (or a NOT-SAME peer) marks
+    /// standing is durable like a grant: the gate's claim answers `refused` from this row and
+    /// opens nothing, `request_scope` for the path is not filed, and the member reads the
+    /// closed door in its own scope status. Lifted only by the operator; a later grant that
+    /// covers the path answers before it and so lifts it in effect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refusals: Vec<StandingRefusal>,
+}
+
+/// One standing refusal (hestia#1417): the member's ASK for this path is refused, durably, until
+/// the operator lifts it. It refuses the ask, not the reach (nomad on #1418): the gate's claim
+/// and `request_scope` answer from it and open nothing, while a grant that covers the path
+/// answers before it, and a STANDING grant that covers it lifts it explicitly (`add`). A refusal
+/// as a node in the nearest-grant walk (#1386) is the follow-up. Never widens anything, so a
+/// NOT-SAME peer may record one, with the reach of the request it was asked to rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandingRefusal {
+    pub member: String,
+    /// Normalised absolute path (`state::normalize_scope_path`).
+    pub path: String,
+    /// Whether the refusal covers the whole subtree under `path`.
+    #[serde(default)]
+    pub recursive: bool,
+    pub refused_at: u64,
+    /// `operator`, or `peer:<member>`.
+    #[serde(default)]
+    pub refused_by: String,
+    /// Why — the deciding seat's words, served back to the member on every re-ask.
+    #[serde(default)]
+    pub reason: String,
+    /// The request this refusal was decided on, for provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// What the refused ASK was for (Nova on #1418): `r` when the gate opened it for a read-only
+    /// tool, otherwise every mode. A standing grant lifts the refusal only when its modes include
+    /// these, so a `w`-only grant over a refused read leaves the refusal standing (the read is
+    /// still unauthorized, and the gate still answers it from the record instead of re-asking).
+    /// Absent on rows written before this field: read as every mode, the conservative side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modes: Option<crate::server::grant_modes::Modes>,
+}
+
+impl StandingRefusal {
+    pub fn covers(&self, path: &str) -> bool {
+        covers_path(&self.path, self.recursive, path)
+    }
+
+    /// The modes the refused ask needed (every mode when unrecorded).
+    pub fn asked_modes(&self) -> crate::server::grant_modes::Modes {
+        self.modes.unwrap_or(crate::server::grant_modes::Modes::ALL)
+    }
+
+    /// Whether `grant` opens what this refusal closed: it covers the path AND its modes include
+    /// the modes the ask needed. Only such a grant lifts the refusal.
+    pub fn lifted_by(&self, grant: &StandingGrant) -> bool {
+        grant.member == self.member && grant.covers(&self.path) && grant.modes.includes(self.asked_modes())
+    }
 }
 
 /// What the daemon found where the standing authority should be, at launch.
@@ -362,6 +422,12 @@ pub struct FloorForMember<'a> {
 }
 
 impl StandingScopeStore {
+    /// The standing refusal covering `path` for `member`, if any (hestia#1417). Exact match
+    /// always; the subtree only when the refusal is recursive, the grants' own rule.
+    pub fn refusal_for(&self, member: &str, path: &str) -> Option<&StandingRefusal> {
+        self.refusals.iter().find(|r| r.member == member && r.covers(path))
+    }
+
     /// Every live standing grant this member holds, oldest first. Expired grants are
     /// filtered HERE, at the read, so no serving surface can leak one by forgetting to.
     pub fn live_for(&self, member: &str, now: u64) -> Vec<&StandingGrant> {
@@ -662,7 +728,19 @@ impl StandingScopeStore {
     /// Add (or replace, keyed by `(member, path)`) a grant. Replacement rather than
     /// duplication, because two records for one path would make "revoked" ambiguous —
     /// and the superseded grant's history lives in the witness chain, not here.
+    /// The standing refusals that `grant` lifts: the member's, covered by the grant, in the modes
+    /// the ask needed (nomad on #1418: the record must not say "closed" while the door is open;
+    /// Nova: a `w`-only grant opens no read, so it lifts no refused read).
+    pub fn refusals_lifted_by(&self, grant: &StandingGrant) -> Vec<StandingRefusal> {
+        self.refusals.iter().filter(|r| r.lifted_by(grant)).cloned().collect()
+    }
+
     pub fn add(&mut self, grant: StandingGrant) {
+        // A standing grant that OPENS what a standing refusal closed (path AND modes) LIFTS it in
+        // the same act, so the store never says closed where a grant has opened the door.
+        // `commit_standing_scope` witnesses each lifted row (`scope_refusal_lifted`, by: grant)
+        // after the commit lands. A narrower grant (w-only over a refused read) lifts nothing.
+        self.refusals.retain(|r| !r.lifted_by(&grant));
         self.grants
             .retain(|g| !(g.member == grant.member && g.path == grant.path));
         self.grants.push(grant);
@@ -1390,6 +1468,7 @@ mod tests {
                 generation: 7,
                 grants: vec![grant("codex", "/w/web4", 1, None)],
                 floor: Vec::new(),
+                refusals: Vec::new(),
             })
             .unwrap(),
         )

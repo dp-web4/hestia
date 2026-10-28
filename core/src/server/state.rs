@@ -194,6 +194,12 @@ pub struct ScopeRequestExt {
     /// `Some` when the gate opened this request on a refusal; `None` when the member filed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateDenyOrigin>,
+    /// For a MEMBER-FILED ask: whether the asker was resolved from a live session when it was
+    /// recorded, or merely asserted (hestia#1409). A gate-opened request carries this on
+    /// `gate.asker_basis`. A NOT-SAME peer may REFUSE a session-attributed member-filed ask;
+    /// granting one stays the operator's. Rows written before this field read as asserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asker_basis: Option<crate::arbiter::AskerBasis>,
     /// The operator answered ONE-TIME: this exact act (`gate.act_digest`), once, inside the
     /// claim window. Never a live grant: it is not served in `live_grants`, so no snapshot
     /// carries it; only `hestia_scope_claim` can spend it.
@@ -616,6 +622,14 @@ pub struct ServerState {
     /// Never persisted: a restart reloads the vault copy, at which point memory and vault
     /// agree again (the grant resurrects, visibly, and a fresh revoke takes the normal path).
     pub standing_scope_dirty: bool,
+    /// TEST SEAMS for the two-phase witness arms that no external injection can time: a chain
+    /// append that fails for the named event types only (so an intent lands and its success row
+    /// does not), and a `persist_standing_scope` that fails (the memory-first rollback's vault
+    /// write). Compiled out of the daemon.
+    #[cfg(test)]
+    pub chain_fault_on: std::collections::HashSet<String>,
+    #[cfg(test)]
+    pub vault_fault_on_persist: bool,
     /// Moves on every policy republish (`server::published`).
     pub publication_version: u64,
     /// The vault policy-list generation the current publication was built from.
@@ -1057,6 +1071,10 @@ impl ServerState {
             standing_projection_audit: crate::server::published::Watched::new(None),
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
+            #[cfg(test)]
+            chain_fault_on: std::collections::HashSet::new(),
+            #[cfg(test)]
+            vault_fault_on_persist: false,
             publication_version: 0,
             published_lists_gen: u64::MAX,
             transport_bindings,
@@ -1428,6 +1446,10 @@ impl ServerState {
     /// entry points below — `commit_standing_scope` for widenings, `apply_standing_revoke`
     /// for tightenings — which encode what a failed persist means for each direction.
     pub fn persist_standing_scope(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.vault_fault_on_persist {
+            anyhow::bail!("injected vault fault (test seam)");
+        }
         crate::vault::save_doc(
             &mut self.vault,
             "scope",
@@ -1451,11 +1473,38 @@ impl ServerState {
         let mut candidate = self.standing_scope.clone();
         mutate(&mut candidate);
         crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &candidate)?;
+        // Standing refusals the mutation removed by GRANTING over them (`StandingScopeStore::add`),
+        // witnessed after the commit so the record never says closed where the door is open
+        // (nomad on #1418). A refusal removed by the explicit lift route is witnessed by that
+        // route's own two-phase rows, not here.
+        let lifted: Vec<crate::server::standing_scope::StandingRefusal> = self.standing_scope.refusals.iter()
+            .filter(|old| !candidate.refusals.iter().any(|n| n.member == old.member && n.path == old.path))
+            .filter(|old| candidate.grants.iter().any(|g| old.lifted_by(g)))
+            .cloned()
+            .collect();
         *self.standing_scope = candidate;
         // The vault now holds exactly what memory holds, so any earlier revoke-persist
         // failure has been overtaken: the synced state is the tighter one plus this
         // committed mutation.
         self.standing_scope_dirty = false;
+        for r in lifted {
+            let by = self.standing_scope.grants.iter()
+                .find(|g| r.lifted_by(g))
+                .map(|g| format!("grant {}", g.request_id.clone().unwrap_or_else(|| g.path.clone())))
+                .unwrap_or_else(|| "grant".into());
+            self.append_chain("scope_refusal_lifted", serde_json::json!({
+                "plugin_id": r.member,
+                "subject_instance_lct": self.member_lct(&r.member),
+                "path": r.path,
+                "recursive": r.recursive,
+                "lifted_by": by,
+                "via": "covering_standing_grant",
+                "refused_by": r.refused_by,
+                "refused_at": r.refused_at,
+                "reason": r.reason,
+                "standing_generation": self.standing_scope.generation,
+            }))?;
+        }
         Ok(())
     }
 
@@ -1795,6 +1844,10 @@ impl ServerState {
         event_type: &str,
         event_data: serde_json::Value,
     ) -> Result<ChainEntry> {
+        #[cfg(test)]
+        if self.chain_fault_on.contains(event_type) {
+            anyhow::bail!("injected chain fault on {event_type} (test seam)");
+        }
         super::state_lock::time_section("chain.append", || {
             self.chain_store
                 .append(event_type, event_data, &self.sovereign_lct)

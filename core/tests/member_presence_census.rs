@@ -643,6 +643,30 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_live_revoke", &[
         "\"subject_instance_lct\": s.member_lct(&req.plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-10-27 (cbp-claude, hestia#1417: a refusal can stand like a grant). The
+    // operator's lift of a standing refusal, the third sibling of the two revokes above.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `scope_refusal_lifted`
+    // chain entry — the member whose standing refusal the operator just lifted. `plugin_id`
+    // is operator-typed, exactly as in `scope_standing_revoke`; a typo 404s on the
+    // `refusals` lookup before this line runs. (2) Compared to decide control flow? No — the
+    // lift keys on the store's `(member, path)` strings; the derived LCT is serialised into
+    // the witness entry and read by nothing. Naming, like its siblings.
+    ("server/http.rs::scope_refusal_lift", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    // ADDED 2026-10-27 (cbp-claude, hestia#1418, nomad's (b)): a STANDING GRANT that covers a
+    // standing refusal lifts it in the same act, and the lift is witnessed here, after the vault
+    // commit, as `scope_refusal_lifted` with `via: covering_standing_grant`.
+    //
+    // READING, both questions. (1) Who gets named? The subject of that chain entry — the member
+    // whose refusal the grant just lifted, read from the refusal row (`r.member`), which came
+    // from the store, not from operator typing. (2) Compared to decide control flow? No — which
+    // refusals lift is decided by `StandingRefusal::lifted_by` on the store's strings and modes;
+    // the derived LCT is serialised into the witness entry and read by nothing. Naming.
+    ("server/state.rs::commit_standing_scope", &[
+        "\"subject_instance_lct\": self.member_lct(&r.member),",
+    ], SiteClass::Naming),
     // ADDED 2026-09-08 (legion-claude, dp's "make standing" / "make recursive" buttons).
     // The census went red on the full `cargo test` after `--lib` was green — the exact
     // trap this file's header describes, and the reason the branch was not pushed on
