@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 83fdf6605c87f540d6bc246cc599487325ef1c741e9a5a6a4b615c57e733738d  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 8418e3e403c83b9e05b3ae0f55068281e431a938812935a7becaf334e44b3d0c  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -592,7 +592,140 @@ def egress_blobs(event: "NormalizedEvent") -> list:
     Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
     return (list(event.paths) + list(event.repos)
             + (egress_items(getattr(event, "egress", None)) or [])
-            + ([event.command] if event.command else []))
+            + ([egress_command_text(event.command)] if event.command else []))
+
+
+#: A value a command's own contract makes TEXT, never a path it opens (hestia #1330). Keyed on the
+#: PARSED COMMAND, not the program (Nova's exact-head review of #1427): `git checkout -m` is --merge,
+#: `gh pr checkout -b` names a branch, `gh pr review -c` is a boolean. Each entry is (prose flags,
+#: the options of that command that take no value). A prose flag counts only when the word before
+#: it cannot be an option waiting for its value (see `_prose_flag_counts`), so `git commit --author
+#: -m .ssh/x`, where git reads `-m` as the author and `.ssh/x` as a pathspec, is swept whole. Every
+#: other word, including an interpreter's `-c`/`-e` code and a quoted path, is swept as before.
+#: Flags read from `gh <cmd> --help` (gh 2.x) and `git <cmd> -h` on Legion, 2026-10-28.
+_GH_TITLE_BODY = frozenset({"--title", "-t", "--body", "-b"})
+_GH_BODY = frozenset({"--body", "-b"})
+_GH_CLOSE_COMMENT = frozenset({"--comment", "-c"})
+_GH_COMMENT_BOOLS = frozenset({"--web", "-w", "--editor", "-e", "--edit-last", "--delete-last",
+                               "--create-if-none", "--yes"})
+_GIT_MESSAGE = frozenset({"-m", "--message"})
+_PROSE_FLAGS = {
+    ("gh", "issue", "create"): (_GH_TITLE_BODY, frozenset({"--web", "-w", "--editor", "-e"})),
+    ("gh", "issue", "edit"): (_GH_TITLE_BODY, frozenset({"--remove-milestone"})),
+    ("gh", "issue", "comment"): (_GH_BODY, _GH_COMMENT_BOOLS),
+    ("gh", "issue", "close"): (_GH_CLOSE_COMMENT, frozenset()),
+    ("gh", "pr", "create"): (_GH_TITLE_BODY, frozenset({
+        "--draft", "-d", "--dry-run", "--editor", "-e", "--fill", "-f", "--fill-first",
+        "--fill-verbose", "--no-maintainer-edit", "--web", "-w"})),
+    ("gh", "pr", "edit"): (_GH_TITLE_BODY, frozenset({"--remove-milestone"})),
+    ("gh", "pr", "comment"): (_GH_BODY, _GH_COMMENT_BOOLS),
+    ("gh", "pr", "review"): (_GH_BODY, frozenset({
+        "--approve", "-a", "--comment", "-c", "--request-changes", "-r"})),
+    ("gh", "pr", "close"): (_GH_CLOSE_COMMENT, frozenset({"--delete-branch", "-d"})),
+    ("git", "commit"): (_GIT_MESSAGE, frozenset({
+        "-q", "--quiet", "-v", "--verbose", "-s", "--signoff", "--no-signoff", "-e", "--edit",
+        "--no-edit", "-a", "--all", "-i", "--include", "-o", "--only", "-n", "--no-verify",
+        "--verify", "--amend", "--no-amend", "--reset-author", "--allow-empty",
+        "--allow-empty-message", "--dry-run", "--status", "--no-status", "-p", "--patch",
+        "--short", "--branch", "--porcelain", "--long", "-z", "--null", "-S", "--gpg-sign",
+        "--no-gpg-sign", "-u", "--untracked-files", "--no-post-rewrite", "--post-rewrite"})),
+    ("git", "tag"): (_GIT_MESSAGE, frozenset({
+        "-a", "--annotate", "-s", "--sign", "--no-sign", "-f", "--force", "-e", "--edit",
+        "--no-edit", "--create-reflog"})),
+}
+#: git's own options BEFORE the subcommand: these take a value; these do not. Any other option there
+#: leaves the command unresolved, so nothing in the segment is exempt.
+_GIT_GLOBAL_WITH_VALUE = frozenset({"-C", "-c"})
+_GIT_GLOBAL_BOOLS = frozenset({"--no-pager", "-P", "--no-optional-locks"})
+_SEGMENT_BREAKS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
+
+
+def _literal(word: str) -> bool:
+    """No `$` and no backtick: the value is the bytes written, not something that expands."""
+    return "$" not in word and "`" not in word
+
+
+def _prose_flag_counts(prev: str, bools: frozenset) -> bool:
+    """A prose flag is the flag only if the word before it is not an option waiting for its value:
+    a non-option word (the program, a subcommand, a positional, or the value of an earlier option),
+    a `--x=y` word, or an option this command's contract lists as taking none. Anything else may
+    consume the prose flag as its value, so the segment is swept as written."""
+    return not prev.startswith("-") or "=" in prev or prev in bools
+
+
+def egress_command_text(command: str) -> str:
+    """The command as Gate 1a sweeps it: every word, except a LITERAL prose value of a flag in
+    `_PROSE_FLAGS` under the command that defines it (hestia #1330). Measured on Legion
+    2026-10-15/10-27: `gh issue create --body "...the workspace credentials file..."` was refused
+    `egress.secret` on a word in the issue's text, so every security write-up went through
+    `--body-file`, the pattern the law discourages elsewhere. A value holding `$` or a backtick is
+    not literal (it could expand to a secret's contents) and stays swept; so does the whole raw
+    command when it cannot be tokenized. Each segment (`_SEGMENT_BREAKS`) is resolved on its own:
+    the program, then its subcommand words (git's own leading options allowed), then the flags.
+    `--` ends the exemptions for the rest of its segment: after it every word is an operand."""
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return command
+    kept = []
+    prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
+    for w in words:
+        if w in _SEGMENT_BREAKS:
+            prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
+            kept.append(w)
+            continue
+        if skip_next:
+            skip_next = False
+            prev = w
+            if _literal(w):
+                continue                    # the literal prose value: not a path, not swept
+            kept.append(w)
+            continue
+        kept.append(w)
+        if prog is None:
+            if "=" in w and not w.startswith("-") and w.split("=", 1)[0].isidentifier():
+                continue                    # an env assignment before the program: still swept
+            prog, prev = os.path.basename(w), w
+            if not any(key[0] == prog for key in _PROSE_FLAGS):
+                done = True
+            continue
+        if done:
+            continue
+        if entry is None:                   # resolving the subcommand
+            if git_value:
+                git_value, prev = False, w
+                continue
+            if prog == "git" and not sub and w in _GIT_GLOBAL_WITH_VALUE:
+                git_value, prev = True, w
+                continue
+            if prog == "git" and not sub and w in _GIT_GLOBAL_BOOLS:
+                prev = w
+                continue
+            if w.startswith("-"):
+                done = True                 # an option the resolver does not know: nothing exempt
+                continue
+            sub.append(w)
+            key = (prog, *sub)
+            if key in _PROSE_FLAGS:
+                entry = _PROSE_FLAGS[key]
+            elif not any(k[:len(key)] == key for k in _PROSE_FLAGS):
+                done = True
+            prev = w
+            continue
+        flags, bools = entry
+        if w == "--":
+            done = True                     # every later word is an operand (a pathspec): swept
+            continue
+        name, eq, val = w.partition("=")
+        if w in flags and _prose_flag_counts(prev, bools):
+            skip_next = True
+        elif (eq and name in flags and name.startswith("--") and _literal(val)
+              and _prose_flag_counts(prev, bools)):
+            kept[-1] = name + "="
+        prev = w
+    return " ".join(kept)
 
 
 @dataclass(frozen=True)
