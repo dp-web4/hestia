@@ -28,7 +28,7 @@ The innate `egress.secret` rule (Gate 1a, `egress_blobs`) sweeps paths and the c
 `degraded_verdict` uses the same `egress_blobs`, so it gains the same view.
 
 ## Evidence (revised core served as `hestia_gate_core`, `run_overlay.py`)
-- `link_target_test.py`: **PASS** on the revised core. All 6 link rows are `egress.secret`, including a `--input=<link>` flag value, and the 3 ordinary rows are untouched. On main's core every link row fails except the real-path control.
+- `link_target_check.py`: **PASS** on the revised core. All 6 link rows are `egress.secret`, including a `--input=<link>` flag value, and the 3 ordinary rows are untouched. On main's core every link row fails except the real-path control.
 - Same exit code under both cores:
   - `test_gate_core`
   - `shell_grammar`
@@ -53,4 +53,4 @@ This and held #1427 (#1330, `egress_command_text`) both edit `egress_blobs`'s re
 - Cut / re-cut: `transform_1331.py <worktree> <out>`, then `build_1331.py <worktree> <out>`.
 - Tests: `run_overlay.py <worktree> <out> <test file>`. Pass an empty `<out>` to run the control on the worktree's core.
 
-After the governed apply, `link_target_test.py` moves to `tools/` and loads the real module.
+After the governed apply, `link_target_check.py` moves to `tools/link_target_test.py` and loads the real module. Until then it has a name `tools/ci_discovery.is_test_shaped` does not match, so CI does not run a held overlay test against the core it was written to fail on (Nova, 10-28).
