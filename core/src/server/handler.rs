@@ -12622,9 +12622,9 @@ mod member_mesh_tests {
     }
 
     /// The row is only useful where the question gets asked. `owed_to_me` is
-    /// what the fire primer renders, so that is where "live and unanswered"
-    /// (a member choosing not to reply) must separate from "never seen here"
-    /// (a misroute) — they want opposite responses from the sender.
+    /// what the fire primer renders, so mailbox liveness must separate from
+    /// "never seen here" without claiming that an interactive member read a
+    /// particular notice or deliberately chose not to answer.
     #[tokio::test]
     async fn unanswered_owed_to_me_carries_recipient_liveness() {
         let (_dir, state) = test_state().await;
@@ -12657,9 +12657,14 @@ mod member_mesh_tests {
         };
         assert_eq!(by_to("thor"), json!("unknown"), "{rows}");
         assert_eq!(by_to("kimi-code"), json!("live"), "{rows}");
-        // Liveness is about the delivery path, not about acting — say so in
-        // the payload, where a reader cannot skip past it.
-        assert!(rows["recipient_liveness_scope"].is_string(), "{rows}");
+        // Mailbox touch and drain are not interactive-session read receipts.
+        let liveness_scope = rows["recipient_liveness_scope"].as_str().unwrap();
+        assert!(liveness_scope.contains("mailbox touches"), "{rows}");
+        assert!(liveness_scope.contains("watcher"), "{rows}");
+        let scope = rows["scope"].as_str().unwrap();
+        assert!(scope.contains("no consuming drain"), "{rows}");
+        assert!(scope.contains("a peek"), "{rows}");
+        assert!(scope.contains("does not prove session read"), "{rows}");
     }
 
     /// **The site the fractal change could have broken silently, and the reason it is
