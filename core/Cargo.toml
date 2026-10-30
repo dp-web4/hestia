@@ -103,5 +103,5 @@ regex = "1"
 globset = "0.4"
 chrono-tz = "0.10"
 
-[dev-dependencies]
+# Private, exclusively created scratch dirs (chain-verify snapshot)
 tempfile = "3"

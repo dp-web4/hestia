@@ -155,6 +155,70 @@ pub fn canonical_act_digest_preimage(f: &ActDigestV1Fields<'_>) -> Vec<u8> {
     out
 }
 
+/// Domain separator for the v1 chain-witness signature over one witness-chain row (#339, B2).
+///
+/// A row's legacy `hash` covers `prev_hash || timestamp || event_type || event_data` and
+/// nothing else: not the `signer_lct` the row names, not the `chain_position` it sits at, not
+/// which chain it belongs to. Signing that hash alone would authenticate the content while
+/// leaving the row's claimed signer and ledger coordinate as unsigned metadata beside it. The
+/// v1 envelope signs the coordinate and the claims, with the legacy hash as one field, so the
+/// legacy hash (and every receipt that addresses a row by it) stays unchanged.
+///
+/// Changing this string, the field order, or a field's spelling is a **v2 wire change**.
+pub const CHAIN_SIGNATURE_DOMAIN: &str = "hestia:chain-entry-signature:v1";
+
+/// The `signature_version` a row carries when it is signed under [`CHAIN_SIGNATURE_DOMAIN`].
+pub const CHAIN_SIGNATURE_VERSION_V1: u32 = 1;
+
+/// Fields bound by a v1 chain-witness signature, in signed order.
+///
+/// Decision 0014 §6.1 names the tuple: chain identity, position, row hash, policy generation,
+/// signer identity, signing-time key identity. `signer_lct` (who the row SAYS acted) and
+/// `witness_lct` (who attests the row's ordering and inclusion) are separate fields because a
+/// witness chain carries rows whose named signer is not the witness — conflating them is the
+/// "one signature carrying both meanings" ambiguity that decision rules out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainSignatureV1Fields<'a> {
+    /// Stable identity of the chain (not a path): survives copies and restarts.
+    pub chain_id: &'a str,
+    /// Canonical decimal u64, no sign, no leading zeros.
+    pub chain_position: &'a str,
+    /// The row's existing 64-hex legacy `hash`.
+    pub row_hash: &'a str,
+    /// The row's `signer_lct` column.
+    pub signer_lct: &'a str,
+    /// The chain witness that produced this signature.
+    pub witness_lct: &'a str,
+    /// Lowercase hex Ed25519 public key the signature verifies under — the signing-time key
+    /// identity, so a later key rotation cannot orphan the row.
+    pub witness_public_key: &'a str,
+    /// The policy generation in force when the row was witnessed.
+    pub policy_generation: &'a str,
+}
+
+/// Exact bytes an Ed25519 chain-witness signature covers (signed directly, not pre-hashed).
+///
+/// Same framing discipline as the act digest: UTF-8, every field named and byte-length
+/// delimited, no serializer participates.
+pub fn canonical_chain_signature_preimage(f: &ChainSignatureV1Fields<'_>) -> Vec<u8> {
+    let fields = [
+        ("chain_id", f.chain_id),
+        ("chain_position", f.chain_position),
+        ("row_hash", f.row_hash),
+        ("signer_lct", f.signer_lct),
+        ("witness_lct", f.witness_lct),
+        ("witness_public_key", f.witness_public_key),
+        ("policy_generation", f.policy_generation),
+    ];
+    let mut out = format!("{CHAIN_SIGNATURE_DOMAIN}\n").into_bytes();
+    for (name, value) in fields {
+        out.extend_from_slice(format!("{name}:{}\n", value.len()).as_bytes());
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +334,88 @@ mod tests {
             canonical_act_digest_preimage(&b),
             "moving bytes across semantic fields must change the preimage"
         );
+    }
+
+    fn sample_chain_sig() -> ChainSignatureV1Fields<'static> {
+        ChainSignatureV1Fields {
+            chain_id:
+                "hestia-chain:1111111111111111111111111111111111111111111111111111111111111111",
+            chain_position: "42",
+            row_hash: "2222222222222222222222222222222222222222222222222222222222222222",
+            signer_lct: "lct:web4:mb32:bsigner",
+            witness_lct: "lct:web4:mb32:bwitness",
+            witness_public_key: "3333333333333333333333333333333333333333333333333333333333333333",
+            policy_generation:
+                "policy:sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        }
+    }
+
+    /// Full v1 chain-signature vector (#339 test 10). Reproducible from UTF-8, byte lengths and
+    /// SHA-256 alone. **Bump the domain to v2 deliberately — never edit this constant to make
+    /// the test pass**: every signed row already on a chain covers the old bytes.
+    #[test]
+    fn the_chain_signature_golden_vector_is_language_independent() {
+        let pre = canonical_chain_signature_preimage(&sample_chain_sig());
+        let text = String::from_utf8(pre.clone()).unwrap();
+        assert!(text.starts_with("hestia:chain-entry-signature:v1\nchain_id:77\nhestia-chain:"));
+        assert!(text.contains("\nchain_position:2\n42\n"));
+        assert_eq!(
+            sha256_hex(&pre),
+            "4264c2847d2326043dffd34d94946c1d334abddd1c9b9791caca69e12c6eab8d",
+        );
+    }
+
+    #[test]
+    fn the_chain_signature_is_domain_separated_and_boundary_safe() {
+        assert_ne!(CHAIN_SIGNATURE_DOMAIN, ACT_DIGEST_DOMAIN);
+        assert_ne!(CHAIN_SIGNATURE_DOMAIN, SESSION_TRANSCRIPT_DOMAIN);
+        let a = ChainSignatureV1Fields {
+            signer_lct: "lct:xy",
+            witness_lct: "z",
+            ..sample_chain_sig()
+        };
+        let b = ChainSignatureV1Fields {
+            signer_lct: "lct:x",
+            witness_lct: "yz",
+            ..sample_chain_sig()
+        };
+        assert_ne!(
+            canonical_chain_signature_preimage(&a),
+            canonical_chain_signature_preimage(&b),
+        );
+        // Every field is bound: changing any one changes the bytes.
+        let base = canonical_chain_signature_preimage(&sample_chain_sig());
+        for f in [
+            ChainSignatureV1Fields {
+                chain_id: "hestia-chain:other",
+                ..sample_chain_sig()
+            },
+            ChainSignatureV1Fields {
+                chain_position: "43",
+                ..sample_chain_sig()
+            },
+            ChainSignatureV1Fields {
+                row_hash: "22",
+                ..sample_chain_sig()
+            },
+            ChainSignatureV1Fields {
+                signer_lct: "lct:other",
+                ..sample_chain_sig()
+            },
+            ChainSignatureV1Fields {
+                witness_lct: "lct:other",
+                ..sample_chain_sig()
+            },
+            ChainSignatureV1Fields {
+                witness_public_key: "33",
+                ..sample_chain_sig()
+            },
+            ChainSignatureV1Fields {
+                policy_generation: "none",
+                ..sample_chain_sig()
+            },
+        ] {
+            assert_ne!(canonical_chain_signature_preimage(&f), base);
+        }
     }
 }
