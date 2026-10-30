@@ -230,7 +230,7 @@ def liveness(x):
 # this seat while the sibling `open_petitions` gap -- whose renderer prints `asked:false`
 # in words -- was noticed the same day. The header moved in here so that it is emitted
 # only when there are rows for it to head.
-HEADER = 'Unanswered (no notice binds a response to these — responsiveness only; a member that woke and silently acted still shows here):\nRecipient liveness is EVIDENCE, not a diagnosis: `quiet Xm` is how long since a mailbox read under that seat, `reads=N` its lifetime read count. A watcher may perform those reads; neither value proves a session saw a notice. A member drains once at the top of a wake and then works, so a BUSY member reads quiet for most of it — quiet is not down (#506). `NEVER SEEN` means no liveness record exists at all.'
+HEADER = 'Unanswered (no notice binds a response to these — responsiveness only; a member that woke and silently acted still shows here):\nRecipient liveness is EVIDENCE, not a diagnosis: `quiet Xm` is how long since a mailbox read under that seat, `reads=N` its lifetime read count. A watcher may perform those reads; neither value proves a session saw a notice. Reads may occur at different times during a wake — quiet is not down (#506). `NEVER SEEN` means no liveness record exists at all.'
 u = json.load(open(sys.argv[1])).get("unanswered")
 # A DISPLAY cap, and it announces itself. Fixing the carrier means the whole fold now
 # arrives: 1,102 rows / ~205 KB of prompt on this seat on 2026-09-04, most of it the
@@ -240,18 +240,21 @@ u = json.load(open(sys.argv[1])).get("unanswered")
 # carries both numbers and says which of the two it is.
 CAP = int(os.getenv("HESTIA_DEBT_ROWS_SHOWN") or 25)
 rows, notes, total = [], [], 0
+def mark_status(x):
+    if "drained_at" not in x: return "drain mark unknown; read status unknown"
+    mark = x["drained_at"]
+    if mark is None: return "drain mark absent; read status unknown"
+    if not isinstance(mark, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})", mark):
+        return "drain mark unknown; read status unknown"
+    try: datetime.datetime.fromisoformat(mark.replace("Z", "+00:00"))
+    except ValueError: return "drain mark unknown; read status unknown"
+    return "drain mark present; read status unknown"
 if isinstance(u, dict):
     for label,key in (("you have not answered","i_owe"),("nobody has answered you","owed_to_me")):
         got = u.get(key) or []
         total += len(got)
         for x in got[:CAP]:
-            mark = x.get("drained_at")
-            if "drained_at" not in x or (mark is not None and (not isinstance(mark, str) or not mark)):
-                seen = "drain status unknown; read status unknown"
-            elif mark is None:
-                seen = "not drained; read status unknown"
-            else:
-                seen = "drained; read status unknown"
+            seen = mark_status(x)
             hint = liveness(x)
             rows.append(f"- id={clean(x.get('id',''))} {clean(x.get('kind',''))} "
                         f"{clean(x.get('from_plugin',''))}->{clean(x.get('to_plugin',''))} "

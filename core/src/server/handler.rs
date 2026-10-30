@@ -8290,9 +8290,9 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
 ///
 /// Two properties this surface must keep, both learned the hard way:
 ///
-/// 1. It is **unanswered**, not undelivered. `drained_at` records a consuming
-///    drain, not a per-notice read receipt: peeks leave it null, and a watcher
-///    may drain without the intended interactive session seeing the notice.
+/// 1. It is **unanswered**, not undelivered. `drained_at` is a drain mark, not
+///    a per-notice read receipt: peeks leave it null, and the local drain may
+///    mark expired ordinary notices that its SELECT did not return.
 ///    Named "undelivered" it would re-create absence-read-as-pass with better
 ///    tooling.
 /// 2. It closes the loop for RESPONSIVENESS, not for ACTION. The INERT
@@ -8432,8 +8432,8 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
                        follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
                        outranks mootness — the misroute is sender-actionable.",
         "scope": "unanswered = no notice binds in_reply_to to it; \
-                  drained_at:null means no consuming drain is recorded; a peek \
-                  may still have seen it, and a drain does not prove session read; \
+                  drained_at:null means the drain mark is absent; a peek may still \
+                  have seen it. A mark does not prove it was returned or read; \
                   each row carries its OWN in_reply_to - group by that, not by \
                   pointer_uri, or distinct dispositions anchored at one section \
                   read as duplicates",
@@ -12662,9 +12662,9 @@ mod member_mesh_tests {
         assert!(liveness_scope.contains("mailbox touches"), "{rows}");
         assert!(liveness_scope.contains("watcher"), "{rows}");
         let scope = rows["scope"].as_str().unwrap();
-        assert!(scope.contains("no consuming drain"), "{rows}");
+        assert!(scope.contains("drain mark is absent"), "{rows}");
         assert!(scope.contains("a peek"), "{rows}");
-        assert!(scope.contains("does not prove session read"), "{rows}");
+        assert!(scope.contains("does not prove it was returned or read"), "{rows}");
     }
 
     /// **The site the fractal change could have broken silently, and the reason it is

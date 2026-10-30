@@ -1985,9 +1985,10 @@ impl InboxTouch {
 }
 
 /// One notice with nothing bound to it — the row the mesh could not produce
-/// before 2026-07-25. `drained_at: None` means no consuming drain is recorded;
-/// a non-consuming peek may still have observed it. `Some(_)` records a drain,
-/// not proof that an interactive member read or understood the notice.
+/// before 2026-07-25. `drained_at: None` means the drain mark is absent; a
+/// non-consuming peek may still have observed it. `Some(_)` records a mark,
+/// not proof that the notice was returned or read: the local drain update also
+/// marks expired ordinary notices excluded from its SELECT.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UnansweredNotice {
     pub id: u64,
@@ -3541,7 +3542,7 @@ mod tests {
         );
         let un = store.member_unanswered("kimi-code", &["reply"], -1).unwrap();
         assert_eq!(un.len(), 1);
-        assert!(un[0].drained_at.is_some(), "drained, then unanswered");
+        assert!(un[0].drained_at.is_some(), "drain mark present, unanswered");
     }
 
     /// Binding a response clears the debt; the per-kind filter keeps the
@@ -3562,7 +3563,7 @@ mod tests {
         let before = store.member_unanswered("kimi-code", counted, -1).unwrap();
         assert_eq!(before.len(), 1, "handoff is not an unanswered-report row");
         assert_eq!(before[0].id, asked);
-        assert!(before[0].drained_at.is_none(), "no consuming drain recorded");
+        assert!(before[0].drained_at.is_none(), "drain mark absent");
         // Kimi answers it: the binding closes the row.
         store
             .enqueue_member("claude-code", "kimi-code", "role:r", "review_done",

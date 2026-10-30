@@ -19,10 +19,17 @@ ROWS = [
      'pointer_uri': 'file:///four', 'drained_at': 42},
     {'id': 5, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
      'pointer_uri': 'file:///five', 'drained_at': ''},
+    {'id': 6, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
+     'pointer_uri': 'file:///six', 'drained_at': 'not-a-timestamp'},
+    {'id': 7, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
+     'pointer_uri': 'file:///seven', 'drained_at': '2026-10-30T12:00:00.123456789+00:00'},
+    {'id': 8, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
+     'pointer_uri': 'file:///eight', 'drained_at': '2026-02-31T12:00:00Z'},
 ]
-EXPECTED = {1: 'not drained; read status unknown', 2: 'drained; read status unknown',
-            3: 'drain status unknown; read status unknown', 4: 'drain status unknown; read status unknown',
-            5: 'drain status unknown; read status unknown'}
+EXPECTED = {1: 'drain mark absent; read status unknown', 2: 'drain mark present; read status unknown',
+            3: 'drain mark unknown; read status unknown', 4: 'drain mark unknown; read status unknown',
+            5: 'drain mark unknown; read status unknown', 6: 'drain mark unknown; read status unknown',
+            7: 'drain mark present; read status unknown', 8: 'drain mark unknown; read status unknown'}
 
 
 def assert_rows(test, output):
@@ -62,6 +69,7 @@ class DrainEvidenceTest(unittest.TestCase):
                                              capture_output=True, text=True, check=True)
                     assert_rows(self, process.stdout)
                     self.assertIn('A watcher may perform those reads', process.stdout)
+                    self.assertNotIn('A member drains once at the top of a wake', process.stdout)
 
 
 if __name__ == '__main__':
