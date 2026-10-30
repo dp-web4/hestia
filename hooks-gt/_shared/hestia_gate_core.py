@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 8418e3e403c83b9e05b3ae0f55068281e431a938812935a7becaf334e44b3d0c  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -592,7 +592,52 @@ def egress_blobs(event: "NormalizedEvent") -> list:
     Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
     return (list(event.paths) + list(event.repos)
             + (egress_items(getattr(event, "egress", None)) or [])
-            + ([egress_command_text(event.command)] if event.command else []))
+            + ([egress_command_text(event.command)] if event.command else [])
+            + link_targets(event))
+
+
+def link_targets(event: "NormalizedEvent") -> list:
+    """The resolved targets of the paths an act names, where a link makes them DIFFER from the name
+    (hestia #1331, gaps a/b). Measured on main f9f29a23 in-process (a fixture, no credential): inside a
+    granted repo, a link to a secret-NAMED file passed Gate 1a by a relative shell read and by `Read`
+    (absolute or relative), because the innate sweep judged the path AS NAMED. Absolute shell paths in
+    the workspace already had their target checked (the scope pass); this gives the one rule no grant
+    relaxes the same view, for every path argument and every shell word that names an existing path
+    (relative ones joined onto the event's cwd). A path that is not a link contributes nothing, so
+    an ordinary act's verdict cannot change. Never raises: an unreadable path adds nothing."""
+    words = list(event.paths)
+    if event.command:
+        try:
+            words += shlex.split(event.command)
+        except ValueError:
+            words += event.command.split()
+    cwd = getattr(event, "cwd", None)
+    out = []
+    for w in words:
+        if not isinstance(w, str) or not w:
+            continue
+        # a flag names a path only through its `=value` (`--input=notes.txt`); a bare flag names none
+        if w.startswith("-"):
+            if "=" not in w:
+                continue
+            cands = {w.split("=", 1)[1]}
+        else:
+            cands = {w, w.split("=", 1)[1]} if "=" in w else {w}
+        for cand in cands:
+            try:
+                base = os.path.expanduser(cand)
+                if not os.path.isabs(base):
+                    if not cwd:
+                        continue
+                    base = os.path.join(cwd, base)
+                if not os.path.lexists(base):
+                    continue
+                real = os.path.realpath(base)
+                if real != os.path.normpath(base):
+                    out.append(real)
+            except (OSError, ValueError):
+                continue
+    return out
 
 
 #: A value a command's own contract makes TEXT, never a path it opens (hestia #1330). Keyed on the
