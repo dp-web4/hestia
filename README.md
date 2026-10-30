@@ -9,8 +9,9 @@ Hestia is the open-source local-first daemon that lets **AI agents from differen
 share one machine under one law**: a single signed policy every agent transits, a
 hash-chained record of what each one did, a human in the loop when an agent reaches for
 something it should not have, and a trust score **derived from that record** rather than
-asserted. Claude Code, Codex, Kimi, Gemini and Cursor plug into the same gate. No cloud
-required.
+asserted. Claude Code, Codex and Kimi are gated by the same common gate in daily use; Gemini
+runs the same gate in code and was verified live once (2026-07-22), but is not in daily use;
+Cursor is observe-only (a witness hook, no pre-tool gate). No cloud required.
 
 That governance is what makes an agent **admissible to a Web4 hub**. A hub cannot verify
 an agent it has no record of; Hestia is where the record is made, so the hub has something
@@ -149,9 +150,9 @@ This is the part that runs every day and has the scars to prove it.
 
 | Component | Status | Evidence |
 |-----------|--------|----------|
-| **Policy gate, multi-vendor** | Measured; shared core consolidated in repo, install evidence incomplete | The gate-consolidation Sprints A–G and shared decision path are merged in the repository; #517 also merged the claude-code seat cutover. That does **not** prove every installed seat is executing the attested common artifact. Live-install / decision-path verification remains separate, and #586 currently shows why: the installer can attest `$HESTIA_HOME/shared/*` while member shims still resolve `_shared/*` unless stage-2 verify-then-import wiring lands. Treat repo convergence as shipped code, not as proof of enforcement on every seat. |
+| **Policy gate, multi-vendor** | Measured for Claude Code, Codex, Kimi; Gemini verified live once (2026-07-22), not in daily use | Since one-gate stage C (#1231, 2026-10-05) every seat's hook is the certified template shim and every decision is `plugins/_shared/hestia_single_gate.py` `decide()`. Each shim imports the gate only from the installed `$HESTIA_HOME/shared/` (or an explicit `HESTIA_SHARED_DIR`), never a checkout, and checks its API version (`plugins/claude-code/hooks/pre_tool_use.py`, `_load_gate`), so the #586 split between attested and imported copies is closed in code. No verdict, an unreadable harness timeout, or an internal error is a deny. Cursor has a witness hook only, no pre-tool gate. |
 | **Witness chain** | Measured | Hash-linked SQLCipher and live event production. Infrastructure failures require the separate Plane-E path because the normal chain may be unavailable. |
-| **Human escalation** | Measured | A refused governance write is offered to a human: dashboard notice, `hestia gate approve/deny`, or an operator-authenticated HTTP decision. Single-use, expiring, witnessed both ends. Store is **rehydrated from the chain**, so a deploy no longer destroys a ruling. |
+| **Human escalation** | Measured | A refused governance write is offered to a human: dashboard notice, `hestia gate approve/deny`, or an operator-authenticated HTTP decision. Single-use, expiring, witnessed both ends. Store is **rehydrated from the chain**, so a deploy no longer destroys a ruling. Writes to the gate's own code carry the `sovereign_plus_peer` bar, which is **not two-factor in code**: the bar is met by the sovereign (operator) factor alone, and the peer factor is invited and recorded as evidence, not required (dp ruling 2026-08-06, after the bar was met 0 of 66 times; `core/src/server/gate_escalation.rs` `bar_met_over`). |
 | **Peer arbitration** | Built, manually exercised | A NOT-SAME peer can rule an escalation and eligibility is checked server-side. No autonomous driver should ship until appeals bind to one recorded act and NOT-BENEFICIARY is enforced. |
 | **Per-member policy** | Measured | Loosen or tighten ONE agent without moving the society. Tightening persists (vault); loosening is memory-only and dies with the daemon. Operator-only — no MCP tool can set it, asserted by test. |
 | **Trust derivation (T3/V3)** | Measured | Pure read-time function over the chain, versioned, ships its receipts. Temperament scores conduct after a deny: re-running 0.0, adapting 0.85, escalating and being upheld 1.0. Unmeasured renders *unmeasured*, never a default prior. |
@@ -163,8 +164,11 @@ This is the part that runs every day and has the scars to prove it.
 
 **Assurance ceiling, stated with it:** all of the above is profile **A1** — a cooperative
 gate running as the same UID as the operator. Tamper-**evident**, not tamper-proof.
-[`docs/GATE_BYPASS_CATALOG.md`](docs/GATE_BYPASS_CATALOG.md) catalogues the ways around it,
-including two environment variables that suffice today. Enforcement against a determined
+[`docs/GATE_BYPASS_CATALOG.md`](docs/GATE_BYPASS_CATALOG.md) catalogues the ways around it.
+Its measured two-environment-variable bypass (2026-07-26) is closed by stage C, which made
+no-verdict a deny; launcher-supplied locators (`HESTIA_HOME`, `HESTIA_SHARED_DIR`,
+`HESTIA_ENDPOINT` where the vault projection does not set it) are still trusted, which is
+inferred from code, not measured (see the catalog's 2026-10-14 re-baseline). Enforcement against a determined
 agent needs A2+ (separate UID) and is not available now.
 
 ### Built but thinly exercised — *plumbed*

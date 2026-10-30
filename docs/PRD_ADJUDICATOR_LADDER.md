@@ -264,7 +264,10 @@ which is how "shipped ≠ in force" happens in reverse.
 
 `gate_escalation.rs:228` is a hardcoded filename match: four specific paths get
 `Bar::SovereignPlusPeer`, everything else `SingleApprover`. It is the system's *only* stakes
-classifier and it lives in a `match` arm. `PRD_ALLOWLISTS.md` §3.6.5 already proposes
+classifier and it lives in a `match` arm. (Note, re-checked 2026-10-14: despite the name,
+`SovereignPlusPeer` is not two-factor in code. `bar_met_over` meets it on the sovereign factor
+alone and keeps the peer factor as recorded evidence, per dp's 2026-08-06 ruling that two-bar
+is an invitation to participate, not a blocker.) `PRD_ALLOWLISTS.md` §3.6.5 already proposes
 `required_tier(kind, society_consequence) -> Tier` as a stored table for the ceremony axis; **this
 PRD proposes `rungs_for(kind, consequence) -> [RungId]` on the same key**, from the same store,
 resolved by the same lookup.

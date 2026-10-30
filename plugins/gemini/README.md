@@ -6,6 +6,12 @@ third after Kimi (#1) and Codex (#2). Modeled on `hestia/plugins/codex/`, but Ge
 from Google's docs rather than inherited. Verifying the harness contract instead of assuming it is the
 whole method.
 
+> **Operational status (2026-10-14): verified live once, 2026-07-22; not in daily use.** Since
+> one-gate stage C (#1231) `hooks/before_tool.py` is the certified template shim and decides
+> through the common gate like the other seats, so Gemini is gated *in code*. It is not a seat
+> in daily operation: a 2026-10-14 read found no Gemini gate fires in the CBP mesh logs and no
+> Gemini watch lock. Do not cite it as a live-gated harness.
+
 > **Fidelity: source-verified contract + LIVE-VERIFIED adapter pass (2026-07-22).** The exit-code /
 > deny / fail-open contract below is read from gemini-cli **source** (file+line cited), not just docs
 > or blogs — per CBP's method note (a blog claim that Codex PreToolUse was "Bash-only" was wrong;

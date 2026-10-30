@@ -419,7 +419,7 @@ the policy it governs and is covered by the same generation counter:
 |---|---|---|---|
 | 0 | `operator-only` | one challenge-signed operator session (`authenticate_operator`) | **yes — bootstrap default** |
 | 1 | `operator-plus-witness` | tier 0 + a second *witnessing* identity recorded on the act (not a second approver — an observer whose record is chain-anchored) | yes, mechanically; needs a designated witness seat |
-| 2 | `sovereign-plus-peer` | `gate_escalation.rs::Bar::SovereignPlusPeer` — operator plus a corroborating peer member | **no — the bar has never scored; corroboration filter uninstalled** |
+| 2 | `sovereign-plus-peer` | design intent: operator plus a corroborating peer member. **In code today (`gate_escalation.rs` `bar_met_over`) `Bar::SovereignPlusPeer` is met by the sovereign factor alone; the peer factor is invited and recorded as evidence, not required (dp ruling 2026-08-06).** So the shipped bar of that name is tier 0 in effect | **no — as a true two-factor tier it has never scored; corroboration filter uninstalled** |
 | 3 | `quorum` | N-of-M named identities | not built |
 
 **Bootstrap default = tier 0, `operator-only`**, and the rationale is the Q3 finding, kept

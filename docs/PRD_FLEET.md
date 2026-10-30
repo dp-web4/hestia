@@ -22,7 +22,7 @@ Today hestia governs agents by injecting hooks into other people's harnesses. Th
 
 - **Visibility:** the gate sees command *text*, not resolved acts. The lexical classifier is simultaneously the false-positive engine (read-only inspection manufactures escalations — measured, `PRD_GATE_CONSOLIDATION` §3.3) and the bypass surface (Class E). The scope check judges *spelling*: `gh pr list --repo x/y` denied; `cd` in and run it, allowed.
 - **Influence:** the hook can refuse and explain; it cannot shape the loop. Retry policy, context injection, tool selection, budget — all belong to the foreign harness.
-- **Coverage:** harness support is permanently uneven (cursor = witness-only; gemini = subprocess-delegates to the claude-code gate; every new harness is a new shim) — and the industry is **moving harness functions into the weights**, so the hook surface hestia depends on is thinning underneath it (§4.7).
+- **Coverage:** harness support is permanently uneven (cursor = witness-only; gemini = subprocess-delegates to the claude-code gate [*2026-10-14: superseded by one-gate stage C, #1231; gemini now runs the common gate in-process, and is verified live once, 2026-07-22, not in daily use*]; every new harness is a new shim) — and the industry is **moving harness functions into the weights**, so the hook surface hestia depends on is thinning underneath it (§4.7).
 - **The bypass floor:** Class B is a measured full bypass with two environment variables. `HESTIA_PRE_FAIL_CLOSED=1` closes every measured bypass and is default-off. The gate is in the agent's blast radius by construction.
 
 The move: **hestia stops being only a hook in other loops and becomes a loop of its own.** Three capabilities, one architecture:
