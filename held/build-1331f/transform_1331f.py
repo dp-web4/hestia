@@ -29,7 +29,7 @@ new = new.replace(old, (
     "                         f\"refused rather than judged in part: name the paths it needs\",\n"
     "                         target=UNENUMERATED_TARGET)\n"
     "        return None\n"))
-for name in ("_glob.glob(", "_GLOB_CHARS.search(", "UNENUMERATED_TARGET"):
+for name in ("_fnmatch.fnmatchcase(", "_GLOB_CHARS.search(", "os.scandir(", "UNENUMERATED_TARGET"):
     assert name in new, name
 diff = "".join(difflib.unified_diff(src.splitlines(True), new.splitlines(True), f"a/{rel}", f"b/{rel}"))
 (here / "source-1331f.diff").write_text(f"diff --git a/{rel} b/{rel}\n" + diff)

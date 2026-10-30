@@ -103,10 +103,63 @@ def main():
             got = v(cmd)
             if got != "deny/mrh.command.unenumerated":
                 bad.append(f"OVERFLOW {name}: mrh.command.unenumerated expected, got {got}")
+
+        # BOUNDED EXECUTION (Nova's #1435 review): the bound must stop the work, not only decide the verdict. Every
+        # directory entry the gate reads is counted, by wrapping os.scandir around evaluate only.
+        big = os.path.join(other, "big")
+        os.makedirs(big)
+        for i in range(12000):
+            open(os.path.join(big, f"e{i}"), "w").close()
+        locked = os.path.join(other, "locked")
+        os.makedirs(os.path.join(locked, "inner"))
+        os.chmod(os.path.join(locked, "inner"), 0)
+        limit = getattr(g.core, "LINK_WALK_LIMIT", None)
+        real_scandir, read = os.scandir, [0]
+
+        class _Counting:
+            def __init__(self, path):
+                self._it = real_scandir(path)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._it.close()
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                e = next(self._it)
+                read[0] += 1
+                return e
+
+            def close(self):
+                self._it.close()
+
+        bounded = [("a glob over one 12,000-entry dir", "cat ../other/big/*"),
+                   ("a walk over one 12,000-entry dir", "grep -R key ../other/big"),
+                   ("a glob of 300 matches", "cat ../other/wide/*.txt")]
+        for name, cmd in bounded:
+            read[0] = 0
+            os.scandir = _Counting
+            try:
+                got = v(cmd)
+            finally:
+                os.scandir = real_scandir
+            cap = (limit + 1) if limit else None
+            if got != "deny/mrh.command.unenumerated":
+                bad.append(f"BOUNDED {name}: mrh.command.unenumerated expected, got {got}")
+            if cap is None or read[0] > cap:
+                bad.append(f"BOUNDED {name}: read {read[0]} directory entries, the bound is {cap}")
+        got = v("grep -R key ../other/locked")
+        os.chmod(os.path.join(locked, "inner"), 0o755)
+        if got != "deny/mrh.command.unenumerated":
+            bad.append(f"BOUNDED an unreadable dir under a walk: mrh.command.unenumerated expected, got {got}")
     for b in bad:
         print("FAIL", b)
     print(f"{'PASS' if not bad else 'FAIL'}: {len(REACH)} reach rows, {len(ORDINARY)} ordinary rows, "
-          f"{len(OVERFLOW)} overflow rows")
+          f"{len(OVERFLOW)} overflow rows, 4 bounded-execution rows")
     return 1 if bad else 0
 
 

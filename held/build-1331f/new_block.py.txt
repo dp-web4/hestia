@@ -1,7 +1,67 @@
 #: How far Gate 1a follows an act's REACH to the links in it (hestia #1331 follow-ups). Past either bound the act is
-#: refused under mrh.command.unenumerated rather than judged in part (egress_unsweepable_deny).
+#: refused under mrh.command.unenumerated rather than judged in part (egress_unsweepable_deny). Both are STRICT work
+#: bounds (Nova's #1435 review): directory entries are read one at a time and counted as they are read, so no glob or
+#: walk lists more than LINK_WALK_LIMIT entries, or collects more than LINK_GLOB_LIMIT matches, before it stops.
 LINK_GLOB_LIMIT = 256      # paths a glob or brace may expand to, per act
-LINK_WALK_LIMIT = 10000    # directory entries a link-following reader may walk, per act
+LINK_WALK_LIMIT = 10000    # directory entries read per act, by globs and link-following walks together
+
+
+class _TooWide(Exception):
+    """A reach past its bound, or a directory it reaches that cannot be read: refused, never judged in part."""
+
+
+def _entries(d: str, budget: list):
+    """The entries of directory `d`, read lazily and each counted against `budget[0]` as it is read."""
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                budget[0] -= 1
+                if budget[0] < 0:
+                    raise _TooWide(f"it would read more than {LINK_WALK_LIMIT} directory entries")
+                yield e
+    except OSError as exc:
+        raise _TooWide(f"a directory it reaches cannot be read ({type(exc).__name__})")
+
+
+def _bounded_glob(pattern: str, budget: list, matches: list) -> list:
+    """The paths an absolute glob `pattern` matches, one component at a time, reading only the directories a
+    wildcard component needs, through `_entries`. `matches[0]` counts down LINK_GLOB_LIMIT across the act. Hidden
+    names match only a component that starts with a dot, as glob does."""
+    parts = [p for p in pattern.split(os.sep) if p]
+    cur = [os.sep]
+    for i, comp in enumerate(parts):
+        last = i == len(parts) - 1
+        nxt = []
+        for c in cur:
+            if not _GLOB_CHARS.search(comp):
+                p = os.path.join(c, comp)
+                if os.path.lexists(p) if last else os.path.isdir(p):
+                    nxt.append(p)
+                continue
+            if not os.path.isdir(c):
+                continue
+            for e in _entries(c, budget):
+                if e.name.startswith(".") and not comp.startswith("."):
+                    continue
+                if _fnmatch.fnmatchcase(e.name, comp) and (last or os.path.isdir(e.path)):
+                    nxt.append(e.path)
+                    if last:
+                        matches[0] -= 1
+                        if matches[0] < 0:
+                            raise _TooWide(f"a pattern reaches more than {LINK_GLOB_LIMIT} paths")
+        cur = nxt
+    return cur
+
+
+def _bounded_walk(root: str, budget: list):
+    """Every path under `root`, depth-first, without following links, read through `_entries`."""
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        for e in _entries(d, budget):
+            yield e.path
+            if e.is_dir(follow_symlinks=False):
+                stack.append(e.path)
 #: Readers that FOLLOW links while walking a directory, and the options that make them do it. A short cluster
 #: counts (`cp -rL`, `tar -chf`), except for find, whose options are whole words. Read from each tool's --help.
 _FOLLOW_FLAGS = {
@@ -164,7 +224,7 @@ def link_reach(event: "NormalizedEvent") -> tuple:
             return [base]
         return [os.path.join(b, base) for b in bases]
 
-    out, seen, budget = [], set(), [LINK_GLOB_LIMIT]
+    out, seen, budget, matches = [], set(), [LINK_WALK_LIMIT], [LINK_GLOB_LIMIT]
 
     def judge(p):
         try:
@@ -177,6 +237,16 @@ def link_reach(event: "NormalizedEvent") -> tuple:
         except (OSError, ValueError):
             pass
 
+    try:
+        _reach_words(words, resolve=resolve, judge=judge, budget=budget, matches=matches)
+        _reach_walks(segs, resolve=resolve, bases=bases, judge=judge, budget=budget)
+    except _TooWide as why:
+        return out, str(why)
+    return out, ""
+
+
+def _reach_words(words, *, resolve, judge, budget, matches) -> None:
+    """Judge every path the act's words name or, as unquoted globs and braces, expand to (bounded)."""
     for w, quoted in words:
         if w.startswith("-"):
             if "=" not in w:
@@ -185,21 +255,21 @@ def link_reach(event: "NormalizedEvent") -> tuple:
         else:
             cands = [w, w.split("=", 1)[1]] if "=" in w else [w]
         for cand in cands:
-            for pat in (_braces(cand) if not quoted else [cand]):
+            expand = not quoted
+            pats = _braces(cand) if expand else [cand]
+            if len(pats) > LINK_GLOB_LIMIT:
+                raise _TooWide(f"a pattern reaches more than {LINK_GLOB_LIMIT} paths")
+            for pat in pats:
                 for full in resolve(pat):
-                    if not quoted and _GLOB_CHARS.search(pat):
-                        try:
-                            hits = _glob.glob(full)
-                        except (OSError, ValueError, RecursionError):
-                            hits = []
-                        budget[0] -= len(hits)
-                        if budget[0] < 0:
-                            return out, f"a pattern reaches more than {LINK_GLOB_LIMIT} paths"
-                        for h in hits:
+                    if expand and _GLOB_CHARS.search(pat):
+                        for h in _bounded_glob(os.path.abspath(full), budget, matches):
                             judge(h)
                     else:
                         judge(full)
-    walked = 0
+
+
+def _reach_walks(segs, *, resolve, bases, judge, budget) -> None:
+    """Judge every link under the directories a link-following reader in the act walks (bounded)."""
     for s in segs:
         prog = os.path.basename(s[0][0])
         rest = [w for w, _ in s[1:]]
@@ -217,13 +287,8 @@ def link_reach(event: "NormalizedEvent") -> tuple:
         if not roots:
             roots = bases[:1]
         for root in roots:
-            for d, dirs, files in os.walk(root, followlinks=False):
-                walked += len(dirs) + len(files)
-                if walked > LINK_WALK_LIMIT:
-                    return out, f"a reader that follows links would walk more than {LINK_WALK_LIMIT} entries"
-                for n in dirs + files:
-                    judge(os.path.join(d, n))
-    return out, ""
+            for p in _bounded_walk(root, budget):
+                judge(p)
 
 
 def link_targets(event: "NormalizedEvent") -> list:
