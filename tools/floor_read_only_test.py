@@ -194,7 +194,10 @@ def test_a_recursive_reach_floor_entry_now_reaches_its_subtree():
 
 def test_read_only_readers_are_closure_readers():
     import hestia_governance_closure as g
-    missing = sorted(core.READ_ONLY_PATH_TOOLS - g._READ_PATH_TOOLS)
+    # Every tool the read-only floor admits (#1398: the plain readers AND every tool whose
+    # PATH_TOOL_MODES need is exactly r) must be one the closure reads as a reader.
+    admitted = set(core.READ_ONLY_PATH_TOOLS) | {t for t, md in core.PATH_TOOL_MODES.items() if md == "r"}
+    missing = sorted(admitted - g._READ_PATH_TOOLS - getattr(g, "_COMPOSED_READ_TOOLS", set()))
     check("scope_readers_are_closure_readers", not missing,
           f"the read-only floor admits these, but the closure classes them as writers: {missing}")
 

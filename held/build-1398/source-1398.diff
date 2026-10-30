@@ -1,0 +1,24 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -3113,9 +3113,17 @@
+ 
+ def _read_only_admits(event: NormalizedEvent, p: str, read_scopes: list, ws: str,
+                       profile: HarnessProfile) -> bool:
+-    """Does the read-only floor admit this path for this act? Only a reader tool, only
+-    inside a read-only root. No read-only roots means no."""
+-    return (bool(read_scopes) and event.tool in READ_ONLY_PATH_TOOLS
++    """Does the read-only floor admit this path for this act? Only an act that only reads, only
++    inside a read-only root. No read-only roots means no.
++
++    "Only reads" is the same rule a narrowed grant uses (hestia #1398): a READ_ONLY_PATH_TOOLS
++    reader, or any tool whose PATH_TOOL_MODES need is exactly "r" -- a being's composed `search`
++    and `git_read` included. Measured 2026-10-25: dp put shared-context/forum on the floor (rw,
++    served read-only); cbp-being's `search` of the forum was refused mrh.path, opened a scope
++    request, and dp had to grant it live. A narrowed `r` grant on the same path admitted that
++    search since part B; the floor did not, so the two read rules disagreed."""
++    reads = event.tool in READ_ONLY_PATH_TOOLS or PATH_TOOL_MODES.get(event.tool) == "r"
++    return (bool(read_scopes) and reads
+             and path_in_scope(p, read_scopes, ws, profile, event.cwd))
+ 
+ 

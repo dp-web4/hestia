@@ -1,0 +1,171 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -3113,9 +3113,17 @@
+ 
+ def _read_only_admits(event: NormalizedEvent, p: str, read_scopes: list, ws: str,
+                       profile: HarnessProfile) -> bool:
+-    """Does the read-only floor admit this path for this act? Only a reader tool, only
+-    inside a read-only root. No read-only roots means no."""
+-    return (bool(read_scopes) and event.tool in READ_ONLY_PATH_TOOLS
++    """Does the read-only floor admit this path for this act? Only an act that only reads, only
++    inside a read-only root. No read-only roots means no.
++
++    "Only reads" is the same rule a narrowed grant uses (hestia #1398): a READ_ONLY_PATH_TOOLS
++    reader, or any tool whose PATH_TOOL_MODES need is exactly "r" -- a being's composed `search`
++    and `git_read` included. Measured 2026-10-25: dp put shared-context/forum on the floor (rw,
++    served read-only); cbp-being's `search` of the forum was refused mrh.path, opened a scope
++    request, and dp had to grant it live. A narrowed `r` grant on the same path admitted that
++    search since part B; the floor did not, so the two read rules disagreed."""
++    reads = event.tool in READ_ONLY_PATH_TOOLS or PATH_TOOL_MODES.get(event.tool) == "r"
++    return (bool(read_scopes) and reads
+             and path_in_scope(p, read_scopes, ws, profile, event.cwd))
+ 
+ 
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 3e0b3aac2b2af5c67d60e88cb2d856aa87317bdb4f7971bafbfa423da9d3975a  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 32dc53efa9bf8504d75868744f18b434e36322e18250dc72049136d99322d269  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -3114,9 +3114,17 @@
+ 
+ def _read_only_admits(event: NormalizedEvent, p: str, read_scopes: list, ws: str,
+                       profile: HarnessProfile) -> bool:
+-    """Does the read-only floor admit this path for this act? Only a reader tool, only
+-    inside a read-only root. No read-only roots means no."""
+-    return (bool(read_scopes) and event.tool in READ_ONLY_PATH_TOOLS
++    """Does the read-only floor admit this path for this act? Only an act that only reads, only
++    inside a read-only root. No read-only roots means no.
++
++    "Only reads" is the same rule a narrowed grant uses (hestia #1398): a READ_ONLY_PATH_TOOLS
++    reader, or any tool whose PATH_TOOL_MODES need is exactly "r" -- a being's composed `search`
++    and `git_read` included. Measured 2026-10-25: dp put shared-context/forum on the floor (rw,
++    served read-only); cbp-being's `search` of the forum was refused mrh.path, opened a scope
++    request, and dp had to grant it live. A narrowed `r` grant on the same path admitted that
++    search since part B; the floor did not, so the two read rules disagreed."""
++    reads = event.tool in READ_ONLY_PATH_TOOLS or PATH_TOOL_MODES.get(event.tool) == "r"
++    return (bool(read_scopes) and reads
+             and path_in_scope(p, read_scopes, ws, profile, event.cwd))
+ 
+ 
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "3e0b3aac2b2af5c67d60e88cb2d856aa87317bdb4f7971bafbfa423da9d3975a",
++      "sha256": "32dc53efa9bf8504d75868744f18b434e36322e18250dc72049136d99322d269",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92"
++  "gt_version": "617b93d02987bf3b53bdbdda421782bda3dbd1acb2b7bc983feb978c786dab18"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92",
++    "gt_version": "617b93d02987bf3b53bdbdda421782bda3dbd1acb2b7bc983feb978c786dab18",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "3e0b3aac2b2af5c67d60e88cb2d856aa87317bdb4f7971bafbfa423da9d3975a"
++        "sha256": "32dc53efa9bf8504d75868744f18b434e36322e18250dc72049136d99322d269"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "a59ad059e96a53d7d0673be2c40485dec68c3bd51e1cc6a15696b6e5c672964c"
++  "gt_version": "931986f21419c9661fec9826a092463c444c4f2ca6f6e3246296d61d6edd345f"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92",
++    "gt_version": "617b93d02987bf3b53bdbdda421782bda3dbd1acb2b7bc983feb978c786dab18",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "3e0b3aac2b2af5c67d60e88cb2d856aa87317bdb4f7971bafbfa423da9d3975a"
++        "sha256": "32dc53efa9bf8504d75868744f18b434e36322e18250dc72049136d99322d269"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "a983936e99378e8cc1d40f1599bcb7dd60f1592dec62ff2e2344cc0e844a265c"
++  "gt_version": "b03f001cef575dd531e9e365352013842ced4e98ca42370215de7b405bc78f87"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92",
++    "gt_version": "617b93d02987bf3b53bdbdda421782bda3dbd1acb2b7bc983feb978c786dab18",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "3e0b3aac2b2af5c67d60e88cb2d856aa87317bdb4f7971bafbfa423da9d3975a"
++        "sha256": "32dc53efa9bf8504d75868744f18b434e36322e18250dc72049136d99322d269"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "1ad99893c45c3ccd97bb0a81e3833ca69d5b2dc414d964c8dc109903fa8aa96e"
++  "gt_version": "b29bfa19005c5a7147f2df4fb4ca6db5eb0df9734b7d17779cdc844698cfbed9"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92",
++    "gt_version": "617b93d02987bf3b53bdbdda421782bda3dbd1acb2b7bc983feb978c786dab18",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "3e0b3aac2b2af5c67d60e88cb2d856aa87317bdb4f7971bafbfa423da9d3975a"
++        "sha256": "32dc53efa9bf8504d75868744f18b434e36322e18250dc72049136d99322d269"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "2e98511abfe14431fdac73b38e33049f78d45e107f403c2d67ccb2384692c5da"
++  "gt_version": "003bf131f9cae753d1c188240966b295e0f2de3458ab53d5331a3ab0ac11cf1f"
+ }
