@@ -24304,18 +24304,27 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
     // the ask is then filed without any look at the target (it buys an escalation, never a
     // permission). The target is stat-ed only UNDER a root the member holds (see `SpaceAnswer`).
     let confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    // A PATH THAT DOES NOT EXIST IS NEVER FILED, WHEREVER IT IS (dp, 2026-10-30: "a nonexistent
+    // path should never escalate to a scope request, it should be flatly denied as not there";
+    // 10-26: "the not visible to you should only come on an existing path that's off limits").
+    // #1415's review had narrowed this to paths under the member's own roots, to keep "does X
+    // exist" from being answered for paths outside its reach. dp's rule takes the other side of
+    // that trade on purpose: the gate already answers `mrh.path.nonexistent` for any missing path
+    // (#1412), and five member-filed asks for missing paths reached the operator on 10-30 under the
+    // narrowed rule. `definitely_absent` still reads an unreadable or dangling entry as present,
+    // so those still file.
+    if !create && definitely_absent(&path) {
+        return Ok(json!({
+            "status": "not_filed",
+            "reason": "nonexistent",
+            "path": path,
+            "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
+            "next": "check the spelling against what you already hold; if you mean to CREATE \
+                     this path, ask again with create: true",
+        }));
+    }
     if !create {
         match space_of(&s, &plugin_id, &path) {
-            SpaceAnswer::Under if definitely_absent(&path) => {
-                return Ok(json!({
-                    "status": "not_filed",
-                    "reason": "nonexistent",
-                    "path": path,
-                    "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
-                    "next": "check the spelling against what you already hold; if you mean to CREATE \
-                             this path, ask again with create: true",
-                }));
-            }
             SpaceAnswer::Misrooted(cand) if !confirm => {
                 return Ok(json!({
                     "status": "not_filed",
@@ -24821,16 +24830,18 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     if unpriceable.is_none() && !subtree && rule == "mrh.path"
         && READ_ONLY_PATH_TOOLS.contains(&tool.as_str())
     {
+        // dp, 2026-10-30: a missing path is denied as not there, wherever it is (see
+        // `tool_request_scope`).
+        if definitely_absent(&path) {
+            return Ok(json!({
+                "verdict": "not_opened",
+                "permits": false,
+                "path": path,
+                "reason": "nonexistent",
+                "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
+            }));
+        }
         match space_of(&s, &plugin_id, &path) {
-            SpaceAnswer::Under if definitely_absent(&path) => {
-                return Ok(json!({
-                    "verdict": "not_opened",
-                    "permits": false,
-                    "path": path,
-                    "reason": "nonexistent",
-                    "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
-                }));
-            }
             SpaceAnswer::Misrooted(cand) => {
                 return Ok(json!({
                     "verdict": "not_opened",
@@ -33106,6 +33117,35 @@ mod existence_first_tests {
     }
 
     #[tokio::test]
+    async fn a_missing_path_anywhere_is_not_there_and_reaches_no_one() {
+        // dp, 2026-10-30: "a nonexistent path should never escalate to a scope request, it should
+        // be flatly denied as not there". The 10-30 shapes: a tripled workspace root, and a system
+        // directory that does not exist on this host. Neither is under any root the member holds.
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let before = pending(&state).await;
+        for p in [dir.path().join("ai-workspace/ai-workspace/shared-context/forum"),
+                  dir.path().join("var/lib/hestia")] {
+            let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+                "path": p.to_str().unwrap(), "reason": "to read what I think is there"})).await.unwrap();
+            assert_eq!(r["status"], "not_filed", "{}: {r}", p.display());
+            assert_eq!(r["reason"], "nonexistent", "{r}");
+            let c = tool_scope_claim(&state, &json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
+                "path": p.to_str().unwrap(), "rule": "mrh.path", "tool_name": "read_file",
+                "act": "read_file", "act_digest": "e".repeat(64)})).await.unwrap();
+            assert_eq!(c["verdict"], "not_opened", "{c}");
+        }
+        assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
+        // An existing off-limits path is the one that files ("not visible to you").
+        let off = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&off).unwrap();
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": off.to_str().unwrap(), "reason": "to read an existing directory"})).await.unwrap();
+        assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
     async fn a_request_for_a_nonexistent_path_is_not_filed() {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
@@ -33120,8 +33160,8 @@ mod existence_first_tests {
         let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
             "path": missing.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
         assert_eq!(r["status"], "not_filed", "{r}");
-        assert_eq!(r["reason"], "likely_misrooted", "{r}");
-        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "the hint names the real path: {r}");
         assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
         // UNDER a root, the target is stat-ed and a missing one is declined as nonexistent.
         let under = dir.path().join("governance/no-such.py");
@@ -33132,268 +33172,10 @@ mod existence_first_tests {
         assert_eq!(pending(&state).await, before);
     }
 
-    /// Nova and nomad on #1415, the dangling-link arm: under an `r` root, `alias -> <outside>/present`
-    /// and `alias2 -> <outside>/absent` are both links; whether the OUTSIDE target exists must not
-    /// decide Under versus Outside. Asks for `alias`, `alias/x`, `alias2`, `alias2/x` all file,
-    /// identically, on request_scope and on the claim route; an exactly granted dangling link is
-    /// not Under by identity either.
-    #[tokio::test]
-    async fn a_dangling_link_under_a_root_is_not_under() {
-        use crate::server::grant_modes::Modes;
-        use crate::server::standing_scope::StandingGrant;
-        let (dir, _) = seeded_home();
-        let state = open_state(&dir);
-        let sid = session(&state).await;
-        let ws = dir.path();
-        let (r, outside) = (ws.join("r"), ws.join("outside"));
-        std::fs::create_dir_all(&r).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("present"), "x").unwrap();
-        std::os::unix::fs::symlink(outside.join("present"), r.join("alias")).unwrap();
-        std::os::unix::fs::symlink(outside.join("absent"), r.join("alias2")).unwrap();
-        std::os::unix::fs::symlink(outside.join("gone"), ws.join("xlink")).unwrap(); // exactly granted, dangling
-        let grant = |path: &std::path::Path, recursive: bool| StandingGrant {
-            member: "cbp-being".into(), path: path.to_str().unwrap().into(), granted_at: 0,
-            granted_by: "operator".into(), reason: "t".into(), expires_at: None, request_id: None,
-            recursive, modes: Modes::ALL,
-        };
-        {
-            let mut s = state.lock().await;
-            s.standing_scope.grants.push(grant(&r, true));
-            s.standing_scope.grants.push(grant(&ws.join("xlink"), false));
-        }
-        let strip = |v: &serde_json::Value, p: &str| serde_json::to_string(v).unwrap().replace(p, "<P>");
-        let ask = |p: String| {
-            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p,
-                           "reason": "a path under a root I hold, which may be a link"});
-            let st = state.clone();
-            async move { tool_request_scope(&st, &b).await.unwrap() }
-        };
-        // Both links sit lexically under the recursive grant, so the answer is the grant's
-        // (`already_granted`), the same for the live and the dangling link: never a quiet
-        // `not_filed` that would say whether the OUTSIDE target exists.
-        let answer = |rel: &'static str| {
-            let p = r.join(rel).to_str().unwrap().to_string();
-            let st = ask.clone();
-            async move { let v = st(p.clone()).await; (v["status"].clone(), strip(&v, &p)) }
-        };
-        for (live, dangling) in [("alias", "alias2"), ("alias/x", "alias2/x")] {
-            let (sa, ta) = answer(live).await;
-            let (sb, tb) = answer(dangling).await;
-            assert_ne!(sa, "not_filed", "{live}: {ta}");
-            assert_ne!(sb, "not_filed", "{dangling}: {tb}");
-            assert_eq!(ta, tb, "the live and the dangling link must answer identically:\n{ta}\n{tb}");
-        }
-        // The claim route (read tool): identical for both links, and never `not_opened`.
-        let claim = |p: &std::path::Path| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
-            "path": p.to_str().unwrap(), "rule": "mrh.path", "tool_name": "read_file",
-            "act": format!("read_file -> {}", p.display()), "act_digest": "d".repeat(64)});
-        let a = tool_scope_claim(&state, &claim(&r.join("alias/y"))).await.unwrap();
-        let b = tool_scope_claim(&state, &claim(&r.join("alias2/y"))).await.unwrap();
-        assert_ne!(a["verdict"], "not_opened", "{a}");
-        // `request_key` is derived from the path; everything else must be the same for both links.
-        for k in ["verdict", "detail", "permits", "reason"] {
-            assert_eq!(a[k], b[k], "{k} differs between the live and the dangling link:\n{a}\n{b}");
-        }
-        let v = ask(ws.join("xlink").to_str().unwrap().to_string()).await;
-        assert_ne!(v["status"], "not_filed", "an exactly granted dangling link is not stat-followed: {v}");
-    }
 
-    /// Nova and nomad on #1415, the last class: a quiet answer may depend only on what the member
-    /// could READ for itself. A w-only root or floor row, an r root shadowed by a nearer w-only
-    /// node, an escaping symlink under an r root, and a w-only exact target all FILE, for an absent
-    /// and for an existing target alike (no differential), and the claim route opens for both.
-    #[tokio::test]
-    async fn a_quiet_answer_needs_read_at_the_resolved_path() {
-        use crate::server::grant_modes::Modes;
-        use crate::server::standing_scope::{FloorEntry, StandingGrant};
-        let (dir, _) = seeded_home();
-        let state = open_state(&dir);
-        let sid = session(&state).await;
-        let ws = dir.path();
-        let mk = |rel: &str| { std::fs::create_dir_all(ws.join(rel)).unwrap(); ws.join(rel) };
-        let (w, wf, r, outside, f, fsub) = (mk("w"), mk("wf"), mk("r"), mk("outside"), mk("f"), mk("f/sub"));
-        for d in [&w, &wf, &outside, &fsub] { std::fs::write(d.join("existing.md"), "x").unwrap(); }
-        std::os::unix::fs::symlink(&outside, r.join("alias")).unwrap();
-        std::fs::write(ws.join("wx"), "x").unwrap();
-        let grant = |path: &std::path::Path, recursive: bool, modes: &str| StandingGrant {
-            member: "cbp-being".into(), path: path.to_str().unwrap().into(), granted_at: 0,
-            granted_by: "operator".into(), reason: "t".into(), expires_at: None, request_id: None,
-            recursive, modes: Modes::parse(modes).unwrap(),
-        };
-        let floor = |path: &std::path::Path, modes: &str| FloorEntry {
-            path: path.to_str().unwrap().into(), added_at: 0, added_by: "operator".into(),
-            reason: "floor".into(), recursive: true, modes: Modes::parse(modes).unwrap(),
-        };
-        {
-            let mut s = state.lock().await;
-            s.standing_scope.grants.push(grant(&w, true, "w"));          // w-only recursive root
-            s.standing_scope.grants.push(grant(&r, true, "r"));          // r root holding an escaping alias
-            s.standing_scope.grants.push(grant(&fsub, true, "w"));       // nearer w-only node under an r floor
-            s.standing_scope.grants.push(grant(&ws.join("wx"), false, "w")); // w-only exact, existing
-            s.standing_scope.grants.push(grant(&ws.join("wm"), false, "w")); // w-only exact, missing
-            s.standing_scope.floor.push(floor(&wf, "w"));                // w-only floor row
-            s.standing_scope.floor.push(floor(&f, "r"));                 // r floor above the w-only node
-        }
-        let ask = |p: String| {
-            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p,
-                           "reason": "a path I believe I may read, asked by hand"});
-            let st = state.clone();
-            async move { tool_request_scope(&st, &b).await.unwrap()["status"].clone() }
-        };
-        let pairs = [
-            (w.join("absent.md"), w.join("existing.md")),
-            (wf.join("absent.md"), wf.join("existing.md")),
-            (r.join("alias/missing.md"), r.join("alias/existing.md")),
-            (fsub.join("absent.md"), fsub.join("existing.md")),
-            (ws.join("wm"), ws.join("wx")),
-        ];
-        for (absent, present) in &pairs {
-            let a = ask(absent.to_str().unwrap().to_string()).await;
-            let b = ask(present.to_str().unwrap().to_string()).await;
-            assert_eq!(a, "pending", "{} must file, not answer quietly", absent.display());
-            assert_eq!(b, "pending", "{} must file", present.display());
-        }
-        // The claim route (read tool) opens for both halves of a pair too.
-        let claim = |p: &std::path::Path| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
-            "path": p.to_str().unwrap(), "rule": "mrh.path", "tool_name": "read_file",
-            "act": format!("read_file -> {}", p.display()), "act_digest": "c".repeat(64)});
-        std::fs::write(w.join("existing2.md"), "x").unwrap(); // fresh paths: the asks above left requests pending
-        for p in [w.join("absent2.md"), w.join("existing2.md")] {
-            let v = tool_scope_claim(&state, &claim(&p)).await.unwrap();
-            assert_eq!(v["verdict"], "opened", "{v}");
-        }
-        // Controls: where the member may READ, an absent target is still declined quietly.
-        assert_eq!(ask(r.join("absent.md").to_str().unwrap().to_string()).await, "not_filed");
-        assert_eq!(ask(f.join("other-absent.md").to_str().unwrap().to_string()).await, "not_filed");
-    }
 
-    /// nomad on #1415, the same class in the `Under` arm: an EXACT grant on a directory covers only
-    /// its own path, so its children are not stat-ed (they file); the root itself still is.
-    #[tokio::test]
-    async fn an_exact_grant_does_not_make_its_subtree_statable() {
-        let (dir, _) = seeded_home();
-        let state = open_state(&dir);
-        let sid = session(&state).await;
-        let d = dir.path().join("d");
-        std::fs::create_dir_all(&d).unwrap();
-        let e = dir.path().join("e"); // granted exactly, and absent
-        for (root, _) in [(&d, ()), (&e, ())] {
-            state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
-                member: "cbp-being".into(), path: root.to_str().unwrap().into(), granted_at: 0,
-                granted_by: "operator".into(), reason: "exact".into(), expires_at: None,
-                request_id: None, recursive: false, modes: crate::server::grant_modes::Modes::ALL,
-            });
-        }
-        let ask = |p: String| {
-            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p,
-                           "reason": "a child of a directory I hold exactly"});
-            let st = state.clone();
-            async move { tool_request_scope(&st, &b).await.unwrap() }
-        };
-        let before = pending(&state).await;
-        let r = ask(d.join("absent.md").to_str().unwrap().to_string()).await;
-        assert_eq!(r["status"], "pending", "a child of an exact root is not Under, so it files: {r}");
-        let r = ask(d.to_str().unwrap().to_string()).await;
-        assert_eq!(r["status"], "already_granted", "the exact root itself: {r}");
-        let r = ask(e.to_str().unwrap().to_string()).await;
-        assert_eq!(r["status"], "not_filed", "the exact root itself may be stat-ed: {r}");
-        assert_eq!(r["reason"], "nonexistent", "{r}");
-        assert_eq!(pending(&state).await, before + 1);
-    }
 
-    /// nomad and Nova on #1415, the oracle through the target: a misrooted ask is answered from
-    /// the in-reach CANDIDATE alone, never by looking at the target, so `<f>/notes/y.md` with `<f>`
-    /// an existing file (a stat there gives ENOTDIR) and `<m>/notes/y.md` with `<m>` missing
-    /// (NotFound) give IDENTICAL answers; `confirm: true` files either, identically, and buys an
-    /// escalation, never a permission.
-    #[tokio::test]
-    async fn a_misrooted_ask_is_answered_from_the_candidate_alone() {
-        let (dir, _) = seeded_home();
-        let state = open_state(&dir);
-        let sid = session(&state).await;
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(home.join("notes")).unwrap();
-        std::fs::write(home.join("notes/y.md"), "x").unwrap();
-        let notes = home.join("notes").to_str().unwrap().to_string();
-        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
-            member: "cbp-being".into(), path: notes.clone(), granted_at: 0, granted_by: "operator".into(),
-            reason: "notes".into(), expires_at: None, request_id: None, recursive: true,
-            modes: crate::server::grant_modes::Modes::ALL,
-        });
-        let f = dir.path().join("f");
-        std::fs::write(&f, "a file, not a directory").unwrap();
-        let m = dir.path().join("m");
-        let via_file = f.join("notes/y.md").to_str().unwrap().to_string();
-        let via_missing = m.join("notes/y.md").to_str().unwrap().to_string();
-        let ask = |p: &str, confirm: bool| {
-            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p,
-                           "reason": "to read my note, by a path I think is right", "confirm": confirm});
-            let st = state.clone();
-            async move { tool_request_scope(&st, &b).await.unwrap() }
-        };
-        let strip = |v: &serde_json::Value, p: &str| serde_json::to_string(v).unwrap().replace(p, "<P>");
-        let (a, b) = (ask(&via_file, false).await, ask(&via_missing, false).await);
-        assert_eq!(a["status"], "not_filed", "{a}");
-        assert_eq!(a["reason"], "likely_misrooted", "{a}");
-        assert_eq!(a["candidate"], format!("{notes}/y.md"), "{a}");
-        assert_eq!(strip(&a, &via_file), strip(&b, &via_missing),
-                   "the answer must not depend on whether <prefix> exists:\n{a}\n{b}");
-        let before = pending(&state).await;
-        let (a, b) = (ask(&via_file, true).await, ask(&via_missing, true).await);
-        assert_eq!(a["status"], "pending", "confirm files it without a look at the target: {a}");
-        assert_eq!(b["status"], "pending", "{b}");
-        assert_eq!(pending(&state).await, before + 2);
-        // The claim route answers the same way for a read tool, from the candidate alone.
-        let claim = |p: &str| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
-            "path": p, "rule": "mrh.path", "tool_name": "read_file",
-            "act": format!("read_file -> {p}"), "act_digest": "b".repeat(64)});
-        let (a, b) = (tool_scope_claim(&state, &claim(&via_file)).await.unwrap(),
-                      tool_scope_claim(&state, &claim(&via_missing)).await.unwrap());
-        assert_eq!(a["verdict"], "not_opened", "{a}");
-        assert_eq!(a["reason"], "likely_misrooted", "{a}");
-        assert_eq!(strip(&a, &via_file), strip(&b, &via_missing), "{a}\n{b}");
-        assert_eq!(pending(&state).await, before + 2, "a claim never opens on a misrooted read");
-    }
 
-    /// nomad on #1415, point 1 through the re-root arm: a path that merely CONTAINS a segment
-    /// named like one of the member's roots (or a floor root) is not the member's space. Only a
-    /// doubled root that lands on something real and readable in the member's reach is quiet;
-    /// these all file, so "does not exist" is never a silent answer about `<elsewhere>`.
-    #[tokio::test]
-    async fn a_root_basename_elsewhere_does_not_make_the_path_the_members_space() {
-        let (dir, _) = seeded_home();
-        let state = open_state(&dir);
-        let sid = session(&state).await;
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(home.join("notes")).unwrap();
-        std::fs::write(home.join("notes/y.md"), "x").unwrap();
-        std::fs::create_dir_all(home.join("forum")).unwrap();
-        let notes = home.join("notes").to_str().unwrap().to_string();
-        let forum = home.join("forum").to_str().unwrap().to_string();
-        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
-            member: "cbp-being".into(), path: notes, granted_at: 0, granted_by: "operator".into(),
-            reason: "notes".into(), expires_at: None, request_id: None, recursive: true,
-            modes: crate::server::grant_modes::Modes::ALL,
-        });
-        state.lock().await.standing_scope.floor.push(crate::server::standing_scope::FloorEntry {
-            path: forum, added_at: 0, added_by: "operator".into(), reason: "floor".into(),
-            recursive: true, modes: crate::server::grant_modes::Modes::READ,
-        });
-        let elsewhere = dir.path().join("elsewhere");
-        for probe in [elsewhere.join("x/notes"), elsewhere.join("notes/x"), elsewhere.join("notes"),
-                      elsewhere.join("forum/z"), elsewhere.join("forum")] {
-            let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
-                "path": probe.to_str().unwrap(), "reason": "probing a path named like one of my roots"})).await.unwrap();
-            assert_eq!(r["status"], "pending", "{} must file: {r}", probe.display());
-        }
-        // The control: the doubled root onto the REAL file is still quiet, with the hint.
-        let doubled = dir.path().join("x/notes/y.md");
-        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
-            "path": doubled.to_str().unwrap(), "reason": "to read my note"})).await.unwrap();
-        assert_eq!(r["status"], "not_filed", "{r}");
-        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
-    }
 
     #[tokio::test]
     async fn create_true_keeps_a_new_path_a_real_ask() {
@@ -33454,7 +33236,7 @@ mod existence_first_tests {
         let before = pending(&state).await;
         let r = tool_scope_claim(&state, &claim("read_file")).await.unwrap();
         assert_eq!(r["verdict"], "not_opened", "{r}");
-        assert_eq!(r["reason"], "likely_misrooted", "the doubled root is answered from its candidate: {r}");
+        assert_eq!(r["reason"], "nonexistent", "a missing path is not there: {r}");
         assert_eq!(pending(&state).await, before, "a read of nothing opens nothing");
         let w = tool_scope_claim(&state, &claim("Write")).await.unwrap();
         assert_eq!(w["verdict"], "opened", "a write may be creating it: {w}");
@@ -33528,7 +33310,8 @@ mod existence_first_tests {
         // 1. an EXACT grant on the root: the child is not readable, so no hint, and it files
         state.lock().await.standing_scope.grants.push(grant(false));
         let r = ask(&state, &sid, &doubled).await;
-        assert_eq!(r["status"], "pending", "{r}");
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
         // 2. recursive: the hint comes back, quietly
         state.lock().await.standing_scope.grants.clear();
         state.lock().await.standing_scope.grants.push(grant(true));
@@ -33540,7 +33323,8 @@ mod existence_first_tests {
         std::fs::write(ws.join("hestia/outside.txt"), "x").unwrap();
         std::os::unix::fs::symlink(ws.join("hestia/outside.txt"), ws.join("governance/hestia/link.txt")).unwrap();
         let r = ask(&state, &sid, ws.join("hestia/governance/hestia/link.txt").to_str().unwrap()).await;
-        assert_eq!(r["status"], "pending", "{r}");
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
         // 4. a floor row that gives this member no read: no hint, files
         state.lock().await.standing_scope.grants.clear();
         state.lock().await.standing_scope.floor.push(crate::server::standing_scope::FloorEntry {
@@ -33548,42 +33332,10 @@ mod existence_first_tests {
             recursive: true, modes: crate::server::grant_modes::Modes::parse("w").unwrap(),
         });
         let r = ask(&state, &sid, &doubled).await;
-        assert_eq!(r["status"], "pending", "{r}");
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
     }
 
-    #[tokio::test]
-    async fn a_grant_on_a_child_does_not_make_its_parents_siblings_the_members_space() {
-        // nomad on #1415: holding `<home>/notes` must not make a sibling of `<home>` (a credential
-        // directory, say) answer "does not exist" silently. It files.
-        let (dir, _) = seeded_home();
-        let state = open_state(&dir);
-        let sid = session(&state).await;
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(home.join("notes")).unwrap();
-        let notes = home.join("notes").to_str().unwrap().to_string();
-        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
-            member: "cbp-being".into(), path: notes, granted_at: 0, granted_by: "operator".into(),
-            reason: "notes".into(), expires_at: None, request_id: None, recursive: true,
-            modes: crate::server::grant_modes::Modes::ALL,
-        });
-        let sibling = home.join("keys/id_ed25519");
-        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
-            "path": sibling.to_str().unwrap(), "reason": "probing beside my notes"})).await.unwrap();
-        assert_eq!(r["status"], "pending", "a sibling of the grant's parent is not the member's space: {r}");
-    }
 
-    #[tokio::test]
-    async fn a_probe_outside_the_members_space_still_files() {
-        // nomad on #1415, point 1: "does not exist" is answered silently only inside the member's
-        // own space; a probe of the host elsewhere files as before, so the operator sees it.
-        let (dir, _) = seeded_home();
-        let state = open_state(&dir);
-        let sid = session(&state).await;
-        let elsewhere = dir.path().join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        let probe = elsewhere.join("secrets/id_ed25519");
-        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
-            "path": probe.to_str().unwrap(), "reason": "probing for a key file"})).await.unwrap();
-        assert_eq!(r["status"], "pending", "a probe outside every grant root's parent files: {r}");
-    }
+
 }
