@@ -1,0 +1,712 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -577,6 +577,14 @@
+     unread. Both Gate 1a sites call it before the token sweep, so the degraded mode does too."""
+     bad = egress_unsweepable(event)
+     if not bad:
++        # hestia #1331: a glob or link-following walk past its bound is refused unjudged, under the rule
++        # for a reach the gate cannot enumerate (the scope pass refuses past SCOPE_JUDGE_BUDGET the same way).
++        too_wide = link_reach(event)[1]
++        if too_wide:
++            return _deny("mrh.command.unenumerated",
++                         f"'{event.tool}': {too_wide}, so the gate cannot judge every link it reaches and it is "
++                         f"refused rather than judged in part: name the paths it needs",
++                         target=UNENUMERATED_TARGET)
+         return None
+     return _deny("egress.secret",
+                  f"'{event.tool}' declares egress the gate cannot sweep ({bad}): egress must be "
+@@ -595,48 +603,238 @@
+             + link_targets(event))
+ 
+ 
+-def link_targets(event: "NormalizedEvent") -> list:
+-    """The resolved targets of the paths an act names, where a link makes them DIFFER from the name
+-    (hestia #1331, gaps a/b). Measured on main f9f29a23 in-process (a fixture, no credential): inside a
+-    granted repo, a link to a secret-NAMED file passed Gate 1a by a relative shell read and by `Read`
+-    (absolute or relative), because the innate sweep judged the path AS NAMED. Absolute shell paths in
+-    the workspace already had their target checked (the scope pass); this gives the one rule no grant
+-    relaxes the same view, for every path argument and every shell word that names an existing path
+-    (relative ones joined onto the event's cwd). A path that is not a link contributes nothing, so
+-    an ordinary act's verdict cannot change. Never raises: an unreadable path adds nothing."""
+-    words = list(event.paths)
+-    if event.command:
++#: How far Gate 1a follows an act's REACH to the links in it (hestia #1331 follow-ups). Past either bound the act is
++#: refused under mrh.command.unenumerated rather than judged in part (egress_unsweepable_deny).
++LINK_GLOB_LIMIT = 256      # paths a glob or brace may expand to, per act
++LINK_WALK_LIMIT = 10000    # directory entries a link-following reader may walk, per act
++#: Readers that FOLLOW links while walking a directory, and the options that make them do it. A short cluster
++#: counts (`cp -rL`, `tar -chf`), except for find, whose options are whole words. Read from each tool's --help.
++_FOLLOW_FLAGS = {
++    "grep": frozenset({"-R", "--dereference-recursive"}),
++    "rg": frozenset({"-L", "--follow"}),
++    "find": frozenset({"-L", "-H", "-follow"}),
++    "cp": frozenset({"-L", "--dereference"}),
++    "tar": frozenset({"-h", "--dereference"}),
++    "bsdtar": frozenset({"-L", "-h", "--dereference"}),
++    "rsync": frozenset({"-L", "--copy-links", "-k", "--copy-dirlinks"}),
++    "cpio": frozenset({"-L", "--dereference"}),
++}
++#: Archivers that follow links BY DEFAULT, and the options that make them store the link instead (nomad's #1435
++#: review). `7z` follows only when adding (`7z a`).
++_FOLLOW_UNLESS = {
++    "zip": frozenset({"-y", "--symlinks"}),
++    "7z": frozenset({"-snl"}),
++}
++#: find walks without following links but LISTS them; an -exec reader then opens each listed path, and readers follow
++#: a link on open (nomad's #1435 review). So a find that execs is a link-following reader with or without -L.
++_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
++#: Programs that change the working directory of what they run, and the option that names it: like an in-line cd.
++_CHDIR_OPTS = {"env": ("-C", "--chdir"), "sudo": ("-D", "--chdir")}
++_CD = frozenset({"cd", "pushd"})
++
++
++def _reach_segments(command: str) -> list:
++    """The command's words as (word, quoted), split at the shell's segment breaks. `quoted` is whether the word was
++    written in quotes, so a pattern the shell will not expand is not expanded here either (nomad's #1435 review:
++    `find clean -name '*.txt'` was expanded against the cwd). When the quoting cannot be read word-for-word, every
++    word counts as unquoted, which only ever adds refusals. The raw words, unquoted, when it cannot be tokenized."""
++    def lex(posix):
++        lx = shlex.shlex(command, posix=posix, punctuation_chars=True)
++        lx.whitespace_split = True
++        return list(lx)
++    try:
++        words = lex(True)
++    except ValueError:
++        return [[(w, False) for w in command.split()]]
++    try:
++        raw = lex(False)
++    except ValueError:
++        raw = []
++    quoted = ([("'" in r or '"' in r) for r in raw] if len(raw) == len(words) else [False] * len(words))
++    segs = [[]]
++    for w, q in zip(words, quoted):
++        if w in _SEGMENT_BREAKS:
++            segs.append([])
++        else:
++            segs[-1].append((w, q))
++    return [s for s in segs if s]
++
++
++def _braces(word: str, limit: int = LINK_GLOB_LIMIT) -> list:
++    """`a{b,c}d` -> [abd, acd], recursively; a word with no complete `{x,y}` group is itself."""
++    i = word.find("{")
++    while i >= 0:
++        depth, j = 0, i
++        for j in range(i, len(word)):
++            depth += word[j] == "{"
++            depth -= word[j] == "}"
++            if depth == 0:
++                break
++        inner = word[i + 1:j]
++        if depth == 0 and "," in inner:
++            parts, d, cur = [], 0, ""
++            for ch in inner:
++                if ch == "," and d == 0:
++                    parts.append(cur)
++                    cur = ""
++                    continue
++                d += ch == "{"
++                d -= ch == "}"
++                cur += ch
++            parts.append(cur)
++            out = []
++            for p in parts:
++                out.extend(_braces(word[:i] + p + word[j + 1:], limit))
++                if len(out) > limit:
++                    return out
++            return out
++        i = word.find("{", i + 1)
++    return [word]
++
++
++def _has_flag(prog: str, flags: frozenset, words: list) -> bool:
++    """A word of the segment is one of `flags`; a short cluster counts (`-rL`), except for find's whole-word options."""
++    for w in words:
++        if w in flags:
++            return True
++        if prog != "find" and w.startswith("-") and not w.startswith("--") and len(w) > 2:
++            if any(f"-{c}" in flags for c in w[1:]):
++                return True
++    return False
++
++
++def _follows_links(prog: str, words: list) -> bool:
++    """Whether this segment's program reads through the links in the directories it walks."""
++    if prog in _FOLLOW_FLAGS and _has_flag(prog, _FOLLOW_FLAGS[prog], words):
++        return True
++    if prog == "find" and any(w in _FIND_EXEC for w in words):
++        return True
++    if prog in _FOLLOW_UNLESS and not _has_flag(prog, _FOLLOW_UNLESS[prog], words):
++        return prog != "7z" or (bool(words) and words[0] == "a")
++    return False
++
++
++def _chdirs(seg: list) -> list:
++    """The directories a segment makes the cwd of what it runs: `cd D`, `pushd D`, `env -C D`, `env --chdir=D`,
++    `sudo -D D`. Unresolved; the caller resolves them against the cwd."""
++    prog = os.path.basename(seg[0][0])
++    words = [w for w, _ in seg[1:]]
++    if prog in _CD:
++        ops = [w for w in words if not w.startswith("-")]
++        return ops[:1]
++    opts = _CHDIR_OPTS.get(prog)
++    if not opts:
++        return []
++    out = []
++    for i, w in enumerate(words):
++        if w in opts and i + 1 < len(words):
++            out.append(words[i + 1])
++        for o in opts:
++            if o.startswith("--") and w.startswith(o + "="):
++                out.append(w.split("=", 1)[1])
++    return out
++
++
++def link_reach(event: "NormalizedEvent") -> tuple:
++    """(targets, too_wide). `targets`: the resolved targets of the links an act names OR reaches, where they differ
++    from the path as written (hestia #1331). #1433 judged only the links an act NAMES; measured on its applied core
++    2026-10-28, every unnamed shape still reached a secret-named target. So:
++    - an UNQUOTED glob or brace word is expanded and each match judged (a quoted pattern is the program's, not the
++      shell's, and is judged as written);
++    - every relative word is judged against the cwd AND every directory the line makes a cwd: `cd`/`pushd`,
++      `env -C`/`--chdir`, `sudo -D`;
++    - a reader that reads through links while walking has its directories walked (the walk itself follows none) and
++      every link inside judged: the -L/-h/--dereference readers, a find that -execs (find lists links and the exec
++      reader opens them), and zip/7z, which follow unless told to store links.
++    `too_wide`: '' or why the act is refused unjudged (a bound passed). Over-approximates by design: cd directories
++    apply to every word, so it can only ADD refusals, and only where a link really points at a secret-named target.
++    Not the Grep/Glob tools: whether they read through links is the host's, unmeasured. Never raises."""
++    cwd = getattr(event, "cwd", None)
++    segs = _reach_segments(event.command) if event.command else []
++    words = [(w, False) for w in event.paths if isinstance(w, str) and w]
++    for s in segs:
++        words += s
++    bases = [cwd] if cwd else []
++    for s in segs:
++        for d in _chdirs(s):
++            d = os.path.expanduser(d)
++            if not os.path.isabs(d) and cwd:
++                d = os.path.join(cwd, d)
++            if os.path.isabs(d) and os.path.isdir(d) and d not in bases:
++                bases.append(d)
++
++    def resolve(cand):
++        base = os.path.expanduser(cand)
++        if os.path.isabs(base):
++            return [base]
++        return [os.path.join(b, base) for b in bases]
++
++    out, seen, budget = [], set(), [LINK_GLOB_LIMIT]
++
++    def judge(p):
+         try:
+-            words += shlex.split(event.command)
+-        except ValueError:
+-            words += event.command.split()
+-    cwd = getattr(event, "cwd", None)
+-    out = []
+-    for w in words:
+-        if not isinstance(w, str) or not w:
+-            continue
+-        # a flag names a path only through its `=value` (`--input=notes.txt`); a bare flag names none
++            if p in seen or not os.path.lexists(p):
++                return
++            seen.add(p)
++            real = os.path.realpath(p)
++            if real != os.path.normpath(p):
++                out.append(real)
++        except (OSError, ValueError):
++            pass
++
++    for w, quoted in words:
+         if w.startswith("-"):
+             if "=" not in w:
++                continue                    # a bare flag names no path; `--input=x` names x
++            cands = [w.split("=", 1)[1]]
++        else:
++            cands = [w, w.split("=", 1)[1]] if "=" in w else [w]
++        for cand in cands:
++            for pat in (_braces(cand) if not quoted else [cand]):
++                for full in resolve(pat):
++                    if not quoted and _GLOB_CHARS.search(pat):
++                        try:
++                            hits = _glob.glob(full)
++                        except (OSError, ValueError, RecursionError):
++                            hits = []
++                        budget[0] -= len(hits)
++                        if budget[0] < 0:
++                            return out, f"a pattern reaches more than {LINK_GLOB_LIMIT} paths"
++                        for h in hits:
++                            judge(h)
++                    else:
++                        judge(full)
++    walked = 0
++    for s in segs:
++        prog = os.path.basename(s[0][0])
++        rest = [w for w, _ in s[1:]]
++        if not _follows_links(prog, rest):
++            continue
++        roots = []
++        for w in rest:
++            if w.startswith("-") or w in ("(", "!"):
++                if prog == "find":
++                    break                   # find's start dirs come before its first expression word
+                 continue
+-            cands = {w.split("=", 1)[1]}
+-        else:
+-            cands = {w, w.split("=", 1)[1]} if "=" in w else {w}
+-        for cand in cands:
+-            try:
+-                base = os.path.expanduser(cand)
+-                if not os.path.isabs(base):
+-                    if not cwd:
+-                        continue
+-                    base = os.path.join(cwd, base)
+-                if not os.path.lexists(base):
+-                    continue
+-                real = os.path.realpath(base)
+-                if real != os.path.normpath(base):
+-                    out.append(real)
+-            except (OSError, ValueError):
+-                continue
+-    return out
++            for full in resolve(w):
++                if os.path.isdir(full) and not os.path.islink(full):
++                    roots.append(full)
++        if not roots:
++            roots = bases[:1]
++        for root in roots:
++            for d, dirs, files in os.walk(root, followlinks=False):
++                walked += len(dirs) + len(files)
++                if walked > LINK_WALK_LIMIT:
++                    return out, f"a reader that follows links would walk more than {LINK_WALK_LIMIT} entries"
++                for n in dirs + files:
++                    judge(os.path.join(d, n))
++    return out, ""
++
++
++def link_targets(event: "NormalizedEvent") -> list:
++    """The resolved targets of the links an act names or reaches, where a link makes them DIFFER from the path as
++    written (hestia #1331): what Gate 1a sweeps beside the paths and command. See `link_reach`."""
++    return link_reach(event)[0]
+ 
+ 
+ #: A value a command's own contract makes TEXT, never a path it opens (hestia #1330). Keyed on the
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 8e09640fa894cd2984e6ae073aa7aad8aac7be0774bebe4a79441215f9c77269  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -578,6 +578,14 @@
+     unread. Both Gate 1a sites call it before the token sweep, so the degraded mode does too."""
+     bad = egress_unsweepable(event)
+     if not bad:
++        # hestia #1331: a glob or link-following walk past its bound is refused unjudged, under the rule
++        # for a reach the gate cannot enumerate (the scope pass refuses past SCOPE_JUDGE_BUDGET the same way).
++        too_wide = link_reach(event)[1]
++        if too_wide:
++            return _deny("mrh.command.unenumerated",
++                         f"'{event.tool}': {too_wide}, so the gate cannot judge every link it reaches and it is "
++                         f"refused rather than judged in part: name the paths it needs",
++                         target=UNENUMERATED_TARGET)
+         return None
+     return _deny("egress.secret",
+                  f"'{event.tool}' declares egress the gate cannot sweep ({bad}): egress must be "
+@@ -596,48 +604,238 @@
+             + link_targets(event))
+ 
+ 
+-def link_targets(event: "NormalizedEvent") -> list:
+-    """The resolved targets of the paths an act names, where a link makes them DIFFER from the name
+-    (hestia #1331, gaps a/b). Measured on main f9f29a23 in-process (a fixture, no credential): inside a
+-    granted repo, a link to a secret-NAMED file passed Gate 1a by a relative shell read and by `Read`
+-    (absolute or relative), because the innate sweep judged the path AS NAMED. Absolute shell paths in
+-    the workspace already had their target checked (the scope pass); this gives the one rule no grant
+-    relaxes the same view, for every path argument and every shell word that names an existing path
+-    (relative ones joined onto the event's cwd). A path that is not a link contributes nothing, so
+-    an ordinary act's verdict cannot change. Never raises: an unreadable path adds nothing."""
+-    words = list(event.paths)
+-    if event.command:
++#: How far Gate 1a follows an act's REACH to the links in it (hestia #1331 follow-ups). Past either bound the act is
++#: refused under mrh.command.unenumerated rather than judged in part (egress_unsweepable_deny).
++LINK_GLOB_LIMIT = 256      # paths a glob or brace may expand to, per act
++LINK_WALK_LIMIT = 10000    # directory entries a link-following reader may walk, per act
++#: Readers that FOLLOW links while walking a directory, and the options that make them do it. A short cluster
++#: counts (`cp -rL`, `tar -chf`), except for find, whose options are whole words. Read from each tool's --help.
++_FOLLOW_FLAGS = {
++    "grep": frozenset({"-R", "--dereference-recursive"}),
++    "rg": frozenset({"-L", "--follow"}),
++    "find": frozenset({"-L", "-H", "-follow"}),
++    "cp": frozenset({"-L", "--dereference"}),
++    "tar": frozenset({"-h", "--dereference"}),
++    "bsdtar": frozenset({"-L", "-h", "--dereference"}),
++    "rsync": frozenset({"-L", "--copy-links", "-k", "--copy-dirlinks"}),
++    "cpio": frozenset({"-L", "--dereference"}),
++}
++#: Archivers that follow links BY DEFAULT, and the options that make them store the link instead (nomad's #1435
++#: review). `7z` follows only when adding (`7z a`).
++_FOLLOW_UNLESS = {
++    "zip": frozenset({"-y", "--symlinks"}),
++    "7z": frozenset({"-snl"}),
++}
++#: find walks without following links but LISTS them; an -exec reader then opens each listed path, and readers follow
++#: a link on open (nomad's #1435 review). So a find that execs is a link-following reader with or without -L.
++_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
++#: Programs that change the working directory of what they run, and the option that names it: like an in-line cd.
++_CHDIR_OPTS = {"env": ("-C", "--chdir"), "sudo": ("-D", "--chdir")}
++_CD = frozenset({"cd", "pushd"})
++
++
++def _reach_segments(command: str) -> list:
++    """The command's words as (word, quoted), split at the shell's segment breaks. `quoted` is whether the word was
++    written in quotes, so a pattern the shell will not expand is not expanded here either (nomad's #1435 review:
++    `find clean -name '*.txt'` was expanded against the cwd). When the quoting cannot be read word-for-word, every
++    word counts as unquoted, which only ever adds refusals. The raw words, unquoted, when it cannot be tokenized."""
++    def lex(posix):
++        lx = shlex.shlex(command, posix=posix, punctuation_chars=True)
++        lx.whitespace_split = True
++        return list(lx)
++    try:
++        words = lex(True)
++    except ValueError:
++        return [[(w, False) for w in command.split()]]
++    try:
++        raw = lex(False)
++    except ValueError:
++        raw = []
++    quoted = ([("'" in r or '"' in r) for r in raw] if len(raw) == len(words) else [False] * len(words))
++    segs = [[]]
++    for w, q in zip(words, quoted):
++        if w in _SEGMENT_BREAKS:
++            segs.append([])
++        else:
++            segs[-1].append((w, q))
++    return [s for s in segs if s]
++
++
++def _braces(word: str, limit: int = LINK_GLOB_LIMIT) -> list:
++    """`a{b,c}d` -> [abd, acd], recursively; a word with no complete `{x,y}` group is itself."""
++    i = word.find("{")
++    while i >= 0:
++        depth, j = 0, i
++        for j in range(i, len(word)):
++            depth += word[j] == "{"
++            depth -= word[j] == "}"
++            if depth == 0:
++                break
++        inner = word[i + 1:j]
++        if depth == 0 and "," in inner:
++            parts, d, cur = [], 0, ""
++            for ch in inner:
++                if ch == "," and d == 0:
++                    parts.append(cur)
++                    cur = ""
++                    continue
++                d += ch == "{"
++                d -= ch == "}"
++                cur += ch
++            parts.append(cur)
++            out = []
++            for p in parts:
++                out.extend(_braces(word[:i] + p + word[j + 1:], limit))
++                if len(out) > limit:
++                    return out
++            return out
++        i = word.find("{", i + 1)
++    return [word]
++
++
++def _has_flag(prog: str, flags: frozenset, words: list) -> bool:
++    """A word of the segment is one of `flags`; a short cluster counts (`-rL`), except for find's whole-word options."""
++    for w in words:
++        if w in flags:
++            return True
++        if prog != "find" and w.startswith("-") and not w.startswith("--") and len(w) > 2:
++            if any(f"-{c}" in flags for c in w[1:]):
++                return True
++    return False
++
++
++def _follows_links(prog: str, words: list) -> bool:
++    """Whether this segment's program reads through the links in the directories it walks."""
++    if prog in _FOLLOW_FLAGS and _has_flag(prog, _FOLLOW_FLAGS[prog], words):
++        return True
++    if prog == "find" and any(w in _FIND_EXEC for w in words):
++        return True
++    if prog in _FOLLOW_UNLESS and not _has_flag(prog, _FOLLOW_UNLESS[prog], words):
++        return prog != "7z" or (bool(words) and words[0] == "a")
++    return False
++
++
++def _chdirs(seg: list) -> list:
++    """The directories a segment makes the cwd of what it runs: `cd D`, `pushd D`, `env -C D`, `env --chdir=D`,
++    `sudo -D D`. Unresolved; the caller resolves them against the cwd."""
++    prog = os.path.basename(seg[0][0])
++    words = [w for w, _ in seg[1:]]
++    if prog in _CD:
++        ops = [w for w in words if not w.startswith("-")]
++        return ops[:1]
++    opts = _CHDIR_OPTS.get(prog)
++    if not opts:
++        return []
++    out = []
++    for i, w in enumerate(words):
++        if w in opts and i + 1 < len(words):
++            out.append(words[i + 1])
++        for o in opts:
++            if o.startswith("--") and w.startswith(o + "="):
++                out.append(w.split("=", 1)[1])
++    return out
++
++
++def link_reach(event: "NormalizedEvent") -> tuple:
++    """(targets, too_wide). `targets`: the resolved targets of the links an act names OR reaches, where they differ
++    from the path as written (hestia #1331). #1433 judged only the links an act NAMES; measured on its applied core
++    2026-10-28, every unnamed shape still reached a secret-named target. So:
++    - an UNQUOTED glob or brace word is expanded and each match judged (a quoted pattern is the program's, not the
++      shell's, and is judged as written);
++    - every relative word is judged against the cwd AND every directory the line makes a cwd: `cd`/`pushd`,
++      `env -C`/`--chdir`, `sudo -D`;
++    - a reader that reads through links while walking has its directories walked (the walk itself follows none) and
++      every link inside judged: the -L/-h/--dereference readers, a find that -execs (find lists links and the exec
++      reader opens them), and zip/7z, which follow unless told to store links.
++    `too_wide`: '' or why the act is refused unjudged (a bound passed). Over-approximates by design: cd directories
++    apply to every word, so it can only ADD refusals, and only where a link really points at a secret-named target.
++    Not the Grep/Glob tools: whether they read through links is the host's, unmeasured. Never raises."""
++    cwd = getattr(event, "cwd", None)
++    segs = _reach_segments(event.command) if event.command else []
++    words = [(w, False) for w in event.paths if isinstance(w, str) and w]
++    for s in segs:
++        words += s
++    bases = [cwd] if cwd else []
++    for s in segs:
++        for d in _chdirs(s):
++            d = os.path.expanduser(d)
++            if not os.path.isabs(d) and cwd:
++                d = os.path.join(cwd, d)
++            if os.path.isabs(d) and os.path.isdir(d) and d not in bases:
++                bases.append(d)
++
++    def resolve(cand):
++        base = os.path.expanduser(cand)
++        if os.path.isabs(base):
++            return [base]
++        return [os.path.join(b, base) for b in bases]
++
++    out, seen, budget = [], set(), [LINK_GLOB_LIMIT]
++
++    def judge(p):
+         try:
+-            words += shlex.split(event.command)
+-        except ValueError:
+-            words += event.command.split()
+-    cwd = getattr(event, "cwd", None)
+-    out = []
+-    for w in words:
+-        if not isinstance(w, str) or not w:
+-            continue
+-        # a flag names a path only through its `=value` (`--input=notes.txt`); a bare flag names none
++            if p in seen or not os.path.lexists(p):
++                return
++            seen.add(p)
++            real = os.path.realpath(p)
++            if real != os.path.normpath(p):
++                out.append(real)
++        except (OSError, ValueError):
++            pass
++
++    for w, quoted in words:
+         if w.startswith("-"):
+             if "=" not in w:
++                continue                    # a bare flag names no path; `--input=x` names x
++            cands = [w.split("=", 1)[1]]
++        else:
++            cands = [w, w.split("=", 1)[1]] if "=" in w else [w]
++        for cand in cands:
++            for pat in (_braces(cand) if not quoted else [cand]):
++                for full in resolve(pat):
++                    if not quoted and _GLOB_CHARS.search(pat):
++                        try:
++                            hits = _glob.glob(full)
++                        except (OSError, ValueError, RecursionError):
++                            hits = []
++                        budget[0] -= len(hits)
++                        if budget[0] < 0:
++                            return out, f"a pattern reaches more than {LINK_GLOB_LIMIT} paths"
++                        for h in hits:
++                            judge(h)
++                    else:
++                        judge(full)
++    walked = 0
++    for s in segs:
++        prog = os.path.basename(s[0][0])
++        rest = [w for w, _ in s[1:]]
++        if not _follows_links(prog, rest):
++            continue
++        roots = []
++        for w in rest:
++            if w.startswith("-") or w in ("(", "!"):
++                if prog == "find":
++                    break                   # find's start dirs come before its first expression word
+                 continue
+-            cands = {w.split("=", 1)[1]}
+-        else:
+-            cands = {w, w.split("=", 1)[1]} if "=" in w else {w}
+-        for cand in cands:
+-            try:
+-                base = os.path.expanduser(cand)
+-                if not os.path.isabs(base):
+-                    if not cwd:
+-                        continue
+-                    base = os.path.join(cwd, base)
+-                if not os.path.lexists(base):
+-                    continue
+-                real = os.path.realpath(base)
+-                if real != os.path.normpath(base):
+-                    out.append(real)
+-            except (OSError, ValueError):
+-                continue
+-    return out
++            for full in resolve(w):
++                if os.path.isdir(full) and not os.path.islink(full):
++                    roots.append(full)
++        if not roots:
++            roots = bases[:1]
++        for root in roots:
++            for d, dirs, files in os.walk(root, followlinks=False):
++                walked += len(dirs) + len(files)
++                if walked > LINK_WALK_LIMIT:
++                    return out, f"a reader that follows links would walk more than {LINK_WALK_LIMIT} entries"
++                for n in dirs + files:
++                    judge(os.path.join(d, n))
++    return out, ""
++
++
++def link_targets(event: "NormalizedEvent") -> list:
++    """The resolved targets of the links an act names or reaches, where a link makes them DIFFER from the path as
++    written (hestia #1331): what Gate 1a sweeps beside the paths and command. See `link_reach`."""
++    return link_reach(event)[0]
+ 
+ 
+ #: A value a command's own contract makes TEXT, never a path it opens (hestia #1330). Keyed on the
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b",
++      "sha256": "8e09640fa894cd2984e6ae073aa7aad8aac7be0774bebe4a79441215f9c77269",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179"
++  "gt_version": "81f06329ba20a2d973033c4c00e6c28dd5e95dd03459999bc3a0c70dee6bb13e"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "81f06329ba20a2d973033c4c00e6c28dd5e95dd03459999bc3a0c70dee6bb13e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "8e09640fa894cd2984e6ae073aa7aad8aac7be0774bebe4a79441215f9c77269"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "d26f719f133a611cda3d6b91f724479478058885035e74bfb4842e628216f4d0"
++  "gt_version": "8847351ed3b48e02778a3f432f29ce584a1e1e6a4ec5000953826a4fcbe894e4"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "81f06329ba20a2d973033c4c00e6c28dd5e95dd03459999bc3a0c70dee6bb13e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "8e09640fa894cd2984e6ae073aa7aad8aac7be0774bebe4a79441215f9c77269"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "cd9be17d272ee05c7d6789b4fb442a9e62e1259d15cbc112a449edbba3ecf064"
++  "gt_version": "20ac457e03d4b381efdb8e890e715e4f32d588a1a5127056053ea1ee63c7810d"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "81f06329ba20a2d973033c4c00e6c28dd5e95dd03459999bc3a0c70dee6bb13e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "8e09640fa894cd2984e6ae073aa7aad8aac7be0774bebe4a79441215f9c77269"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "fa321587c9448ed240d3719ddc5770eed11c5dea953f24ad30f561ead887c8a0"
++  "gt_version": "8d0e8aabfbcd94b7d44b20e4d4449ae7aedc0304ad60c3af95db6a68d9624b32"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "81f06329ba20a2d973033c4c00e6c28dd5e95dd03459999bc3a0c70dee6bb13e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "8e09640fa894cd2984e6ae073aa7aad8aac7be0774bebe4a79441215f9c77269"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "2a561c893e4cf9d3c16a247e2f60c4b27e9c3fa98c85073f5085617d06b091c0"
++  "gt_version": "b185ceaed509404384c8147765a491c173f26c80256cd88ad740a2e222496332"
+ }

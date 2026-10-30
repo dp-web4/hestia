@@ -28,6 +28,14 @@ REACH = [
     ("pushd && cat", "pushd sub && cat key.txt"), ("grep -R .", "grep -R key ."),
     ("rg -L", "rg -L key"), ("find -L -exec cat", "find -L . -name 'id_*' -exec cat {} +"),
     ("cp -rL", "cp -rL sub sub2"), ("tar -h", "tar -chf clean/out.tar ."),
+    # nomad's #1435 review: find lists links and its -exec reader opens them; zip/7z follow by default; env -C is a cd
+    ("find -exec without -L", "find sub -type l -exec cat {} \\;"),
+    ("find . -name quoted -exec cat", "find . -name '*.txt' -exec cat {} +"),
+    ("zip -r (follows by default)", "zip -r clean/out.zip ."),
+    ("7z a (follows by default)", "7z a clean/out.7z sub"),
+    ("env -C dir", "env -C sub cat key.txt"),
+    ("env --chdir=dir", "env --chdir=sub cat key.txt"),
+    ("cd .. then a relative path", "cd .. && cat hestia/notes.txt"),
 ]
 ORDINARY = [
     ("plain file", "cat plain.txt"), ("glob on a clean dir", "cat clean/*.txt"),
@@ -35,6 +43,12 @@ ORDINARY = [
     ("an in-repo link (not secret)", "cat clean/alias.txt"), ("rg without -L", "rg key"),
     ("grep -r on a clean dir", "grep -r key clean"), ("a glob naming nothing", "ls zz*"),
     ("a glob under the bound", "ls ../other/wide/f1*.txt"), ("named link (#1433)", "cat notes.txt"),
+    # nomad's #1435 review: a quoted pattern is find's, not the shell's; zip -y stores links; git prints link text
+    ("find a clean dir, quoted pattern", "find clean -name '*.txt' -exec cat {} +"),
+    ("zip -ry stores links", "zip -ry clean/out.zip sub"),
+    ("7z a -snl stores links", "7z a -snl clean/out.7z sub"),
+    ("git -C sub show (link text, not target)", "git -C sub show HEAD:key.txt"),
+    ("a quoted glob naming nothing", "grep -n 'no*such' clean/a.txt"),
 ]
 OVERFLOW = [("glob of 300 files", "cat ../other/wide/*.txt"),
             ("grep -R over 10,100 entries", "grep -R key ../other/deep")]
