@@ -1,9 +1,15 @@
 #: How far Gate 1a follows an act's REACH to the links in it (hestia #1331 follow-ups). Past either bound the act is
-#: refused under mrh.command.unenumerated rather than judged in part (egress_unsweepable_deny). Both are STRICT work
-#: bounds (Nova's #1435 review): directory entries are read one at a time and counted as they are read, so no glob or
-#: walk lists more than LINK_WALK_LIMIT entries, or collects more than LINK_GLOB_LIMIT matches, before it stops.
-LINK_GLOB_LIMIT = 256      # paths a glob or brace may expand to, per act
-LINK_WALK_LIMIT = 10000    # directory entries read per act, by globs and link-following walks together
+#: refused under mrh.command.unenumerated rather than judged in part (egress_unsweepable_deny). All are STRICT work
+#: bounds (Nova's #1435 review): directory entries are read one at a time and counted as they are read, so nothing
+#: lists more entries, or collects more matches, than its bound before it stops. Two entry budgets, because the two
+#: risks differ (nomad's #1435 review): a glob is a caller-written pattern, so its scan stays small; a walk's size is
+#: the tree's own, so its budget is set from the measured cost of real trees. Measured 2026-10-30, no-follow scandir,
+#: warm: Legion SAGE 82,943 entries / 48 ms, web4 46,983 / 20 ms, hestia 14,369 / 19 ms (0.4-1.3 us per entry);
+#: Nomad SAGE 70,237 / 43 ms. 200,000 is about 120 ms warm, clears every repo, and still refuses a whole workspace
+#: (Legion's ai-workspace: 705,755 entries).
+LINK_GLOB_LIMIT = 256          # paths a glob or brace may expand to, per act
+LINK_GLOB_SCAN_LIMIT = 10000   # directory entries a glob may read while expanding, per act
+LINK_WALK_LIMIT = 200000       # directory entries the act's link-following walks may read, per act
 
 
 class _TooWide(Exception):
@@ -11,13 +17,14 @@ class _TooWide(Exception):
 
 
 def _entries(d: str, budget: list):
-    """The entries of directory `d`, read lazily and each counted against `budget[0]` as it is read."""
+    """The entries of directory `d`, read lazily and each counted against `budget[0]` as it is read. `budget` is
+    [remaining, bound, what]: `what` names the reader in the refusal."""
     try:
         with os.scandir(d) as it:
             for e in it:
                 budget[0] -= 1
                 if budget[0] < 0:
-                    raise _TooWide(f"it would read more than {LINK_WALK_LIMIT} directory entries")
+                    raise _TooWide(f"{budget[2]} would read more than {budget[1]} directory entries")
                 yield e
     except OSError as exc:
         raise _TooWide(f"a directory it reaches cannot be read ({type(exc).__name__})")
@@ -224,7 +231,9 @@ def link_reach(event: "NormalizedEvent") -> tuple:
             return [base]
         return [os.path.join(b, base) for b in bases]
 
-    out, seen, budget, matches = [], set(), [LINK_WALK_LIMIT], [LINK_GLOB_LIMIT]
+    out, seen, matches = [], set(), [LINK_GLOB_LIMIT]
+    scan = [LINK_GLOB_SCAN_LIMIT, LINK_GLOB_SCAN_LIMIT, "a pattern"]
+    walk = [LINK_WALK_LIMIT, LINK_WALK_LIMIT, "a reader that follows links"]
 
     def judge(p):
         try:
@@ -238,8 +247,8 @@ def link_reach(event: "NormalizedEvent") -> tuple:
             pass
 
     try:
-        _reach_words(words, resolve=resolve, judge=judge, budget=budget, matches=matches)
-        _reach_walks(segs, resolve=resolve, bases=bases, judge=judge, budget=budget)
+        _reach_words(words, resolve=resolve, judge=judge, budget=scan, matches=matches)
+        _reach_walks(segs, resolve=resolve, bases=bases, judge=judge, budget=walk)
     except _TooWide as why:
         return out, str(why)
     return out, ""
