@@ -1,0 +1,451 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -480,6 +480,11 @@
+     #: "rwed". Consulted by evaluate() only for an act whose mode it can name, and only when
+     #: every mode that act needs is in the grant's. A full-mode grant stays in `scope`.
+     mode_scope: tuple = ()
++    #: The society floor's NARROWED entries with their modes (hestia #1398, the write half), the
++    #: same ``((entry, modes), ...)`` shape as `mode_scope`. Consulted by evaluate() only for a
++    #: path no grant of the member's own covers (#1386: the nearest explicit grant decides, the
++    #: floor fills only beyond it), and only when every mode the act needs is in the entry's.
++    floor_mode_scope: tuple = ()
+     #: Where this policy was resolved from, carried so a reader never has to guess which store
+     #: won. A policy that cannot say where it came from is not auditable.
+     source: str = "unresolved"
+@@ -1060,6 +1065,7 @@
+                         generation=gen, expires_at=exp,
+                         read_scope=tuple(read_parsed or ()),
+                         mode_scope=_parse_mode_scope(got.get("in_scope_modes")),
++                        floor_mode_scope=_parse_mode_scope(got.get("in_scope_floor_modes")),
+                     )
+ 
+     # 2. Local replica — fail-closed fallback, marked stale.
+@@ -3406,6 +3412,13 @@
+             f"grant decides (hestia #1386).")
+ 
+ 
++def _floor_hint(floor_modes: str, need: str) -> str:
++    missing = "".join(m for m in need if m not in floor_modes)
++    return (f" The society floor reaches here with {floor_modes}; this act needs {need} (missing "
++            f"{missing}). A floor entry serves the modes it holds and no more (hestia #1398); a grant "
++            f"of your own on this path would decide instead (hestia #1386).")
++
++
+ def _command_reached_paths(cmd: str, workspace: str, cwd: Optional[str], forbidden,
+                            home_markers) -> Optional[list]:
+     """Every path the command checker resolves for `cmd` (beyond home and temp roots), or None
+@@ -3463,6 +3476,7 @@
+     scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
+     read_scopes = list(getattr(pol, "read_scope", ()) or ())
+     mode_scopes = list(getattr(pol, "mode_scope", ()) or ())
++    floor_modes = list(getattr(pol, "floor_mode_scope", ()) or ())
+     forbidden = forbidden_tokens(profile)
+ 
+     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
+@@ -3538,6 +3552,9 @@
+                 )
+     full_nodes, narrowed_nodes = _grant_nodes(scopes, mode_scopes, ws)
+     precedence = _precedence_matters(full_nodes, narrowed_nodes)
++    # #1398 write half: the narrowed floor as grant nodes of its own, consulted only for a path no
++    # node of the member's own covers. Parsed by the same rule as a narrowed grant.
++    floor_nodes = _grant_nodes([], floor_modes, ws)[1] if floor_modes else []
+     for p in ([] if event.repos else event.paths):
+         admitted = (path_in_scope(p, scopes, ws, profile, event.cwd)
+                     or _read_only_admits(event, p, read_scopes, ws, profile)
+@@ -3557,6 +3574,25 @@
+                     if not all(m in cmodes for m in need):
+                         admitted, capped = False, _beneath_hint(child, cmodes, need)
+                         break
++        # #1398, THE WRITE HALF: a NARROWED floor entry (rw on the forum, say) serves the modes it
++        # holds, where no grant of the member's own reaches (dp 10-23 on #1386: the floor fills only
++        # beyond the member's own grants). The nearest floor entry covering the path decides, in its
++        # modes; it never widens a member's own narrower grant (that grant is the nearer node and
++        # has already decided above), and an act that can reach below the path it names still
++        # answers to every narrowed grant of the member's beneath it.
++        if not admitted and not capped and floor_nodes and not event.repos:
++            if _nearest_grant(p, full_nodes + narrowed_nodes, event.cwd) is None:
++                floor_near = _nearest_grant(p, floor_nodes, event.cwd)
++                need = act_path_modes(event) or GRANT_MODES
++                if floor_near is not None and all(m in floor_near for m in need):
++                    admitted = True
++                    if event.tool not in SINGLE_TARGET_TOOLS:
++                        for child, cmodes in _narrowed_beneath(p, narrowed_nodes, event.cwd):
++                            if not all(m in cmodes for m in need):
++                                admitted, capped = False, _beneath_hint(child, cmodes, need)
++                                break
++                elif floor_near is not None:
++                    capped = _floor_hint(floor_near, need)
+         if not admitted:
+             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
+             # on any long path truncates away the very component that tripped the gate — the
+@@ -3615,7 +3651,19 @@
+             ok, offending, refused = command_scope_reach(
+                 event.command, scopes + extra, ws, event.cwd,
+                 forbidden=forbidden, home_markers=profile.home_markers)
+-        if ok and precedence:
++        # #1398 write half, for a shell line: the narrowed floor entries holding every mode the
++        # command needs, tried only after the member's own grants and the read floor did not admit
++        # it, and only for a command whose need can be named (a read, today). A line admitted this
++        # way then takes the #1386 walk below, so a path it reaches under a grant of the member's
++        # own is still decided by that grant, never by the floor.
++        floor_used = False
++        floor_extra = _mode_entries(floor_modes, cmd_need) if (floor_nodes and cmd_need) else []
++        if not ok and floor_extra:
++            ok, offending, refused = command_scope_reach(
++                event.command, scopes + extra + floor_extra, ws, event.cwd,
++                forbidden=forbidden, home_markers=profile.home_markers)
++            floor_used = ok
++        if ok and (precedence or floor_used):
+             # #1386 for a shell line: every path it reaches takes its nearest grant. A command on
+             # the read-only allowlist needs r there; any other command needs a full grant, as in
+             # part B. A line whose reach cannot be named in full is refused here rather than
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+--- a/plugins/_shared/hestia_gate_mechanism.py
++++ b/plugins/_shared/hestia_gate_mechanism.py
+@@ -1219,6 +1219,11 @@
+             # the same reason as `in_scope_read`: a core that predates this key ignores it and
+             # admits nothing for them, so narrowing never widens on an older gate.
+             "in_scope_modes": [],
++            # NARROWED floor entries with their modes (hestia #1398, the write half): the floor
++            # fills only where no grant of the member's own reaches (#1386), with the modes the
++            # entry holds. Same reason as `in_scope_read`: a core that predates this key ignores
++            # it and admits nothing extra.
++            "in_scope_floor_modes": [],
+             "generation": None,
+             "expires_at": None,
+         }
+@@ -1334,6 +1339,30 @@
+                         snap["society_floor_read"].append(p.strip())
+                         snap["in_scope_read"].append(
+                             _scope_entry_for_grant(p, f.get("recursive") is True))
++            # EVERY NARROWED floor entry WITH ITS MODES (hestia #1398, the write half), from the
++            # member-independent `floor_by_mode` list the daemon serves beside the withheld view.
++            # The withholding (`floor_for`) protects a MODE-BLIND gate from reading a narrowed
++            # entry as full reach; a core that applies #1386's precedence (the member's own grant
++            # decides wherever it reaches, the floor fills only beyond it) can consume the rows
++            # themselves, in their modes. Only narrowed rows are taken: an all-modes entry is
++            # served as reach in `society_floor` already, or withheld for a reason this gate
++            # honours by not re-admitting it. Same parsing rule as `grants_by_mode`: a row whose
++            # modes are not a non-empty proper subset of "rwed" is skipped, so malformed data reads
++            # as no floor. Absent on an older daemon: a no-op.
++            floor_modes = scope.get("floor_by_mode")
++            if isinstance(floor_modes, list):
++                for f in floor_modes:
++                    if not isinstance(f, dict):
++                        continue
++                    p, modes = f.get("path"), f.get("modes")
++                    if not (isinstance(p, str) and p.strip() and isinstance(modes, str)):
++                        continue
++                    if not modes or modes == "rwed" or any(m not in "rwed" for m in modes):
++                        continue
++                    snap["in_scope_floor_modes"].append({
++                        "entry": _scope_entry_for_grant(p, f.get("recursive") is True),
++                        "modes": "".join(m for m in "rwed" if m in modes),
++                    })
+             floor_digest = scope.get("society_floor_digest")
+             if isinstance(floor_digest, str) and len(floor_digest) == 64:
+                 snap["society_floor_digest"] = floor_digest
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 484c754e8d3c49a9f65fecc9aeb48fbc49389671e5a470bbf74b5503acf95e35  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 93af7b3f960a66d8d5f0b27759c5b7804acfb3f65740db4c7751899edb3c13c1  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -481,6 +481,11 @@
+     #: "rwed". Consulted by evaluate() only for an act whose mode it can name, and only when
+     #: every mode that act needs is in the grant's. A full-mode grant stays in `scope`.
+     mode_scope: tuple = ()
++    #: The society floor's NARROWED entries with their modes (hestia #1398, the write half), the
++    #: same ``((entry, modes), ...)`` shape as `mode_scope`. Consulted by evaluate() only for a
++    #: path no grant of the member's own covers (#1386: the nearest explicit grant decides, the
++    #: floor fills only beyond it), and only when every mode the act needs is in the entry's.
++    floor_mode_scope: tuple = ()
+     #: Where this policy was resolved from, carried so a reader never has to guess which store
+     #: won. A policy that cannot say where it came from is not auditable.
+     source: str = "unresolved"
+@@ -1061,6 +1066,7 @@
+                         generation=gen, expires_at=exp,
+                         read_scope=tuple(read_parsed or ()),
+                         mode_scope=_parse_mode_scope(got.get("in_scope_modes")),
++                        floor_mode_scope=_parse_mode_scope(got.get("in_scope_floor_modes")),
+                     )
+ 
+     # 2. Local replica — fail-closed fallback, marked stale.
+@@ -3407,6 +3413,13 @@
+             f"grant decides (hestia #1386).")
+ 
+ 
++def _floor_hint(floor_modes: str, need: str) -> str:
++    missing = "".join(m for m in need if m not in floor_modes)
++    return (f" The society floor reaches here with {floor_modes}; this act needs {need} (missing "
++            f"{missing}). A floor entry serves the modes it holds and no more (hestia #1398); a grant "
++            f"of your own on this path would decide instead (hestia #1386).")
++
++
+ def _command_reached_paths(cmd: str, workspace: str, cwd: Optional[str], forbidden,
+                            home_markers) -> Optional[list]:
+     """Every path the command checker resolves for `cmd` (beyond home and temp roots), or None
+@@ -3464,6 +3477,7 @@
+     scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
+     read_scopes = list(getattr(pol, "read_scope", ()) or ())
+     mode_scopes = list(getattr(pol, "mode_scope", ()) or ())
++    floor_modes = list(getattr(pol, "floor_mode_scope", ()) or ())
+     forbidden = forbidden_tokens(profile)
+ 
+     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
+@@ -3539,6 +3553,9 @@
+                 )
+     full_nodes, narrowed_nodes = _grant_nodes(scopes, mode_scopes, ws)
+     precedence = _precedence_matters(full_nodes, narrowed_nodes)
++    # #1398 write half: the narrowed floor as grant nodes of its own, consulted only for a path no
++    # node of the member's own covers. Parsed by the same rule as a narrowed grant.
++    floor_nodes = _grant_nodes([], floor_modes, ws)[1] if floor_modes else []
+     for p in ([] if event.repos else event.paths):
+         admitted = (path_in_scope(p, scopes, ws, profile, event.cwd)
+                     or _read_only_admits(event, p, read_scopes, ws, profile)
+@@ -3558,6 +3575,25 @@
+                     if not all(m in cmodes for m in need):
+                         admitted, capped = False, _beneath_hint(child, cmodes, need)
+                         break
++        # #1398, THE WRITE HALF: a NARROWED floor entry (rw on the forum, say) serves the modes it
++        # holds, where no grant of the member's own reaches (dp 10-23 on #1386: the floor fills only
++        # beyond the member's own grants). The nearest floor entry covering the path decides, in its
++        # modes; it never widens a member's own narrower grant (that grant is the nearer node and
++        # has already decided above), and an act that can reach below the path it names still
++        # answers to every narrowed grant of the member's beneath it.
++        if not admitted and not capped and floor_nodes and not event.repos:
++            if _nearest_grant(p, full_nodes + narrowed_nodes, event.cwd) is None:
++                floor_near = _nearest_grant(p, floor_nodes, event.cwd)
++                need = act_path_modes(event) or GRANT_MODES
++                if floor_near is not None and all(m in floor_near for m in need):
++                    admitted = True
++                    if event.tool not in SINGLE_TARGET_TOOLS:
++                        for child, cmodes in _narrowed_beneath(p, narrowed_nodes, event.cwd):
++                            if not all(m in cmodes for m in need):
++                                admitted, capped = False, _beneath_hint(child, cmodes, need)
++                                break
++                elif floor_near is not None:
++                    capped = _floor_hint(floor_near, need)
+         if not admitted:
+             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
+             # on any long path truncates away the very component that tripped the gate — the
+@@ -3616,7 +3652,19 @@
+             ok, offending, refused = command_scope_reach(
+                 event.command, scopes + extra, ws, event.cwd,
+                 forbidden=forbidden, home_markers=profile.home_markers)
+-        if ok and precedence:
++        # #1398 write half, for a shell line: the narrowed floor entries holding every mode the
++        # command needs, tried only after the member's own grants and the read floor did not admit
++        # it, and only for a command whose need can be named (a read, today). A line admitted this
++        # way then takes the #1386 walk below, so a path it reaches under a grant of the member's
++        # own is still decided by that grant, never by the floor.
++        floor_used = False
++        floor_extra = _mode_entries(floor_modes, cmd_need) if (floor_nodes and cmd_need) else []
++        if not ok and floor_extra:
++            ok, offending, refused = command_scope_reach(
++                event.command, scopes + extra + floor_extra, ws, event.cwd,
++                forbidden=forbidden, home_markers=profile.home_markers)
++            floor_used = ok
++        if ok and (precedence or floor_used):
+             # #1386 for a shell line: every path it reaches takes its nearest grant. A command on
+             # the read-only allowlist needs r there; any other command needs a full grant, as in
+             # part B. A line whose reach cannot be named in full is refused here rather than
+diff --git a/hooks-gt/_shared/hestia_gate_mechanism.py b/hooks-gt/_shared/hestia_gate_mechanism.py
+--- a/hooks-gt/_shared/hestia_gate_mechanism.py
++++ b/hooks-gt/_shared/hestia_gate_mechanism.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 8dc766d7f985059287a57c87027a0d0aac8bdab1b8864eae75e44f1ece34dbef  (published ground truth; manifest: hooks-gt)
+ """Shared in-process daemon-query mechanism — the society-safety verdict path.
+ 
+ PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
+@@ -1220,6 +1220,11 @@
+             # the same reason as `in_scope_read`: a core that predates this key ignores it and
+             # admits nothing for them, so narrowing never widens on an older gate.
+             "in_scope_modes": [],
++            # NARROWED floor entries with their modes (hestia #1398, the write half): the floor
++            # fills only where no grant of the member's own reaches (#1386), with the modes the
++            # entry holds. Same reason as `in_scope_read`: a core that predates this key ignores
++            # it and admits nothing extra.
++            "in_scope_floor_modes": [],
+             "generation": None,
+             "expires_at": None,
+         }
+@@ -1335,6 +1340,30 @@
+                         snap["society_floor_read"].append(p.strip())
+                         snap["in_scope_read"].append(
+                             _scope_entry_for_grant(p, f.get("recursive") is True))
++            # EVERY NARROWED floor entry WITH ITS MODES (hestia #1398, the write half), from the
++            # member-independent `floor_by_mode` list the daemon serves beside the withheld view.
++            # The withholding (`floor_for`) protects a MODE-BLIND gate from reading a narrowed
++            # entry as full reach; a core that applies #1386's precedence (the member's own grant
++            # decides wherever it reaches, the floor fills only beyond it) can consume the rows
++            # themselves, in their modes. Only narrowed rows are taken: an all-modes entry is
++            # served as reach in `society_floor` already, or withheld for a reason this gate
++            # honours by not re-admitting it. Same parsing rule as `grants_by_mode`: a row whose
++            # modes are not a non-empty proper subset of "rwed" is skipped, so malformed data reads
++            # as no floor. Absent on an older daemon: a no-op.
++            floor_modes = scope.get("floor_by_mode")
++            if isinstance(floor_modes, list):
++                for f in floor_modes:
++                    if not isinstance(f, dict):
++                        continue
++                    p, modes = f.get("path"), f.get("modes")
++                    if not (isinstance(p, str) and p.strip() and isinstance(modes, str)):
++                        continue
++                    if not modes or modes == "rwed" or any(m not in "rwed" for m in modes):
++                        continue
++                    snap["in_scope_floor_modes"].append({
++                        "entry": _scope_entry_for_grant(p, f.get("recursive") is True),
++                        "modes": "".join(m for m in "rwed" if m in modes),
++                    })
+             floor_digest = scope.get("society_floor_digest")
+             if isinstance(floor_digest, str) and len(floor_digest) == 64:
+                 snap["society_floor_digest"] = floor_digest
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,12 +7,12 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "484c754e8d3c49a9f65fecc9aeb48fbc49389671e5a470bbf74b5503acf95e35",
++      "sha256": "93af7b3f960a66d8d5f0b27759c5b7804acfb3f65740db4c7751899edb3c13c1",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+       "path": "hestia_gate_mechanism.py",
+-      "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681",
++      "sha256": "8dc766d7f985059287a57c87027a0d0aac8bdab1b8864eae75e44f1ece34dbef",
+       "source": "plugins/_shared/hestia_gate_mechanism.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "02c886fdff53fb1975ad425eaaeeb4262de720e80b197c2d1ab2fdc8fb8a911b"
++  "gt_version": "3d8da87deada50d31a2aa4a9011ed870d48d6eda1d54833f5ebe4488bc51f515"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "02c886fdff53fb1975ad425eaaeeb4262de720e80b197c2d1ab2fdc8fb8a911b",
++    "gt_version": "3d8da87deada50d31a2aa4a9011ed870d48d6eda1d54833f5ebe4488bc51f515",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "484c754e8d3c49a9f65fecc9aeb48fbc49389671e5a470bbf74b5503acf95e35"
++        "sha256": "93af7b3f960a66d8d5f0b27759c5b7804acfb3f65740db4c7751899edb3c13c1"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
++        "sha256": "8dc766d7f985059287a57c87027a0d0aac8bdab1b8864eae75e44f1ece34dbef"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "1a47367500ae6d1b1ff308330e155125eb1dec5338933c8fff33e75e955c36bd"
++  "gt_version": "d82cb44d8bbcb0d4e9148639aae8eabca19155f6bdc528a303059c292875eb26"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "02c886fdff53fb1975ad425eaaeeb4262de720e80b197c2d1ab2fdc8fb8a911b",
++    "gt_version": "3d8da87deada50d31a2aa4a9011ed870d48d6eda1d54833f5ebe4488bc51f515",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "484c754e8d3c49a9f65fecc9aeb48fbc49389671e5a470bbf74b5503acf95e35"
++        "sha256": "93af7b3f960a66d8d5f0b27759c5b7804acfb3f65740db4c7751899edb3c13c1"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
++        "sha256": "8dc766d7f985059287a57c87027a0d0aac8bdab1b8864eae75e44f1ece34dbef"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "c148ce3568314a98ef9892edd55ac6aaf6f899246d645009e049ca7caae1635e"
++  "gt_version": "0dd934da96ce2f54270d3708e2836a63ef6fdb23955b6ba89857fb22e7431056"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "02c886fdff53fb1975ad425eaaeeb4262de720e80b197c2d1ab2fdc8fb8a911b",
++    "gt_version": "3d8da87deada50d31a2aa4a9011ed870d48d6eda1d54833f5ebe4488bc51f515",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "484c754e8d3c49a9f65fecc9aeb48fbc49389671e5a470bbf74b5503acf95e35"
++        "sha256": "93af7b3f960a66d8d5f0b27759c5b7804acfb3f65740db4c7751899edb3c13c1"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
++        "sha256": "8dc766d7f985059287a57c87027a0d0aac8bdab1b8864eae75e44f1ece34dbef"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "78cd0a45c05fab1493734b3994807f1f7f7b5566d51c6fe4c65ab59ea59b3c2c"
++  "gt_version": "22e1aeb1341b5166547512713a5b4ef689b68b9140e02f816b7522ed8d753385"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "02c886fdff53fb1975ad425eaaeeb4262de720e80b197c2d1ab2fdc8fb8a911b",
++    "gt_version": "3d8da87deada50d31a2aa4a9011ed870d48d6eda1d54833f5ebe4488bc51f515",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "484c754e8d3c49a9f65fecc9aeb48fbc49389671e5a470bbf74b5503acf95e35"
++        "sha256": "93af7b3f960a66d8d5f0b27759c5b7804acfb3f65740db4c7751899edb3c13c1"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
++        "sha256": "8dc766d7f985059287a57c87027a0d0aac8bdab1b8864eae75e44f1ece34dbef"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "124ec0a82d3da01550a6cdfa1ace939828dbd8345d53327cb9e316d574af0b86"
++  "gt_version": "4e2b943d6960d2dca3fd683a69447d1d58a8d8e5b4d2a5bb1aad3d4eb3b8a588"
+ }
