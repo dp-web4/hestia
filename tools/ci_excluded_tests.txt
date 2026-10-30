@@ -53,3 +53,4 @@ tools/upgrade_path_test.py
 # Held with #1345 part B (grant modes at the gate): it tests a gate core that is not applied yet,
 # so it fails against the tree until the governed apply. It moves to tools/ at the apply and this
 # line goes, as floor_read_only_test.py did for #1347.
+held/build-1386/grant_precedence_gate_test.py

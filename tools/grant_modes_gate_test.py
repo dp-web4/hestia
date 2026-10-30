@@ -344,10 +344,18 @@ def test_an_all_modes_floor_never_widens_a_narrowed_child_grant():
         m._McpHttp = lambda ep, dl: fake
         reserved = m.fetch_policy_snapshot("cbp-being", use_cache=False)
         prof, pol = _policy(reserved)
-        check("if_reserved_the_union_widens_the_child",
-              not _verdict(prof, pol, ws, "Write", path=target).blocks,
-              "if this starts refusing, the gate caps the floor itself (#1386) and the "
-              "daemon's withholding may be revisited under #1385; until then it must stay")
+        if hasattr(core, "nearest_grant_modes"):
+            # Part C (#1386): the nearest grant decides, so the gate caps a re-served floor entry
+            # by itself. The daemon's withholding stays all the same (#1387): two independent
+            # guards, and removing one is its own reviewed change.
+            check("if_reserved_part_c_still_caps_the_child",
+                  _verdict(prof, pol, ws, "Write", path=target).blocks,
+                  "part C must refuse the child write even if the floor entry were re-served")
+        else:
+            check("if_reserved_the_union_widens_the_child",
+                  not _verdict(prof, pol, ws, "Write", path=target).blocks,
+                  "if this starts refusing, the gate caps the floor itself (#1386) and the "
+                  "daemon's withholding may be revisited under #1385; until then it must stay")
 
 
 ALL = [
