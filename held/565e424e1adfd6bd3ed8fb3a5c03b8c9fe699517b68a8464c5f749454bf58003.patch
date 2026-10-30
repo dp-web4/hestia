@@ -1,0 +1,1414 @@
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -219,6 +219,36 @@
+ 
+ _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+ 
++# ── the critical-timeout protocol (dp ruling on #1262, 2026-10-07): canonical or MISWIRED ──
++#: Canonical envelope for a critical hook registration's timeout, seconds. A value outside is
++#: REJECTED (MISWIRED), never clamped. The reconciler WRITES DEFAULT when it canonicalizes a
++#: registration; the gate never substitutes it — a missing timeout is MISWIRED, whatever the
++#: vendor documents.
++MIN_TIMEOUT_SECONDS = 3.0
++DEFAULT_TIMEOUT_SECONDS = 10.0
++MAX_TIMEOUT_SECONDS = 30.0
++#: The margin is proportional and bounded: max(floor, min(cap, timeout * rate)) — the shim's
++#: declared cap from 10 s up, the floor at the 3 s envelope edge.
++MARGIN_FLOOR_SECONDS = 0.5
++MARGIN_RATE = 0.15
++
++
++def validate_timeout(value, unit: float):
++    """The protocol's one validator — the gate is its first consumer; deploy/preflight, the
++    reconciler and the census wire in under #1262 row 10. A STRUCTURALLY parsed timeout field,
++    in the harness's unit, -> (canonical seconds, None), or (None, reason) MISWIRED. No vendor
++    default is ever substituted; an out-of-envelope value is rejected, not clamped."""
++    if value is None:
++        return None, ("no timeout declared (a missing timeout is MISWIRED: a vendor default "
++                      "is not a security semantic)")
++    if not isinstance(value, (int, float)) or isinstance(value, bool):
++        return None, f"timeout {value!r} is not a number the protocol can bind"
++    seconds = float(value) * unit
++    if not MIN_TIMEOUT_SECONDS <= seconds <= MAX_TIMEOUT_SECONDS:
++        return None, (f"timeout {seconds:g}s is outside the canonical envelope "
++                      f"{MIN_TIMEOUT_SECONDS:g}-{MAX_TIMEOUT_SECONDS:g}s (rejected, never clamped)")
++    return seconds, None
++
+ 
+ def _expand(text: str, env, cwd: Optional[str]) -> Optional[str]:
+     """`${VAR:-default}`, `${VAR}`, `$VAR`, `~` and `{cwd}`. None when a variable with no default
+@@ -250,36 +280,73 @@
+     return out
+ 
+ 
+-def _command_targets(command: str, env) -> list:
+-    """Every absolute path a hook command names, expanded the way the harness's shell would."""
++def _command_tokens(command: str, env):
++    """Every token of a hook command, expanded the way the harness's shell would (environment
++    assignments skipped; a token naming an unset variable with no default drops out)."""
+     try:
+         tokens = shlex.split(command)
+     except ValueError:
+         tokens = command.split()
+-    out = []
+     for tok in tokens:
+         if "=" in tok and not tok.startswith(("/", "~", "$")):
+             continue                       # an environment assignment, not the program
+         t = _expand(tok, env, None)
+-        if t and os.path.isabs(t):
+-            out.append(t)
+-    return out
++        if t:
++            yield t
++
++
++def _command_targets(command: str, env) -> list:
++    """Every absolute path a hook command names, expanded the way the harness's shell would."""
++    return [t for t in _command_tokens(command, env) if os.path.isabs(t)]
++
++
++def _names_hook(command: str, env, base: str) -> bool:
++    """Boolean relevance ONLY: does this command appear to invoke this hook. Two readings, and
++    either one is evidence. (1) The basename as a BOUNDED token of the expanded RAW text (of the
++    raw command when a `${VAR}`/`{cwd}` cannot be resolved here) — not a token basename equality:
++    shlex without punctuation_chars glues shell operators onto the token (`./hook.py;`,
++    `hook.py|cat`, `(python3 ./hook.py)`), basename equality misses those, and the entry then
++    DROPS beside a longer exact binding, letting the computed deadline outrun the timeout the
++    harness actually enforces on that spelling (#1262 re-review P1 — every glued spelling was
++    executed under `sh` and runs the hook). (2) The same bounded test on each SHELL-NORMALIZED
++    token — shlex quote and backslash removal (`./gate_'hook'.py`, `./gate_\\hook.py`) — because
++    the shell performs that same removal and the normalized spelling RUNS the hook (#1262
++    re-review P1 round 2: the quoted/escaped spellings were executed under `sh` beside an exact
++    15s registration and the bound outran it at 15s). The edge class [A-Za-z0-9._-] keeps a
++    longer name that merely CONTAINS the basename (`hook.py.bak`, `hook.py5`, `xhook.py`) a
++    different file: it drops. Constructs no lexical reading can resolve — glob patterns
++    (`gate_hoo?.py`), command substitution (`$(printf ...)`) — stay outside this guarantee.
++    Whatever names the hook without an exact realpath binding is MISWIRED evidence; the binding
++    test itself stays exact."""
++    pattern = r"(?<![A-Za-z0-9._-])" + re.escape(base) + r"(?![A-Za-z0-9._-])"
++    text = _expand(command, env, None)
++    if text is None:
++        text = command
++    if re.search(pattern, text):
++        return True
++    return any(re.search(pattern, token) for token in _command_tokens(command, env))
+ 
+ 
+ def _hook_entries(doc: Any, reader: str, layout: str, event: str) -> list:
+-    """[(command, timeout-or-None)] for every hook registered on `event` in a parsed config."""
++    """[(command, timeout-or-None, entry-object, ancestors)] for every hook registered on
++    `event` in a parsed config. The entry object rides along so a duplicate-key mark recorded at
++    parse time can be attributed to the exact registration that carries it; `ancestors` is the
++    chain of (object, key) the walk traversed from the document root, so an agreeing duplicate
++    mark on the ENCLOSING wiring can be attributed to the registrations beneath it (#1262
++    re-review P2 round 2)."""
+     out = []
+     hooks = doc.get("hooks") if isinstance(doc, dict) else None
+     if layout == "flat":
+         for tbl in hooks if isinstance(hooks, list) else []:
+             if isinstance(tbl, dict) and tbl.get("event") == event and isinstance(tbl.get("command"), str):
+-                out.append((tbl["command"], tbl.get("timeout")))
++                out.append((tbl["command"], tbl.get("timeout"), tbl, ((doc, "hooks"),)))
+         return out
+     groups = hooks.get(event) if isinstance(hooks, dict) else None
+     for group in groups if isinstance(groups, list) else []:
+         for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
+             if isinstance(h, dict) and isinstance(h.get("command"), str):
+-                out.append((h["command"], h.get("timeout")))
++                out.append((h["command"], h.get("timeout"), h,
++                            ((doc, "hooks"), (hooks, event), (group, "hooks"))))
+     return out
+ 
+ 
+@@ -287,9 +354,21 @@
+ 
+ 
+ def _load_config(path: str, reader: str):
+-    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan").
++    """(parsed document, None, dupes) or (None, why, {}). `dupes` maps id(marked object) to
++    (the marked object, {repeated key: [occurrences in order]}), for the JSON reader only:
++    json.loads is last-wins — as the harness's own parser is — so a duplicated key is no
++    measured deadline overrun, but it IS ambiguous wiring, MISWIRED evidence under the
++    protocol's duplicate rule (#1262 re-review P2). TOML rejects a duplicate key at parse, so
++    the tomllib path never marks anything. A TOML config without tomllib is (None, "scan", {}).
++    The mark carries its object: holding it keeps the id from being recycled once an overwritten
++    object is freed, and the lookup re-checks identity — a bare id() can be handed to a later
++    allocation, which would hang a stranger's repeated key on a clean registration (#1262
++    re-review B1). Occurrences are kept so an ENCLOSING key whose copies agree (deep-equal) can
++    be told from one the harness's last-wins parser silently chooses between (#1262 re-review
++    P2 round 2).
+     Cached on (path, reader, mtime, size): the timeout bound and the registered-surface read
+-    parse each registration once per process, and a changed file is re-read."""
++    parse each registration once per process, and a changed file is re-read. The cached
++    document is what keeps every marked object alive, so a mark's identity holds across hits."""
+     st = os.stat(path)
+     key = (path, reader, st.st_mtime_ns, st.st_size)
+     hit = _CONFIG_CACHE.get(key)
+@@ -304,22 +383,43 @@
+     with open(path, "rb") as fh:
+         raw = fh.read()
+     if reader == "json-hook-commands":
+-        return json.loads(raw.decode("utf-8")), None
++        dupes: dict = {}
++
++        def _pairs(pairs):
++            obj = {}
++            repeated = {}
++            for k, v in pairs:
++                if k in obj:
++                    repeated.setdefault(k, [obj[k]]).append(v)
++                obj[k] = v
++            if repeated:
++                dupes[id(obj)] = (obj, repeated)
++            return obj
++
++        return json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs), None, dupes
+     try:
+         import tomllib  # type: ignore
+     except ImportError:
+-        return None, "scan"
+-    return tomllib.loads(raw.decode("utf-8")), None
+-
+-
+-def _scan_timeouts(path: str, base: str) -> Optional[list]:
+-    """No TOML parser: every `timeout = N` in a file that names this hook at all. Conservative —
+-    the smallest of them can only shorten the bound. None when the file does not name the hook."""
++        return None, "scan", {}
++    return tomllib.loads(raw.decode("utf-8")), None, {}
++
++
++def _dupe_marks(dupes: dict, obj: Any) -> Optional[dict]:
++    """The {repeated key: occurrences} recorded for THIS object, or None. The mark is accepted
++    only by identity: a bare id() match proves nothing, because an overwritten duplicate's object
++    is freed and its id can be recycled onto a clean registration (#1262 re-review B1)."""
++    mark = dupes.get(id(obj)) if dupes else None
++    if mark is not None and mark[0] is obj:
++        return mark[1]
++    return None
++
++
++def _text_mentions_hook(path: str, base: str) -> bool:
++    """Boolean relevance ONLY: does this file's text mention the hook at all. Reads no value —
++    the protocol forbids inferring a deadline from a lexical scan (#1262); it exists to split a
++    broken file that appears to register this hook (MISWIRED) from one that does not (drops)."""
+     with open(path, encoding="utf-8", errors="replace") as fh:
+-        text = fh.read()
+-    if base not in text:
+-        return None
+-    return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
++        return base in fh.read()
+ 
+ 
+ def _all_hook_commands(doc: Any, layout: str) -> list:
+@@ -356,7 +456,7 @@
+             if not path or not os.path.isfile(path):
+                 continue
+             reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
+-            doc, how = _load_config(path, reader)
++            doc, how, _dupes = _load_config(path, reader)
+             if how == "scan":
+                 with open(path, encoding="utf-8", errors="replace") as fh:
+                     commands = [m.group(1) or m.group(2) or "" for m in _SCAN_COMMAND.finditer(fh.read())]
+@@ -389,84 +489,119 @@
+ 
+     `harness` is the shim's HARNESS data: where this harness records its hooks (`registrations`:
+     reader, layout, path with `~`/`${VAR:-default}`/`{cwd}`), the hook `event`, the timeout's
+-    unit, the harness's own default when an entry omits it (None when unknown), `on_timeout`
+-    and `margin_seconds`. Every registration of THIS file on the event counts (its realpath, or
+-    failing any such match its basename), from every source that exists, and the SMALLEST
+-    timeout wins: a smaller bound costs availability, never safety. A non-harness invoker's
+-    HESTIA_HOOK_TIMEOUT_S joins the same minimum.
+-
+-    Returns `HarnessBound(deadline=start + timeout - margin, ...)`, or `deadline=None` with the
+-    reason when no enforced timeout could be established."""
++    unit, `on_timeout` and `margin_seconds` (the proportional margin's cap). A vendor default
++    timeout the data may carry is a harness FACT, not a security semantic: never substituted.
++
++    The critical-timeout protocol (dp ruling on #1262, 2026-10-07): canonical or MISWIRED.
++    The bound resolves to ONE registration binding THIS file exactly (its realpath) on the
++    event, carrying ONE explicit timeout that `validate_timeout` accepts — present, numeric,
++    inside the envelope after the unit, rejected outside and never clamped or defaulted.
++    Anything else that APPEARS to register this hook contributes no deadline, only MISWIRED
++    evidence, and closes the bound: a missing or non-numeric timeout, an out-of-envelope
++    value, an unparseable or unreadable config naming the hook, no parser available for it, a
++    relative, foreign or shell-punctuated command naming its basename — read again after the
++    shell's own quote and backslash removal, because the shell runs that file (the timeout
++    cannot be bound to the exact registered hook), a JSON registration object that repeats a
++    key, or wiring that encloses it repeating a key with an identical value (the harness's own
++    parser is last-wins; ambiguous wiring is not a binding), or duplicate/conflicting bindings.
++    A config whose text never mentions this hook is irrelevant
++    and drops. The gate NEVER infers a deadline from a partial lexical scan. A non-harness
++    invoker's explicit HESTIA_HOOK_TIMEOUT_S joins the minimum: it can only shorten.
++
++    Returns `HarnessBound(deadline=start + timeout - margin, ...)` with the proportional
++    margin max(0.5, min(cap, timeout * 0.15)), or `deadline=None` with the MISWIRED reason (or
++    the plain no-registration reason) when no enforced timeout could be established."""
+     env = os.environ if env is None else env
+-    margin = float(harness.get("margin_seconds") or 0.0)
++    margin_cap = float(harness.get("margin_seconds") or 1.5)
+     on_timeout = str(harness.get("on_timeout") or "unknown")
+     try:
+         unit = float(harness.get("timeout_unit_seconds") or 1.0)
+-        default = harness.get("default_timeout_seconds")
+         event = harness.get("event") or ""
+         me = os.path.realpath(self_path)
+         base = os.path.basename(me)
+-        exact, by_name, sources, problems = [], [], [], []
++        bindings, problems = [], []
+         for reg in harness.get("registrations") or ():
+             path = _expand(str(reg.get("path") or ""), env, cwd)
+             if not path or not os.path.isfile(path):
+-                continue
++                continue                       # not configured there: nothing registers
+             reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
+             try:
+-                doc, how = _load_config(path, reader)
+-            except Exception as exc:  # noqa: BLE001 — an unreadable registration is no bound
+-                problems.append(f"{path}: unreadable ({type(exc).__name__})")
++                doc, how, dupes = _load_config(path, reader)
++            except Exception as exc:  # noqa: BLE001 — a parse failure must not swallow this hook
++                try:
++                    relevant = _text_mentions_hook(path, base)
++                except Exception:  # noqa: BLE001 — unreadable: it may be the registration
++                    relevant = True
++                if relevant:
++                    problems.append(f"{path}: MISWIRED: appears to register this hook but "
++                                    f"cannot be parsed or read ({type(exc).__name__})")
++                continue                       # its text never names this hook: irrelevant
++            if how == "scan":
++                if _text_mentions_hook(path, base):
++                    problems.append(f"{path}: MISWIRED: appears to register this hook and no "
++                                    f"parser is available for it")
+                 continue
+-            if how == "scan":
+-                values = _scan_timeouts(path, base)
+-                if values is None:
+-                    continue
+-                if not values and default is None:
+-                    problems.append(f"{path}: names this hook but no timeout could be read")
+-                    continue
+-                vals = [v * unit for v in values] + ([float(default)] if default is not None else [])
+-                by_name.append((min(vals), f"{path} (line scan, smallest timeout in the file)"))
+-                continue
+-            for command, timeout in _hook_entries(doc, reader, layout, event):
++            for command, timeout, hook_obj, ancestors in _hook_entries(doc, reader, layout, event):
+                 targets = _command_targets(command, env)
+                 hit_exact = any(os.path.realpath(t) == me for t in targets)
+-                hit_name = hit_exact or any(os.path.basename(t) == base for t in targets)
+-                if not hit_name:
++                if not hit_exact:
++                    if _names_hook(command, env, base):
++                        problems.append(f"{path}: MISWIRED: names this hook without binding it "
++                                        f"exactly (a relative, foreign or shell-punctuated command "
++                                        f"cannot bind a timeout to the registered hook)")
++                    continue                   # some other hook's entry: irrelevant
++                repeated = _dupe_marks(dupes, hook_obj)
++                if repeated:
++                    problems.append(f"{path}: MISWIRED: this hook's registration repeats key "
++                                    f"{sorted(repeated)} — the harness's JSON parser is last-wins, "
++                                    f"so an ambiguous entry is not a binding")
+                     continue
+-                if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+-                    seconds = float(timeout) * unit
+-                    where = f"{path}: timeout {timeout}"
+-                elif default is not None:
+-                    seconds = float(default)
+-                    where = f"{path}: no timeout declared, harness default {default}s"
+-                else:
+-                    problems.append(f"{path}: registers this hook with no timeout, and this "
+-                                    f"harness's default is not known")
++                enclosing = next((key for container, key in ancestors
++                                  if (marks := _dupe_marks(dupes, container)) and key in marks
++                                  and all(v == marks[key][-1] for v in marks[key])), None)
++                if enclosing is not None:
++                    problems.append(f"{path}: MISWIRED: the wiring enclosing this hook's "
++                                    f"registration repeats key {enclosing!r} with an identical "
++                                    f"value (an agreeing duplicate) — the harness's JSON parser "
++                                    f"is last-wins, so ambiguous wiring is not a binding")
+                     continue
+-                (exact if hit_exact else by_name).append((seconds, where))
+-        found = exact or by_name
++                seconds, why = validate_timeout(timeout, unit)
++                if seconds is None:
++                    problems.append(f"{path}: MISWIRED: {why}")
++                    continue
++                bindings.append((seconds, f"{path}: timeout {timeout}"))
++        if len(bindings) > 1:
++            problems.append("MISWIRED: duplicate/conflicting registrations of this hook ("
++                            + "; ".join(w for _, w in bindings) + ")")
++            bindings = []
++        found = list(bindings)
+         declared = env.get(HOOK_TIMEOUT_ENV)
+         if declared:
+             try:
+                 d = float(declared)
+                 if d > 0:
+                     found = found + [(d, f"{HOOK_TIMEOUT_ENV}={declared} (the invoker's declaration)")]
++                else:
++                    problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not positive")
+             except ValueError:
+                 problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not a number")
+-        if problems and not exact:
+-            # A registration of this hook we could not read may carry the smaller timeout.
+-            return HarnessBound(None, None, margin, on_timeout, tuple(w for _, w in found),
++        if problems:
++            # Whatever appears to register this hook but is not one exact, canonical
++            # registration contributes no deadline — MISWIRED is wiring evidence, never a
++            # guessed timeout.
++            return HarnessBound(None, None, margin_cap, on_timeout, tuple(w for _, w in found),
+                                 "; ".join(problems))
+         if not found:
+-            return HarnessBound(None, None, margin, on_timeout, (),
++            return HarnessBound(None, None, margin_cap, on_timeout, (),
+                                 f"no registration of {base} on {event or 'its event'} was found "
+                                 f"in this harness's configuration, and no {HOOK_TIMEOUT_ENV} was "
+                                 f"declared")
+         timeout = min(s for s, _ in found)
+-        sources.extend(w for _, w in found)
+-        return HarnessBound(start + timeout - margin, timeout, margin, on_timeout, tuple(sources))
++        margin = max(MARGIN_FLOOR_SECONDS, min(margin_cap, timeout * MARGIN_RATE))
++        return HarnessBound(start + timeout - margin, timeout, margin, on_timeout,
++                            tuple(w for _, w in found))
+     except Exception as exc:  # noqa: BLE001 — a reader that breaks establishes nothing
+-        return HarnessBound(None, None, margin, on_timeout, (),
++        return HarnessBound(None, None, margin_cap, on_timeout, (),
+                             f"the registration reader failed ({type(exc).__name__}: {exc})")
+ 
+ 
+diff --git a/plugins/claude-code/hooks/hooks.json b/plugins/claude-code/hooks/hooks.json
+--- a/plugins/claude-code/hooks/hooks.json
++++ b/plugins/claude-code/hooks/hooks.json
+@@ -1,7 +1,7 @@
+ {
+   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Claude Code hooks (~/.claude/settings.json). deploy/register-members.py renders @HESTIA_PLUGIN_ROOT@/claude-code/hooks/<file> to the member's declared install dest (expects.json install.dest) and merges, by target basename, only the hooks the settings do not already carry. It renders @HESTIA_HOME@ to the deploying environment's HESTIA_HOME as an absolute path (unset refuses: the bootstrap locator has no default) on the gate and the witness, the two hooks that load the seat projection, together with HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\": the role is launch context, never config (the projection cannot carry it), so the line passes a launcher's HESTIA_ROLE through and otherwise defaults to this member's install.default_role (no declaration drops the token). Since dp's 2026-10-06 ruling the deployer OWNS these lines: every line it installed is rewritten to this template on each deploy; per-seat customisation goes through the vault's seat projection, never a hand edit to a hook line. Unrendered placeholders must never be deployed. Shapes and timeouts mirror the registration measured on thor 2026-09-28.",
+   "_why": "Before this file, claude-code's registration was a hand edit on every host (#1133, #1135): the plugin shipped pre_tool_use.py, witness.py and law_inject.py and nothing wrote them into settings.json. The daemon's install_claude_code merges only the witness. This template is what the installer renders.",
+-  "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the registration this template becomes (seconds; Claude Code's default for an entry without one is 60) and decides inside start + timeout - 1.5 s, so it always fails closed before Claude Code kills it (a hook timeout is a non-blocking error there: the tool runs, i.e. fail-open). 10 s absorbs one cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
++  "_timeout_contract": "One-gate stage C, critical-timeout protocol (#1262). The PreToolUse gate READS its timeout from the registration this template becomes (seconds). The value must be ONE explicit, structurally parsed timeout inside the canonical 3-30 s envelope: a missing, duplicate, unreadable or out-of-envelope timeout is MISWIRED and closes the bound — Claude Code's 60 s vendor default is never substituted. The gate decides inside start + timeout - margin with margin = max(0.5, min(1.5, timeout*0.15)), so it always fails closed before Claude Code kills it (a hook timeout is a non-blocking error there: the tool runs, i.e. fail-open). 10 s absorbs one cold member connect (measured 4.6-5.1 s). A registration outside the envelope is rejected, not clamped; deploy/register-members.py reports a noncanonical one.",
+   "_disposition_reader": "disposition_deliver.py (PRD_DISPOSITION_DELIVERY R4/R4a, #845, #849) renders the daemon's ruling on the asker's own hook stream, so an asker learns 'approved, re-issue the same act' without the operator relaying it in chat. PreToolUse and PostToolUse are the ports that reach a SUBAGENT (every tool call it makes fires them, carrying the parent's session_id plus its own agent_id, measured on Claude Code 2.1.290, 2026-10-06); UserPromptSubmit reaches only the interactive parent idle at its prompt. PreToolUse renders on the asker's very next call; PostToolUse catches a ruling that lands during a long call. It is a stat on one file and fails silent, so 3 s, the witness's budget. It carries HESTIA_HOME because the lane lives in the daemon's home, and no HESTIA_ROLE because it loads no seat projection. Before this entry the reader shipped in expects.json and no host registered it (CBP's deploy log: 'skip disposition_deliver.py - not registered on this host'), so every ruling still went by hand.",
+   "_member_mesh": "#1373 (dp 2026-10-23: the mesh is 'a standard part of what hestia does, fleet-wide, and installation should be automatic'). The member-mesh pair, rendered like every other line here: SessionStart surfaces this member's pending mesh notices (session-mesh-inbox.sh), UserPromptSubmit surfaces a ruling that lands mid-session (prompt-disposition-watch.sh, #366). HESTIA_MESH_PLUGIN is PINNED on the line because #108 removed the CLI's default: an unpinned line is a DARK member (plugins/member-mesh/install.sh's refusal), and a pin rendered by the deployer can never be missing. The role is the same pass-through as the gate's. Both scripts and their CLI (hestia-mesh.py, an install.companions entry) are installed beside each other by install-members.sh, because both call $(dirname $0)/hestia-mesh.py. A host whose mesh lines were registered by hand elsewhere keeps them: a same-named line at another target is FOREIGN and never rewritten or duplicated.",
+   "hooks": {
+diff --git a/plugins/codex/hooks/hooks.json b/plugins/codex/hooks/hooks.json
+--- a/plugins/codex/hooks/hooks.json
++++ b/plugins/codex/hooks/hooks.json
+@@ -1,7 +1,7 @@
+ {
+   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Codex CLI hooks. Codex loads hooks from a hooks.json or inline hook tables in its user configuration. Requires codex_hooks enabled. Replace both placeholders with verified absolute paths before installing; unrendered placeholders must never be deployed.",
+   "_paths_note": "Replace @HESTIA_HOME@, @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ at install time (deploy/register-members.py does: @HESTIA_HOME@ is the deploying environment's HESTIA_HOME as an absolute path, refused when unset -- the gate and the witness load the seat projection through it, #1242). HESTIA_ROLE is passed through with install.default_role as its default (codex declares none: the token is dropped and the daemon default applies). @HESTIA_PLUGIN_SOURCE@ is the deployed plugin directory: hydrate.sh reads instance/identity.seed.json from CODEX_PLUGIN_ROOT, and the installer does not copy the seed under the dest. The deployer owns the lines it installs and rewrites them to this template on each deploy (dp 2026-10-06). The public repository carries no operator-specific workspace path.",
+-  "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the registration this template becomes (seconds; an entry without one is refused, since Codex's default is not documented here) and decides inside start + timeout - 1.5 s, so it always fails closed before Codex kills it (Codex marks a timed-out hook failed and the tool call continues, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
++  "_timeout_contract": "One-gate stage C, critical-timeout protocol (#1262). The PreToolUse gate READS its timeout from the registration this template becomes (seconds). The value must be ONE explicit, structurally parsed timeout inside the canonical 3-30 s envelope: a missing, duplicate, unreadable or out-of-envelope timeout is MISWIRED and closes the bound — no vendor default is ever substituted (Codex's is not documented here). The gate decides inside start + timeout - margin with margin = max(0.5, min(1.5, timeout*0.15)), so it always fails closed before Codex kills it (Codex marks a timed-out hook failed and the tool call continues, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). A registration outside the envelope is rejected, not clamped; deploy/register-members.py reports a noncanonical one.",
+   "_member_mesh": "#1373 (dp 2026-10-23: the mesh is 'a standard part of what hestia does, fleet-wide, and installation should be automatic'). The member-mesh pair, rendered like every other line here: SessionStart surfaces this member's pending mesh notices (session-mesh-inbox.sh), UserPromptSubmit surfaces a ruling that lands mid-session (prompt-disposition-watch.sh, #366). HESTIA_MESH_PLUGIN is PINNED on the line because #108 removed the CLI's default: an unpinned line is a DARK member (plugins/member-mesh/install.sh's refusal), and a pin rendered by the deployer can never be missing. The role is the same pass-through as the gate's. Both scripts and their CLI (hestia-mesh.py, an install.companions entry) are installed beside each other by install-members.sh, because both call $(dirname $0)/hestia-mesh.py. A host whose mesh lines were registered by hand elsewhere keeps them: a same-named line at another target is FOREIGN and never rewritten or duplicated.",
+   "hooks": {
+     "PreToolUse": [
+diff --git a/plugins/gemini/hooks/hooks.json b/plugins/gemini/hooks/hooks.json
+--- a/plugins/gemini/hooks/hooks.json
++++ b/plugins/gemini/hooks/hooks.json
+@@ -2,7 +2,7 @@
+   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Gemini CLI user-level hooks. Prefer plugins/gemini/install.sh, which renders verified absolute runtime paths. Project-source hooks may be gated by the harness trust setting and are not a substitute for user-level installation.",
+   "_paths_note": "Replace @HESTIA_HOME@ (the deploying environment's HESTIA_HOME, absolute; deploy/register-members.py refuses when it is unset), @HESTIA_DEFAULT_ROLE@ (install.default_role, inside a HESTIA_ROLE pass-through; dropped when undeclared), @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ before installation, then verify every command target exists. Unrendered placeholders must never be installed: a missing hook process may fail open in the harness.",
+   "_hooksConfig_note": "Pin \"hooksConfig\": {\"enabled\": true} in settings.json alongside this block. It defaults true, but \"enabled\": false disarms every hook and hooksConfig.disabled can disable this gate by command string. Operator's prerogative, but it must be visible to anything auditing the member.",
+-  "_timeout_contract": "One-gate stage C. The BeforeTool gate READS its timeout from the registration this template becomes (MILLISECONDS; gemini-cli's default for an entry without one is 60000) and decides inside start + timeout - 1.5 s, so it always fails closed before gemini-cli kills it (a timed-out hook produces no output and the tool proceeds, i.e. fail-open). 15000 ms absorbs a cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
++  "_timeout_contract": "One-gate stage C, critical-timeout protocol (#1262). The BeforeTool gate READS its timeout from the registration this template becomes (MILLISECONDS). The value must be ONE explicit, structurally parsed timeout inside the canonical 3-30 s envelope (3000-30000 ms): a missing, duplicate, unreadable or out-of-envelope timeout is MISWIRED and closes the bound — gemini-cli's 60000 ms vendor default is never substituted. The gate decides inside start + timeout - margin with margin = max(0.5, min(1.5, timeout*0.15)), so it always fails closed before gemini-cli kills it (a timed-out hook produces no output and the tool proceeds, i.e. fail-open). 15000 ms absorbs a cold member connect (measured 4.6-5.1 s). A registration outside the envelope is rejected, not clamped; deploy/register-members.py reports a noncanonical one.",
+   "hooks": {
+     "BeforeTool": [
+       {
+diff --git a/plugins/kimi/hooks/hooks.json b/plugins/kimi/hooks/hooks.json
+--- a/plugins/kimi/hooks/hooks.json
++++ b/plugins/kimi/hooks/hooks.json
+@@ -1,7 +1,7 @@
+ {
+   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Kimi Code hooks. deploy/register-members.py renders it into ~/.kimi-code/config.toml as flat `[[hooks]] event = ...` tables (install.registration.layout = flat), reconciling by target: a line whose target is under the declared dest is hestia's and is rewritten to this template on every deploy (dp 2026-10-06); any other line is never touched. @HESTIA_HOME@ renders to the deploying environment's HESTIA_HOME as an absolute path, refused when unset (#1237); HESTIA_ROLE passes a launcher's value through and otherwise defaults to install.default_role. Unrendered placeholders must never be deployed.",
+   "_witness_note": "witness.py is the hook that reaches the daemon; kimi fires PostToolUseFailure INSTEAD of PostToolUse for a failed call, so the witness is registered on both. Before 2026-09-28 kimi shipped no witness: its seat ran a private 07-26 copy of claude-code's that never saw a failure and never closed a gated action (findings/per-harness-witness-drift-2026-09-28.md).",
+-  "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the flat [[hooks]] table this template becomes (seconds; an entry without one is refused, since Kimi's default is not documented here) and decides inside start + timeout - 1.5 s, so it always fails closed before Kimi kills it (Kimi's engine allows the tool on a timeout, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). Nothing in this template sets HESTIA_PRE_TOTAL_BUDGET_MS: since stage C no gate reads it (the deadline is the registration's), so a hand-added one on a registered command is inert and should be removed.",
++  "_timeout_contract": "One-gate stage C, critical-timeout protocol (#1262). The PreToolUse gate READS its timeout from the flat [[hooks]] table this template becomes (seconds). The value must be ONE explicit, structurally parsed timeout inside the canonical 3-30 s envelope: a missing, duplicate, unreadable or out-of-envelope timeout is MISWIRED and closes the bound — Kimi's documented 30 s vendor default is never substituted. The gate decides inside start + timeout - margin with margin = max(0.5, min(1.5, timeout*0.15)), so it always fails closed before Kimi kills it (Kimi's engine allows the tool on a timeout, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). A registration outside the envelope is rejected, not clamped; deploy/register-members.py reports a noncanonical one. Nothing in this template sets HESTIA_PRE_TOTAL_BUDGET_MS: since stage C no gate reads it (the deadline is the registration's), so a hand-added one on a registered command is inert and should be removed.",
+   "_member_mesh": "#1373 (dp 2026-10-23: the mesh is 'a standard part of what hestia does, fleet-wide, and installation should be automatic'). The member-mesh pair, rendered like every other line here: SessionStart surfaces this member's pending mesh notices (session-mesh-inbox.sh), UserPromptSubmit surfaces a ruling that lands mid-session (prompt-disposition-watch.sh, #366). HESTIA_MESH_PLUGIN is PINNED on the line because #108 removed the CLI's default: an unpinned line is a DARK member (plugins/member-mesh/install.sh's refusal), and a pin rendered by the deployer can never be missing. The role is the same pass-through as the gate's. Both scripts and their CLI (hestia-mesh.py, an install.companions entry) are installed beside each other by install-members.sh, because both call $(dirname $0)/hestia-mesh.py. A host whose mesh lines were registered by hand elsewhere keeps them: a same-named line at another target is FOREIGN and never rewritten or duplicated.",
+   "hooks": {
+     "PreToolUse": [
+diff --git a/plugins/kimi/hooks/pre_tool_use.py b/plugins/kimi/hooks/pre_tool_use.py
+--- a/plugins/kimi/hooks/pre_tool_use.py
++++ b/plugins/kimi/hooks/pre_tool_use.py
+@@ -8,8 +8,13 @@
+ 
+ HARNESS FACTS (data below, not code):
+   - registration: flat `[[hooks]]` tables (`event = "PreToolUse"`) in `~/.kimi-code/config.toml`;
+-    `timeout` in seconds. Kimi's default for an entry that declares none is not documented
+-    here, so such an entry is refused, never guessed.
++    `timeout` in seconds. Kimi's vendor default for an entry that declares none is 30 s,
++    verified from the binary: `hook.timeout ?? DEFAULT_HOOK_TIMEOUT_SECONDS` (agent-core-v2
++    `matchHooks`, 2.1.1). A vendor default is a harness FACT, never a security semantic:
++    under the critical-timeout protocol (#1262) the bound comes only from ONE explicit,
++    structurally parsed, in-envelope (3-30 s) timeout on the exact registration — a missing,
++    duplicate, unreadable or unparseable one is MISWIRED and closes the bound
++    (`gate.harness_timeout_unknown`).
+   - Kimi's hook engine FAILS OPEN on every failure mode (verified from the binary: timeout,
+     spawn failure, a non-2 exit, an exception all allow the tool).
+   - the correlation key is Kimi's `tool_call_id`, read from the raw event by the common gate.
+@@ -226,7 +231,7 @@
+         {"reader": "toml-hook-commands", "layout": "flat", "path": "~/.kimi-code/config.toml"},
+     ),
+     "timeout_unit_seconds": 1,
+-    "default_timeout_seconds": None,
++    "default_timeout_seconds": 30,
+     "on_timeout": ("fail-open: Kimi's hook engine allows the tool on a timeout, a spawn "
+                    "failure, a non-2 exit or an exception"),
+     "margin_seconds": 1.5,
+diff --git a/plugins/gemini/tests/channel_contract_test.py b/plugins/gemini/tests/channel_contract_test.py
+--- a/plugins/gemini/tests/channel_contract_test.py
++++ b/plugins/gemini/tests/channel_contract_test.py
+@@ -93,8 +93,11 @@
+ ENV = {k: v for k, v in os.environ.items()
+        if k not in ("HESTIA_SHARED_DIR", "HESTIA_ENDPOINT", "HESTIA_WORKSPACE", "HESTIA_GATE_MODE")}
+ # The test is the hook's invoker, so it declares the timeout it enforces (subprocess default
+-# below is none; 20 s is ample) and the gate decides inside it.
+-ENV.update(HESTIA_HOME=HOME, HESTIA_HOOK_TIMEOUT_S="20")
++# below is none; 20 s is ample) and the gate decides inside it. HOME is the fixture: inheriting
++# the operator's real home would leak the LIVE seat's registration (~/.gemini/settings.json),
++# which names this hook's basename without binding this fixture shim exactly — MISWIRED
++# (ambiguous hook ownership) under the critical-timeout protocol (#1262).
++ENV.update(HESTIA_HOME=HOME, HESTIA_HOOK_TIMEOUT_S="20", HOME=HOME)
+ CWD = os.path.join(V, "ws", "web4")
+ FORBIDDEN = "sec" + "rets"   # assembled: this file's text must not carry the token the gate matches
+ 
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -1606,11 +1606,12 @@
+ def test_the_bound_is_the_real_registration(m, g, wc, home):
+     """THE SAFETY INVARIANT (dp 2026-10-02): the deadline is the hook process's start plus the
+     timeout the harness REALLY enforces, read from its live registration, minus the margin — for
+-    every seat, in each harness's own config shape and unit. Never the default, never a template;
+-    the smallest of several registrations wins; an unreadable or absent one is refused."""
++    every seat, in each harness's own config shape and unit. Never the default, never a template.
++    The critical-timeout protocol (#1262): ONE exact, canonical registration or MISWIRED — a
++    missing, out-of-envelope or duplicate timeout closes the bound; an absent one is refused."""
+     real_config = {"claude-code": ("json-hook-commands", "nested", "settings.json", 1, 60),
+                    "codex": ("toml-hook-commands", "nested", "config.toml", 1, None),
+-                   "kimi": ("toml-hook-commands", "flat", "config.toml", 1, None),
++                   "kimi": ("toml-hook-commands", "flat", "config.toml", 1, 30),
+                    "gemini": ("json-hook-commands", "nested", "settings.json", 0.001, 60)}
+     for seat in SEATS:
+         shim_mod = _shim_module(seat)
+@@ -1620,6 +1621,10 @@
+               and primary.get("layout", "nested") == layout and primary["path"].endswith(cfg_name)
+               and shim_mod.HARNESS["timeout_unit_seconds"] == unit
+               and shim_mod.HARNESS["default_timeout_seconds"] == default, shim_mod.HARNESS)
++        # The margin cap, directly (#1259 A6): with no cap declared the bound could equal the
++        # enforced deadline and the shim would race the harness's kill.
++        check(f"{seat}-declares-a-positive-margin",
++              float(shim_mod.HARNESS.get("margin_seconds") or 0) > 0, shim_mod.HARNESS)
+         with tempfile.TemporaryDirectory() as td:
+             h = pathlib.Path(td)
+             env = {"HOME": str(h)}
+@@ -1635,28 +1640,250 @@
+             b = g.harness_bound(harness, str(shim), t0, env=env)
+             check(f"{seat}-bound-is-the-registered-7s", b.timeout_seconds is not None
+                   and abs(b.timeout_seconds - 7.0) < 1e-9, b)
++            # The margin is proportional and bounded (#1262): max(0.5, min(cap, timeout*0.15)).
++            want_margin = max(0.5, min(harness["margin_seconds"], 7.0 * 0.15))
+             check(f"{seat}-deadline-strictly-below-the-harness", b.deadline is not None
+-                  and b.deadline < t0 + 7.0 and abs(b.deadline - (t0 + 7.0 - harness["margin_seconds"])) < 1e-6, b)
++                  and b.deadline < t0 + 7.0 and abs(b.deadline - (t0 + 7.0 - want_margin)) < 1e-6
++                  and abs(b.margin_seconds - want_margin) < 1e-9, b)
+             check(f"{seat}-declares-what-the-harness-does", "fail-open" in b.on_timeout, b)
+             b2 = g.harness_bound(harness, str(shim), t0, env=dict(env, HESTIA_HOOK_TIMEOUT_S="4"))
+             check(f"{seat}-a-declaration-can-only-shorten", b2.timeout_seconds == 4.0, b2)
+             b3 = g.harness_bound(harness, str(shim), t0, env=dict(env, HESTIA_HOOK_TIMEOUT_S="60"))
+             check(f"{seat}-a-declaration-cannot-lengthen", abs(b3.timeout_seconds - 7.0) < 1e-9, b3)
+-            # Two registrations of the same hook: the SMALLER one bounds this invocation.
+-            _write_registration(cfg, seat, shim, seven, extra_timeout=4000 if seat == "gemini" else 4)
++            # The canonical envelope (3-30 s, in the harness's own unit): edges accepted.
++            for raw, seconds in (((3000, 3.0), (30000, 30.0)) if seat == "gemini"
++                                 else ((3, 3.0), (30, 30.0))):
++                _write_registration(cfg, seat, shim, raw)
++                b = g.harness_bound(harness, str(shim), t0, env=env)
++                check(f"{seat}-envelope-edge-{seconds:g}s-accepted", b.timeout_seconds == seconds, b)
++            for raw, seconds in (((2000, 2), (31000, 31)) if seat == "gemini"
++                                 else ((2, 2), (31, 31))):
++                _write_registration(cfg, seat, shim, raw)
++                b = g.harness_bound(harness, str(shim), t0, env=env)
++                check(f"{seat}-outside-envelope-{seconds}s-miswired",
++                      b.deadline is None and "MISWIRED" in b.why and "envelope" in b.why, b)
++            # Two registrations of the same hook, even AGREEING ones: duplicate is MISWIRED.
++            _write_registration(cfg, seat, shim, seven,
++                                extra_timeout=7000 if seat == "gemini" else 7)
+             b = g.harness_bound(harness, str(shim), t0, env=env)
+-            check(f"{seat}-the-smallest-registration-wins", b.timeout_seconds == 4.0, b)
+-            # No timeout field: the harness's documented default, or a refusal when unknown.
++            check(f"{seat}-duplicate-registrations-are-miswired",
++                  b.deadline is None and "duplicate" in b.why, b)
++            # No timeout field: MISWIRED, whatever the vendor default (a data fact, not a semantic).
+             _write_registration(cfg, seat, shim, None)
+             b = g.harness_bound(harness, str(shim), t0, env=env)
+-            if default is None:
+-                check(f"{seat}-untimed-with-unknown-default-refused", b.deadline is None, b)
+-            else:
+-                check(f"{seat}-untimed-uses-the-harness-default", b.timeout_seconds == float(default), b)
+-            # An unreadable config that names the hook establishes nothing.
++            check(f"{seat}-untimed-is-miswired", b.deadline is None and "MISWIRED" in b.why, b)
++            # A broken config that does not name the hook is irrelevant: it drops.
+             cfg.write_text("{not json or toml")
+             b = g.harness_bound(harness, str(shim), t0, env=env)
+             check(f"{seat}-unreadable-config-no-bound", b.deadline is None, b)
++
++
++def test_canonical_or_miswired(m, g, wc, home):
++    """The critical-timeout protocol (dp ruling on #1262, superseding the #1259 scan recovery):
++    the bound resolves to ONE exact, canonical registration — structurally parsed, explicit,
++    in-envelope — and anything else that appears to register the hook is MISWIRED evidence,
++    never a guessed deadline. One seat's config format suffices: the reader under test is the
++    shared gate."""
++    seat = "kimi"
++    shim_mod = _shim_module(seat)
++    with tempfile.TemporaryDirectory() as td:
++        h = pathlib.Path(td)
++        env = {"HOME": str(h)}
++        shim = h / "hooks" / "gate_hook.py"     # never created: realpath needs no file
++        t0 = time.monotonic()
++
++        def harness(*paths):
++            regs = tuple(dict(shim_mod.HARNESS["registrations"][0], path=str(p)) for p in paths)
++            return dict(shim_mod.HARNESS, registrations=regs)
++
++        def write(path, body):
++            path.write_text(body)
++            return path
++
++        def entry(path, timeout, command=None):
++            t = "" if timeout is None else f"\ntimeout = {timeout}"
++            cmd = command or f"python3 {shim}"
++            return write(path, f'[[hooks]]\nevent = "PreToolUse"\ncommand = "{cmd}"{t}\n')
++
++        def miswired(b):
++            return b.deadline is None and "MISWIRED" in b.why
++
++        abs15 = entry(h / "abs15.toml", 15)
++
++        # A relative (or foreign same-basename) command names the hook but cannot bind it exactly.
++        rel = entry(h / "rel.toml", 5, command="python3 hooks/gate_hook.py")
++        b = g.harness_bound(harness(abs15, rel), str(shim), t0, env=env)
++        check("relative-command-is-miswired", miswired(b), b)
++        foreign = entry(h / "foreign.toml", 5, command="python3 /other/seat/gate_hook.py")
++        b = g.harness_bound(harness(foreign), str(shim), t0, env=env)
++        check("foreign-same-basename-is-miswired", miswired(b), b)
++
++        # A config that fails to parse while naming the hook is MISWIRED; one that does not drops.
++        mal = write(h / "mal.toml", '[[hooks]\nevent = "PreToolUse"\n'
++                                    f'command = "python3 {shim}"\ntimeout = 5\n')
++        b = g.harness_bound(harness(abs15, mal), str(shim), t0, env=env)
++        check("malformed-naming-hook-is-miswired", miswired(b), b)
++        other = write(h / "other.toml", '[[hooks]\nevent = "PreToolUse"\n'
++                                        'command = "python3 other_hook.py"\ntimeout = 5\n')
++        b = g.harness_bound(harness(abs15, other), str(shim), t0, env=env)
++        check("broken-unrelated-config-drops", b.timeout_seconds == 15.0, b)
++
++        # Spellings the STRUCTURAL parser binds and normalizes are accepted; the same text in an
++        # unparseable file is MISWIRED — the gate never infers a deadline from a lexical scan.
++        for label, body in (("scientific", "timeout = 5e0"), ("signed", "timeout = +5")):
++            ok_cfg = write(h / f"ok_{label}.toml",
++                           f'[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {shim}"\n{body}\n')
++            b = g.harness_bound(harness(ok_cfg), str(shim), t0, env=env)
++            check(f"parseable-{label}-normalizes", b.timeout_seconds == 5.0, b)
++            bad = write(h / f"bad_{label}.toml",
++                        f'[[hooks]\nevent = "PreToolUse"\ncommand = "python3 {shim}"\n{body}\n')
++            b = g.harness_bound(harness(bad), str(shim), t0, env=env)
++            check(f"unparseable-{label}-is-miswired", miswired(b), b)
++        inline = write(h / "inline.toml",
++                       f'hooks = [{{event = "PreToolUse", command = "python3 {shim}", timeout = 5}}]\n')
++        b = g.harness_bound(harness(inline), str(shim), t0, env=env)
++        check("parseable-inline-table-binds", b.timeout_seconds == 5.0, b)
++
++        # Omitted is MISWIRED — and a sibling hook's readable timeout is never borrowed.
++        sibling = write(h / "sibling.toml",
++                        f'[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {shim}"\n\n'
++                        f'[[hooks]]\nevent = "SessionStart"\ncommand = "/x/other.sh"\ntimeout = 8\n')
++        b = g.harness_bound(harness(sibling), str(shim), t0, env=env)
++        check("omitted-never-borrows-a-sibling", miswired(b) and "no timeout" in b.why, b)
++
++        # Duplicates, even agreeing ones, in one file or two: MISWIRED.
++        b = g.harness_bound(harness(entry(h / "dup1.toml", 10), entry(h / "dup2.toml", 10)),
++                            str(shim), t0, env=env)
++        check("duplicate-registrations-are-miswired", miswired(b) and "duplicate" in b.why, b)
++
++        # #1262 re-review P1: a shell operator glued to a relative (or exact) spelling still RUNS
++        # this hook — each spelling is EXECUTED below — so it must not drop out of the bound
++        # beside a longer exact registration; it is MISWIRED evidence.
++        real_hook = h / "hooks" / "gate_hook.py"
++        real_hook.parent.mkdir(parents=True, exist_ok=True)
++        real_hook.write_text("print('gate-hook-ran')\n")
++        for label, spelling in (("semicolon", "python3 ./gate_hook.py;"),
++                                ("andand", "python3 ./gate_hook.py&&true"),
++                                ("subshell", "(python3 ./gate_hook.py)"),
++                                ("pipe", "python3 gate_hook.py|cat"),
++                                ("exact-semicolon", f"python3 {real_hook};")):
++            ran = subprocess.run(["sh", "-c", spelling], cwd=str(real_hook.parent),
++                                 capture_output=True, text=True, timeout=30)
++            check(f"p1-shell-actually-runs-{label}",
++                  ran.returncode == 0 and "gate-hook-ran" in ran.stdout, ran)
++            glued = entry(h / f"glued-{label}.toml", 5, command=spelling)
++            b = g.harness_bound(harness(abs15, glued), str(shim), t0, env=env)
++            check(f"p1-glued-{label}-is-miswired", miswired(b), b)
++
++        # #1262 re-review P1 round 2 (codex, notice 18529): the shell's OWN quote and backslash
++        # removal makes these spellings this same file — each is EXECUTED below — so relevance
++        # must read the shell-normalized token as well as the raw text; beside the exact 15s
++        # registration each of these real 5s registrations is MISWIRED evidence, never a drop.
++        for label, spelling in (("quoted-fragment", "python3 ./gate_'hook'.py"),
++                                ("double-quoted-fragment", 'python3 ./gate_"hook".py'),
++                                ("escaped-character", "python3 ./gate_\\hook.py"),
++                                ("quoted-fragment-semicolon", "python3 ./gate_'hook'.py;")):
++            ran = subprocess.run(["sh", "-c", spelling], cwd=str(real_hook.parent),
++                                 capture_output=True, text=True, timeout=30)
++            check(f"p1-shell-actually-runs-{label}",
++                  ran.returncode == 0 and "gate-hook-ran" in ran.stdout, ran)
++            quoted = entry(h / f"quoted-{label}.toml", 5,
++                           command=spelling.replace("\\", "\\\\").replace('"', '\\"'))
++            b = g.harness_bound(harness(abs15, quoted), str(shim), t0, env=env)
++            check(f"p1-quoted-{label}-is-miswired", miswired(b), b)
++
++        # No parser for a config that names the hook: MISWIRED. One that does not: drops.
++        orig_loader = g._load_config
++        try:
++            g._load_config = lambda *a: (None, "scan", {})
++            b = g.harness_bound(harness(abs15), str(shim), t0, env=env)
++            check("no-parser-is-miswired", miswired(b), b)
++            b = g.harness_bound(harness(other), str(shim), t0, env=env)
++            check("no-parser-unrelated-drops", b.deadline is None and "MISWIRED" not in b.why, b)
++        finally:
++            g._load_config = orig_loader
++
++
++def test_json_duplicate_keys_are_miswired(m, g, wc, home):
++    """#1262 re-review P2: the JSON reader is last-wins — as the harness's own parser is — so a
++    hook object carrying a duplicated key is no measured deadline overrun; it is ambiguous
++    wiring, and the protocol counts it MISWIRED rather than binding the surviving value,
++    AGREEING duplicates included. A duplicate inside ANOTHER hook's object is that hook's
++    ambiguity and does not touch this hook's bound."""
++    seat = "claude-code"
++    shim_mod = _shim_module(seat)
++    with tempfile.TemporaryDirectory() as td:
++        h = pathlib.Path(td)
++        env = {"HOME": str(h)}
++        cfg = h / "settings.json"
++        harness = _neutral_harness(shim_mod.HARNESS, cfg)
++        shim = h / "hooks" / "gate_hook.py"     # never created: realpath needs no file
++        t0 = time.monotonic()
++
++        def obj(command, timeout_fragment):
++            return '{"type": "command", "command": "' + command + '", ' + timeout_fragment + '}'
++
++        def write(*entries):
++            cfg.write_text('{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": ['
++                           + ", ".join(entries) + ']}]}}')
++
++        for label, fragment in (("conflicting-5-15", '"timeout": 5, "timeout": 15'),
++                                ("conflicting-15-5", '"timeout": 15, "timeout": 5'),
++                                ("agreeing-10-10", '"timeout": 10, "timeout": 10')):
++            write(obj(f"python3 {shim}", fragment))
++            b = g.harness_bound(harness, str(shim), t0, env=env)
++            check(f"json-duplicate-timeout-{label}-is-miswired",
++                  b.deadline is None and "MISWIRED" in b.why and "repeats key" in b.why, b)
++
++        # A duplicated key in a DIFFERENT hook's object leaves this hook's clean binding alone.
++        write(obj(f"python3 {shim}", '"timeout": 10'),
++              obj("python3 /x/other.py", '"timeout": 5, "timeout": 20'))
++        b = g.harness_bound(harness, str(shim), t0, env=env)
++        check("json-duplicate-in-another-hooks-object-drops", b.timeout_seconds == 10.0, b)
++
++        # #1262 re-review P2 round 2 (codex, notice 18529): AGREEING duplicates on the keys that
++        # ENCLOSE the registration are ambiguous wiring too — the entry-local mark alone misses
++        # them, and a clean 15s bound beside identical copies breaches the duplicate rule.
++        clean15 = obj(f"python3 {shim}", '"timeout": 15')
++        group15 = '{"matcher": "Bash", "hooks": [' + clean15 + ']}'
++        event15 = '"PreToolUse": [' + group15 + ']'
++        cfg.write_text('{"hooks": {' + event15 + '}, "hooks": {' + event15 + '}}')
++        b = g.harness_bound(harness, str(shim), t0, env=env)
++        check("json-agreeing-duplicate-top-hooks-is-miswired",
++              b.deadline is None and "MISWIRED" in b.why and "repeats key" in b.why, b)
++        cfg.write_text('{"hooks": {' + event15 + ', ' + event15 + '}}')
++        b = g.harness_bound(harness, str(shim), t0, env=env)
++        check("json-agreeing-duplicate-event-is-miswired",
++              b.deadline is None and "MISWIRED" in b.why and "repeats key" in b.why, b)
++        cfg.write_text('{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [' + clean15
++                       + '], "hooks": [' + clean15 + ']}]}}')
++        b = g.harness_bound(harness, str(shim), t0, env=env)
++        check("json-agreeing-duplicate-group-hooks-is-miswired",
++              b.deadline is None and "MISWIRED" in b.why and "repeats key" in b.why, b)
++
++        # R2 (claude-code, notice 18530): DISAGREEING duplicates at an enclosing level resolve
++        # last-wins, exactly as the harness's own parser resolves them — the surviving
++        # registration is the one the harness enforces, so it binds.
++        group5 = '{"matcher": "Bash", "hooks": [' + obj(f"python3 {shim}", '"timeout": 5') + ']}'
++        cfg.write_text('{"hooks": {"PreToolUse": [' + group5 + '], "PreToolUse": [' + group15
++                       + ']}}')
++        b = g.harness_bound(harness, str(shim), t0, env=env)
++        check("json-disagreeing-ancestor-binds-last-wins", b.timeout_seconds == 15.0, b)
++
++        # #1262 re-review B1 (claude-code, notice 18530): a duplicate mark is attributed by
++        # object IDENTITY, never by a bare id() — the first group's overwritten note object is
++        # freed, and its recycled id must not hang a stranger's repeated 'k' on the second
++        # group's clean registration.
++        cfg.write_text('{"hooks": {"PreToolUse": ['
++                       '{"matcher": "Bash", "hooks": [], "note": {"k": 1, "k": 2}, "note": 0}, '
++                       '{"matcher": "Bash", "hooks": [' + clean15 + ']}]}}')
++        b = g.harness_bound(harness, str(shim), t0, env=env)
++        check("json-overwritten-objects-id-reuse-still-binds", b.timeout_seconds == 15.0, b)
++
++        # Regression guard: a clean single-key registration still binds.
++        write(obj(f"python3 {shim}", '"timeout": 10'))
++        b = g.harness_bound(harness, str(shim), t0, env=env)
++        check("json-single-key-still-binds", b.timeout_seconds == 10.0, b)
+ 
+ 
+ def test_an_unknown_or_spent_bound_refuses_without_asking(m, g, wc, home):
+@@ -1778,6 +2005,8 @@
+     test_an_internal_error_fails_closed_through_the_one_recorder,
+     test_stage_c_wires_every_seat,
+     test_the_bound_is_the_real_registration,
++    test_canonical_or_miswired,
++    test_json_duplicate_keys_are_miswired,
+     test_an_unknown_or_spent_bound_refuses_without_asking,
+     test_the_launch_role_bound_is_the_gates,
+     test_the_mcp_transport_is_command_scoped,
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: bcda71a1678f1aa69412eff18cc65ad06bf380c61e29243482a54687e9a1e18a  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -220,6 +220,36 @@
+ 
+ _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+ 
++# ── the critical-timeout protocol (dp ruling on #1262, 2026-10-07): canonical or MISWIRED ──
++#: Canonical envelope for a critical hook registration's timeout, seconds. A value outside is
++#: REJECTED (MISWIRED), never clamped. The reconciler WRITES DEFAULT when it canonicalizes a
++#: registration; the gate never substitutes it — a missing timeout is MISWIRED, whatever the
++#: vendor documents.
++MIN_TIMEOUT_SECONDS = 3.0
++DEFAULT_TIMEOUT_SECONDS = 10.0
++MAX_TIMEOUT_SECONDS = 30.0
++#: The margin is proportional and bounded: max(floor, min(cap, timeout * rate)) — the shim's
++#: declared cap from 10 s up, the floor at the 3 s envelope edge.
++MARGIN_FLOOR_SECONDS = 0.5
++MARGIN_RATE = 0.15
++
++
++def validate_timeout(value, unit: float):
++    """The protocol's one validator — the gate is its first consumer; deploy/preflight, the
++    reconciler and the census wire in under #1262 row 10. A STRUCTURALLY parsed timeout field,
++    in the harness's unit, -> (canonical seconds, None), or (None, reason) MISWIRED. No vendor
++    default is ever substituted; an out-of-envelope value is rejected, not clamped."""
++    if value is None:
++        return None, ("no timeout declared (a missing timeout is MISWIRED: a vendor default "
++                      "is not a security semantic)")
++    if not isinstance(value, (int, float)) or isinstance(value, bool):
++        return None, f"timeout {value!r} is not a number the protocol can bind"
++    seconds = float(value) * unit
++    if not MIN_TIMEOUT_SECONDS <= seconds <= MAX_TIMEOUT_SECONDS:
++        return None, (f"timeout {seconds:g}s is outside the canonical envelope "
++                      f"{MIN_TIMEOUT_SECONDS:g}-{MAX_TIMEOUT_SECONDS:g}s (rejected, never clamped)")
++    return seconds, None
++
+ 
+ def _expand(text: str, env, cwd: Optional[str]) -> Optional[str]:
+     """`${VAR:-default}`, `${VAR}`, `$VAR`, `~` and `{cwd}`. None when a variable with no default
+@@ -251,36 +281,73 @@
+     return out
+ 
+ 
+-def _command_targets(command: str, env) -> list:
+-    """Every absolute path a hook command names, expanded the way the harness's shell would."""
++def _command_tokens(command: str, env):
++    """Every token of a hook command, expanded the way the harness's shell would (environment
++    assignments skipped; a token naming an unset variable with no default drops out)."""
+     try:
+         tokens = shlex.split(command)
+     except ValueError:
+         tokens = command.split()
+-    out = []
+     for tok in tokens:
+         if "=" in tok and not tok.startswith(("/", "~", "$")):
+             continue                       # an environment assignment, not the program
+         t = _expand(tok, env, None)
+-        if t and os.path.isabs(t):
+-            out.append(t)
+-    return out
++        if t:
++            yield t
++
++
++def _command_targets(command: str, env) -> list:
++    """Every absolute path a hook command names, expanded the way the harness's shell would."""
++    return [t for t in _command_tokens(command, env) if os.path.isabs(t)]
++
++
++def _names_hook(command: str, env, base: str) -> bool:
++    """Boolean relevance ONLY: does this command appear to invoke this hook. Two readings, and
++    either one is evidence. (1) The basename as a BOUNDED token of the expanded RAW text (of the
++    raw command when a `${VAR}`/`{cwd}` cannot be resolved here) — not a token basename equality:
++    shlex without punctuation_chars glues shell operators onto the token (`./hook.py;`,
++    `hook.py|cat`, `(python3 ./hook.py)`), basename equality misses those, and the entry then
++    DROPS beside a longer exact binding, letting the computed deadline outrun the timeout the
++    harness actually enforces on that spelling (#1262 re-review P1 — every glued spelling was
++    executed under `sh` and runs the hook). (2) The same bounded test on each SHELL-NORMALIZED
++    token — shlex quote and backslash removal (`./gate_'hook'.py`, `./gate_\\hook.py`) — because
++    the shell performs that same removal and the normalized spelling RUNS the hook (#1262
++    re-review P1 round 2: the quoted/escaped spellings were executed under `sh` beside an exact
++    15s registration and the bound outran it at 15s). The edge class [A-Za-z0-9._-] keeps a
++    longer name that merely CONTAINS the basename (`hook.py.bak`, `hook.py5`, `xhook.py`) a
++    different file: it drops. Constructs no lexical reading can resolve — glob patterns
++    (`gate_hoo?.py`), command substitution (`$(printf ...)`) — stay outside this guarantee.
++    Whatever names the hook without an exact realpath binding is MISWIRED evidence; the binding
++    test itself stays exact."""
++    pattern = r"(?<![A-Za-z0-9._-])" + re.escape(base) + r"(?![A-Za-z0-9._-])"
++    text = _expand(command, env, None)
++    if text is None:
++        text = command
++    if re.search(pattern, text):
++        return True
++    return any(re.search(pattern, token) for token in _command_tokens(command, env))
+ 
+ 
+ def _hook_entries(doc: Any, reader: str, layout: str, event: str) -> list:
+-    """[(command, timeout-or-None)] for every hook registered on `event` in a parsed config."""
++    """[(command, timeout-or-None, entry-object, ancestors)] for every hook registered on
++    `event` in a parsed config. The entry object rides along so a duplicate-key mark recorded at
++    parse time can be attributed to the exact registration that carries it; `ancestors` is the
++    chain of (object, key) the walk traversed from the document root, so an agreeing duplicate
++    mark on the ENCLOSING wiring can be attributed to the registrations beneath it (#1262
++    re-review P2 round 2)."""
+     out = []
+     hooks = doc.get("hooks") if isinstance(doc, dict) else None
+     if layout == "flat":
+         for tbl in hooks if isinstance(hooks, list) else []:
+             if isinstance(tbl, dict) and tbl.get("event") == event and isinstance(tbl.get("command"), str):
+-                out.append((tbl["command"], tbl.get("timeout")))
++                out.append((tbl["command"], tbl.get("timeout"), tbl, ((doc, "hooks"),)))
+         return out
+     groups = hooks.get(event) if isinstance(hooks, dict) else None
+     for group in groups if isinstance(groups, list) else []:
+         for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
+             if isinstance(h, dict) and isinstance(h.get("command"), str):
+-                out.append((h["command"], h.get("timeout")))
++                out.append((h["command"], h.get("timeout"), h,
++                            ((doc, "hooks"), (hooks, event), (group, "hooks"))))
+     return out
+ 
+ 
+@@ -288,9 +355,21 @@
+ 
+ 
+ def _load_config(path: str, reader: str):
+-    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan").
++    """(parsed document, None, dupes) or (None, why, {}). `dupes` maps id(marked object) to
++    (the marked object, {repeated key: [occurrences in order]}), for the JSON reader only:
++    json.loads is last-wins — as the harness's own parser is — so a duplicated key is no
++    measured deadline overrun, but it IS ambiguous wiring, MISWIRED evidence under the
++    protocol's duplicate rule (#1262 re-review P2). TOML rejects a duplicate key at parse, so
++    the tomllib path never marks anything. A TOML config without tomllib is (None, "scan", {}).
++    The mark carries its object: holding it keeps the id from being recycled once an overwritten
++    object is freed, and the lookup re-checks identity — a bare id() can be handed to a later
++    allocation, which would hang a stranger's repeated key on a clean registration (#1262
++    re-review B1). Occurrences are kept so an ENCLOSING key whose copies agree (deep-equal) can
++    be told from one the harness's last-wins parser silently chooses between (#1262 re-review
++    P2 round 2).
+     Cached on (path, reader, mtime, size): the timeout bound and the registered-surface read
+-    parse each registration once per process, and a changed file is re-read."""
++    parse each registration once per process, and a changed file is re-read. The cached
++    document is what keeps every marked object alive, so a mark's identity holds across hits."""
+     st = os.stat(path)
+     key = (path, reader, st.st_mtime_ns, st.st_size)
+     hit = _CONFIG_CACHE.get(key)
+@@ -305,22 +384,43 @@
+     with open(path, "rb") as fh:
+         raw = fh.read()
+     if reader == "json-hook-commands":
+-        return json.loads(raw.decode("utf-8")), None
++        dupes: dict = {}
++
++        def _pairs(pairs):
++            obj = {}
++            repeated = {}
++            for k, v in pairs:
++                if k in obj:
++                    repeated.setdefault(k, [obj[k]]).append(v)
++                obj[k] = v
++            if repeated:
++                dupes[id(obj)] = (obj, repeated)
++            return obj
++
++        return json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs), None, dupes
+     try:
+         import tomllib  # type: ignore
+     except ImportError:
+-        return None, "scan"
+-    return tomllib.loads(raw.decode("utf-8")), None
+-
+-
+-def _scan_timeouts(path: str, base: str) -> Optional[list]:
+-    """No TOML parser: every `timeout = N` in a file that names this hook at all. Conservative —
+-    the smallest of them can only shorten the bound. None when the file does not name the hook."""
++        return None, "scan", {}
++    return tomllib.loads(raw.decode("utf-8")), None, {}
++
++
++def _dupe_marks(dupes: dict, obj: Any) -> Optional[dict]:
++    """The {repeated key: occurrences} recorded for THIS object, or None. The mark is accepted
++    only by identity: a bare id() match proves nothing, because an overwritten duplicate's object
++    is freed and its id can be recycled onto a clean registration (#1262 re-review B1)."""
++    mark = dupes.get(id(obj)) if dupes else None
++    if mark is not None and mark[0] is obj:
++        return mark[1]
++    return None
++
++
++def _text_mentions_hook(path: str, base: str) -> bool:
++    """Boolean relevance ONLY: does this file's text mention the hook at all. Reads no value —
++    the protocol forbids inferring a deadline from a lexical scan (#1262); it exists to split a
++    broken file that appears to register this hook (MISWIRED) from one that does not (drops)."""
+     with open(path, encoding="utf-8", errors="replace") as fh:
+-        text = fh.read()
+-    if base not in text:
+-        return None
+-    return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
++        return base in fh.read()
+ 
+ 
+ def _all_hook_commands(doc: Any, layout: str) -> list:
+@@ -357,7 +457,7 @@
+             if not path or not os.path.isfile(path):
+                 continue
+             reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
+-            doc, how = _load_config(path, reader)
++            doc, how, _dupes = _load_config(path, reader)
+             if how == "scan":
+                 with open(path, encoding="utf-8", errors="replace") as fh:
+                     commands = [m.group(1) or m.group(2) or "" for m in _SCAN_COMMAND.finditer(fh.read())]
+@@ -390,84 +490,119 @@
+ 
+     `harness` is the shim's HARNESS data: where this harness records its hooks (`registrations`:
+     reader, layout, path with `~`/`${VAR:-default}`/`{cwd}`), the hook `event`, the timeout's
+-    unit, the harness's own default when an entry omits it (None when unknown), `on_timeout`
+-    and `margin_seconds`. Every registration of THIS file on the event counts (its realpath, or
+-    failing any such match its basename), from every source that exists, and the SMALLEST
+-    timeout wins: a smaller bound costs availability, never safety. A non-harness invoker's
+-    HESTIA_HOOK_TIMEOUT_S joins the same minimum.
+-
+-    Returns `HarnessBound(deadline=start + timeout - margin, ...)`, or `deadline=None` with the
+-    reason when no enforced timeout could be established."""
++    unit, `on_timeout` and `margin_seconds` (the proportional margin's cap). A vendor default
++    timeout the data may carry is a harness FACT, not a security semantic: never substituted.
++
++    The critical-timeout protocol (dp ruling on #1262, 2026-10-07): canonical or MISWIRED.
++    The bound resolves to ONE registration binding THIS file exactly (its realpath) on the
++    event, carrying ONE explicit timeout that `validate_timeout` accepts — present, numeric,
++    inside the envelope after the unit, rejected outside and never clamped or defaulted.
++    Anything else that APPEARS to register this hook contributes no deadline, only MISWIRED
++    evidence, and closes the bound: a missing or non-numeric timeout, an out-of-envelope
++    value, an unparseable or unreadable config naming the hook, no parser available for it, a
++    relative, foreign or shell-punctuated command naming its basename — read again after the
++    shell's own quote and backslash removal, because the shell runs that file (the timeout
++    cannot be bound to the exact registered hook), a JSON registration object that repeats a
++    key, or wiring that encloses it repeating a key with an identical value (the harness's own
++    parser is last-wins; ambiguous wiring is not a binding), or duplicate/conflicting bindings.
++    A config whose text never mentions this hook is irrelevant
++    and drops. The gate NEVER infers a deadline from a partial lexical scan. A non-harness
++    invoker's explicit HESTIA_HOOK_TIMEOUT_S joins the minimum: it can only shorten.
++
++    Returns `HarnessBound(deadline=start + timeout - margin, ...)` with the proportional
++    margin max(0.5, min(cap, timeout * 0.15)), or `deadline=None` with the MISWIRED reason (or
++    the plain no-registration reason) when no enforced timeout could be established."""
+     env = os.environ if env is None else env
+-    margin = float(harness.get("margin_seconds") or 0.0)
++    margin_cap = float(harness.get("margin_seconds") or 1.5)
+     on_timeout = str(harness.get("on_timeout") or "unknown")
+     try:
+         unit = float(harness.get("timeout_unit_seconds") or 1.0)
+-        default = harness.get("default_timeout_seconds")
+         event = harness.get("event") or ""
+         me = os.path.realpath(self_path)
+         base = os.path.basename(me)
+-        exact, by_name, sources, problems = [], [], [], []
++        bindings, problems = [], []
+         for reg in harness.get("registrations") or ():
+             path = _expand(str(reg.get("path") or ""), env, cwd)
+             if not path or not os.path.isfile(path):
+-                continue
++                continue                       # not configured there: nothing registers
+             reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
+             try:
+-                doc, how = _load_config(path, reader)
+-            except Exception as exc:  # noqa: BLE001 — an unreadable registration is no bound
+-                problems.append(f"{path}: unreadable ({type(exc).__name__})")
++                doc, how, dupes = _load_config(path, reader)
++            except Exception as exc:  # noqa: BLE001 — a parse failure must not swallow this hook
++                try:
++                    relevant = _text_mentions_hook(path, base)
++                except Exception:  # noqa: BLE001 — unreadable: it may be the registration
++                    relevant = True
++                if relevant:
++                    problems.append(f"{path}: MISWIRED: appears to register this hook but "
++                                    f"cannot be parsed or read ({type(exc).__name__})")
++                continue                       # its text never names this hook: irrelevant
++            if how == "scan":
++                if _text_mentions_hook(path, base):
++                    problems.append(f"{path}: MISWIRED: appears to register this hook and no "
++                                    f"parser is available for it")
+                 continue
+-            if how == "scan":
+-                values = _scan_timeouts(path, base)
+-                if values is None:
+-                    continue
+-                if not values and default is None:
+-                    problems.append(f"{path}: names this hook but no timeout could be read")
+-                    continue
+-                vals = [v * unit for v in values] + ([float(default)] if default is not None else [])
+-                by_name.append((min(vals), f"{path} (line scan, smallest timeout in the file)"))
+-                continue
+-            for command, timeout in _hook_entries(doc, reader, layout, event):
++            for command, timeout, hook_obj, ancestors in _hook_entries(doc, reader, layout, event):
+                 targets = _command_targets(command, env)
+                 hit_exact = any(os.path.realpath(t) == me for t in targets)
+-                hit_name = hit_exact or any(os.path.basename(t) == base for t in targets)
+-                if not hit_name:
++                if not hit_exact:
++                    if _names_hook(command, env, base):
++                        problems.append(f"{path}: MISWIRED: names this hook without binding it "
++                                        f"exactly (a relative, foreign or shell-punctuated command "
++                                        f"cannot bind a timeout to the registered hook)")
++                    continue                   # some other hook's entry: irrelevant
++                repeated = _dupe_marks(dupes, hook_obj)
++                if repeated:
++                    problems.append(f"{path}: MISWIRED: this hook's registration repeats key "
++                                    f"{sorted(repeated)} — the harness's JSON parser is last-wins, "
++                                    f"so an ambiguous entry is not a binding")
+                     continue
+-                if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+-                    seconds = float(timeout) * unit
+-                    where = f"{path}: timeout {timeout}"
+-                elif default is not None:
+-                    seconds = float(default)
+-                    where = f"{path}: no timeout declared, harness default {default}s"
+-                else:
+-                    problems.append(f"{path}: registers this hook with no timeout, and this "
+-                                    f"harness's default is not known")
++                enclosing = next((key for container, key in ancestors
++                                  if (marks := _dupe_marks(dupes, container)) and key in marks
++                                  and all(v == marks[key][-1] for v in marks[key])), None)
++                if enclosing is not None:
++                    problems.append(f"{path}: MISWIRED: the wiring enclosing this hook's "
++                                    f"registration repeats key {enclosing!r} with an identical "
++                                    f"value (an agreeing duplicate) — the harness's JSON parser "
++                                    f"is last-wins, so ambiguous wiring is not a binding")
+                     continue
+-                (exact if hit_exact else by_name).append((seconds, where))
+-        found = exact or by_name
++                seconds, why = validate_timeout(timeout, unit)
++                if seconds is None:
++                    problems.append(f"{path}: MISWIRED: {why}")
++                    continue
++                bindings.append((seconds, f"{path}: timeout {timeout}"))
++        if len(bindings) > 1:
++            problems.append("MISWIRED: duplicate/conflicting registrations of this hook ("
++                            + "; ".join(w for _, w in bindings) + ")")
++            bindings = []
++        found = list(bindings)
+         declared = env.get(HOOK_TIMEOUT_ENV)
+         if declared:
+             try:
+                 d = float(declared)
+                 if d > 0:
+                     found = found + [(d, f"{HOOK_TIMEOUT_ENV}={declared} (the invoker's declaration)")]
++                else:
++                    problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not positive")
+             except ValueError:
+                 problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not a number")
+-        if problems and not exact:
+-            # A registration of this hook we could not read may carry the smaller timeout.
+-            return HarnessBound(None, None, margin, on_timeout, tuple(w for _, w in found),
++        if problems:
++            # Whatever appears to register this hook but is not one exact, canonical
++            # registration contributes no deadline — MISWIRED is wiring evidence, never a
++            # guessed timeout.
++            return HarnessBound(None, None, margin_cap, on_timeout, tuple(w for _, w in found),
+                                 "; ".join(problems))
+         if not found:
+-            return HarnessBound(None, None, margin, on_timeout, (),
++            return HarnessBound(None, None, margin_cap, on_timeout, (),
+                                 f"no registration of {base} on {event or 'its event'} was found "
+                                 f"in this harness's configuration, and no {HOOK_TIMEOUT_ENV} was "
+                                 f"declared")
+         timeout = min(s for s, _ in found)
+-        sources.extend(w for _, w in found)
+-        return HarnessBound(start + timeout - margin, timeout, margin, on_timeout, tuple(sources))
++        margin = max(MARGIN_FLOOR_SECONDS, min(margin_cap, timeout * MARGIN_RATE))
++        return HarnessBound(start + timeout - margin, timeout, margin, on_timeout,
++                            tuple(w for _, w in found))
+     except Exception as exc:  # noqa: BLE001 — a reader that breaks establishes nothing
+-        return HarnessBound(None, None, margin, on_timeout, (),
++        return HarnessBound(None, None, margin_cap, on_timeout, (),
+                             f"the registration reader failed ({type(exc).__name__}: {exc})")
+ 
+ 
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21",
++      "sha256": "bcda71a1678f1aa69412eff18cc65ad06bf380c61e29243482a54687e9a1e18a",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92"
++  "gt_version": "be4aaa1662bf2936a5e8b73b39e7f3deeb3dd9323a02fe07086cbb3c3c130977"
+ }
+diff --git a/hooks-gt/claude-code/hooks/hooks.json b/hooks-gt/claude-code/hooks/hooks.json
+--- a/hooks-gt/claude-code/hooks/hooks.json
++++ b/hooks-gt/claude-code/hooks/hooks.json
+@@ -1,7 +1,7 @@
+ {
+   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Claude Code hooks (~/.claude/settings.json). deploy/register-members.py renders @HESTIA_PLUGIN_ROOT@/claude-code/hooks/<file> to the member's declared install dest (expects.json install.dest) and merges, by target basename, only the hooks the settings do not already carry. It renders @HESTIA_HOME@ to the deploying environment's HESTIA_HOME as an absolute path (unset refuses: the bootstrap locator has no default) on the gate and the witness, the two hooks that load the seat projection, together with HESTIA_ROLE=\"${HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}\": the role is launch context, never config (the projection cannot carry it), so the line passes a launcher's HESTIA_ROLE through and otherwise defaults to this member's install.default_role (no declaration drops the token). Since dp's 2026-10-06 ruling the deployer OWNS these lines: every line it installed is rewritten to this template on each deploy; per-seat customisation goes through the vault's seat projection, never a hand edit to a hook line. Unrendered placeholders must never be deployed. Shapes and timeouts mirror the registration measured on thor 2026-09-28.",
+   "_why": "Before this file, claude-code's registration was a hand edit on every host (#1133, #1135): the plugin shipped pre_tool_use.py, witness.py and law_inject.py and nothing wrote them into settings.json. The daemon's install_claude_code merges only the witness. This template is what the installer renders.",
+-  "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the registration this template becomes (seconds; Claude Code's default for an entry without one is 60) and decides inside start + timeout - 1.5 s, so it always fails closed before Claude Code kills it (a hook timeout is a non-blocking error there: the tool runs, i.e. fail-open). 10 s absorbs one cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
++  "_timeout_contract": "One-gate stage C, critical-timeout protocol (#1262). The PreToolUse gate READS its timeout from the registration this template becomes (seconds). The value must be ONE explicit, structurally parsed timeout inside the canonical 3-30 s envelope: a missing, duplicate, unreadable or out-of-envelope timeout is MISWIRED and closes the bound — Claude Code's 60 s vendor default is never substituted. The gate decides inside start + timeout - margin with margin = max(0.5, min(1.5, timeout*0.15)), so it always fails closed before Claude Code kills it (a hook timeout is a non-blocking error there: the tool runs, i.e. fail-open). 10 s absorbs one cold member connect (measured 4.6-5.1 s). A registration outside the envelope is rejected, not clamped; deploy/register-members.py reports a noncanonical one.",
+   "_disposition_reader": "disposition_deliver.py (PRD_DISPOSITION_DELIVERY R4/R4a, #845, #849) renders the daemon's ruling on the asker's own hook stream, so an asker learns 'approved, re-issue the same act' without the operator relaying it in chat. PreToolUse and PostToolUse are the ports that reach a SUBAGENT (every tool call it makes fires them, carrying the parent's session_id plus its own agent_id, measured on Claude Code 2.1.290, 2026-10-06); UserPromptSubmit reaches only the interactive parent idle at its prompt. PreToolUse renders on the asker's very next call; PostToolUse catches a ruling that lands during a long call. It is a stat on one file and fails silent, so 3 s, the witness's budget. It carries HESTIA_HOME because the lane lives in the daemon's home, and no HESTIA_ROLE because it loads no seat projection. Before this entry the reader shipped in expects.json and no host registered it (CBP's deploy log: 'skip disposition_deliver.py - not registered on this host'), so every ruling still went by hand.",
+   "_member_mesh": "#1373 (dp 2026-10-23: the mesh is 'a standard part of what hestia does, fleet-wide, and installation should be automatic'). The member-mesh pair, rendered like every other line here: SessionStart surfaces this member's pending mesh notices (session-mesh-inbox.sh), UserPromptSubmit surfaces a ruling that lands mid-session (prompt-disposition-watch.sh, #366). HESTIA_MESH_PLUGIN is PINNED on the line because #108 removed the CLI's default: an unpinned line is a DARK member (plugins/member-mesh/install.sh's refusal), and a pin rendered by the deployer can never be missing. The role is the same pass-through as the gate's. Both scripts and their CLI (hestia-mesh.py, an install.companions entry) are installed beside each other by install-members.sh, because both call $(dirname $0)/hestia-mesh.py. A host whose mesh lines were registered by hand elsewhere keeps them: a same-named line at another target is FOREIGN and never rewritten or duplicated.",
+   "hooks": {
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -12,7 +12,7 @@
+     },
+     {
+       "path": "hooks/hooks.json",
+-      "sha256": "6b1c103d29ab0a19227b2e409a3a8a2b0560e576d82cac9c35f980a7da46b5ca",
++      "sha256": "0d5389aed3a8cf4a326e794648f65e42814321e98ebd7e17115a627cd9a767ee",
+       "source": "plugins/claude-code/hooks/hooks.json"
+     },
+     {
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92",
++    "gt_version": "be4aaa1662bf2936a5e8b73b39e7f3deeb3dd9323a02fe07086cbb3c3c130977",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "bcda71a1678f1aa69412eff18cc65ad06bf380c61e29243482a54687e9a1e18a"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "a59ad059e96a53d7d0673be2c40485dec68c3bd51e1cc6a15696b6e5c672964c"
++  "gt_version": "f33002c9c28ba55c51f28cf8340afa693e9d8e528377ba641c8626a326dde968"
+ }
+diff --git a/hooks-gt/codex/hooks/hooks.json b/hooks-gt/codex/hooks/hooks.json
+--- a/hooks-gt/codex/hooks/hooks.json
++++ b/hooks-gt/codex/hooks/hooks.json
+@@ -1,7 +1,7 @@
+ {
+   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Codex CLI hooks. Codex loads hooks from a hooks.json or inline hook tables in its user configuration. Requires codex_hooks enabled. Replace both placeholders with verified absolute paths before installing; unrendered placeholders must never be deployed.",
+   "_paths_note": "Replace @HESTIA_HOME@, @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ at install time (deploy/register-members.py does: @HESTIA_HOME@ is the deploying environment's HESTIA_HOME as an absolute path, refused when unset -- the gate and the witness load the seat projection through it, #1242). HESTIA_ROLE is passed through with install.default_role as its default (codex declares none: the token is dropped and the daemon default applies). @HESTIA_PLUGIN_SOURCE@ is the deployed plugin directory: hydrate.sh reads instance/identity.seed.json from CODEX_PLUGIN_ROOT, and the installer does not copy the seed under the dest. The deployer owns the lines it installs and rewrites them to this template on each deploy (dp 2026-10-06). The public repository carries no operator-specific workspace path.",
+-  "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the registration this template becomes (seconds; an entry without one is refused, since Codex's default is not documented here) and decides inside start + timeout - 1.5 s, so it always fails closed before Codex kills it (Codex marks a timed-out hook failed and the tool call continues, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
++  "_timeout_contract": "One-gate stage C, critical-timeout protocol (#1262). The PreToolUse gate READS its timeout from the registration this template becomes (seconds). The value must be ONE explicit, structurally parsed timeout inside the canonical 3-30 s envelope: a missing, duplicate, unreadable or out-of-envelope timeout is MISWIRED and closes the bound — no vendor default is ever substituted (Codex's is not documented here). The gate decides inside start + timeout - margin with margin = max(0.5, min(1.5, timeout*0.15)), so it always fails closed before Codex kills it (Codex marks a timed-out hook failed and the tool call continues, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). A registration outside the envelope is rejected, not clamped; deploy/register-members.py reports a noncanonical one.",
+   "_member_mesh": "#1373 (dp 2026-10-23: the mesh is 'a standard part of what hestia does, fleet-wide, and installation should be automatic'). The member-mesh pair, rendered like every other line here: SessionStart surfaces this member's pending mesh notices (session-mesh-inbox.sh), UserPromptSubmit surfaces a ruling that lands mid-session (prompt-disposition-watch.sh, #366). HESTIA_MESH_PLUGIN is PINNED on the line because #108 removed the CLI's default: an unpinned line is a DARK member (plugins/member-mesh/install.sh's refusal), and a pin rendered by the deployer can never be missing. The role is the same pass-through as the gate's. Both scripts and their CLI (hestia-mesh.py, an install.companions entry) are installed beside each other by install-members.sh, because both call $(dirname $0)/hestia-mesh.py. A host whose mesh lines were registered by hand elsewhere keeps them: a same-named line at another target is FOREIGN and never rewritten or duplicated.",
+   "hooks": {
+     "PreToolUse": [
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hooks/hooks.json",
+-      "sha256": "a8157d20a130aefbf073872e25c9a3978406b5376472eabc05a2213208e84b72",
++      "sha256": "0af6d621130ab96d98e2c1246a9c11d90adca4abe06958a076013facbc327827",
+       "source": "plugins/codex/hooks/hooks.json"
+     },
+     {
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92",
++    "gt_version": "be4aaa1662bf2936a5e8b73b39e7f3deeb3dd9323a02fe07086cbb3c3c130977",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "bcda71a1678f1aa69412eff18cc65ad06bf380c61e29243482a54687e9a1e18a"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "a983936e99378e8cc1d40f1599bcb7dd60f1592dec62ff2e2344cc0e844a265c"
++  "gt_version": "94c9f04baa4acdf43fffadf667211607a8b63e850a81c93f24a290fbd9cb739a"
+ }
+diff --git a/hooks-gt/gemini/hooks/hooks.json b/hooks-gt/gemini/hooks/hooks.json
+--- a/hooks-gt/gemini/hooks/hooks.json
++++ b/hooks-gt/gemini/hooks/hooks.json
+@@ -2,7 +2,7 @@
+   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Gemini CLI user-level hooks. Prefer plugins/gemini/install.sh, which renders verified absolute runtime paths. Project-source hooks may be gated by the harness trust setting and are not a substitute for user-level installation.",
+   "_paths_note": "Replace @HESTIA_HOME@ (the deploying environment's HESTIA_HOME, absolute; deploy/register-members.py refuses when it is unset), @HESTIA_DEFAULT_ROLE@ (install.default_role, inside a HESTIA_ROLE pass-through; dropped when undeclared), @HESTIA_WORKSPACE@ and @HESTIA_PLUGIN_ROOT@ before installation, then verify every command target exists. Unrendered placeholders must never be installed: a missing hook process may fail open in the harness.",
+   "_hooksConfig_note": "Pin \"hooksConfig\": {\"enabled\": true} in settings.json alongside this block. It defaults true, but \"enabled\": false disarms every hook and hooksConfig.disabled can disable this gate by command string. Operator's prerogative, but it must be visible to anything auditing the member.",
+-  "_timeout_contract": "One-gate stage C. The BeforeTool gate READS its timeout from the registration this template becomes (MILLISECONDS; gemini-cli's default for an entry without one is 60000) and decides inside start + timeout - 1.5 s, so it always fails closed before gemini-cli kills it (a timed-out hook produces no output and the tool proceeds, i.e. fail-open). 15000 ms absorbs a cold member connect (measured 4.6-5.1 s). A shorter registration costs availability, never safety; deploy/register-members.py reports one below this floor.",
++  "_timeout_contract": "One-gate stage C, critical-timeout protocol (#1262). The BeforeTool gate READS its timeout from the registration this template becomes (MILLISECONDS). The value must be ONE explicit, structurally parsed timeout inside the canonical 3-30 s envelope (3000-30000 ms): a missing, duplicate, unreadable or out-of-envelope timeout is MISWIRED and closes the bound — gemini-cli's 60000 ms vendor default is never substituted. The gate decides inside start + timeout - margin with margin = max(0.5, min(1.5, timeout*0.15)), so it always fails closed before gemini-cli kills it (a timed-out hook produces no output and the tool proceeds, i.e. fail-open). 15000 ms absorbs a cold member connect (measured 4.6-5.1 s). A registration outside the envelope is rejected, not clamped; deploy/register-members.py reports a noncanonical one.",
+   "hooks": {
+     "BeforeTool": [
+       {
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -12,7 +12,7 @@
+     },
+     {
+       "path": "hooks/hooks.json",
+-      "sha256": "efd3e850e35bcefe116626b04cdc0f2b6770f2e3fed41a0870acfb9963639791",
++      "sha256": "9a067b277bf91ca6a045ba0dede82d599c091bc929c16f648dead12e57e96ae1",
+       "source": "plugins/gemini/hooks/hooks.json"
+     },
+     {
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92",
++    "gt_version": "be4aaa1662bf2936a5e8b73b39e7f3deeb3dd9323a02fe07086cbb3c3c130977",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "bcda71a1678f1aa69412eff18cc65ad06bf380c61e29243482a54687e9a1e18a"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "1ad99893c45c3ccd97bb0a81e3833ca69d5b2dc414d964c8dc109903fa8aa96e"
++  "gt_version": "5cc668010685f513480606c8bd91feb75cea2ee07c08778c315bf86160db23b1"
+ }
+diff --git a/hooks-gt/kimi/hooks/hooks.json b/hooks-gt/kimi/hooks/hooks.json
+--- a/hooks-gt/kimi/hooks/hooks.json
++++ b/hooks-gt/kimi/hooks/hooks.json
+@@ -1,7 +1,7 @@
+ {
+   "_comment": "NON-RUNNABLE INSTALLATION TEMPLATE for Kimi Code hooks. deploy/register-members.py renders it into ~/.kimi-code/config.toml as flat `[[hooks]] event = ...` tables (install.registration.layout = flat), reconciling by target: a line whose target is under the declared dest is hestia's and is rewritten to this template on every deploy (dp 2026-10-06); any other line is never touched. @HESTIA_HOME@ renders to the deploying environment's HESTIA_HOME as an absolute path, refused when unset (#1237); HESTIA_ROLE passes a launcher's value through and otherwise defaults to install.default_role. Unrendered placeholders must never be deployed.",
+   "_witness_note": "witness.py is the hook that reaches the daemon; kimi fires PostToolUseFailure INSTEAD of PostToolUse for a failed call, so the witness is registered on both. Before 2026-09-28 kimi shipped no witness: its seat ran a private 07-26 copy of claude-code's that never saw a failure and never closed a gated action (findings/per-harness-witness-drift-2026-09-28.md).",
+-  "_timeout_contract": "One-gate stage C. The PreToolUse gate READS its timeout from the flat [[hooks]] table this template becomes (seconds; an entry without one is refused, since Kimi's default is not documented here) and decides inside start + timeout - 1.5 s, so it always fails closed before Kimi kills it (Kimi's engine allows the tool on a timeout, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). Nothing in this template sets HESTIA_PRE_TOTAL_BUDGET_MS: since stage C no gate reads it (the deadline is the registration's), so a hand-added one on a registered command is inert and should be removed.",
++  "_timeout_contract": "One-gate stage C, critical-timeout protocol (#1262). The PreToolUse gate READS its timeout from the flat [[hooks]] table this template becomes (seconds). The value must be ONE explicit, structurally parsed timeout inside the canonical 3-30 s envelope: a missing, duplicate, unreadable or out-of-envelope timeout is MISWIRED and closes the bound — Kimi's documented 30 s vendor default is never substituted. The gate decides inside start + timeout - margin with margin = max(0.5, min(1.5, timeout*0.15)), so it always fails closed before Kimi kills it (Kimi's engine allows the tool on a timeout, i.e. fail-open). 15 s absorbs a cold member connect (measured 4.6-5.1 s). A registration outside the envelope is rejected, not clamped; deploy/register-members.py reports a noncanonical one. Nothing in this template sets HESTIA_PRE_TOTAL_BUDGET_MS: since stage C no gate reads it (the deadline is the registration's), so a hand-added one on a registered command is inert and should be removed.",
+   "_member_mesh": "#1373 (dp 2026-10-23: the mesh is 'a standard part of what hestia does, fleet-wide, and installation should be automatic'). The member-mesh pair, rendered like every other line here: SessionStart surfaces this member's pending mesh notices (session-mesh-inbox.sh), UserPromptSubmit surfaces a ruling that lands mid-session (prompt-disposition-watch.sh, #366). HESTIA_MESH_PLUGIN is PINNED on the line because #108 removed the CLI's default: an unpinned line is a DARK member (plugins/member-mesh/install.sh's refusal), and a pin rendered by the deployer can never be missing. The role is the same pass-through as the gate's. Both scripts and their CLI (hestia-mesh.py, an install.companions entry) are installed beside each other by install-members.sh, because both call $(dirname $0)/hestia-mesh.py. A host whose mesh lines were registered by hand elsewhere keeps them: a same-named line at another target is FOREIGN and never rewritten or duplicated.",
+   "hooks": {
+     "PreToolUse": [
+diff --git a/hooks-gt/kimi/hooks/pre_tool_use.py b/hooks-gt/kimi/hooks/pre_tool_use.py
+--- a/hooks-gt/kimi/hooks/pre_tool_use.py
++++ b/hooks-gt/kimi/hooks/pre_tool_use.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: eb8969c817fb4fb6d60db00a2ecc26e38bd8debfd02bf54be29e05636f3268b1  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 9f7333fc0a57b8041d01862b71cf2745d55e2b7b272c4fddfc0c789d48aff3ae  (published ground truth; manifest: hooks-gt)
+ """Hestia PreToolUse gate for Kimi Code: the certified shim (one-gate stage C).
+ 
+ This file is `plugins/_template/shim_template.py` with this harness's data and adapters. It
+@@ -9,8 +9,13 @@
+ 
+ HARNESS FACTS (data below, not code):
+   - registration: flat `[[hooks]]` tables (`event = "PreToolUse"`) in `~/.kimi-code/config.toml`;
+-    `timeout` in seconds. Kimi's default for an entry that declares none is not documented
+-    here, so such an entry is refused, never guessed.
++    `timeout` in seconds. Kimi's vendor default for an entry that declares none is 30 s,
++    verified from the binary: `hook.timeout ?? DEFAULT_HOOK_TIMEOUT_SECONDS` (agent-core-v2
++    `matchHooks`, 2.1.1). A vendor default is a harness FACT, never a security semantic:
++    under the critical-timeout protocol (#1262) the bound comes only from ONE explicit,
++    structurally parsed, in-envelope (3-30 s) timeout on the exact registration — a missing,
++    duplicate, unreadable or unparseable one is MISWIRED and closes the bound
++    (`gate.harness_timeout_unknown`).
+   - Kimi's hook engine FAILS OPEN on every failure mode (verified from the binary: timeout,
+     spawn failure, a non-2 exit, an exception all allow the tool).
+   - the correlation key is Kimi's `tool_call_id`, read from the raw event by the common gate.
+@@ -227,7 +232,7 @@
+         {"reader": "toml-hook-commands", "layout": "flat", "path": "~/.kimi-code/config.toml"},
+     ),
+     "timeout_unit_seconds": 1,
+-    "default_timeout_seconds": None,
++    "default_timeout_seconds": 30,
+     "on_timeout": ("fail-open: Kimi's hook engine allows the tool on a timeout, a spawn "
+                    "failure, a non-2 exit or an exception"),
+     "margin_seconds": 1.5,
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hooks/hooks.json",
+-      "sha256": "cb7f5833f591f8ec646f75f7a7b0cd10ada3c464c61a582217b5750374af9a12",
++      "sha256": "70a621d344bb5ae0e1d1b8dd2b9656c2d112b3dee77deddd73df2407abd907c9",
+       "source": "plugins/kimi/hooks/hooks.json"
+     },
+     {
+@@ -22,7 +22,7 @@
+     },
+     {
+       "path": "hooks/pre_tool_use.py",
+-      "sha256": "eb8969c817fb4fb6d60db00a2ecc26e38bd8debfd02bf54be29e05636f3268b1",
++      "sha256": "9f7333fc0a57b8041d01862b71cf2745d55e2b7b272c4fddfc0c789d48aff3ae",
+       "source": "plugins/kimi/hooks/pre_tool_use.py"
+     },
+     {
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4092c6d15166a61df232a397e8cc328570760f74f5f66449210d35313da2ae92",
++    "gt_version": "be4aaa1662bf2936a5e8b73b39e7f3deeb3dd9323a02fe07086cbb3c3c130977",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "bcda71a1678f1aa69412eff18cc65ad06bf380c61e29243482a54687e9a1e18a"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "2e98511abfe14431fdac73b38e33049f78d45e107f403c2d67ccb2384692c5da"
++  "gt_version": "aa91929eba790178a5e23fc19b15143326615de71d461f73e5bc9f9afe95384c"
+ }
