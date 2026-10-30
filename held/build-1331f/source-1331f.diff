@@ -1,0 +1,234 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -577,6 +577,14 @@
+     unread. Both Gate 1a sites call it before the token sweep, so the degraded mode does too."""
+     bad = egress_unsweepable(event)
+     if not bad:
++        # hestia #1331: a glob or link-following walk past its bound is refused unjudged, under the rule
++        # for a reach the gate cannot enumerate (the scope pass refuses past SCOPE_JUDGE_BUDGET the same way).
++        too_wide = link_reach(event)[1]
++        if too_wide:
++            return _deny("mrh.command.unenumerated",
++                         f"'{event.tool}': {too_wide}, so the gate cannot judge every link it reaches and it is "
++                         f"refused rather than judged in part: name the paths it needs",
++                         target=UNENUMERATED_TARGET)
+         return None
+     return _deny("egress.secret",
+                  f"'{event.tool}' declares egress the gate cannot sweep ({bad}): egress must be "
+@@ -595,48 +603,178 @@
+             + link_targets(event))
+ 
+ 
+-def link_targets(event: "NormalizedEvent") -> list:
+-    """The resolved targets of the paths an act names, where a link makes them DIFFER from the name
+-    (hestia #1331, gaps a/b). Measured on main f9f29a23 in-process (a fixture, no credential): inside a
+-    granted repo, a link to a secret-NAMED file passed Gate 1a by a relative shell read and by `Read`
+-    (absolute or relative), because the innate sweep judged the path AS NAMED. Absolute shell paths in
+-    the workspace already had their target checked (the scope pass); this gives the one rule no grant
+-    relaxes the same view, for every path argument and every shell word that names an existing path
+-    (relative ones joined onto the event's cwd). A path that is not a link contributes nothing, so
+-    an ordinary act's verdict cannot change. Never raises: an unreadable path adds nothing."""
+-    words = list(event.paths)
+-    if event.command:
++#: How far Gate 1a follows an act's REACH to the links in it (hestia #1331 follow-ups). Past either bound the act is
++#: refused under mrh.command.unenumerated rather than judged in part (egress_unsweepable_deny).
++LINK_GLOB_LIMIT = 256      # paths a glob or brace may expand to, per act
++LINK_WALK_LIMIT = 10000    # directory entries a link-following reader may walk, per act
++#: Readers that FOLLOW links while walking a directory, and the options that make them do it. A short cluster
++#: counts (`cp -rL`, `tar -chf`), except for find, whose options are whole words. Read from each tool's --help.
++_FOLLOW_FLAGS = {
++    "grep": frozenset({"-R", "--dereference-recursive"}),
++    "rg": frozenset({"-L", "--follow"}),
++    "find": frozenset({"-L", "-H", "-follow"}),
++    "cp": frozenset({"-L", "--dereference"}),
++    "tar": frozenset({"-h", "--dereference"}),
++    "rsync": frozenset({"-L", "--copy-links", "-k", "--copy-dirlinks"}),
++}
++_CD = frozenset({"cd", "pushd"})
++
++
++def _reach_segments(command: str) -> list:
++    """The command's words, split at the shell's segment breaks; the raw words when it cannot be tokenized."""
++    try:
++        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
++        lex.whitespace_split = True
++        words = list(lex)
++    except ValueError:
++        return [command.split()]
++    segs = [[]]
++    for w in words:
++        if w in _SEGMENT_BREAKS:
++            segs.append([])
++        else:
++            segs[-1].append(w)
++    return [s for s in segs if s]
++
++
++def _braces(word: str, limit: int = LINK_GLOB_LIMIT) -> list:
++    """`a{b,c}d` -> [abd, acd], recursively; a word with no complete `{x,y}` group is itself."""
++    i = word.find("{")
++    while i >= 0:
++        depth, j = 0, i
++        for j in range(i, len(word)):
++            depth += word[j] == "{"
++            depth -= word[j] == "}"
++            if depth == 0:
++                break
++        inner = word[i + 1:j]
++        if depth == 0 and "," in inner:
++            parts, d, cur = [], 0, ""
++            for ch in inner:
++                if ch == "," and d == 0:
++                    parts.append(cur)
++                    cur = ""
++                    continue
++                d += ch == "{"
++                d -= ch == "}"
++                cur += ch
++            parts.append(cur)
++            out = []
++            for p in parts:
++                out.extend(_braces(word[:i] + p + word[j + 1:], limit))
++                if len(out) > limit:
++                    return out
++            return out
++        i = word.find("{", i + 1)
++    return [word]
++
++
++def _follow_flag(prog: str, word: str) -> bool:
++    flags = _FOLLOW_FLAGS[prog]
++    if word in flags:
++        return True
++    if prog != "find" and word.startswith("-") and not word.startswith("--") and len(word) > 2:
++        return any(f"-{c}" in flags for c in word[1:])
++    return False
++
++
++def link_reach(event: "NormalizedEvent") -> tuple:
++    """(targets, too_wide). `targets`: the resolved targets of the links an act names OR reaches, where they differ
++    from the path as written (hestia #1331). #1433 judged only the links an act NAMES; measured on its applied core
++    2026-10-28, every unnamed shape still reached a secret-named target: globs and braces (`cat *.txt`, `cat keys/*`),
++    a cd/pushd inside the line (`cd sub && cat key.txt`), and readers that follow links while walking
++    (`grep -R`, `rg -L`, `find -L`, `cp -rL`, `tar -h`). So a glob or brace word is expanded and each match judged;
++    every relative word is judged against the cwd AND every directory a cd/pushd in the line names; and a
++    link-following reader's directories are walked (links not followed by the walk itself) and every link inside
++    judged. `too_wide`: '' or why the act is refused unjudged (a bound passed). Over-approximates by design: a
++    quoted pattern is expanded like a glob (shlex keeps no quoting), and the cd directories apply to every word, so
++    this can only ADD refusals, and only where a link really points at a secret-named target. Not the Grep/Glob
++    tools: whether they read through links is the host's, unmeasured. Never raises."""
++    cwd = getattr(event, "cwd", None)
++    segs = _reach_segments(event.command) if event.command else []
++    words = [w for w in event.paths if isinstance(w, str) and w]
++    for s in segs:
++        words += s
++    bases = [cwd] if cwd else []
++    for s in segs:
++        if s[0] in _CD:
++            ops = [w for w in s[1:] if not w.startswith("-")]
++            if ops:
++                d = os.path.expanduser(ops[0])
++                if not os.path.isabs(d) and cwd:
++                    d = os.path.join(cwd, d)
++                if os.path.isabs(d) and os.path.isdir(d) and d not in bases:
++                    bases.append(d)
++
++    def resolve(cand):
++        base = os.path.expanduser(cand)
++        if os.path.isabs(base):
++            return [base]
++        return [os.path.join(b, base) for b in bases]
++
++    out, seen, budget = [], set(), [LINK_GLOB_LIMIT]
++
++    def judge(p):
+         try:
+-            words += shlex.split(event.command)
+-        except ValueError:
+-            words += event.command.split()
+-    cwd = getattr(event, "cwd", None)
+-    out = []
++            if p in seen or not os.path.lexists(p):
++                return
++            seen.add(p)
++            real = os.path.realpath(p)
++            if real != os.path.normpath(p):
++                out.append(real)
++        except (OSError, ValueError):
++            pass
++
+     for w in words:
+-        if not isinstance(w, str) or not w:
+-            continue
+-        # a flag names a path only through its `=value` (`--input=notes.txt`); a bare flag names none
+         if w.startswith("-"):
+             if "=" not in w:
++                continue                    # a bare flag names no path; `--input=x` names x
++            cands = [w.split("=", 1)[1]]
++        else:
++            cands = [w, w.split("=", 1)[1]] if "=" in w else [w]
++        for cand in cands:
++            for pat in _braces(cand):
++                for full in resolve(pat):
++                    if _GLOB_CHARS.search(pat):
++                        try:
++                            hits = _glob.glob(full)
++                        except (OSError, ValueError, RecursionError):
++                            hits = []
++                        budget[0] -= len(hits)
++                        if budget[0] < 0:
++                            return out, f"a pattern reaches more than {LINK_GLOB_LIMIT} paths"
++                        for h in hits:
++                            judge(h)
++                    else:
++                        judge(full)
++    walked = 0
++    for s in segs:
++        prog = os.path.basename(s[0])
++        if prog not in _FOLLOW_FLAGS or not any(_follow_flag(prog, w) for w in s[1:]):
++            continue
++        roots = []
++        for w in s[1:]:
++            if w.startswith("-"):
+                 continue
+-            cands = {w.split("=", 1)[1]}
+-        else:
+-            cands = {w, w.split("=", 1)[1]} if "=" in w else {w}
+-        for cand in cands:
+-            try:
+-                base = os.path.expanduser(cand)
+-                if not os.path.isabs(base):
+-                    if not cwd:
+-                        continue
+-                    base = os.path.join(cwd, base)
+-                if not os.path.lexists(base):
+-                    continue
+-                real = os.path.realpath(base)
+-                if real != os.path.normpath(base):
+-                    out.append(real)
+-            except (OSError, ValueError):
+-                continue
+-    return out
++            for full in resolve(w):
++                if os.path.isdir(full) and not os.path.islink(full):
++                    roots.append(full)
++        if not roots:
++            roots = bases[:1]
++        for root in roots:
++            for d, dirs, files in os.walk(root, followlinks=False):
++                walked += len(dirs) + len(files)
++                if walked > LINK_WALK_LIMIT:
++                    return out, f"a reader that follows links would walk more than {LINK_WALK_LIMIT} entries"
++                for n in dirs + files:
++                    judge(os.path.join(d, n))
++    return out, ""
++
++
++def link_targets(event: "NormalizedEvent") -> list:
++    """The resolved targets of the links an act names or reaches, where a link makes them DIFFER from the path as
++    written (hestia #1331): what Gate 1a sweeps beside the paths and command. See `link_reach`."""
++    return link_reach(event)[0]
+ 
+ 
+ #: A value a command's own contract makes TEXT, never a path it opens (hestia #1330). Keyed on the
