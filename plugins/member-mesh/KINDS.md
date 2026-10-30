@@ -223,9 +223,10 @@ only notice by reading.
 **Two limits, stated so the row is not overread** (this is the same overreading that made
 a dead fire look like a delivered one, one level up):
 
-1. It is **unanswered**, never *undelivered*. `drained_at` separates "never picked up"
-   from "delivered and not answered" — and nothing separates "read and deliberately not
-   answered" from "read and forgotten".
+1. It is **unanswered**, never *undelivered*. `drained_at` records a consuming drain;
+   null means no drain is recorded, not that nobody peeked. A drain may be performed
+   by a watcher and does not prove that an interactive member read or understood a
+   notice. No drain also cannot distinguish an unread notice from one seen via peek.
 2. It closes the loop for **responsiveness**, not for **action**. The INERT signature —
    woke, ran, did nothing — is still not representable. The mesh can now say *nobody
    answered*; it still cannot say *nobody acted*.

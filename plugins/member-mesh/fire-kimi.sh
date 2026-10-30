@@ -188,9 +188,9 @@ def _short(sec):
 def liveness(x):
     """Recipient liveness as EVIDENCE, never as a diagnosis (#506).
 
-    "live and unanswered" is a member choosing not to reply; "never seen on this
-    mesh" is a misroute; and the two want opposite responses from you. That much
-    was always right. What was wrong: `dormant` was rendered as "watcher not
+    "live and unanswered" shows mailbox activity without a bound response; it
+    does not establish that a member saw or chose to ignore a notice. "Never seen
+    on this mesh" is a possible misroute. What was wrong: `dormant` was rendered as "watcher not
     running" — ONE of the three causes handler.rs:3953 names for that verdict and
     explicitly declines to choose between (watcher down, host asleep, member
     between sessions) — while this renderer dropped, unread, the evidence the
@@ -230,7 +230,7 @@ def liveness(x):
 # this seat while the sibling `open_petitions` gap -- whose renderer prints `asked:false`
 # in words -- was noticed the same day. The header moved in here so that it is emitted
 # only when there are rows for it to head.
-HEADER = 'Unanswered (no notice binds a response to these — responsiveness only; a member that woke and silently acted still shows here):\nRecipient liveness is EVIDENCE, not a diagnosis: `quiet Xm` is how long since that recipient last READ its mailbox, `reads=N` its lifetime read count. A member drains once at the top of a wake and then works, so a BUSY member reads quiet for most of it — quiet is not down (#506). `NEVER SEEN` means no liveness record exists at all.'
+HEADER = 'Unanswered (no notice binds a response to these — responsiveness only; a member that woke and silently acted still shows here):\nRecipient liveness is EVIDENCE, not a diagnosis: `quiet Xm` is how long since a mailbox read under that seat, `reads=N` its lifetime read count. A watcher may perform those reads; neither value proves a session saw a notice. A member drains once at the top of a wake and then works, so a BUSY member reads quiet for most of it — quiet is not down (#506). `NEVER SEEN` means no liveness record exists at all.'
 u = json.load(open(sys.argv[1])).get("unanswered")
 # A DISPLAY cap, and it announces itself. Fixing the carrier means the whole fold now
 # arrives: 1,102 rows / ~205 KB of prompt on this seat on 2026-09-04, most of it the
@@ -245,7 +245,13 @@ if isinstance(u, dict):
         got = u.get(key) or []
         total += len(got)
         for x in got[:CAP]:
-            seen = "delivered" if x.get("drained_at") else "never picked up"
+            mark = x.get("drained_at")
+            if "drained_at" not in x or (mark is not None and (not isinstance(mark, str) or not mark)):
+                seen = "drain status unknown; read status unknown"
+            elif mark is None:
+                seen = "not drained; read status unknown"
+            else:
+                seen = "drained; read status unknown"
             hint = liveness(x)
             rows.append(f"- id={clean(x.get('id',''))} {clean(x.get('kind',''))} "
                         f"{clean(x.get('from_plugin',''))}->{clean(x.get('to_plugin',''))} "

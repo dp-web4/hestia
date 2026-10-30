@@ -1985,9 +1985,9 @@ impl InboxTouch {
 }
 
 /// One notice with nothing bound to it — the row the mesh could not produce
-/// before 2026-07-25. `drained_at: None` means it was never even picked up;
-/// `Some(_)` means it was delivered and went unanswered, which is a different
-/// finding and must not be collapsed into the first.
+/// before 2026-07-25. `drained_at: None` means no consuming drain is recorded;
+/// a non-consuming peek may still have observed it. `Some(_)` records a drain,
+/// not proof that an interactive member read or understood the notice.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UnansweredNotice {
     pub id: u64,
@@ -3541,7 +3541,7 @@ mod tests {
         );
         let un = store.member_unanswered("kimi-code", &["reply"], -1).unwrap();
         assert_eq!(un.len(), 1);
-        assert!(un[0].drained_at.is_some(), "delivered, then unanswered");
+        assert!(un[0].drained_at.is_some(), "drained, then unanswered");
     }
 
     /// Binding a response clears the debt; the per-kind filter keeps the
@@ -3562,7 +3562,7 @@ mod tests {
         let before = store.member_unanswered("kimi-code", counted, -1).unwrap();
         assert_eq!(before.len(), 1, "handoff is not an unanswered-report row");
         assert_eq!(before[0].id, asked);
-        assert!(before[0].drained_at.is_none(), "never picked up");
+        assert!(before[0].drained_at.is_none(), "no consuming drain recorded");
         // Kimi answers it: the binding closes the row.
         store
             .enqueue_member("claude-code", "kimi-code", "role:r", "review_done",

@@ -1146,7 +1146,13 @@ try: d=json.load(sys.stdin)
 except Exception: raise SystemExit(0)
 for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me")):
     for n in d.get(key,[]) or []:
-        seen = "delivered, unanswered" if n.get("drained_at") else "NEVER PICKED UP"
+        mark = n.get("drained_at")
+        if "drained_at" not in n or (mark is not None and (not isinstance(mark, str) or not mark)):
+            seen = "drain status unknown; read status unknown"
+        elif mark is None:
+            seen = "not drained; read status unknown"
+        else:
+            seen = "drained; read status unknown"
         live = n.get("recipient_liveness")
         if live and live != "live": seen += f", recipient {live}"
         # Single quotes inside the expressions, deliberately: this block is

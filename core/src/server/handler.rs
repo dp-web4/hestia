@@ -8290,10 +8290,10 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
 ///
 /// Two properties this surface must keep, both learned the hard way:
 ///
-/// 1. It is **unanswered**, not undelivered. A notice read and deliberately
-///    not answered is forensically identical here to one nobody ever picked
-///    up (`drained_at` separates those two, and only those two). Named
-///    "undelivered" it would re-create absence-read-as-pass with better
+/// 1. It is **unanswered**, not undelivered. `drained_at` records a consuming
+///    drain, not a per-notice read receipt: peeks leave it null, and a watcher
+///    may drain without the intended interactive session seeing the notice.
+///    Named "undelivered" it would re-create absence-read-as-pass with better
 ///    tooling.
 /// 2. It closes the loop for RESPONSIVENESS, not for ACTION. The INERT
 ///    signature — woke, ran, did nothing — is still not representable. The
@@ -8432,12 +8432,13 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
                        follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
                        outranks mootness — the misroute is sender-actionable.",
         "scope": "unanswered = no notice binds in_reply_to to it; \
-                  drained_at:null additionally means it was never picked up; \
+                  drained_at:null means no consuming drain is recorded; a peek \
+                  may still have seen it, and a drain does not prove session read; \
                   each row carries its OWN in_reply_to - group by that, not by \
                   pointer_uri, or distinct dispositions anchored at one section \
                   read as duplicates",
-        "recipient_liveness_scope": "liveness measures the DELIVERY PATH (did that member \
-                                     read its mailbox), not the member's ability to act — a \
+        "recipient_liveness_scope": "liveness measures mailbox touches under that seat, \
+                                     not an interactive member's ability to act — a \
                                      watcher polling for a broken CLI reads as live. \
                                      'unknown' means never seen on THIS mesh, which is the \
                                      dead-letter class and usually a misroute",
