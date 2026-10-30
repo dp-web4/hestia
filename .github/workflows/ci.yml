@@ -247,6 +247,10 @@ jobs:
         run: |
           npm install --silent --no-audit --no-fund --prefix "$RUNNER_TEMP/lint" eslint@10 globals
           NODE_PATH="$RUNNER_TEMP/lint/node_modules" node tools/dashboard_no_undef.mjs
+      # The update button after a click, with the browser's clock ahead of and behind the
+      # daemon's (#1434): the real renderDeployment and click handler against fake snapshots.
+      - name: Update button holds an accepted click until the snapshot shows it
+        run: node tools/dashboard_deployment_pending_test.mjs
 
   # The app is a separate Rust crate plus a TypeScript frontend. Core green says
   # nothing about either: Sprint A demonstrated the gap when an app-only helper

@@ -26,6 +26,16 @@ checks = {
         and 'fn deployment_check_trigger_for' in http,
     'check is witnessed before it is triggered': http.index('"deployment_check_requested"') < http.index('deployment_trigger_output(&trigger_for_run)).await {\n        Ok(result) => result,\n        Err(error) => Err(format!("update check trigger'),
     'UI check sends no request body': "apiFetch('/api/operator/deployment/check', { method: 'POST' })" in ui,
+    # /api/dashboard serves the last snapshot while the next one builds, so the poll right
+    # after a click can predate it (tl-dell 2026-10-27: "update" flickered back for seconds).
+    'UI holds an accepted click until the snapshot shows it': 'let deploymentPending = null;' in ui
+        and 'd.update_request_id === p.requestId' in ui
+        and 'requestId: body.request_id' in ui
+        and 'DEPLOYMENT_PENDING_MAX_MS' in ui,
+    # A check has no id; it is matched by the server's stamp changing, never by comparing the
+    # browser's clock with the daemon's (#1434 review). Behaviour: dashboard_deployment_pending_test.mjs.
+    'UI matches a check click without comparing clocks': 'checkMark !== p.checkMark' in ui
+        and 'Date.parse(chk.at)' not in ui,
     'UI says up to date only from a check': "`● up to date${checked}`" in ui and "deployment current" not in ui,
     'supervisor records its verdict': 'deploy-check.tsv' in deploy and 'write_check_result up-to-date' in deploy
         and 'write_check_result available' in deploy,
