@@ -98,7 +98,11 @@ step_download() {
   if curl -fsSL "$checksum_url" -o "$tmpdir/$filename.sha256" 2>/dev/null; then
     (
       cd "$tmpdir"
-      if ! sha256sum -c "$filename.sha256" >/dev/null 2>&1; then
+      # macOS ships `shasum`, not `sha256sum` (found by install smoke, web4#904: every macOS
+      # install refused a correct download). Same `<hex>  <name>` check-file format for both.
+      if command -v sha256sum >/dev/null 2>&1; then sumcheck=(sha256sum -c)
+      else sumcheck=(shasum -a 256 -c); fi
+      if ! "${sumcheck[@]}" "$filename.sha256" >/dev/null 2>&1; then
         c_err "SHA-256 checksum verification failed for $filename"
         exit 1
       fi
@@ -973,18 +977,26 @@ step_claude_hooks() {
 
 step_smoketest() {
   c_hdr "smoke test"
-  local host="${HESTIA_BIND%:*}" port="${HESTIA_BIND##*:}"
-  # Give the daemon a second to come up.
-  for _ in 1 2 3 4 5; do
-    if curl -fsS -o /dev/null "http://${host}:${port}/api/dashboard"; then
-      c_ok "dashboard reachable at http://${host}:${port}/"
-      curl -fsS "http://${host}:${port}/api/dashboard" \
-        | python3 -c "import json,sys; d=json.load(sys.stdin); print('  chain length:', d['society']['chain_length']); print('  vault entries:', d['society']['vault_entries']); print('  known plugins:', d['society']['known_plugins'])"
-      return 0
+  local host="${HESTIA_BIND%:*}" port="${HESTIA_BIND##*:}" body got want="${VERSION}"
+  # /api/version is the daemon's open handshake route (the app reads it before sign-in).
+  # This step used /api/dashboard, which became operator-authenticated: on a healthy fresh
+  # install it answered 401 and the installer reported a dead daemon and exited 1 (found by
+  # install smoke, web4#904). The daemon must also be the release this run installed: a release
+  # binary built at its tag reports that tag as its build_id (`git describe`).
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if body="$(curl -fsS "http://${host}:${port}/api/version" 2>/dev/null)"; then
+      got="$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("build_id",""))' 2>/dev/null || true)"
+      if [ "$got" = "$want" ]; then
+        c_ok "daemon ${got} answering at http://${host}:${port}/ (sign in from the dashboard)"
+        return 0
+      fi
+      c_err "a daemon answers at http://${host}:${port}/ but reports build '${got}', not '${want}'"
+      c_dim "  another hestia may own ${HESTIA_BIND}; stop it, or set HESTIA_BIND and re-run"
+      exit 1
     fi
     sleep 1
   done
-  c_err "daemon did not respond at http://${host}:${port}/api/dashboard"
+  c_err "daemon did not respond at http://${host}:${port}/api/version"
   exit 1
 }
 

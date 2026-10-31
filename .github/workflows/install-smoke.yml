@@ -1,7 +1,7 @@
 name: install smoke
 
 # A FRESH host installs a published release the way the README tells an outside user to, and the
-# daemon it ends up running reports that release's version (web4#904: v0.3.0 final needs a fresh
+# daemon it ends up running reports that release's tag as its build_id (web4#904: v0.3.0 final needs a fresh
 # install from the rc assets to pass on Linux and macOS).
 #
 # No existing job did this. release.yml builds and publishes the assets; upgrade path drives the
@@ -66,7 +66,6 @@ jobs:
           case "$tag" in v[0-9]*) ;; *) echo "::error::not a release tag: '$tag'"; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "src=$src" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "installing $tag with the installer from: $src"
 
       - uses: actions/checkout@v4
@@ -105,14 +104,14 @@ jobs:
       - name: The running daemon is the release
         shell: bash
         env:
-          WANT: ${{ steps.pick.outputs.version }}
+          WANT: ${{ steps.pick.outputs.tag }}
         run: |
           set -euo pipefail
           body="$(curl -fsS http://127.0.0.1:7711/api/version)"
           echo "$body"
-          got="$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+          got="$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["build_id"])')"
           if [ "$got" != "$WANT" ]; then
-            echo "::error::daemon reports version '$got', expected '$WANT'"
+            echo "::error::daemon reports build_id '$got', expected '$WANT'"
             exit 1
           fi
           echo "ok: daemon $got"
