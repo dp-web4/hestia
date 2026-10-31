@@ -1,0 +1,55 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -3175,6 +3175,21 @@
+     if dir_bases is None:
+         found.unenum.append(f"more than {_MAX_DIR_BASES} directory changes")
+         dir_bases = []
++    # A `cd` INTO A LINK inside the workspace is judged where it lands (nomad's review of #1429's held patch):
++    # `cd <granted>/linkdir && cat data.txt`, linkdir -> an ungranted repo, read the ungranted repo through a
++    # bare word (not a path candidate), while `cat ./linkdir/data.txt` was refused. Judged on every literal
++    # `cd` destination whether or not a relative word follows, by #953's rule: egress first, then the target's
++    # repo; a link out of the workspace keeps #953's allowance.
++    for _b in (_dir_bases(found.dirs, cwd) or []):
++        _bl = os.path.normpath(_b).replace("\\", "/")
++        if (_bl == ws or _bl.startswith(ws + "/")) and os.path.realpath(_bl).replace("\\", "/") != _bl:
++            _hidden = _symlink_target_forbidden(_bl, egress)
++            if _hidden is not None:
++                return False, _hidden, _hidden
++            _r = _symlinked_reach_verdict(_bl, _bl[len(ws):].lstrip("/").split("/", 1)[0], repo_scopes,
++                                          scopes, workspace)
++            if _r is not None:
++                return (False,) + _r
+     # A relative path after a directory change is ALSO judged where it lands under it, strictly
+     # (the Read rule, inside the workspace too): `cd /tmp && cat ../etc/x` reaches /etc/x.
+     candidates = list(candidates) + [
+@@ -3196,6 +3211,29 @@
+                                                        if globbed else probe):
+                 continue
+             judged += 1
++            landed = os.path.normpath(probe).replace("\\", "/")
++            if landed == ws or landed.startswith(ws + "/"):
++                # Landing INSIDE the workspace: pass 1's rule for an in-workspace token (#1429), not the
++                # outside rule on its realpath. Before this, a venv's `.venv/bin/python` after `cd <repo>`
++                # was refused as a read of the system interpreter it links to, while the same file spelled
++                # `<ws>/<repo>/.venv/bin/python` passed under #953's link allowance (measured on McNugget,
++                # 2026-10-30, against this core offline). Egress first, then the grant, then the link.
++                hidden = _symlink_target_forbidden(landed, egress)
++                if hidden is not None:
++                    return False, hidden, hidden
++                seg = landed[len(ws):].lstrip("/").split("/", 1)[0]
++                if seg and seg not in repo_scopes and not _within_path_grant(landed, scopes, workspace):
++                    refused = _symlinked_reach_verdict(landed, seg, repo_scopes, scopes, workspace)
++                    if refused is not None:
++                        return (False,) + refused
++                elif os.path.realpath(landed).replace("\\", "/") != landed:
++                    # Granted where it lands lexically, but a LINK: judged where it lands (#953's in-workspace
++                    # half), so `cd <granted> && cat ./peek` into an ungranted repo stays refused, as today's
++                    # outside rule refused it. A target outside the workspace is #953's allowance (the venv).
++                    refused = _symlinked_reach_verdict(landed, seg, repo_scopes, scopes, workspace)
++                    if refused is not None:
++                        return (False,) + refused
++                continue
+             refused = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
+             if refused is not None:
+                 return (False,) + refused
