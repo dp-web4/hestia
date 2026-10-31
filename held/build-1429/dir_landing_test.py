@@ -63,6 +63,14 @@ DENY = [
     ("a subshell cd, a link into an ungranted repo", f"(cd {granted} && cat ./peek)"),
     ("cd INTO a dir link to an ungranted repo, then a bare word (the gap)", f"cd {granted}/linkdir && cat data.txt"),
     ("cd, cd into the dir link, then a bare word", f"cd {granted} && cd linkdir && cat data.txt"),
+    # hub's review: normpath cancels `link/..` lexically; the kernel follows the link first, then `..`
+    ("a .. after a dir link (kernel lands in notgranted)", f"cd {granted} && cat linkdir/../notgranted/data.txt"),
+    ("cd into the dir link, then ../", f"cd {granted}/linkdir && cat ../notgranted/data.txt"),
+    ("a cd target with .. after a dir link, then ./", f"cd {granted}/linkdir/../notgranted && cat ./data.txt"),
+    ("a cd target with .. after a dir link, then a bare word", f"cd {granted}/linkdir/../notgranted && cat data.txt"),
+]
+ALLOW += [
+    ("a .. through a REAL subdirectory stays in the granted repo", f"cd {granted} && cat sub/../sub/own.txt"),
 ]
 bad = []
 for name, cmd in ALLOW:

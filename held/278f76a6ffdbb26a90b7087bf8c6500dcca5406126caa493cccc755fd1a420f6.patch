@@ -1,0 +1,314 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -2771,6 +2771,22 @@
+     return out
+ 
+ 
++def _raw_dir_bases(dirs, cwd: str):
++    """`_dir_bases` without `normpath` (hub's review of #1429's held patch): each `cd` destination joined
++    as the shell passes it to the kernel, so a `..` after a link is resolved AFTER the link by `realpath`.
++    Same composition and cap as `_dir_bases`; None when there are more than `_MAX_DIR_BASES`."""
++    bases = []
++    for d in dirs:
++        new = [d] if d.startswith("/") else [os.path.join(b, d) for b in [cwd] + bases]
++        for n in new:
++            n = n.replace("\\", "/")
++            if n not in bases:
++                bases.append(n)
++        if len(bases) > _MAX_DIR_BASES:
++            return None
++    return bases
++
++
+ def _dir_bases(dirs, cwd: str):
+     """Every directory a relative path may resolve under after the command's directory changes:
+     each literal `cd` / `-C` target, a relative one composed under every base known before it
+@@ -3171,14 +3187,32 @@
+     rels = [(s_, g_) for s_, k_, g_ in candidates if k_ == "rel"]
+     if found.dirs_unknown and rels:
+         found.unenum.append(f"a relative path after {found.dirs_unknown}")
+-    dir_bases = _dir_bases(found.dirs, cwd) if rels else []
++    dir_bases = _raw_dir_bases(found.dirs, cwd) if rels else []
+     if dir_bases is None:
+         found.unenum.append(f"more than {_MAX_DIR_BASES} directory changes")
+         dir_bases = []
++    # A `cd` INTO A LINK inside the workspace is judged where it lands (nomad's review of #1429's held patch):
++    # `cd <granted>/linkdir && cat data.txt`, linkdir -> an ungranted repo, read the ungranted repo through a
++    # bare word (not a path candidate), while `cat ./linkdir/data.txt` was refused. Judged on every literal
++    # `cd` destination whether or not a relative word follows, by #953's rule: egress first, then the target's
++    # repo; a link out of the workspace keeps #953's allowance.
++    _wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++    for _b in (_raw_dir_bases(found.dirs, cwd) or []):
++        _bl = os.path.normpath(_b).replace("\\", "/")
++        _real = os.path.realpath(_b).replace("\\", "/")      # the RAW join: links first, then `..`
++        if (_bl == ws or _bl.startswith(ws + "/")) and _real != _bl:
++            if any(f in _real.lower() for f in egress):
++                return False, _real, _real
++            if _real == _wsr or _real.startswith(_wsr + "/"):
++                _tseg = _real[len(_wsr):].lstrip("/").split("/", 1)[0]
++                if not (_tseg in repo_scopes or _within_path_grant(_real, scopes, workspace)):
++                    return False, (_tseg or "<workspace root>"), _real
+     # A relative path after a directory change is ALSO judged where it lands under it, strictly
+     # (the Read rule, inside the workspace too): `cd /tmp && cat ../etc/x` reaches /etc/x.
+     candidates = list(candidates) + [
+-        (os.path.normpath(os.path.join(b, s_)).replace("\\", "/"), "dir", g_)
++        # RAW, not normpath'd: a `..` after a link is resolved by the kernel after the link, and every judge
++        # downstream either normalises for itself (`_outside_reach_refused`) or needs the raw path's realpath.
++        (os.path.join(b, s_).replace("\\", "/"), "dir", g_)
+         for b in dir_bases for s_, g_ in rels]
+     for spelling, kind, globbed in candidates:
+         if (spelling, kind, globbed) in seen3:
+@@ -3196,6 +3230,34 @@
+                                                        if globbed else probe):
+                 continue
+             judged += 1
++            landed = os.path.normpath(probe).replace("\\", "/")
++            if landed == ws or landed.startswith(ws + "/"):
++                # Landing INSIDE the workspace: pass 1's rule for an in-workspace token (#1429), not the
++                # outside rule on its realpath. Before this, a venv's `.venv/bin/python` after `cd <repo>`
++                # was refused as a read of the system interpreter it links to, while the same file spelled
++                # `<ws>/<repo>/.venv/bin/python` passed under #953's link allowance (measured on McNugget,
++                # 2026-10-30, against this core offline). Egress first, then the grant, then the link.
++                # WHERE THE KERNEL LANDS, NOT WHERE THE TEXT DOES (hub's review): `normpath` cancels
++                # `linkdir/..` lexically, but the kernel follows the link first and then applies `..`, so
++                # `cd membot && cat linkdir/../notgranted/x` reads <ws>/notgranted. `probe` is the raw join
++                # (the dir candidates are built without normpath), so its realpath is the kernel's landing.
++                real = os.path.realpath(probe).replace("\\", "/")
++                if real != landed:
++                    # A link on the way (or a symlinked workspace): judged where it lands (#953). Egress
++                    # first; inside the workspace the TARGET's repo must be granted (`cd <granted> && cat
++                    # ./peek` into an ungranted repo stays refused); outside it is #953's allowance (the venv).
++                    if any(f in real.lower() for f in egress):
++                        return False, real, real
++                    wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++                    if real == wsr or real.startswith(wsr + "/"):
++                        tseg = real[len(wsr):].lstrip("/").split("/", 1)[0]
++                        if not (tseg in repo_scopes or _within_path_grant(real, scopes, workspace)):
++                            return False, (tseg or "<workspace root>"), real
++                    continue
++                seg = landed[len(ws):].lstrip("/").split("/", 1)[0]
++                if seg and seg not in repo_scopes and not _within_path_grant(landed, scopes, workspace):
++                    return False, seg, landed
++                continue
+             refused = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
+             if refused is not None:
+                 return (False,) + refused
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: be293becd8ceedeb857149e186024555f0967b99bfd74bb8082f220818e4987b  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -2772,6 +2772,22 @@
+     return out
+ 
+ 
++def _raw_dir_bases(dirs, cwd: str):
++    """`_dir_bases` without `normpath` (hub's review of #1429's held patch): each `cd` destination joined
++    as the shell passes it to the kernel, so a `..` after a link is resolved AFTER the link by `realpath`.
++    Same composition and cap as `_dir_bases`; None when there are more than `_MAX_DIR_BASES`."""
++    bases = []
++    for d in dirs:
++        new = [d] if d.startswith("/") else [os.path.join(b, d) for b in [cwd] + bases]
++        for n in new:
++            n = n.replace("\\", "/")
++            if n not in bases:
++                bases.append(n)
++        if len(bases) > _MAX_DIR_BASES:
++            return None
++    return bases
++
++
+ def _dir_bases(dirs, cwd: str):
+     """Every directory a relative path may resolve under after the command's directory changes:
+     each literal `cd` / `-C` target, a relative one composed under every base known before it
+@@ -3172,14 +3188,32 @@
+     rels = [(s_, g_) for s_, k_, g_ in candidates if k_ == "rel"]
+     if found.dirs_unknown and rels:
+         found.unenum.append(f"a relative path after {found.dirs_unknown}")
+-    dir_bases = _dir_bases(found.dirs, cwd) if rels else []
++    dir_bases = _raw_dir_bases(found.dirs, cwd) if rels else []
+     if dir_bases is None:
+         found.unenum.append(f"more than {_MAX_DIR_BASES} directory changes")
+         dir_bases = []
++    # A `cd` INTO A LINK inside the workspace is judged where it lands (nomad's review of #1429's held patch):
++    # `cd <granted>/linkdir && cat data.txt`, linkdir -> an ungranted repo, read the ungranted repo through a
++    # bare word (not a path candidate), while `cat ./linkdir/data.txt` was refused. Judged on every literal
++    # `cd` destination whether or not a relative word follows, by #953's rule: egress first, then the target's
++    # repo; a link out of the workspace keeps #953's allowance.
++    _wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++    for _b in (_raw_dir_bases(found.dirs, cwd) or []):
++        _bl = os.path.normpath(_b).replace("\\", "/")
++        _real = os.path.realpath(_b).replace("\\", "/")      # the RAW join: links first, then `..`
++        if (_bl == ws or _bl.startswith(ws + "/")) and _real != _bl:
++            if any(f in _real.lower() for f in egress):
++                return False, _real, _real
++            if _real == _wsr or _real.startswith(_wsr + "/"):
++                _tseg = _real[len(_wsr):].lstrip("/").split("/", 1)[0]
++                if not (_tseg in repo_scopes or _within_path_grant(_real, scopes, workspace)):
++                    return False, (_tseg or "<workspace root>"), _real
+     # A relative path after a directory change is ALSO judged where it lands under it, strictly
+     # (the Read rule, inside the workspace too): `cd /tmp && cat ../etc/x` reaches /etc/x.
+     candidates = list(candidates) + [
+-        (os.path.normpath(os.path.join(b, s_)).replace("\\", "/"), "dir", g_)
++        # RAW, not normpath'd: a `..` after a link is resolved by the kernel after the link, and every judge
++        # downstream either normalises for itself (`_outside_reach_refused`) or needs the raw path's realpath.
++        (os.path.join(b, s_).replace("\\", "/"), "dir", g_)
+         for b in dir_bases for s_, g_ in rels]
+     for spelling, kind, globbed in candidates:
+         if (spelling, kind, globbed) in seen3:
+@@ -3197,6 +3231,34 @@
+                                                        if globbed else probe):
+                 continue
+             judged += 1
++            landed = os.path.normpath(probe).replace("\\", "/")
++            if landed == ws or landed.startswith(ws + "/"):
++                # Landing INSIDE the workspace: pass 1's rule for an in-workspace token (#1429), not the
++                # outside rule on its realpath. Before this, a venv's `.venv/bin/python` after `cd <repo>`
++                # was refused as a read of the system interpreter it links to, while the same file spelled
++                # `<ws>/<repo>/.venv/bin/python` passed under #953's link allowance (measured on McNugget,
++                # 2026-10-30, against this core offline). Egress first, then the grant, then the link.
++                # WHERE THE KERNEL LANDS, NOT WHERE THE TEXT DOES (hub's review): `normpath` cancels
++                # `linkdir/..` lexically, but the kernel follows the link first and then applies `..`, so
++                # `cd membot && cat linkdir/../notgranted/x` reads <ws>/notgranted. `probe` is the raw join
++                # (the dir candidates are built without normpath), so its realpath is the kernel's landing.
++                real = os.path.realpath(probe).replace("\\", "/")
++                if real != landed:
++                    # A link on the way (or a symlinked workspace): judged where it lands (#953). Egress
++                    # first; inside the workspace the TARGET's repo must be granted (`cd <granted> && cat
++                    # ./peek` into an ungranted repo stays refused); outside it is #953's allowance (the venv).
++                    if any(f in real.lower() for f in egress):
++                        return False, real, real
++                    wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++                    if real == wsr or real.startswith(wsr + "/"):
++                        tseg = real[len(wsr):].lstrip("/").split("/", 1)[0]
++                        if not (tseg in repo_scopes or _within_path_grant(real, scopes, workspace)):
++                            return False, (tseg or "<workspace root>"), real
++                    continue
++                seg = landed[len(ws):].lstrip("/").split("/", 1)[0]
++                if seg and seg not in repo_scopes and not _within_path_grant(landed, scopes, workspace):
++                    return False, seg, landed
++                continue
+             refused = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
+             if refused is not None:
+                 return (False,) + refused
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b",
++      "sha256": "be293becd8ceedeb857149e186024555f0967b99bfd74bb8082f220818e4987b",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179"
++  "gt_version": "29a7da7b3af6a5427fa13ba3f1c167535a7f14d774f6db001a69eeffdd8dea08"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "29a7da7b3af6a5427fa13ba3f1c167535a7f14d774f6db001a69eeffdd8dea08",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "be293becd8ceedeb857149e186024555f0967b99bfd74bb8082f220818e4987b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "d26f719f133a611cda3d6b91f724479478058885035e74bfb4842e628216f4d0"
++  "gt_version": "e462e6f1c8dd5a6f1d08f575dfd699eab78830c27e4452cb0d9edfeb64a8b795"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "29a7da7b3af6a5427fa13ba3f1c167535a7f14d774f6db001a69eeffdd8dea08",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "be293becd8ceedeb857149e186024555f0967b99bfd74bb8082f220818e4987b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "cd9be17d272ee05c7d6789b4fb442a9e62e1259d15cbc112a449edbba3ecf064"
++  "gt_version": "ec45315fb532c8f6ab63871a3fa901a9803add3a6c0127911da3a7b34584a57b"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "29a7da7b3af6a5427fa13ba3f1c167535a7f14d774f6db001a69eeffdd8dea08",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "be293becd8ceedeb857149e186024555f0967b99bfd74bb8082f220818e4987b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "fa321587c9448ed240d3719ddc5770eed11c5dea953f24ad30f561ead887c8a0"
++  "gt_version": "d22cfb9d766029cbdb19c05ee230770a458adfe0f2978e3557fc3ac4355c3d77"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "29a7da7b3af6a5427fa13ba3f1c167535a7f14d774f6db001a69eeffdd8dea08",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "be293becd8ceedeb857149e186024555f0967b99bfd74bb8082f220818e4987b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "2a561c893e4cf9d3c16a247e2f60c4b27e9c3fa98c85073f5085617d06b091c0"
++  "gt_version": "2ce9f0a02dac7f865e8b660797982fe6a75868844177a48624c7a4c51224241d"
+ }

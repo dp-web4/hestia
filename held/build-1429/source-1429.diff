@@ -1,7 +1,35 @@
 diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
 --- a/plugins/_shared/hestia_gate_core.py
 +++ b/plugins/_shared/hestia_gate_core.py
-@@ -3175,6 +3175,21 @@
+@@ -2771,6 +2771,22 @@
+     return out
+ 
+ 
++def _raw_dir_bases(dirs, cwd: str):
++    """`_dir_bases` without `normpath` (hub's review of #1429's held patch): each `cd` destination joined
++    as the shell passes it to the kernel, so a `..` after a link is resolved AFTER the link by `realpath`.
++    Same composition and cap as `_dir_bases`; None when there are more than `_MAX_DIR_BASES`."""
++    bases = []
++    for d in dirs:
++        new = [d] if d.startswith("/") else [os.path.join(b, d) for b in [cwd] + bases]
++        for n in new:
++            n = n.replace("\\", "/")
++            if n not in bases:
++                bases.append(n)
++        if len(bases) > _MAX_DIR_BASES:
++            return None
++    return bases
++
++
+ def _dir_bases(dirs, cwd: str):
+     """Every directory a relative path may resolve under after the command's directory changes:
+     each literal `cd` / `-C` target, a relative one composed under every base known before it
+@@ -3171,14 +3187,32 @@
+     rels = [(s_, g_) for s_, k_, g_ in candidates if k_ == "rel"]
+     if found.dirs_unknown and rels:
+         found.unenum.append(f"a relative path after {found.dirs_unknown}")
+-    dir_bases = _dir_bases(found.dirs, cwd) if rels else []
++    dir_bases = _raw_dir_bases(found.dirs, cwd) if rels else []
      if dir_bases is None:
          found.unenum.append(f"more than {_MAX_DIR_BASES} directory changes")
          dir_bases = []
@@ -10,20 +38,28 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +    # bare word (not a path candidate), while `cat ./linkdir/data.txt` was refused. Judged on every literal
 +    # `cd` destination whether or not a relative word follows, by #953's rule: egress first, then the target's
 +    # repo; a link out of the workspace keeps #953's allowance.
-+    for _b in (_dir_bases(found.dirs, cwd) or []):
++    _wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++    for _b in (_raw_dir_bases(found.dirs, cwd) or []):
 +        _bl = os.path.normpath(_b).replace("\\", "/")
-+        if (_bl == ws or _bl.startswith(ws + "/")) and os.path.realpath(_bl).replace("\\", "/") != _bl:
-+            _hidden = _symlink_target_forbidden(_bl, egress)
-+            if _hidden is not None:
-+                return False, _hidden, _hidden
-+            _r = _symlinked_reach_verdict(_bl, _bl[len(ws):].lstrip("/").split("/", 1)[0], repo_scopes,
-+                                          scopes, workspace)
-+            if _r is not None:
-+                return (False,) + _r
++        _real = os.path.realpath(_b).replace("\\", "/")      # the RAW join: links first, then `..`
++        if (_bl == ws or _bl.startswith(ws + "/")) and _real != _bl:
++            if any(f in _real.lower() for f in egress):
++                return False, _real, _real
++            if _real == _wsr or _real.startswith(_wsr + "/"):
++                _tseg = _real[len(_wsr):].lstrip("/").split("/", 1)[0]
++                if not (_tseg in repo_scopes or _within_path_grant(_real, scopes, workspace)):
++                    return False, (_tseg or "<workspace root>"), _real
      # A relative path after a directory change is ALSO judged where it lands under it, strictly
      # (the Read rule, inside the workspace too): `cd /tmp && cat ../etc/x` reaches /etc/x.
      candidates = list(candidates) + [
-@@ -3196,6 +3211,29 @@
+-        (os.path.normpath(os.path.join(b, s_)).replace("\\", "/"), "dir", g_)
++        # RAW, not normpath'd: a `..` after a link is resolved by the kernel after the link, and every judge
++        # downstream either normalises for itself (`_outside_reach_refused`) or needs the raw path's realpath.
++        (os.path.join(b, s_).replace("\\", "/"), "dir", g_)
+         for b in dir_bases for s_, g_ in rels]
+     for spelling, kind, globbed in candidates:
+         if (spelling, kind, globbed) in seen3:
+@@ -3196,6 +3230,34 @@
                                                         if globbed else probe):
                  continue
              judged += 1
@@ -34,21 +70,26 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +                # was refused as a read of the system interpreter it links to, while the same file spelled
 +                # `<ws>/<repo>/.venv/bin/python` passed under #953's link allowance (measured on McNugget,
 +                # 2026-10-30, against this core offline). Egress first, then the grant, then the link.
-+                hidden = _symlink_target_forbidden(landed, egress)
-+                if hidden is not None:
-+                    return False, hidden, hidden
++                # WHERE THE KERNEL LANDS, NOT WHERE THE TEXT DOES (hub's review): `normpath` cancels
++                # `linkdir/..` lexically, but the kernel follows the link first and then applies `..`, so
++                # `cd membot && cat linkdir/../notgranted/x` reads <ws>/notgranted. `probe` is the raw join
++                # (the dir candidates are built without normpath), so its realpath is the kernel's landing.
++                real = os.path.realpath(probe).replace("\\", "/")
++                if real != landed:
++                    # A link on the way (or a symlinked workspace): judged where it lands (#953). Egress
++                    # first; inside the workspace the TARGET's repo must be granted (`cd <granted> && cat
++                    # ./peek` into an ungranted repo stays refused); outside it is #953's allowance (the venv).
++                    if any(f in real.lower() for f in egress):
++                        return False, real, real
++                    wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++                    if real == wsr or real.startswith(wsr + "/"):
++                        tseg = real[len(wsr):].lstrip("/").split("/", 1)[0]
++                        if not (tseg in repo_scopes or _within_path_grant(real, scopes, workspace)):
++                            return False, (tseg or "<workspace root>"), real
++                    continue
 +                seg = landed[len(ws):].lstrip("/").split("/", 1)[0]
 +                if seg and seg not in repo_scopes and not _within_path_grant(landed, scopes, workspace):
-+                    refused = _symlinked_reach_verdict(landed, seg, repo_scopes, scopes, workspace)
-+                    if refused is not None:
-+                        return (False,) + refused
-+                elif os.path.realpath(landed).replace("\\", "/") != landed:
-+                    # Granted where it lands lexically, but a LINK: judged where it lands (#953's in-workspace
-+                    # half), so `cd <granted> && cat ./peek` into an ungranted repo stays refused, as today's
-+                    # outside rule refused it. A target outside the workspace is #953's allowance (the venv).
-+                    refused = _symlinked_reach_verdict(landed, seg, repo_scopes, scopes, workspace)
-+                    if refused is not None:
-+                        return (False,) + refused
++                    return False, seg, landed
 +                continue
              refused = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
              if refused is not None:
