@@ -1,0 +1,142 @@
+name: install smoke
+
+# A FRESH host installs a published release the way the README tells an outside user to, and the
+# daemon it ends up running reports that release's tag as its build_id (web4#904: v0.3.0 final needs a fresh
+# install from the rc assets to pass on Linux and macOS).
+#
+# No existing job did this. release.yml builds and publishes the assets; upgrade path drives the
+# deploy timer from main against an isolated daemon. Neither runs `deploy/fleet/install.sh` against
+# the published assets on a machine that has never seen hestia.
+#
+# What runs:
+#   release published   the installer AT THAT TAG (raw URL, as `curl | bash` would fetch it),
+#                       installing that tag.
+#   workflow_dispatch   the same, for a tag you name (re-check an existing release).
+#   pull_request        the installer FROM THE PR against the newest release, pre-releases
+#                       included, so an installer change is tested before it ships.
+#
+# Hooks and the deploy supervisor are skipped (HESTIA_SKIP_HOOK, HESTIA_SKIP_DEPLOY): a runner has
+# no seats to wire. Everything else is the real path: download + sha256, vault init, the systemd
+# user unit (Linux) or launchd agent (macOS), and the installer's own smoke test.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "release tag to install (e.g. v0.3.0-rc.4)"
+        required: true
+  pull_request:
+    paths:
+      - "deploy/fleet/install.sh"
+      - ".github/workflows/install-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: fresh install (${{ matrix.os }}${{ matrix.home && ', custom HESTIA_HOME' || '' }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        home: [""]
+        include:
+          # #1444: the unit hardcoded %h/.hestia, so an install with HESTIA_HOME set put the
+          # vault where the daemon never looked. An empty value is the installer's default home.
+          # `alt` = a home under the runner's temp root, derived at run time (a baked runner home
+          # path is a machine-layout literal: tools/public_boundary.py rejects it).
+          - os: ubuntu-latest
+            home: alt
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HESTIA_SKIP_HOOK: "1"
+      HESTIA_SKIP_DEPLOY: "1"
+    steps:
+      - name: Custom HESTIA_HOME
+        if: matrix.home == 'alt'
+        shell: bash
+        run: echo "HESTIA_HOME=$RUNNER_TEMP/hestia-alt-home" >> "$GITHUB_ENV"
+
+      - name: Which release, which installer
+        id: pick
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REL_TAG: ${{ github.event.release.tag_name }}
+          IN_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            release) tag="$REL_TAG"; src=tag ;;
+            workflow_dispatch) tag="$IN_TAG"; src=tag ;;
+            *) tag="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName -q '.[0].tagName')"; src=pr ;;
+          esac
+          case "$tag" in v[0-9]*) ;; *) echo "::error::not a release tag: '$tag'"; exit 1 ;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "src=$src" >> "$GITHUB_OUTPUT"
+          echo "installing $tag with the installer from: $src"
+
+      - uses: actions/checkout@v4
+        if: steps.pick.outputs.src == 'pr'
+
+      # A GitHub Linux runner has no user systemd manager until linger is on. The installer's
+      # Linux path is `systemctl --user`, the same as on a real desktop login.
+      - name: User systemd session (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          uid="$(id -u)"
+          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
+          for _ in $(seq 1 20); do
+            [ -S "/run/user/$uid/bus" ] && break
+            sleep 1
+          done
+          XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-system-running || true
+
+      - name: Install
+        shell: bash
+        env:
+          HESTIA_VERSION: ${{ steps.pick.outputs.tag }}
+          SRC: ${{ steps.pick.outputs.src }}
+        run: |
+          set -euo pipefail
+          if [ "$SRC" = pr ]; then
+            bash deploy/fleet/install.sh
+          else
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${HESTIA_VERSION}/deploy/fleet/install.sh" -o /tmp/install.sh
+            bash /tmp/install.sh
+          fi
+
+      - name: The running daemon is the release
+        shell: bash
+        env:
+          WANT: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          body="$(curl -fsS http://127.0.0.1:7711/api/version)"
+          echo "$body"
+          got="$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin)["build_id"])')"
+          if [ "$got" != "$WANT" ]; then
+            echo "::error::daemon reports build_id '$got', expected '$WANT'"
+            exit 1
+          fi
+          echo "ok: daemon $got"
+
+      - name: Service logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            systemctl --user status hestia.service --no-pager || true
+            journalctl --user -u hestia --no-pager -n 80 || true
+          else
+            tail -n 80 "${HESTIA_HOME:-$HOME/.hestia}/hestia.log" || true
+            launchctl list | grep -i hestia || true
+          fi
