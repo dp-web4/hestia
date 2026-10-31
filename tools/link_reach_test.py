@@ -51,7 +51,7 @@ ORDINARY = [
     ("git -C sub show (link text, not target)", "git -C sub show HEAD:key.txt"),
     ("a quoted glob naming nothing", "grep -n 'no*such' clean/a.txt"),
 ]
-OVERFLOW = [("glob of 300 files", "cat ../other/wide/*.txt")]
+OVERFLOW = [("a glob past the match cap", "cat ../other/wide/*.txt")]
 #: What main's core (#1433) says for the ordinary rows: the reach work must leave each exactly as it was.
 ORDINARY_WANT = {"named link (#1433)": "deny/egress.secret"}
 
@@ -76,7 +76,7 @@ def main():
         for n in ("a.txt", "b.txt"):
             open(os.path.join(clean, n), "w").write("key\n")
         os.symlink(os.path.join(clean, "a.txt"), os.path.join(clean, "alias.txt"))
-        for i in range(300):
+        for i in range(getattr(g.core, "LINK_GLOB_LIMIT", 256) + 44):     # just past the match cap
             open(os.path.join(wide, f"f{i}.txt"), "w").close()
         for i in range(101):
             dd = os.path.join(deep, f"d{i}")
@@ -148,14 +148,14 @@ def main():
         # The glob scan budget, at its real value: a caller-written pattern over one 12,000-entry dir, and 300 matches.
         scan_cap = getattr(g.core, "LINK_GLOB_SCAN_LIMIT", None)
         for name, cmd in [("a glob over one 12,000-entry dir", "cat ../other/big/*"),
-                          ("a glob of 300 matches", "cat ../other/wide/*.txt")]:
+                          ("a glob past the match cap", "cat ../other/wide/*.txt")]:
             got = counted(cmd)
             if got != "deny/mrh.command.unenumerated":
                 bad.append(f"BOUNDED {name}: mrh.command.unenumerated expected, got {got}")
-            if scan_cap is None or read[0] > scan_cap + 1:
+            if scan_cap is None or read[0] > 2 * (scan_cap + 1):   # two bounded passes: the secret sweep + the overflow decision
                 bad.append(f"BOUNDED {name}: read {read[0]} directory entries, the bound is {scan_cap}")
         # The walk budget's MECHANICS, at a small cap so the fixture stays small: lowered to 10,000 for this one row,
-        # a walk over the 12,000-entry dir must stop by 10,001 entries read.
+        # a walk over the 12,000-entry dir must stop by 10,001 entries read in each of the two passes evaluate makes.
         if limit is not None:
             g.core.LINK_WALK_LIMIT = 10000
         try:
@@ -163,8 +163,8 @@ def main():
         finally:
             if limit is not None:
                 g.core.LINK_WALK_LIMIT = limit
-        if got != "deny/mrh.command.unenumerated" or read[0] > 10001:
-            bad.append(f"BOUNDED a walk past a lowered 10,000 cap: {got}, read {read[0]} directory entries")
+        if got != "deny/mrh.command.unenumerated" or read[0] > 2 * 10001:   # two bounded passes, each stops at the cap
+            bad.append(f"BOUNDED a walk past a lowered 10,000 cap (2 passes, 20,002 max): {got}, read {read[0]} directory entries")
         # The walk budget's VALUE (nomad's #1435 review): walks the size of a real repo are allowed when they reach no
         # link, so a routine `find DIR -exec` or `grep -R` at a repo root is not refused for nothing.
         for name, cmd in [("a walk over 12,000 entries, no link", "grep -R key ../other/big"),
