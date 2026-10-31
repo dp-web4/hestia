@@ -1,0 +1,570 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -689,6 +689,172 @@
+     return "$" not in word and "`" not in word
+ 
+ 
++_EGRESS_PUNCT = "();<>|&"
++
++
++def _shell_liveness(command: str, words: list) -> Optional[list]:
++    """For each of shlex's `words`, whether the shell would EXPAND anything in it: an unescaped `$` or
++    backtick outside single quotes (hestia #1330, second half). shlex drops the quoting, so `_literal`
++    alone refused `--body 'the `credentials` file'` and `"the \\`credentials\\` file"`, where the
++    shell expands nothing (measured on McNugget 2026-10-31: every issue body with markdown code).
++
++    A scan of the raw command that mirrors shlex's own word values (posix, punctuation_chars,
++    whitespace_split, `#` comments) and records liveness by the SHELL's rules: inside single quotes
++    nothing is live; inside double quotes `\\$` and `\\``` are literal and `\\\\` is one backslash (so
++    `"\\\\`x`"` is live); unquoted, a backslash makes the next character literal. It returns None,
++    and the caller keeps `_literal`, whenever its words differ from shlex's in any way, so a form
++    this scan does not model can only be judged as strictly as before."""
++    vals, lives = [], []
++    cur, live, have = [], False, False
++    i, n = 0, len(command)
++
++    def flush():
++        nonlocal cur, live, have
++        if have:
++            vals.append("".join(cur))
++            lives.append(live)
++        cur, live, have = [], False, False
++
++    while i < n:
++        c = command[i]
++        if c in " \t\r\n":
++            flush()
++            i += 1
++            continue
++        if c == "#" and not have:
++            j = command.find("\n", i)
++            i = n if j < 0 else j
++            continue
++        if c in _EGRESS_PUNCT:
++            flush()
++            j = i
++            while j < n and command[j] in _EGRESS_PUNCT:
++                j += 1
++            vals.append(command[i:j])
++            lives.append(False)
++            i = j
++            continue
++        have = True
++        if c == "\\":
++            if i + 1 >= n:
++                return None
++            cur.append(command[i + 1])
++            i += 2
++            continue
++        if c == "'":
++            j = command.find("'", i + 1)
++            if j < 0:
++                return None
++            cur.append(command[i + 1:j])
++            i = j + 1
++            continue
++        if c == '"':
++            i += 1
++            while True:
++                if i >= n:
++                    return None
++                d = command[i]
++                if d == '"':
++                    i += 1
++                    break
++                if d == "\\" and i + 1 < n and command[i + 1] in '\\"':
++                    cur.append(command[i + 1])
++                    i += 2
++                    continue
++                if d == "\\" and i + 1 < n and command[i + 1] in "$`":
++                    cur.append(d + command[i + 1])      # shlex keeps the backslash; the shell expands nothing
++                    i += 2
++                    continue
++                if d in "$`":
++                    live = True
++                cur.append(d)
++                i += 1
++            continue
++        if c in "$`":
++            live = True
++        cur.append(c)
++        i += 1
++    flush()
++    return lives if vals == list(words) else None
++
++
++#: The only heredoc consumers whose body Gate 1a may leave unswept: they copy it to stdout or a file
++#: and run nothing. Matched on the consumer's first word exactly (no env prefix, no `sudo`, no
++#: `xargs`), so anything that could hand the body to a program keeps it swept.
++_EGRESS_DATA_WRITERS = frozenset({"cat", "tee"})
++#: What may follow the heredoc in the same act for its body to stay unswept: one `gh` command that
++#: publishes a body and runs nothing local, optionally piped into a reader that runs nothing. Each must
++#: name its repo (`-R`/`--repo`): without one, gh asks git which repo this is, and a heredoc in the same
++#: act may have written `.git/config` (nomad's round 2 on 469b4315). Not allowed, because they execute:
++#: `gh alias set --shell` + the alias, `gh extension`, `gh pr create|checkout|merge` and `gh repo sync`
++#: (they run git, and git runs hooks), `gh api` (its `{owner}` placeholders come from git), and anything
++#: else: `sh s.sh`, `. ./s.sh`, `make`, `npm`, `git commit` (hooks), `eval "$x"`.
++_EGRESS_INERT_LATER = re.compile(
++    r"^\s*gh\s+(?:issue\s+(?:create|comment|edit)|pr\s+(?:comment|review|edit))\s"
++    r"(?=[^\n]*(?:(?<!\S)-R\s|(?<!\S)--repo[\s=]))[^;&`$()<>|]*(?:\|\s*(?:tail|head|wc)(?:\s+-?[\w]+)*\s*)?$")
++
++
++def _egress_pure_writer(before: str, after: str) -> bool:
++    """Whether a heredoc opened between `before` and `after` on one line feeds a pure data writer whose
++    output goes nowhere that runs it: the consumer is `cat`/`tee`, the line before it opens no group,
++    subshell or substitution (`(cat <<'EOF' …) | sh`, `x=$(cat <<'EOF' …)`, `{ … } | sh`), and the
++    rest of the line holds no pipe, chain, background, substitution or redirection-from."""
++    if re.search(r"[|;&`$()<{}]", after) or re.search(r"[`({]|\$\(", before):
++        return False
++    seg = re.split(r"\|\||&&|[|;&]", before)[-1]
++    try:
++        words = shlex.split(seg, posix=True)
++    except ValueError:
++        return False
++    return bool(words) and os.path.basename(words[0]) in _EGRESS_DATA_WRITERS and "=" not in words[0]
++
++
++def _egress_heredoc_data_removed(cmd: str) -> str:
++    """The command with the body of ONE quoted-delimiter heredoc written by a pure data writer removed
++    (hestia #1330, second half). `cat > notes.md <<'EOF'` with "rotating the credentials" in its body
++    was refused egress.secret, though the body is text the shell never runs or expands, and the same
++    bytes written with the Write tool are not swept (a local file's contents are not egress).
++
++    ENDING THE BODY LATER THAN BASH IS THE UNSAFE DIRECTION (nomad's review of eb2db327, where three
++    shapes got a real read past this): whatever bash runs in the gap would be dropped. So the body is
++    dropped only when all of these hold, and otherwise the command is swept exactly as written:
++    - exactly one heredoc in the command, quoted (`<<'W'`, `<<"W"`, `<<\\W`, `<<-` forms), its
++      delimiter word followed only by a space, a tab or the end of the line (`<<'EOF'x` is `EOFx` to
++      bash), no carriage return anywhere, and no backslash ending the heredoc line (bash continues it:
++      `<<'EOF' \\` + `; cat key` is a command);
++    - its consumer is a pure data writer (`_egress_pure_writer`);
++    - no earlier line redirects output into something that runs it (`exec`, `>(`, `<(`);
++    - every later line is empty or inert (`_EGRESS_INERT_LATER`): writing `s.sh` and running it in the
++      same act is not the Write-then-Bash split the premise rests on.
++    The heredoc's own line and every later line are always swept."""
++    if "<<" not in cmd or "\r" in cmd:
++        return cmd
++    lines = cmd.split("\n")
++    found = [(k, m) for k, ln in enumerate(lines)
++             for m in _HEREDOC_OP.finditer(ln) if not _quoted_at(ln, m.start())]
++    if len(found) != 1:
++        return cmd
++    k, m = found[0]
++    line = lines[k]
++    dash, word = m.group(1), m.group(4)
++    if not (m.group(2) or m.group(3)):
++        return cmd                                   # unquoted: the shell expands the body
++    if re.search(r"(?<!\\)(?:\\\\)*\\$", line) or not re.match(r"(?:[ \t]|$)", line[m.end():]):
++        return cmd
++    if not _egress_pure_writer(line[:m.start()], line[m.end():]):
++        return cmd
++    if any(re.search(r"\bexec\b|>\(|<\(", ln) for ln in lines[:k]):
++        return cmd
++    j = k + 1
++    while j < len(lines) and (lines[j].lstrip("\t") if dash else lines[j]) != word:
++        j += 1
++    if j >= len(lines):
++        return cmd                                   # unterminated
++    if not all(not ln.strip() or _EGRESS_INERT_LATER.match(ln) for ln in lines[j + 1:]):
++        return cmd
++    return "\n".join(lines[:k + 1] + lines[j:])
++
++
+ def _prose_flag_counts(prev: str, bools: frozenset) -> bool:
+     """A prose flag is the flag only if the word before it is not an option waiting for its value:
+     a non-option word (the program, a subcommand, a positional, or the value of an earlier option),
+@@ -706,16 +872,27 @@
+     not literal (it could expand to a secret's contents) and stays swept; so does the whole raw
+     command when it cannot be tokenized. Each segment (`_SEGMENT_BREAKS`) is resolved on its own:
+     the program, then its subcommand words (git's own leading options allowed), then the flags.
+-    `--` ends the exemptions for the rest of its segment: after it every word is an operand."""
++    `--` ends the exemptions for the rest of its segment: after it every word is an operand.
++
++    Second half (2026-10-31): a quoted-delimiter heredoc body written by `cat`/`tee` is data and is
++    not swept (`_egress_heredoc_data_removed`), and a value is literal by the SHELL's quoting, not by
++    whether shlex's output holds a `$` or backtick (`_shell_liveness`); either falls back to the
++    rule above wherever it does not model the command."""
++    command = _egress_heredoc_data_removed(command)
+     try:
+         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+         lex.whitespace_split = True
+         words = list(lex)
+     except ValueError:
+         return command
++    lives = _shell_liveness(command, words)
++
++    def unexpanding(idx: int, value: str) -> bool:
++        return (not lives[idx]) if lives is not None else _literal(value)
++
+     kept = []
+     prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
+-    for w in words:
++    for idx, w in enumerate(words):
+         if w in _SEGMENT_BREAKS:
+             prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
+             kept.append(w)
+@@ -723,7 +900,7 @@
+         if skip_next:
+             skip_next = False
+             prev = w
+-            if _literal(w):
++            if unexpanding(idx, w):
+                 continue                    # the literal prose value: not a path, not swept
+             kept.append(w)
+             continue
+@@ -765,7 +942,7 @@
+         name, eq, val = w.partition("=")
+         if w in flags and _prose_flag_counts(prev, bools):
+             skip_next = True
+-        elif (eq and name in flags and name.startswith("--") and _literal(val)
++        elif (eq and name in flags and name.startswith("--") and unexpanding(idx, val)
+               and _prose_flag_counts(prev, bools)):
+             kept[-1] = name + "="
+         prev = w
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: b0df672214f8776a9cb27687f78723d04b9eb97aeab81e3fb796b79e0264f96e  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -690,6 +690,172 @@
+     return "$" not in word and "`" not in word
+ 
+ 
++_EGRESS_PUNCT = "();<>|&"
++
++
++def _shell_liveness(command: str, words: list) -> Optional[list]:
++    """For each of shlex's `words`, whether the shell would EXPAND anything in it: an unescaped `$` or
++    backtick outside single quotes (hestia #1330, second half). shlex drops the quoting, so `_literal`
++    alone refused `--body 'the `credentials` file'` and `"the \\`credentials\\` file"`, where the
++    shell expands nothing (measured on McNugget 2026-10-31: every issue body with markdown code).
++
++    A scan of the raw command that mirrors shlex's own word values (posix, punctuation_chars,
++    whitespace_split, `#` comments) and records liveness by the SHELL's rules: inside single quotes
++    nothing is live; inside double quotes `\\$` and `\\``` are literal and `\\\\` is one backslash (so
++    `"\\\\`x`"` is live); unquoted, a backslash makes the next character literal. It returns None,
++    and the caller keeps `_literal`, whenever its words differ from shlex's in any way, so a form
++    this scan does not model can only be judged as strictly as before."""
++    vals, lives = [], []
++    cur, live, have = [], False, False
++    i, n = 0, len(command)
++
++    def flush():
++        nonlocal cur, live, have
++        if have:
++            vals.append("".join(cur))
++            lives.append(live)
++        cur, live, have = [], False, False
++
++    while i < n:
++        c = command[i]
++        if c in " \t\r\n":
++            flush()
++            i += 1
++            continue
++        if c == "#" and not have:
++            j = command.find("\n", i)
++            i = n if j < 0 else j
++            continue
++        if c in _EGRESS_PUNCT:
++            flush()
++            j = i
++            while j < n and command[j] in _EGRESS_PUNCT:
++                j += 1
++            vals.append(command[i:j])
++            lives.append(False)
++            i = j
++            continue
++        have = True
++        if c == "\\":
++            if i + 1 >= n:
++                return None
++            cur.append(command[i + 1])
++            i += 2
++            continue
++        if c == "'":
++            j = command.find("'", i + 1)
++            if j < 0:
++                return None
++            cur.append(command[i + 1:j])
++            i = j + 1
++            continue
++        if c == '"':
++            i += 1
++            while True:
++                if i >= n:
++                    return None
++                d = command[i]
++                if d == '"':
++                    i += 1
++                    break
++                if d == "\\" and i + 1 < n and command[i + 1] in '\\"':
++                    cur.append(command[i + 1])
++                    i += 2
++                    continue
++                if d == "\\" and i + 1 < n and command[i + 1] in "$`":
++                    cur.append(d + command[i + 1])      # shlex keeps the backslash; the shell expands nothing
++                    i += 2
++                    continue
++                if d in "$`":
++                    live = True
++                cur.append(d)
++                i += 1
++            continue
++        if c in "$`":
++            live = True
++        cur.append(c)
++        i += 1
++    flush()
++    return lives if vals == list(words) else None
++
++
++#: The only heredoc consumers whose body Gate 1a may leave unswept: they copy it to stdout or a file
++#: and run nothing. Matched on the consumer's first word exactly (no env prefix, no `sudo`, no
++#: `xargs`), so anything that could hand the body to a program keeps it swept.
++_EGRESS_DATA_WRITERS = frozenset({"cat", "tee"})
++#: What may follow the heredoc in the same act for its body to stay unswept: one `gh` command that
++#: publishes a body and runs nothing local, optionally piped into a reader that runs nothing. Each must
++#: name its repo (`-R`/`--repo`): without one, gh asks git which repo this is, and a heredoc in the same
++#: act may have written `.git/config` (nomad's round 2 on 469b4315). Not allowed, because they execute:
++#: `gh alias set --shell` + the alias, `gh extension`, `gh pr create|checkout|merge` and `gh repo sync`
++#: (they run git, and git runs hooks), `gh api` (its `{owner}` placeholders come from git), and anything
++#: else: `sh s.sh`, `. ./s.sh`, `make`, `npm`, `git commit` (hooks), `eval "$x"`.
++_EGRESS_INERT_LATER = re.compile(
++    r"^\s*gh\s+(?:issue\s+(?:create|comment|edit)|pr\s+(?:comment|review|edit))\s"
++    r"(?=[^\n]*(?:(?<!\S)-R\s|(?<!\S)--repo[\s=]))[^;&`$()<>|]*(?:\|\s*(?:tail|head|wc)(?:\s+-?[\w]+)*\s*)?$")
++
++
++def _egress_pure_writer(before: str, after: str) -> bool:
++    """Whether a heredoc opened between `before` and `after` on one line feeds a pure data writer whose
++    output goes nowhere that runs it: the consumer is `cat`/`tee`, the line before it opens no group,
++    subshell or substitution (`(cat <<'EOF' …) | sh`, `x=$(cat <<'EOF' …)`, `{ … } | sh`), and the
++    rest of the line holds no pipe, chain, background, substitution or redirection-from."""
++    if re.search(r"[|;&`$()<{}]", after) or re.search(r"[`({]|\$\(", before):
++        return False
++    seg = re.split(r"\|\||&&|[|;&]", before)[-1]
++    try:
++        words = shlex.split(seg, posix=True)
++    except ValueError:
++        return False
++    return bool(words) and os.path.basename(words[0]) in _EGRESS_DATA_WRITERS and "=" not in words[0]
++
++
++def _egress_heredoc_data_removed(cmd: str) -> str:
++    """The command with the body of ONE quoted-delimiter heredoc written by a pure data writer removed
++    (hestia #1330, second half). `cat > notes.md <<'EOF'` with "rotating the credentials" in its body
++    was refused egress.secret, though the body is text the shell never runs or expands, and the same
++    bytes written with the Write tool are not swept (a local file's contents are not egress).
++
++    ENDING THE BODY LATER THAN BASH IS THE UNSAFE DIRECTION (nomad's review of eb2db327, where three
++    shapes got a real read past this): whatever bash runs in the gap would be dropped. So the body is
++    dropped only when all of these hold, and otherwise the command is swept exactly as written:
++    - exactly one heredoc in the command, quoted (`<<'W'`, `<<"W"`, `<<\\W`, `<<-` forms), its
++      delimiter word followed only by a space, a tab or the end of the line (`<<'EOF'x` is `EOFx` to
++      bash), no carriage return anywhere, and no backslash ending the heredoc line (bash continues it:
++      `<<'EOF' \\` + `; cat key` is a command);
++    - its consumer is a pure data writer (`_egress_pure_writer`);
++    - no earlier line redirects output into something that runs it (`exec`, `>(`, `<(`);
++    - every later line is empty or inert (`_EGRESS_INERT_LATER`): writing `s.sh` and running it in the
++      same act is not the Write-then-Bash split the premise rests on.
++    The heredoc's own line and every later line are always swept."""
++    if "<<" not in cmd or "\r" in cmd:
++        return cmd
++    lines = cmd.split("\n")
++    found = [(k, m) for k, ln in enumerate(lines)
++             for m in _HEREDOC_OP.finditer(ln) if not _quoted_at(ln, m.start())]
++    if len(found) != 1:
++        return cmd
++    k, m = found[0]
++    line = lines[k]
++    dash, word = m.group(1), m.group(4)
++    if not (m.group(2) or m.group(3)):
++        return cmd                                   # unquoted: the shell expands the body
++    if re.search(r"(?<!\\)(?:\\\\)*\\$", line) or not re.match(r"(?:[ \t]|$)", line[m.end():]):
++        return cmd
++    if not _egress_pure_writer(line[:m.start()], line[m.end():]):
++        return cmd
++    if any(re.search(r"\bexec\b|>\(|<\(", ln) for ln in lines[:k]):
++        return cmd
++    j = k + 1
++    while j < len(lines) and (lines[j].lstrip("\t") if dash else lines[j]) != word:
++        j += 1
++    if j >= len(lines):
++        return cmd                                   # unterminated
++    if not all(not ln.strip() or _EGRESS_INERT_LATER.match(ln) for ln in lines[j + 1:]):
++        return cmd
++    return "\n".join(lines[:k + 1] + lines[j:])
++
++
+ def _prose_flag_counts(prev: str, bools: frozenset) -> bool:
+     """A prose flag is the flag only if the word before it is not an option waiting for its value:
+     a non-option word (the program, a subcommand, a positional, or the value of an earlier option),
+@@ -707,16 +873,27 @@
+     not literal (it could expand to a secret's contents) and stays swept; so does the whole raw
+     command when it cannot be tokenized. Each segment (`_SEGMENT_BREAKS`) is resolved on its own:
+     the program, then its subcommand words (git's own leading options allowed), then the flags.
+-    `--` ends the exemptions for the rest of its segment: after it every word is an operand."""
++    `--` ends the exemptions for the rest of its segment: after it every word is an operand.
++
++    Second half (2026-10-31): a quoted-delimiter heredoc body written by `cat`/`tee` is data and is
++    not swept (`_egress_heredoc_data_removed`), and a value is literal by the SHELL's quoting, not by
++    whether shlex's output holds a `$` or backtick (`_shell_liveness`); either falls back to the
++    rule above wherever it does not model the command."""
++    command = _egress_heredoc_data_removed(command)
+     try:
+         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+         lex.whitespace_split = True
+         words = list(lex)
+     except ValueError:
+         return command
++    lives = _shell_liveness(command, words)
++
++    def unexpanding(idx: int, value: str) -> bool:
++        return (not lives[idx]) if lives is not None else _literal(value)
++
+     kept = []
+     prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
+-    for w in words:
++    for idx, w in enumerate(words):
+         if w in _SEGMENT_BREAKS:
+             prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
+             kept.append(w)
+@@ -724,7 +901,7 @@
+         if skip_next:
+             skip_next = False
+             prev = w
+-            if _literal(w):
++            if unexpanding(idx, w):
+                 continue                    # the literal prose value: not a path, not swept
+             kept.append(w)
+             continue
+@@ -766,7 +943,7 @@
+         name, eq, val = w.partition("=")
+         if w in flags and _prose_flag_counts(prev, bools):
+             skip_next = True
+-        elif (eq and name in flags and name.startswith("--") and _literal(val)
++        elif (eq and name in flags and name.startswith("--") and unexpanding(idx, val)
+               and _prose_flag_counts(prev, bools)):
+             kept[-1] = name + "="
+         prev = w
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b",
++      "sha256": "b0df672214f8776a9cb27687f78723d04b9eb97aeab81e3fb796b79e0264f96e",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179"
++  "gt_version": "d6069ddf6386f06ab3eb9d8850e3cba44e89e44fa05e9e9eb35dfbdd6cc004cb"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "d6069ddf6386f06ab3eb9d8850e3cba44e89e44fa05e9e9eb35dfbdd6cc004cb",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "b0df672214f8776a9cb27687f78723d04b9eb97aeab81e3fb796b79e0264f96e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "d26f719f133a611cda3d6b91f724479478058885035e74bfb4842e628216f4d0"
++  "gt_version": "72b782db929803a1349311411d429b71cbb1e3be80164dfc98facab94799b075"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "d6069ddf6386f06ab3eb9d8850e3cba44e89e44fa05e9e9eb35dfbdd6cc004cb",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "b0df672214f8776a9cb27687f78723d04b9eb97aeab81e3fb796b79e0264f96e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "cd9be17d272ee05c7d6789b4fb442a9e62e1259d15cbc112a449edbba3ecf064"
++  "gt_version": "ccf519cd3d8686dc23f457eeb90cf3ff64f5771ff32d815c3601706232cd1ab7"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "d6069ddf6386f06ab3eb9d8850e3cba44e89e44fa05e9e9eb35dfbdd6cc004cb",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "b0df672214f8776a9cb27687f78723d04b9eb97aeab81e3fb796b79e0264f96e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "fa321587c9448ed240d3719ddc5770eed11c5dea953f24ad30f561ead887c8a0"
++  "gt_version": "f45c39f3132195b190d7afa7d09044d14bda38f8e7c2387a1f09b9f40b70a673"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "d6069ddf6386f06ab3eb9d8850e3cba44e89e44fa05e9e9eb35dfbdd6cc004cb",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "b0df672214f8776a9cb27687f78723d04b9eb97aeab81e3fb796b79e0264f96e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "2a561c893e4cf9d3c16a247e2f60c4b27e9c3fa98c85073f5085617d06b091c0"
++  "gt_version": "77368010c236d8a75fce79b6a3b68eb35891b662ebef06270e14f64cd52fd141"
+ }
