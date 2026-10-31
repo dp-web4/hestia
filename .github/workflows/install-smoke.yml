@@ -46,16 +46,22 @@ jobs:
         include:
           # #1444: the unit hardcoded %h/.hestia, so an install with HESTIA_HOME set put the
           # vault where the daemon never looked. An empty value is the installer's default home.
+          # `alt` = a home under the runner's temp root, derived at run time (a baked runner home
+          # path is a machine-layout literal: tools/public_boundary.py rejects it).
           - os: ubuntu-latest
-            home: /home/runner/hestia-alt-home
+            home: alt
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
       HESTIA_SKIP_HOOK: "1"
       HESTIA_SKIP_DEPLOY: "1"
-      HESTIA_HOME: ${{ matrix.home }}
     steps:
+      - name: Custom HESTIA_HOME
+        if: matrix.home == 'alt'
+        shell: bash
+        run: echo "HESTIA_HOME=$RUNNER_TEMP/hestia-alt-home" >> "$GITHUB_ENV"
+
       - name: Which release, which installer
         id: pick
         shell: bash
