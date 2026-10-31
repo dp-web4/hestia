@@ -1030,8 +1030,19 @@ step_claude_hooks() {
   fi
   c_ok "source at $src"
 
+  # install-members.sh hashes with `sha256sum`, which macOS does not ship (found by the install
+  # smoke gate arm, #1443). It is a governed file, so the installer supplies the command rather
+  # than editing it: `shasum -a 256` prints the same `<hex>  <name>` lines, stdin included.
+  local shim_path="$PATH"
+  if ! command -v sha256sum >/dev/null 2>&1 && command -v shasum >/dev/null 2>&1; then
+    local shim="$HESTIA_HOME/src/.shim"
+    mkdir -p "$shim"
+    printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > "$shim/sha256sum"
+    chmod 0755 "$shim/sha256sum"
+    shim_path="$shim:$PATH"
+  fi
   local rc=0
-  HESTIA_HOME="$HESTIA_HOME" HESTIA_WORKSPACE="$HESTIA_WORKSPACE" \
+  PATH="$shim_path" HESTIA_HOME="$HESTIA_HOME" HESTIA_WORKSPACE="$HESTIA_WORKSPACE" \
     "$bash4" "$src/deploy/install-members.sh" || rc=$?
   if [ "$rc" -ne 0 ]; then
     c_err "the members' install failed (exit $rc); the gate is NOT installed. Output above."
@@ -1039,6 +1050,11 @@ step_claude_hooks() {
     exit 1
   fi
   c_ok "claude-code gate installed from ${VERSION}; it governs the next Claude Code session"
+  # The installer grants nothing: scope is the operator's act. A fresh seat therefore holds no
+  # scope, and its first acts are refused narrowly, each filing a scope request.
+  c_warn "the seat holds NO scope yet: its acts are refused until you grant some, and each refusal"
+  c_warn "  files a scope request. Grant its workspace ($HESTIA_WORKSPACE) or rule the requests on"
+  c_warn "  the dashboard: http://${HESTIA_BIND}/ (sign in with $HESTIA_HOME/operator.key)"
 }
 
 step_smoketest() {

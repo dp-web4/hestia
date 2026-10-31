@@ -6,10 +6,13 @@ gate arm). It reads the PreToolUse gate line install.sh registered in ~/.claude/
 runs it the way Claude Code does (the line through /bin/sh, the event on stdin, the settings `env`
 plus CLAUDECODE=1, cwd = the workspace):
 
-  allow  a Read of a file inside HESTIA_WORKSPACE      -> must NOT be denied
-  deny   `touch <the installed gate itself>`           -> must be denied FOR THE LAW (its
-         governance surface), not for an infrastructure reason: a gate that cannot load its
-         engine or projection refuses everything, and that deny proves nothing.
+  1. a Read inside HESTIA_WORKSPACE, before any grant -> refused narrowly (mrh): a fresh seat
+     holds no scope, because the installer grants nothing (scope is the operator's act)
+  2. `touch <the installed gate itself>`              -> refused FOR THE LAW (its governance
+     surface), not for an infrastructure reason: a gate that cannot load its engine or
+     projection refuses everything, and that deny proves nothing
+  3. the operator grants the seat its workspace (POST /api/scope/grant, operator-signed)
+  4. the same Read                                    -> allowed
 
 Witnessed: the daemon's chain length (operator-authenticated /api/dashboard, signed with the
 operator key the daemon minted at genesis) must grow across the two decisions.
@@ -30,6 +33,7 @@ import sys
 from pathlib import Path
 
 GATE = "pre_tool_use.py"
+SH = "/bin/sh"  # how Claude Code runs a hook line
 LAW_REASON = re.compile(r"gate-self|governance surface|self-access", re.I)
 
 
@@ -121,31 +125,52 @@ def main() -> int:
     env.pop("HESTIA_ROLE", None)
     probe = ws / "hestia-gate-smoke.txt"
     probe.write_text("read me\n")
-    events = {
-        "allow": {"hook_event_name": "PreToolUse", "session_id": "hestia-install-smoke",
-                  "tool_name": "Read", "tool_input": {"file_path": str(probe)}},
-        "deny": {"hook_event_name": "PreToolUse", "session_id": "hestia-install-smoke",
-                 "tool_name": "Bash", "tool_input": {"command": f"touch {target(cmd)}"}},
-    }
-    for label, event in events.items():
-        r = subprocess.run(["/bin/sh", "-c", cmd], input=json.dumps(event), env=env, cwd=str(ws),
+    def run(event):
+        r = subprocess.run([SH, "-c", cmd], input=json.dumps(event), env=env, cwd=str(ws),
                            capture_output=True, text=True, timeout=60)
-        d = denies(r.returncode, r.stdout)
-        why = said(r.stderr) or said(r.stdout)
-        if label == "allow":
-            ok = not d
-            print(f"{'ok  ' if ok else 'FAIL'} allow: Read inside the workspace -> {'denied' if d else 'allowed'} (rc={r.returncode}) {why}")
-        else:
-            ok = d and bool(LAW_REASON.search(why))
-            print(f"{'ok  ' if ok else 'FAIL'} deny: self-write of the gate -> {'denied' if d else 'ALLOWED'} (rc={r.returncode}) {why}")
-        if not ok:
-            fails.append(f"{label} probe")
+        return denies(r.returncode, r.stdout), r.returncode, (said(r.stderr) or said(r.stdout))
+
+    read_ev = {"hook_event_name": "PreToolUse", "session_id": "hestia-install-smoke",
+               "tool_name": "Read", "tool_input": {"file_path": str(probe)}}
+    self_ev = {"hook_event_name": "PreToolUse", "session_id": "hestia-install-smoke",
+               "tool_name": "Bash", "tool_input": {"command": f"touch {target(cmd)}"}}
+
+    # 1. A fresh seat holds NO scope: the installer grants nothing (scope is the operator's), so
+    #    even a read inside the workspace is refused, narrowly (mrh), and files a scope request.
+    d, rc, why = run(read_ev)
+    ok = d and "mrh" in why
+    print(f"{'ok  ' if ok else 'FAIL'} fresh seat, no grant: Read inside the workspace -> {'denied' if d else 'ALLOWED'} (rc={rc}) {why}")
+    if not ok:
+        fails.append("fresh-seat read was not a narrow scope refusal")
+
+    # 2. The law: a write to the gate's own file is refused as a governance-surface write.
+    d, rc, why = run(self_ev)
+    ok = d and bool(LAW_REASON.search(why))
+    print(f"{'ok  ' if ok else 'FAIL'} deny: self-write of the gate -> {'denied' if d else 'ALLOWED'} (rc={rc}) {why}")
+    if not ok:
+        fails.append("self-write probe")
+
+    # 3. The operator grants the seat its workspace (what an operator does on the dashboard).
+    status, body = op.call("POST", "/api/scope/grant", {
+        "plugin_id": "claude-code", "path": str(ws), "recursive": True,
+        "reason": "install smoke (#1443): the operator grants the seat its workspace"})
+    ok = status == 200
+    print(f"{'ok  ' if ok else 'FAIL'} operator grant of the workspace -> {status} {json.dumps(body)[:200]}")
+    if not ok:
+        fails.append("operator grant")
+
+    # 4. Now the same read is allowed: the gate decides by the daemon's grant.
+    d, rc, why = run(read_ev)
+    ok = not d
+    print(f"{'ok  ' if ok else 'FAIL'} granted: Read inside the workspace -> {'denied' if d else 'allowed'} (rc={rc}) {why}")
+    if not ok:
+        fails.append("granted read was refused")
 
     after = chain_length()
     grew = after > before
     print(f"{'ok  ' if grew else 'FAIL'} witnessed: chain {before} -> {after}")
     if not grew:
-        fails.append("the chain did not grow across two gate decisions")
+        fails.append("the chain did not grow across the gate decisions")
     if fails:
         print("FAIL: " + "; ".join(fails))
         return 1
