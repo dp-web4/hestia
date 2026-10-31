@@ -75,6 +75,14 @@ DENY = [
     ("a Makefile written, then make", f"cat > Makefile <<'EOF'\nall:\n\tcat {KEY}\nEOF\nmake"),
     ("gh chained to a run on the later line", f"cat > s.md <<'EOF'\ncat {KEY}\nEOF\ngh issue view 1; sh s.md"),
     ("two heredocs in one act", f"cat > a.md <<'EOF'\nnote\nEOF\nsh <<'EOF'\ncat {KEY}\nEOF"),
+    # nomad's round 2 on 469b4315: a lone gh is not inert
+    ("gh alias set --shell, then the alias", f"cat > s.sh <<'EOF'\ncat {KEY}\nEOF\ngh alias set --shell r 'sh s.sh'\ngh r"),
+    ("a git hook, then gh pr create (runs git)", f"cat > .git/hooks/pre-push <<'EOF'\n#!/bin/sh\ncat {KEY}\nEOF\ngh pr create --fill"),
+    ("a git hook, then gh pr checkout", f"cat > .git/hooks/post-checkout <<'EOF'\n#!/bin/sh\ncat {KEY}\nEOF\ngh pr checkout 3"),
+    ("GH_PAGER as an env prefix", f"cat > s.sh <<'EOF'\ncat {KEY}\nEOF\nGH_PAGER='sh s.sh' gh issue view 3"),
+    ("gh issue comment without -R (gh asks git)", f"cat > .git/config <<'EOF'\n[core]\n\tfsmonitor = cat {KEY}\nEOF\ngh issue comment 3 --body-file b.md"),
+    ("gh api (placeholders resolve through git)", f"cat > s.md <<'EOF'\ncat {KEY}\nEOF\ngh api repos/{{owner}}/{{repo}}/issues -F body=@s.md"),
+    ("gh extension", f"cat > s.sh <<'EOF'\ncat {KEY}\nEOF\ngh extension exec x"),
 ]
 ALLOW += [
     ("write, then publish it with --body-file", "cat > i.md <<'EOF'\nrotating the credentials\nEOF\ngh issue create -R o/r --title t --body-file i.md | tail -1"),

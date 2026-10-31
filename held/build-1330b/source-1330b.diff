@@ -1,7 +1,7 @@
 diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
 --- a/plugins/_shared/hestia_gate_core.py
 +++ b/plugins/_shared/hestia_gate_core.py
-@@ -689,6 +689,166 @@
+@@ -689,6 +689,172 @@
      return "$" not in word and "`" not in word
  
  
@@ -98,10 +98,16 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +#: and run nothing. Matched on the consumer's first word exactly (no env prefix, no `sudo`, no
 +#: `xargs`), so anything that could hand the body to a program keeps it swept.
 +_EGRESS_DATA_WRITERS = frozenset({"cat", "tee"})
-+#: What may follow the heredoc in the same act for its body to stay unswept: `gh` alone (it publishes
-+#: text and runs no local file), optionally piped into a reader that runs nothing. Anything else may
-+#: run the bytes just written: `sh s.sh`, `. ./s.sh`, `make`, `npm`, `git commit` (hooks), `eval "$x"`.
-+_EGRESS_INERT_LATER = re.compile(r"^\s*gh\s[^;&`$()<>|]*(?:\|\s*(?:tail|head|wc)(?:\s+-?[\w]+)*\s*)?$")
++#: What may follow the heredoc in the same act for its body to stay unswept: one `gh` command that
++#: publishes a body and runs nothing local, optionally piped into a reader that runs nothing. Each must
++#: name its repo (`-R`/`--repo`): without one, gh asks git which repo this is, and a heredoc in the same
++#: act may have written `.git/config` (nomad's round 2 on 469b4315). Not allowed, because they execute:
++#: `gh alias set --shell` + the alias, `gh extension`, `gh pr create|checkout|merge` and `gh repo sync`
++#: (they run git, and git runs hooks), `gh api` (its `{owner}` placeholders come from git), and anything
++#: else: `sh s.sh`, `. ./s.sh`, `make`, `npm`, `git commit` (hooks), `eval "$x"`.
++_EGRESS_INERT_LATER = re.compile(
++    r"^\s*gh\s+(?:issue\s+(?:create|comment|edit)|pr\s+(?:comment|review|edit))\s"
++    r"(?=[^\n]*(?:(?<!\S)-R\s|(?<!\S)--repo[\s=]))[^;&`$()<>|]*(?:\|\s*(?:tail|head|wc)(?:\s+-?[\w]+)*\s*)?$")
 +
 +
 +def _egress_pure_writer(before: str, after: str) -> bool:
@@ -168,7 +174,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
  def _prose_flag_counts(prev: str, bools: frozenset) -> bool:
      """A prose flag is the flag only if the word before it is not an option waiting for its value:
      a non-option word (the program, a subcommand, a positional, or the value of an earlier option),
-@@ -706,16 +866,27 @@
+@@ -706,16 +872,27 @@
      not literal (it could expand to a secret's contents) and stays swept; so does the whole raw
      command when it cannot be tokenized. Each segment (`_SEGMENT_BREAKS`) is resolved on its own:
      the program, then its subcommand words (git's own leading options allowed), then the flags.
@@ -198,7 +204,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
          if w in _SEGMENT_BREAKS:
              prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
              kept.append(w)
-@@ -723,7 +894,7 @@
+@@ -723,7 +900,7 @@
          if skip_next:
              skip_next = False
              prev = w
@@ -207,7 +213,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
                  continue                    # the literal prose value: not a path, not swept
              kept.append(w)
              continue
-@@ -765,7 +936,7 @@
+@@ -765,7 +942,7 @@
          name, eq, val = w.partition("=")
          if w in flags and _prose_flag_counts(prev, bools):
              skip_next = True

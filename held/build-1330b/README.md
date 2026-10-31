@@ -1,9 +1,10 @@
 # held: #1330, second half — heredoc data and quote-aware literals. **NOT applied.**
 
-Patch: `held/469b43154db19c56b1c3ee7e04db4022994e4df7aed666f7f240855335e1cb46.patch`: the gate core, plus the hooks-gt mirror and the 5 manifests. Its governed files are based on `4a775cd1` (the build prints the branch head, which only adds `held/` files).
+Patch: `held/bcbaeef31a72d2f2c7e6ab9baaf34c210af4383806605894a61f23da4974dc9f.patch`: the gate core, plus the hooks-gt mirror and the 5 manifests. Its governed files are based on `4a775cd1` (the build prints the branch head, which only adds `held/` files).
 
 | lineage | sha256 | status |
 |---|---|---|
+| `held/lineage/469b4315…patch` | `469b43154db19c56b1c3ee7e04db4022994e4df7aed666f7f240855335e1cb46` | **superseded**: nomad's round 2 found that a lone `gh` isn't inert. `gh alias set --shell` + the alias runs shell, and `gh pr create`/`checkout` run git, and git runs hooks. Reference only |
 | `held/lineage/eb2db327…patch` | `eb2db3275127414d6b175029400e4cdecd52686b64970f8ca77fe8d781a0ece4` | **superseded**: nomad's review found three heredoc shapes that got a real secret read past it (bash ran each), plus a softer fourth. Reference only |
 
 ## What #1427 left swept
@@ -23,16 +24,23 @@ Patch: `held/469b43154db19c56b1c3ee7e04db4022994e4df7aed666f7f240855335e1cb46.pa
 - The consumer is exactly **`cat` or `tee`**, and the line before it opens no `(`, `{`, `$(` or backtick, so `(cat <<'EOF' …) | sh`, `{ …; } | sh` and `x=$(cat <<'EOF' …)` followed by `eval` are all swept.
 - The rest of the heredoc line holds no `| ; & \` $ ( ) < { }`.
 - **No earlier line** holds `exec`, `>(` or `<(` (for example `exec > >(sh)` before a `cat`).
-- **Every later line** is empty or a single `gh …` command, optionally piped into `tail`, `head` or `wc`. Writing a file and running it in the same act (`sh s.sh`, `. ./s.sh`, `./s.sh`, `make`, `git commit` running a hook) is not the Write-then-Bash split the premise rests on, so the body stays swept. `git commit -F` is deliberately **not** allowed, because a commit runs hooks.
+- **Every later line** is empty, or **one body-publishing `gh` command that names its repo**: `gh issue create|comment|edit` or `gh pr comment|review|edit` with `-R`/`--repo`, optionally piped into `tail`, `head` or `wc`. Writing a file and running it in the same act is not the Write-then-Bash split the premise rests on, so the body stays swept. That covers `sh s.sh`, `. ./s.sh`, `./s.sh`, `make`, and `git commit` running a hook. Also excluded:
+  - `gh alias set --shell` followed by the alias;
+  - `gh extension`;
+  - `gh pr create|checkout|merge` and `gh repo sync`, which run git, and git runs hooks;
+  - `gh api`, whose `{owner}` placeholders resolve through git;
+  - any gh line without `-R`/`--repo`, since gh then asks git which repo it is in, and the heredoc may have written `.git/config`;
+  - `git commit -F`.
 
 The heredoc's own line and every later line are always swept.
 
 **Unchanged:** interpreter `-c`/`-e`, shell and interpreter heredocs, **unquoted** heredoc bodies, paths, redirections, `--body-file`, and every #1427 control.
 
 ## Evidence (revised core served as `hestia_gate_core`)
-- **`held/build-1330b/egress_prose2_test.py`: PASS on the revised core** (12 prose rows allowed, 31 control rows `egress.secret`). On main's core it **fails exactly the 12 prose rows** and denies all 31 controls, so every control is a case today's gate already catches.
+- **`held/build-1330b/egress_prose2_test.py`: PASS on the revised core** (12 prose rows allowed, 38 control rows `egress.secret`). On main's core it **fails exactly the 12 prose rows** and denies all 38 controls, so every control is a case today's gate already catches.
   - Nomad's breaks: `<<'EOF' \` + `; cat`, `<<'EOF'\` + `&& cat`, `<<'EOF'x`, and write-then-`sh`.
-  - Further breaks the author found after nomad's review:
+  - Nomad's round 2: `gh alias set --shell` + the alias, a hook + `gh pr create`, a hook + `gh pr checkout`, a `GH_PAGER` prefix. Plus the author's: `gh` without `-R` after a `.git/config` write, `gh api`, and `gh extension`.
+  - Further breaks the author found after nomad's first review:
     - a CR after the delimiter;
     - a heredoc in `$( )` then `eval`;
     - a subshell or brace group piped to `sh`;
