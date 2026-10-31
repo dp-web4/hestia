@@ -33,6 +33,11 @@ outside = os.path.join(base, "outside", ".ssh")
 os.makedirs(outside)
 open(os.path.join(outside, "id_test"), "w").close()
 os.symlink(os.path.join(outside, "id_test"), os.path.join(granted, "key"))
+# nomad's review: directory links inside the granted repo, and a plain subdirectory
+os.symlink(os.path.join(ws, "notgranted"), os.path.join(granted, "linkdir"))
+os.symlink(outside, os.path.join(granted, "sshdir"))
+os.makedirs(os.path.join(granted, "sub"))
+open(os.path.join(granted, "sub", "own.txt"), "w").close()
 scopes = ["membot"]
 
 ALLOW = [
@@ -40,12 +45,24 @@ ALLOW = [
     ("the venv interpreter relative after cd (the #1429 case)", f"cd {granted} && .venv/bin/python -c 1"),
     ("./.venv/bin/python after cd", f"cd {granted} && ./.venv/bin/python -c 1"),
     ("a plain in-repo file after cd", f"cd {granted} && cat .venv/bin/python"),
+    ("cd into a real subdirectory, then a bare word", f"cd {granted}/sub && cat own.txt"),
 ]
 DENY = [
     ("a link to a forbidden target after cd (egress first)", f"cd {granted} && cat ./key"),
     ("a link into an ungranted repo after cd", f"cd {granted} && cat ./peek"),
     ("an ungranted repo after cd", f"cd {ws}/notgranted && cat ./data.txt"),
     ("a relative escape out of the workspace after cd", f"cd {granted} && cat ../../outside/.ssh/id_test"),
+    # nomad's review of 79b60b56: the same rule for directory links, mid-path and as the cd target
+    ("a dir link mid-path into an ungranted repo", f"cd {granted} && cat ./linkdir/data.txt"),
+    ("a dir link mid-path to a .ssh dir", f"cd {granted} && cat ./sshdir/id_test"),
+    ("cd into a .ssh dir link, then a bare word", f"cd {granted}/sshdir && cat id_test"),
+    ("a .. walk out of a subdirectory into an ungranted repo", f"cd {granted} && cat sub/../../notgranted/data.txt"),
+    ("a second cd into an ungranted repo", f"cd {granted} && cd ../notgranted && cat data.txt"),
+    ("cd ; a link to a key", f"cd {granted}; cat ./key"),
+    ("pushd, a link to a key", f"pushd {granted} && cat ./key"),
+    ("a subshell cd, a link into an ungranted repo", f"(cd {granted} && cat ./peek)"),
+    ("cd INTO a dir link to an ungranted repo, then a bare word (the gap)", f"cd {granted}/linkdir && cat data.txt"),
+    ("cd, cd into the dir link, then a bare word", f"cd {granted} && cd linkdir && cat data.txt"),
 ]
 bad = []
 for name, cmd in ALLOW:

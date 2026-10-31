@@ -1,6 +1,10 @@
 # held: #1429, a relative word landing inside the workspace after `cd` gets the in-workspace rule. **NOT applied.**
 
-Patch: `held/79b60b56ca42c39940df3c833ca563af846ac60328ebeb542a240a781de0c223.patch` (base `4a775cd1`): the gate core, plus the hooks-gt mirror and the 5 manifests.
+Patch: `held/a0619365938ffbb128719e5314f5cab4e50758fee98eea3619bcb7173744e980.patch` (base `4a775cd1`): the gate core, plus the hooks-gt mirror and the 5 manifests.
+
+| lineage | status |
+|---|---|
+| `held/lineage/79b60b56…patch` | **superseded**. nomad's review (GO on the change) found an adjacent gap that predates it: a `cd` **into** a directory link inside a granted repo was not judged where it lands, so `cd <granted>/linkdir && cat data.txt` (linkdir → an ungranted repo) was allowed, on today's core too. Reference only |
 
 ## The defect (measured offline on McNugget, 2026-10-30, against the gate's own `command_scope_reach`)
 The same venv binary in a granted repo gets opposite verdicts, depending only on how it's spelled:
@@ -21,12 +25,27 @@ In the `kind == "dir"` branch, a landing **inside** the workspace is judged by p
 2. **The grant:** if the landing's repo segment is not granted, `_symlinked_reach_verdict` decides (and names the right repo).
 3. **A link inside a granted repo is judged where it lands** (`_symlinked_reach_verdict`). A target in an ungranted repo is refused, as today's outside rule refused it. A target outside the workspace gets #953's allowance: that's the venv interpreter.
 
+4. **A `cd` destination that is a link inside the workspace is judged where it lands** (nomad's review), by the same #953 rule: egress first, then the target's repo. This applies to every literal `cd` destination, whether or not a relative word follows, because a bare word after `cd` (`cat data.txt`) is not a path candidate. This **tightens** today's core, which allows that read.
+
 Landings **outside** the workspace keep today's rule (`cd /tmp && cat ../etc/x` is still judged at `/etc/x`).
 
 ## Evidence (revised core served as `hestia_gate_core`)
-- **`held/build-1429/dir_landing_test.py`: PASS** (4 allow, 4 deny). On today's core it **fails exactly the 3 relative-after-`cd` allow rows** (all refused as `/usr/bin/python3`) and denies all 4 controls.
+- **`held/build-1429/dir_landing_test.py`: PASS** (5 allow, 14 deny). On today's core it fails **exactly 5 rows**: the 3 relative-after-`cd` allow rows (refused as `/usr/bin/python3`), plus nomad's 2 `cd`-into-a-dir-link rows, which today's core wrongly **allows**.
   - Allow: the venv interpreter by absolute path (unchanged); `cd <repo> && .venv/bin/python`; `./.venv/bin/python`; a plain in-repo file after `cd`.
-  - Deny: a link to a forbidden `.ssh` target after `cd` (egress first); a link from a granted repo into an ungranted one; an ungranted repo after `cd`; a `../..` escape out of the workspace.
+  - Deny:
+    - a link to a forbidden `.ssh` target after `cd` (egress first);
+    - a link from a granted repo into an ungranted one;
+    - an ungranted repo after `cd`;
+    - a `../..` escape out of the workspace.
+  - Nomad's rows (deny):
+    - a dir link mid-path into an ungranted repo;
+    - a dir link mid-path to `.ssh`;
+    - `cd` into a `.ssh` dir link, then a bare word;
+    - `sub/../../notgranted`;
+    - a second `cd` into an ungranted repo;
+    - `cd ;`, `pushd`, and a subshell `cd`, each with a link;
+    - **`cd` into a dir link to an ungranted repo, then a bare word**, and the same reached via a second `cd`.
+  - Allow: `cd` into a real subdirectory, then a bare word.
   - The fixture is built beside the test, not under a temp root (temp roots are always reachable, which would make every row pass), and removed afterwards.
 - **A first cut was wrong and the test caught it.** It skipped every check when the landing's own repo was granted, which let `cd <granted> && cat ./peek` (a link into an ungranted repo) through. Today's core refuses that. Step 3 above closes it.
 - Shell-scope battery: **1431 / 3 on both cores**, with the same 3 rows (macOS `/var/folders` temp cases on this box).
