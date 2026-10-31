@@ -1079,6 +1079,9 @@ op = seed.Operator(endpoint.rsplit("/mcp", 1)[0], home / "operator.key")
 op.open_session()
 status, body = op.call("POST", "/api/scope/grant", {
     "plugin_id": "claude-code", "path": ws, "recursive": True, "expected_existing": None,
+    # The seat was installed a moment ago and has not connected yet (its first Claude Code
+    # session will); the daemon refuses a grant to a never-connected member unless told so.
+    "grant_ahead_of_connect": True,
     "reason": f"initial workspace grant: the operator supplied HESTIA_WORKSPACE={ws} to the "
               f"release installer ({version}); dp ruling 2026-10-30 (hestia #1448)"})
 if status == 200:
