@@ -1,0 +1,232 @@
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+--- a/plugins/_shared/hestia_gate_mechanism.py
++++ b/plugins/_shared/hestia_gate_mechanism.py
+@@ -1385,7 +1385,12 @@
+     `deadline` (stage C): no request starts after it (raises TimeoutError; the tally's caller
+     swallows it, accounting never changes a decision).
+     """
+-    endpoint = endpoint or os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
++    # #944: the endpoint is configuration. With none projected, attest nothing; never a
++    # guessed port (2026-10-06: a fallback to :7711 reached the live daemon from a CI
++    # harness and opened four real escalations under other members' names, #1246).
++    endpoint = endpoint or _discover_endpoint()
++    if endpoint is None:
++        return None
+ 
+     def post(payload, timeout, hdrs=None):
+         timeout = _step_timeout(timeout, deadline)
+@@ -1492,8 +1497,12 @@
+     gate-self session this call mints joins to the per-wake session the outcome rows carry.
+ 
+     `deadline` (stage C): an absolute `time.monotonic()` bound. Each step keeps its fixed budget
+-    but never runs past it, and no step starts after it (that is a None: refusal or loss)."""
+-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
++    but never runs past it, and no step starts after it (that is a None: refusal or loss).
++
++    No endpoint discovered (#944) is a None too: nothing is sent to a guessed port."""
++    endpoint = _discover_endpoint()
++    if endpoint is None:
++        return None
+ 
+     def post(payload, hdrs, timeout):
+         timeout = _step_timeout(timeout, deadline)
+@@ -1756,8 +1765,12 @@
+     capped by it, so a slow connect can never let the MUTATING call go out after the caller has
+     already decided. Returns the result dict, or None when nothing was sent (out of time before
+     the mutating call), or `SCOPE_UNCERTAIN` when the mutating call was SENT and no answer came —
+-    the daemon may have applied it. Never raises."""
+-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
++    the daemon may have applied it. Never raises.
++
++    No endpoint discovered (#944) is None: nothing was sent, to any port."""
++    endpoint = _discover_endpoint()
++    if endpoint is None:
++        return None
+     end = deadline if deadline is not None else time.monotonic() + 3.0
+ 
+     def left(cap):
+diff --git a/hooks-gt/_shared/hestia_gate_mechanism.py b/hooks-gt/_shared/hestia_gate_mechanism.py
+--- a/hooks-gt/_shared/hestia_gate_mechanism.py
++++ b/hooks-gt/_shared/hestia_gate_mechanism.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf  (published ground truth; manifest: hooks-gt)
+ """Shared in-process daemon-query mechanism — the society-safety verdict path.
+ 
+ PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
+@@ -1386,7 +1386,12 @@
+     `deadline` (stage C): no request starts after it (raises TimeoutError; the tally's caller
+     swallows it, accounting never changes a decision).
+     """
+-    endpoint = endpoint or os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
++    # #944: the endpoint is configuration. With none projected, attest nothing; never a
++    # guessed port (2026-10-06: a fallback to :7711 reached the live daemon from a CI
++    # harness and opened four real escalations under other members' names, #1246).
++    endpoint = endpoint or _discover_endpoint()
++    if endpoint is None:
++        return None
+ 
+     def post(payload, timeout, hdrs=None):
+         timeout = _step_timeout(timeout, deadline)
+@@ -1493,8 +1498,12 @@
+     gate-self session this call mints joins to the per-wake session the outcome rows carry.
+ 
+     `deadline` (stage C): an absolute `time.monotonic()` bound. Each step keeps its fixed budget
+-    but never runs past it, and no step starts after it (that is a None: refusal or loss)."""
+-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
++    but never runs past it, and no step starts after it (that is a None: refusal or loss).
++
++    No endpoint discovered (#944) is a None too: nothing is sent to a guessed port."""
++    endpoint = _discover_endpoint()
++    if endpoint is None:
++        return None
+ 
+     def post(payload, hdrs, timeout):
+         timeout = _step_timeout(timeout, deadline)
+@@ -1757,8 +1766,12 @@
+     capped by it, so a slow connect can never let the MUTATING call go out after the caller has
+     already decided. Returns the result dict, or None when nothing was sent (out of time before
+     the mutating call), or `SCOPE_UNCERTAIN` when the mutating call was SENT and no answer came —
+-    the daemon may have applied it. Never raises."""
+-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
++    the daemon may have applied it. Never raises.
++
++    No endpoint discovered (#944) is None: nothing was sent, to any port."""
++    endpoint = _discover_endpoint()
++    if endpoint is None:
++        return None
+     end = deadline if deadline is not None else time.monotonic() + 3.0
+ 
+     def left(cap):
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -12,7 +12,7 @@
+     },
+     {
+       "path": "hestia_gate_mechanism.py",
+-      "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681",
++      "sha256": "2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf",
+       "source": "plugins/_shared/hestia_gate_mechanism.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179"
++  "gt_version": "f334ca524a5d461226c40344a35e903c2465fa03a864ce43e1e6cfe7a1819583"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "f334ca524a5d461226c40344a35e903c2465fa03a864ce43e1e6cfe7a1819583",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
++        "sha256": "2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "d26f719f133a611cda3d6b91f724479478058885035e74bfb4842e628216f4d0"
++  "gt_version": "512daee83359304178f0ea4d1c43c388025f8fb09ff977acded959fb28877380"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "f334ca524a5d461226c40344a35e903c2465fa03a864ce43e1e6cfe7a1819583",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
++        "sha256": "2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "cd9be17d272ee05c7d6789b4fb442a9e62e1259d15cbc112a449edbba3ecf064"
++  "gt_version": "5bf76adad93a52520bea702c3c184962a80fc2ab75c0dd8a249e447d5c359112"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "f334ca524a5d461226c40344a35e903c2465fa03a864ce43e1e6cfe7a1819583",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
++        "sha256": "2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "fa321587c9448ed240d3719ddc5770eed11c5dea953f24ad30f561ead887c8a0"
++  "gt_version": "4832d7a703b89f0480f1050dfac8a2e3756fccab8786b7de1fe059263913a718"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "f334ca524a5d461226c40344a35e903c2465fa03a864ce43e1e6cfe7a1819583",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
++        "sha256": "2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "2a561c893e4cf9d3c16a247e2f60c4b27e9c3fa98c85073f5085617d06b091c0"
++  "gt_version": "f4fcbf85b7fb919bc892b2025355ea6d7e4e1ea370fb01828a7c0dbfe8c24528"
+ }
