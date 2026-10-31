@@ -1,0 +1,308 @@
+#: How far Gate 1a follows an act's REACH to the links in it (hestia #1331 follow-ups). Past either bound the act is
+#: refused under mrh.command.unenumerated rather than judged in part (egress_unsweepable_deny). All are STRICT work
+#: bounds (Nova's #1435 review): directory entries are read one at a time and counted as they are read, so nothing
+#: lists more entries, or collects more matches, than its bound before it stops. Two entry budgets, because the two
+#: risks differ (nomad's #1435 review): a glob is a caller-written pattern, so its scan stays small; a walk's size is
+#: the tree's own, so its budget is set from the measured cost of real trees. Measured 2026-10-30, no-follow scandir,
+#: warm: Legion SAGE 82,943 entries / 48 ms, web4 46,983 / 20 ms, hestia 14,369 / 19 ms (0.4-1.3 us per entry);
+#: Nomad SAGE 70,237 / 43 ms. 200,000 is about 120 ms warm, clears every repo, and still refuses a whole workspace
+#: (Legion's ai-workspace: 705,755 entries).
+LINK_GLOB_LIMIT = 256          # paths a glob or brace may expand to, per act
+LINK_GLOB_SCAN_LIMIT = 10000   # directory entries a glob may read while expanding, per act
+LINK_WALK_LIMIT = 200000       # directory entries the act's link-following walks may read, per act
+
+
+class _TooWide(Exception):
+    """A reach past its bound, or a directory it reaches that cannot be read: refused, never judged in part."""
+
+
+def _entries(d: str, budget: list):
+    """The entries of directory `d`, read lazily and each counted against `budget[0]` as it is read. `budget` is
+    [remaining, bound, what]: `what` names the reader in the refusal."""
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                budget[0] -= 1
+                if budget[0] < 0:
+                    raise _TooWide(f"{budget[2]} would read more than {budget[1]} directory entries")
+                yield e
+    except OSError as exc:
+        raise _TooWide(f"a directory it reaches cannot be read ({type(exc).__name__})")
+
+
+def _bounded_glob(pattern: str, budget: list, matches: list) -> list:
+    """The paths an absolute glob `pattern` matches, one component at a time, reading only the directories a
+    wildcard component needs, through `_entries`. `matches[0]` counts down LINK_GLOB_LIMIT across the act. Hidden
+    names match only a component that starts with a dot, as glob does."""
+    parts = [p for p in pattern.split(os.sep) if p]
+    cur = [os.sep]
+    for i, comp in enumerate(parts):
+        last = i == len(parts) - 1
+        nxt = []
+        for c in cur:
+            if not _GLOB_CHARS.search(comp):
+                p = os.path.join(c, comp)
+                if os.path.lexists(p) if last else os.path.isdir(p):
+                    nxt.append(p)
+                continue
+            if not os.path.isdir(c):
+                continue
+            for e in _entries(c, budget):
+                if e.name.startswith(".") and not comp.startswith("."):
+                    continue
+                if _fnmatch.fnmatchcase(e.name, comp) and (last or os.path.isdir(e.path)):
+                    nxt.append(e.path)
+                    if last:
+                        matches[0] -= 1
+                        if matches[0] < 0:
+                            raise _TooWide(f"a pattern reaches more than {LINK_GLOB_LIMIT} paths")
+        cur = nxt
+    return cur
+
+
+def _bounded_walk(root: str, budget: list):
+    """Every path under `root`, depth-first, without following links, read through `_entries`."""
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        for e in _entries(d, budget):
+            yield e.path
+            if e.is_dir(follow_symlinks=False):
+                stack.append(e.path)
+#: Readers that FOLLOW links while walking a directory, and the options that make them do it. A short cluster
+#: counts (`cp -rL`, `tar -chf`), except for find, whose options are whole words. Read from each tool's --help.
+_FOLLOW_FLAGS = {
+    "grep": frozenset({"-R", "--dereference-recursive"}),
+    "rg": frozenset({"-L", "--follow"}),
+    "find": frozenset({"-L", "-H", "-follow"}),
+    "cp": frozenset({"-L", "--dereference"}),
+    "tar": frozenset({"-h", "--dereference"}),
+    "bsdtar": frozenset({"-L", "-h", "--dereference"}),
+    "rsync": frozenset({"-L", "--copy-links", "-k", "--copy-dirlinks"}),
+    "cpio": frozenset({"-L", "--dereference"}),
+}
+#: Archivers that follow links BY DEFAULT, and the options that make them store the link instead (nomad's #1435
+#: review). `7z` follows only when adding (`7z a`).
+_FOLLOW_UNLESS = {
+    "zip": frozenset({"-y", "--symlinks"}),
+    "7z": frozenset({"-snl"}),
+}
+#: find walks without following links but LISTS them; an -exec reader then opens each listed path, and readers follow
+#: a link on open (nomad's #1435 review). So a find that execs is a link-following reader with or without -L.
+_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+#: Programs that change the working directory of what they run, and the option that names it: like an in-line cd.
+_CHDIR_OPTS = {"env": ("-C", "--chdir"), "sudo": ("-D", "--chdir")}
+_CD = frozenset({"cd", "pushd"})
+
+
+def _reach_segments(command: str) -> list:
+    """The command's words as (word, quoted), split at the shell's segment breaks. `quoted` is whether the word was
+    written in quotes, so a pattern the shell will not expand is not expanded here either (nomad's #1435 review:
+    `find clean -name '*.txt'` was expanded against the cwd). When the quoting cannot be read word-for-word, every
+    word counts as unquoted, which only ever adds refusals. The raw words, unquoted, when it cannot be tokenized."""
+    def lex(posix):
+        lx = shlex.shlex(command, posix=posix, punctuation_chars=True)
+        lx.whitespace_split = True
+        return list(lx)
+    try:
+        words = lex(True)
+    except ValueError:
+        return [[(w, False) for w in command.split()]]
+    try:
+        raw = lex(False)
+    except ValueError:
+        raw = []
+    quoted = ([("'" in r or '"' in r) for r in raw] if len(raw) == len(words) else [False] * len(words))
+    segs = [[]]
+    for w, q in zip(words, quoted):
+        if w in _SEGMENT_BREAKS:
+            segs.append([])
+        else:
+            segs[-1].append((w, q))
+    return [s for s in segs if s]
+
+
+def _braces(word: str, limit: int = LINK_GLOB_LIMIT) -> list:
+    """`a{b,c}d` -> [abd, acd], recursively; a word with no complete `{x,y}` group is itself."""
+    i = word.find("{")
+    while i >= 0:
+        depth, j = 0, i
+        for j in range(i, len(word)):
+            depth += word[j] == "{"
+            depth -= word[j] == "}"
+            if depth == 0:
+                break
+        inner = word[i + 1:j]
+        if depth == 0 and "," in inner:
+            parts, d, cur = [], 0, ""
+            for ch in inner:
+                if ch == "," and d == 0:
+                    parts.append(cur)
+                    cur = ""
+                    continue
+                d += ch == "{"
+                d -= ch == "}"
+                cur += ch
+            parts.append(cur)
+            out = []
+            for p in parts:
+                out.extend(_braces(word[:i] + p + word[j + 1:], limit))
+                if len(out) > limit:
+                    return out
+            return out
+        i = word.find("{", i + 1)
+    return [word]
+
+
+def _has_flag(prog: str, flags: frozenset, words: list) -> bool:
+    """A word of the segment is one of `flags`; a short cluster counts (`-rL`), except for find's whole-word options."""
+    for w in words:
+        if w in flags:
+            return True
+        if prog != "find" and w.startswith("-") and not w.startswith("--") and len(w) > 2:
+            if any(f"-{c}" in flags for c in w[1:]):
+                return True
+    return False
+
+
+def _follows_links(prog: str, words: list) -> bool:
+    """Whether this segment's program reads through the links in the directories it walks."""
+    if prog in _FOLLOW_FLAGS and _has_flag(prog, _FOLLOW_FLAGS[prog], words):
+        return True
+    if prog == "find" and any(w in _FIND_EXEC for w in words):
+        return True
+    if prog in _FOLLOW_UNLESS and not _has_flag(prog, _FOLLOW_UNLESS[prog], words):
+        return prog != "7z" or (bool(words) and words[0] == "a")
+    return False
+
+
+def _chdirs(seg: list) -> list:
+    """The directories a segment makes the cwd of what it runs: `cd D`, `pushd D`, `env -C D`, `env --chdir=D`,
+    `sudo -D D`. Unresolved; the caller resolves them against the cwd."""
+    prog = os.path.basename(seg[0][0])
+    words = [w for w, _ in seg[1:]]
+    if prog in _CD:
+        ops = [w for w in words if not w.startswith("-")]
+        return ops[:1]
+    opts = _CHDIR_OPTS.get(prog)
+    if not opts:
+        return []
+    out = []
+    for i, w in enumerate(words):
+        if w in opts and i + 1 < len(words):
+            out.append(words[i + 1])
+        for o in opts:
+            if o.startswith("--") and w.startswith(o + "="):
+                out.append(w.split("=", 1)[1])
+    return out
+
+
+def link_reach(event: "NormalizedEvent") -> tuple:
+    """(targets, too_wide). `targets`: the resolved targets of the links an act names OR reaches, where they differ
+    from the path as written (hestia #1331). #1433 judged only the links an act NAMES; measured on its applied core
+    2026-10-28, every unnamed shape still reached a secret-named target. So:
+    - an UNQUOTED glob or brace word is expanded and each match judged (a quoted pattern is the program's, not the
+      shell's, and is judged as written);
+    - every relative word is judged against the cwd AND every directory the line makes a cwd: `cd`/`pushd`,
+      `env -C`/`--chdir`, `sudo -D`;
+    - a reader that reads through links while walking has its directories walked (the walk itself follows none) and
+      every link inside judged: the -L/-h/--dereference readers, a find that -execs (find lists links and the exec
+      reader opens them), and zip/7z, which follow unless told to store links.
+    `too_wide`: '' or why the act is refused unjudged (a bound passed). Over-approximates by design: cd directories
+    apply to every word, so it can only ADD refusals, and only where a link really points at a secret-named target.
+    Not the Grep/Glob tools: whether they read through links is the host's, unmeasured. Never raises."""
+    cwd = getattr(event, "cwd", None)
+    segs = _reach_segments(event.command) if event.command else []
+    words = [(w, False) for w in event.paths if isinstance(w, str) and w]
+    for s in segs:
+        words += s
+    bases = [cwd] if cwd else []
+    for s in segs:
+        for d in _chdirs(s):
+            d = os.path.expanduser(d)
+            if not os.path.isabs(d) and cwd:
+                d = os.path.join(cwd, d)
+            if os.path.isabs(d) and os.path.isdir(d) and d not in bases:
+                bases.append(d)
+
+    def resolve(cand):
+        base = os.path.expanduser(cand)
+        if os.path.isabs(base):
+            return [base]
+        return [os.path.join(b, base) for b in bases]
+
+    out, seen, matches = [], set(), [LINK_GLOB_LIMIT]
+    scan = [LINK_GLOB_SCAN_LIMIT, LINK_GLOB_SCAN_LIMIT, "a pattern"]
+    walk = [LINK_WALK_LIMIT, LINK_WALK_LIMIT, "a reader that follows links"]
+
+    def judge(p):
+        try:
+            if p in seen or not os.path.lexists(p):
+                return
+            seen.add(p)
+            real = os.path.realpath(p)
+            if real != os.path.normpath(p):
+                out.append(real)
+        except (OSError, ValueError):
+            pass
+
+    try:
+        _reach_words(words, resolve=resolve, judge=judge, budget=scan, matches=matches)
+        _reach_walks(segs, resolve=resolve, bases=bases, judge=judge, budget=walk)
+    except _TooWide as why:
+        return out, str(why)
+    return out, ""
+
+
+def _reach_words(words, *, resolve, judge, budget, matches) -> None:
+    """Judge every path the act's words name or, as unquoted globs and braces, expand to (bounded)."""
+    for w, quoted in words:
+        if w.startswith("-"):
+            if "=" not in w:
+                continue                    # a bare flag names no path; `--input=x` names x
+            cands = [w.split("=", 1)[1]]
+        else:
+            cands = [w, w.split("=", 1)[1]] if "=" in w else [w]
+        for cand in cands:
+            expand = not quoted
+            pats = _braces(cand) if expand else [cand]
+            if len(pats) > LINK_GLOB_LIMIT:
+                raise _TooWide(f"a pattern reaches more than {LINK_GLOB_LIMIT} paths")
+            for pat in pats:
+                for full in resolve(pat):
+                    if expand and _GLOB_CHARS.search(pat):
+                        for h in _bounded_glob(os.path.abspath(full), budget, matches):
+                            judge(h)
+                    else:
+                        judge(full)
+
+
+def _reach_walks(segs, *, resolve, bases, judge, budget) -> None:
+    """Judge every link under the directories a link-following reader in the act walks (bounded)."""
+    for s in segs:
+        prog = os.path.basename(s[0][0])
+        rest = [w for w, _ in s[1:]]
+        if not _follows_links(prog, rest):
+            continue
+        roots = []
+        for w in rest:
+            if w.startswith("-") or w in ("(", "!"):
+                if prog == "find":
+                    break                   # find's start dirs come before its first expression word
+                continue
+            for full in resolve(w):
+                if os.path.isdir(full) and not os.path.islink(full):
+                    roots.append(full)
+        if not roots:
+            roots = bases[:1]
+        for root in roots:
+            for p in _bounded_walk(root, budget):
+                judge(p)
+
+
+def link_targets(event: "NormalizedEvent") -> list:
+    """The resolved targets of the links an act names or reaches, where a link makes them DIFFER from the path as
+    written (hestia #1331): what Gate 1a sweeps beside the paths and command. See `link_reach`."""
+    return link_reach(event)[0]
+
+
