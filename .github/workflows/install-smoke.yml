@@ -30,6 +30,8 @@ on:
   pull_request:
     paths:
       - "deploy/fleet/install.sh"
+      - "deploy/fleet/gate_smoke.py"
+      - "deploy/install-members.sh"
       - ".github/workflows/install-smoke.yml"
 
 permissions:
