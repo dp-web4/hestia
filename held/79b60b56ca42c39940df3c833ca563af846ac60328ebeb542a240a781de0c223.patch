@@ -1,0 +1,188 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -3196,6 +3196,29 @@
+                                                        if globbed else probe):
+                 continue
+             judged += 1
++            landed = os.path.normpath(probe).replace("\\", "/")
++            if landed == ws or landed.startswith(ws + "/"):
++                # Landing INSIDE the workspace: pass 1's rule for an in-workspace token (#1429), not the
++                # outside rule on its realpath. Before this, a venv's `.venv/bin/python` after `cd <repo>`
++                # was refused as a read of the system interpreter it links to, while the same file spelled
++                # `<ws>/<repo>/.venv/bin/python` passed under #953's link allowance (measured on McNugget,
++                # 2026-10-30, against this core offline). Egress first, then the grant, then the link.
++                hidden = _symlink_target_forbidden(landed, egress)
++                if hidden is not None:
++                    return False, hidden, hidden
++                seg = landed[len(ws):].lstrip("/").split("/", 1)[0]
++                if seg and seg not in repo_scopes and not _within_path_grant(landed, scopes, workspace):
++                    refused = _symlinked_reach_verdict(landed, seg, repo_scopes, scopes, workspace)
++                    if refused is not None:
++                        return (False,) + refused
++                elif os.path.realpath(landed).replace("\\", "/") != landed:
++                    # Granted where it lands lexically, but a LINK: judged where it lands (#953's in-workspace
++                    # half), so `cd <granted> && cat ./peek` into an ungranted repo stays refused, as today's
++                    # outside rule refused it. A target outside the workspace is #953's allowance (the venv).
++                    refused = _symlinked_reach_verdict(landed, seg, repo_scopes, scopes, workspace)
++                    if refused is not None:
++                        return (False,) + refused
++                continue
+             refused = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
+             if refused is not None:
+                 return (False,) + refused
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 6ef0324e9bef94f354caa5d1c34425d61c377b04ee86dae002ba15102197d21e  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -3197,6 +3197,29 @@
+                                                        if globbed else probe):
+                 continue
+             judged += 1
++            landed = os.path.normpath(probe).replace("\\", "/")
++            if landed == ws or landed.startswith(ws + "/"):
++                # Landing INSIDE the workspace: pass 1's rule for an in-workspace token (#1429), not the
++                # outside rule on its realpath. Before this, a venv's `.venv/bin/python` after `cd <repo>`
++                # was refused as a read of the system interpreter it links to, while the same file spelled
++                # `<ws>/<repo>/.venv/bin/python` passed under #953's link allowance (measured on McNugget,
++                # 2026-10-30, against this core offline). Egress first, then the grant, then the link.
++                hidden = _symlink_target_forbidden(landed, egress)
++                if hidden is not None:
++                    return False, hidden, hidden
++                seg = landed[len(ws):].lstrip("/").split("/", 1)[0]
++                if seg and seg not in repo_scopes and not _within_path_grant(landed, scopes, workspace):
++                    refused = _symlinked_reach_verdict(landed, seg, repo_scopes, scopes, workspace)
++                    if refused is not None:
++                        return (False,) + refused
++                elif os.path.realpath(landed).replace("\\", "/") != landed:
++                    # Granted where it lands lexically, but a LINK: judged where it lands (#953's in-workspace
++                    # half), so `cd <granted> && cat ./peek` into an ungranted repo stays refused, as today's
++                    # outside rule refused it. A target outside the workspace is #953's allowance (the venv).
++                    refused = _symlinked_reach_verdict(landed, seg, repo_scopes, scopes, workspace)
++                    if refused is not None:
++                        return (False,) + refused
++                continue
+             refused = _outside_reach_refused(probe, scopes, workspace, cwd, egress, home_markers)
+             if refused is not None:
+                 return (False,) + refused
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b",
++      "sha256": "6ef0324e9bef94f354caa5d1c34425d61c377b04ee86dae002ba15102197d21e",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179"
++  "gt_version": "7e8e644e3a616353c5429603c3fec79bec5b70320b07828e049cd29004cab6fc"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "7e8e644e3a616353c5429603c3fec79bec5b70320b07828e049cd29004cab6fc",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "6ef0324e9bef94f354caa5d1c34425d61c377b04ee86dae002ba15102197d21e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "d26f719f133a611cda3d6b91f724479478058885035e74bfb4842e628216f4d0"
++  "gt_version": "4ba34113d1c69b59a929e727bae239065778ff58600d3d2295e0139b1516b0c9"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "7e8e644e3a616353c5429603c3fec79bec5b70320b07828e049cd29004cab6fc",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "6ef0324e9bef94f354caa5d1c34425d61c377b04ee86dae002ba15102197d21e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "cd9be17d272ee05c7d6789b4fb442a9e62e1259d15cbc112a449edbba3ecf064"
++  "gt_version": "cddf1fee59c21255f20a933dfd6cbfeb53d2735b2a8301bc161ee77a94726447"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "7e8e644e3a616353c5429603c3fec79bec5b70320b07828e049cd29004cab6fc",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "6ef0324e9bef94f354caa5d1c34425d61c377b04ee86dae002ba15102197d21e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "fa321587c9448ed240d3719ddc5770eed11c5dea953f24ad30f561ead887c8a0"
++  "gt_version": "c1075f023a1c689be422e330cf56c2ffe8efc98707a9619bb4ee45595100dc73"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
++    "gt_version": "7e8e644e3a616353c5429603c3fec79bec5b70320b07828e049cd29004cab6fc",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4950dbf22a465755f31a930a1edda0df63a0e0235af629aaa86825de3a730f6b"
++        "sha256": "6ef0324e9bef94f354caa5d1c34425d61c377b04ee86dae002ba15102197d21e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "2a561c893e4cf9d3c16a247e2f60c4b27e9c3fa98c85073f5085617d06b091c0"
++  "gt_version": "6b4cfc4e69fabc4680bc7eff84e6d2e4f7f921cb310c3d71166f35cc48d1c226"
+ }
