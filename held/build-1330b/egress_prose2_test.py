@@ -55,6 +55,30 @@ DENY = [
     ("a read on a later line", f"cat > /tmp/x <<'EOF'\nnote\nEOF\ncat {KEY}"),
     ("a heredoc to a command that is not cat/tee", f"xargs cat <<'EOF'\n{KEY}\nEOF"),
     ("sudo tee, a heredoc to an escalated writer", "sudo tee /tmp/x <<'EOF'\nthe credentials\nEOF"),
+    # nomad's review of eb2db327: bash ran the read in each of these, and the first patch dropped it
+    ("a continued heredoc line, then ; cat", f"cat > x.md <<'EOF' \\\n; cat {KEY}\nnote\nEOF"),
+    ("a continued heredoc line, then && cat", f"cat > x.md <<'EOF'\\\n&& cat {KEY}\nnote\nEOF"),
+    ("a partly quoted delimiter ('EOF'x ends at EOFx)", f"cat > x.md <<'EOF'x\nEOFx\ncat {KEY}\nEOF"),
+    ("write a script, then run it in the same act", f"cat > s.sh <<'EOF'\ncat {KEY}\nEOF\nsh s.sh"),
+    ("write, then source it", f"cat > s.sh <<'EOF'\ncat {KEY}\nEOF\n. ./s.sh"),
+    ("write, then run it by path", f"cat > s.sh <<'EOF'\ncat {KEY}\nEOF\n./s.sh"),
+    ("write via 1>, then run", f"cat 1>s.sh <<'EOF'\ncat {KEY}\nEOF\nbash s.sh"),
+    ("tee after a cd, then run", f"cd /tmp && tee s.sh <<'EOF'\ncat {KEY}\nEOF\nsh s.sh"),
+    ("published AND run", f"cat > s.md <<'EOF'\ncat {KEY}\nEOF\ngh issue create --body-file s.md && sh s.md"),
+    # the author's own probes after nomad's: the body still reaches something that runs it
+    ("a CR after the delimiter (bash's word is EOF\\r)", f"cat > x.md <<'EOF'\r\nEOF\ncat {KEY}\nEOF\r"),
+    ("a heredoc inside $( ), eval'd later", f"x=$(cat <<'EOF'\ncat {KEY}\nEOF\n)\neval \"$x\""),
+    ("a subshell heredoc piped to sh on a later line", f"(cat <<'EOF'\ncat {KEY}\nEOF\n) | sh"),
+    ("a brace group heredoc piped to sh", f"{{ cat <<'EOF'\ncat {KEY}\nEOF\n}} | sh"),
+    ("stdout sent into a shell by an earlier exec", f"exec > >(sh)\ncat <<'EOF'\ncat {KEY}\nEOF"),
+    ("a git hook written, then git commit runs it", f"cat > .git/hooks/pre-commit <<'EOF'\ncat {KEY}\nEOF\ngit commit -m x"),
+    ("a Makefile written, then make", f"cat > Makefile <<'EOF'\nall:\n\tcat {KEY}\nEOF\nmake"),
+    ("gh chained to a run on the later line", f"cat > s.md <<'EOF'\ncat {KEY}\nEOF\ngh issue view 1; sh s.md"),
+    ("two heredocs in one act", f"cat > a.md <<'EOF'\nnote\nEOF\nsh <<'EOF'\ncat {KEY}\nEOF"),
+]
+ALLOW += [
+    ("write, then publish it with --body-file", "cat > i.md <<'EOF'\nrotating the credentials\nEOF\ngh issue create -R o/r --title t --body-file i.md | tail -1"),
+    ("write, then gh comment --body-file", "cat > c.md <<'EOF'\nthe secrets file\nEOF\ngh pr comment 3 -R o/r --body-file c.md"),
 ]
 
 

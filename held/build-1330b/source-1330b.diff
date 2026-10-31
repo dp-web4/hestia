@@ -1,7 +1,7 @@
 diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
 --- a/plugins/_shared/hestia_gate_core.py
 +++ b/plugins/_shared/hestia_gate_core.py
-@@ -689,6 +689,159 @@
+@@ -689,6 +689,166 @@
      return "$" not in word and "`" not in word
  
  
@@ -98,15 +98,20 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +#: and run nothing. Matched on the consumer's first word exactly (no env prefix, no `sudo`, no
 +#: `xargs`), so anything that could hand the body to a program keeps it swept.
 +_EGRESS_DATA_WRITERS = frozenset({"cat", "tee"})
++#: What may follow the heredoc in the same act for its body to stay unswept: `gh` alone (it publishes
++#: text and runs no local file), optionally piped into a reader that runs nothing. Anything else may
++#: run the bytes just written: `sh s.sh`, `. ./s.sh`, `make`, `npm`, `git commit` (hooks), `eval "$x"`.
++_EGRESS_INERT_LATER = re.compile(r"^\s*gh\s[^;&`$()<>|]*(?:\|\s*(?:tail|head|wc)(?:\s+-?[\w]+)*\s*)?$")
 +
 +
 +def _egress_pure_writer(before: str, after: str) -> bool:
 +    """Whether a heredoc opened between `before` and `after` on one line feeds a pure data writer whose
-+    output goes nowhere that runs it: the consumer is `cat`/`tee`, and the rest of the line holds no
-+    pipe, chain, background, substitution, subshell or further redirection-from."""
-+    if re.search(r"[|;&`$()<]", after):
++    output goes nowhere that runs it: the consumer is `cat`/`tee`, the line before it opens no group,
++    subshell or substitution (`(cat <<'EOF' …) | sh`, `x=$(cat <<'EOF' …)`, `{ … } | sh`), and the
++    rest of the line holds no pipe, chain, background, substitution or redirection-from."""
++    if re.search(r"[|;&`$()<{}]", after) or re.search(r"[`({]|\$\(", before):
 +        return False
-+    seg = re.split(r"\|\||&&|[|;&(]|\$\(|`", before)[-1]
++    seg = re.split(r"\|\||&&|[|;&]", before)[-1]
 +    try:
 +        words = shlex.split(seg, posix=True)
 +    except ValueError:
@@ -115,53 +120,55 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
 +
 +
 +def _egress_heredoc_data_removed(cmd: str) -> str:
-+    """The command with the body of each QUOTED-delimiter heredoc written by a pure data writer
-+    removed (hestia #1330, second half). `cat > notes.md <<'EOF'` with "rotating the credentials" in
-+    its body was refused egress.secret, though the body is text the shell never runs or expands: the
-+    same bytes written with the Write tool are not swept, since a local file's contents are not egress.
++    """The command with the body of ONE quoted-delimiter heredoc written by a pure data writer removed
++    (hestia #1330, second half). `cat > notes.md <<'EOF'` with "rotating the credentials" in its body
++    was refused egress.secret, though the body is text the shell never runs or expands, and the same
++    bytes written with the Write tool are not swept (a local file's contents are not egress).
 +
-+    Kept, and swept exactly as before: the heredoc's own line (so `cat > ~/.ssh/x <<'EOF'` and
-+    `cat ~/.ssh/k - <<'EOF'` still deny), every later line, an UNQUOTED delimiter's body (the shell
-+    expands `$(…)` in it), and the body of any other consumer (a shell, an interpreter, `xargs`,
-+    `sudo tee`, or `cat` piped onward). More than one heredoc on a line, or an unterminated one, is
-+    not modelled here: the whole command is swept as written."""
-+    if "<<" not in cmd:
++    ENDING THE BODY LATER THAN BASH IS THE UNSAFE DIRECTION (nomad's review of eb2db327, where three
++    shapes got a real read past this): whatever bash runs in the gap would be dropped. So the body is
++    dropped only when all of these hold, and otherwise the command is swept exactly as written:
++    - exactly one heredoc in the command, quoted (`<<'W'`, `<<"W"`, `<<\\W`, `<<-` forms), its
++      delimiter word followed only by a space, a tab or the end of the line (`<<'EOF'x` is `EOFx` to
++      bash), no carriage return anywhere, and no backslash ending the heredoc line (bash continues it:
++      `<<'EOF' \\` + `; cat key` is a command);
++    - its consumer is a pure data writer (`_egress_pure_writer`);
++    - no earlier line redirects output into something that runs it (`exec`, `>(`, `<(`);
++    - every later line is empty or inert (`_EGRESS_INERT_LATER`): writing `s.sh` and running it in the
++      same act is not the Write-then-Bash split the premise rests on.
++    The heredoc's own line and every later line are always swept."""
++    if "<<" not in cmd or "\r" in cmd:
 +        return cmd
 +    lines = cmd.split("\n")
-+    out, i = [], 0
-+    while i < len(lines):
-+        line = lines[i]
-+        out.append(line)
-+        i += 1
-+        ops = [m for m in _HEREDOC_OP.finditer(line) if not _quoted_at(line, m.start())]
-+        if not ops:
-+            continue
-+        if len(ops) > 1:
-+            return cmd
-+        m = ops[0]
-+        dash, word = m.group(1), m.group(4)
-+        quoted = bool(m.group(2) or m.group(3))
-+        body, j, closed = [], i, False
-+        while j < len(lines):
-+            b = lines[j]
-+            j += 1
-+            if (b.lstrip("\t") if dash else b) == word:
-+                closed = True
-+                break
-+            body.append(b)
-+        if not closed:
-+            return cmd
-+        if not (quoted and _egress_pure_writer(line[:m.start()], line[m.end():])):
-+            out.extend(body)
-+        out.append(lines[j - 1])
-+        i = j
-+    return "\n".join(out)
++    found = [(k, m) for k, ln in enumerate(lines)
++             for m in _HEREDOC_OP.finditer(ln) if not _quoted_at(ln, m.start())]
++    if len(found) != 1:
++        return cmd
++    k, m = found[0]
++    line = lines[k]
++    dash, word = m.group(1), m.group(4)
++    if not (m.group(2) or m.group(3)):
++        return cmd                                   # unquoted: the shell expands the body
++    if re.search(r"(?<!\\)(?:\\\\)*\\$", line) or not re.match(r"(?:[ \t]|$)", line[m.end():]):
++        return cmd
++    if not _egress_pure_writer(line[:m.start()], line[m.end():]):
++        return cmd
++    if any(re.search(r"\bexec\b|>\(|<\(", ln) for ln in lines[:k]):
++        return cmd
++    j = k + 1
++    while j < len(lines) and (lines[j].lstrip("\t") if dash else lines[j]) != word:
++        j += 1
++    if j >= len(lines):
++        return cmd                                   # unterminated
++    if not all(not ln.strip() or _EGRESS_INERT_LATER.match(ln) for ln in lines[j + 1:]):
++        return cmd
++    return "\n".join(lines[:k + 1] + lines[j:])
 +
 +
  def _prose_flag_counts(prev: str, bools: frozenset) -> bool:
      """A prose flag is the flag only if the word before it is not an option waiting for its value:
      a non-option word (the program, a subcommand, a positional, or the value of an earlier option),
-@@ -706,16 +859,27 @@
+@@ -706,16 +866,27 @@
      not literal (it could expand to a secret's contents) and stays swept; so does the whole raw
      command when it cannot be tokenized. Each segment (`_SEGMENT_BREAKS`) is resolved on its own:
      the program, then its subcommand words (git's own leading options allowed), then the flags.
@@ -191,7 +198,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
          if w in _SEGMENT_BREAKS:
              prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
              kept.append(w)
-@@ -723,7 +887,7 @@
+@@ -723,7 +894,7 @@
          if skip_next:
              skip_next = False
              prev = w
@@ -200,7 +207,7 @@ diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_c
                  continue                    # the literal prose value: not a path, not swept
              kept.append(w)
              continue
-@@ -765,7 +929,7 @@
+@@ -765,7 +936,7 @@
          name, eq, val = w.partition("=")
          if w in flags and _prose_flag_counts(prev, bools):
              skip_next = True
