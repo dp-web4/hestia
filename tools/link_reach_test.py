@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """hestia #1331 follow-ups: Gate 1a judges the links an act REACHES without naming them (globs/braces, a cd inside
 the line, readers that follow links). In-process through tools/grant_modes_gate_test's fixtures; the "secret" is a
-FAKE file in a temp workspace whose path carries the innate token. A held overlay check, not test-shaped on purpose:
-run against main's core it fails the REACH and OVERFLOW rows by design.
-Run: python3 held/build-1331f/link_reach_check.py <dir with core_rev.py | "">   ("" = this worktree's own core)"""
+FAKE file in a temp workspace whose path carries the innate token.
+Run: python3 tools/link_reach_test.py
+Applied 2026-10-31 under escalation e451d203eace3f23 and moved here from held/build-1331f/link_reach_check.py; with
+no argument it loads the real module (pass a dir holding core_rev.py to judge a revised copy)."""
 import importlib.util
 import os
 import pathlib
