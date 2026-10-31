@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """#1435 fix: a single-gate GateEvent (tool_input, no command/paths) through core.egress_unsweepable_deny must return,
-not raise. argv: <dir with core_rev.py | ""> ("" = this worktree's own core). Not test-shaped: on the applied #1435
-core it raises, by design."""
+not raise. CI on the first #1435 head (90b74740): every single-gate act failed closed as gate.internal_error.
+Run: python3 tools/gate_event_reach_test.py   (applied 2026-10-31 under escalation 812eda165b4d9bd7; pass a dir
+holding core_rev.py to judge a revised copy)."""
 import importlib.util, pathlib, sys
 OUT = sys.argv[1] if len(sys.argv) > 1 else ""
 ROOT = next(p for p in pathlib.Path(__file__).resolve().parents if (p / "plugins" / "_shared").is_dir())

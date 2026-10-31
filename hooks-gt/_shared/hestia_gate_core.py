@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: d78092f0e10fef3c2e661bf6c5c4aa8c81e78c3f23e5f5f6f77e7c73bbb57a37  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: c5ec7622985eb004d1830db9e3a28f61b848ff65140b04aae6147fce94ab820c  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -578,14 +578,6 @@ def egress_unsweepable_deny(event: "NormalizedEvent") -> Optional["Verdict"]:
     unread. Both Gate 1a sites call it before the token sweep, so the degraded mode does too."""
     bad = egress_unsweepable(event)
     if not bad:
-        # hestia #1331: a glob or link-following walk past its bound is refused unjudged, under the rule
-        # for a reach the gate cannot enumerate (the scope pass refuses past SCOPE_JUDGE_BUDGET the same way).
-        too_wide = link_reach(event)[1]
-        if too_wide:
-            return _deny("mrh.command.unenumerated",
-                         f"'{event.tool}': {too_wide}, so the gate cannot judge every link it reaches and it is "
-                         f"refused rather than judged in part: name the paths it needs",
-                         target=UNENUMERATED_TARGET)
         return None
     return _deny("egress.secret",
                  f"'{event.tool}' declares egress the gate cannot sweep ({bad}): egress must be "
@@ -613,7 +605,7 @@ def egress_blobs(event: "NormalizedEvent") -> list:
 #: warm: Legion SAGE 82,943 entries / 48 ms, web4 46,983 / 20 ms, hestia 14,369 / 19 ms (0.4-1.3 us per entry);
 #: Nomad SAGE 70,237 / 43 ms. 200,000 is about 120 ms warm, clears every repo, and still refuses a whole workspace
 #: (Legion's ai-workspace: 705,755 entries).
-LINK_GLOB_LIMIT = 256          # paths a glob or brace may expand to, per act
+LINK_GLOB_LIMIT = 2048         # paths a glob or brace may expand to, per act (each a realpath: a few ms in all)
 LINK_GLOB_SCAN_LIMIT = 10000   # directory entries a glob may read while expanding, per act
 LINK_WALK_LIMIT = 200000       # directory entries the act's link-following walks may read, per act
 
@@ -803,7 +795,7 @@ def _chdirs(seg: list) -> list:
     return out
 
 
-def link_reach(event: "NormalizedEvent") -> tuple:
+def link_reach(event: "NormalizedEvent", within: Optional[tuple] = None) -> tuple:
     """(targets, too_wide). `targets`: the resolved targets of the links an act names OR reaches, where they differ
     from the path as written (hestia #1331). #1433 judged only the links an act NAMES; measured on its applied core
     2026-10-28, every unnamed shape still reached a secret-named target. So:
@@ -816,10 +808,15 @@ def link_reach(event: "NormalizedEvent") -> tuple:
       reader opens them), and zip/7z, which follow unless told to store links.
     `too_wide`: '' or why the act is refused unjudged (a bound passed). Over-approximates by design: cd directories
     apply to every word, so it can only ADD refusals, and only where a link really points at a secret-named target.
-    Not the Grep/Glob tools: whether they read through links is the host's, unmeasured. Never raises."""
+    Not the Grep/Glob tools: whether they read through links is the host's, unmeasured. Never raises.
+    `within` (granted roots, absolute): when given, only reach rooted inside the grants is expanded or walked; the
+    overflow check passes it, so a pattern outside the grants is left to the scope pass and its escalation."""
     cwd = getattr(event, "cwd", None)
-    segs = _reach_segments(event.command) if event.command else []
-    words = [(w, False) for w in event.paths if isinstance(w, str) and w]
+    # getattr, as egress_blobs does: an event shape without command/paths (the single gate's GateEvent) must
+    # contribute nothing, never raise into gate.internal_error.
+    command = getattr(event, "command", None)
+    segs = _reach_segments(command) if command else []
+    words = [(w, False) for w in (getattr(event, "paths", None) or ()) if isinstance(w, str) and w]
     for s in segs:
         words += s
     bases = [cwd] if cwd else []
@@ -841,6 +838,15 @@ def link_reach(event: "NormalizedEvent") -> tuple:
     scan = [LINK_GLOB_SCAN_LIMIT, LINK_GLOB_SCAN_LIMIT, "a pattern"]
     walk = [LINK_WALK_LIMIT, LINK_WALK_LIMIT, "a reader that follows links"]
 
+    roots_in = None if within is None else tuple(os.path.realpath(r).rstrip("/") for r in within)
+
+    def counts(p):
+        """Whether reach rooted at `p` is inside the grants (always, with no `within`)."""
+        if roots_in is None:
+            return True
+        rp = os.path.realpath(p).rstrip("/") or "/"
+        return any(rp == r or rp.startswith(r + "/") or r.startswith(rp.rstrip("/") + "/") for r in roots_in)
+
     def judge(p):
         try:
             if p in seen or not os.path.lexists(p):
@@ -853,14 +859,14 @@ def link_reach(event: "NormalizedEvent") -> tuple:
             pass
 
     try:
-        _reach_words(words, resolve=resolve, judge=judge, budget=scan, matches=matches)
-        _reach_walks(segs, resolve=resolve, bases=bases, judge=judge, budget=walk)
+        _reach_words(words, resolve=resolve, judge=judge, budget=scan, matches=matches, counts=counts)
+        _reach_walks(segs, resolve=resolve, bases=bases, judge=judge, budget=walk, counts=counts)
     except _TooWide as why:
         return out, str(why)
     return out, ""
 
 
-def _reach_words(words, *, resolve, judge, budget, matches) -> None:
+def _reach_words(words, *, resolve, judge, budget, matches, counts=lambda p: True) -> None:
     """Judge every path the act's words name or, as unquoted globs and braces, expand to (bounded)."""
     for w, quoted in words:
         if w.startswith("-"):
@@ -877,13 +883,18 @@ def _reach_words(words, *, resolve, judge, budget, matches) -> None:
             for pat in pats:
                 for full in resolve(pat):
                     if expand and _GLOB_CHARS.search(pat):
-                        for h in _bounded_glob(os.path.abspath(full), budget, matches):
+                        absf = os.path.abspath(full)
+                        fixed = absf.split("/")
+                        cut = next((i for i, c in enumerate(fixed) if _GLOB_CHARS.search(c)), len(fixed))
+                        if not counts("/".join(fixed[:cut]) or "/"):
+                            continue        # a pattern outside the grants: the scope pass's, not ours
+                        for h in _bounded_glob(absf, budget, matches):
                             judge(h)
                     else:
                         judge(full)
 
 
-def _reach_walks(segs, *, resolve, bases, judge, budget) -> None:
+def _reach_walks(segs, *, resolve, bases, judge, budget, counts=lambda p: True) -> None:
     """Judge every link under the directories a link-following reader in the act walks (bounded)."""
     for s in segs:
         prog = os.path.basename(s[0][0])
@@ -902,8 +913,25 @@ def _reach_walks(segs, *, resolve, bases, judge, budget) -> None:
         if not roots:
             roots = bases[:1]
         for root in roots:
+            if not counts(root):
+                continue                    # a walk outside the grants: the scope pass's, not ours
             for p in _bounded_walk(root, budget):
                 judge(p)
+
+
+def link_reach_too_wide(event: "NormalizedEvent", within: Optional[tuple] = None) -> Optional["Verdict"]:
+    """hestia #1331: an act whose glob or link-following walk passes its bound is refused unjudged, under the rule
+    for a reach the gate cannot enumerate (the scope pass refuses past SCOPE_JUDGE_BUDGET the same way). Called
+    only where evaluate is about to ALLOW: outside the grant the scope pass has already refused or escalated, and an
+    out-of-scope glob must keep its escalation (one_gate_decide_contract phantom-glob-still-escalates). `within`
+    is the granted roots: a pattern or walk rooted outside them is not counted (None = an unscoped policy)."""
+    too_wide = link_reach(event, within)[1]
+    if not too_wide:
+        return None
+    return _deny("mrh.command.unenumerated",
+                 f"'{event.tool}': {too_wide}, so the gate cannot judge every link it reaches and it is "
+                 f"refused rather than judged in part: name the paths it needs",
+                 target=UNENUMERATED_TARGET)
 
 
 def link_targets(event: "NormalizedEvent") -> list:
@@ -3926,7 +3954,10 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                 target=refused or "",
             )
 
-    return ALLOW
+    _repos, _roots = _scope_parts(scopes, ws)
+    _wsr = os.path.realpath(os.path.expanduser(ws)).rstrip("/")
+    within = tuple(_roots) + tuple(os.path.join(_wsr, r) for r in _repos if r and r != AgentPolicy.UNSCOPED)
+    return link_reach_too_wide(event, within) or ALLOW
 
 
 # ── The ratified degraded mode (Sprint F — PRD §7.1 criterion 9) ────────────────────────
