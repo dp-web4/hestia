@@ -18,10 +18,12 @@ Witnessed, PER STEP (GPT-6 review of #1448: one before/after count let the opera
 satisfy "the daemon witnessed both decisions"). After each step the probe reads the chain entries
 that step appended (operator-authenticated /api/chain, signed with the operator key the daemon
 minted at genesis) and requires:
-  1. a policy_decision DENY for the Read, under an mrh rule
-  2. a policy_decision DENY for the Bash self-write, under the gate's governance rule
-  3. new entries for the grant, and NO policy_decision among them (the grant is not a decision)
-  4. a policy_decision ALLOW for the Read: affirmative evidence, not merely "not denied"
+  1. a policy_decision DENY, with the scope_requested entry the mrh refusal files for the Read
+  2. a policy_decision DENY, with the gate_self_access entry the governance rule records
+  3. new entries for the grant, and NO gate decision (policy_decision / policy_allow) among them
+  4. a policy_allow ALLOW: affirmative evidence of the allow, not merely "not denied"
+`rule_name` is empty in /api/chain's projection, so the rule is evidenced by the companion entry
+each refusal writes (measured on the gate arms, run 41153941717), not by that field.
 
 argv: --src <the tag's source dir, for tools/seed_seat_config.py's operator client>
 env:  HESTIA_HOME, HESTIA_WORKSPACE (both required; nothing is guessed)
@@ -132,14 +134,24 @@ def main() -> int:
             mark[0] = new[-1]["chain_position"]
         return new
 
-    def decisions(entries, tool, verdict):
-        return [e for e in entries if e.get("event_type") == "policy_decision"
-                and e.get("tool_name") == tool and (e.get("decision") or "").lower() == verdict]
+    GATE_EVENTS = ("policy_decision", "policy_allow")
+
+    def decisions(entries, verdict):
+        kind = "policy_allow" if verdict == "allow" else "policy_decision"
+        return [e for e in entries if e.get("event_type") == kind
+                and (e.get("decision") or "").lower() == verdict]
+
+    def has(entries, event_type):
+        return any(e.get("event_type") == event_type for e in entries)
 
     def show(entries) -> str:
-        return ", ".join(f"#{e['chain_position']} {e.get('event_type')}"
-                         + (f" {e.get('decision')}/{e.get('rule_name')}" if e.get("decision") else "")
-                         for e in entries) or "nothing"
+        def one(e):
+            bits = [f"#{e['chain_position']} {e.get('event_type')}"]
+            for k in ("decision", "tool_name", "target"):
+                if e.get(k):
+                    bits.append(f"{k}={str(e[k])[:60]}")
+            return " ".join(bits)
+        return "; ".join(one(e) for e in entries) or "nothing"
 
     def witnessed(label, entries, ok):
         print(f"{'ok  ' if ok else 'FAIL'}   chain for {label}: {show(entries)}")
@@ -170,8 +182,7 @@ def main() -> int:
     if not ok:
         fails.append("fresh-seat read was not a narrow scope refusal")
     new = appended()
-    witnessed("the fresh-seat Read", new,
-              any("mrh" in (e.get("rule_name") or "") for e in decisions(new, "Read", "deny")))
+    witnessed("the fresh-seat Read", new, bool(decisions(new, "deny")) and has(new, "scope_requested"))
 
     # 2. The law: a write to the gate's own file is refused as a governance-surface write.
     d, rc, why = run(self_ev)
@@ -180,8 +191,7 @@ def main() -> int:
     if not ok:
         fails.append("self-write probe")
     new = appended()
-    witnessed("the self-write", new, any(LAW_REASON.search((e.get("rule_name") or "") + " " + (e.get("reason") or ""))
-                                         for e in decisions(new, "Bash", "deny")))
+    witnessed("the self-write", new, bool(decisions(new, "deny")) and has(new, "gate_self_access"))
 
     # 3. The operator grants the seat its workspace (what an operator does on the dashboard).
     status, body = op.call("POST", "/api/scope/grant", {
@@ -193,7 +203,7 @@ def main() -> int:
         fails.append("operator grant")
     new = appended()
     witnessed("the operator grant (no policy_decision may count it)", new,
-              bool(new) and not any(e.get("event_type") == "policy_decision" for e in new))
+              bool(new) and not any(e.get("event_type") in GATE_EVENTS for e in new))
 
     # 4. Now the same read is allowed: the gate decides by the daemon's grant.
     d, rc, why = run(read_ev)
@@ -202,11 +212,11 @@ def main() -> int:
     if not ok:
         fails.append("granted read was refused")
     new = appended()
-    witnessed("the granted Read (an ALLOW decision)", new, bool(decisions(new, "Read", "allow")))
+    witnessed("the granted Read (an ALLOW decision)", new, bool(decisions(new, "allow")))
     if fails:
         print("FAIL: " + "; ".join(fails))
         return 1
-    print("PASS: each gate decision (deny, deny, allow) is its own policy_decision on the daemon's chain")
+    print("PASS: each gate decision (deny, deny, allow) is its own record on the daemon's chain")
     return 0
 
 
