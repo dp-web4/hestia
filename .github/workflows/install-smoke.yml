@@ -30,6 +30,8 @@ on:
   pull_request:
     paths:
       - "deploy/fleet/install.sh"
+      - "deploy/fleet/gate_smoke.py"
+      - "deploy/install-members.sh"
       - ".github/workflows/install-smoke.yml"
 
 permissions:
@@ -37,12 +39,13 @@ permissions:
 
 jobs:
   install:
-    name: fresh install (${{ matrix.os }}${{ matrix.home && ', custom HESTIA_HOME' || '' }})
+    name: fresh install (${{ matrix.os }}${{ matrix.home && ', custom HESTIA_HOME' || '' }}${{ matrix.gate && ', claude-code gate' || '' }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-14]
         home: [""]
+        gate: [false]
         include:
           # #1444: the unit hardcoded %h/.hestia, so an install with HESTIA_HOME set put the
           # vault where the daemon never looked. An empty value is the installer's default home.
@@ -50,11 +53,21 @@ jobs:
           # path is a machine-layout literal: tools/public_boundary.py rejects it).
           - os: ubuntu-latest
             home: alt
+          # #1443: the release installs a WORKING claude-code gate. A runner has no Claude Code, so
+          # the arm opts in (HESTIA_INSTALL_GATE=1 creates ~/.claude), names a workspace, provides
+          # the Ed25519 library the seat seeder needs, then drives the installed gate once each way
+          # (deploy/fleet/gate_smoke.py): a verdict from the daemon, witnessed on its chain.
+          - os: ubuntu-latest
+            home: ""
+            gate: true
+          - os: macos-14
+            home: ""
+            gate: true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
-      HESTIA_SKIP_HOOK: "1"
+      HESTIA_SKIP_HOOK: ${{ !matrix.gate && '1' || '' }}
       HESTIA_SKIP_DEPLOY: "1"
     steps:
       - name: Custom HESTIA_HOME
@@ -100,6 +113,24 @@ jobs:
           done
           XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user is-system-running || true
 
+      - uses: actions/setup-python@v5
+        if: matrix.gate
+        with:
+          python-version: "3.12"
+
+      - name: Gate prerequisites (Ed25519 library, a workspace, bash >= 4)
+        if: matrix.gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -q cryptography
+          mkdir -p "$RUNNER_TEMP/ws"
+          echo "HESTIA_WORKSPACE=$RUNNER_TEMP/ws" >> "$GITHUB_ENV"
+          echo "HESTIA_INSTALL_GATE=1" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = macOS ] && ! { command -v /opt/homebrew/bin/bash || command -v /usr/local/bin/bash; } >/dev/null 2>&1; then
+            brew install bash
+          fi
+
       - name: Install
         shell: bash
         env:
@@ -128,6 +159,19 @@ jobs:
             exit 1
           fi
           echo "ok: daemon $got"
+
+      - name: The release-installed gate decides and the daemon witnesses (#1443)
+        if: matrix.gate
+        shell: bash
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          home="${HESTIA_HOME:-$HOME/.hestia}"
+          src="$home/src/hestia-$TAG"
+          probe="deploy/fleet/gate_smoke.py"
+          [ -f "$probe" ] || probe="$src/deploy/fleet/gate_smoke.py"
+          HESTIA_HOME="$home" python "$probe" --src "$src"
 
       - name: Service logs on failure
         if: failure()
