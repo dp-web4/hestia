@@ -6,24 +6,23 @@ gate arm). It reads the PreToolUse gate line install.sh registered in ~/.claude/
 runs it the way Claude Code does (the line through /bin/sh, the event on stdin, the settings `env`
 plus CLAUDECODE=1, cwd = the workspace):
 
-  1. a Read inside HESTIA_WORKSPACE, before any grant -> refused narrowly (mrh): a fresh seat
-     holds no scope, because the installer grants nothing (scope is the operator's act)
-  2. `touch <the installed gate itself>`              -> refused FOR THE LAW (its governance
-     surface), not for an infrastructure reason: a gate that cannot load its engine or
-     projection refuses everything, and that deny proves nothing
-  3. the operator grants the seat its workspace (POST /api/scope/grant, operator-signed)
-  4. the same Read                                    -> allowed
+Supplying HESTIA_WORKSPACE authorises the installer's ONE operator grant of that path (dp, 2026-10-30,
+on #1448: "supplied workspace means a working workspace"). The probe checks:
 
-Witnessed, PER STEP (GPT-6 review of #1448: one before/after count let the operator grant alone
-satisfy "the daemon witnessed both decisions"). After each step the probe reads the chain entries
-that step appended (operator-authenticated /api/chain, signed with the operator key the daemon
-minted at genesis) and requires:
-  1. a policy_decision DENY, with the scope_requested entry the mrh refusal files for the Read
-  2. a policy_decision DENY, with the gate_self_access entry the governance rule records
-  3. new entries for the grant, and NO gate decision (policy_decision / policy_allow) among them
-  4. a policy_allow ALLOW: affirmative evidence of the allow, not merely "not denied"
-`rule_name` is empty in /api/chain's projection, so the rule is evidenced by the companion entry
-each refusal writes (measured on the gate arms, run 41153941717), not by that field.
+  0. the grant is ON THE CHAIN as an operator act: operator_gate + scope_granted, appended before
+     any gate decision, and the daemon serves it as a standing grant of exactly the workspace
+  1. a Read inside the workspace                      -> ALLOWED, with a policy_allow record
+     naming the Read and the file (affirmative evidence, not merely "not denied")
+  2. `touch <the installed gate itself>`              -> refused FOR THE LAW, with a
+     policy_decision deny naming the Bash act, and the gate_self_access record. A gate that
+     cannot load its engine refuses everything, and that deny would prove nothing
+  3. the NO-GRANT CONTROL: a Read of a file OUTSIDE the workspace -> refused narrowly, with a
+     policy_decision deny and the scope_requested record the mrh refusal files. The grant reaches
+     the supplied path and nothing wider
+
+Each step's records are the chain entries THAT step appended (operator-authenticated /api/chain),
+so a grant is never counted as a gate decision (GPT-6 review of #1448). `rule_name` is empty in
+/api/chain's projection, so a rule is evidenced by the companion record its refusal writes.
 
 argv: --src <the tag's source dir, for tools/seed_seat_config.py's operator client>
 env:  HESTIA_HOME, HESTIA_WORKSPACE (both required; nothing is guessed)
@@ -166,6 +165,10 @@ def main() -> int:
     env.pop("HESTIA_ROLE", None)
     probe = ws / "hestia-gate-smoke.txt"
     probe.write_text("read me\n")
+    outside_dir = ws.parent / (ws.name + "-outside")
+    outside_dir.mkdir(exist_ok=True)
+    outside = outside_dir / "not-granted.txt"
+    outside.write_text("outside the supplied workspace\n")
     def run(event):
         r = subprocess.run([SH, "-c", cmd], input=json.dumps(event), env=env, cwd=str(ws),
                            capture_output=True, text=True, timeout=60)
@@ -173,19 +176,34 @@ def main() -> int:
 
     read_ev = {"hook_event_name": "PreToolUse", "session_id": "hestia-install-smoke",
                "tool_name": "Read", "tool_input": {"file_path": str(probe)}}
+    out_ev = {"hook_event_name": "PreToolUse", "session_id": "hestia-install-smoke",
+              "tool_name": "Read", "tool_input": {"file_path": str(outside)}}
     self_ev = {"hook_event_name": "PreToolUse", "session_id": "hestia-install-smoke",
                "tool_name": "Bash", "tool_input": {"command": f"touch {target(cmd)}"}}
 
-    # 1. A fresh seat holds NO scope: the installer grants nothing (scope is the operator's), so
-    #    even a read inside the workspace is refused, narrowly (mrh), and files a scope request.
-    d, rc, why = run(read_ev)
-    ok = d and "mrh" in why
-    print(f"{'ok  ' if ok else 'FAIL'} fresh seat, no grant: Read inside the workspace -> {'denied' if d else 'ALLOWED'} (rc={rc}) {why}")
+    # 0. The installer's grant: an operator act on the chain, of exactly the workspace.
+    before = chain_tail()
+    grants = [e for e in before if e.get("event_type") == "scope_granted"]
+    gates = [e for e in before if e.get("event_type") in GATE_EVENTS]
+    ok = bool(grants) and any(e.get("event_type") == "operator_gate" for e in before) and not gates
+    print(f"{'ok  ' if ok else 'FAIL'}   installer's grant on the chain: {show(grants) if grants else 'none'}"
+          f"{'' if not gates else ' (gate decisions ALREADY present: ' + show(gates) + ')'}")
     if not ok:
-        fails.append("fresh-seat read was not a narrow scope refusal")
+        fails.append("no operator scope_granted from the installer before the probe")
+    named = [e for e in grants if e.get("target")]
+    if named and not any(e.get("target") == str(ws) for e in named):
+        fails.append("the installer's grant names a path other than the supplied workspace")
+        print(f"FAIL   grant target is not {ws}: {show(named)}")
+
+    # 1. Inside the supplied workspace: allowed, affirmatively.
+    d, rc, why = run(read_ev)
+    ok = not d
+    print(f"{'ok  ' if ok else 'FAIL'} Read inside the granted workspace -> {'denied' if d else 'allowed'} (rc={rc}) {why}")
+    if not ok:
+        fails.append("a Read inside the supplied workspace was refused")
     new = appended()
-    witnessed("the fresh-seat Read", new,
-              bool(decisions(new, "deny", "Read", str(probe))) and has(new, "scope_requested"))
+    witnessed("the Read inside the workspace (an ALLOW decision)", new,
+              bool(decisions(new, "allow", "Read", str(probe))))
 
     # 2. The law: a write to the gate's own file is refused as a governance-surface write.
     d, rc, why = run(self_ev)
@@ -197,30 +215,20 @@ def main() -> int:
     witnessed("the self-write", new,
               bool(decisions(new, "deny", "Bash", target(cmd))) and has(new, "gate_self_access"))
 
-    # 3. The operator grants the seat its workspace (what an operator does on the dashboard).
-    status, body = op.call("POST", "/api/scope/grant", {
-        "plugin_id": "claude-code", "path": str(ws), "recursive": True,
-        "reason": "install smoke (#1443): the operator grants the seat its workspace"})
-    ok = status == 200
-    print(f"{'ok  ' if ok else 'FAIL'} operator grant of the workspace -> {status} {json.dumps(body)[:200]}")
+    # 3. No-grant control: outside the supplied workspace the seat holds nothing.
+    d, rc, why = run(out_ev)
+    ok = d and "mrh" in why
+    print(f"{'ok  ' if ok else 'FAIL'} no-grant control: Read OUTSIDE the workspace -> {'denied' if d else 'ALLOWED'} (rc={rc}) {why}")
     if not ok:
-        fails.append("operator grant")
+        fails.append("a Read outside the workspace was not a narrow scope refusal")
     new = appended()
-    witnessed("the operator grant (no policy_decision may count it)", new,
-              bool(new) and not any(e.get("event_type") in GATE_EVENTS for e in new))
+    witnessed("the Read outside the workspace", new,
+              bool(decisions(new, "deny", "Read", str(outside))) and has(new, "scope_requested"))
 
-    # 4. Now the same read is allowed: the gate decides by the daemon's grant.
-    d, rc, why = run(read_ev)
-    ok = not d
-    print(f"{'ok  ' if ok else 'FAIL'} granted: Read inside the workspace -> {'denied' if d else 'allowed'} (rc={rc}) {why}")
-    if not ok:
-        fails.append("granted read was refused")
-    new = appended()
-    witnessed("the granted Read (an ALLOW decision)", new, bool(decisions(new, "allow", "Read", str(probe))))
     if fails:
         print("FAIL: " + "; ".join(fails))
         return 1
-    print("PASS: each gate decision (deny, deny, allow) is its own record on the daemon's chain")
+    print("PASS: installer grant on the chain; allow inside, self-write and outside refused, each its own record")
     return 0
 
 

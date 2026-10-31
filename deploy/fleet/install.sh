@@ -1050,11 +1050,55 @@ step_claude_hooks() {
     exit 1
   fi
   c_ok "claude-code gate installed from ${VERSION}; it governs the next Claude Code session"
-  # The installer grants nothing: scope is the operator's act. A fresh seat therefore holds no
-  # scope, and its first acts are refused narrowly, each filing a scope request.
-  c_warn "the seat holds NO scope yet: its acts are refused until you grant some, and each refusal"
-  c_warn "  files a scope request. Grant its workspace ($HESTIA_WORKSPACE) or rule the requests on"
-  c_warn "  the dashboard: http://${HESTIA_BIND}/ (sign in with $HESTIA_HOME/operator.key)"
+  step_initial_workspace_grant "$src"
+}
+
+# THE OPERATOR'S INITIAL GRANT (dp, 2026-10-30, on #1448): "supplied workspace means a working
+# workspace". Supplying HESTIA_WORKSPACE to this installer authorises ONE grant of exactly that
+# path to the claude-code seat. It is a real operator act: signed with the operator key the daemon
+# minted at genesis, through the same /api/scope/grant the dashboard uses, so it lands on the chain
+# as scope_granted and is inspectable, editable and revocable there. An environment variable is
+# never itself a grant.
+#   - exactly the supplied path (recursive), nothing wider;
+#   - `expected_existing: null`: written only if no standing grant on (claude-code, that path)
+#     exists. A re-install finds the operator's current grant and leaves it as it is, never
+#     replacing or widening it;
+#   - a failed grant is a visible, non-zero failure of the gate setup, not a warning.
+step_initial_workspace_grant() {
+  local src="$1" rc=0 out
+  out="$(python3 - "$src/tools/seed_seat_config.py" "$HESTIA_HOME" "$HESTIA_WORKSPACE" "$VERSION" <<'PY'
+import importlib.util, json, sys
+from pathlib import Path
+seed_py, home, ws, version = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("seed_seat_config", seed_py)
+seed = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(seed)
+home = Path(home)
+endpoint = (home / "endpoint").read_text().strip()
+op = seed.Operator(endpoint.rsplit("/mcp", 1)[0], home / "operator.key")
+op.open_session()
+status, body = op.call("POST", "/api/scope/grant", {
+    "plugin_id": "claude-code", "path": ws, "recursive": True, "expected_existing": None,
+    "reason": f"initial workspace grant: the operator supplied HESTIA_WORKSPACE={ws} to the "
+              f"release installer ({version}); dp ruling 2026-10-30 (hestia #1448)"})
+if status == 200:
+    print("granted " + json.dumps(body)[:200]); sys.exit(0)
+if status == 409 and isinstance(body, dict) and body.get("moved") and body.get("current"):
+    print("kept " + json.dumps(body.get("current"))[:200]); sys.exit(3)
+print(f"refused {status} " + json.dumps(body)[:300]); sys.exit(1)
+PY
+)" || rc=$?
+  case "$rc" in
+    0) c_ok "operator granted the seat its workspace: $HESTIA_WORKSPACE (recursive; on the chain as scope_granted)"
+       c_dim "  edit or revoke it on the dashboard: http://${HESTIA_BIND}/" ;;
+    3) c_ok "the seat already holds a grant on $HESTIA_WORKSPACE; left as it is (a re-install never widens it)"
+       c_dim "  $out" ;;
+    *) c_err "the gate is installed but its initial workspace grant FAILED: $out"
+       c_err "  the seat holds no scope, so every act it tries is refused. Grant $HESTIA_WORKSPACE on"
+       c_err "  the dashboard (http://${HESTIA_BIND}/, sign in with the operator key in $HESTIA_HOME), then"
+       c_err "  re-run this installer to confirm."
+       exit 1 ;;
+  esac
 }
 
 step_smoketest() {
