@@ -14,8 +14,14 @@ plus CLAUDECODE=1, cwd = the workspace):
   3. the operator grants the seat its workspace (POST /api/scope/grant, operator-signed)
   4. the same Read                                    -> allowed
 
-Witnessed: the daemon's chain length (operator-authenticated /api/dashboard, signed with the
-operator key the daemon minted at genesis) must grow across the two decisions.
+Witnessed, PER STEP (GPT-6 review of #1448: one before/after count let the operator grant alone
+satisfy "the daemon witnessed both decisions"). After each step the probe reads the chain entries
+that step appended (operator-authenticated /api/chain, signed with the operator key the daemon
+minted at genesis) and requires:
+  1. a policy_decision DENY for the Read, under an mrh rule
+  2. a policy_decision DENY for the Bash self-write, under the gate's governance rule
+  3. new entries for the grant, and NO policy_decision among them (the grant is not a decision)
+  4. a policy_decision ALLOW for the Read: affirmative evidence, not merely "not denied"
 
 argv: --src <the tag's source dir, for tools/seed_seat_config.py's operator client>
 env:  HESTIA_HOME, HESTIA_WORKSPACE (both required; nothing is guessed)
@@ -111,13 +117,34 @@ def main() -> int:
     op = seed.Operator(endpoint.rsplit("/mcp", 1)[0], home / "operator.key")
     op.open_session()
 
-    def chain_length() -> int:
-        status, body = op.call("GET", "/api/dashboard")
-        if status != 200:
-            raise SystemExit(f"FAIL /api/dashboard answered {status} to the operator session")
-        return int(body["society"]["chain_length"])
+    def chain_tail() -> list[dict]:
+        status, body = op.call("GET", "/api/chain?limit=200")
+        if status != 200 or not isinstance(body, dict) or body.get("read_error"):
+            raise SystemExit(f"FAIL /api/chain answered {status}: {json.dumps(body)[:200]}")
+        return sorted(body.get("entries") or [], key=lambda e: e["chain_position"])
 
-    before = chain_length()
+    mark = [max((e["chain_position"] for e in chain_tail()), default=-1)]
+
+    def appended() -> list[dict]:
+        """The entries appended since the last call (the previous step's mark)."""
+        new = [e for e in chain_tail() if e["chain_position"] > mark[0]]
+        if new:
+            mark[0] = new[-1]["chain_position"]
+        return new
+
+    def decisions(entries, tool, verdict):
+        return [e for e in entries if e.get("event_type") == "policy_decision"
+                and e.get("tool_name") == tool and (e.get("decision") or "").lower() == verdict]
+
+    def show(entries) -> str:
+        return ", ".join(f"#{e['chain_position']} {e.get('event_type')}"
+                         + (f" {e.get('decision')}/{e.get('rule_name')}" if e.get("decision") else "")
+                         for e in entries) or "nothing"
+
+    def witnessed(label, entries, ok):
+        print(f"{'ok  ' if ok else 'FAIL'}   chain for {label}: {show(entries)}")
+        if not ok:
+            fails.append(f"chain evidence for {label}")
 
     env = dict(os.environ)
     env.update({k: v for k, v in (settings.get("env") or {}).items() if isinstance(v, str)})
@@ -142,6 +169,9 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'} fresh seat, no grant: Read inside the workspace -> {'denied' if d else 'ALLOWED'} (rc={rc}) {why}")
     if not ok:
         fails.append("fresh-seat read was not a narrow scope refusal")
+    new = appended()
+    witnessed("the fresh-seat Read", new,
+              any("mrh" in (e.get("rule_name") or "") for e in decisions(new, "Read", "deny")))
 
     # 2. The law: a write to the gate's own file is refused as a governance-surface write.
     d, rc, why = run(self_ev)
@@ -149,6 +179,9 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'} deny: self-write of the gate -> {'denied' if d else 'ALLOWED'} (rc={rc}) {why}")
     if not ok:
         fails.append("self-write probe")
+    new = appended()
+    witnessed("the self-write", new, any(LAW_REASON.search((e.get("rule_name") or "") + " " + (e.get("reason") or ""))
+                                         for e in decisions(new, "Bash", "deny")))
 
     # 3. The operator grants the seat its workspace (what an operator does on the dashboard).
     status, body = op.call("POST", "/api/scope/grant", {
@@ -158,6 +191,9 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'} operator grant of the workspace -> {status} {json.dumps(body)[:200]}")
     if not ok:
         fails.append("operator grant")
+    new = appended()
+    witnessed("the operator grant (no policy_decision may count it)", new,
+              bool(new) and not any(e.get("event_type") == "policy_decision" for e in new))
 
     # 4. Now the same read is allowed: the gate decides by the daemon's grant.
     d, rc, why = run(read_ev)
@@ -165,16 +201,12 @@ def main() -> int:
     print(f"{'ok  ' if ok else 'FAIL'} granted: Read inside the workspace -> {'denied' if d else 'allowed'} (rc={rc}) {why}")
     if not ok:
         fails.append("granted read was refused")
-
-    after = chain_length()
-    grew = after > before
-    print(f"{'ok  ' if grew else 'FAIL'} witnessed: chain {before} -> {after}")
-    if not grew:
-        fails.append("the chain did not grow across the gate decisions")
+    new = appended()
+    witnessed("the granted Read (an ALLOW decision)", new, bool(decisions(new, "Read", "allow")))
     if fails:
         print("FAIL: " + "; ".join(fails))
         return 1
-    print("PASS: the release-installed gate decides through the daemon and the daemon witnesses it")
+    print("PASS: each gate decision (deny, deny, allow) is its own policy_decision on the daemon's chain")
     return 0
 
 
