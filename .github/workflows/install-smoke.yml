@@ -37,17 +37,24 @@ permissions:
 
 jobs:
   install:
-    name: fresh install (${{ matrix.os }})
+    name: fresh install (${{ matrix.os }}${{ matrix.home && ', custom HESTIA_HOME' || '' }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-14]
+        home: [""]
+        include:
+          # #1444: the unit hardcoded %h/.hestia, so an install with HESTIA_HOME set put the
+          # vault where the daemon never looked. An empty value is the installer's default home.
+          - os: ubuntu-latest
+            home: /home/runner/hestia-alt-home
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
       HESTIA_SKIP_HOOK: "1"
       HESTIA_SKIP_DEPLOY: "1"
+      HESTIA_HOME: ${{ matrix.home }}
     steps:
       - name: Which release, which installer
         id: pick
@@ -124,6 +131,6 @@ jobs:
             systemctl --user status hestia.service --no-pager || true
             journalctl --user -u hestia --no-pager -n 80 || true
           else
-            tail -n 80 "$HOME/.hestia/hestia.log" || true
+            tail -n 80 "${HESTIA_HOME:-$HOME/.hestia}/hestia.log" || true
             launchctl list | grep -i hestia || true
           fi

@@ -27,9 +27,11 @@ set -euo pipefail
 REPO="dp-web4/hestia"
 # The release a pin-less install gets. #520: this was a literal (v0.0.3) for two months after
 # v0.0.4 shipped -- every curl|sh install got a binary that cannot read v0.0.4's databases, and
-# the header above said "default: latest". It now resolves GitHub's marked-latest release, and
-# falls back to this floor only when the API cannot be reached (offline, rate-limited).
-FALLBACK_VERSION="v0.0.4"
+# the header above said "default: latest". It resolves GitHub's marked-latest release. There is
+# NO floor literal any more (#1444): the v0.0.4 floor outlived three release candidates and no
+# release step updated it. A rate-limited API falls back to the releases/latest redirect, which
+# is not rate-limited; if neither answers, GitHub is unreachable, the download would fail too,
+# and the installer stops and says so.
 VERSION="${HESTIA_VERSION:-}"
 # The default home, named once: the deploy units are bound to it (step_deploy_supervisor).
 HESTIA_HOME_DEFAULT="$HOME/.hestia"
@@ -212,8 +214,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'HESTIA_PASSPHRASE="\$(cat %h/.hestia/.passphrase)" exec %h/.local/bin/hestia serve --bind ${HESTIA_BIND}'
-Environment=HESTIA_HOME=%h/.hestia
+ExecStart=/bin/sh -c 'HESTIA_PASSPHRASE="\$(cat ${HESTIA_HOME}/.passphrase)" exec %h/.local/bin/hestia serve --bind ${HESTIA_BIND}'
+Environment=HESTIA_HOME=${HESTIA_HOME}
 Environment=RUST_LOG=warn
 # THE GAUGE'S ONLY INPUT. \`deployment_health\` reads this env var and has NO fallback:
 # unset means \`deployment_health_from_path(None)\` -> state "unknown". It was present in
@@ -222,7 +224,7 @@ Environment=RUST_LOG=warn
 # the deployment badge from "stale" (a signal) to "unknown" (no signal), silently. The tool
 # you reach for to deploy would have disabled the instrument that tells you whether the
 # deploy landed. Found 2026-08-24 while answering "what are the obstacles to deployment".
-Environment=HESTIA_CURRENT_BUILD_FILE=%h/.hestia/current-build.json
+Environment=HESTIA_CURRENT_BUILD_FILE=${HESTIA_HOME}/current-build.json
 # ARENA CAP (#354). glibc allocates one 64 MB arena per thread up to 8 x cores — a 4 GB
 # fragmentation ceiling on an 8-core host. An arena only returns memory by trimming its
 # TOP, so one live allocation above a freed block pins the whole region and every heavy
@@ -248,7 +250,7 @@ Environment=HESTIA_WORKSPACE=${HESTIA_WORKSPACE}
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.hestia
+ReadWritePaths=${HESTIA_HOME}
 PrivateTmp=true
 Restart=on-failure
 RestartSec=5s
@@ -527,7 +529,7 @@ step_service_macos() {
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>HESTIA_PASSPHRASE="\$(cat \$HOME/.hestia/.passphrase)" exec \$HOME/.local/bin/hestia serve --bind ${HESTIA_BIND}</string>
+    <string>HESTIA_PASSPHRASE="\$(cat ${HESTIA_HOME}/.passphrase)" exec \$HOME/.local/bin/hestia serve --bind ${HESTIA_BIND}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -850,8 +852,8 @@ step_deploy_supervisor() {
     c_dim "  from a checkout, or see deploy/from-main/README.md"
     return
   fi
-  # The shipped units are bound to ~/.hestia (HESTIA_HOME=%h/.hestia here, and the same in the
-  # daemon unit this script installs), and hestia-deploy defaults its clones to
+  # The deploy units are bound to ~/.hestia (the daemon unit takes HESTIA_HOME since #1444, the
+  # deploy units do not yet), and hestia-deploy defaults its clones to
   # ~/.hestia/deploy. Installing for another HESTIA_HOME would put the clones where the
   # supervisor never looks and deploy into a home the daemon does not read. Until the units
   # take HESTIA_HOME from configuration, say so instead of installing a half-wired supervisor.
@@ -1006,9 +1008,15 @@ resolve_version() {
   tag="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
     | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)" || true
   case "$tag" in
+    v[0-9]*) ;;
+    *) tag="$(curl -fsS -o /dev/null --max-time 15 -w '%{redirect_url}' "https://github.com/${REPO}/releases/latest" 2>/dev/null \
+         | sed -n 's#.*/releases/tag/\(v[0-9][^/?]*\)$#\1#p')" || true ;;
+  esac
+  case "$tag" in
     v[0-9]*) VERSION="$tag" ;;
-    *) VERSION="$FALLBACK_VERSION"
-       c_warn "could not resolve the latest release from GitHub; installing ${VERSION} (set HESTIA_VERSION to choose)" ;;
+    *) c_err "could not resolve the latest release from GitHub (API and releases/latest both failed)"
+       c_dim "  set HESTIA_VERSION to a release tag (https://github.com/${REPO}/releases) and re-run"
+       exit 1 ;;
   esac
 }
 
