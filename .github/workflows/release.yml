@@ -172,7 +172,7 @@ jobs:
           # builds on windows (vendored OpenSSL), so the remaining work is cfg-gating
           # the Unix file-mode calls — filed as #342. Linux + macOS cover the fleet.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
     steps:
       # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
       # green. hestia/core has path deps into ../../web4/..., so the release must
@@ -270,7 +270,7 @@ jobs:
             os: ubuntu-22.04
             bundles: appimage,deb
           - platform: aarch64-macos
-            os: macos-14
+            os: macos-15
             bundles: app,dmg
     steps:
       # app/src-tauri path-depends on ../../../web4/web4-core: the same sibling layout and the
