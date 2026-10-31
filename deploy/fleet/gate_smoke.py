@@ -136,10 +136,12 @@ def main() -> int:
 
     GATE_EVENTS = ("policy_decision", "policy_allow")
 
-    def decisions(entries, verdict):
+    def decisions(entries, verdict, tool, target_has):
+        """Gate decision records for THIS act: the verdict, the tool, and the act's target."""
         kind = "policy_allow" if verdict == "allow" else "policy_decision"
         return [e for e in entries if e.get("event_type") == kind
-                and (e.get("decision") or "").lower() == verdict]
+                and (e.get("decision") or "").lower() == verdict
+                and e.get("tool_name") == tool and target_has in (e.get("target") or "")]
 
     def has(entries, event_type):
         return any(e.get("event_type") == event_type for e in entries)
@@ -182,7 +184,8 @@ def main() -> int:
     if not ok:
         fails.append("fresh-seat read was not a narrow scope refusal")
     new = appended()
-    witnessed("the fresh-seat Read", new, bool(decisions(new, "deny")) and has(new, "scope_requested"))
+    witnessed("the fresh-seat Read", new,
+              bool(decisions(new, "deny", "Read", str(probe))) and has(new, "scope_requested"))
 
     # 2. The law: a write to the gate's own file is refused as a governance-surface write.
     d, rc, why = run(self_ev)
@@ -191,7 +194,8 @@ def main() -> int:
     if not ok:
         fails.append("self-write probe")
     new = appended()
-    witnessed("the self-write", new, bool(decisions(new, "deny")) and has(new, "gate_self_access"))
+    witnessed("the self-write", new,
+              bool(decisions(new, "deny", "Bash", target(cmd))) and has(new, "gate_self_access"))
 
     # 3. The operator grants the seat its workspace (what an operator does on the dashboard).
     status, body = op.call("POST", "/api/scope/grant", {
@@ -212,7 +216,7 @@ def main() -> int:
     if not ok:
         fails.append("granted read was refused")
     new = appended()
-    witnessed("the granted Read (an ALLOW decision)", new, bool(decisions(new, "allow")))
+    witnessed("the granted Read (an ALLOW decision)", new, bool(decisions(new, "allow", "Read", str(probe))))
     if fails:
         print("FAIL: " + "; ".join(fails))
         return 1
