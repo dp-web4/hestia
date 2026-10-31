@@ -25,11 +25,24 @@ ROWS = [
      'pointer_uri': 'file:///seven', 'drained_at': '2026-10-30T12:00:00.123456789+00:00'},
     {'id': 8, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
      'pointer_uri': 'file:///eight', 'drained_at': '2026-02-31T12:00:00Z'},
+    {'id': 9, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
+     'pointer_uri': 'file:///nine', 'drained_at': '2026-10-30T12:00:00+05:59'},
+    {'id': 10, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
+     'pointer_uri': 'file:///ten', 'drained_at': '2026-10-30T12:00:00-05:59'},
+    {'id': 11, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
+     'pointer_uri': 'file:///eleven', 'drained_at': '2026-10-30T12:00:00+05:60'},
+    {'id': 12, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
+     'pointer_uri': 'file:///twelve', 'drained_at': '2026-10-30T12:00:00-00:99'},
+    {'id': 13, 'kind': 'review_request', 'from_plugin': 'codex', 'to_plugin': 'claude-code',
+     'pointer_uri': 'file:///thirteen', 'drained_at': '2026-10-30T12:00:00+24:00'},
 ]
 EXPECTED = {1: 'drain mark absent; read status unknown', 2: 'drain mark present; read status unknown',
             3: 'drain mark unknown; read status unknown', 4: 'drain mark unknown; read status unknown',
             5: 'drain mark unknown; read status unknown', 6: 'drain mark unknown; read status unknown',
-            7: 'drain mark present; read status unknown', 8: 'drain mark unknown; read status unknown'}
+            7: 'drain mark present; read status unknown', 8: 'drain mark unknown; read status unknown',
+            9: 'drain mark present; read status unknown', 10: 'drain mark present; read status unknown',
+            11: 'drain mark unknown; read status unknown', 12: 'drain mark unknown; read status unknown',
+            13: 'drain mark unknown; read status unknown'}
 
 
 def assert_rows(test, output):

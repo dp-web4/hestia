@@ -279,7 +279,7 @@ def mark_status(x):
     if "drained_at" not in x: return "drain mark unknown; read status unknown"
     mark = x["drained_at"]
     if mark is None: return "drain mark absent; read status unknown"
-    if not isinstance(mark, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})", mark):
+    if not isinstance(mark, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:[0-5]\d)", mark):
         return "drain mark unknown; read status unknown"
     try: datetime.datetime.fromisoformat(mark.replace("Z", "+00:00"))
     except ValueError: return "drain mark unknown; read status unknown"
