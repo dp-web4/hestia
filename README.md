@@ -337,11 +337,7 @@ curl -s http://127.0.0.1:7711/api/version     # {"version":"X.Y.Z","build_id":"v
 
 Then open `http://127.0.0.1:7711/` and sign in as the operator.
 
-**Governing an AI coding agent from a release install is not finished** (#1443). The installer
-does not yet install the shared gate engine or register the hooks, and the instruction it printed
-up to rc.4 points at a hook that cannot load its engine (read from the code, not yet run). Until #1443 lands, the gate is installed from
-a checkout (`deploy/from-main/`). Seat seeding then also needs an Ed25519 library for Python
-(`pip install cryptography` or PyNaCl).
+**The policy gate.** On a machine with Claude Code (`~/.claude` exists), the installer also installs the claude-code gate from the same release: the shared engine under `$HESTIA_HOME/shared`, the hooks registered in `~/.claude/settings.json`, and the seat's configuration in the vault. It needs `HESTIA_WORKSPACE` set to the directory your agent works in (the gate's scope root), bash 4 or newer (macOS: `brew install bash`), and an Ed25519 library for python3 (`python3 -m pip install --user cryptography`). Each missing prerequisite is named and the step is skipped, never guessed; the daemon is installed either way. **The installer grants no scope.** The new seat starts with none, so its first acts are refused and each files a scope request: grant it its workspace, or rule the requests, on the dashboard (sign in with `$HESTIA_HOME/operator.key`). `HESTIA_SKIP_HOOK=1` skips the gate. Don't run the installer from inside a Claude Code session: the members' install refuses to let a governed session install its own gate.
 
 **Verify provenance.** Every asset of a release from v0.3.0-rc.3 on carries a Sigstore build
 attestation made by this repository's release workflow:
