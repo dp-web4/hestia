@@ -143,6 +143,18 @@ is stated rather than inferred away. Three tiers remain kept apart on purpose:*
   Not a euphemism for broken; it means nobody has yet found out.
 - **Not built** — stated so it cannot be inferred from silence.
 
+### Before you install: what the gate does not protect against
+
+These are open, and they bound what an install can promise:
+
+- **Connect is not authenticated yet** (#824). A process that can reach the daemon's port can
+  claim a member identity when it connects; principal binding comes before law, role, vault or
+  reputation, and it is not built.
+- **Same-user principals are not isolated** (#954). Processes running as one OS user can act as
+  one another's member identity.
+- **The gate stops accidents, not adversaries** (#49). It is a policy check inside the agent's
+  own process, with the agent's privileges. A capable agent that wants to route around it can.
+
 ### The governance layer — measured
 
 This is the part that runs every day and has the scars to prove it.
@@ -294,10 +306,54 @@ SDKs release in lockstep (dp, 2026-10-11; web4#904). The number lives in the roo
   `release.yml` with no tag is a dry run: every build runs and uploads artifacts, and no release
   is created. No Windows build yet: the app follows the daemon (#342).
 
+### Installing the daemon
+
+The daemon is the part everything else talks to: the vault, the society chain, the MCP endpoint
+and the dashboard. Install it first, then the app from the **same release**.
+
+**Prerequisites.** Linux with a systemd user session (a normal desktop login; on a headless box
+run `loginctl enable-linger $USER` first), or macOS on Apple Silicon. `curl`, `tar` and `python3`.
+Port 7711 on loopback free, or set `HESTIA_BIND`.
+
+**Install** a release by naming its tag. The installer is fetched from that tag, so it matches the
+binary it installs:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dp-web4/hestia/vX.Y.Z/deploy/fleet/install.sh -o install.sh
+HESTIA_VERSION=vX.Y.Z bash install.sh
+```
+
+Without `HESTIA_VERSION` it installs GitHub's latest release, which is never a release candidate.
+It downloads the daemon for your platform, checks its `.sha256`, creates the vault and its
+passphrase (mode 600) under `HESTIA_HOME` (default `~/.hestia`), installs a systemd user unit or a
+launchd agent, and checks that the daemon answering on the port is the release it installed.
+Re-running it upgrades the binary and keeps the vault and chain.
+
+**Check it:**
+
+```sh
+curl -s http://127.0.0.1:7711/api/version     # {"version":"X.Y.Z","build_id":"vX.Y.Z",...}
+```
+
+Then open `http://127.0.0.1:7711/` and sign in as the operator.
+
+**Governing an AI coding agent from a release install is not finished** (#1443). The installer
+does not yet install the shared gate engine or register the hooks, and the instruction it printed
+up to rc.4 points at a hook that cannot load its engine (read from the code, not yet run). Until #1443 lands, the gate is installed from
+a checkout (`deploy/from-main/`). Seat seeding then also needs an Ed25519 library for Python
+(`pip install cryptography` or PyNaCl).
+
+**Verify provenance.** Every asset of a release from v0.3.0-rc.3 on carries a Sigstore build
+attestation made by this repository's release workflow:
+
+```sh
+gh attestation verify hestia-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz --repo dp-web4/hestia
+```
+
 ### Installing the desktop app
 
-The desktop bundles are **unsigned** for now (no signing identity exists yet), so the OS will
-warn the first time. Check the download against its `.sha256` (or `SHA256SUMS`) first.
+Check a download against its `.sha256` (or `SHA256SUMS`), or verify its attestation as above.
+The desktop bundles carry provenance but no OS code signature yet, so the OS warns the first time.
 
 - **Linux, AppImage:** a download is not executable. Run
   `chmod +x hestia-app-vX.Y.Z-x86_64-linux.AppImage`, then run the file. AppImages need FUSE 2
@@ -310,8 +366,8 @@ warn the first time. Check the download against its `.sha256` (or `SHA256SUMS`) 
   "damaged"). Either open it once and then use System Settings → Privacy & Security → **Open
   Anyway**, or clear the quarantine flag: `xattr -dr com.apple.quarantine /Applications/Hestia.app`.
   Intel Macs are not built.
-- **Android:** the APK is signed with a debug keystore. Allow "install unknown apps" for your
-  browser or file manager, then open the APK.
+- **Android:** the APK is signed with the project's release key (since v0.3.0-rc.3). It is not
+  on an app store: allow "install unknown apps" for your browser or file manager, then open it.
 
 The app checks the daemon's version over `/api/version` when it connects, so install the app and
 the daemon from the same release.
