@@ -8290,10 +8290,10 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
 ///
 /// Two properties this surface must keep, both learned the hard way:
 ///
-/// 1. It is **unanswered**, not undelivered. A notice read and deliberately
-///    not answered is forensically identical here to one nobody ever picked
-///    up (`drained_at` separates those two, and only those two). Named
-///    "undelivered" it would re-create absence-read-as-pass with better
+/// 1. It is **unanswered**, not undelivered. `drained_at` is a drain mark, not
+///    a per-notice read receipt: peeks leave it null, and the local drain may
+///    mark expired ordinary notices that its SELECT did not return.
+///    Named "undelivered" it would re-create absence-read-as-pass with better
 ///    tooling.
 /// 2. It closes the loop for RESPONSIVENESS, not for ACTION. The INERT
 ///    signature — woke, ran, did nothing — is still not representable. The
@@ -8432,12 +8432,13 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
                        follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
                        outranks mootness — the misroute is sender-actionable.",
         "scope": "unanswered = no notice binds in_reply_to to it; \
-                  drained_at:null additionally means it was never picked up; \
+                  drained_at:null means the drain mark is absent; a peek may still \
+                  have seen it. A mark does not prove it was returned or read; \
                   each row carries its OWN in_reply_to - group by that, not by \
                   pointer_uri, or distinct dispositions anchored at one section \
                   read as duplicates",
-        "recipient_liveness_scope": "liveness measures the DELIVERY PATH (did that member \
-                                     read its mailbox), not the member's ability to act — a \
+        "recipient_liveness_scope": "liveness measures mailbox touches under that seat, \
+                                     not an interactive member's ability to act — a \
                                      watcher polling for a broken CLI reads as live. \
                                      'unknown' means never seen on THIS mesh, which is the \
                                      dead-letter class and usually a misroute",
@@ -12621,9 +12622,9 @@ mod member_mesh_tests {
     }
 
     /// The row is only useful where the question gets asked. `owed_to_me` is
-    /// what the fire primer renders, so that is where "live and unanswered"
-    /// (a member choosing not to reply) must separate from "never seen here"
-    /// (a misroute) — they want opposite responses from the sender.
+    /// what the fire primer renders, so mailbox liveness must separate from
+    /// "never seen here" without claiming that an interactive member read a
+    /// particular notice or deliberately chose not to answer.
     #[tokio::test]
     async fn unanswered_owed_to_me_carries_recipient_liveness() {
         let (_dir, state) = test_state().await;
@@ -12656,9 +12657,14 @@ mod member_mesh_tests {
         };
         assert_eq!(by_to("thor"), json!("unknown"), "{rows}");
         assert_eq!(by_to("kimi-code"), json!("live"), "{rows}");
-        // Liveness is about the delivery path, not about acting — say so in
-        // the payload, where a reader cannot skip past it.
-        assert!(rows["recipient_liveness_scope"].is_string(), "{rows}");
+        // Mailbox touch and drain are not interactive-session read receipts.
+        let liveness_scope = rows["recipient_liveness_scope"].as_str().unwrap();
+        assert!(liveness_scope.contains("mailbox touches"), "{rows}");
+        assert!(liveness_scope.contains("watcher"), "{rows}");
+        let scope = rows["scope"].as_str().unwrap();
+        assert!(scope.contains("drain mark is absent"), "{rows}");
+        assert!(scope.contains("a peek"), "{rows}");
+        assert!(scope.contains("does not prove it was returned or read"), "{rows}");
     }
 
     /// **The site the fractal change could have broken silently, and the reason it is

@@ -1141,12 +1141,23 @@ retry_stale_primers
 announce_unanswered() {
   local OUT; OUT=$(unanswered 2>/dev/null) || return 0
   printf '%s' "$OUT" | python3 -c '
-import json,sys
+import datetime,json,re,sys
 try: d=json.load(sys.stdin)
 except Exception: raise SystemExit(0)
+def mark_status(n):
+    if "drained_at" not in n:
+        return "drain mark unknown; read status unknown"
+    mark = n["drained_at"]
+    if mark is None:
+        return "drain mark absent; read status unknown"
+    if not isinstance(mark, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:[0-5]\d)", mark):
+        return "drain mark unknown; read status unknown"
+    try: datetime.datetime.fromisoformat(mark.replace("Z", "+00:00"))
+    except ValueError: return "drain mark unknown; read status unknown"
+    return "drain mark present; read status unknown"
 for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me")):
     for n in d.get(key,[]) or []:
-        seen = "delivered, unanswered" if n.get("drained_at") else "NEVER PICKED UP"
+        seen = mark_status(n)
         live = n.get("recipient_liveness")
         if live and live != "live": seen += f", recipient {live}"
         # Single quotes inside the expressions, deliberately: this block is
