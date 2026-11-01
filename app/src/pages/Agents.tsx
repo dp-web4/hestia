@@ -114,10 +114,12 @@ export function unaccountedMembers(
 function MemberLifecycle({
   m,
   inventoryFresh,
+  inventoryGeneration,
   onActed,
 }: {
   m: UnaccountedMember;
   inventoryFresh: boolean;
+  inventoryGeneration: number;
   onActed: () => void;
 }) {
   const [reason, setReason] = useState("");
@@ -125,8 +127,9 @@ function MemberLifecycle({
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   // Set only by the daemon's live-member refusal. The operator ticks it; it is never pre-set.
-  const [question, setQuestion] = useState<Extract<MemberActOutcome, { outcome: "needs_confirmation" }> | null>(null);
+  const [answer, setAnswer] = useState<{ generation: number; question: Extract<MemberActOutcome, { outcome: "needs_confirmation" }> } | null>(null);
   const [confirm, setConfirm] = useState(false);
+  const question = answer?.generation === inventoryGeneration ? answer.question : null;
 
   const act = async () => {
     if (!inventoryFresh) return;
@@ -135,9 +138,9 @@ function MemberLifecycle({
     try {
       const out = m.retired
         ? await reinstateAgent(m.id, reason)
-        : await retireAgent(m.id, reason, ref, confirm);
+        : await retireAgent(m.id, reason, ref, !!question && confirm);
       if (out.outcome === "needs_confirmation") {
-        setQuestion(out);
+        setAnswer({ generation: inventoryGeneration, question: out });
         setConfirm(false);
       } else if (out.outcome === "already_retired" || out.outcome === "already_reinstated") {
         setMsg(out.detail);
@@ -195,6 +198,7 @@ function MemberLifecycle({
 export function Agents() {
   const [inv, setInv] = useState<AgentInventory | null>(null);
   const [inventoryFresh, setInventoryFresh] = useState(false);
+  const [inventoryGeneration, setInventoryGeneration] = useState(0);
   const [retired, setRetired] = useState<string[]>([]);
   const [snap, setSnap] = useState<DashboardSnapshot | null>(null);
   const [status, setStatus] = useState<OperatorStatus | null>(null);
@@ -206,6 +210,7 @@ export function Agents() {
 
   const refresh = useCallback(async () => {
     const generation = ++refreshGeneration.current;
+    setInventoryGeneration(generation);
     // Keep forms mounted, but disable lifecycle actions until the current
     // inventory and registry have both been read.
     setInventoryFresh(false);
@@ -443,7 +448,7 @@ export function Agents() {
                   {m.retired ? " · retired on this seat" : ""}
                 </span>
               </h3>
-              <MemberLifecycle m={m} inventoryFresh={inventoryFresh} onActed={refresh} />
+              <MemberLifecycle m={m} inventoryFresh={inventoryFresh} inventoryGeneration={inventoryGeneration} onActed={refresh} />
             </article>
           ))}
         </section>

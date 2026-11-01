@@ -315,6 +315,47 @@ describe("Agents", () => {
       expect(await screen.findByText(/Retired on this seat/)).toBeTruthy();
     });
 
+    it("invalidates the live-member confirmation on refresh but retains the fields", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValue(inventory([claude]));
+      getDashboard.mockResolvedValue({ retired: [], members: ["caude-code"], trust: [] });
+      retireAgent.mockReset();
+      retireAgent.mockResolvedValue({ outcome: "needs_confirmation", detail: "live member", acts_recently: 12, unmeasurable: false, window_hours: 24 });
+      render(<Agents />);
+      const button = await screen.findByRole("button", { name: "Retire" }) as HTMLButtonElement;
+      const [reason, ref] = screen.getAllByRole("textbox") as HTMLInputElement[];
+      fireEvent.change(reason, { target: { value: "typo" } });
+      fireEvent.change(ref, { target: { value: "issue 123" } });
+      fireEvent.click(button);
+      fireEvent.click(await screen.findByRole("checkbox"));
+      fireEvent.focus(window);
+      await waitFor(() => expect(button.disabled).toBe(false));
+      expect(screen.queryByRole("checkbox")).toBeNull();
+      expect(reason.value).toBe("typo");
+      expect(ref.value).toBe("issue 123");
+      fireEvent.click(button);
+      await screen.findByRole("checkbox");
+      expect(retireAgent).toHaveBeenLastCalledWith("caude-code", "typo", "issue 123", false);
+      expect((screen.getByRole("checkbox") as HTMLInputElement).checked).toBe(false);
+    });
+
+    it("ignores a live-member refusal returned after a refresh began", async () => {
+      let resolve!: (value: unknown) => void;
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValue(inventory([claude]));
+      getDashboard.mockResolvedValue({ retired: [], members: ["caude-code"], trust: [] });
+      retireAgent.mockReset();
+      retireAgent.mockReturnValueOnce(new Promise((yes) => { resolve = yes; }));
+      render(<Agents />);
+      const button = await screen.findByRole("button", { name: "Retire" }) as HTMLButtonElement;
+      fireEvent.click(button);
+      fireEvent.focus(window);
+      await act(async () => resolve({ outcome: "needs_confirmation", detail: "old evidence", acts_recently: 12, unmeasurable: false, window_hours: 24 }));
+      await waitFor(() => expect(button.disabled).toBe(false));
+      expect(screen.queryByText("old evidence")).toBeNull();
+      expect(screen.queryByRole("checkbox")).toBeNull();
+    });
+
     it("an id another view already retired is reported, not overwritten", async () => {
       operatorStatus.mockResolvedValue(signedIn);
       agentsInventory.mockResolvedValue(inventory([claude]));
