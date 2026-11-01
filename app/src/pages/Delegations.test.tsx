@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { DelegationList, DelegationRow } from "../lib/types";
 
 const getDashboard = vi.fn();
@@ -28,6 +28,12 @@ const list = (over: Partial<DelegationList> = {}): DelegationList => ({
   plugin_id: "kimi-code", agent_key: "k", delegations: [row()], roles: ROLES, retired: false, ...over,
 });
 const signedIn = { signed_in: true, lct_id: "lct:x" };
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
 
 afterEach(() => {
   cleanup();
@@ -41,6 +47,93 @@ async function pick(member: string) {
 }
 
 describe("Delegations", () => {
+  it("does not expose the previous member while loading or accept an older response", async () => {
+    const a = deferred<DelegationList>();
+    const b = deferred<DelegationList>();
+    operatorStatus.mockResolvedValue(signedIn);
+    getDashboard.mockResolvedValue({ members: ["kimi-code", "claude-code"] });
+    delegationsList.mockImplementation((m: string) => m === "kimi-code" ? a.promise : b.promise);
+    render(<Delegations />);
+    await pick("kimi-code");
+    fireEvent.change(screen.getByLabelText("member"), { target: { value: "claude-code" } });
+    expect(screen.queryByRole("button", { name: /Delegate|Revoke/ })).toBeNull();
+    await act(async () => b.resolve(list({ plugin_id: "claude-code" })));
+    expect(await screen.findByText("Delegate to claude-code")).toBeTruthy();
+    await act(async () => a.resolve(list()));
+    expect(screen.getByText("Delegate to claude-code")).toBeTruthy();
+    expect(screen.queryByText("Delegate to kimi-code")).toBeNull();
+  });
+
+  it("switching clears entered authority, and stale errors cannot replace the new view", async () => {
+    const stale = deferred<DelegationList>();
+    operatorStatus.mockResolvedValue(signedIn);
+    getDashboard.mockResolvedValue({ members: ["kimi-code", "claude-code"] });
+    delegationsList.mockImplementation((m: string) => m === "kimi-code" ? Promise.resolve(list()) : stale.promise);
+    render(<Delegations />);
+    await pick("kimi-code");
+    await screen.findByText("Delegate to kimi-code");
+    fireEvent.click(screen.getByLabelText("witness"));
+    fireEvent.change(screen.getByPlaceholderText("why this member needs this authority"), { target: { value: "old reason" } });
+    fireEvent.change(screen.getByLabelText("member"), { target: { value: "claude-code" } });
+    expect(screen.queryByText("Delegate to kimi-code")).toBeNull();
+    fireEvent.change(screen.getByLabelText("member"), { target: { value: "kimi-code" } });
+    await screen.findByText("Delegate to kimi-code");
+    expect((screen.getByLabelText("witness") as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByPlaceholderText("why this member needs this authority") as HTMLInputElement).value).toBe("");
+    await act(async () => stale.reject(new Error("stale read")));
+    expect(screen.queryByText(/stale read/)).toBeNull();
+  });
+
+  it("a mismatched response never enables a different member's controls", async () => {
+    operatorStatus.mockResolvedValue(signedIn);
+    getDashboard.mockResolvedValue({ members: ["claude-code"] });
+    delegationsList.mockResolvedValue(list());
+    render(<Delegations />);
+    await pick("claude-code");
+    expect(await screen.findByText(/response member does not match selection/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Delegate|Revoke/ })).toBeNull();
+  });
+
+  it("a completed old-member grant is attributed correctly and cannot refresh the new member", async () => {
+    const pending = deferred<{ delegation_id: string; unvalidated_actions: string[] }>();
+    operatorStatus.mockResolvedValue(signedIn);
+    getDashboard.mockResolvedValue({ members: ["kimi-code", "claude-code"] });
+    delegationsList.mockImplementation((m: string) => Promise.resolve(list({ plugin_id: m, delegations: [] })));
+    delegationGrant.mockReturnValue(pending.promise);
+    render(<Delegations />);
+    await pick("kimi-code");
+    await screen.findByText("Delegate to kimi-code");
+    fireEvent.click(screen.getByLabelText("witness"));
+    fireEvent.change(screen.getByPlaceholderText("why this member needs this authority"), { target: { value: "audit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Delegate" }));
+    expect(delegationGrant).toHaveBeenCalledTimes(1);
+    fireEvent.change(screen.getByLabelText("member"), { target: { value: "claude-code" } });
+    await screen.findByText("Delegate to claude-code");
+    await act(async () => pending.resolve({ delegation_id: "x", unvalidated_actions: [] }));
+    expect(screen.getByText("Delegate to claude-code")).toBeTruthy();
+    expect(screen.getByText("Action completed for kimi-code (previous selection): Delegated to kimi-code.")).toBeTruthy();
+    expect(delegationsList.mock.calls.filter(([m]) => m === "kimi-code")).toHaveLength(1);
+  });
+
+  it("a failed old-member action is reported after switching", async () => {
+    const pending = deferred<{ delegation_id: string; unvalidated_actions: string[] }>();
+    operatorStatus.mockResolvedValue(signedIn);
+    getDashboard.mockResolvedValue({ members: ["kimi-code", "claude-code"] });
+    delegationsList.mockImplementation((m: string) => Promise.resolve(list({ plugin_id: m, delegations: [] })));
+    delegationGrant.mockReturnValue(pending.promise);
+    render(<Delegations />);
+    await pick("kimi-code");
+    await screen.findByText("Delegate to kimi-code");
+    fireEvent.click(screen.getByLabelText("witness"));
+    fireEvent.change(screen.getByPlaceholderText("why this member needs this authority"), { target: { value: "audit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Delegate" }));
+    fireEvent.change(screen.getByLabelText("member"), { target: { value: "claude-code" } });
+    await screen.findByText("Delegate to claude-code");
+    await act(async () => pending.reject(new Error("connection lost")));
+    expect(screen.getByText(/Action outcome for kimi-code could not be confirmed: Error: connection lost/)).toBeTruthy();
+    expect(screen.getByText("Delegate to claude-code")).toBeTruthy();
+  });
+
   it("the member is chosen from the registry, and its delegations listed with status", async () => {
     operatorStatus.mockResolvedValue(signedIn);
     getDashboard.mockResolvedValue({ members: ["kimi-code", "claude-code"] });

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   delegationGrant,
   delegationRevoke,
@@ -45,21 +45,21 @@ function DelegationCard({
   member,
   signedIn,
   onActed,
+  onFailed,
 }: {
   d: DelegationRow;
   member: string;
   signedIn: boolean;
   onActed: (msg: string) => void;
+  onFailed: (msg: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
   const st = status(d);
 
   const revoke = async () => {
     setBusy(true);
-    setErr(null);
     try {
       const out = await delegationRevoke(member, d.id, reason);
       onActed(
@@ -68,7 +68,7 @@ function DelegationCard({
           : `${d.id.slice(0, 8)}…: revoked.`,
       );
     } catch (e) {
-      setErr(String(e));
+      onFailed(String(e));
     } finally {
       setBusy(false);
     }
@@ -115,7 +115,6 @@ function DelegationCard({
           </button>
         </div>
       )}
-      {err && <div className="error-banner">{err}</div>}
     </div>
   );
 }
@@ -124,10 +123,12 @@ function GrantForm({
   member,
   roles,
   onActed,
+  onFailed,
 }: {
   member: string;
   roles: string[];
   onActed: (msg: string) => void;
+  onFailed: (msg: string) => void;
 }) {
   const [picked, setPicked] = useState<string[]>([]);
   const [actions, setActions] = useState("");
@@ -161,7 +162,7 @@ function GrantForm({
           : `Delegated to ${member}.`,
       );
     } catch (e) {
-      setNotice(String(e));
+      onFailed(String(e));
     } finally {
       setBusy(false);
     }
@@ -220,6 +221,11 @@ export function Delegations() {
   const [status, setStatus] = useState<OperatorStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Invalidate synchronously in the change handler, not only in an effect:
+  // an older response can arrive before React runs the next effect.
+  const selected = useRef("");
+  const request = useRef(0);
+  const selectionEpoch = useRef(0);
 
   const loadMembers = useCallback(async () => {
     try {
@@ -232,14 +238,20 @@ export function Delegations() {
   }, []);
 
   const loadList = useCallback(async (m: string) => {
+    if (m !== selected.current) return;
+    const generation = ++request.current;
     if (!m) {
       setList(null);
       return;
     }
     try {
-      setList(await delegationsList(m));
+      const next = await delegationsList(m);
+      if (generation !== request.current || m !== selected.current) return;
+      if (next.plugin_id !== m) throw new Error("delegation response member does not match selection");
+      setList(next);
       setError(null);
     } catch (e) {
+      if (generation !== request.current || m !== selected.current) return;
       // A failed look is a failed look: an empty list would read as "nothing delegated".
       setError(String(e));
       setList(null);
@@ -259,12 +271,22 @@ export function Delegations() {
     loadList(member);
     const onFocus = () => loadList(member);
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    return () => {
+      ++request.current;
+      window.removeEventListener("focus", onFocus);
+    };
   }, [member, loadList, signedIn]);
-  const acted = (msg: string) => {
+  const renderedEpoch = selectionEpoch.current;
+  const acted = (subject: string, epoch: number, msg: string) => {
+    if (subject !== selected.current || epoch !== selectionEpoch.current) {
+      setNotice(`Action completed for ${subject} (previous selection): ${msg}`);
+      return;
+    }
     setNotice(msg);
-    loadList(member);
+    loadList(subject);
   };
+  // A transport error does not prove that the daemon did not commit the act.
+  const failed = (subject: string, msg: string) => setNotice(`Action outcome for ${subject} could not be confirmed: ${msg}`);
 
   return (
     <div className="page">
@@ -278,7 +300,16 @@ export function Delegations() {
 
       <label>
         member
-        <select value={member} onChange={(e) => setMember(e.target.value)}>
+        <select value={member} onChange={(e) => {
+          const next = e.target.value;
+          selected.current = next;
+          ++selectionEpoch.current;
+          ++request.current;
+          setList(null);
+          setError(null);
+          setNotice(null);
+          setMember(next);
+        }}>
           <option value="">— choose —</option>
           {members.map((m) => (
             <option key={m} value={m}>
@@ -291,7 +322,7 @@ export function Delegations() {
       {error && <div className="error-banner">could not read delegations: {error}</div>}
       {notice && <p data-notice>{notice}</p>}
 
-      {list && (
+      {list && list.plugin_id === member && (
         <>
           {list.retired && (
             <div className="error-banner">
@@ -304,12 +335,12 @@ export function Delegations() {
           ) : (
             <div className="delegation-list">
               {list.delegations.map((d) => (
-                <DelegationCard key={d.id} d={d} member={list.plugin_id} signedIn={signedIn} onActed={acted} />
+                <DelegationCard key={`${list.plugin_id}:${d.id}`} d={d} member={list.plugin_id} signedIn={signedIn} onActed={(msg) => acted(list.plugin_id, renderedEpoch, msg)} onFailed={(msg) => failed(list.plugin_id, msg)} />
               ))}
             </div>
           )}
           {signedIn && !list.retired && (
-            <GrantForm member={list.plugin_id} roles={list.roles} onActed={acted} />
+            <GrantForm key={list.plugin_id} member={list.plugin_id} roles={list.roles} onActed={(msg) => acted(list.plugin_id, renderedEpoch, msg)} onFailed={(msg) => failed(list.plugin_id, msg)} />
           )}
         </>
       )}
