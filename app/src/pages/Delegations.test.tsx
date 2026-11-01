@@ -130,8 +130,23 @@ describe("Delegations", () => {
     fireEvent.change(screen.getByLabelText("member"), { target: { value: "claude-code" } });
     await screen.findByText("Delegate to claude-code");
     await act(async () => pending.reject(new Error("connection lost")));
-    expect(screen.getByText(/Action outcome for kimi-code could not be confirmed: Error: connection lost/)).toBeTruthy();
+    expect(screen.getByText(/Action for kimi-code returned an error \(it may or may not have been applied\): Error: connection lost/)).toBeTruthy();
     expect(screen.getByText("Delegate to claude-code")).toBeTruthy();
+  });
+
+  it("refreshes the same member after an action error", async () => {
+    operatorStatus.mockResolvedValue(signedIn);
+    getDashboard.mockResolvedValue({ members: ["kimi-code"] });
+    delegationsList.mockResolvedValue(list({ delegations: [] }));
+    delegationGrant.mockRejectedValue(new Error("denied"));
+    render(<Delegations />);
+    await pick("kimi-code");
+    await screen.findByText("Delegate to kimi-code");
+    fireEvent.click(screen.getByLabelText("witness"));
+    fireEvent.change(screen.getByPlaceholderText("why this member needs this authority"), { target: { value: "audit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Delegate" }));
+    expect(await screen.findByText(/returned an error.*denied/)).toBeTruthy();
+    await waitFor(() => expect(delegationsList).toHaveBeenCalledTimes(2));
   });
 
   it("the member is chosen from the registry, and its delegations listed with status", async () => {

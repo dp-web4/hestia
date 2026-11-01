@@ -285,8 +285,11 @@ export function Delegations() {
     setNotice(msg);
     loadList(subject);
   };
-  // A transport error does not prove that the daemon did not commit the act.
-  const failed = (subject: string, msg: string) => setNotice(`Action outcome for ${subject} could not be confirmed: ${msg}`);
+  // Invoke errors may be definite refusals or transport failures after commit.
+  const failed = (subject: string, epoch: number, msg: string) => {
+    setNotice(`Action for ${subject} returned an error (it may or may not have been applied): ${msg}`);
+    if (subject === selected.current && epoch === selectionEpoch.current) loadList(subject);
+  };
 
   return (
     <div className="page">
@@ -335,12 +338,12 @@ export function Delegations() {
           ) : (
             <div className="delegation-list">
               {list.delegations.map((d) => (
-                <DelegationCard key={`${list.plugin_id}:${d.id}`} d={d} member={list.plugin_id} signedIn={signedIn} onActed={(msg) => acted(list.plugin_id, renderedEpoch, msg)} onFailed={(msg) => failed(list.plugin_id, msg)} />
+                <DelegationCard key={`${list.plugin_id}:${d.id}`} d={d} member={list.plugin_id} signedIn={signedIn} onActed={(msg) => acted(list.plugin_id, renderedEpoch, msg)} onFailed={(msg) => failed(list.plugin_id, renderedEpoch, msg)} />
               ))}
             </div>
           )}
           {signedIn && !list.retired && (
-            <GrantForm key={list.plugin_id} member={list.plugin_id} roles={list.roles} onActed={(msg) => acted(list.plugin_id, renderedEpoch, msg)} onFailed={(msg) => failed(list.plugin_id, msg)} />
+            <GrantForm key={list.plugin_id} member={list.plugin_id} roles={list.roles} onActed={(msg) => acted(list.plugin_id, renderedEpoch, msg)} onFailed={(msg) => failed(list.plugin_id, renderedEpoch, msg)} />
           )}
         </>
       )}
