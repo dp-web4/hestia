@@ -61,6 +61,39 @@ pub struct MemberRegistry {
     fillers: HashSet<String>,
 }
 
+/// Which namespace proved a member reference.
+///
+/// A caller must never infer "canonical" from a string shape after resolution:
+/// the resolver carries the evidence that actually matched. This is the FR1
+/// seam from `PRD_LCT_IDENTITY_CONVERGENCE` and the identity half of F3's
+/// machine-level receive router (#1202/#1210).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberReferenceKind {
+    PluginId,
+    CanonicalLct,
+    VerifiedLegacyAlias,
+}
+
+/// One resolved, non-filler member presence.
+#[derive(Debug)]
+pub struct MemberResolution<'a> {
+    pub plugin_id: &'a str,
+    pub lct: &'a Lct,
+    pub matched_by: MemberReferenceKind,
+}
+
+/// Is a resolved address actually hosted below the named parent on this box?
+///
+/// `KnownButNotChild` is deliberately distinct from `Unknown`: a receiver
+/// can honestly say "that entity is known, but not local to this parent" instead
+/// of silently falling through to a similarly named seat.
+#[derive(Debug)]
+pub enum LocalChildResolution<'a> {
+    Local(MemberResolution<'a>),
+    KnownButNotChild(MemberResolution<'a>),
+    Unknown,
+}
+
 impl MemberRegistry {
     pub fn get(&self, plugin_id: &str) -> Option<&Lct> {
         self.members.get(plugin_id)
@@ -77,6 +110,139 @@ impl MemberRegistry {
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
     }
+
+    /// Resolve exactly one MEMBER reference through the canonical three namespaces:
+    ///
+    /// - ordinary strings are plugin/member ids;
+    /// - `lct:web4:mb32:...` is canonical presence;
+    /// - `lct:web4:member:...` is accepted only when the stored legacy alias verifies.
+    ///
+    /// Fillers are excluded: they are invoked role occupants, not independently
+    /// addressable members. Unknown namespace-looking `lct:web4:...` strings do
+    /// not fall back to plugin ids — that would let a typo in an identity namespace
+    /// silently become a different kind of identifier.
+    ///
+    /// Duplicate canonical ids or verified aliases fail closed instead of picking
+    /// whichever HashMap entry happens to iterate first. #840 owns copied-presence
+    /// adjudication; this resolver's job is to refuse ambiguity, not hide it.
+    pub fn resolve_reference(
+        &self,
+        reference: &str,
+    ) -> anyhow::Result<Option<MemberResolution<'_>>> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Ok(None);
+        }
+
+        if reference.starts_with("lct:web4:mb32:") {
+            let mut found: Option<MemberResolution<'_>> = None;
+            for (plugin_id, lct) in &self.members {
+                if self.fillers.contains(plugin_id) || lct.lct_id() != reference {
+                    continue;
+                }
+                anyhow::ensure!(
+                    found.is_none(),
+                    "canonical member LCT '{reference}' resolves to more than one member"
+                );
+                found = Some(MemberResolution {
+                    plugin_id: plugin_id.as_str(),
+                    lct,
+                    matched_by: MemberReferenceKind::CanonicalLct,
+                });
+            }
+            return Ok(found);
+        }
+
+        if reference.starts_with("lct:web4:member:") {
+            let mut found: Option<MemberResolution<'_>> = None;
+            for (plugin_id, lct) in &self.members {
+                if self.fillers.contains(plugin_id) {
+                    continue;
+                }
+                let Some(alias) = lct.legacy_alias.as_ref() else {
+                    continue;
+                };
+                if alias.legacy_id != reference {
+                    continue;
+                }
+                anyhow::ensure!(
+                    alias.verify(),
+                    "legacy member alias '{reference}' is present but fails derivation verification"
+                );
+                anyhow::ensure!(
+                    found.is_none(),
+                    "verified legacy member alias '{reference}' resolves to more than one member"
+                );
+                found = Some(MemberResolution {
+                    plugin_id: plugin_id.as_str(),
+                    lct,
+                    matched_by: MemberReferenceKind::VerifiedLegacyAlias,
+                });
+            }
+            return Ok(found);
+        }
+
+        // Identity-looking input is never reinterpreted as a plugin id.
+        if reference.starts_with("lct:web4:") {
+            return Ok(None);
+        }
+
+        let Some((plugin_id, lct)) = self.members.get_key_value(reference) else {
+            return Ok(None);
+        };
+        if self.fillers.contains(plugin_id) {
+            return Ok(None);
+        }
+        Ok(Some(MemberResolution {
+            plugin_id: plugin_id.as_str(),
+            lct,
+            matched_by: MemberReferenceKind::PluginId,
+        }))
+    }
+
+    /// Enumerate non-filler members whose LCT explicitly carries the given
+    /// parent binding. This is a projection of witnessed identity state, not a
+    /// naming convention: `sprout-being` is not local merely because its name
+    /// starts with `sprout-`.
+    pub fn children_of(&self, parent_lct_id: &str) -> Vec<(&str, &Lct)> {
+        let mut out: Vec<(&str, &Lct)> = self
+            .members
+            .iter()
+            .filter(|(plugin_id, lct)| {
+                !self.fillers.contains(*plugin_id)
+                    && lct.mrh.bound.iter().any(|edge| {
+                        edge.edge_type == "parent" && edge.lct_id == parent_lct_id
+                    })
+            })
+            .map(|(plugin_id, lct)| (plugin_id.as_str(), lct))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
+    }
+
+    /// Resolve an address and classify whether it belongs to this parent.
+    ///
+    /// This is intentionally only the DEMUX primitive for F3. It does not wake
+    /// a session, infer work assignment, ACK a hub mailbox item, or grant any
+    /// authority. Address chooses the inbox; local law decides what happens next.
+    pub fn resolve_child_of(
+        &self,
+        parent_lct_id: &str,
+        reference: &str,
+    ) -> anyhow::Result<LocalChildResolution<'_>> {
+        let Some(member) = self.resolve_reference(reference)? else {
+            return Ok(LocalChildResolution::Unknown);
+        };
+        let local = member.lct.mrh.bound.iter().any(|edge| {
+            edge.edge_type == "parent" && edge.lct_id == parent_lct_id
+        });
+        if local {
+            Ok(LocalChildResolution::Local(member))
+        } else {
+            Ok(LocalChildResolution::KnownButNotChild(member))
+        }
+    }
+
     /// Every (plugin_id, LCT) pair, for the publish set. Sorted by plugin_id so
     /// dry-runs and publishes are reproducible.
     pub fn iter_sorted(&self) -> Vec<(&String, &Lct)> {
@@ -645,6 +811,116 @@ mod tests {
             &mut reg,
             "ghost",
             operational.verifying_key()
+        ));
+    }
+
+    #[test]
+    fn canonical_resolver_accepts_plugin_canonical_and_verified_legacy_alias() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        ensure_member(&mut vault, &mut reg, "sprout-being", false, "parent-a", "anchor")
+            .unwrap();
+
+        let canonical = reg.get("sprout-being").unwrap().lct_id();
+        let legacy = reg
+            .get("sprout-being")
+            .unwrap()
+            .legacy_alias
+            .as_ref()
+            .unwrap()
+            .legacy_id
+            .clone();
+
+        for (reference, expected_kind) in [
+            ("sprout-being".to_string(), MemberReferenceKind::PluginId),
+            (canonical.clone(), MemberReferenceKind::CanonicalLct),
+            (legacy.clone(), MemberReferenceKind::VerifiedLegacyAlias),
+        ] {
+            let resolved = reg
+                .resolve_reference(&reference)
+                .unwrap()
+                .expect("known member resolves");
+            assert_eq!(resolved.plugin_id, "sprout-being");
+            assert_eq!(resolved.lct.lct_id(), canonical);
+            assert_eq!(resolved.matched_by, expected_kind);
+        }
+
+        // A syntactically identity-like typo is absence, never a plugin-id fallback.
+        assert!(reg
+            .resolve_reference("lct:web4:other:sprout-being")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_resolution_requires_a_verified_alias_and_never_fabricates_presence() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        ensure_member(&mut vault, &mut reg, "sprout-being", false, "parent-a", "anchor")
+            .unwrap();
+
+        // A correctly-derived alias for a member that is NOT in the registry is still
+        // absence. The derivation proves a label, not presence.
+        let absent = member_legacy_alias("ghost-being", "anchor").legacy_id;
+        assert!(reg.resolve_reference(&absent).unwrap().is_none());
+
+        // If stored continuity evidence itself is corrupt, fail closed and name it.
+        let forged = "lct:web4:member:forged".to_string();
+        reg.members
+            .get_mut("sprout-being")
+            .unwrap()
+            .legacy_alias
+            .as_mut()
+            .unwrap()
+            .legacy_id = forged.clone();
+        let err = reg.resolve_reference(&forged).unwrap_err().to_string();
+        assert!(err.contains("fails derivation verification"), "{err}");
+    }
+
+    #[test]
+    fn local_child_projection_uses_parent_binding_not_name_or_filler_status() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+
+        // These stand in for the future machine LCTs. The projection is deliberately
+        // agnostic to HOW that parent identity is minted; it reads only the LCT binding.
+        ensure_member(&mut vault, &mut reg, "sprout-claude", false, "machine-a", "anchor")
+            .unwrap();
+        ensure_member(&mut vault, &mut reg, "sprout-being", false, "machine-a", "anchor")
+            .unwrap();
+        ensure_member(&mut vault, &mut reg, "sprout-stale", false, "machine-b", "anchor")
+            .unwrap();
+        ensure_filler(
+            &mut vault,
+            &mut reg,
+            "sprout-local-reasoner",
+            "machine-a",
+            "anchor",
+        )
+        .unwrap();
+
+        let children = reg.children_of("machine-a");
+        assert_eq!(
+            children.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec!["sprout-being", "sprout-claude"],
+            "same-name-prefix remote members and fillers are not hosted children"
+        );
+
+        let being_lct = reg.get("sprout-being").unwrap().lct_id();
+        match reg.resolve_child_of("machine-a", &being_lct).unwrap() {
+            LocalChildResolution::Local(r) => assert_eq!(r.plugin_id, "sprout-being"),
+            other => panic!("sprout-being should be local, got {other:?}"),
+        }
+
+        let stale_lct = reg.get("sprout-stale").unwrap().lct_id();
+        match reg.resolve_child_of("machine-a", &stale_lct).unwrap() {
+            LocalChildResolution::KnownButNotChild(r) => assert_eq!(r.plugin_id, "sprout-stale"),
+            other => panic!("known remote child must not become local, got {other:?}"),
+        }
+
+        assert!(matches!(
+            reg.resolve_child_of("machine-a", "sprout-ghost").unwrap(),
+            LocalChildResolution::Unknown
         ));
     }
 

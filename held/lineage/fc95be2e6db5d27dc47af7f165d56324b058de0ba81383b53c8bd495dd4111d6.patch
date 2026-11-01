@@ -1,0 +1,350 @@
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+index 8103edfc..025b4ac4 100644
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -62,6 +62,7 @@ witness owns the cache, the mechanism owns transport, `record_decision` owns the
+ """
+ from __future__ import annotations
+ 
++import fnmatch
+ import json
+ import os
+ import re
+@@ -872,11 +873,30 @@ def _closure_verdict(inv: _Invocation):
+     rv = _closure_view(inv.event, reg.closure())
+     if rv is None or rv.classification != "write":
+         return cv if cv is not None else rv
+-    if rv.resolved and rv.resolved in reg.entries:
++    if _reaches_registered_entry(rv.resolved, reg.entries):
+         rv = replace(rv, marker=REGISTERED_ENTRY_MARKER)
+     return rv
+ 
+ 
++_GLOB_CHARS = frozenset("*?[")
++
++
++def _reaches_registered_entry(target, entries) -> bool:
++    """True when this resolved write target CAN land on one of the seat's registered gate
++    entries: the entry itself, or a wildcard whose expansion can include it (Codex review of
++    #1247 at 18f91db, P1: `touch <legacy>/before_*` reached the running gate yet carried no
++    entry token, and the daemon — which knows only DECLARED locations — could not recover it).
++    `fnmatch` lets `*` cross `/`, which a shell glob does not: it can only over-match, and an
++    over-match prices higher, never lower."""
++    if not isinstance(target, str) or not target:
++        return False
++    if target in entries:
++        return True
++    if not _GLOB_CHARS.intersection(target):
++        return False
++    return any(fnmatch.fnmatchcase(e, target) for e in entries)
++
++
+ def _closure_write_set(event: GateEvent, against=None):
+     """(targets, complete): EVERY governed write-position path this act resolves into the
+     closure, in order — not only the first, which is all `_closure_view` reports (Codex review
+@@ -897,7 +917,17 @@ def _closure_write_set(event: GateEvent, against=None):
+         else:
+             verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd, closure=against)
+         resolved = [(v.resolved or v.resource) for v in verdicts if v.marker and v.resource]
+-        return resolved, bool(resolved) and all(v.marker for v in verdicts)
++        # COMPLETE only when every verdict is a resolved write to a pinned location (Codex
++        # review of #1247 at 18f91db, P1 inherited from #1239). It cannot be read off the
++        # matched targets alone: `write_verdicts` returns only what matched the closure, so a
++        # destination it could not resolve — a `$VAR` (out of grammar: the targets are then
++        # vocabulary tokens, not destinations), or a relative path with no cwd to pin it — is
++        # simply absent, and a known target beside it read as the whole set.
++        complete = bool(resolved) and all(
++            v.marker and v.rule == closure.RULE_WRITE
++            and isinstance(v.resolved, str) and os.path.isabs(v.resolved)
++            for v in verdicts)
++        return resolved, complete
+     except Exception:  # noqa: BLE001 — unenumerated is priced highest, never lowest
+         return [], False
+ 
+@@ -920,7 +950,8 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
+             pass
+         return None
+     write_set = _closure_write_set(ev, inv.registered.closure() if inv.registered else None)
+-    if inv.registered is not None and any(t in inv.registered.entries for t in write_set[0]):
++    if inv.registered is not None and any(_reaches_registered_entry(t, inv.registered.entries)
++                                          for t in write_set[0]):
+         # A target is this seat's REGISTERED gate entry (one no declaration covers): say so
+         # in-band, so the daemon prices it like a declared entry even when it is not the target
+         # the closure reported first (`cv`'s marker covers only that one).
+diff --git a/plugins/_shared/registered_surface_test.py b/plugins/_shared/registered_surface_test.py
+index 593e042b..26024f87 100755
+--- a/plugins/_shared/registered_surface_test.py
++++ b/plugins/_shared/registered_surface_test.py
+@@ -211,6 +211,57 @@ def test_a_registered_entry_no_declaration_covers_escalates_under_the_entry_mark
+     check("dir-write-not-entry-marker", v.classification == "write"
+           and v.marker != gate.REGISTERED_ENTRY_MARKER, v)
+ 
++    # A WILDCARD that can expand onto the entry carries the marker too (Codex review of #1247
++    # at 18f91db, P1): the daemon knows only declared locations, so evidence the gate drops here
++    # is unrecoverable there. One that cannot reach the entry is the negative control.
++    def bash(command):
++        ev = gate.GateEvent(tool="Bash", tool_input={"command": command}, cwd="/",
++                            session_id="s", raw={})
++        return ev, gate._closure_verdict(Inv(ev))
++
++    for pattern in ("before_*", "before_too?.py", "[ab]efore_tool.py"):
++        ev, v = bash("touch " + os.path.join(legacy, pattern))
++        check(f"glob-entry-marker:{pattern}", v.classification == "write"
++              and v.marker == gate.REGISTERED_ENTRY_MARKER, v)
++        targets, _complete = gate._closure_write_set(ev, s.closure())
++        check(f"glob-entry-reaches:{pattern}",
++              any(gate._reaches_registered_entry(t, s.entries) for t in targets), targets)
++    ev, v = bash("touch " + os.path.join(legacy, "after_*"))
++    check("glob-not-entry", v.classification == "write"
++          and v.marker != gate.REGISTERED_ENTRY_MARKER, v)
++    targets, _complete = gate._closure_write_set(ev, s.closure())
++    check("glob-not-entry-reaches", not any(gate._reaches_registered_entry(t, s.entries)
++                                            for t in targets), targets)
++
++
++def test_an_unresolved_destination_leaves_the_write_set_incomplete():
++    """`complete` is about the whole write set, not the targets that matched (Codex review of
++    #1247 at 18f91db, P1 inherited from #1239). A `$VAR` destination — in the protected dir or
++    beside a known target — and a relative destination with no cwd to pin it are unenumerated,
++    so the daemon prices the highest bar. A literal, located write set stays complete."""
++    home = _home()
++    hooks = os.path.join(home, "plugins", "m", "hooks")
++
++    def write_set(command, cwd="/"):
++        ev = gate.GateEvent(tool="Bash", tool_input={"command": command}, cwd=cwd,
++                            session_id="s", raw={})
++        return gate._closure_write_set(ev)
++
++    for label, command, cwd in (
++        ("var-in-protected-dir", f"touch {hooks}/$TARGET", "/"),
++        ("var-after-known", f'touch {hooks}/ordinary.txt; touch "$TARGET"', "/"),
++        ("relative-no-cwd", "touch plugins/m/hooks/ordinary.txt", None),
++    ):
++        targets, complete = write_set(command, cwd)
++        check(f"incomplete:{label}", targets and not complete, (targets, complete))
++    for label, command, cwd in (
++        ("literal-absolute", f"touch {hooks}/ordinary.txt {hooks}/{ENTRY}", "/"),
++        ("relative-with-cwd", "touch plugins/m/hooks/ordinary.txt", home),
++        ("glob-in-protected-dir", f"touch {hooks}/*.py", "/"),
++    ):
++        targets, complete = write_set(command, cwd)
++        check(f"complete:{label}", targets and complete, (targets, complete))
++
+ 
+ def test_the_degenerate_anchor_is_not_widened():
+     """A gate run from a home or the root does not govern the whole home: only the file itself."""
+@@ -230,6 +281,7 @@ ALL = [
+     test_a_foreign_hook_is_not_governed_by_being_registered,
+     test_toml_registrations_are_read_too,
+     test_a_registered_entry_no_declaration_covers_escalates_under_the_entry_marker,
++    test_an_unresolved_destination_leaves_the_write_set_incomplete,
+     test_the_degenerate_anchor_is_not_widened,
+ ]
+ 
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: 86bf3113a70d7ba2f86aa9f4ff61543b1967a8fb2bf1f27fa0765e41172543f1  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: b66e93b3ec4313c805024b1594c0d1f46b598f0cec547c2c53bb5e2c86d4e7e4  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -63,6 +63,7 @@
+ """
+ from __future__ import annotations
+ 
++import fnmatch
+ import json
+ import os
+ import re
+@@ -873,9 +874,28 @@
+     rv = _closure_view(inv.event, reg.closure())
+     if rv is None or rv.classification != "write":
+         return cv if cv is not None else rv
+-    if rv.resolved and rv.resolved in reg.entries:
++    if _reaches_registered_entry(rv.resolved, reg.entries):
+         rv = replace(rv, marker=REGISTERED_ENTRY_MARKER)
+     return rv
++
++
++_GLOB_CHARS = frozenset("*?[")
++
++
++def _reaches_registered_entry(target, entries) -> bool:
++    """True when this resolved write target CAN land on one of the seat's registered gate
++    entries: the entry itself, or a wildcard whose expansion can include it (Codex review of
++    #1247 at 18f91db, P1: `touch <legacy>/before_*` reached the running gate yet carried no
++    entry token, and the daemon — which knows only DECLARED locations — could not recover it).
++    `fnmatch` lets `*` cross `/`, which a shell glob does not: it can only over-match, and an
++    over-match prices higher, never lower."""
++    if not isinstance(target, str) or not target:
++        return False
++    if target in entries:
++        return True
++    if not _GLOB_CHARS.intersection(target):
++        return False
++    return any(fnmatch.fnmatchcase(e, target) for e in entries)
+ 
+ 
+ def _closure_write_set(event: GateEvent, against=None):
+@@ -898,7 +918,17 @@
+         else:
+             verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd, closure=against)
+         resolved = [(v.resolved or v.resource) for v in verdicts if v.marker and v.resource]
+-        return resolved, bool(resolved) and all(v.marker for v in verdicts)
++        # COMPLETE only when every verdict is a resolved write to a pinned location (Codex
++        # review of #1247 at 18f91db, P1 inherited from #1239). It cannot be read off the
++        # matched targets alone: `write_verdicts` returns only what matched the closure, so a
++        # destination it could not resolve — a `$VAR` (out of grammar: the targets are then
++        # vocabulary tokens, not destinations), or a relative path with no cwd to pin it — is
++        # simply absent, and a known target beside it read as the whole set.
++        complete = bool(resolved) and all(
++            v.marker and v.rule == closure.RULE_WRITE
++            and isinstance(v.resolved, str) and os.path.isabs(v.resolved)
++            for v in verdicts)
++        return resolved, complete
+     except Exception:  # noqa: BLE001 — unenumerated is priced highest, never lowest
+         return [], False
+ 
+@@ -921,7 +951,8 @@
+             pass
+         return None
+     write_set = _closure_write_set(ev, inv.registered.closure() if inv.registered else None)
+-    if inv.registered is not None and any(t in inv.registered.entries for t in write_set[0]):
++    if inv.registered is not None and any(_reaches_registered_entry(t, inv.registered.entries)
++                                          for t in write_set[0]):
+         # A target is this seat's REGISTERED gate entry (one no declaration covers): say so
+         # in-band, so the daemon prices it like a declared entry even when it is not the target
+         # the closure reported first (`cv`'s marker covers only that one).
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "86bf3113a70d7ba2f86aa9f4ff61543b1967a8fb2bf1f27fa0765e41172543f1",
++      "sha256": "b66e93b3ec4313c805024b1594c0d1f46b598f0cec547c2c53bb5e2c86d4e7e4",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "bff38247b911a3021a1f9213954a0909258c4b4aa927e23fde60679d7627e01f"
++  "gt_version": "7d09954d26b211524559686c022d7920af2fd004a98429830588ab5c5ae63749"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "bff38247b911a3021a1f9213954a0909258c4b4aa927e23fde60679d7627e01f",
++    "gt_version": "7d09954d26b211524559686c022d7920af2fd004a98429830588ab5c5ae63749",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "86bf3113a70d7ba2f86aa9f4ff61543b1967a8fb2bf1f27fa0765e41172543f1"
++        "sha256": "b66e93b3ec4313c805024b1594c0d1f46b598f0cec547c2c53bb5e2c86d4e7e4"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "8ac24d997a5595e311d145e6ac441ab5f2a0f585821ff1c58a90b5c909c122d0"
++  "gt_version": "08331c48f555857cd8f5d23e4362fedf1541a690c52d5e4e1885c1eca755a9b6"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "bff38247b911a3021a1f9213954a0909258c4b4aa927e23fde60679d7627e01f",
++    "gt_version": "7d09954d26b211524559686c022d7920af2fd004a98429830588ab5c5ae63749",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "86bf3113a70d7ba2f86aa9f4ff61543b1967a8fb2bf1f27fa0765e41172543f1"
++        "sha256": "b66e93b3ec4313c805024b1594c0d1f46b598f0cec547c2c53bb5e2c86d4e7e4"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "1f666444d011d519200bae2e4c090308069c7cd00cb5e6af2a15dac19b21b428"
++  "gt_version": "bc2333b9c37756c9beb487a3d2788081c8e5d41fc9dc8a3284424d3d9dd542d7"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "bff38247b911a3021a1f9213954a0909258c4b4aa927e23fde60679d7627e01f",
++    "gt_version": "7d09954d26b211524559686c022d7920af2fd004a98429830588ab5c5ae63749",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "86bf3113a70d7ba2f86aa9f4ff61543b1967a8fb2bf1f27fa0765e41172543f1"
++        "sha256": "b66e93b3ec4313c805024b1594c0d1f46b598f0cec547c2c53bb5e2c86d4e7e4"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3c764f838a3735e3a3916e4e3389c672b0ac0a8b0c37d6c72b78ece9ae337bf3"
++  "gt_version": "15e8ffd7bb05f0b662e6be33f74f62476278c7de60cc68a16ac0bfb6dc9758c3"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "bff38247b911a3021a1f9213954a0909258c4b4aa927e23fde60679d7627e01f",
++    "gt_version": "7d09954d26b211524559686c022d7920af2fd004a98429830588ab5c5ae63749",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "86bf3113a70d7ba2f86aa9f4ff61543b1967a8fb2bf1f27fa0765e41172543f1"
++        "sha256": "b66e93b3ec4313c805024b1594c0d1f46b598f0cec547c2c53bb5e2c86d4e7e4"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "eee872f12e6c8c887711417691d2e1d804ee7e565a58bfc2faa6056996de2cd2"
++  "gt_version": "95d547e4d9c77b7fbd95b82b2a0015f31998134599db6d53a20f823035a03649"
+ }

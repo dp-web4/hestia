@@ -1,0 +1,57 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1889,11 +1889,17 @@
+     # appended after them by `_shell_words`, and a body is a subshell.
+     main_len = len(_tokenize(cmd)) if depth == 0 else 0
+     bindable = _literal_names(toks) if depth == 0 else set()
+-    # IFS decides field splitting. If the command assigns it ANYWHERE (a statement, a prefix to a
+-    # command, `IFS+=`), no splitting assumption holds for ANY value: every binding then resolves
+-    # only at a double-quoted use (Codex 20554). Binders that could set it (`read`, `declare`, …)
+-    # already disqualify the rule wholesale.
+-    ifs_touched = any(k == "word" and re.match(r"IFS\+?=", w) for k, w, _g in toks)
++    # IFS decides field splitting. The default-IFS assumption holds only while the command never
++    # NAMES IFS: then every binding resolves at an unquoted use too. Any occurrence of the name, in
++    # any position (`IFS=`, `IFS+=`, a prefix, `for IFS in`/`for IFS;`, `select IFS`, `exec {IFS}>`,
++    # `coproc IFS`, `wait -p IFS`, a data body, a comment), makes every binding resolve only at a
++    # double-quoted use. Not an enumeration of binders: Codex 20554 found `=`, 20972 found `for`,
++    # and bash has more. Backslash-newlines are removed first (`I\<newline>FS=:` binds IFS). Code
++    # the gate cannot see (`eval`, `source`, `sh -c`, namerefs, `printf -v`) already disqualifies
++    # the rule wholesale; an IFS inherited from earlier shell state stays the stated residual.
++    # The token test is kept beside the text test so this never allows what 20554's repair refused.
++    ifs_touched = ("IFS" in cmd.replace("\\\n", "")
++                   or any(k == "word" and re.match(r"IFS\+?=", w) for k, w, _g in toks))
+     bind = {"pending": None, "prev_sep": ";", "paren": 0, "kw": 0}
+ 
+     def new_segment(sep=None):
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -402,6 +402,27 @@
+             ('quote-ifs-append', 'IFS+=:; S=/tmp:/etc; cat $S/hostname'),
+             ('quote-ifs-after-binding', 'S=/tmp:/etc; IFS=:; cat $S/hostname'),
+         ]
++        # Codex's IFS runner (docs/reviews/scope-1232-ifs-regressions.py, notice 20972, f9e94b40)
++        # and every other spelling that names IFS (2026-10-12).
++        deny += [
++            ('codex-ifs-loop-binding', 'S=/tmp:/etc; for IFS in :; do cat $S/hostname; done'),
++            ('codex-ifs-ordinary-ifs-assignment-control', 'IFS=:; S=/tmp:/etc; cat $S/hostname'),
++            ('quote-ifs-for-positional', 'S=/tmp:/etc; for IFS; do cat $S/hostname; done'),
++            ('quote-ifs-select', 'S=/tmp:/etc; select IFS in :; do cat $S/hostname; break; done'),
++            ('quote-ifs-exec-fd-name', 'S=/tmp1/etc; exec {IFS}>/dev/null; cat $S/hostname'),
++            ('quote-ifs-coproc', 'S=/tmp1/etc; coproc IFS { :; }; cat $S/hostname'),
++            ('quote-ifs-wait-p', 'S=/tmp1/etc; sleep 0 & wait -n -p IFS; cat $S/hostname'),
++            ('quote-ifs-case-branch', 'S=/tmp:/etc; case : in *) IFS=: ;; esac; cat $S/hostname'),
++            ('quote-ifs-continuation-assign', 'S=/tmp:/etc; I\\\nFS=:; cat $S/hostname'),
++            ('quote-ifs-continuation-for', 'S=/tmp:/etc; for I\\\nFS in :; do cat $S/hostname; done'),
++            ('quote-ifs-continuation-fd-name', 'S=/tmp1/etc; exec {I\\\nFS}>/dev/null; cat $S/hostname'),
++            ('quote-ifs-array-element', 'IFS[0]=:; S=/tmp:/etc; cat $S/hostname'),
++        ]
++        allow += [
++            ('codex-ifs-loop-quoted-control', 'S=/tmp:/etc; for IFS in :; do cat "$S/hostname"; done'),
++            ('codex-ifs-array-quoted-control', 'IFS[0]=:; S=/tmp:/etc; cat "$S/hostname"'),
++            ('codex-ifs-default-ifs-control', 'S=/tmp:/etc; cat $S/hostname'),
++        ]
+         allow += [
+             ('codex-quote-custom-ifs-quoted-control', 'IFS=:; S=/tmp:/etc; cat "$S/hostname"'),
+             ('codex-quote-whitespace-quoted-control', 'S="/tmp/x /etc"; cat "$S/hostname"'),

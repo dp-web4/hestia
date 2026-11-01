@@ -126,10 +126,17 @@ def asserting(fn):
 
 
 def _load_gate():
+    """The shell classifier the gate decides with: since one-gate stage C the SHARED
+    `hestia_shell_classifier` every seat's common gate loads (the claude-code hook re-exported
+    `_is_read_only` from it before; the certified shim classifies nothing itself)."""
     import importlib.util
-    spec = importlib.util.spec_from_file_location("gate_under_test", HOOK)
+    shared = os.environ["HESTIA_SHARED_DIR"]
+    if shared not in sys.path:
+        sys.path.insert(0, shared)
+    spec = importlib.util.spec_from_file_location(
+        "hestia_shell_classifier", os.path.join(shared, "hestia_shell_classifier.py"))
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["gate_under_test"] = mod
+    sys.modules["hestia_shell_classifier"] = mod
     spec.loader.exec_module(mod)
     return mod
 

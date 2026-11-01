@@ -1,0 +1,370 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1077,7 +1077,7 @@
+ #: path literals are judged, and code that computes a path is a declared residual.)
+ #: Words that run the NEXT word as the command (`sudo bash <<EOF` feeds bash).
+ _HEREDOC_WRAPPERS = frozenset(("sudo", "env", "nice", "nohup", "timeout", "exec", "command",
+-                               "time", "doas", "stdbuf", "ionice", "xargs"))
++                               "time", "doas", "stdbuf", "ionice", "xargs", "builtin"))
+ #: groups: 1 `-` (tab-strip), 2 a backslash (`<<\EOF`), 3 a quote, 4 the delimiter word. A quoted
+ #: or backslashed delimiter makes the body LITERAL; an unquoted one makes it undergo expansion.
+ _HEREDOC_OP = re.compile(r"""(?<!<)<<(?!<)(-?)\s*(\\?)(['"]?)([A-Za-z_][A-Za-z0-9_.-]*)\3""")
+@@ -1331,6 +1331,13 @@
+ #: Sentinels in a tokenised word: a `$` / backtick the shell will NOT expand (quoted or escaped),
+ #: and an UNQUOTED brace expansion (`{a,b}`, `{1..3}`) about to open.
+ _LIT_DOLLAR, _LIT_TICK, _BRACE = "\x00", "\x02", "\x03"
++#: Marks a `$NAME` / `${…}` reference written INSIDE double quotes (no field splitting, no
++#: globbing at that use) — evidence the literal rule needs before a whitespace value may bind.
++_DQ_REF = "\x04"
++#: `$'…'` (ANSI-C) and `$"…"` (locale) quoting rewrite their content; never modelled. The word
++#: carries this unbound parameter reference, so wherever it is judged as a path it is
++#: unenumerated (`ANSI-C` is not an identifier: no assignment can ever bind it).
++_ANSI_C_MARK = "${ANSI-C}"
+ _BRACE_EXPANSION = re.compile(r"""\{[^\s{}'"]*(?:,|\.\.)[^\s{}'"]*\}""")
+ 
+ 
+@@ -1397,11 +1404,27 @@
+                     seg.append(text[j:k + 1])
+                     j = k + 1
+                     continue
++                if text[j] == "$" and j + 1 < n and (text[j + 1] == "{" or text[j + 1] == "_"
++                                                     or text[j + 1].isalpha()):
++                    seg.append(_DQ_REF)               # a quoted variable reference
+                 seg.append(text[j])
+                 j += 1
+             if j >= n:
+                 raise _Unmodelled("an unbalanced double quote")
+             buf.append("".join(seg))
++            in_word = True
++            i = j + 1
++            continue
++        if text.startswith("$'", i) or text.startswith('$"', i):
++            # ANSI-C / locale quoting (Codex 20536): its content is rewritten by the shell, so the
++            # word is unenumerated wherever it is judged as a path (`_ANSI_C_MARK`).
++            q = text[i + 1]
++            j = i + 2
++            while j < n and text[j] != q:
++                j += 2 if text[j] == "\\" else 1
++            if j >= n:
++                raise _Unmodelled("an unbalanced $-quote")
++            buf.append(_ANSI_C_MARK + text[i + 2:j].replace("$", _LIT_DOLLAR).replace("`", _LIT_TICK))
+             in_word = True
+             i = j + 1
+             continue
+@@ -1457,7 +1480,7 @@
+     return out
+ 
+ 
+-def _shell_words(cmd: str, depth: int = 0) -> list:
++def _shell_words(cmd: str, depth: int = 0, origin=None) -> list:
+     """Every token of a command, with each `$( … )` / backtick body lifted out (balanced, so
+     nesting and multiline bodies hold) and tokenised as a command of its own after a separator —
+     quoting a substitution cannot hide its reach."""
+@@ -1465,17 +1488,23 @@
+         raise _Unmodelled("substitutions nested deeper than the parser follows")
+     toks = _tokenize(cmd)
+     extra = []
+-    for kind, w, _g in toks:
++    for i, (kind, w, _g) in enumerate(toks):
+         if kind == "word" and ("$(" in w or "`" in w):
+             # `quotes=False`: `_tokenize` already resolved quoting (a `$` or backtick that single
+             # quotes made literal is a sentinel now), so an apostrophe left in a dequoted word is an
+             # ordinary character. Re-reading it as a quote hid `"'$(cat /x)'"` (Codex review 17054,
+             # P1-quote-context).
+-            for body in _substitution_bodies(w.replace(_LIT_TICK, ""), quotes=False):
++            for body in _substitution_bodies(w.replace(_LIT_TICK, "").replace(_DQ_REF, ""),
++                                             quotes=False):
+                 extra.append(("sep", ";", False))
++                # The body runs when the OUTER word holding it is expanded: its position in the
++                # outer command (`origin`, the outermost word's token index, carried through
++                # nesting) is what a binding must precede (Codex 20536, P1-1).
++                extra.append(("mark", i if origin is None else origin, False))
+                 # A heredoc INSIDE a substitution (`-m "$(cat <<'EOF' … EOF)"`) is handled like
+                 # any other: the outer pass saw its `<<` inside quotes and left it as text.
+-                extra.extend(_shell_words(_strip_data_heredocs(body), depth + 1))
++                extra.extend(_shell_words(_strip_data_heredocs(body), depth + 1,
++                                          i if origin is None else origin))
+     return toks + extra
+ 
+ 
+@@ -1657,13 +1686,17 @@
+             out.append("0")                      # arithmetic: a number (its bodies are judged)
+         elif ref in _PLACEHOLDER_PARAMS:
+             out.append(_PLACEHOLDER_PARAMS[ref])
+-        elif known and (ref[2:-1] if ref.startswith("${") else ref[1:]) in known:
+-            out.append(known[ref[2:-1] if ref.startswith("${") else ref[1:]])
++        elif known and (ref[2:-1] if ref.startswith("${") else ref[1:]) in known \
++                and (not known[ref[2:-1] if ref.startswith("${") else ref[1:]][1]
++                     or (a > 0 and value[a - 1] == _DQ_REF)):
++            # A value that field splitting could break apart binds only at a QUOTED use (Codex
++            # 20536, P1-2); `known` maps name -> (value, needs_quote).
++            out.append(known[ref[2:-1] if ref.startswith("${") else ref[1:]][0])
+         else:
+             raise _Unenumerated(_expansion_kind(ref))
+         last = b
+     out.append(value[last:])
+-    return "".join(out).replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`")
++    return ("".join(out).replace(_DQ_REF, "").replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`"))
+ 
+ 
+ def _path_shaped(value: str, uglob: bool) -> bool:
+@@ -1704,8 +1737,12 @@
+ _SHELL_OWNED_NAMES = frozenset(("HOME", "PWD", "OLDPWD", "IFS", "PATH", "CDPATH", "ENV",
+                                 "BASH_ENV", "SHELLOPTS", "BASHOPTS", "PS4", "UID", "EUID", "PPID",
+                                 "RANDOM", "SECONDS", "LINENO", "BASH_ARGV0", "GLOBIGNORE"))
+-_BINDING_COMMANDS = frozenset(("unset", "export", "read", "declare", "local", "typeset", "readonly",
+-                               "for", "select", "mapfile", "readarray", "getopts", "let"))
++_BINDING_COMMANDS = frozenset(("for", "select"))
++#: Any of these ANYWHERE in the command disqualifies EVERY name (Codex 20536, P1-3): their operand
++#: spellings (`printf -vS`, `read -aS`, `declare -n R=S`, …) are not worth modelling.
++_ANY_BINDER = frozenset(("unset", "export", "read", "declare", "local", "typeset", "readonly",
++                         "mapfile", "readarray", "getopts", "let", "eval", "source", ".",
++                         "watch", "function", "builtin", "enable", "trap", "alias"))
+ _CODE_COMMANDS = frozenset(("eval", "source", ".", "watch", "function"))
+ 
+ 
+@@ -1714,6 +1751,19 @@
+     stream (substitution bodies included), never bound any other way, not shell- or
+     environment-owned, and the command runs no string or file as shell and defines no function."""
+     words = [w for k, w, _g in toks if k == "word"]
++    # Wholesale disqualifications (Codex 20536, P1-3 and P1-4): any binder; `printf` with ANY
++    # option starting `-v`; any arithmetic (`$((`, `((`); an assigning expansion (`${N:=x}`,
++    # `${N=x}`); any shell or interpreter invocation, with any option spelling, anywhere.
++    for i, w in enumerate(words):
++        b = os.path.basename(w)
++        if b in _ANY_BINDER or _HEREDOC_INTERPRETER.match(b) or b in _CODE_OPT_HEADS \
++                or "$((" in w or "((" in w or re.search(r"\$\{[A-Za-z_]\w*:?=", w):
++            return set()
++        if b == "printf" and any(x.startswith("-v") for x in words[i + 1:]):
++            return set()
++    for i, (k, w, _g) in enumerate(toks):
++        if k == "sep" and w == "(" and i > 0 and toks[i - 1] == ("sep", "(", False):
++            return set()                                   # `(( … ))`
+     for i, (k, w, _g) in enumerate(toks):
+         if k == "word" and (os.path.basename(w) in _CODE_COMMANDS
+                             or (w in ("-c", "--command") and i > 0 and toks[i - 1][0] == "word"
+@@ -1755,9 +1805,10 @@
+ 
+ def _is_bindable_literal(val: str, uglob: bool) -> bool:
+     """A value that is a literal and nothing else: no `$` (live or quoted), backtick, glob
+-    character, brace or `..` component."""
++    character, brace or `..` component. (Whitespace is allowed here; such a value binds only at
++    a quoted use — see `_word_value`.)"""
+     if uglob or _BRACE in val or any(c in val for c in "$`*?[{}") or _LIT_DOLLAR in val \
+-            or _LIT_TICK in val:
++            or _LIT_TICK in val or _DQ_REF in val or _ANSI_C_MARK in val:
+         return False
+     return ".." not in val.split("/")
+ 
+@@ -1781,7 +1832,7 @@
+         if not _path_shaped(value, uglob):
+             return
+         try:
+-            v = _word_value(value, found.known)
++            v = _word_value(value, in_force())
+         except _Unenumerated as why:
+             found.unenum.append(str(why))
+             return
+@@ -1806,11 +1857,16 @@
+         # A string the command runs as shell (`eval`, `su -c`, `sh -c` in argv): a command of
+         # its own. A `$` single quotes kept literal here is live when the string runs.
+         out.extend(_outside_candidates(_strip_data_heredocs(
+-            text.replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`")), pwd, depth + 1, found))
++            text.replace(_DQ_REF, "").replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`")),
++            pwd, depth + 1, found))
++
++    def in_force():
++        cut = body_origin
++        return {n: (v_, q_) for n, (v_, q_, ci) in found.known.items() if cut is None or ci < cut}
+ 
+     def chdir(value, uglob):
+         try:
+-            v = _word_value(value, found.known)
++            v = _word_value(value, in_force())
+         except _Unenumerated as why:
+             found.dirs_unknown = f"a directory change to {why}"
+             return
+@@ -1827,7 +1883,15 @@
+     bindable = _literal_names(toks) if depth == 0 else set()
+     bind = {"pending": None, "prev_sep": ";", "paren": 0, "kw": 0}
+ 
+-    def new_segment():
++    def new_segment(sep=None):
++        # An INTERPRETER whose program is not on its command line — piped in, a here-string, `-`,
++        # or a descriptor path — runs code the gate cannot see: unenumerated (Codex 20536).
++        h = state.get("head")
++        if h and _HEREDOC_INTERPRETER.match(h) and not state.get("code_opt") \
++                and not state.get("heredoc") and (
++                state.get("stdin_prog") or ((state.get("piped_in") or state.get("herestring"))
++                                            and not state.get("script_arg"))):
++            found.unenum.append(f"`{h}` reading its program from stdin or a descriptor")
+         # `cd` with no argument goes HOME; `pushd` with none swaps the stack (not followed).
+         if state.get("head") in ("cd", "pushd") and not state.get("chdir_seen"):
+             home = os.getenv("HOME")
+@@ -1837,18 +1901,27 @@
+                 found.dirs_unknown = f"`{state['head']}` with no directory"
+         state.update(head=None, spec={}, pending=None, redirect=False, positional=0,
+                      pattern_given=False, opts_done=False, dirpending=False, chdir_seen=False,
+-                     env_expansion=None)
++                     env_expansion=None, code_opt=False, stdin_prog=False, herestring=False,
++                     script_arg=False, heredoc=False, piped_in=sep in ("|", "|&"))
+ 
+     new_segment()
+     loop_state = None
+     seg_words, prev = [], None
++    body_origin = None
+     for idx, (kind, w, uglob) in enumerate(toks):
+         p, prev = prev, (kind, w)
++        if kind == "mark":
++            # Entering a substitution body: from here on only bindings committed BEFORE the
++            # outer word that holds it are in force (Codex 20536, P1-1).
++            body_origin = w
++            continue
+         if bind["pending"] is not None:
+             name_, val_ = bind["pending"]
+             bind["pending"] = None
+             if kind == "sep" and w in (";", "&&"):
+-                found.known[name_] = val_                  # the statement ended: N is bound
++                # The statement ended: N is bound from token `idx` on. (value, needs_quote,
++                # commit index): IFS whitespace in the value binds only at a quoted use.
++                found.known[name_] = (val_, any(c in val_ for c in " \t\n"), idx)
+         if kind == "sep" and w == "(":
+             bind["paren"] += 1
+         elif kind == "sep" and w == ")":
+@@ -1879,7 +1952,7 @@
+             found.unenum.append("a process substitution used as a path")
+         if kind == "sep" or (kind == "word" and state["head"] is None and w in _SHELL_KEYWORDS):
+             seg_words = []
+-            new_segment()
++            new_segment(w if kind == "sep" else None)
+             bind["prev_sep"] = w if kind == "sep" else "keyword"
+             continue
+         if kind == "word":
+@@ -1889,6 +1962,10 @@
+             # word is a here-STRING (data; its substitutions were lifted out and are judged).
+             # `<<`: the next word is a heredoc delimiter (bodies are handled before tokenising).
+             state["redirect"] = "skip" if w.startswith("<<") else True
++            if w.startswith("<<<"):
++                state["herestring"] = True
++            elif w.startswith("<<"):
++                state["heredoc"] = True            # a heredoc program is visible and judged
+             continue
+         if state["redirect"] == "skip":
+             state["redirect"] = False
+@@ -1965,7 +2042,7 @@
+                 code(w)
+                 continue
+             if opt in ("-c", "-e") and _CODE_ARG_HEADS.match(head):
+-                for lit in _code_path_literals(w.replace(_LIT_DOLLAR, "$")):
++                for lit in _code_path_literals(w.replace(_DQ_REF, "").replace(_LIT_DOLLAR, "$")):
+                     emit(lit, False)
+                 continue
+             emit(w, uglob)
+@@ -2001,10 +2078,20 @@
+                                  or name in spec.get("string_opts", ())):
+                     emit(val, uglob)
+                 continue
++            if (_HEREDOC_SHELL.match(head) or _CODE_ARG_HEADS.match(head)) and not w.startswith("--") \
++                    and re.fullmatch(r"-[A-Za-z]*[ce][A-Za-z]*", w) \
++                    and ("c" in w[1:] or (_CODE_ARG_HEADS.match(head) and "e" in w[1:])):
++                # A clustered code option (`bash -lc`, `sh -ec`, `perl -ne`, Codex 20536 P1-4):
++                # the next word is the program, whatever letters ride with it.
++                state["pending"] = "-c" if "c" in w[1:] else "-e"
++                state["code_opt"] = True
++                continue
+             if w in takes or (w == "-c" and (_HEREDOC_SHELL.match(head)
+                                              or _CODE_ARG_HEADS.match(head))) \
+                     or (w == "-e" and _CODE_ARG_HEADS.match(head)):
+                 state["pending"] = w
++                if w in ("-c", "-e"):
++                    state["code_opt"] = True
+                 continue
+             if not w.startswith("--") and len(w) > 2 and w[:2] in takes:
+                 # attached short-option value: `-d/`, `-F:`, `-e/x/`, `-fFILE`
+@@ -2023,6 +2110,12 @@
+                 emit(m.group(1), uglob)                    # `-I/usr/include`, `-C/elsewhere`
+             continue
+         state["positional"] += 1
++        if state["positional"] == 1 and _HEREDOC_INTERPRETER.match(head) and not state["code_opt"]:
++            # The program: a script file (judged as a path below), or stdin / a descriptor.
++            if w == "-" or w.startswith(("/dev/fd/", "/dev/stdin", "/proc/self/fd/")):
++                state["stdin_prog"] = True
++            else:
++                state["script_arg"] = True
+         if head in ("cd", "pushd") and state["positional"] == 1:
+             state["chdir_seen"] = True
+             chdir(w, uglob)
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -377,6 +377,59 @@
+             ("lit-mapfile", "S=/tmp/review-probe; mapfile S < f; cat $S/x"),
+             ("lit-let", "S=/tmp/review-probe; let S=1; cat $S/x"),
+             ("lit-background", "S=/tmp/review-probe & cat $S/x"),
++            # An interpreter anywhere disqualifies every name (Codex 20536, P1-4); also pins that
++            # a code literal before the binding does not crash the scan (a 2026-10-11 regression).
++            ("lit-after-a-python-c-literal",
++             "python3 -c \"print(open('/tmp/review-probe').read())\"; S=/tmp/review-probe; cat $S/x"),
++        ]
++        # Codex's two #1232 regression runners (docs/reviews/scope-1232-shell-regressions.py and
++        # scope-1232-literal-regressions.py, notice 20536, bc1ea92b) as INVARIANTS: every
++        # refusal case is refused (a path or a scope request), every positive control allowed.
++        deny += [
++            ('codex-shell-direct', 'cat /etc/hestia-scope-review-nonexistent'),
++            ('codex-shell-standalone-c', "bash -c 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-long-option-c', "bash --noprofile -c 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-combined-lc', "bash -lc 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-combined-ec', "sh -ec 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-exec-combined', "exec bash -lc 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-sudo-combined', "sudo bash -lc 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-builtin-eval', "builtin eval 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-command-eval', "command eval 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-ansi-c-quote', "cat $'/etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-shell-here-string', "bash <<< 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-shell-pipe', "printf 'cat /etc/hestia-scope-review-nonexistent' | bash"),
++            ('codex-shell-shell-descriptor', "bash /dev/fd/3 3<<< 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-lit-substitution-use-before-assignment', 'echo "$(cat $S/hostname)"; S=/tmp/review-probe'),
++            ('codex-lit-literal-field-splitting', 'S="/tmp/review-probe /etc"; cat $S/hostname'),
++            ('codex-lit-attached-printf-variable', 'S=/tmp/review-probe; printf -vS %s /etc; cat $S/hostname'),
++            ('codex-lit-attached-read-array', 'S=/tmp/review-probe; read -aS <<< /etc; cat $S/hostname'),
++            ('codex-lit-arithmetic-rebinding', 'S=/tmp; : $((S=0)); cat /$S/etc/hostname'),
++            ('codex-lit-combined-shell-code', "S=/tmp/review-probe; sh -ec 'cat /etc/hostname'; cat $S/x"),
++            ('codex-lit-shell-options-disqualify', 'S=/tmp/review-probe; bash --noprofile -c true; cat $S/x'),
++            ('codex-lit-combined-shell-options-disqualify', 'S=/tmp/review-probe; bash -lc true; cat $S/x'),
++            ('codex-lit-prefix-assignment', 'S=/tmp/review-probe cat $S/x'),
++            ('codex-lit-pipeline-left', 'S=/tmp/review-probe | true; cat $S/x'),
++            ('codex-lit-pipeline-right', 'true | S=/tmp/review-probe; cat $S/x'),
++            ('codex-lit-subshell-binding', '(S=/tmp/review-probe); cat $S/x'),
++            ('codex-lit-eval-rebinding', 'S=/tmp/review-probe; eval S=/tmp/other; cat $S/x'),
++            ('codex-lit-plain-shell-disqualify', 'S=/tmp/review-probe; sh -c true; cat $S/x'),
++            ('codex-lit-nameref-target', 'S=/tmp/review-probe; declare -n R=S; R=/tmp/other; cat $S/x'),
++            ('codex-lit-array-element', 'S=/tmp/review-probe; S[0]=/tmp/other; cat $S/x'),
++            ('codex-lit-array-compound', 'S=(/tmp/review-probe); cat $S/x'),
++            ('codex-lit-plain-use-before', 'cat $S/x; S=/tmp/review-probe'),
++            ('codex-lit-spaced-printf-variable', 'S=/tmp/review-probe; printf -v S %s /etc; cat $S/hostname'),
++            ('codex-lit-spaced-read-array', 'S=/tmp/review-probe; read -a S <<< /etc; cat $S/hostname'),
++            ('codex-lit-direct-forbidden', 'S=/etc; cat $S/hostname'),
++        ]
++        allow += [
++            ('codex-shell-allowed-temp-path', 'cat /tmp/hestia-scope-review-nonexistent'),
++            ('codex-shell-inert-here-string', "cat <<< 'cat /etc/hestia-scope-review-nonexistent'"),
++            ('codex-shell-inert-pipe', "printf 'cat /etc/hestia-scope-review-nonexistent' | cat"),
++            ('codex-lit-simple-allow', 'S=/tmp/review-probe; cat $S/x'),
++            ('codex-lit-and-allow', 'S=/tmp/review-probe && cat "${S}/x"'),
++            ('codex-lit-newline-allow', 'S=/tmp/review-probe\ncat $S/x'),
++            ('codex-lit-later-substitution-allow', 'S=/tmp/review-probe; echo "$(cat $S/x)"'),
++            ('codex-lit-quoted-whitespace-allow', 'S="/tmp/review-probe /etc"; cat "$S/hostname"'),
+         ]
+         allow += [
+             # device sinks stay reachable
+@@ -439,9 +492,6 @@
+             ("lit-newline", "S=/tmp/review-probe\ncat $S/x"),
+             ("lit-relative-in-repo", "S=a.txt; cat $S"),
+             ("lit-used-inside-a-later-substitution", "S=/tmp/review-probe; echo \"$(cat $S/x)\""),
+-            # regression: a code literal before the binding must not break the scan
+-            ("lit-after-a-python-c-literal",
+-             "python3 -c \"print(open('/tmp/review-probe').read())\"; S=/tmp/review-probe; cat $S/x"),
+             ("commit-message-heredoc-apostrophe",
+              "git commit -m \"$(cat <<'EOF'\nit's fine (really\nEOF\n)\""),
+             ("comment-is-not-run", f"ls  # {o}/secret.txt"),

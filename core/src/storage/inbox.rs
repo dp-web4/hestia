@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -97,9 +98,15 @@ pub struct InboxNotice {
 /// Durable inbound mailbox persisted to SQLCipher. Locking is internal so the
 /// store is `Send + Sync` from the caller's perspective (same shape as
 /// [`super::SqliteChainStore`]).
+/// Run before every inbox WRITE; an error refuses the write.
+pub type PreWriteBarrier = std::sync::Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>;
+
 pub struct SqliteInboxStore {
     conn: Mutex<Connection>,
     path: PathBuf,
+    /// Durable reads (#1266 review): inbox rows routinely carry a chain hash (dispositions,
+    /// invitations, notices, egress), so no inbox write may reach disk ahead of the chain.
+    barrier: std::sync::OnceLock<PreWriteBarrier>,
 }
 
 /// The debt-clearing kinds (`reply`, `ack`, `review_done`), matched fractally —
@@ -144,8 +151,24 @@ impl SqliteInboxStore {
         .context("initializing inbox schema (wrong storage key, or not an inbox DB?)")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            barrier: std::sync::OnceLock::new(),
             path,
         })
+    }
+
+    /// Install the pre-write barrier (the daemon: make the witness chain durable first).
+    pub fn set_pre_write_barrier(&self, barrier: PreWriteBarrier) {
+        let _ = self.barrier.set(barrier);
+    }
+
+    /// The write connection, after the barrier. Every method that writes a row takes this. The
+    /// direct `self.conn.lock()` sites are reads (their `ensure_*_schema` calls are idempotent
+    /// DDL, not data) plus `peek_member`'s liveness touch, which names no chain fact.
+    fn write_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        if let Some(b) = self.barrier.get() {
+            b().map_err(|e| anyhow::anyhow!("inbox write refused: {e}"))?;
+        }
+        Ok(self.conn.lock().unwrap())
     }
 
     pub fn path(&self) -> &Path {
@@ -178,7 +201,7 @@ impl SqliteInboxStore {
     ) -> Result<u64> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         conn.execute(
             "DELETE FROM inbox_notices WHERE queued_at < ?1",
             params![cutoff],
@@ -217,7 +240,7 @@ impl SqliteInboxStore {
     /// the same failure bias as the hub's mailbox).
     pub fn drain(&self) -> Result<Vec<InboxNotice>> {
         let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         let tx = conn.transaction().context("starting inbox drain")?;
         let notices = {
             let mut stmt = tx
@@ -356,9 +379,25 @@ impl SqliteInboxStore {
              -- whole column would be wrong even if it were possible — NULLs never
              -- conflict in SQLite, but the index would still tax every insert.
              CREATE UNIQUE INDEX IF NOT EXISTS idx_member_notices_disposition_key
-                 ON member_notices(disposition_key) WHERE disposition_key IS NOT NULL;",
+                 ON member_notices(disposition_key) WHERE disposition_key IS NOT NULL;
+             CREATE TABLE IF NOT EXISTS member_send_ops (
+                 sender_plugin       TEXT NOT NULL,
+                 operation_id        TEXT NOT NULL,
+                 binding_json        TEXT NOT NULL,
+                 witness_hash        TEXT NOT NULL,
+                 queued_id           INTEGER,
+                 egress_peer         TEXT,
+                 outcome             TEXT NOT NULL,
+                 response_json       TEXT NOT NULL,
+                 shadow_record_json  TEXT,
+                 shadow_witness_hash TEXT,
+                 created_at          TEXT NOT NULL,
+                 PRIMARY KEY (sender_plugin, operation_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_member_send_ops_created
+                 ON member_send_ops(created_at);",
         )
-        .context("indexing member_notices.in_reply_to")?;
+        .context("indexing member_notices and member-send operations")?;
         Self::ensure_touch_schema(conn)?;
         // The projector's cursor (same revised review): one row per projection
         // name, the chain position safely processed THROUGH. Living here rather
@@ -400,7 +439,7 @@ impl SqliteInboxStore {
     /// tracks would silently skip obligations, which is the exact hole the
     /// disposition projector exists to close.
     pub fn set_projection_cursor(&self, name: &str, position: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         conn.execute(
             "INSERT INTO projection_cursors (name, position) VALUES (?1, ?2)
@@ -440,7 +479,7 @@ impl SqliteInboxStore {
     ) -> Result<Option<u64>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         // Same retention discipline as every other writer on this plane.
         conn.execute(
@@ -564,7 +603,7 @@ impl SqliteInboxStore {
     /// not invent one.
     #[cfg(test)]
     pub fn backdate_inbox_touch(&self, plugin_id: &str, when: DateTime<Utc>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let n = conn.execute(
             "UPDATE member_inbox_touch SET first_seen = ?2, last_touch = ?2 WHERE plugin_id = ?1",
@@ -622,6 +661,7 @@ impl SqliteInboxStore {
     /// transport-authenticated, not caller-supplied, so there is no forgeable field
     /// in the loop bound at all. Cost: no third-party transit in v1, which is a
     /// deliberate limit, not an oversight.
+
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue_egress(
         &self,
@@ -633,23 +673,35 @@ impl SqliteInboxStore {
         pointer_uri: Option<&str>,
         chain_hash: &str,
     ) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        // The row names `chain_hash`: barrier first (Codex review 18933 — this ordinary
+        // admission was missed when the operation-keyed one was converted).
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
-        // The forwarding plane carries its OWN bound, because it no longer borrows
-        // the local plane's (see `enqueue_member`: the TTL prune and the cap used to
-        // reach across the seam and delete queued forwards). A bound that EVICTS needs
-        // a report path to stay honest. This comment used to justify the choice by
-        // saying the egress seam HAS none — no attempt counter, nothing that can say a
-        // forward was dropped. That is no longer true: `mark_failed`,
-        // `MAX_EGRESS_ATTEMPTS` and `retire_and_report_egress` now retire, witness and
-        // report exhausted rows to their sender. The choice stands on the surviving
-        // half of the argument, which never depended on the missing path: refusing
-        // admission tells a caller that is LIVE and holding the receipt, at the moment
-        // it can still do something about it, while evicting a parked row reports to a
-        // sender that has long since gone. The report path bounds how long a row may
-        // FAIL, not how many rows may be admitted; the two bounds do not substitute.
-        // Backpressure to a present sender is attributable; eviction of a parked row
-        // is the black hole.
+        Self::enqueue_egress_on(
+            &conn,
+            dest_peer,
+            to_plugin,
+            from_plugin,
+            from_role,
+            kind,
+            pointer_uri,
+            chain_hash,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_egress_on(
+        conn: &Connection,
+        dest_peer: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        transport_stamp: Option<&str>,
+    ) -> Result<u64> {
         let queued: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
               WHERE dest_peer IS NOT NULL AND drained_at IS NULL",
@@ -662,15 +714,6 @@ impl SqliteInboxStore {
                  refusing admission rather than evicting a queued forward"
             );
         }
-        // PER-PEER, and the reason it is a SECOND clause rather than a replacement: the
-        // global bound protects the STORE (unbounded growth), this one protects the other
-        // PEERS (one wedged link starving every healthy one). Both are real and neither
-        // implies the other, so both are tested.
-        //
-        // Ordered after the global check so that when the plane is genuinely full the
-        // caller still gets the plane-full message; this clause speaks only when the plane
-        // has room and THIS destination does not, which is the case the old code answered
-        // with a message about the total.
         let queued_peer: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
               WHERE dest_peer = ?1 AND drained_at IS NULL",
@@ -687,10 +730,20 @@ impl SqliteInboxStore {
         }
         conn.execute(
             "INSERT INTO member_notices
-                (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at, dest_peer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![to_plugin, from_plugin, from_role, kind, pointer_uri,
-                    chain_hash, Utc::now().to_rfc3339(), dest_peer],
+                (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
+                 dest_peer, transport_stamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                to_plugin,
+                from_plugin,
+                from_role,
+                kind,
+                pointer_uri,
+                chain_hash,
+                Utc::now().to_rfc3339(),
+                dest_peer,
+                transport_stamp,
+            ],
         )
         .context("enqueueing egress notice")?;
         Ok(conn.last_insert_rowid() as u64)
@@ -701,7 +754,7 @@ impl SqliteInboxStore {
     /// many callers unchanged; the handler makes both calls under the one server lock, so no
     /// drainer can read the row between them.
     pub fn set_egress_transport_stamp(&self, id: u64, stamp: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         conn.execute(
             "UPDATE member_notices SET transport_stamp = ?1 WHERE id = ?2 AND dest_peer IS NOT NULL",
@@ -775,7 +828,7 @@ impl SqliteInboxStore {
     /// fleet mesh ACCEPTED it, not that the far member read it. Conflating those is
     /// the "send succeeded != delivered" defect this whole thread is about.
     pub fn mark_egress_forwarded(&self, id: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         conn.execute(
             "UPDATE member_notices SET drained_at = ?1 WHERE id = ?2 AND dest_peer IS NOT NULL",
             params![Utc::now().to_rfc3339(), id as i64],
@@ -794,9 +847,245 @@ impl SqliteInboxStore {
         chain_hash: &str,
         in_reply_to: Option<u64>,
     ) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        // Local notices, escalation invitations, appeal dispatch: the row names `chain_hash`,
+        // so barrier first (Codex review 18933).
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         Self::enqueue_member_on(&conn, to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, in_reply_to)
+    }
+
+
+    /// Read one already-committed member-notify operation.
+    pub fn member_send_operation(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+    ) -> Result<Option<MemberSendOperation>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_member_schema(&conn)?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)
+    }
+
+    fn member_send_operation_on(
+        conn: &Connection,
+        sender_plugin: &str,
+        operation_id: &str,
+    ) -> Result<Option<MemberSendOperation>> {
+        conn.query_row(
+            "SELECT binding_json, witness_hash, queued_id, egress_peer, outcome,
+                    response_json, shadow_record_json, shadow_witness_hash, created_at
+               FROM member_send_ops
+              WHERE sender_plugin = ?1 AND operation_id = ?2",
+            params![sender_plugin, operation_id],
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+            )),
+        )
+        .optional()?
+        .map(|r| -> Result<MemberSendOperation> {
+            Ok(MemberSendOperation {
+                sender_plugin: sender_plugin.to_string(),
+                operation_id: operation_id.to_string(),
+                binding_json: r.0,
+                witness_hash: r.1,
+                queued_id: r.2.map(|v| v as u64),
+                egress_peer: r.3,
+                outcome: r.4,
+                response_json: serde_json::from_str(&r.5)
+                    .context("parsing member send operation response")?,
+                shadow_record_json: r.6,
+                shadow_witness_hash: r.7,
+                created_at: DateTime::parse_from_rfc3339(&r.8)
+                    .context("parsing member send operation created_at")?
+                    .with_timezone(&Utc),
+            })
+        })
+        .transpose()
+    }
+
+    fn validate_member_send_replay(
+        op: &MemberSendOperation,
+        binding_json: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            op.binding_json == binding_json,
+            "member-notify operation '{}' for '{}' was already used for different send intent",
+            op.operation_id,
+            op.sender_plugin
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_member_operation(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        binding_json: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        in_reply_to: Option<u64>,
+        response_template: &Value,
+        shadow_record_template: Option<&Value>,
+    ) -> Result<MemberSendOperation> {
+        let mut conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting member-send operation")?;
+        if let Some(op) = Self::member_send_operation_on(&tx, sender_plugin, operation_id)? {
+            Self::validate_member_send_replay(&op, binding_json)?;
+            tx.commit().context("committing member-send replay read")?;
+            return Ok(op);
+        }
+        let queued_id = Self::enqueue_member_on(
+            &tx,
+            to_plugin,
+            from_plugin,
+            from_role,
+            kind,
+            pointer_uri,
+            chain_hash,
+            in_reply_to,
+        )?;
+        let mut response = response_template.clone();
+        response["queued_id"] = serde_json::json!(queued_id);
+        response["egress_queued_to"] = Value::Null;
+        if response.get("replayed").is_none() {
+            response["replayed"] = serde_json::json!(false);
+        }
+        let response_json = serde_json::to_string(&response)?;
+        let shadow_record_json = shadow_record_template
+            .map(|v| serde_json::to_string(v))
+            .transpose()?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO member_send_ops
+                (sender_plugin, operation_id, binding_json, witness_hash, queued_id,
+                 egress_peer, outcome, response_json, shadow_record_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'queued', ?6, ?7, ?8)",
+            params![
+                sender_plugin, operation_id, binding_json, chain_hash,
+                queued_id as i64, response_json, shadow_record_json, now,
+            ],
+        )
+        .context("binding local member-send operation")?;
+        tx.commit().context("committing local member-send operation")?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)?
+            .ok_or_else(|| anyhow::anyhow!("member-send operation disappeared after commit"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_egress_operation(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        binding_json: &str,
+        dest_peer: &str,
+        to_plugin: &str,
+        from_plugin: &str,
+        from_role: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+        chain_hash: &str,
+        transport_stamp: Option<&str>,
+        response_template: &Value,
+        shadow_record_template: Option<&Value>,
+    ) -> Result<MemberSendOperation> {
+        let mut conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting routed member-send operation")?;
+        if let Some(op) = Self::member_send_operation_on(&tx, sender_plugin, operation_id)? {
+            Self::validate_member_send_replay(&op, binding_json)?;
+            tx.commit().context("committing routed member-send replay read")?;
+            return Ok(op);
+        }
+        let queued_id = Self::enqueue_egress_on(
+            &tx,
+            dest_peer,
+            to_plugin,
+            from_plugin,
+            from_role,
+            kind,
+            pointer_uri,
+            chain_hash,
+            transport_stamp,
+        )?;
+        let mut response = response_template.clone();
+        response["queued_id"] = serde_json::json!(queued_id);
+        response["egress_queued_to"] = serde_json::json!(dest_peer);
+        if response.get("replayed").is_none() {
+            response["replayed"] = serde_json::json!(false);
+        }
+        let response_json = serde_json::to_string(&response)?;
+        let shadow_record_json = shadow_record_template
+            .map(|template| {
+                let mut record = template.clone();
+                record["legacy_egress_row_id"] = serde_json::json!(queued_id);
+                serde_json::to_string(&record)
+            })
+            .transpose()?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO member_send_ops
+                (sender_plugin, operation_id, binding_json, witness_hash, queued_id,
+                 egress_peer, outcome, response_json, shadow_record_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9)",
+            params![
+                sender_plugin, operation_id, binding_json, chain_hash,
+                queued_id as i64, dest_peer, response_json, shadow_record_json, now,
+            ],
+        )
+        .context("binding routed member-send operation")?;
+        tx.commit().context("committing routed member-send operation")?;
+        Self::member_send_operation_on(&conn, sender_plugin, operation_id)?
+            .ok_or_else(|| anyhow::anyhow!("routed member-send operation disappeared after commit"))
+    }
+
+    pub fn set_member_send_shadow_witness(
+        &self,
+        sender_plugin: &str,
+        operation_id: &str,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        let prior: Option<Option<String>> = conn
+            .query_row(
+                "SELECT shadow_witness_hash FROM member_send_ops
+                  WHERE sender_plugin = ?1 AND operation_id = ?2",
+                params![sender_plugin, operation_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(prior) = prior else {
+            anyhow::bail!("member-send operation '{operation_id}' for '{sender_plugin}' is absent");
+        };
+        if let Some(prior) = prior {
+            anyhow::ensure!(
+                prior == witness_hash,
+                "member-send operation '{operation_id}' is bound to a different shadow witness"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE member_send_ops SET shadow_witness_hash = ?3
+              WHERE sender_plugin = ?1 AND operation_id = ?2
+                AND shadow_witness_hash IS NULL",
+            params![sender_plugin, operation_id, witness_hash],
+        )?;
+        anyhow::ensure!(n == 1, "member-send shadow witness changed concurrently");
+        Ok(())
     }
 
     /// Retire an egress row AND queue its author's report in one transaction (#1030 review):
@@ -815,7 +1104,7 @@ impl SqliteInboxStore {
         report_pointer: Option<&str>,
         chain_hash: &str,
     ) -> Result<Option<u64>> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting egress retirement")?;
         let n = tx
@@ -1125,7 +1414,7 @@ impl SqliteInboxStore {
     /// addressed back to this party. `None` when the id is not on record (aged out:
     /// unverifiable, not forged — same posture as `member_notice_recipient`).
     pub fn member_notice_sender(&self, id: u64) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare("SELECT from_plugin FROM member_notices WHERE id = ?1")?;
         let mut rows = stmt.query(params![id as i64])?;
@@ -1152,7 +1441,7 @@ impl SqliteInboxStore {
     pub fn drain_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting member drain")?;
         let notices = {
@@ -1250,6 +1539,10 @@ impl SqliteInboxStore {
     pub fn peek_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
         let now = Utc::now();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        // The one direct-lock write left in this store (audited for Codex review 18933): the
+        // liveness touch records WHEN the member read, and carries no chain fact, so a peek
+        // does not pay a chain flush for it. Every row that names a chain hash takes
+        // `write_conn`.
         let conn = self.conn.lock().unwrap();
         Self::ensure_member_schema(&conn)?;
         Self::touch_inbox(&conn, to_plugin, &now)?;
@@ -1503,7 +1796,7 @@ impl SqliteInboxStore {
     /// true, so a local row can never match a named peer. Same result, one term
     /// fewer.
     pub fn egress_queued_for(&self, dest_peer: &str) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM member_notices
@@ -1529,7 +1822,7 @@ impl SqliteInboxStore {
     /// actually be emitted; a store method cannot witness one.
     pub fn expired_egress(&self, older_than_secs: i64, limit: u32) -> Result<Vec<u64>> {
         let cutoff = (Utc::now() - chrono::Duration::seconds(older_than_secs)).to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let mut stmt = conn.prepare(
             "SELECT id FROM member_notices
@@ -1562,7 +1855,7 @@ impl SqliteInboxStore {
     /// packet already retired. `None` means *nothing happened*, which is the only
     /// answer that lets the caller stay silent.
     pub fn record_egress_failure(&self, id: u64, reason: &str) -> Result<Option<i64>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let updated = conn
             .execute(
@@ -1599,7 +1892,7 @@ impl SqliteInboxStore {
     /// dead a second time — and `member_notice_unreachable` is a durable claim
     /// about a PEER that a trust tally will count.
     pub fn retire_egress(&self, id: u64) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn()?;
         let n = conn
             .execute(
                 "UPDATE member_notices SET drained_at = ?1
@@ -1692,9 +1985,10 @@ impl InboxTouch {
 }
 
 /// One notice with nothing bound to it — the row the mesh could not produce
-/// before 2026-07-25. `drained_at: None` means it was never even picked up;
-/// `Some(_)` means it was delivered and went unanswered, which is a different
-/// finding and must not be collapsed into the first.
+/// before 2026-07-25. `drained_at: None` means the drain mark is absent; a
+/// non-consuming peek may still have observed it. `Some(_)` records a mark,
+/// not proof that the notice was returned or read: the local drain update also
+/// marks expired ordinary notices excluded from its SELECT.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UnansweredNotice {
     pub id: u64,
@@ -1747,6 +2041,1290 @@ pub struct EgressRow {
     pub last_error: Option<String>,
     /// The sender's transport binding when the row was queued (#1030); None = unbound.
     pub transport_stamp: Option<String>,
+}
+
+/// One daemon-level idempotency record for hestia_member_notify.
+///
+/// operation_id identifies ONE caller operation, not one message body. Two
+/// intentionally identical notices with different operation ids are distinct.
+#[derive(Debug, Clone)]
+pub struct MemberSendOperation {
+    pub sender_plugin: String,
+    pub operation_id: String,
+    pub binding_json: String,
+    pub witness_hash: String,
+    pub queued_id: Option<u64>,
+    pub egress_peer: Option<String>,
+    pub outcome: String,
+    pub response_json: Value,
+    pub shadow_record_json: Option<String>,
+    pub shadow_witness_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+
+// ---- F3 host receiver custody ------------------------------------------------
+
+/// Durable state for one Hub receipt-mode notice accepted by the machine router.
+/// The Hub notice id is the transport idempotency key. The row survives the
+/// cross-database witness/enqueue steps and the final Hub ACK, so every crash
+/// edge can resume without duplicating a member notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubReceiptCustody {
+    pub receiver_binding_id: Uuid,
+    pub notice_id: String,
+    pub child_lct: String,
+    pub to_plugin: String,
+    pub witness_hash: Option<String>,
+    pub member_notice_id: Option<u64>,
+    pub delivery_witness_hash: Option<String>,
+    pub hub_acked_at: Option<DateTime<Utc>>,
+}
+
+impl SqliteInboxStore {
+    fn ensure_hub_receipt_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hub_receipt_custody (
+                receiver_binding_id TEXT NOT NULL,
+                hub_lct           TEXT NOT NULL,
+                hub_member_lct    TEXT NOT NULL,
+                child_lct         TEXT NOT NULL,
+                to_plugin         TEXT NOT NULL,
+                notice_id         TEXT NOT NULL,
+                notice_json       TEXT NOT NULL,
+                kind              TEXT NOT NULL,
+                pointer_uri       TEXT,
+                queued_at         TEXT NOT NULL,
+                witness_hash      TEXT,
+                member_notice_id  INTEGER,
+                delivery_witness_hash TEXT,
+                hub_acked_at      TEXT,
+                PRIMARY KEY (receiver_binding_id, notice_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_hub_receipt_pending_ack
+                 ON hub_receipt_custody(receiver_binding_id, hub_acked_at, member_notice_id);",
+        )
+        .context("initializing Hub receipt custody schema")?;
+
+        // Development/dogfood builds may already have created the Slice-B table
+        // before the delivery-witness state was made explicit. Upgrade it in place
+        // rather than interpreting a missing column as "already delivered".
+        let has_delivery_witness = {
+            let mut stmt = conn.prepare("PRAGMA table_info(hub_receipt_custody)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row? == "delivery_witness_hash" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_delivery_witness {
+            conn.execute_batch(
+                "ALTER TABLE hub_receipt_custody ADD COLUMN delivery_witness_hash TEXT;",
+            )
+            .context("adding Hub receipt delivery-witness column")?;
+        }
+        Ok(())
+    }
+
+    /// Persist the complete fetched notice before any witness, local enqueue, or ACK.
+    /// Re-fetching the same Hub id is idempotent. If an id ever arrives with different
+    /// immutable bytes, fail closed rather than silently treating two packets as one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_hub_receipt(
+        &self,
+        receiver_binding_id: Uuid,
+        hub_lct: Uuid,
+        hub_member_lct: Uuid,
+        child_lct: &str,
+        to_plugin: &str,
+        notice_id: &str,
+        notice_json: &str,
+        kind: &str,
+        pointer_uri: Option<&str>,
+    ) -> Result<HubReceiptCustody> {
+        anyhow::ensure!(
+            notice_id.len() == 64 && notice_id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "Hub receipt notice id must be 64 hex characters"
+        );
+        let conn = self.write_conn()?;
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let now_dt = Utc::now();
+        let now = now_dt.to_rfc3339();
+        // ACKed transport-custody rows are retry metadata, not the member's
+        // retained mail. Keep them for the same seven-day horizon as the Hub
+        // ACK tombstone, then reclaim them. Pending/unacked rows never age out:
+        // their whole purpose is to remember custody until the Hub agrees.
+        let cutoff = (now_dt - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        conn.execute(
+            "DELETE FROM hub_receipt_custody
+              WHERE hub_acked_at IS NOT NULL AND hub_acked_at < ?1",
+            params![cutoff],
+        )
+        .context("pruning completed Hub receipt custody rows")?;
+        conn.execute(
+            "INSERT OR IGNORE INTO hub_receipt_custody
+                (receiver_binding_id, hub_lct, hub_member_lct, child_lct, to_plugin, notice_id,
+                 notice_json, kind, pointer_uri, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                receiver_binding_id.to_string(), hub_lct.to_string(), hub_member_lct.to_string(),
+                child_lct, to_plugin, notice_id, notice_json, kind, pointer_uri, now
+            ],
+        )
+        .context("staging Hub receipt notice")?;
+
+        let row = conn.query_row(
+            "SELECT hub_lct, hub_member_lct, child_lct, to_plugin, notice_json, kind,
+                    pointer_uri, witness_hash, member_notice_id, delivery_witness_hash, hub_acked_at
+               FROM hub_receipt_custody
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2",
+            params![receiver_binding_id.to_string(), notice_id],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<i64>>(8)?, r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<String>>(10)?,
+            )),
+        )?;
+        anyhow::ensure!(
+            row.0 == hub_lct.to_string() && row.1 == hub_member_lct.to_string()
+                && row.2 == child_lct && row.3 == to_plugin && row.4 == notice_json
+                && row.5 == kind && row.6.as_deref() == pointer_uri,
+            "Hub notice id {notice_id} was re-fetched with different immutable content"
+        );
+        Ok(HubReceiptCustody {
+            receiver_binding_id,
+            notice_id: notice_id.to_string(),
+            child_lct: row.2,
+            to_plugin: row.3,
+            witness_hash: row.7,
+            member_notice_id: row.8.map(|n| n as u64),
+            delivery_witness_hash: row.9,
+            hub_acked_at: row.10
+                .map(|s| DateTime::parse_from_rfc3339(&s)
+                    .map(|t| t.with_timezone(&Utc)))
+                .transpose()
+                .context("parsing Hub receipt ack time")?,
+        })
+    }
+
+    /// Complete local acceptance after the witness exists. Member enqueue and the
+    /// custody watermark commit in ONE inbox transaction, so a crash cannot create a
+    /// member notice without recording which Hub receipt produced it.
+    pub fn accept_hub_receipt(
+        &self,
+        receiver_binding_id: Uuid,
+        notice_id: &str,
+        witness_hash: &str,
+    ) -> Result<u64> {
+        let mut conn = self.write_conn()?;
+        Self::ensure_hub_receipt_schema(&conn)?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting Hub receipt local acceptance")?;
+        let row = tx.query_row(
+            "SELECT to_plugin, pointer_uri, witness_hash, member_notice_id
+               FROM hub_receipt_custody
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2",
+            params![receiver_binding_id.to_string(), notice_id],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?,
+            )),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("Hub receipt {notice_id} was not staged"))?;
+        if let Some(existing) = row.2.as_deref() {
+            anyhow::ensure!(
+                existing == witness_hash,
+                "Hub receipt {notice_id} is already bound to a different witness"
+            );
+        }
+        if let Some(id) = row.3 {
+            return Ok(id as u64);
+        }
+
+        // A Hub ACK means the packet is now safely in LOCAL custody. The ordinary
+        // member-inbox admission rule is allowed to evict that recipient's oldest
+        // pending notice at capacity; transport receipt admission is NOT. Refuse
+        // here and leave the Hub copy unacked instead of buying the new packet by
+        // silently deleting an older one.
+        //
+        // Count only rows that survive enqueue_member_on's TTL prune, plus
+        // undrained dispositions (which that prune explicitly exempts). Egress
+        // rows are a different plane and do not spend the local recipient budget.
+        let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM member_notices
+              WHERE to_plugin = ?1
+                AND drained_at IS NULL
+                AND dest_peer IS NULL
+                AND (queued_at >= ?2 OR kind = 'disposition')",
+            params![row.0, cutoff],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            pending < MAX_INBOX_NOTICES as i64,
+            "local inbox for '{}' is full ({pending}/{MAX_INBOX_NOTICES}); Hub notice {notice_id} NOT acked",
+            row.0
+        );
+
+        let local_id = Self::enqueue_member_on(
+            &tx,
+            &row.0,
+            "hestia-router",
+            "role:constellation:router",
+            "coordination.hub",
+            row.1.as_deref(),
+            witness_hash,
+            None,
+        )?;
+        tx.execute(
+            "UPDATE hub_receipt_custody
+                SET witness_hash = ?3, member_notice_id = ?4
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2",
+            params![
+                receiver_binding_id.to_string(), notice_id, witness_hash, local_id as i64
+            ],
+        )
+        .context("recording Hub receipt local acceptance")?;
+        tx.commit().context("committing Hub receipt local acceptance")?;
+        Ok(local_id)
+    }
+
+    /// Receipt ids that are durably local but whose Hub ACK is not yet recorded.
+    /// Includes the lost-ACK-response case; Hub tombstones make the retry safe.
+    /// Any receipt custody not yet confirmed ACKed to the Hub. A local mailbox
+    /// binding must not be removed or retargeted while this is non-zero: doing so
+    /// would strand the only credential/endpoint that can finish the transfer.
+    pub fn hub_receipt_inflight_count(&self, receiver_binding_id: Uuid) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM hub_receipt_custody
+              WHERE receiver_binding_id = ?1 AND hub_acked_at IS NULL",
+            params![receiver_binding_id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Record the witness that proves durable member-inbox acceptance.
+    ///
+    /// The row may have a member_notice_id before this is set (crash between
+    /// enqueue and witness). Such a row is NOT ACK-eligible. Replaying the same
+    /// delivery witness is idempotent; trying to bind a different witness fails.
+    pub fn record_hub_receipt_delivery_witness(
+        &self,
+        receiver_binding_id: Uuid,
+        notice_id: &str,
+        delivery_witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let row = conn
+            .query_row(
+                "SELECT member_notice_id, delivery_witness_hash
+                   FROM hub_receipt_custody
+                  WHERE receiver_binding_id = ?1 AND notice_id = ?2",
+                params![receiver_binding_id.to_string(), notice_id],
+                |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("Hub receipt {notice_id} was not staged"))?;
+        anyhow::ensure!(
+            row.0.is_some(),
+            "cannot record delivery witness for Hub receipt {notice_id} before local acceptance"
+        );
+        if let Some(existing) = row.1 {
+            anyhow::ensure!(
+                existing == delivery_witness_hash,
+                "Hub receipt {notice_id} is already bound to a different delivery witness"
+            );
+            return Ok(());
+        }
+        let changed = conn.execute(
+            "UPDATE hub_receipt_custody
+                SET delivery_witness_hash = ?3
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2
+                AND member_notice_id IS NOT NULL
+                AND delivery_witness_hash IS NULL",
+            params![
+                receiver_binding_id.to_string(),
+                notice_id,
+                delivery_witness_hash,
+            ],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "Hub receipt {notice_id} delivery witness state changed concurrently"
+        );
+        Ok(())
+    }
+
+    pub fn pending_hub_receipt_acks(&self, receiver_binding_id: Uuid) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT notice_id FROM hub_receipt_custody
+              WHERE receiver_binding_id = ?1
+                AND member_notice_id IS NOT NULL
+                AND delivery_witness_hash IS NOT NULL
+                AND hub_acked_at IS NULL
+              ORDER BY queued_at ASC",
+        )?;
+        let rows = stmt.query_map(params![receiver_binding_id.to_string()], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    pub fn mark_hub_receipt_acked(
+        &self,
+        receiver_binding_id: Uuid,
+        notice_id: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let changed = conn.execute(
+            "UPDATE hub_receipt_custody SET hub_acked_at = ?3
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2
+                AND member_notice_id IS NOT NULL
+                AND delivery_witness_hash IS NOT NULL",
+            params![receiver_binding_id.to_string(), notice_id, Utc::now().to_rfc3339()],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "cannot mark Hub receipt {notice_id} ACKed before witnessed local delivery"
+        );
+        Ok(())
+    }
+
+    pub fn hub_receipt_custody(
+        &self,
+        receiver_binding_id: Uuid,
+        notice_id: &str,
+    ) -> Result<Option<HubReceiptCustody>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_hub_receipt_schema(&conn)?;
+        let row = conn.query_row(
+            "SELECT child_lct, to_plugin, witness_hash, member_notice_id,
+                    delivery_witness_hash, hub_acked_at
+               FROM hub_receipt_custody
+              WHERE receiver_binding_id = ?1 AND notice_id = ?2",
+            params![receiver_binding_id.to_string(), notice_id],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?, r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            )),
+        ).optional()?;
+        row.map(|r| -> Result<HubReceiptCustody> {
+            Ok(HubReceiptCustody {
+                receiver_binding_id, notice_id: notice_id.to_string(), child_lct: r.0, to_plugin: r.1,
+                witness_hash: r.2, member_notice_id: r.3.map(|n| n as u64),
+                delivery_witness_hash: r.4,
+                hub_acked_at: r.5.map(|s| DateTime::parse_from_rfc3339(&s)
+                    .map(|t| t.with_timezone(&Utc))).transpose()
+                    .context("parsing Hub receipt ack time")?,
+            })
+        }).transpose()
+    }
+}
+
+// ---- F3 router transit custody -----------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterPacketState {
+    pub packet_id: Uuid,
+    pub packet_json: String,
+    pub packet_hash: String,
+    pub decision_json: Option<String>,
+    pub local_child_lct: Option<String>,
+    pub outbound_packet_json: Option<String>,
+    pub next_hop_lct: Option<String>,
+    pub forward_link_id: Option<Uuid>,
+    pub forward_operation_id: Option<String>,
+    pub local_notice_id: Option<u64>,
+    pub downstream_notice_id: Option<String>,
+    pub downstream_entry_index: Option<u64>,
+    pub completion_witness_hash: Option<String>,
+    pub completion_kind: Option<String>,
+}
+
+impl SqliteInboxStore {
+    fn ensure_router_packet_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS router_packets (
+                packet_id                TEXT PRIMARY KEY,
+                packet_json              TEXT NOT NULL,
+                packet_hash              TEXT NOT NULL,
+                decision_json            TEXT,
+                local_child_lct          TEXT,
+                outbound_packet_json     TEXT,
+                next_hop_lct             TEXT,
+                forward_link_id          TEXT,
+                forward_operation_id     TEXT,
+                local_notice_id          INTEGER,
+                downstream_notice_id     TEXT,
+                downstream_entry_index   INTEGER,
+                completion_witness_hash  TEXT,
+                completion_kind          TEXT,
+                created_at               TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS router_ingress_receipts (
+                ingress_binding_id TEXT NOT NULL,
+                hub_notice_id      TEXT NOT NULL,
+                packet_id          TEXT NOT NULL,
+                notice_json        TEXT NOT NULL,
+                stage_witness_hash TEXT,
+                hub_acked_at       TEXT,
+                queued_at          TEXT NOT NULL,
+                PRIMARY KEY (ingress_binding_id, hub_notice_id),
+                FOREIGN KEY(packet_id) REFERENCES router_packets(packet_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_router_receipts_packet
+                 ON router_ingress_receipts(packet_id);
+             CREATE INDEX IF NOT EXISTS idx_router_receipts_pending
+                 ON router_ingress_receipts(ingress_binding_id, hub_acked_at);
+             CREATE TABLE IF NOT EXISTS router_ingress_rejections (
+                ingress_binding_id  TEXT NOT NULL,
+                hub_notice_id       TEXT NOT NULL,
+                notice_json         TEXT NOT NULL,
+                claimed_packet_id   TEXT,
+                refusal_witness_hash TEXT NOT NULL,
+                hub_acked_at        TEXT,
+                queued_at           TEXT NOT NULL,
+                PRIMARY KEY (ingress_binding_id, hub_notice_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_router_rejections_pending
+                 ON router_ingress_rejections(ingress_binding_id, hub_acked_at);
+             CREATE TABLE IF NOT EXISTS router_origin_ops (
+                origin_lct    TEXT NOT NULL,
+                operation_id  TEXT NOT NULL,
+                binding_json  TEXT NOT NULL,
+                packet_id     TEXT NOT NULL UNIQUE,
+                created_at    TEXT NOT NULL,
+                PRIMARY KEY (origin_lct, operation_id),
+                FOREIGN KEY(packet_id) REFERENCES router_packets(packet_id)
+             );",
+        )
+        .context("initializing router transit custody schema")?;
+        let has_local_child = {
+            let mut stmt = conn.prepare("PRAGMA table_info(router_packets)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for row in rows {
+                if row? == "local_child_lct" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_local_child {
+            conn.execute_batch(
+                "ALTER TABLE router_packets ADD COLUMN local_child_lct TEXT;",
+            )
+            .context("adding router packet local-child pin")?;
+        }
+        Ok(())
+    }
+
+    fn prune_router_custody_on(conn: &Connection) -> Result<()> {
+        let cutoff = (Utc::now() - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+
+        // Rejected receipts are operational retry state, not the permanent
+        // governance record. Once Hub ACK landed, the witness chain is the
+        // durable history and this row may age out with the ordinary inbox TTL.
+        conn.execute(
+            "DELETE FROM router_ingress_rejections
+              WHERE hub_acked_at IS NOT NULL AND queued_at < ?1",
+            params![cutoff],
+        )
+        .context("pruning acknowledged router ingress rejections")?;
+
+        // Accepted receipts follow the same rule, but never delete an unacked
+        // custody edge. Packet rows are removed only after every receipt row has
+        // aged away and the packet has a witnessed completion.
+        conn.execute(
+            "DELETE FROM router_ingress_receipts
+              WHERE hub_acked_at IS NOT NULL AND queued_at < ?1",
+            params![cutoff],
+        )
+        .context("pruning acknowledged router ingress receipts")?;
+
+        // Origin operation ids are retry tombstones for the same operational
+        // horizon. Remove the op mapping immediately before its completed packet,
+        // never while the packet is pending.
+        conn.execute(
+            "DELETE FROM router_origin_ops
+              WHERE packet_id IN (
+                    SELECT p.packet_id FROM router_packets p
+                     WHERE p.completion_witness_hash IS NOT NULL
+                       AND p.created_at < ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM router_ingress_receipts r
+                            WHERE r.packet_id = p.packet_id
+                       )
+              )",
+            params![cutoff],
+        )
+        .context("pruning completed router origin operations")?;
+
+        conn.execute(
+            "DELETE FROM router_packets
+              WHERE completion_witness_hash IS NOT NULL
+                AND created_at < ?1
+                AND NOT EXISTS (
+                    SELECT 1 FROM router_ingress_receipts r
+                     WHERE r.packet_id = router_packets.packet_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM router_origin_ops o
+                     WHERE o.packet_id = router_packets.packet_id
+                )",
+            params![cutoff],
+        )
+        .context("pruning completed router packets")?;
+        Ok(())
+    }
+
+    /// Persist exact packet bytes plus this transport receipt before deciding a route.
+    /// Packet id is globally idempotent inside this router: seeing the same id with
+    /// different bytes is a protocol violation, not a second packet.
+    pub fn stage_router_packet(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+        packet_id: Uuid,
+        notice_json: &str,
+        packet_json: &str,
+        packet_hash: &str,
+    ) -> Result<RouterPacketState> {
+        let mut conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::prune_router_custody_on(&conn)?;
+        let tx = conn.transaction().context("starting router packet stage")?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT OR IGNORE INTO router_packets
+                (packet_id, packet_json, packet_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![packet_id.to_string(), packet_json, packet_hash, now],
+        )?;
+        let immutable = tx.query_row(
+            "SELECT packet_json, packet_hash FROM router_packets WHERE packet_id = ?1",
+            params![packet_id.to_string()],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        anyhow::ensure!(
+            immutable.0 == packet_json && immutable.1 == packet_hash,
+            "route packet id {packet_id} was replayed with different bytes"
+        );
+
+        tx.execute(
+            "INSERT OR IGNORE INTO router_ingress_receipts
+                (ingress_binding_id, hub_notice_id, packet_id, notice_json, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                ingress_binding_id.to_string(),
+                hub_notice_id,
+                packet_id.to_string(),
+                notice_json,
+                now,
+            ],
+        )?;
+        let mapped: (String, String) = tx.query_row(
+            "SELECT packet_id, notice_json FROM router_ingress_receipts
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        anyhow::ensure!(
+            mapped.0 == packet_id.to_string() && mapped.1 == notice_json,
+            "Hub receipt {hub_notice_id} was replayed with different immutable content"
+        );
+        tx.commit().context("committing router packet stage")?;
+        drop(conn);
+        self.router_packet_state(packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("staged route packet {packet_id} disappeared"))
+    }
+
+    /// Atomically bind a caller retry key to ONE randomly-minted packet and
+    /// admit that packet into router custody. The retry namespace is per origin
+    /// LCT, and binding_json is the immutable application send intent
+    /// (destination/kind/pointer/hash), deliberately excluding live route-table
+    /// details such as hop_limit.
+    ///
+    /// On retry, candidate_* are ignored: the first packet bytes win. This is
+    /// what keeps a hop-limit/config change between attempts from mutating an
+    /// already-originated packet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stage_router_origin(
+        &self,
+        origin_lct: &str,
+        operation_id: &str,
+        binding_json: &str,
+        candidate_packet_id: Uuid,
+        candidate_packet_json: &str,
+        candidate_packet_hash: &str,
+    ) -> Result<(RouterPacketState, bool)> {
+        let mut conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::prune_router_custody_on(&conn)?;
+        let tx = conn.transaction().context("starting router origin admission")?;
+
+        let existing: Option<(String, String)> = tx.query_row(
+            "SELECT packet_id, binding_json
+               FROM router_origin_ops
+              WHERE origin_lct = ?1 AND operation_id = ?2",
+            params![origin_lct, operation_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+
+        if let Some((packet_id_s, first_binding)) = existing {
+            anyhow::ensure!(
+                first_binding == binding_json,
+                "route origin operation '{operation_id}' for {origin_lct} was already used for different send intent"
+            );
+            let packet_id = Uuid::parse_str(&packet_id_s)
+                .context("parsing persisted route origin packet id")?;
+            let state = Self::router_packet_state_on(&tx, packet_id)?
+                .ok_or_else(|| anyhow::anyhow!(
+                    "route origin operation '{operation_id}' points at missing packet {packet_id}"
+                ))?;
+            tx.commit().context("committing router origin retry read")?;
+            return Ok((state, false));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO router_packets
+                (packet_id, packet_json, packet_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                candidate_packet_id.to_string(),
+                candidate_packet_json,
+                candidate_packet_hash,
+                now,
+            ],
+        )
+        .context("admitting originated router packet")?;
+        tx.execute(
+            "INSERT INTO router_origin_ops
+                (origin_lct, operation_id, binding_json, packet_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                origin_lct,
+                operation_id,
+                binding_json,
+                candidate_packet_id.to_string(),
+                now,
+            ],
+        )
+        .context("binding router origin operation")?;
+        let state = Self::router_packet_state_on(&tx, candidate_packet_id)?
+            .ok_or_else(|| anyhow::anyhow!(
+                "originated route packet {candidate_packet_id} disappeared during admission"
+            ))?;
+        tx.commit().context("committing router origin admission")?;
+        Ok((state, true))
+    }
+
+    pub fn record_router_stage_witness(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+        packet_id: Uuid,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        let existing: Option<(String, Option<String>)> = conn.query_row(
+            "SELECT packet_id, stage_witness_hash FROM router_ingress_receipts
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let Some((mapped, prior)) = existing else {
+            anyhow::bail!("router ingress receipt {hub_notice_id} was not staged");
+        };
+        anyhow::ensure!(mapped == packet_id.to_string(),
+            "router ingress receipt {hub_notice_id} belongs to another packet");
+        if let Some(prior) = prior {
+            anyhow::ensure!(prior == witness_hash,
+                "router ingress receipt {hub_notice_id} is bound to a different stage witness");
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_ingress_receipts SET stage_witness_hash = ?3
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2
+                AND stage_witness_hash IS NULL",
+            params![ingress_binding_id.to_string(), hub_notice_id, witness_hash],
+        )?;
+        anyhow::ensure!(n == 1, "router stage witness state changed concurrently");
+        Ok(())
+    }
+
+    /// Persist the route decision AND the exact outbound packet before network I/O.
+    /// Replaying must present byte-identical decision material.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_router_forward_decision(
+        &self,
+        packet_id: Uuid,
+        decision_json: &str,
+        outbound_packet_json: &str,
+        next_hop_lct: &str,
+        forward_link_id: Uuid,
+        operation_id: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        let state = Self::router_packet_state_on(&conn, packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
+        if let Some(existing) = state.decision_json {
+            anyhow::ensure!(
+                existing == decision_json
+                    && state.outbound_packet_json.as_deref() == Some(outbound_packet_json)
+                    && state.next_hop_lct.as_deref() == Some(next_hop_lct)
+                    && state.forward_link_id == Some(forward_link_id)
+                    && state.forward_operation_id.as_deref() == Some(operation_id),
+                "route packet {packet_id} already has a different persisted decision"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_packets
+                SET decision_json = ?2, outbound_packet_json = ?3,
+                    next_hop_lct = ?4, forward_link_id = ?5, forward_operation_id = ?6
+              WHERE packet_id = ?1 AND decision_json IS NULL",
+            params![
+                packet_id.to_string(), decision_json, outbound_packet_json,
+                next_hop_lct, forward_link_id.to_string(), operation_id,
+            ],
+        )?;
+        anyhow::ensure!(n == 1, "route packet decision changed concurrently");
+        Ok(())
+    }
+
+    pub fn record_router_local_decision(
+        &self,
+        packet_id: Uuid,
+        decision_json: &str,
+        local_child_lct: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        let state = Self::router_packet_state_on(&conn, packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
+        if let Some(existing) = state.decision_json {
+            anyhow::ensure!(
+                existing == decision_json
+                    && state.local_child_lct.as_deref() == local_child_lct,
+                "route packet {packet_id} already has a different persisted decision"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_packets
+                SET decision_json = ?2, local_child_lct = ?3
+              WHERE packet_id = ?1 AND decision_json IS NULL",
+            params![packet_id.to_string(), decision_json, local_child_lct],
+        )?;
+        anyhow::ensure!(n == 1, "route packet local decision changed concurrently");
+        Ok(())
+    }
+
+    /// Deliver one route packet to a local child exactly once. The member row and
+    /// packet watermark are one SQLite transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_router_packet_local(
+        &self,
+        packet_id: Uuid,
+        to_plugin: &str,
+        from_lct: &str,
+        kind: &str,
+        pointer_uri: &str,
+        chain_hash: &str,
+    ) -> Result<u64> {
+        let mut conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting routed local acceptance")?;
+        let existing: Option<i64> = tx.query_row(
+            "SELECT local_notice_id FROM router_packets WHERE packet_id = ?1",
+            params![packet_id.to_string()],
+            |r| r.get(0),
+        ).optional()?.flatten();
+        if let Some(id) = existing {
+            return Ok(id as u64);
+        }
+        let id = Self::enqueue_member_on(
+            &tx,
+            to_plugin,
+            from_lct,
+            "role:constellation:router",
+            kind,
+            Some(pointer_uri),
+            chain_hash,
+            None,
+        )?;
+        let n = tx.execute(
+            "UPDATE router_packets SET local_notice_id = ?2
+              WHERE packet_id = ?1 AND local_notice_id IS NULL",
+            params![packet_id.to_string(), id as i64],
+        )?;
+        anyhow::ensure!(n == 1, "route packet local acceptance changed concurrently");
+        tx.commit().context("committing routed local acceptance")?;
+        Ok(id)
+    }
+
+    pub fn record_router_downstream_receipt(
+        &self,
+        packet_id: Uuid,
+        notice_id: &str,
+        entry_index: u64,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        let state = Self::router_packet_state_on(&conn, packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
+        if let Some(existing) = state.downstream_notice_id {
+            anyhow::ensure!(
+                existing == notice_id && state.downstream_entry_index == Some(entry_index),
+                "route packet {packet_id} is bound to a different downstream receipt"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_packets
+                SET downstream_notice_id = ?2, downstream_entry_index = ?3
+              WHERE packet_id = ?1 AND downstream_notice_id IS NULL",
+            params![packet_id.to_string(), notice_id, entry_index as i64],
+        )?;
+        anyhow::ensure!(n == 1, "route packet downstream receipt changed concurrently");
+        Ok(())
+    }
+
+    pub fn complete_router_packet(
+        &self,
+        packet_id: Uuid,
+        completion_kind: &str,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        let state = Self::router_packet_state_on(&conn, packet_id)?
+            .ok_or_else(|| anyhow::anyhow!("route packet {packet_id} was not staged"))?;
+        if let Some(existing) = state.completion_witness_hash {
+            anyhow::ensure!(
+                existing == witness_hash && state.completion_kind.as_deref() == Some(completion_kind),
+                "route packet {packet_id} is already completed differently"
+            );
+            return Ok(());
+        }
+        let n = conn.execute(
+            "UPDATE router_packets
+                SET completion_witness_hash = ?2, completion_kind = ?3
+              WHERE packet_id = ?1 AND completion_witness_hash IS NULL",
+            params![packet_id.to_string(), witness_hash, completion_kind],
+        )?;
+        anyhow::ensure!(n == 1, "route packet completion changed concurrently");
+        Ok(())
+    }
+
+    /// Persist an ingress rejection independently of router_packets. This is
+    /// the anti-poisoning boundary: an unconfigured Hub citizen must not be
+    /// able to claim a packet_id in the router's global idempotency namespace.
+    pub fn record_router_ingress_rejection(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+        notice_json: &str,
+        claimed_packet_id: Option<Uuid>,
+        witness_hash: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::prune_router_custody_on(&conn)?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO router_ingress_rejections
+                (ingress_binding_id, hub_notice_id, notice_json, claimed_packet_id,
+                 refusal_witness_hash, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                ingress_binding_id.to_string(),
+                hub_notice_id,
+                notice_json,
+                claimed_packet_id.map(|v| v.to_string()),
+                witness_hash,
+                now,
+            ],
+        )?;
+        let row: (String, Option<String>, String) = conn.query_row(
+            "SELECT notice_json, claimed_packet_id, refusal_witness_hash
+               FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        anyhow::ensure!(
+            row.0 == notice_json
+                && row.1 == claimed_packet_id.map(|v| v.to_string())
+                && row.2 == witness_hash,
+            "router ingress rejection {hub_notice_id} was replayed with different immutable content"
+        );
+        Ok(())
+    }
+
+    /// Normal transit receipts are ACK-eligible only after local stage evidence
+    /// and one witnessed packet completion. Rejections live in a separate table
+    /// and therefore cannot create or complete a router_packets row.
+    pub fn pending_router_ingress_acks(
+        &self,
+        ingress_binding_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT r.hub_notice_id
+               FROM router_ingress_receipts r
+               JOIN router_packets p ON p.packet_id = r.packet_id
+              WHERE r.ingress_binding_id = ?1
+                AND r.hub_acked_at IS NULL
+                AND r.stage_witness_hash IS NOT NULL
+                AND p.completion_witness_hash IS NOT NULL
+              ORDER BY r.queued_at ASC",
+        )?;
+        let rows = stmt.query_map(params![ingress_binding_id.to_string()], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    pub fn mark_router_ingress_acked(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        let eligible: i64 = conn.query_row(
+            "SELECT COUNT(*)
+               FROM router_ingress_receipts r
+               JOIN router_packets p ON p.packet_id = r.packet_id
+              WHERE r.ingress_binding_id = ?1 AND r.hub_notice_id = ?2
+                AND r.stage_witness_hash IS NOT NULL
+                AND p.completion_witness_hash IS NOT NULL",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            eligible == 1,
+            "cannot ACK router ingress {hub_notice_id} before witnessed completion"
+        );
+        conn.execute(
+            "UPDATE router_ingress_receipts SET hub_acked_at = COALESCE(hub_acked_at, ?3)
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![
+                ingress_binding_id.to_string(), hub_notice_id, Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_router_rejection_acks(
+        &self,
+        ingress_binding_id: Uuid,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT hub_notice_id
+               FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1
+                AND hub_acked_at IS NULL
+                AND refusal_witness_hash IS NOT NULL
+              ORDER BY queued_at ASC",
+        )?;
+        let rows = stmt.query_map(params![ingress_binding_id.to_string()], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows { out.push(row?); }
+        Ok(out)
+    }
+
+    pub fn mark_router_rejection_acked(
+        &self,
+        ingress_binding_id: Uuid,
+        hub_notice_id: &str,
+    ) -> Result<()> {
+        let conn = self.write_conn()?;
+        Self::ensure_router_packet_schema(&conn)?;
+        let eligible: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2
+                AND refusal_witness_hash IS NOT NULL",
+            params![ingress_binding_id.to_string(), hub_notice_id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            eligible == 1,
+            "cannot ACK router ingress rejection {hub_notice_id} before witnessed refusal"
+        );
+        conn.execute(
+            "UPDATE router_ingress_rejections
+                SET hub_acked_at = COALESCE(hub_acked_at, ?3)
+              WHERE ingress_binding_id = ?1 AND hub_notice_id = ?2",
+            params![
+                ingress_binding_id.to_string(), hub_notice_id, Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn router_packet_state(&self, packet_id: Uuid) -> Result<Option<RouterPacketState>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        Self::router_packet_state_on(&conn, packet_id)
+    }
+
+    fn router_packet_state_on(
+        conn: &Connection,
+        packet_id: Uuid,
+    ) -> Result<Option<RouterPacketState>> {
+        conn.query_row(
+            "SELECT packet_json, packet_hash, decision_json, local_child_lct,
+                    outbound_packet_json, next_hop_lct, forward_link_id,
+                    forward_operation_id, local_notice_id, downstream_notice_id,
+                    downstream_entry_index, completion_witness_hash, completion_kind
+               FROM router_packets WHERE packet_id = ?1",
+            params![packet_id.to_string()],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?, r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?, r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<i64>>(8)?, r.get::<_, Option<String>>(9)?,
+                r.get::<_, Option<i64>>(10)?, r.get::<_, Option<String>>(11)?,
+                r.get::<_, Option<String>>(12)?,
+            )),
+        ).optional()?.map(|r| -> Result<RouterPacketState> {
+            Ok(RouterPacketState {
+                packet_id,
+                packet_json: r.0,
+                packet_hash: r.1,
+                decision_json: r.2,
+                local_child_lct: r.3,
+                outbound_packet_json: r.4,
+                next_hop_lct: r.5,
+                forward_link_id: r.6.map(|v| Uuid::parse_str(&v))
+                    .transpose().context("parsing router forward_link_id")?,
+                forward_operation_id: r.7,
+                local_notice_id: r.8.map(|v| v as u64),
+                downstream_notice_id: r.9,
+                downstream_entry_index: r.10.map(|v| v as u64),
+                completion_witness_hash: r.11,
+                completion_kind: r.12,
+            })
+        }).transpose()
+    }
+
+    pub fn router_ingress_inflight_count(&self, ingress_binding_id: Uuid) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_router_packet_schema(&conn)?;
+        let accepted: i64 = conn.query_row(
+            "SELECT COUNT(*)
+               FROM router_ingress_receipts
+              WHERE ingress_binding_id = ?1 AND hub_acked_at IS NULL",
+            params![ingress_binding_id.to_string()],
+            |r| r.get(0),
+        )?;
+        let rejected: i64 = conn.query_row(
+            "SELECT COUNT(*)
+               FROM router_ingress_rejections
+              WHERE ingress_binding_id = ?1 AND hub_acked_at IS NULL",
+            params![ingress_binding_id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok((accepted + rejected) as u64)
+    }
+}
+
+
+/// One channel-send in the outbox (#1344). The outbox is a table of the SQLCipher inbox, so a
+/// row is sealed at rest under the daemon's storage key like every other inbox row: a member's
+/// message is private-record material.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ChannelOutboxRow {
+    pub id: u64,
+    pub member: String,
+    pub member_lct: String,
+    pub channel_id: String,
+    pub recipient_class: String,
+    pub binding_version: u64,
+    pub content: String,
+    pub content_sha256: String,
+    /// Epoch seconds the send arrived.
+    pub created: u64,
+    /// The budget refused it (shadow: it is recorded, and it would not have been sent).
+    pub would_deny: bool,
+    pub answered_at: Option<u64>,
+    pub answered_by: Option<String>,
+    pub chain_hash: String,
+}
+
+/// The fields of a new outbox row (`channel_outbox_insert`).
+pub struct NewChannelOutbox<'a> {
+    pub member: &'a str,
+    pub member_lct: &'a str,
+    pub channel_id: &'a str,
+    pub recipient_class: &'a str,
+    pub binding_version: u64,
+    pub content: &'a str,
+    pub content_sha256: &'a str,
+    pub created: u64,
+    pub would_deny: bool,
+    pub chain_hash: &'a str,
+}
+
+const CHANNEL_OUTBOX_COLS: &str = "id, member, member_lct, channel_id, recipient_class, binding_version, \
+     content, content_sha256, created, would_deny, answered_at, answered_by, chain_hash";
+
+impl SqliteInboxStore {
+    fn ensure_channel_schema(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_outbox (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                member           TEXT NOT NULL,
+                member_lct       TEXT NOT NULL,
+                channel_id       TEXT NOT NULL,
+                recipient_class  TEXT NOT NULL,
+                binding_version  INTEGER NOT NULL,
+                content          TEXT NOT NULL,
+                content_sha256   TEXT NOT NULL,
+                created          INTEGER NOT NULL,
+                would_deny       INTEGER NOT NULL,
+                answered_at      INTEGER,
+                answered_by      TEXT,
+                chain_hash       TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_channel_outbox_budget
+                 ON channel_outbox(member_lct, channel_id, created);",
+        )
+        .context("initializing channel_outbox schema")?;
+        Ok(())
+    }
+
+    fn channel_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelOutboxRow> {
+        Ok(ChannelOutboxRow {
+            id: row.get::<_, i64>(0)? as u64,
+            member: row.get(1)?,
+            member_lct: row.get(2)?,
+            channel_id: row.get(3)?,
+            recipient_class: row.get(4)?,
+            binding_version: row.get::<_, i64>(5)? as u64,
+            content: row.get(6)?,
+            content_sha256: row.get(7)?,
+            created: row.get::<_, i64>(8)? as u64,
+            would_deny: row.get::<_, i64>(9)? != 0,
+            answered_at: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+            answered_by: row.get(11)?,
+            chain_hash: row.get(12)?,
+        })
+    }
+
+    /// Record one send. The row names its chain row, so the barrier runs first.
+    pub fn channel_outbox_insert(&self, r: &NewChannelOutbox<'_>) -> Result<u64> {
+        let conn = self.write_conn()?;
+        Self::ensure_channel_schema(&conn)?;
+        conn.execute(
+            "INSERT INTO channel_outbox (member, member_lct, channel_id, recipient_class, \
+             binding_version, content, content_sha256, created, would_deny, chain_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![r.member, r.member_lct, r.channel_id, r.recipient_class, r.binding_version as i64,
+                    r.content, r.content_sha256, r.created as i64, r.would_deny as i64, r.chain_hash],
+        )
+        .context("recording channel send")?;
+        Ok(conn.last_insert_rowid() as u64)
+    }
+
+    /// EVERY member's unanswered sends on a channel since `since`, oldest first. The caller
+    /// decides whose they are (`tool_channel_send` keeps the sender's and its aliases', through
+    /// `same_entity`), so the budget is not split by two spellings of one member.
+    pub fn channel_unanswered_on_channel(&self, channel_id: &str, since: u64) -> Result<Vec<ChannelOutboxRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_channel_schema(&conn)?;
+        let mut st = conn.prepare(&format!(
+            "SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox WHERE channel_id = ?1 \
+             AND created >= ?2 AND answered_at IS NULL AND would_deny = 0 ORDER BY id"))?;
+        let rows = st.query_map(params![channel_id, since as i64], Self::channel_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The member's UNANSWERED sends on a channel since `since` (epoch seconds), oldest first,
+    /// by its LCT exactly. A row the budget refused is not counted: it was never sent.
+    pub fn channel_unanswered(&self, member_lct: &str, channel_id: &str, since: u64) -> Result<Vec<ChannelOutboxRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_channel_schema(&conn)?;
+        let mut st = conn.prepare(&format!(
+            "SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox WHERE member_lct = ?1 AND channel_id = ?2 \
+             AND created >= ?3 AND answered_at IS NULL AND would_deny = 0 ORDER BY id"))?;
+        let rows = st.query_map(params![member_lct, channel_id, since as i64], Self::channel_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One outbox row by id.
+    pub fn channel_outbox_get(&self, id: u64) -> Result<Option<ChannelOutboxRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_channel_schema(&conn)?;
+        conn.query_row(&format!("SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox WHERE id = ?1"),
+                       params![id as i64], Self::channel_row)
+            .optional()
+            .context("reading channel outbox row")
+    }
+
+    /// Rows newest first: one member's (`member` = Some, its own only), or all (operator).
+    pub fn channel_outbox_list(&self, member: Option<&str>, limit: u32) -> Result<Vec<ChannelOutboxRow>> {
+        let conn = self.conn.lock().unwrap();
+        Self::ensure_channel_schema(&conn)?;
+        let limit = limit.clamp(1, 500) as i64;
+        let rows = match member {
+            Some(m) => {
+                let mut st = conn.prepare(&format!(
+                    "SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox WHERE member = ?1 ORDER BY id DESC LIMIT ?2"))?;
+                let v = st.query_map(params![m, limit], Self::channel_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            }
+            None => {
+                let mut st = conn.prepare(&format!(
+                    "SELECT {CHANNEL_OUTBOX_COLS} FROM channel_outbox ORDER BY id DESC LIMIT ?1"))?;
+                let v = st.query_map(params![limit], Self::channel_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+                v
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Mark a row answered. False when there is no such row or it was already answered: an
+    /// answer is recorded once, never moved.
+    pub fn channel_mark_answered(&self, id: u64, by: &str, at: u64) -> Result<bool> {
+        let conn = self.write_conn()?;
+        Self::ensure_channel_schema(&conn)?;
+        let n = conn.execute(
+            "UPDATE channel_outbox SET answered_at = ?1, answered_by = ?2 WHERE id = ?3 AND answered_at IS NULL",
+            params![at as i64, by, id as i64],
+        )
+        .context("marking channel send answered")?;
+        Ok(n == 1)
+    }
 }
 
 #[cfg(test)]
@@ -1964,7 +3542,7 @@ mod tests {
         );
         let un = store.member_unanswered("kimi-code", &["reply"], -1).unwrap();
         assert_eq!(un.len(), 1);
-        assert!(un[0].drained_at.is_some(), "delivered, then unanswered");
+        assert!(un[0].drained_at.is_some(), "drain mark present, unanswered");
     }
 
     /// Binding a response clears the debt; the per-kind filter keeps the
@@ -1985,7 +3563,7 @@ mod tests {
         let before = store.member_unanswered("kimi-code", counted, -1).unwrap();
         assert_eq!(before.len(), 1, "handoff is not an unanswered-report row");
         assert_eq!(before[0].id, asked);
-        assert!(before[0].drained_at.is_none(), "never picked up");
+        assert!(before[0].drained_at.is_none(), "drain mark absent");
         // Kimi answers it: the binding closes the row.
         store
             .enqueue_member("claude-code", "kimi-code", "role:r", "review_done",

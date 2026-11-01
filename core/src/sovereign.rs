@@ -266,6 +266,27 @@ impl Society {
         .map(|p| p.lct.lct_id())
     }
 
+    /// Recover the already-persisted Society binding key without minting,
+    /// healing, or changing vault state. Router-interface certificates use this
+    /// key to prove that the canonical router LCT itself authorized the
+    /// transport binding. A missing/corrupt persisted identity is a hard error,
+    /// never an excuse to sign with `ai_identity_secret` or another member key.
+    pub fn persisted_signing_keypair(
+        vault: &crate::vault::Vault,
+    ) -> anyhow::Result<web4_core::crypto::KeyPair> {
+        let persisted = crate::vault::load_doc::<Option<PersistedSociety>>(
+            vault,
+            SOVEREIGN_NAMESPACE,
+            SOVEREIGN_DOC,
+            SOVEREIGN_LEGACY_FILE,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("no persisted Society/router identity"))?;
+        recover_kp(&persisted.keypair_secret_hex, &persisted.lct)
+            .ok_or_else(|| anyhow::anyhow!(
+                "persisted Society/router binding key does not match its LCT public key"
+            ))
+    }
+
     /// The society's canonical, key-derived LCT id (`lct:web4:mb32:…`).
     pub fn lct_id(&self) -> String {
         self.lct.lct_id()

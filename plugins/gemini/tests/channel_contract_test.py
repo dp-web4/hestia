@@ -6,7 +6,7 @@ The gate blocks two different ways on purpose (see "TWO DENY CHANNELS" in the ga
     POLICY deny  (the gate reached a verdict) -> exit 0 + stdout JSON  -> deny, no operator banner
     ANOMALY deny (the gate could not judge)   -> exit 2 + stderr text  -> deny, WITH the banner
 
-gate_holes_repro.sh already asserts that each *case* lands on the right channel. This file asserts
+gate_holes_test.py already asserts that each *case* lands on the right channel. This file asserts
 the thing that makes the split correct in the first place - the property that would silently rot if
 someone later "simplified" both channels back into one:
 
@@ -64,38 +64,51 @@ check("exit 1 is an ALLOW+warning, never a deny (the gate must never exit 1)",
       decide(1, "", "hestia: deny [gate] - x")[0], "allow")
 
 # --- Part 2: the live gate actually emits those shapes, and fd 1 is exclusive ------------------
-# Sandbox must NOT be under /tmp: the gate grants /tmp as a root, which would make every
-# out-of-scope path trivially contained (same constraint as gate_holes_repro.sh).
+# Since one-gate stage C the shim is the certified template over the common gate: it reads ONLY
+# its vault projection under HESTIA_HOME, and the gate is loaded from the projection's
+# HESTIA_SHARED_DIR. The fixture stages both, with a CLOSED endpoint, so no live daemon matters:
+# with no policy snapshot every act is denied, and an innate egress refusal keeps its own rule
+# (a real verdict, so the clean channel) while everything else is the infrastructure denial
+# (an anomaly, so the banner). Sandbox not under /tmp (the gate grants /tmp as a root).
 V = os.environ.get("HESTIA_GATETEST_DIR", os.path.expanduser("~/.cache/hestia-gemini-channeltest"))
 shutil.rmtree(V, ignore_errors=True)
+HOME = os.path.join(V, "hestia-home")
+SHARED = os.path.join(V, "shared")
 os.makedirs(os.path.join(V, "ws", "web4"))
-os.makedirs(os.path.join(V, "ws", "private-context"))
-with open(os.path.join(V, "ident.json"), "w") as f:
-    f.write('{"mrh":{"in_scope":["repo:web4"]}}\n')
-ENV = dict(os.environ, HESTIA_WORKSPACE=os.path.join(V, "ws"),
-           HESTIA_GEMINI_IDENTITY=os.path.join(V, "ident.json"),
-           HESTIA_GEMINI_LAUNCH_CWD=os.path.join(V, "ws", "web4"),
-           HESTIA_SOCIETY_GATE="/nonexistent/governor.py",
-           # The tree under test, named explicitly (#742's fixture rule). Since slice 4 the
-           # gemini gate loads scope law ONLY from HESTIA_SHARED_DIR or the installed engine,
-           # and fails CLOSED without it -- so on a runner with no install, the absent-governor
-           # arm denied at Gate 1b before the event ever reached the Gate-2 banner this test
-           # exists to require. Naming the reviewed tree restores the arm's precondition.
-           HESTIA_SHARED_DIR=os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "..", "..", "_shared"),
-           HESTIA_GEMINI_GATE_MODE="enforce")
+os.makedirs(os.path.join(HOME, "seats"))
+os.makedirs(SHARED)
+_TREE_SHARED = os.path.join(HERE, "..", "..", "_shared")
+# Staging seam (unset in the repo and in CI): {module: path} in place of the tree's copies.
+_OVERLAY = json.loads(os.environ.get("HESTIA_CONTRACT_OVERLAY") or "{}")
+for _name in os.listdir(_TREE_SHARED):
+    if _name.startswith("hestia_") and _name.endswith(".py") and "_test" not in _name:
+        shutil.copy(_OVERLAY.get(_name[:-3]) or os.path.join(_TREE_SHARED, _name),
+                    os.path.join(SHARED, _name))
+for _mod, _path in _OVERLAY.items():
+    if _mod.startswith("hestia_"):
+        shutil.copy(_path, os.path.join(SHARED, _mod + ".py"))
+with open(os.path.join(HOME, "seats", "gemini.env"), "w") as f:
+    f.write(f"# member: gemini\nHESTIA_HOME={HOME}\nHESTIA_SHARED_DIR={SHARED}\n"
+            f"HESTIA_ENDPOINT=http://127.0.0.1:1/mcp\nHESTIA_WORKSPACE={os.path.join(V, 'ws')}\n")
+ENV = {k: v for k, v in os.environ.items()
+       if k not in ("HESTIA_SHARED_DIR", "HESTIA_ENDPOINT", "HESTIA_WORKSPACE", "HESTIA_GATE_MODE")}
+# The test is the hook's invoker, so it declares the timeout it enforces (subprocess default
+# below is none; 20 s is ample) and the gate decides inside it.
+ENV.update(HESTIA_HOME=HOME, HESTIA_HOOK_TIMEOUT_S="20")
 CWD = os.path.join(V, "ws", "web4")
+FORBIDDEN = "sec" + "rets"   # assembled: this file's text must not carry the token the gate matches
 
 
 def fire(event):
-    r = subprocess.run([sys.executable, GATE], input=event, capture_output=True, text=True, env=ENV)
+    r = subprocess.run([sys.executable, GATE], input=event, capture_output=True, text=True,
+                       env=ENV, timeout=60)
     return r.returncode, r.stdout, r.stderr
 
 
-# Gate-1b scope deny: a policy verdict, so it must take the clean channel.
+# An innate egress refusal: a policy verdict, so it must take the clean channel.
 code, out, err = fire(json.dumps({"hook_event_name": "BeforeTool", "cwd": CWD,
                                  "tool_name": "read_file",
-                                 "tool_input": {"file_path": "../private-context/notes.md"}}))
+                                 "tool_input": {"absolute_path": f"{CWD}/{FORBIDDEN}/token"}}))
 check("live policy deny -> exit 0", code, 0)
 check("live policy deny -> runner denies", decide(code, out, err)[0], "deny")
 check("live policy deny -> no operator banner", decide(code, out, err)[2], False)
@@ -106,7 +119,7 @@ except Exception as exc:
 check("live policy deny -> fd 1 is exactly the decision object, nothing else",
       isinstance(payload, dict) and sorted(payload) == ["decision", "reason"], True)
 check("live policy deny -> the reason still reaches the model",
-      isinstance(payload, dict) and payload.get("reason", "").startswith("hestia: deny [scope]"), True)
+      isinstance(payload, dict) and "[egress.secret]" in payload.get("reason", ""), True)
 
 # Unreadable event: the gate never got to judge -> anomaly channel.
 code, out, err = fire("not json at all")
@@ -115,13 +128,12 @@ check("live anomaly -> runner denies", decide(code, out, err)[0], "deny")
 check("live anomaly -> raises the operator banner", decide(code, out, err)[2], True)
 check("live anomaly -> nothing on fd 1 (the reason rides stderr)", out.strip(), "")
 
-# An absent governor is a malfunction, not a verdict: it must NOT be laundered into a clean deny.
-# (`python3 /nonexistent/governor.py` exits 2 with stderr text - byte-identical to a real verdict.)
+# An absent daemon is a malfunction, not a verdict: it must NOT be laundered into a clean deny.
 code, out, err = fire(json.dumps({"hook_event_name": "BeforeTool", "cwd": CWD,
                                  "tool_name": "write_file",
                                  "tool_input": {"file_path": "main.py", "content": "x"}}))
-check("absent governor -> denies", decide(code, out, err)[0], "deny")
-check("absent governor -> banner raised (a missing daemon must be visible)",
+check("absent daemon -> denies", decide(code, out, err)[0], "deny")
+check("absent daemon -> banner raised (a missing daemon must be visible)",
       decide(code, out, err)[2], True)
 
 shutil.rmtree(V, ignore_errors=True)

@@ -10,11 +10,12 @@
 //! chain appends) don't re-derive per write.
 
 pub mod chain;
+pub mod durability;
 pub mod inbox;
 pub mod trust;
 
 pub use chain::{ChainEntry, SqliteChainStore};
-pub use inbox::{InboxNotice, SqliteInboxStore};
+pub use inbox::{HubReceiptCustody, InboxNotice, RouterPacketState, SqliteInboxStore};
 pub use trust::TrustStore;
 
 use std::path::Path;

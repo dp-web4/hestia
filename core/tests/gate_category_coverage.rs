@@ -184,6 +184,15 @@ const CATEGORY_COVERAGE: &[(&str, Coverage, &[&str])] = &[
         &["policy/extract.rs::classify"],
     ),
     (
+        "channel_egress",
+        DefaultAllow(
+            "shadow (#1344 slice 1): nothing leaves the machine. Every send is judged, \
+             witnessed and kept in the outbox; the unanswered budget is recorded, not \
+             enforced. Moves to Ruled, with a preset rule, in the delivery slice",
+        ),
+        &["policy/extract.rs::classify", "server/handler.rs::tool_channel_send"],
+    ),
+    (
         "witness_append",
         DefaultAllow(
             "NOT deliberate — the capability was built to be gateable (see the \

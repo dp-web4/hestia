@@ -1,0 +1,92 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1338,6 +1338,12 @@
+ #: carries this unbound parameter reference, so wherever it is judged as a path it is
+ #: unenumerated (`ANSI-C` is not an identifier: no assignment can ever bind it).
+ _ANSI_C_MARK = "${ANSI-C}"
++#: Every byte the lexer uses as an IN-BAND marker (`_LIT_DOLLAR`, `\x01` in `_path_shaped`,
++#: `_LIT_TICK`, `_BRACE`, `_DQ_REF`) plus one spare. A command that already contains one could
++#: forge quote / literal evidence (Codex 20554: `cat \x04$S` read as a quoted use), so such a
++#: command is UNENUMERATED before any marker is inserted. (`_ANSI_C_MARK` is spelled in shell
++#: syntax; forging it only makes a word unenumerated, the strict direction.)
++_MARKER_BYTES = re.compile("[\x00-\x05]")
+ _BRACE_EXPANSION = re.compile(r"""\{[^\s{}'"]*(?:,|\.\.)[^\s{}'"]*\}""")
+ 
+ 
+@@ -1350,6 +1356,8 @@
+     and backticks stay inside their word (bodies are judged separately); `#` at a word start begins
+     a comment (not executed); a newline or `;` / `&&` / `||` / `|` / `&` / `(` / `)` separates
+     commands; `\\`-newline continues. Anything unbalanced raises `_Unmodelled`."""
++    if _MARKER_BYTES.search(text):
++        raise _Unmodelled("a control character the gate's lexer reserves as an internal marker")
+     out, buf, in_word, uglob = [], [], False, False
+     i, n = 0, len(text)
+ 
+@@ -1857,8 +1865,8 @@
+         # A string the command runs as shell (`eval`, `su -c`, `sh -c` in argv): a command of
+         # its own. A `$` single quotes kept literal here is live when the string runs.
+         out.extend(_outside_candidates(_strip_data_heredocs(
+-            text.replace(_DQ_REF, "").replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`")),
+-            pwd, depth + 1, found))
++            text.replace(_DQ_REF, "").replace(_BRACE, "").replace(_LIT_DOLLAR, "$")
++            .replace(_LIT_TICK, "`")), pwd, depth + 1, found))
+ 
+     def in_force():
+         cut = body_origin
+@@ -1881,6 +1889,11 @@
+     # appended after them by `_shell_words`, and a body is a subshell.
+     main_len = len(_tokenize(cmd)) if depth == 0 else 0
+     bindable = _literal_names(toks) if depth == 0 else set()
++    # IFS decides field splitting. If the command assigns it ANYWHERE (a statement, a prefix to a
++    # command, `IFS+=`), no splitting assumption holds for ANY value: every binding then resolves
++    # only at a double-quoted use (Codex 20554). Binders that could set it (`read`, `declare`, …)
++    # already disqualify the rule wholesale.
++    ifs_touched = any(k == "word" and re.match(r"IFS\+?=", w) for k, w, _g in toks)
+     bind = {"pending": None, "prev_sep": ";", "paren": 0, "kw": 0}
+ 
+     def new_segment(sep=None):
+@@ -1921,7 +1934,7 @@
+             if kind == "sep" and w in (";", "&&"):
+                 # The statement ended: N is bound from token `idx` on. (value, needs_quote,
+                 # commit index): IFS whitespace in the value binds only at a quoted use.
+-                found.known[name_] = (val_, any(c in val_ for c in " \t\n"), idx)
++                found.known[name_] = (val_, ifs_touched or any(c in val_ for c in " \t\n"), idx)
+         if kind == "sep" and w == "(":
+             bind["paren"] += 1
+         elif kind == "sep" and w == ")":
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -382,6 +382,31 @@
+             ("lit-after-a-python-c-literal",
+              "python3 -c \"print(open('/tmp/review-probe').read())\"; S=/tmp/review-probe; cat $S/x"),
+         ]
++        # Codex's quote runner (docs/reviews/scope-1232-quote-regressions.py, notice 20554,
++        # 33bddc1c) and the marker / IFS rows that generalise it (2026-10-12).
++        deny += [
++            ('codex-quote-custom-ifs-splits-literal', 'IFS=:; S=/tmp:/etc; cat $S/hostname'),
++            ('codex-quote-raw-quote-marker', 'S="/tmp/x /etc"; cat \x04$S/hostname'),
++            ('codex-quote-single-quoted-marker', 'S="/tmp/x /etc"; cat \'\x04\'$S/hostname'),
++            ('codex-quote-whitespace-unquoted-control', 'S="/tmp/x /etc"; cat $S/hostname'),
++            ('codex-quote-mixed-quoted-unquoted-control', 'S="/tmp/x /etc"; cat "$S"$S/hostname'),
++            ('codex-quote-newline-unquoted-control', 'S="/tmp/x\n/etc"; cat $S/hostname'),
++            ('quote-marker-byte-00', 'S=/tmp/x; cat \x00$S/hostname'),
++            ('quote-marker-byte-01', 'S=/tmp/x; cat \x01$S/hostname'),
++            ('quote-marker-byte-02', 'S=/tmp/x; cat \x02$S/hostname'),
++            ('quote-marker-byte-03', 'S=/tmp/x; cat \x03$S/hostname'),
++            ('quote-marker-byte-04', 'S=/tmp/x; cat \x04$S/hostname'),
++            ('quote-marker-byte-05', 'S=/tmp/x; cat \x05$S/hostname'),
++            ('quote-marker-byte-in-single-quotes', "S=/tmp/x; cat '\x00'$S/hostname"),
++            ('quote-ifs-prefix-assignment', 'S=/tmp:/etc; IFS=: cat $S/hostname'),
++            ('quote-ifs-append', 'IFS+=:; S=/tmp:/etc; cat $S/hostname'),
++            ('quote-ifs-after-binding', 'S=/tmp:/etc; IFS=:; cat $S/hostname'),
++        ]
++        allow += [
++            ('codex-quote-custom-ifs-quoted-control', 'IFS=:; S=/tmp:/etc; cat "$S/hostname"'),
++            ('codex-quote-whitespace-quoted-control', 'S="/tmp/x /etc"; cat "$S/hostname"'),
++            ('codex-quote-simple-literal-control', 'S=/tmp/x; cat $S/hostname'),
++        ]
+         # Codex's two #1232 regression runners (docs/reviews/scope-1232-shell-regressions.py and
+         # scope-1232-literal-regressions.py, notice 20536, bc1ea92b) as INVARIANTS: every
+         # refusal case is refused (a path or a scope request), every positive control allowed.

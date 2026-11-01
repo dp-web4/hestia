@@ -171,6 +171,17 @@ CASES = [
      "git apply /tmp/definitely-missing-xyz.patch", "write", OPQ),
     ("git_apply__no_input_at_all_fails_closed",
      "git apply", "write", OPQ),
+    # --- read-only apply flags never write, so patch readability is out of scope (kimi
+    # #1175 FP hotspot: this cell was 5 of 13 withdrawals in one reviewed morning; making
+    # the right path the efficient path means the grammar learns the flag) ---
+    ("git_apply_stat__missing_patch_is_read_only",
+     "git apply --stat /tmp/definitely-missing-xyz.patch", "none", None),
+    ("git_apply_check__missing_patch_is_read_only",
+     "git apply --check /tmp/definitely-missing-xyz.patch", "none", None),
+    ("git_apply_numstat_summary__read_only",
+     "git apply --numstat --summary /tmp/definitely-missing-xyz.patch", "none", None),
+    ("git_apply_stat_reapply__rearms_write",
+     f"git apply --stat --apply {BENIGN_DIR}/closure.patch", "write", RULE_W),
     ("git_am__mbox_with_closure_diff",
      f"git am {BENIGN_DIR}/closure.patch", "write", RULE_W),
     ("git_am__missing_mbox_fails_closed",

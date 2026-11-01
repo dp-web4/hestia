@@ -22,10 +22,8 @@ use web4_core::crypto::KeyPair;
 use web4_core::lct::{EntityType, Lct};
 use web4_core::{Attestation, CitizenshipRecord, PublicKey};
 
-/// The purpose string hestia vouches under (`member_registry::vouch_witnessing_key`).
-/// Test-local on purpose: it is a bare literal in both repos today, which is the
-/// whole of C4. When `WITNESS_KEY_PURPOSE` is exported, this becomes an import.
-const HESTIA_WITNESS_PURPOSE: &str = "witnessing";
+/// The purpose string hestia vouches under: web4-core's exported constant, imported (C4).
+use hestia::witness::WITNESS_KEY_PURPOSE as HESTIA_WITNESS_PURPOSE;
 
 fn subject() -> String {
     Lct::new(EntityType::AiSoftware, None).0.lct_id()
@@ -54,22 +52,23 @@ fn resolver(registry: &[Lct]) -> impl Fn(&str) -> Option<PublicKey> + '_ {
     }
 }
 
-/// **C1 — distinctness is over the witness ID STRING, not the signing KEY.**
+/// **C1 — distinctness is over the signing KEY as well as the witness id (R1).**
 ///
 /// `hestia witness onboard <plugin_id>` vouches
 /// `member_signing_keypair(vault, &conn.member_key_source)` — a function of the
 /// hub CONNECTION, not of `plugin_id`. Onboarding three members of one
 /// constellation against one connection therefore vouches ONE key onto three
-/// LCTs, and `witness attest --as` signs all three with it. Three witness ids,
-/// one signer, quorum met: the canon's "three entries that are one witness are
-/// not a quorum" holds at the id layer and not at the key layer, where the
-/// independence it is protecting actually lives.
+/// LCTs, and `witness attest --as` signs all three with it. Until R1 that was a
+/// passing quorum: the canon's "three entries that are one witness are not a
+/// quorum" held at the id layer and not at the key layer, where the
+/// independence it protects lives.
 ///
-/// Should move to: dedup on the RESOLVED KEY as well as the id — in the
-/// producer (`valid_distinct_existence`) so a certificate like this is never
-/// built, and in the verifier's stated contract so an existing one is caught.
+/// Now the producer (`valid_distinct_existence`) and its diagnostic mirror
+/// (`QuorumReport::assess`) both dedup on the resolved key: no certificate is
+/// built, and the report names the shared key as the cause instead of a bare
+/// "quorum not met". (The verifier half is web4-core's, HUB's R2.)
 #[test]
-fn c1_three_witness_ids_backed_by_one_key_currently_pass() {
+fn c1_three_witness_ids_backed_by_one_key_are_one_witness() {
     let sid = subject();
     let ts = fixed_ts();
     let shared_op = KeyPair::generate();
@@ -79,7 +78,7 @@ fn c1_three_witness_ids_backed_by_one_key_currently_pass() {
         .map(|m| hestia::witness::attest(&sid, &m.lct_id(), ts, &shared_op))
         .collect();
 
-    let (certificate, attestations) = hestia::witness::build_birth_certificate(
+    let built = hestia::witness::build_birth_certificate(
         &sid,
         "lct:web4:role:citizen",
         "lct:web4:society:test",
@@ -87,22 +86,25 @@ fn c1_three_witness_ids_backed_by_one_key_currently_pass() {
         &atts,
         ts,
         resolver(&registry),
-    )
-    .expect("the producer builds this certificate today");
-    let record = CitizenshipRecord { certificate, attestations };
-
-    let distinct_keys: std::collections::BTreeSet<String> = record
-        .attestations
-        .iter()
-        .filter_map(|a| resolver(&registry)(&a.witness).map(|k| k.to_hex()))
-        .collect();
-
-    assert_eq!(record.certificate.birth_witnesses.len(), 3, "three declared witnesses");
-    assert_eq!(distinct_keys.len(), 1, "backed by exactly one signing key");
-    assert!(
-        record.verify_quorum(&sid, resolver(&registry)),
-        "MEASURED (to be fixed): the quorum passes on three spellings of one key"
     );
+    assert!(built.is_none(), "three spellings of one key are not a quorum: no certificate is built");
+
+    let report = hestia::witness::QuorumReport::assess(&sid, &atts, resolver(&registry));
+    assert_eq!(report.distinct_valid.len(), 1, "one key counts once: {report:?}");
+    assert_eq!(report.shared_key.len(), 2, "the other two are named as the same key: {report:?}");
+    assert!(report.duplicate_witness.is_empty(), "they are different ids, not repeats: {report:?}");
+    assert!(!report.quorum_met());
+    assert!(report.explain().contains("same key"), "{}", report.explain());
+
+    // three witnesses with three keys still make a quorum
+    let ops: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+    let registry: Vec<Lct> = ops.iter().map(|op| onboarded(op).0).collect();
+    let atts: Vec<Attestation> = registry
+        .iter()
+        .zip(&ops)
+        .map(|(m, op)| hestia::witness::attest(&sid, &m.lct_id(), ts, op))
+        .collect();
+    assert!(hestia::witness::QuorumReport::assess(&sid, &atts, resolver(&registry)).quorum_met());
 }
 
 /// **C2 — declared-witness coverage is checked against a LIVE resolver, so more
@@ -195,9 +197,9 @@ fn c2_one_witness_rotating_voids_a_four_witness_certificate() {
 /// JSON store, a JS client, a `TIMESTAMP(3)` column — silently invalidates the
 /// signature, and the verifier reports the generic "quorum not met".
 ///
-/// Should move to: the producer truncates to whole seconds before signing.
-/// Measured below: a second-precision attestation survives both a JSON
-/// round-trip and a millisecond normalisation, because truncating it is a no-op.
+/// Now (R4) the producer truncates to whole seconds before signing, so an
+/// attestation made at `Utc::now()` survives both a JSON round-trip and a
+/// millisecond normalisation: truncating it again is a no-op.
 #[test]
 fn c3_second_precision_is_the_only_ts_that_survives_a_lossy_hop() {
     let sid = subject();
@@ -208,11 +210,12 @@ fn c3_second_precision_is_the_only_ts_that_survives_a_lossy_hop() {
     assert!(as_signed.verify(&sid, &op.verifying_key()), "verifies as signed");
 
     let mut lossy = as_signed.clone();
-    lossy.ts = Utc.timestamp_millis_opt(now.timestamp_millis()).unwrap();
+    lossy.ts = Utc.timestamp_millis_opt(as_signed.ts.timestamp_millis()).unwrap();  // the hop normalises what was signed
     assert!(
-        !lossy.verify(&sid, &op.verifying_key()),
-        "MEASURED: a millisecond hop breaks a nanosecond-precision attestation"
+        lossy.verify(&sid, &op.verifying_key()),
+        "R4: attest() truncated to whole seconds, so a millisecond hop changes nothing"
     );
+    assert_eq!(as_signed.ts.timestamp_subsec_nanos(), 0, "signed at whole-second precision");
 
     let truncated = hestia::witness::attest(
         &sid,
@@ -230,25 +233,20 @@ fn c3_second_precision_is_the_only_ts_that_survives_a_lossy_hop() {
     );
 }
 
-/// **C4 — the purpose string is a cross-repo literal with two spellings.**
+/// **C4 — the purpose string is ONE constant across both repos.**
 ///
-/// hestia vouches and resolves `"witnessing"` (`member_registry.rs`, `cli.rs`).
-/// web4-core's `OperationalKey::purpose` doc comment says `e.g. "witness"`, and
-/// so do its tests. A hub-side resolver written from web4-core's own example
-/// resolves `None` for every real witness and reports "quorum not met" — a
-/// spelling mismatch wearing the costume of a governance failure.
-///
-/// Should move to: `WITNESS_KEY_PURPOSE` exported from web4-core, with the doc
-/// comment and tests using it. This test is pinned to `HESTIA_WITNESS_PURPOSE`
-/// so it follows the constant once it exists.
+/// It was a bare literal in each: hestia vouched and resolved `"witnessing"`, while
+/// web4-core's doc comment and tests said `"witness"`. A hub-side resolver written from
+/// that example resolved `None` for every real witness and reported "quorum not met".
+/// web4-core now exports `WITNESS_PURPOSE`; hestia's `WITNESS_KEY_PURPOSE` is that
+/// constant, re-exported, so a resolver on either side keys on the same value.
 #[test]
-fn c4_the_other_purpose_spelling_resolves_to_nothing() {
+fn c4_the_witness_purpose_is_web4_cores_constant() {
+    assert_eq!(HESTIA_WITNESS_PURPOSE, web4_core::WITNESS_PURPOSE, "one constant, both repos");
     let (lct, _binding) = onboarded(&KeyPair::generate());
-    assert!(lct.operational_key_for(HESTIA_WITNESS_PURPOSE).is_some());
-    assert!(
-        lct.operational_key_for("witness").is_none(),
-        "MEASURED: web4-core's documented spelling resolves None against a real vouch"
-    );
+    assert!(lct.operational_key_for(web4_core::WITNESS_PURPOSE).is_some());
+    // the old documented spelling still resolves nothing, which is why it is a constant now
+    assert!(lct.operational_key_for("witness").is_none());
 }
 
 /// **C5 — the subject id is inside the signed bytes, and two id spaces are live.**
@@ -274,4 +272,33 @@ fn c5_an_attestation_over_the_other_id_space_can_never_verify() {
         !att.verify(&mb32, &op.verifying_key()),
         "MEASURED: and worthless under the id the registry knows"
     );
+}
+
+/// **R6 — a subject that is not the canonical key-derived id is refused by name**, at the
+/// CLI before the vault, and in the quorum: the authority counts nothing over it and the
+/// report says why, instead of a bare "quorum not met".
+#[test]
+fn r6_a_non_canonical_subject_is_refused_with_its_reason() {
+    use hestia::witness::{canonical_subject_id, is_canonical_lct_id, SubjectIdError};
+    let real = web4_core::derive_lct_id(&KeyPair::generate().verifying_key());
+    assert!(is_canonical_lct_id(&real), "a derived id passes: {real}");
+    assert!(matches!(canonical_subject_id("lct:web4:member:1b4e28ba-2fa1-11d2-883f-0016d3cca427"),
+                     Err(SubjectIdError::MembershipIdSpace(_))));
+    assert!(matches!(canonical_subject_id("lct:web4:role:citizen"), Err(SubjectIdError::WrongSpace(_))));
+    assert!(matches!(canonical_subject_id("lct:web4:mb32:bsubject"), Err(SubjectIdError::BodyLength { got: 7 })));
+    // 52 well-formed characters whose last carries non-zero padding bits ('b' is neither 'a' nor 'q')
+    let bad_tail = format!("{}b", &real[..real.len() - 1]);
+    assert!(matches!(canonical_subject_id(&bad_tail), Err(SubjectIdError::PaddingBits { last: 'b' })));
+
+    // three independent witnesses over a stand-in subject: nothing counts, and the cause is named
+    let ts = fixed_ts();
+    let ops: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+    let registry: Vec<Lct> = ops.iter().map(|op| onboarded(op).0).collect();
+    let stand_in = "lct:web4:mb32:bsubject";
+    let atts: Vec<Attestation> = registry.iter().zip(&ops)
+        .map(|(m, op)| hestia::witness::attest(stand_in, &m.lct_id(), ts, op)).collect();
+    let report = hestia::witness::QuorumReport::assess(stand_in, &atts, resolver(&registry));
+    assert!(report.subject_refused.is_some() && report.distinct_valid.is_empty(), "{report:?}");
+    assert!(report.explain().contains("cannot be attested"), "{}", report.explain());
+    assert!(hestia::witness::valid_distinct_existence(stand_in, &atts, resolver(&registry)).is_empty());
 }

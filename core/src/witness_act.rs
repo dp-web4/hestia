@@ -34,6 +34,9 @@ fn address_parts(address: &ActAddress) -> (&'static str, String) {
         ActAddress::Citizen { lct_id } => ("citizen", lct_id.to_string()),
         ActAddress::Role { role } => ("role", role.clone()),
         ActAddress::Society { lct_id } => ("society", lct_id.to_string()),
+        // web4#907 (member-of routing B2a): the true destination of a routed act. The kind
+        // string is the variant's serde tag, like every arm above.
+        ActAddress::Lct { canonical } => ("lct", canonical.clone()),
     }
 }
 
@@ -232,5 +235,19 @@ mod tests {
         // from ActDigestV1Fields, so A's mark survived B's attachment.
         assert!(verify_witness(&act, &mark_a, &a.verifying_key()).unwrap());
         assert!(verify_witness(&act, &mark_b, &b.verifying_key()).unwrap());
+    }
+
+    #[test]
+    fn an_lct_addressed_act_is_witnessed_under_its_true_destination() {
+        let mut act = an_act();
+        act.address = ActAddress::Lct { canonical: "lct:web4:mb32:child".to_string() };
+        assert_eq!(address_parts(&act.address), ("lct", "lct:web4:mb32:child".to_string()));
+        let kp = KeyPair::generate();
+        let mark = sign_act(&act, &kp, Uuid::new_v4(), "verified").unwrap();
+        assert!(verify_witness(&act, &mark, &kp.verifying_key()).unwrap());
+        // Re-pointing the destination (e.g. at the router) after witnessing breaks the mark.
+        let mut rerouted = act.clone();
+        rerouted.address = ActAddress::Lct { canonical: "lct:web4:mb32:router".to_string() };
+        assert!(!verify_witness(&rerouted, &mark, &kp.verifying_key()).unwrap());
     }
 }

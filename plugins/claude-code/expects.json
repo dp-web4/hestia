@@ -5,6 +5,8 @@
   "install": {
     "member": "claude-code",
     "dest": "~/.claude/hooks/hestia",
+    "default_role": "role:constellation:interactive-dev",
+    "_default_role_note": "HESTIA_ROLE is launch context, never config: the seat loader refuses it from the vault projection, so the hook line is the only place a default can live. deploy/register-members.py renders it as a pass-through, HESTIA_ROLE=\"${HESTIA_ROLE:-<this>}\", on the gate and witness lines, so a launcher that knows better (a mesh fire, a watcher unit) still overrides it. The value is what this seat registered by hand before the reconciler (dp 2026-10-06).",
     "registration": {
       "reader": "json-hook-commands",
       "path": [
@@ -18,6 +20,13 @@
       "hooks/law_inject.py",
       "hooks/disposition_deliver.py"
     ],
+    "mesh_member": "claude-code",
+    "requires": [
+      "member-mesh/session-mesh-inbox.sh",
+      "member-mesh/prompt-disposition-watch.sh",
+      "member-mesh/hestia-mesh.py"
+    ],
+    "_mesh_member_note": "#1373: this member carries the member mesh. install-members.sh installs plugins/member-mesh/RUNTIME_MANIFEST.txt's files (the two mesh hooks this member's template registers, and the CLI they call from their own directory) into the directory its harness runs the mesh hooks from, and records them in the manifest. The value is the member's mesh id, pinned on the template's mesh lines.",
     "gate_probe": {
       "entry": "hooks/pre_tool_use.py",
       "environment": {
