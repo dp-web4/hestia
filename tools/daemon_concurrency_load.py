@@ -220,7 +220,7 @@ def worker(idx, args, stop, out, lock):
             law = step("operating_law", lambda: c.tool("hestia_operating_law", {"session_id": sid}))
             if "law_hash" not in law:
                 raise RuntimeError(f"operating_law: {str(law)[:160]}")
-            step("scope_status", lambda: c.tool("hestia_scope_status", {"plugin_id": member}))
+            step("scope_status", lambda: c.tool("hestia_scope_status", {"plugin_id": member, "session_id": sid}))
             rec["snapshot"] = time.monotonic() - t0
             if args.witness:
                 w0 = time.monotonic()

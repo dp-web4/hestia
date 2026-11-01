@@ -172,7 +172,7 @@ jobs:
           # builds on windows (vendored OpenSSL), so the remaining work is cfg-gating
           # the Unix file-mode calls — filed as #342. Linux + macOS cover the fleet.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
     steps:
       # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
       # green. hestia/core has path deps into ../../web4/..., so the release must
@@ -270,7 +270,7 @@ jobs:
             os: ubuntu-22.04
             bundles: appimage,deb
           - platform: aarch64-macos
-            os: macos-14
+            os: macos-15
             bundles: app,dmg
     steps:
       # app/src-tauri path-depends on ../../../web4/web4-core: the same sibling layout and the
@@ -532,6 +532,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write   # dispatch install smoke at the end (see the last step)
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -633,3 +634,16 @@ jobs:
             --assemble "$ASSEMBLE" --kind "$KIND" --notes notes.md
           gh api "repos/$GH_REPO/releases/${{ steps.rel.outputs.id }}" \
             --jq '{html_url, draft, prerelease, assets: (.assets | length)}'
+
+      # A release this job publishes with GITHUB_TOKEN does NOT fire install-smoke's
+      # `release: published` trigger (GitHub suppresses events from GITHUB_TOKEN, except
+      # workflow_dispatch), so until v0.3.0-rc.5 no published release had ever been
+      # fresh-installed by CI. When it finally was, it caught a curl | sh install that had
+      # died at the systemd unit since July (#1458). Dispatch it explicitly, at the tag, so
+      # the smoke is the one that shipped with this release.
+      - name: Dispatch install smoke for this release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run install-smoke.yml --repo "$GH_REPO" --ref "$TAG" -f tag="$TAG"
+          echo "install smoke dispatched for $TAG: gh run list --workflow install-smoke.yml --repo $GH_REPO"
