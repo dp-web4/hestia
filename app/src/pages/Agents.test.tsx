@@ -155,7 +155,7 @@ describe("Agents", () => {
     expect(agentGateRestore).toHaveBeenCalledWith("codex");
   });
 
-  it("keeps the bypass input and focus during refresh while hiding lifecycle controls", async () => {
+  it("keeps the bypass input and focus during refresh while disabling lifecycle actions", async () => {
     let resolve!: (value: AgentInventory) => void;
     const pending = new Promise<AgentInventory>((yes) => { resolve = yes; });
     operatorStatus.mockResolvedValue(signedIn);
@@ -168,13 +168,40 @@ describe("Agents", () => {
     fireEvent.change(input, { target: { value: "investigating gate" } });
     input.focus();
     fireEvent.focus(window);
-    expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
-    expect(screen.getByRole("textbox")).toBe(input);
+    expect((screen.getByRole("button", { name: "Retire" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getAllByRole("textbox")).toContain(input);
     expect(document.activeElement).toBe(input);
     expect(input.value).toBe("investigating gate");
     await act(async () => resolve(inventory([gated])));
     expect(await screen.findByRole("button", { name: "Retire" })).toBeTruthy();
     expect(screen.getAllByRole("textbox")).toContain(input);
+  });
+
+  it("preserves retirement inputs during refresh and removes an invalidated offer", async () => {
+    let resolve!: (value: AgentInventory) => void;
+    const pending = new Promise<AgentInventory>((yes) => { resolve = yes; });
+    operatorStatus.mockResolvedValue(signedIn);
+    agentsInventory.mockResolvedValueOnce(inventory([claude])).mockReturnValueOnce(pending)
+      .mockResolvedValueOnce(inventory([claude, { ...codex, plugin: "caude-code" }]));
+    getDashboard.mockResolvedValue({ retired: [], members: ["caude-code"], trust: [] });
+    render(<Agents />);
+    const button = await screen.findByRole("button", { name: "Retire" }) as HTMLButtonElement;
+    const [reason, reference] = screen.getAllByRole("textbox") as HTMLInputElement[];
+    fireEvent.change(reason, { target: { value: "typo" } });
+    fireEvent.change(reference, { target: { value: "issue 123" } });
+    reference.focus();
+    fireEvent.focus(window);
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(retireAgent).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(reference);
+    expect(reason.value).toBe("typo");
+    expect(reference.value).toBe("issue 123");
+    await act(async () => resolve(inventory([claude])));
+    await waitFor(() => expect(button.disabled).toBe(false));
+    expect(reference.value).toBe("issue 123");
+    fireEvent.focus(window);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Retire" })).toBeNull());
   });
 
   describe("Sprint 3b — retire / reinstate a member nothing here accounts for", () => {
@@ -213,7 +240,7 @@ describe("Agents", () => {
       render(<Agents />);
       await screen.findByRole("button", { name: "Retire" });
       fireEvent.focus(window);
-      expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
+      expect((screen.getByRole("button", { name: "Retire" }) as HTMLButtonElement).disabled).toBe(true);
       expect(await screen.findByText(/offline/)).toBeTruthy();
       expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
     });

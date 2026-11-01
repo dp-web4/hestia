@@ -113,9 +113,11 @@ export function unaccountedMembers(
 
 function MemberLifecycle({
   m,
+  inventoryFresh,
   onActed,
 }: {
   m: UnaccountedMember;
+  inventoryFresh: boolean;
   onActed: () => void;
 }) {
   const [reason, setReason] = useState("");
@@ -127,6 +129,7 @@ function MemberLifecycle({
   const [confirm, setConfirm] = useState(false);
 
   const act = async () => {
+    if (!inventoryFresh) return;
     setBusy(true);
     setMsg(null);
     try {
@@ -181,7 +184,7 @@ function MemberLifecycle({
           </label>
         </div>
       )}
-      <button disabled={busy || (!!question && !confirm)} onClick={act}>
+      <button disabled={!inventoryFresh || busy || (!!question && !confirm)} onClick={act}>
         {m.retired ? "Reinstate" : "Retire"}
       </button>
       {msg && <p className="muted">{msg}</p>}
@@ -203,8 +206,8 @@ export function Agents() {
 
   const refresh = useCallback(async () => {
     const generation = ++refreshGeneration.current;
-    // Keep the gate table mounted while withholding lifecycle controls until
-    // the current inventory and registry have both been read.
+    // Keep forms mounted, but disable lifecycle actions until the current
+    // inventory and registry have both been read.
     setInventoryFresh(false);
     try {
       const st = await operatorStatus();
@@ -271,7 +274,7 @@ export function Agents() {
   };
   const dormant = inv?.gaps?.dormant_plugin ?? [];
   const ungoverned = inv?.gaps?.ungoverned ?? [];
-  const orphans = status?.signed_in && inventoryFresh ? unaccountedMembers(inv, snap) : [];
+  const orphans = status?.signed_in ? unaccountedMembers(inv, snap) : [];
 
   return (
     <div className="page">
@@ -430,6 +433,7 @@ export function Agents() {
             this seat; it is not deletion, and it is reversible — but reinstating does not give the
             authority back.
           </p>
+          {!inventoryFresh && <p className="muted">Refreshing inventory; lifecycle actions are unavailable until current evidence arrives.</p>}
           {orphans.map((m) => (
             <article key={m.id} className="section" data-orphan={m.id}>
               <h3>
@@ -439,7 +443,7 @@ export function Agents() {
                   {m.retired ? " · retired on this seat" : ""}
                 </span>
               </h3>
-              <MemberLifecycle m={m} onActed={refresh} />
+              <MemberLifecycle m={m} inventoryFresh={inventoryFresh} onActed={refresh} />
             </article>
           ))}
         </section>
