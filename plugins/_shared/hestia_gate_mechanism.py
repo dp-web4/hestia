@@ -1385,7 +1385,12 @@ def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None, dead
     `deadline` (stage C): no request starts after it (raises TimeoutError; the tally's caller
     swallows it, accounting never changes a decision).
     """
-    endpoint = endpoint or os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+    # #944: the endpoint is configuration. With none projected, attest nothing; never a
+    # guessed port (2026-10-06: a fallback to :7711 reached the live daemon from a CI
+    # harness and opened four real escalations under other members' names, #1246).
+    endpoint = endpoint or _discover_endpoint()
+    if endpoint is None:
+        return None
 
     def post(payload, timeout, hdrs=None):
         timeout = _step_timeout(timeout, deadline)
@@ -1492,8 +1497,12 @@ def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=
     gate-self session this call mints joins to the per-wake session the outcome rows carry.
 
     `deadline` (stage C): an absolute `time.monotonic()` bound. Each step keeps its fixed budget
-    but never runs past it, and no step starts after it (that is a None: refusal or loss)."""
-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+    but never runs past it, and no step starts after it (that is a None: refusal or loss).
+
+    No endpoint discovered (#944) is a None too: nothing is sent to a guessed port."""
+    endpoint = _discover_endpoint()
+    if endpoint is None:
+        return None
 
     def post(payload, hdrs, timeout):
         timeout = _step_timeout(timeout, deadline)
@@ -1756,8 +1765,12 @@ def scope_call(tool, args, *, plugin_id, role, client_name, host_session_id=None
     capped by it, so a slow connect can never let the MUTATING call go out after the caller has
     already decided. Returns the result dict, or None when nothing was sent (out of time before
     the mutating call), or `SCOPE_UNCERTAIN` when the mutating call was SENT and no answer came —
-    the daemon may have applied it. Never raises."""
-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+    the daemon may have applied it. Never raises.
+
+    No endpoint discovered (#944) is None: nothing was sent, to any port."""
+    endpoint = _discover_endpoint()
+    if endpoint is None:
+        return None
     end = deadline if deadline is not None else time.monotonic() + 3.0
 
     def left(cap):

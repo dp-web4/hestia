@@ -5,9 +5,8 @@ On 2026-10-06 (#1246) a CI harness ran gates whose registration carried no HESTI
 decision path refused, but the side paths fell back to http://127.0.0.1:7711/mcp, reached the live
 daemon, and opened four real escalations under codex's and kimi-code's names.
 
-Loads the mechanism named by HESTIA_MECH_UNDER_TEST (default: the repo's), so the same rows run
-against main (expected to FAIL rows 1-3) and the held result (expected to pass all).
-Run: HESTIA_MECH_UNDER_TEST=<out>/mech_rev.py python3 held/build-944e/endpoint_fallback_test.py
+Applied 2026-11-01 (escalation 29f13b3bc3bb8d4c); held until then as held/build-944e. Loads the mechanism
+named by HESTIA_MECH_UNDER_TEST (default: the repo's); the pre-#944 mechanism fails rows 1-3.
 """
 import importlib.util
 import os
