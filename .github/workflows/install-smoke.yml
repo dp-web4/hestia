@@ -10,7 +10,9 @@ name: install smoke
 #
 # What runs:
 #   release published   the installer AT THAT TAG (raw URL, as `curl | bash` would fetch it),
-#                       installing that tag.
+#                       installing that tag. Fires only for a release a PERSON publishes:
+#                       release.yml publishes with GITHUB_TOKEN, which fires no events, so
+#                       it dispatches this workflow itself as its last step.
 #   workflow_dispatch   the same, for a tag you name (re-check an existing release).
 #   pull_request        the installer FROM THE PR against the newest release, pre-releases
 #                       included, so an installer change is tested before it ships.
