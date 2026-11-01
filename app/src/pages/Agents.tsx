@@ -191,6 +191,7 @@ function MemberLifecycle({
 
 export function Agents() {
   const [inv, setInv] = useState<AgentInventory | null>(null);
+  const [inventoryFresh, setInventoryFresh] = useState(false);
   const [retired, setRetired] = useState<string[]>([]);
   const [snap, setSnap] = useState<DashboardSnapshot | null>(null);
   const [status, setStatus] = useState<OperatorStatus | null>(null);
@@ -202,8 +203,9 @@ export function Agents() {
 
   const refresh = useCallback(async () => {
     const generation = ++refreshGeneration.current;
-    // Hide lifecycle controls while their supporting inventory is refreshed.
-    setInv(null);
+    // Keep the gate table mounted while withholding lifecycle controls until
+    // the current inventory and registry have both been read.
+    setInventoryFresh(false);
     try {
       const st = await operatorStatus();
       if (generation !== refreshGeneration.current) return;
@@ -219,6 +221,7 @@ export function Agents() {
       setRetired(snap.retired ?? []);
       setSnap(snap);
       setError(null);
+      setInventoryFresh(true);
     } catch (e) {
       if (generation !== refreshGeneration.current) return;
       setError(String(e));
@@ -268,7 +271,7 @@ export function Agents() {
   };
   const dormant = inv?.gaps?.dormant_plugin ?? [];
   const ungoverned = inv?.gaps?.ungoverned ?? [];
-  const orphans = status?.signed_in ? unaccountedMembers(inv, snap) : [];
+  const orphans = status?.signed_in && inventoryFresh ? unaccountedMembers(inv, snap) : [];
 
   return (
     <div className="page">

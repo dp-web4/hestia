@@ -155,6 +155,28 @@ describe("Agents", () => {
     expect(agentGateRestore).toHaveBeenCalledWith("codex");
   });
 
+  it("keeps the bypass input and focus during refresh while hiding lifecycle controls", async () => {
+    let resolve!: (value: AgentInventory) => void;
+    const pending = new Promise<AgentInventory>((yes) => { resolve = yes; });
+    operatorStatus.mockResolvedValue(signedIn);
+    agentsInventory.mockResolvedValueOnce(inventory([gated])).mockReturnValueOnce(pending);
+    getDashboard.mockResolvedValue({ retired: [], members: ["caude-code"], trust: [] });
+    render(<Agents />);
+    await screen.findByRole("button", { name: "Retire" });
+    fireEvent.click(screen.getByText("bypass gate…"));
+    const input = screen.getAllByRole("textbox").find((el) => el.closest(".bypass-confirm")) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "investigating gate" } });
+    input.focus();
+    fireEvent.focus(window);
+    expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
+    expect(screen.getByRole("textbox")).toBe(input);
+    expect(document.activeElement).toBe(input);
+    expect(input.value).toBe("investigating gate");
+    await act(async () => resolve(inventory([gated])));
+    expect(await screen.findByRole("button", { name: "Retire" })).toBeTruthy();
+    expect(screen.getAllByRole("textbox")).toContain(input);
+  });
+
   describe("Sprint 3b — retire / reinstate a member nothing here accounts for", () => {
     const trust = (plugin_id: string, action_count: number, aliased_to?: string) =>
       ({ plugin_id, action_count, aliased_to }) as never;
