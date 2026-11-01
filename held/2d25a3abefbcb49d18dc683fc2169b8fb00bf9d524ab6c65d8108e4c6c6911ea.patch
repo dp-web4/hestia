@@ -53,8 +53,8 @@ diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
    ],
    "engine": null,
    "requires": [],
--  "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179"
-+  "gt_version": "ee1512bc0455b5b67aeb18d28b7d1b87a72af605aa150b071c4b54b98fd9b567"
+-  "gt_version": "76a7b999ea9193c7de3e3d332a7e59629d66156b47adf072a640a38869d32006"
++  "gt_version": "fe2c0eb08b32d53ac1db9b9527fd5091075249bfc954c089c70d5c6f61a20d63"
  }
 diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
 --- a/hooks-gt/claude-code/manifest.json
@@ -63,8 +63,8 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
    ],
    "engine": {
      "unit": "_shared",
--    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
-+    "gt_version": "ee1512bc0455b5b67aeb18d28b7d1b87a72af605aa150b071c4b54b98fd9b567",
+-    "gt_version": "76a7b999ea9193c7de3e3d332a7e59629d66156b47adf072a640a38869d32006",
++    "gt_version": "fe2c0eb08b32d53ac1db9b9527fd5091075249bfc954c089c70d5c6f61a20d63",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -81,8 +81,8 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
        "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
      }
    ],
--  "gt_version": "d26f719f133a611cda3d6b91f724479478058885035e74bfb4842e628216f4d0"
-+  "gt_version": "665f91b3100c5db41ce11fa46a1c75a0670bc90f4f9dd3210627bc906541cc5e"
+-  "gt_version": "75ccefa2cbe55eb4903bf49680961b13c40765efb8e9d5dce942dd84a21f2bda"
++  "gt_version": "f047ad169da94aa9999096e49089a4e002392598edcd242581d251a562f158bc"
  }
 diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
 --- a/hooks-gt/codex/manifest.json
@@ -91,8 +91,8 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
    ],
    "engine": {
      "unit": "_shared",
--    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
-+    "gt_version": "ee1512bc0455b5b67aeb18d28b7d1b87a72af605aa150b071c4b54b98fd9b567",
+-    "gt_version": "76a7b999ea9193c7de3e3d332a7e59629d66156b47adf072a640a38869d32006",
++    "gt_version": "fe2c0eb08b32d53ac1db9b9527fd5091075249bfc954c089c70d5c6f61a20d63",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -109,8 +109,8 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
        "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
      }
    ],
--  "gt_version": "cd9be17d272ee05c7d6789b4fb442a9e62e1259d15cbc112a449edbba3ecf064"
-+  "gt_version": "4e4c8ef516e4b256a111e7f9b80e3b833bc1d5b96b4499be2fe49bfc84aa0c98"
+-  "gt_version": "23bbbec59481d5117ddb41e2959a0c8377220a47d07a5bc4fcd57b3d547c30a2"
++  "gt_version": "bd043e443ab93fe9b4fb4c2af7b3137f10852ddca33748191ebc9875de24d737"
  }
 diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
 --- a/hooks-gt/gemini/manifest.json
@@ -119,8 +119,8 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
    ],
    "engine": {
      "unit": "_shared",
--    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
-+    "gt_version": "ee1512bc0455b5b67aeb18d28b7d1b87a72af605aa150b071c4b54b98fd9b567",
+-    "gt_version": "76a7b999ea9193c7de3e3d332a7e59629d66156b47adf072a640a38869d32006",
++    "gt_version": "fe2c0eb08b32d53ac1db9b9527fd5091075249bfc954c089c70d5c6f61a20d63",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -137,8 +137,8 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
      ]
    },
    "requires": [],
--  "gt_version": "fa321587c9448ed240d3719ddc5770eed11c5dea953f24ad30f561ead887c8a0"
-+  "gt_version": "7daa46a71e426048bfaf5b7ad020724feed2907a927df261f322a04459723ba5"
+-  "gt_version": "6d953a635372116fdea2635ef74d1cf1637486f97b6fc3bf2e34fd1b9f0cc569"
++  "gt_version": "024c0363c392126210fd1fd8d2b88d5091f02584d36633c6ebeadae3b542ce1e"
  }
 diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
 --- a/hooks-gt/kimi/manifest.json
@@ -147,8 +147,8 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
    ],
    "engine": {
      "unit": "_shared",
--    "gt_version": "d1f11db0cf725a1b6034f2418cc1e070371355844ccff8358e946e85f28e7179",
-+    "gt_version": "ee1512bc0455b5b67aeb18d28b7d1b87a72af605aa150b071c4b54b98fd9b567",
+-    "gt_version": "76a7b999ea9193c7de3e3d332a7e59629d66156b47adf072a640a38869d32006",
++    "gt_version": "fe2c0eb08b32d53ac1db9b9527fd5091075249bfc954c089c70d5c6f61a20d63",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -165,6 +165,6 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
        "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
      }
    ],
--  "gt_version": "2a561c893e4cf9d3c16a247e2f60c4b27e9c3fa98c85073f5085617d06b091c0"
-+  "gt_version": "75c464f1c0ff6a04a928329bc8007d78464f4a1a6d657944bc479050064f38c5"
+-  "gt_version": "f80f1ab23c9219ff746f0baf3ee85c16d51d3e7a64b47c58bc1f6557d7d6d95a"
++  "gt_version": "0e137d5cf7c7de8d31778573f97bde7777dd1d3e01d305ce734e724b6fb2d30e"
  }
