@@ -1891,6 +1891,7 @@ pub async fn serve_with_callback(
         .route("/api/agents/:id/delegations", get(agent_delegations_list).post(agent_delegation_grant))
         .route("/api/agents/:id/delegations/:deleg/revoke", post(agent_delegation_revoke))
         .route("/api/agents/:id/retire", post(agent_retire))
+        .route("/api/agents/:id/retire-if-unretired", post(agent_retire_if_unretired))
         .route("/api/agents/:id/reinstate", post(agent_reinstate))
         .route("/api/agents/:id/bypass", post(agent_gate_bypass))
         .route("/api/agents/:id/restore", post(agent_gate_restore))
@@ -8073,6 +8074,28 @@ async fn agent_retire(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    agent_retire_inner(state, gate, id, body, false).await
+}
+
+/// Conditional route for views which showed an unretired member. A distinct
+/// route makes an older daemon refuse the request instead of ignoring a new
+/// field and silently performing an unconditional retirement.
+async fn agent_retire_if_unretired(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    agent_retire_inner(state, gate, id, body, true).await
+}
+
+async fn agent_retire_inner(
+    state: SharedState,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    id: String,
+    body: serde_json::Value,
+    require_unretired: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
     let plugin_id = id.trim().to_string();
     let field = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let (reason, evidence_ref) = (field("reason"), field("ref"));
@@ -8088,6 +8111,15 @@ async fn agent_retire(
     }
     let confirm_active = body.get("confirm_active").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut s = state.lock().await;
+
+    // Bind the precondition and the retirement commit under the same lock.
+    // A conflict writes neither an intent nor a replacement tombstone.
+    if require_unretired && s.retired_members.is_retired(&plugin_id) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "the member was already retired; no retirement was written",
+            "code": "already_retired",
+        })));
+    }
 
     // THE GUARD. Retiring a phantom is the point; retiring the seat you are typing from is the
     // accident, and the three ids differ by one character. A member that has ACTED recently is
@@ -11528,6 +11560,59 @@ mod disposition_tests {
 
     async fn retire(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
         retire_gated(state, id, body, None).await
+    }
+
+    async fn retire_if_unretired(state: &SharedState, id: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = agent_retire_if_unretired(State(state.clone()), None, Path(id.to_string()), Json(body)).await.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn conditional_retire_does_not_replace_a_tombstone_after_preflight() {
+        let (_dir, state) = test_state().await;
+        // The app's view/preflight sees no retirement, then another actor wins.
+        assert!(!state.lock().await.retired_members.is_retired("old-id"));
+        let (status, _) = retire(&state, "old-id", serde_json::json!({"reason":"first", "ref":"r1"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (old_record, old_generation, old_chain) = {
+            let s = state.lock().await;
+            (s.retired_members.get("old-id").unwrap().clone(), s.retired_members.generation,
+             s.recent_chain(100).len())
+        };
+        let (status, body) = retire_if_unretired(&state, "old-id", serde_json::json!({"reason":"second", "ref":"r2"})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "already_retired");
+        let s = state.lock().await;
+        assert_eq!(s.retired_members.get("old-id").unwrap(), &old_record);
+        assert_eq!(s.retired_members.generation, old_generation);
+        assert_eq!(s.recent_chain(100).len(), old_chain, "conflict writes no intent");
+    }
+
+    #[tokio::test]
+    async fn conditional_retire_allows_new_member_and_legacy_route_can_restate() {
+        let (_dir, state) = test_state().await;
+        let (status, _) = retire_if_unretired(&state, "old-id", serde_json::json!({"reason":"first", "ref":"r1"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = retire(&state, "old-id", serde_json::json!({"reason":"restated", "ref":"r2"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state.lock().await.retired_members.get("old-id").unwrap().reason, "restated");
+    }
+
+    #[tokio::test]
+    async fn concurrent_conditional_retirements_have_exactly_one_winner() {
+        let (_dir, state) = test_state().await;
+        let a = retire_if_unretired(&state, "old-id", serde_json::json!({"reason":"one", "ref":"r1"}));
+        let b = retire_if_unretired(&state, "old-id", serde_json::json!({"reason":"two", "ref":"r2"}));
+        let (a, b) = tokio::join!(a, b);
+        assert!((a.0 == StatusCode::OK && b.0 == StatusCode::CONFLICT)
+             || (b.0 == StatusCode::OK && a.0 == StatusCode::CONFLICT));
+        let s = state.lock().await;
+        assert_eq!(s.retired_members.generation, 1);
+        let chain = s.recent_chain(100);
+        assert_eq!(chain.iter().filter(|e| e.event_type == "member_retire_intent").count(), 1);
+        assert_eq!(chain.iter().filter(|e| e.event_type == "member_retired").count(), 1);
     }
 
     /// The same call carrying the gate witness the `operator_gate` middleware inserts —

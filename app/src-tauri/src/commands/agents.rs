@@ -69,6 +69,9 @@ fn retire_outcome(status: reqwest::StatusCode, body: serde_json::Value) -> Resul
         return Ok(serde_json::json!({ "outcome": "retired", "result": body }));
     }
     let why = body.get("error").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if status == reqwest::StatusCode::CONFLICT && body.get("code").and_then(|v| v.as_str()) == Some("already_retired") {
+        return Ok(serde_json::json!({ "outcome": "already_retired", "detail": why }));
+    }
     // The live-member guard is the one 409 that is a question, not a race: it carries the
     // evidence (`acts_recently`, or `unmeasurable`) the operator must weigh.
     if status == reqwest::StatusCode::CONFLICT
@@ -122,7 +125,7 @@ pub async fn retire_agent(
         "confirm_active": confirm_active.unwrap_or(false),
     });
     let (status, value) =
-        daemon::request_status(&state, reqwest::Method::POST, &format!("/api/agents/{id}/retire"), Some(body))
+        daemon::request_status(&state, reqwest::Method::POST, &format!("/api/agents/{id}/retire-if-unretired"), Some(body))
             .await?;
     retire_outcome(status, value)
 }
@@ -251,6 +254,10 @@ mod tests {
         assert!(retire_outcome(StatusCode::BAD_REQUEST, json!({"error": "reason and ref are required"})).is_err());
         // a 409 WITHOUT the guard's evidence is not a question to confirm through
         assert!(retire_outcome(StatusCode::CONFLICT, json!({"error": "something else"})).is_err());
+        // An older daemon cannot ignore the precondition: it lacks this route.
+        assert!(retire_outcome(StatusCode::NOT_FOUND, json!({"error": "unknown route"})).is_err());
+        let conflict = retire_outcome(StatusCode::CONFLICT, json!({"code": "already_retired", "error": "no write"})).unwrap();
+        assert_eq!(conflict["outcome"], "already_retired");
         assert!(reinstate_outcome(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "still retired: disk"})).is_err());
     }
 

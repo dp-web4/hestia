@@ -579,8 +579,22 @@
           "status": "required"
         },
         "app": {
-          "status": "required"
+          "status": "planned",
+          "why": "The app uses the conditional retirement route below; it does not offer unconditional restatement."
         }
+      }
+    },
+    {
+      "id": "agent-retire-if-unretired",
+      "title": "Retire a member only if its retirement record is still absent",
+      "place": "activity",
+      "kind": "write",
+      "risk": "medium",
+      "routes": ["POST /api/agents/:id/retire-if-unretired"],
+      "rules": ["member-id", "signed-in-only"],
+      "surfaces": {
+        "dashboard": {"status": "planned", "why": "The dashboard currently offers unconditional restatement."},
+        "app": {"status": "required"}
       }
     },
     {
