@@ -944,37 +944,164 @@ step_deploy_supervisor() {
   fi
 }
 
+# THE POLICY GATE, FROM THE RELEASE (#1443). Before this step a release install fetched only
+# plugins/claude-code and printed "add the hooks to ~/.claude/settings.json": the hook it pointed
+# at loads its engine from $HESTIA_HOME/shared, which nothing in this script wrote, so following
+# the instruction gave a gate that refused every call, and not following it gave an ungoverned
+# Claude Code beside a daemon that witnessed nothing.
+#
+# Now it runs the SAME members' install a deploy runs (deploy/install-members.sh: the shared
+# engine, each member's hooks, the registration lines, the seat documents), from the source of
+# the SAME tag as the binary. Nothing is reimplemented here. Source comes from a shallow
+# `git clone --branch <tag>` so install-members.sh records the audited `git describe` build id;
+# without git it falls back to the tag archive and the build id reads "unknown" (said aloud).
+#
+# Preconditions are checked first and each failure says what to do; none is guessed:
+#   - Claude Code on this machine (~/.claude exists). Absent -> skip, never mint a config for a
+#     harness that is not here (#1130), unless HESTIA_INSTALL_GATE=1 asks for it explicitly.
+#   - HESTIA_WORKSPACE: the directory the agent works in, the gate's scope root. No default.
+#   - bash >= 4 (install-members.sh uses declare -A / mapfile; macOS ships 3.2).
+#   - an Ed25519 backend for python3 (PyNaCl or cryptography): the seat seeder signs the
+#     operator challenge with the key the daemon minted at genesis.
+# It runs after the smoke test: the seeder needs the running daemon's endpoint and operator key.
+find_bash4() {
+  local b
+  for b in "${HESTIA_BASH:-}" bash /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [ -n "$b" ] || continue
+    command -v "$b" >/dev/null 2>&1 || continue
+    if "$b" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then
+      command -v "$b"
+      return 0
+    fi
+  done
+  return 1
+}
+
 step_claude_hooks() {
   if [ -n "${HESTIA_SKIP_HOOK:-}" ]; then
-    c_dim "claude-code hooks skipped (HESTIA_SKIP_HOOK set)"
+    c_dim "claude-code gate skipped (HESTIA_SKIP_HOOK set)"
     return
   fi
-  c_hdr "claude-code hooks"
-  local settings="$HOME/.claude/settings.json"
-  if [ ! -f "$settings" ]; then
-    c_dim "no ~/.claude/settings.json — skipping (install on machines where you run Claude Code)"
+  c_hdr "claude-code policy gate"
+  local claude_dir="$HOME/.claude"
+  if [ ! -d "$claude_dir" ]; then
+    if [ "${HESTIA_INSTALL_GATE:-}" = "1" ]; then
+      mkdir -p "$claude_dir"
+      c_warn "created $claude_dir (HESTIA_INSTALL_GATE=1)"
+    else
+      c_dim "Claude Code is not on this machine ($claude_dir absent); gate not installed."
+      c_dim "  install Claude Code, then re-run this installer (or set HESTIA_INSTALL_GATE=1)"
+      return
+    fi
+  fi
+  local missing=()
+  if [ -z "${HESTIA_WORKSPACE:-}" ] || [ ! -d "${HESTIA_WORKSPACE:-}" ]; then
+    missing+=("HESTIA_WORKSPACE=<the directory your agent works in> (the gate's scope root; none is guessed)")
+  fi
+  local bash4=""
+  bash4="$(find_bash4)" || missing+=("bash >= 4 (macOS: brew install bash; or point HESTIA_BASH at one)")
+  if ! python3 -c 'import nacl.signing' >/dev/null 2>&1 \
+     && ! python3 -c 'from cryptography.hazmat.primitives.asymmetric import ed25519' >/dev/null 2>&1; then
+    missing+=("an Ed25519 library for python3: python3 -m pip install --user cryptography (or PyNaCl)")
+  fi
+  if [ "${#missing[@]}" -gt 0 ]; then
+    c_warn "gate NOT installed; this machine still needs:"
+    local m
+    for m in "${missing[@]}"; do c_warn "  - $m"; done
+    c_warn "  then re-run this installer. The daemon above is installed and running either way."
     return
   fi
-  # Detect plugin location: prefer ~/.hestia/plugins/claude-code, fall
-  # back to the repo's plugins/claude-code if running from a checkout.
-  local plugin_dir=""
-  local repo_root
-  repo_root="$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd || true)"
-  if [ -d "$HOME/.hestia/plugins/claude-code/hooks" ]; then
-    plugin_dir="$HOME/.hestia/plugins/claude-code"
-  elif [ -n "$repo_root" ] && [ -d "$repo_root/plugins/claude-code/hooks" ]; then
-    plugin_dir="$repo_root/plugins/claude-code"
+
+  local src="$HESTIA_HOME/src/hestia-${VERSION}"
+  if [ ! -f "$src/deploy/install-members.sh" ]; then
+    rm -rf "$src.partial"
+    mkdir -p "$HESTIA_HOME/src"
+    if command -v git >/dev/null 2>&1 \
+       && git clone -q --depth 1 --branch "$VERSION" "https://github.com/${REPO}.git" "$src.partial" 2>/dev/null; then
+      c_ok "source for ${VERSION} cloned (the members' install records its git describe)"
+    else
+      rm -rf "$src.partial"
+      mkdir -p "$src.partial"
+      curl -fsSL "https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz" \
+        | tar -xz -C "$src.partial" --strip-components=1
+      c_warn "source for ${VERSION} from the tag archive (no git): the install records build id 'unknown'"
+    fi
+    mv "$src.partial" "$src"
   fi
-  if [ -z "$plugin_dir" ]; then
-    c_warn "no hestia claude-code plugin found; fetching plugin source under \$HESTIA_HOME/plugins…"
-    mkdir -p "$HESTIA_HOME/plugins"
-    curl -fsSL "https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz" \
-      | tar -xz -C "$HESTIA_HOME/plugins" --strip-components=2 "hestia-${VERSION#v}/plugins/claude-code"
-    plugin_dir="$HESTIA_HOME/plugins/claude-code"
+  c_ok "source at $src"
+
+  # install-members.sh hashes with `sha256sum`, which macOS does not ship (found by the install
+  # smoke gate arm, #1443). It is a governed file, so the installer supplies the command rather
+  # than editing it: `shasum -a 256` prints the same `<hex>  <name>` lines, stdin included.
+  local shim_path="$PATH"
+  if ! command -v sha256sum >/dev/null 2>&1 && command -v shasum >/dev/null 2>&1; then
+    local shim="$HESTIA_HOME/src/.shim"
+    mkdir -p "$shim"
+    printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > "$shim/sha256sum"
+    chmod 0755 "$shim/sha256sum"
+    shim_path="$shim:$PATH"
   fi
-  c_ok "claude-code plugin at $plugin_dir"
-  c_dim "to enable, add the PreToolUse + PostToolUse hooks from $plugin_dir to ~/.claude/settings.json"
-  c_dim "(future: 'hestia plugin install claude-code' will do this for you)"
+  local rc=0
+  PATH="$shim_path" HESTIA_HOME="$HESTIA_HOME" HESTIA_WORKSPACE="$HESTIA_WORKSPACE" \
+    "$bash4" "$src/deploy/install-members.sh" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    c_err "the members' install failed (exit $rc); the gate is NOT installed. Output above."
+    c_dim "  re-run: HESTIA_HOME=$HESTIA_HOME HESTIA_WORKSPACE=$HESTIA_WORKSPACE $bash4 $src/deploy/install-members.sh"
+    exit 1
+  fi
+  c_ok "claude-code gate installed from ${VERSION}; it governs the next Claude Code session"
+  step_initial_workspace_grant "$src"
+}
+
+# THE OPERATOR'S INITIAL GRANT (dp, 2026-10-30, on #1448): "supplied workspace means a working
+# workspace". Supplying HESTIA_WORKSPACE to this installer authorises ONE grant of exactly that
+# path to the claude-code seat. It is a real operator act: signed with the operator key the daemon
+# minted at genesis, through the same /api/scope/grant the dashboard uses, so it lands on the chain
+# as scope_granted and is inspectable, editable and revocable there. An environment variable is
+# never itself a grant.
+#   - exactly the supplied path (recursive), nothing wider;
+#   - `expected_existing: null`: written only if no standing grant on (claude-code, that path)
+#     exists. A re-install finds the operator's current grant and leaves it as it is, never
+#     replacing or widening it;
+#   - a failed grant is a visible, non-zero failure of the gate setup, not a warning.
+step_initial_workspace_grant() {
+  local src="$1" rc=0 out
+  out="$(python3 - "$src/tools/seed_seat_config.py" "$HESTIA_HOME" "$HESTIA_WORKSPACE" "$VERSION" <<'PY'
+import importlib.util, json, sys
+from pathlib import Path
+seed_py, home, ws, version = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("seed_seat_config", seed_py)
+seed = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(seed)
+home = Path(home)
+endpoint = (home / "endpoint").read_text().strip()
+op = seed.Operator(endpoint.rsplit("/mcp", 1)[0], home / "operator.key")
+op.open_session()
+status, body = op.call("POST", "/api/scope/grant", {
+    "plugin_id": "claude-code", "path": ws, "recursive": True, "expected_existing": None,
+    # The seat was installed a moment ago and has not connected yet (its first Claude Code
+    # session will); the daemon refuses a grant to a never-connected member unless told so.
+    "grant_ahead_of_connect": True,
+    "reason": f"initial workspace grant: the operator supplied HESTIA_WORKSPACE={ws} to the "
+              f"release installer ({version}); dp ruling 2026-10-30 (hestia #1448)"})
+if status == 200:
+    print("granted " + json.dumps(body)[:200]); sys.exit(0)
+if status == 409 and isinstance(body, dict) and body.get("moved") and body.get("current"):
+    print("kept " + json.dumps(body.get("current"))[:200]); sys.exit(3)
+print(f"refused {status} " + json.dumps(body)[:300]); sys.exit(1)
+PY
+)" || rc=$?
+  case "$rc" in
+    0) c_ok "operator granted the seat its workspace: $HESTIA_WORKSPACE (recursive; on the chain as scope_granted)"
+       c_dim "  edit or revoke it on the dashboard: http://${HESTIA_BIND}/" ;;
+    3) c_ok "the seat already holds a grant on $HESTIA_WORKSPACE; left as it is (a re-install never widens it)"
+       c_dim "  $out" ;;
+    *) c_err "the gate is installed but its initial workspace grant FAILED: $out"
+       c_err "  the seat holds no scope, so every act it tries is refused. Grant $HESTIA_WORKSPACE on"
+       c_err "  the dashboard (http://${HESTIA_BIND}/, sign in with the operator key in $HESTIA_HOME), then"
+       c_err "  re-run this installer to confirm."
+       exit 1 ;;
+  esac
 }
 
 step_smoketest() {
@@ -1085,8 +1212,8 @@ main() {
   esac
   step_workspace_marker
   step_deploy_supervisor
-  step_claude_hooks
   step_smoketest
+  step_claude_hooks
   c_hdr "done"
   c_ok "open http://${HESTIA_BIND}/ for the dashboard"
   c_dim "logs: journalctl --user -u hestia (Linux) | tail $HESTIA_HOME/hestia.log (macOS)"
