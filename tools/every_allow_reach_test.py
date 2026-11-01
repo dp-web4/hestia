@@ -6,8 +6,8 @@ on any path that can allow. Four authorities over one past-the-cap glob (`cat <d
   (c) degraded_verdict, read-only    -> deny mrh.command.unenumerated (was: allow), Bash `cat` and `ls`
   (d) the glob OUTSIDE every grant   -> the scope refusal, NOT unenumerated (the escalation path survives)
 plus controls: a small glob is allowed under (a) (b) (c), and link_reach_too_wide takes the single gate's GateEvent
-(no command, no paths) without raising. Not test-shaped: on the applied core (b) and (c) allow, by design.
-Run under held/build-1331h/run_overlay.py <worktree> <dir with core_rev.py> <this file>."""
+(no command, no paths) without raising. On the 748469d2 core (b) and (c) allowed.
+Run: python3 tools/every_allow_reach_test.py   (applied 2026-11-01 under escalation 41ede99f0ef3a026)."""
 import os
 import sys
 

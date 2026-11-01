@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: c5ec7622985eb004d1830db9e3a28f61b848ff65140b04aae6147fce94ab820c  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -922,7 +922,9 @@ def _reach_walks(segs, *, resolve, bases, judge, budget, counts=lambda p: True) 
 def link_reach_too_wide(event: "NormalizedEvent", within: Optional[tuple] = None) -> Optional["Verdict"]:
     """hestia #1331: an act whose glob or link-following walk passes its bound is refused unjudged, under the rule
     for a reach the gate cannot enumerate (the scope pass refuses past SCOPE_JUDGE_BUDGET the same way). Called
-    only where evaluate is about to ALLOW: outside the grant the scope pass has already refused or escalated, and an
+    before EVERY allow (Nova's #1435 review): evaluate's final allow (with `within`), its unscoped early allow and
+    degraded_verdict's read allows (with none: no scope layer there to defer to). Outside the grant the scope pass
+    refuses or escalates first, and an
     out-of-scope glob must keep its escalation (one_gate_decide_contract phantom-glob-still-escalates). `within`
     is the granted roots: a pattern or walk rooted outside them is not counted (None = an unscoped policy)."""
     too_wide = link_reach(event, within)[1]
@@ -3825,7 +3827,9 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     # down daemon from bricking every member — but it can never widen to everything.
     if pol.is_unscoped():
         if not pol.stale:
-            return ALLOW
+            # Gate 1a swept only what link_reach reached; past its bound the rest is unchecked, so an
+            # unscoped allow still refuses it (Nova's #1435 review: innate checks are never relaxed by scope).
+            return link_reach_too_wide(event) or ALLOW
         # Stale + unscoped: drop the wildcard so it cannot match downstream, and evaluate the
         # remaining standing scope normally. Fails narrow, which is the direction a replica may
         # move in.
@@ -4089,8 +4093,10 @@ def degraded_verdict(event: NormalizedEvent,
                     f"out-of-MRH private repo): '{f}'",
                     innate=True,
                 )
+    # Degraded mode allows reads, but never one whose links Gate 1a checked only in part (Nova's #1435 review).
+    too_wide = link_reach_too_wide(event)
     if event.tool in READ_CLASS:
-        return ALLOW
+        return too_wide or ALLOW
     if event.tool.lower() in ("bash", "shell") and event.command \
             and _degraded_command_is_read(event.command):
         # The ratified posture is deny-writes-allow-READS, and a read-only shell command
@@ -4099,7 +4105,7 @@ def degraded_verdict(event: NormalizedEvent,
         # `git rev-list --count` refused while single reads passed). The grammar below is
         # deliberately conservative: every segment's verb must be on the read allowlist,
         # any write-redirect/substitution/unknown verb keeps the deny.
-        return ALLOW
+        return too_wide or ALLOW
     return _deny(
         "gate.degraded",
         f"'{event.tool}' is write/exec-class and the policy daemon is unreachable — the "

@@ -36,4 +36,4 @@ No bound changes. Each call is one bounded `link_reach`, the same budget as eval
 | shell-scope battery | 1434 / 0 |
 | `gate_event_reach_test` (revised dir) | PASS |
 
-At apply time, `every_allow_check.py` moves to `tools/every_allow_reach_test.py`.
+Applied 2026-11-01 under escalation `41ede99f0ef3a026`; `every_allow_check.py` is now `tools/every_allow_reach_test.py`.
