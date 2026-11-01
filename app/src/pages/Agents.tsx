@@ -72,8 +72,12 @@ export interface UnaccountedMember {
 // Unknown, partial, or future status values are not proof that no installed
 // agent carries a member. Require the report's evidence, not merely an object.
 function inventoryIsMeasured(inv: AgentInventory | null): inv is AgentInventory {
-  return !!inv && (inv.status === "GOVERNED" || inv.status === "UNGOVERNED_PRESENT")
-    && Array.isArray(inv.detail) && Array.isArray(inv.installed);
+  // The producer gives MISWIRED/PARTIAL/UNGOVERNED_PRESENT precedence over
+  // UNKNOWN, so status alone can conceal unresolved inventory observations.
+  return !!inv && ["OK", "MISWIRED", "PARTIAL", "UNGOVERNED_PRESENT"].includes(inv.status)
+    && Array.isArray(inv.detail) && Array.isArray(inv.installed)
+    && Array.isArray(inv.unknown) && inv.unknown.length === 0
+    && Array.isArray(inv.gaps?.unknown) && inv.gaps.unknown.length === 0;
 }
 
 /**

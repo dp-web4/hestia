@@ -45,7 +45,8 @@ function inventory(detail: AgentRow[], over: Partial<AgentInventory> = {}): Agen
     status: "UNGOVERNED_PRESENT", machine: "HUB",
     installed: detail.map((d) => d.agent),
     governed: detail.filter((d) => d.governed).map((d) => d.agent),
-    gaps: { ungoverned: detail.filter((d) => !d.governed).map((d) => d.agent), dormant_plugin: ["gemini"] },
+    unknown: [],
+    gaps: { ungoverned: detail.filter((d) => !d.governed).map((d) => d.agent), dormant_plugin: ["gemini"], unknown: [] },
     detail, ...over,
   };
 }
@@ -162,8 +163,16 @@ describe("Agents", () => {
       const snapshot = { members: ["claude-code"], trust: [], retired: [] };
       expect(unaccountedMembers(null, snapshot)).toEqual([]);
       expect(unaccountedMembers({ status: "UNKNOWN" }, snapshot)).toEqual([]);
-      expect(unaccountedMembers({ status: "GOVERNED" }, snapshot)).toEqual([]);
+      expect(unaccountedMembers({ status: "OK" }, snapshot)).toEqual([]);
       expect(unaccountedMembers(inventory([], { status: "FUTURE_STATUS" }), snapshot)).toEqual([]);
+      expect(unaccountedMembers(inventory([], { status: "UNGOVERNED_PRESENT", unknown: ["unreadable source"] }), snapshot)).toEqual([]);
+      expect(unaccountedMembers(inventory([], { status: "MISWIRED", gaps: { unknown: ["an agent"] } }), snapshot)).toEqual([]);
+      expect(unaccountedMembers(inventory([], { status: "OK" }), snapshot)).toEqual([
+        { id: "claude-code", actions: 0, retired: false },
+      ]);
+      expect(unaccountedMembers(inventory([], { status: "MISWIRED" }), snapshot)).toEqual([
+        { id: "claude-code", actions: 0, retired: false },
+      ]);
     });
 
     it("does not offer retirement on UNKNOWN even with a registered member", async () => {

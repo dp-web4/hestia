@@ -471,6 +471,7 @@ export interface GateBypass {
 /** `GET /api/agents`. UNKNOWN carries a reason and must never render as an empty, clean list. */
 export interface AgentInventory {
   status: "GOVERNED" | "UNGOVERNED_PRESENT" | "UNKNOWN" | string;
+  unknown?: string[];
   reason?: string;
   machine?: string;
   installed?: string[];
