@@ -57,6 +57,11 @@ if [ -z "${HESTIA_WORKSPACE:-}" ]; then
   fi
   unset _self_dir _repo_root
 fi
+# "Keeps the empty value" has to mean SET to empty: under `set -u` an unset name kills the
+# install at its first use (the unit heredoc on Linux, the environment report on macOS).
+# Every `curl | sh` install without HESTIA_WORKSPACE died that way until the v0.3.0-rc.5
+# install smoke, the first run against a published release rather than a checkout.
+HESTIA_WORKSPACE="${HESTIA_WORKSPACE:-}"
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/hestia"
 
