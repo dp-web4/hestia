@@ -24448,6 +24448,12 @@ fn with_modes(mut row: Value, modes: crate::server::grant_modes::Modes) -> Value
     row
 }
 
+/// How many `hestia_scope_status` reads this daemon served with no session that resolves to the asserted
+/// member (hestia #1450 phase 0, step B). Step C refuses those reads, and is safe only once every
+/// machine's count stays at zero: that is when every caller (the gate's snapshot fetch above all) sends
+/// its session. Served in every response as `unbound_reads_since_start`, a bare number.
+static UNBOUND_SCOPE_STATUS_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
 
@@ -24456,6 +24462,35 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     // LOCK-FREE (stage 2): the published policy snapshot, never the state lock.
     let s = state.published();
     s.observe();
+
+    // THE CALLER IS WHO ITS SESSION SAYS, NOT WHO IT NAMES (hestia #1450 phase 0, step B). This read
+    // returns a member's grants, floor and request history, and it took `plugin_id` on trust: any
+    // process that could reach the daemon could read another member's territory by naming it, while
+    // hestia_operating_law and hestia_scope_claim already resolved the session. A session that resolves
+    // to a DIFFERENT member is refused here -- that is a lie, and no honest caller sends one. An absent
+    // or unresolvable session is still served, as before, because the gate itself fetched its snapshot
+    // without one until step A: refusing it would deny every governed act on every machine running an
+    // older hook ("no snapshot, no permit"). Those reads are marked and counted; step C refuses them.
+    let caller_bound = match args.get("session_id").and_then(|v| v.as_str()) {
+        Some(sid) => match s.resolve(Some(sid)) {
+            Some(who) if who.plugin_id == plugin_id => true,
+            Some(who) => {
+                return Err(anyhow::anyhow!(
+                    "hestia_scope_status: the session you sent belongs to '{}', not '{}'. This read \
+                     answers for the member whose session asks; send plugin_id '{}' with that session, \
+                     or that member's own session.",
+                    who.plugin_id, plugin_id, who.plugin_id
+                ));
+            }
+            None => false,
+        },
+        None => false,
+    };
+    let unbound_reads = if caller_bound {
+        UNBOUND_SCOPE_STATUS_READS.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        UNBOUND_SCOPE_STATUS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    };
 
     // THE HONOR HORIZON IS BOUNDED BY WHAT IT COVERS (GPT review of #431, blocker 3). A
     // flat now+8h told consumers they could honour a cached snapshot for hours while a
@@ -24572,6 +24607,10 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
 
     Ok(json!({
         "plugin_id": plugin_id,
+        // #1450 phase 0: true when the session sent resolves to `plugin_id`; false for a read served on the
+        // asserted name alone (no session, or one that no longer resolves). Step C refuses those.
+        "caller_bound": caller_bound,
+        "unbound_reads_since_start": unbound_reads,
         "requests": requests,
         // The operative list, separated from the history, because "what may I read right now"
         // and "what have I asked for" are different questions and only one of them is a
@@ -27436,6 +27475,48 @@ mod standing_scope_surface_tests {
             out["snapshot_expires_at"].as_u64().unwrap() > now,
             "the honor horizon must be a future instant"
         );
+    }
+
+    /// hestia #1450 phase 0, step B: the read answers for the member whose session asks. A session that
+    /// resolves to another member is refused; no session, or one that no longer resolves, is served as
+    /// before but marked unbound and counted (the gate fetched its snapshot without one until step A, so
+    /// refusing those would deny every governed act on an older hook).
+    #[tokio::test]
+    async fn scope_status_refuses_another_members_session_and_marks_unbound_reads() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.add(standing("kimi-code", "/w/web4", now, None));
+        }
+        let kimi = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let codex = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        // its own session: served, bound
+        let own = tool_scope_status(&state, &json!({"plugin_id": "kimi-code", "session_id": kimi}))
+            .await.unwrap();
+        assert_eq!(own["caller_bound"], json!(true));
+        assert_eq!(own["standing_grants"][0]["path"], "/w/web4");
+
+        // no session: served exactly as before, marked unbound, counted
+        let before = own["unbound_reads_since_start"].as_u64().unwrap();
+        let bare = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        assert_eq!(bare["caller_bound"], json!(false));
+        assert_eq!(bare["standing_grants"][0]["path"], "/w/web4", "an older hook still gets its snapshot");
+        assert!(bare["unbound_reads_since_start"].as_u64().unwrap() > before);
+
+        // ANOTHER member's session naming kimi-code: refused, and nothing of kimi-code's is returned
+        let err = tool_scope_status(&state, &json!({"plugin_id": "kimi-code", "session_id": codex}))
+            .await.expect_err("a session that belongs to codex cannot read kimi-code's territory");
+        let msg = format!("{err}");
+        assert!(msg.contains("belongs to 'codex'") && !msg.contains("/w/web4"), "{msg}");
+
+        // a session that does not resolve: served unbound (step C tightens this)
+        let stale = tool_scope_status(&state, &json!({"plugin_id": "kimi-code",
+                                                       "session_id": "not-a-session"})).await.unwrap();
+        assert_eq!(stale["caller_bound"], json!(false));
     }
 
     /// #483 acceptance 5: one non-empty floor is served byte-for-byte identically to
