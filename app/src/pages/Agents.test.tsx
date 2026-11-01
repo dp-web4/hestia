@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { AgentInventory, AgentRow } from "../lib/types";
 
 const agentsInventory = vi.fn();
@@ -157,6 +157,50 @@ describe("Agents", () => {
   describe("Sprint 3b — retire / reinstate a member nothing here accounts for", () => {
     const trust = (plugin_id: string, action_count: number, aliased_to?: string) =>
       ({ plugin_id, action_count, aliased_to }) as never;
+
+    it("never derives candidates from unknown, absent or incomplete inventory", () => {
+      const snapshot = { members: ["claude-code"], trust: [], retired: [] };
+      expect(unaccountedMembers(null, snapshot)).toEqual([]);
+      expect(unaccountedMembers({ status: "UNKNOWN" }, snapshot)).toEqual([]);
+      expect(unaccountedMembers({ status: "GOVERNED" }, snapshot)).toEqual([]);
+      expect(unaccountedMembers(inventory([], { status: "FUTURE_STATUS" }), snapshot)).toEqual([]);
+    });
+
+    it("does not offer retirement on UNKNOWN even with a registered member", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValue({ status: "UNKNOWN", reason: "inventory unavailable" });
+      getDashboard.mockResolvedValue({ retired: [], members: ["claude-code"], trust: [] });
+      render(<Agents />);
+      expect(await screen.findByText(/inventory unavailable/)).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
+    });
+
+    it("removes a previous retire offer when refreshing fails", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValueOnce(inventory([claude])).mockRejectedValueOnce(new Error("offline"));
+      getDashboard.mockResolvedValue({ retired: [], members: ["caude-code"], trust: [] });
+      render(<Agents />);
+      await screen.findByRole("button", { name: "Retire" });
+      fireEvent.focus(window);
+      expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
+      expect(await screen.findByText(/offline/)).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
+    });
+
+    it("a stale successful refresh cannot undo a newer failed refresh", async () => {
+      let resolve!: (value: AgentInventory) => void;
+      const stale = new Promise<AgentInventory>((yes) => { resolve = yes; });
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockReturnValueOnce(stale).mockRejectedValueOnce(new Error("newer failure"));
+      getDashboard.mockResolvedValue({ retired: [], members: ["caude-code"], trust: [] });
+      render(<Agents />);
+      await waitFor(() => expect(agentsInventory).toHaveBeenCalledTimes(1));
+      fireEvent.focus(window);
+      expect(await screen.findByText(/newer failure/)).toBeTruthy();
+      await act(async () => resolve(inventory([claude])));
+      expect(screen.queryByRole("button", { name: "Retire" })).toBeNull();
+      expect(screen.getByText(/newer failure/)).toBeTruthy();
+    });
 
     it("finds the registry's ids that no installed agent carries, and only those", () => {
       const inv = inventory([claude, being]);

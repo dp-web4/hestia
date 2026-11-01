@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   agentGateBypass,
   agentGateRestore,
@@ -69,6 +69,13 @@ export interface UnaccountedMember {
   retired: boolean;
 }
 
+// Unknown, partial, or future status values are not proof that no installed
+// agent carries a member. Require the report's evidence, not merely an object.
+function inventoryIsMeasured(inv: AgentInventory | null): inv is AgentInventory {
+  return !!inv && (inv.status === "GOVERNED" || inv.status === "UNGOVERNED_PRESENT")
+    && Array.isArray(inv.detail) && Array.isArray(inv.installed);
+}
+
 /**
  * PURE: member ids this seat has recorded that no installed agent here carries — the
  * dashboard's "nothing on this machine accounts for it" group, from the same two sources
@@ -79,7 +86,7 @@ export function unaccountedMembers(
   inv: AgentInventory | null,
   snap: Pick<DashboardSnapshot, "trust" | "members" | "retired"> | null,
 ): UnaccountedMember[] {
-  if (!snap) return [];
+  if (!snap || !inventoryIsMeasured(inv)) return [];
   const machine = (inv?.machine ?? "").toLowerCase();
   const accounted = new Set<string>();
   for (const r of inv?.detail ?? []) {
@@ -187,10 +194,15 @@ export function Agents() {
   const [confirming, setConfirming] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [actError, setActError] = useState<string | null>(null);
+  const refreshGeneration = useRef(0);
 
   const refresh = useCallback(async () => {
+    const generation = ++refreshGeneration.current;
+    // Hide lifecycle controls while their supporting inventory is refreshed.
+    setInv(null);
     try {
       const st = await operatorStatus();
+      if (generation !== refreshGeneration.current) return;
       setStatus(st);
       if (!st.signed_in) {
         setInv(null);
@@ -198,11 +210,13 @@ export function Agents() {
         return;
       }
       const [report, snap] = await Promise.all([agentsInventory(), getDashboard()]);
+      if (generation !== refreshGeneration.current) return;
       setInv(report);
       setRetired(snap.retired ?? []);
       setSnap(snap);
       setError(null);
     } catch (e) {
+      if (generation !== refreshGeneration.current) return;
       setError(String(e));
       setInv(null);
     }
@@ -214,6 +228,7 @@ export function Agents() {
     const onFocus = () => refresh();
     window.addEventListener("focus", onFocus);
     return () => {
+      ++refreshGeneration.current;
       clearInterval(t);
       window.removeEventListener("focus", onFocus);
     };
@@ -277,6 +292,10 @@ export function Agents() {
           UNKNOWN — {inv.reason ?? "the inventory could not run"}. This is not a clean result: it
           means the box could not be looked at.
         </div>
+      )}
+
+      {inv && inv.status !== "UNKNOWN" && !inventoryIsMeasured(inv) && (
+        <div className="error-banner">Inventory is incomplete or unrecognized; member lifecycle controls are unavailable.</div>
       )}
 
       {inv && inv.status !== "UNKNOWN" && (
