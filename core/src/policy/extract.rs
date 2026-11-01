@@ -18,6 +18,12 @@ pub fn extract_target(tool_name: &str, input: &Value) -> Option<String> {
     if !input.is_object() {
         return None;
     }
+    // A CHANNEL SEND'S TARGET IS NEVER CALLER TEXT (#1344 amendment, item 3). The daemon builds
+    // it from the operator's binding, `{channel_id}:{recipient_class}`
+    // (`server::channel::ChannelBinding::target`); a caller could put anything in `path` or `url`.
+    if is_channel_send(tool_name) {
+        return None;
+    }
 
     for key in ["file_path", "path", "url", "notebook_path"] {
         if let Some(v) = input.get(key).and_then(Value::as_str) {
@@ -51,6 +57,11 @@ pub fn extract_full_command(tool_name: &str, input: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// `hestia_channel_send` (any MCP prefix) and SAGE's `channel_send` verb (#1344): one category.
+pub fn is_channel_send(tool_name: &str) -> bool {
+    tool_name == "channel_send" || tool_name.ends_with("hestia_channel_send")
 }
 
 /// Map a tool name to a category for rule matching.
@@ -88,6 +99,7 @@ pub fn classify(tool_name: &str) -> &'static str {
         // lets a caller write audit history, so law must be able to deny it for
         // unattended roles the same way it denies credential_access.
         t if t.ends_with("hestia_request_witness") => "witness_append",
+        t if is_channel_send(t) => "channel_egress",
         _ => "unknown",
     }
 }
@@ -146,5 +158,22 @@ mod tests {
             classify("mcp__hestia__hestia_request_witness"),
             "witness_append"
         );
+    }
+
+    #[test]
+    fn both_channel_send_names_classify_to_channel_egress() {
+        for t in ["hestia_channel_send", "mcp__hestia__hestia_channel_send", "channel_send"] {
+            assert_eq!(classify(t), "channel_egress", "{t}");
+        }
+        assert_eq!(classify("channel_sender"), "unknown", "a prefix is not the verb");
+    }
+
+    #[test]
+    fn a_channel_send_target_is_never_caller_text() {
+        let input = json!({"path": "/srv/somewhere/else", "url": "mailto:x@example.invalid",
+                           "file_path": "x", "channel_id": "dp", "recipient": "someone"});
+        for t in ["hestia_channel_send", "mcp__hestia__hestia_channel_send", "channel_send"] {
+            assert_eq!(extract_target(t, &input), None, "{t}");
+        }
     }
 }

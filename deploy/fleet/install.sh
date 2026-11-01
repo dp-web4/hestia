@@ -19,13 +19,23 @@
 #   HESTIA_HOME      override install location for state (default: ~/.hestia)
 #   HESTIA_BIND      bind address for the daemon (default: 127.0.0.1:7711)
 #   HESTIA_SKIP_HOOK if set, do NOT wire ~/.claude/settings.json hooks
+#   HESTIA_SKIP_DEPLOY   if set, do NOT install the deploy supervisor (dashboard update button)
+#   HESTIA_AUTO_UPDATE   =1 also arms the 4-hourly deploy timer (default: installed but OFF)
 #
 set -euo pipefail
 
 REPO="dp-web4/hestia"
-DEFAULT_VERSION="v0.0.3"
-VERSION="${HESTIA_VERSION:-$DEFAULT_VERSION}"
-HESTIA_HOME="${HESTIA_HOME:-$HOME/.hestia}"
+# The release a pin-less install gets. #520: this was a literal (v0.0.3) for two months after
+# v0.0.4 shipped -- every curl|sh install got a binary that cannot read v0.0.4's databases, and
+# the header above said "default: latest". It resolves GitHub's marked-latest release. There is
+# NO floor literal any more (#1444): the v0.0.4 floor outlived three release candidates and no
+# release step updated it. A rate-limited API falls back to the releases/latest redirect, which
+# is not rate-limited; if neither answers, GitHub is unreachable, the download would fail too,
+# and the installer stops and says so.
+VERSION="${HESTIA_VERSION:-}"
+# The default home, named once: the deploy units are bound to it (step_deploy_supervisor).
+HESTIA_HOME_DEFAULT="$HOME/.hestia"
+HESTIA_HOME="${HESTIA_HOME:-$HESTIA_HOME_DEFAULT}"
 HESTIA_BIND="${HESTIA_BIND:-127.0.0.1:7711}"
 # DERIVE, do not enumerate. The first draft of this block listed the workspace roots of
 # the machines in this fleet, which is wrong twice: it is a guess on any machine not on
@@ -47,6 +57,11 @@ if [ -z "${HESTIA_WORKSPACE:-}" ]; then
   fi
   unset _self_dir _repo_root
 fi
+# "Keeps the empty value" has to mean SET to empty: under `set -u` an unset name kills the
+# install at its first use (the unit heredoc on Linux, the environment report on macOS).
+# Every `curl | sh` install without HESTIA_WORKSPACE died that way until the v0.3.0-rc.5
+# install smoke, the first run against a published release rather than a checkout.
+HESTIA_WORKSPACE="${HESTIA_WORKSPACE:-}"
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/hestia"
 
@@ -90,7 +105,11 @@ step_download() {
   if curl -fsSL "$checksum_url" -o "$tmpdir/$filename.sha256" 2>/dev/null; then
     (
       cd "$tmpdir"
-      if ! sha256sum -c "$filename.sha256" >/dev/null 2>&1; then
+      # macOS ships `shasum`, not `sha256sum` (found by install smoke, web4#904: every macOS
+      # install refused a correct download). Same `<hex>  <name>` check-file format for both.
+      if command -v sha256sum >/dev/null 2>&1; then sumcheck=(sha256sum -c)
+      else sumcheck=(shasum -a 256 -c); fi
+      if ! "${sumcheck[@]}" "$filename.sha256" >/dev/null 2>&1; then
         c_err "SHA-256 checksum verification failed for $filename"
         exit 1
       fi
@@ -200,8 +219,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'HESTIA_PASSPHRASE="\$(cat %h/.hestia/.passphrase)" exec %h/.local/bin/hestia serve --bind ${HESTIA_BIND}'
-Environment=HESTIA_HOME=%h/.hestia
+ExecStart=/bin/sh -c 'HESTIA_PASSPHRASE="\$(cat ${HESTIA_HOME}/.passphrase)" exec %h/.local/bin/hestia serve --bind ${HESTIA_BIND}'
+Environment=HESTIA_HOME=${HESTIA_HOME}
 Environment=RUST_LOG=warn
 # THE GAUGE'S ONLY INPUT. \`deployment_health\` reads this env var and has NO fallback:
 # unset means \`deployment_health_from_path(None)\` -> state "unknown". It was present in
@@ -210,7 +229,7 @@ Environment=RUST_LOG=warn
 # the deployment badge from "stale" (a signal) to "unknown" (no signal), silently. The tool
 # you reach for to deploy would have disabled the instrument that tells you whether the
 # deploy landed. Found 2026-08-24 while answering "what are the obstacles to deployment".
-Environment=HESTIA_CURRENT_BUILD_FILE=%h/.hestia/current-build.json
+Environment=HESTIA_CURRENT_BUILD_FILE=${HESTIA_HOME}/current-build.json
 # ARENA CAP (#354). glibc allocates one 64 MB arena per thread up to 8 x cores — a 4 GB
 # fragmentation ceiling on an 8-core host. An arena only returns memory by trimming its
 # TOP, so one live allocation above a freed block pins the whole region and every heavy
@@ -236,7 +255,7 @@ Environment=HESTIA_WORKSPACE=${HESTIA_WORKSPACE}
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.hestia
+ReadWritePaths=${HESTIA_HOME}
 PrivateTmp=true
 Restart=on-failure
 RestartSec=5s
@@ -515,7 +534,7 @@ step_service_macos() {
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>HESTIA_PASSPHRASE="\$(cat \$HOME/.hestia/.passphrase)" exec \$HOME/.local/bin/hestia serve --bind ${HESTIA_BIND}</string>
+    <string>HESTIA_PASSPHRASE="\$(cat ${HESTIA_HOME}/.passphrase)" exec \$HOME/.local/bin/hestia serve --bind ${HESTIA_BIND}</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -785,60 +804,409 @@ step_workspace_marker() {
   fi
 }
 
+# The deploy supervisor (deploy/from-main): what the dashboard's update / "check for updates"
+# button starts, and what its auto-update toggle schedules.
+#
+# WHY HERE. Until this step the supervisor was a separate once-per-box install in
+# deploy/from-main/README.md that no installer ran, so on every box set up from this script the
+# dashboard offered an update button that could only fail with "Unit hestia-deploy.service not
+# found" (#791, Nomad 2026-09-01; tl-dell 2026-10-16). An operator should not need a README of
+# shell lines to get a working update button.
+#
+# WHAT IT INSTALLS, AND WHAT IT LEAVES OFF. The two deploy clones under $HESTIA_HOME/deploy, the
+# hestia-deploy script, the service + timer units with HESTIA_WORKSPACE rendered, and the
+# update-check service + timer. The DEPLOY TIMER STAYS OFF unless HESTIA_AUTO_UPDATE=1: nothing
+# builds or restarts until the operator clicks update or switches auto-update on in the
+# dashboard. The CHECK timer is on: it only reports whether an update is available. A re-run
+# never turns an armed timer off and never touches the deploy clones' history.
+#
+# WHEN IT SKIPS (and says so). The supervisor builds hestia main from source, so it needs a
+# checkout install (a resolved HESTIA_WORKSPACE) with git and cargo. A release install
+# (`curl | sh`) tracks releases, not main, and is updated by re-running this script; converting
+# it to main-tracking is a choice this step does not make for it. macOS: the launchd agent's
+# binary path must be derived from the daemon's registration (README), so it is not automated
+# here yet.
+# One systemd `Environment=` line for VAR=VALUE that survives systemd's own parser. Unquoted,
+# the value is split at whitespace (a workspace under "/home/x/My Projects" became two
+# assignments, one of them invalid and dropped: measured with systemd-analyze verify), `%` is
+# a specifier, and backslash and quote are special. So: double-quote the whole assignment,
+# escape backslash and quote, and double every `%` (systemd.exec(5), systemd.unit(5)
+# "Specifiers"). A newline cannot be expressed in a unit file at all: refuse it.
+systemd_env_line() {
+  local var="$1" val="$2" nl=$'\n'
+  case "$val" in *"$nl"*) return 1 ;; esac
+  val="${val//\\/\\\\}"
+  val="${val//\"/\\\"}"
+  val="${val//%/%%}"
+  printf 'Environment="%s=%s"\n' "$var" "$val"
+}
+
+step_deploy_supervisor() {
+  if [ -n "${HESTIA_SKIP_DEPLOY:-}" ]; then
+    c_dim "deploy supervisor skipped (HESTIA_SKIP_DEPLOY set)"
+    return
+  fi
+  c_hdr "deploy supervisor (dashboard update button)"
+  if [ "$(uname -s)" != Linux ]; then
+    c_dim "not automated on $(uname -s) yet: see deploy/from-main/README.md (launchd)"
+    return
+  fi
+  if [ -z "${HESTIA_WORKSPACE:-}" ]; then
+    c_dim "release install (no checkout): update by re-running this installer."
+    c_dim "  the deploy supervisor builds hestia main from source; to opt in, run this script"
+    c_dim "  from a checkout, or see deploy/from-main/README.md"
+    return
+  fi
+  # The deploy units are bound to ~/.hestia (the daemon unit takes HESTIA_HOME since #1444, the
+  # deploy units do not yet), and hestia-deploy defaults its clones to
+  # ~/.hestia/deploy. Installing for another HESTIA_HOME would put the clones where the
+  # supervisor never looks and deploy into a home the daemon does not read. Until the units
+  # take HESTIA_HOME from configuration, say so instead of installing a half-wired supervisor.
+  if [ "$HESTIA_HOME" != "${HESTIA_HOME_DEFAULT:?}" ]; then
+    c_warn "deploy supervisor not installed: HESTIA_HOME is $HESTIA_HOME, but the deploy units"
+    c_warn "  run against $HESTIA_HOME_DEFAULT. Install it by hand (deploy/from-main/README.md) if this box"
+    c_warn "  should deploy from main, with HESTIA_HOME and HESTIA_DEPLOY_ROOT set in the unit."
+    return
+  fi
+  local missing=""
+  command -v git >/dev/null 2>&1   || missing="$missing git"
+  command -v cargo >/dev/null 2>&1 || missing="$missing cargo"
+  if [ -n "$missing" ]; then
+    c_warn "deploy supervisor not installed: needs$missing (it builds hestia main from source)"
+    c_warn "  install the missing tool(s) and re-run this installer"
+    return
+  fi
+  local deploy_root="$HESTIA_HOME/deploy" unit_dir="$HOME/.config/systemd/user"
+  local src="$deploy_root/hestia/deploy/from-main"
+  mkdir -p "$deploy_root" "$unit_dir" "$BIN_DIR"
+  # https, not ssh: the units run without an agent or a key, and both repos are public.
+  local name
+  for name in hestia web4; do
+    if [ ! -d "$deploy_root/$name/.git" ]; then
+      git clone -q "https://github.com/dp-web4/$name.git" "$deploy_root/$name" \
+        || { c_err "clone of $name into $deploy_root failed"; return 1; }
+    fi
+  done
+  if [ ! -f "$src/hestia-deploy.sh" ]; then
+    c_err "deploy checkout has no deploy/from-main/hestia-deploy.sh: $deploy_root/hestia"
+    return 1
+  fi
+  install -m 0755 "$src/hestia-deploy.sh" "$BIN_DIR/hestia-deploy"
+  # The shipped unit leaves HESTIA_WORKSPACE empty on purpose ("render it from explicit operator
+  # configuration"); this installer's resolved workspace is that configuration. The line is
+  # replaced by awk reading it from the environment, not by sed: a workspace path containing
+  # `|`, `&` or `\` would otherwise be read as sed syntax.
+  local env_line
+  if ! env_line="$(systemd_env_line HESTIA_WORKSPACE "$HESTIA_WORKSPACE")"; then
+    c_err "HESTIA_WORKSPACE contains a newline; a systemd unit cannot carry it"
+    return 1
+  fi
+  if ! ENV_LINE="$env_line" awk '
+      $0 == "Environment=HESTIA_WORKSPACE=" { print ENVIRON["ENV_LINE"]; n++; next }
+      { print }
+      END { exit n == 1 ? 0 : 1 }' \
+      "$src/hestia-deploy.service" > "$unit_dir/hestia-deploy.service"; then
+    c_err "hestia-deploy.service no longer has exactly one empty HESTIA_WORKSPACE= line: $src"
+    return 1
+  fi
+  install -m 0644 "$src/hestia-deploy.timer" "$unit_dir/hestia-deploy.timer"
+  # The update CHECK (report only, never installs): what the dashboard's "check for updates"
+  # starts and what keeps its "checked <time>" fresh. Its timer is switched on the first time it
+  # is installed; a re-run leaves an operator's later choice alone.
+  local check_fresh=0
+  [ -f "$unit_dir/hestia-deploy-check.timer" ] || check_fresh=1
+  install -m 0644 "$src/hestia-deploy-check.service" "$unit_dir/hestia-deploy-check.service"
+  install -m 0644 "$src/hestia-deploy-check.timer" "$unit_dir/hestia-deploy-check.timer"
+  # Read back, as the other steps do: a zero exit is not evidence the bytes landed.
+  if ! grep -qxF -- "$env_line" "$unit_dir/hestia-deploy.service"; then
+    c_err "hestia-deploy.service was written without HESTIA_WORKSPACE: $unit_dir/hestia-deploy.service"
+    return 1
+  fi
+  # And have systemd itself parse it, where it can: an assignment it splits or rejects is a
+  # warning on stderr with exit 0, so the warning is what is checked.
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    local verify
+    verify="$(systemd-analyze verify "$unit_dir/hestia-deploy.service" 2>&1 || true)"
+    case "$verify" in
+      *"nvalid environment"*|*"Failed to resolve"*)
+        c_err "systemd does not parse the rendered unit: $verify"
+        return 1 ;;
+    esac
+  fi
+  systemctl --user daemon-reload
+  c_ok "deploy supervisor installed: the dashboard update button works"
+  if [ "$check_fresh" = 1 ]; then
+    systemctl --user enable --now hestia-deploy-check.timer
+    c_ok "update check ON: checks hestia main every 4h and shows the result; installs nothing"
+  fi
+  if [ "${HESTIA_AUTO_UPDATE:-}" = 1 ]; then
+    systemctl --user enable --now hestia-deploy.timer
+    c_ok "auto-update ON (HESTIA_AUTO_UPDATE=1): deploys hestia main every 4h"
+  elif systemctl --user is-enabled --quiet hestia-deploy.timer 2>/dev/null; then
+    c_ok "auto-update already ON: left as it is"
+  else
+    c_dim "auto-update OFF: updates happen when you click update; switch it on in the dashboard"
+  fi
+}
+
+# THE POLICY GATE, FROM THE RELEASE (#1443). Before this step a release install fetched only
+# plugins/claude-code and printed "add the hooks to ~/.claude/settings.json": the hook it pointed
+# at loads its engine from $HESTIA_HOME/shared, which nothing in this script wrote, so following
+# the instruction gave a gate that refused every call, and not following it gave an ungoverned
+# Claude Code beside a daemon that witnessed nothing.
+#
+# Now it runs the SAME members' install a deploy runs (deploy/install-members.sh: the shared
+# engine, each member's hooks, the registration lines, the seat documents), from the source of
+# the SAME tag as the binary. Nothing is reimplemented here. Source comes from a shallow
+# `git clone --branch <tag>` so install-members.sh records the audited `git describe` build id;
+# without git it falls back to the tag archive and the build id reads "unknown" (said aloud).
+#
+# Preconditions are checked first and each failure says what to do; none is guessed:
+#   - Claude Code on this machine (~/.claude exists). Absent -> skip, never mint a config for a
+#     harness that is not here (#1130), unless HESTIA_INSTALL_GATE=1 asks for it explicitly.
+#   - HESTIA_WORKSPACE: the directory the agent works in, the gate's scope root. No default.
+#   - bash >= 4 (install-members.sh uses declare -A / mapfile; macOS ships 3.2).
+#   - an Ed25519 backend for python3 (PyNaCl or cryptography): the seat seeder signs the
+#     operator challenge with the key the daemon minted at genesis.
+# It runs after the smoke test: the seeder needs the running daemon's endpoint and operator key.
+find_bash4() {
+  local b
+  for b in "${HESTIA_BASH:-}" bash /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    [ -n "$b" ] || continue
+    command -v "$b" >/dev/null 2>&1 || continue
+    if "$b" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then
+      command -v "$b"
+      return 0
+    fi
+  done
+  return 1
+}
+
 step_claude_hooks() {
   if [ -n "${HESTIA_SKIP_HOOK:-}" ]; then
-    c_dim "claude-code hooks skipped (HESTIA_SKIP_HOOK set)"
+    c_dim "claude-code gate skipped (HESTIA_SKIP_HOOK set)"
     return
   fi
-  c_hdr "claude-code hooks"
-  local settings="$HOME/.claude/settings.json"
-  if [ ! -f "$settings" ]; then
-    c_dim "no ~/.claude/settings.json — skipping (install on machines where you run Claude Code)"
+  c_hdr "claude-code policy gate"
+  local claude_dir="$HOME/.claude"
+  if [ ! -d "$claude_dir" ]; then
+    if [ "${HESTIA_INSTALL_GATE:-}" = "1" ]; then
+      mkdir -p "$claude_dir"
+      c_warn "created $claude_dir (HESTIA_INSTALL_GATE=1)"
+    else
+      c_dim "Claude Code is not on this machine ($claude_dir absent); gate not installed."
+      c_dim "  install Claude Code, then re-run this installer (or set HESTIA_INSTALL_GATE=1)"
+      return
+    fi
+  fi
+  local missing=()
+  if [ -z "${HESTIA_WORKSPACE:-}" ] || [ ! -d "${HESTIA_WORKSPACE:-}" ]; then
+    missing+=("HESTIA_WORKSPACE=<the directory your agent works in> (the gate's scope root; none is guessed)")
+  fi
+  local bash4=""
+  bash4="$(find_bash4)" || missing+=("bash >= 4 (macOS: brew install bash; or point HESTIA_BASH at one)")
+  if ! python3 -c 'import nacl.signing' >/dev/null 2>&1 \
+     && ! python3 -c 'from cryptography.hazmat.primitives.asymmetric import ed25519' >/dev/null 2>&1; then
+    missing+=("an Ed25519 library for python3: python3 -m pip install --user cryptography (or PyNaCl)")
+  fi
+  if [ "${#missing[@]}" -gt 0 ]; then
+    c_warn "gate NOT installed; this machine still needs:"
+    local m
+    for m in "${missing[@]}"; do c_warn "  - $m"; done
+    c_warn "  then re-run this installer. The daemon above is installed and running either way."
     return
   fi
-  # Detect plugin location: prefer ~/.hestia/plugins/claude-code, fall
-  # back to the repo's plugins/claude-code if running from a checkout.
-  local plugin_dir=""
-  local repo_root
-  repo_root="$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd || true)"
-  if [ -d "$HOME/.hestia/plugins/claude-code/hooks" ]; then
-    plugin_dir="$HOME/.hestia/plugins/claude-code"
-  elif [ -n "$repo_root" ] && [ -d "$repo_root/plugins/claude-code/hooks" ]; then
-    plugin_dir="$repo_root/plugins/claude-code"
+
+  local src="$HESTIA_HOME/src/hestia-${VERSION}"
+  if [ ! -f "$src/deploy/install-members.sh" ]; then
+    rm -rf "$src.partial"
+    mkdir -p "$HESTIA_HOME/src"
+    if command -v git >/dev/null 2>&1 \
+       && git clone -q --depth 1 --branch "$VERSION" "https://github.com/${REPO}.git" "$src.partial" 2>/dev/null; then
+      c_ok "source for ${VERSION} cloned (the members' install records its git describe)"
+    else
+      rm -rf "$src.partial"
+      mkdir -p "$src.partial"
+      curl -fsSL "https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz" \
+        | tar -xz -C "$src.partial" --strip-components=1
+      c_warn "source for ${VERSION} from the tag archive (no git): the install records build id 'unknown'"
+    fi
+    mv "$src.partial" "$src"
   fi
-  if [ -z "$plugin_dir" ]; then
-    c_warn "no hestia claude-code plugin found; fetching plugin source under \$HESTIA_HOME/plugins…"
-    mkdir -p "$HESTIA_HOME/plugins"
-    curl -fsSL "https://github.com/${REPO}/archive/refs/tags/${VERSION}.tar.gz" \
-      | tar -xz -C "$HESTIA_HOME/plugins" --strip-components=2 "hestia-${VERSION#v}/plugins/claude-code"
-    plugin_dir="$HESTIA_HOME/plugins/claude-code"
+  c_ok "source at $src"
+
+  # install-members.sh hashes with `sha256sum`, which macOS does not ship (found by the install
+  # smoke gate arm, #1443). It is a governed file, so the installer supplies the command rather
+  # than editing it: `shasum -a 256` prints the same `<hex>  <name>` lines, stdin included.
+  local shim_path="$PATH"
+  if ! command -v sha256sum >/dev/null 2>&1 && command -v shasum >/dev/null 2>&1; then
+    local shim="$HESTIA_HOME/src/.shim"
+    mkdir -p "$shim"
+    printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > "$shim/sha256sum"
+    chmod 0755 "$shim/sha256sum"
+    shim_path="$shim:$PATH"
   fi
-  c_ok "claude-code plugin at $plugin_dir"
-  c_dim "to enable, add the PreToolUse + PostToolUse hooks from $plugin_dir to ~/.claude/settings.json"
-  c_dim "(future: 'hestia plugin install claude-code' will do this for you)"
+  local rc=0
+  PATH="$shim_path" HESTIA_HOME="$HESTIA_HOME" HESTIA_WORKSPACE="$HESTIA_WORKSPACE" \
+    "$bash4" "$src/deploy/install-members.sh" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    c_err "the members' install failed (exit $rc); the gate is NOT installed. Output above."
+    c_dim "  re-run: HESTIA_HOME=$HESTIA_HOME HESTIA_WORKSPACE=$HESTIA_WORKSPACE $bash4 $src/deploy/install-members.sh"
+    exit 1
+  fi
+  c_ok "claude-code gate installed from ${VERSION}; it governs the next Claude Code session"
+  step_initial_workspace_grant "$src"
+}
+
+# THE OPERATOR'S INITIAL GRANT (dp, 2026-10-30, on #1448): "supplied workspace means a working
+# workspace". Supplying HESTIA_WORKSPACE to this installer authorises ONE grant of exactly that
+# path to the claude-code seat. It is a real operator act: signed with the operator key the daemon
+# minted at genesis, through the same /api/scope/grant the dashboard uses, so it lands on the chain
+# as scope_granted and is inspectable, editable and revocable there. An environment variable is
+# never itself a grant.
+#   - exactly the supplied path (recursive), nothing wider;
+#   - `expected_existing: null`: written only if no standing grant on (claude-code, that path)
+#     exists. A re-install finds the operator's current grant and leaves it as it is, never
+#     replacing or widening it;
+#   - a failed grant is a visible, non-zero failure of the gate setup, not a warning.
+step_initial_workspace_grant() {
+  local src="$1" rc=0 out
+  out="$(python3 - "$src/tools/seed_seat_config.py" "$HESTIA_HOME" "$HESTIA_WORKSPACE" "$VERSION" <<'PY'
+import importlib.util, json, sys
+from pathlib import Path
+seed_py, home, ws, version = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("seed_seat_config", seed_py)
+seed = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(seed)
+home = Path(home)
+endpoint = (home / "endpoint").read_text().strip()
+op = seed.Operator(endpoint.rsplit("/mcp", 1)[0], home / "operator.key")
+op.open_session()
+status, body = op.call("POST", "/api/scope/grant", {
+    "plugin_id": "claude-code", "path": ws, "recursive": True, "expected_existing": None,
+    # The seat was installed a moment ago and has not connected yet (its first Claude Code
+    # session will); the daemon refuses a grant to a never-connected member unless told so.
+    "grant_ahead_of_connect": True,
+    "reason": f"initial workspace grant: the operator supplied HESTIA_WORKSPACE={ws} to the "
+              f"release installer ({version}); dp ruling 2026-10-30 (hestia #1448)"})
+if status == 200:
+    print("granted " + json.dumps(body)[:200]); sys.exit(0)
+if status == 409 and isinstance(body, dict) and body.get("moved") and body.get("current"):
+    print("kept " + json.dumps(body.get("current"))[:200]); sys.exit(3)
+print(f"refused {status} " + json.dumps(body)[:300]); sys.exit(1)
+PY
+)" || rc=$?
+  case "$rc" in
+    0) c_ok "operator granted the seat its workspace: $HESTIA_WORKSPACE (recursive; on the chain as scope_granted)"
+       c_dim "  edit or revoke it on the dashboard: http://${HESTIA_BIND}/" ;;
+    3) c_ok "the seat already holds a grant on $HESTIA_WORKSPACE; left as it is (a re-install never widens it)"
+       c_dim "  $out" ;;
+    *) c_err "the gate is installed but its initial workspace grant FAILED: $out"
+       c_err "  the seat holds no scope, so every act it tries is refused. Grant $HESTIA_WORKSPACE on"
+       c_err "  the dashboard (http://${HESTIA_BIND}/, sign in with the operator key in $HESTIA_HOME), then"
+       c_err "  re-run this installer to confirm."
+       exit 1 ;;
+  esac
 }
 
 step_smoketest() {
   c_hdr "smoke test"
-  local host="${HESTIA_BIND%:*}" port="${HESTIA_BIND##*:}"
-  # Give the daemon a second to come up.
-  for _ in 1 2 3 4 5; do
-    if curl -fsS -o /dev/null "http://${host}:${port}/api/dashboard"; then
-      c_ok "dashboard reachable at http://${host}:${port}/"
-      curl -fsS "http://${host}:${port}/api/dashboard" \
-        | python3 -c "import json,sys; d=json.load(sys.stdin); print('  chain length:', d['society']['chain_length']); print('  vault entries:', d['society']['vault_entries']); print('  known plugins:', d['society']['known_plugins'])"
-      return 0
+  local host="${HESTIA_BIND%:*}" port="${HESTIA_BIND##*:}" body got want="${VERSION}"
+  # /api/version is the daemon's open handshake route (the app reads it before sign-in).
+  # This step used /api/dashboard, which became operator-authenticated: on a healthy fresh
+  # install it answered 401 and the installer reported a dead daemon and exited 1 (found by
+  # install smoke, web4#904). The daemon must also be the release this run installed: a release
+  # binary built at its tag reports that tag as its build_id (`git describe`).
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if body="$(curl -fsS "http://${host}:${port}/api/version" 2>/dev/null)"; then
+      got="$(printf '%s' "$body" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("build_id",""))' 2>/dev/null || true)"
+      if [ "$got" = "$want" ]; then
+        c_ok "daemon ${got} answering at http://${host}:${port}/ (sign in from the dashboard)"
+        return 0
+      fi
+      c_err "a daemon answers at http://${host}:${port}/ but reports build '${got}', not '${want}'"
+      c_dim "  another hestia may own ${HESTIA_BIND}; stop it, or set HESTIA_BIND and re-run"
+      exit 1
     fi
     sleep 1
   done
-  c_err "daemon did not respond at http://${host}:${port}/api/dashboard"
+  c_err "daemon did not respond at http://${host}:${port}/api/version"
   exit 1
+}
+
+resolve_version() {
+  [ -n "$VERSION" ] && return 0
+  local tag
+  tag="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)" || true
+  case "$tag" in
+    v[0-9]*) ;;
+    *) tag="$(curl -fsS -o /dev/null --max-time 15 -w '%{redirect_url}' "https://github.com/${REPO}/releases/latest" 2>/dev/null \
+         | sed -n 's#.*/releases/tag/\(v[0-9][^/?]*\)$#\1#p')" || true ;;
+  esac
+  case "$tag" in
+    v[0-9]*) VERSION="$tag" ;;
+    *) c_err "could not resolve the latest release from GitHub (API and releases/latest both failed)"
+       c_dim "  set HESTIA_VERSION to a release tag (https://github.com/${REPO}/releases) and re-run"
+       exit 1 ;;
+  esac
+}
+
+# Never replace a newer daemon with an older release (#520: the v0.0.3 default downgraded a
+# v0.0.4 host and took its daemon down -- v0.0.3 cannot open v0.0.4's databases). Compares the
+# installed binary's package version with the target tag; a deliberate downgrade must say so.
+#
+# Portable on purpose (#1279 review): no GNU version-sort (stock macOS has none). Fail CLOSED: an
+# installed binary whose version cannot be read, or a target that is not X.Y.Z, refuses unless
+# the operator opts in. Only an affirmative HESTIA_ALLOW_DOWNGRADE (1/true/yes) is an opt-in;
+# `0`, `false` or any other value is not.
+
+# version_newer A B -> exit 0 iff X.Y.Z A is strictly newer than X.Y.Z B (numeric per field).
+version_newer() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, ".")
+    for (i = 1; i <= 3; i++) { xi = (i <= na) ? x[i] + 0 : 0; yi = (i <= nb) ? y[i] + 0 : 0
+      if (xi > yi) exit 0; if (xi < yi) exit 1 }
+    exit 1 }'
+}
+
+downgrade_opted_in() {
+  case "$(printf '%s' "${HESTIA_ALLOW_DOWNGRADE:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+guard_downgrade() {
+  [ -x "$BIN_PATH" ] || return 0
+  local have want semver='^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$'
+  have="$("$BIN_PATH" --version 2>/dev/null | sed -n 's/^[^0-9]*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)"
+  want="${VERSION#v}"; want="${want%%-*}"
+  if ! printf '%s' "$have" | grep -Eq "$semver" || ! printf '%s' "$want" | grep -Eq "$semver"; then
+    if downgrade_opted_in; then
+      c_warn "cannot compare installed hestia (${have:-unreadable}) with ${VERSION}; proceeding (HESTIA_ALLOW_DOWNGRADE set)"
+      return 0
+    fi
+    c_err "cannot compare installed hestia (${have:-version unreadable}) with ${VERSION}; refusing in case this is a downgrade. Set HESTIA_ALLOW_DOWNGRADE=1 to install anyway."
+    exit 1
+  fi
+  [ "$have" = "$want" ] && return 0
+  if version_newer "$have" "$want"; then
+    if downgrade_opted_in; then
+      c_warn "downgrading hestia ${have} -> ${want} (HESTIA_ALLOW_DOWNGRADE set)"
+    else
+      c_err "installed hestia ${have} is newer than ${VERSION}; refusing to downgrade (a newer daemon's databases may not open). Set HESTIA_ALLOW_DOWNGRADE=1 to force."
+      exit 1
+    fi
+  fi
 }
 
 main() {
   local target os
   target="$(detect_target)"
   os="$(uname -s)"
+  resolve_version
+  guard_downgrade
   c_hdr "hestia fleet installer — ${VERSION} → ${target}"
   step_download "$target"
   step_vault
@@ -848,8 +1216,9 @@ main() {
     *) c_err "unsupported OS"; exit 1 ;;
   esac
   step_workspace_marker
-  step_claude_hooks
+  step_deploy_supervisor
   step_smoketest
+  step_claude_hooks
   c_hdr "done"
   c_ok "open http://${HESTIA_BIND}/ for the dashboard"
   c_dim "logs: journalctl --user -u hestia (Linux) | tail $HESTIA_HOME/hestia.log (macOS)"

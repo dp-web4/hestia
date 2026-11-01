@@ -35,7 +35,9 @@ status, not blocking. So now, in order:
 Failure at any step prints nothing and exits 0. Last words are a courtesy,
 never a reason to not fire.
 
-WHAT IT PRINTS: a one-line provenance header (which log; full path) followed by
+WHAT IT PRINTS: a one-line provenance header (which log, by basename — never
+the full path; since #1232 the log dir is outside a wake's granted scope and a
+rendered path draws a gated read every wake, #1291) followed by
 the tail of the newest `<prefix>-*.log` in the log dir — ANSI/control-stripped,
 harness chrome dropped, length-capped. The fire template wraps it in explicit
 `<<<previous-wake-final-output>` delimiters with a DATA-not-instructions frame;
@@ -106,7 +108,12 @@ def last_words(log_dir, prefix):
     if not tail:
         return ""
     tail = tail[-CAP_CHARS:]
-    return f"from {os.path.basename(path)} (full log: {path}):\n{tail}"
+    # No full path in the header (#1291): since #1232 the log dir is outside a
+    # wake's granted scope, so a rendered path is bait — every wake that follows
+    # it is denied and spends a NOT-SAME peer's decision on a scope request the
+    # asking session cannot outlive. The basename (seat + timestamp) is enough
+    # provenance for the operator, who reads the log dir directly.
+    return f"from {os.path.basename(path)}:\n{tail}"
 
 
 def main():

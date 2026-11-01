@@ -4,9 +4,14 @@
 //! tool / resource specification this server exposes.
 
 mod agents;
+pub mod adjudicator;
+pub mod api_version;
 mod dashboard;
+pub mod decision_witness;
+pub mod evidence;
 pub mod gate_escalation;
 pub mod governance_ledger;
+pub mod grant_modes;
 mod handler;
 mod http;
 mod hub_tab;
@@ -19,7 +24,10 @@ mod public_identity;
 pub mod retirement;
 pub mod standing_scope;
 pub mod transport_binding;
+pub mod channel;
 mod state;
+pub mod state_lock;
+pub mod published;
 
 pub use dashboard::{
     ActivityStats, DashboardSnapshot, DeploymentHealth, RecentEntry, SocietyView, TrustView,
@@ -31,7 +39,6 @@ pub use state::{ServerState, SharedState};
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use crate::vault::Vault;
 
@@ -55,5 +62,5 @@ pub fn build_state(mut vault: Vault, home: &Path, passphrase: &str) -> Result<Sh
         tracing::warn!("failed to project public identity from authoritative vault state: {e:#}");
     }
 
-    Ok(Arc::new(Mutex::new(state)))
+    Ok(Arc::new(state_lock::StateCell::new(state)))
 }

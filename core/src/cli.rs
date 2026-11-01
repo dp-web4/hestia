@@ -127,6 +127,40 @@ enum Command {
     #[command(subcommand)]
     Scope(ScopeCmd),
 
+    /// Member lifecycle (#990, on #1100's store): retire a residue id out of the
+    /// governance pools (grants revoked in the same act), or reinstate it.
+    /// Operator-signed against the daemon's challenge surface — adds no authority
+    /// the daemon does not already enforce.
+    Member {
+        #[command(subcommand)]
+        cmd: MemberCmd,
+
+        /// Daemon URL
+        #[arg(long, default_value = "http://127.0.0.1:7711", global = true)]
+        endpoint: String,
+
+        /// Operator credential file (JSON `{lct_id, secret_key_hex}`) whose public
+        /// half is law-listed in `operator_access`. Read, never printed; supplied
+        /// here or via HESTIA_OPERATOR_KEY, never guessed.
+        #[arg(long, global = true, env = "HESTIA_OPERATOR_KEY")]
+        key: PathBuf,
+    },
+
+    /// Channel sends (#1344, shadow): bind a member's channel, list the outbox, and mark a
+    /// send answered. Operator-signed, like `member`.
+    Channel {
+        #[command(subcommand)]
+        cmd: ChannelCmd,
+
+        /// Daemon URL
+        #[arg(long, default_value = "http://127.0.0.1:7711", global = true)]
+        endpoint: String,
+
+        /// Operator credential file (JSON `{lct_id, secret_key_hex}`), as for `member`.
+        #[arg(long, global = true, env = "HESTIA_OPERATOR_KEY")]
+        key: PathBuf,
+    },
+
     /// Governance-surface escalations — the remedy every gate deny already names.
     ///
     /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
@@ -177,6 +211,13 @@ enum GateCmd {
         wait: Option<u64>,
     },
 
+    /// What the daemon did for a request key (#1166). Read-only: it observes no escalation
+    /// and starts no claim window, so it is safe where `poll` is not (#732).
+    Lookup {
+        /// The 64-hex request key a gate refusal printed
+        request_key: String,
+    },
+
     /// Approve a governance write. Requires --reason; a PEER deny does not (but
     /// withdrawing your OWN escalation does — see `deny`).
     Approve {
@@ -216,6 +257,72 @@ enum GateCmd {
         /// evidence)
         #[arg(long)]
         argument: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ChannelCmd {
+    /// Mark one outbox row answered: the bound recipient replied, so it no longer counts
+    /// against the member's unanswered budget (#1344 decision c). Once only.
+    Answer {
+        /// The outbox id (from `hestia channel outbox` or the dashboard)
+        outbox_id: u64,
+    },
+    /// Bind (or rebind) where a member's sends to a channel go.
+    Bind {
+        /// The member (plugin id), e.g. legion-being
+        member: String,
+        /// The channel name the member asks for, e.g. dp
+        channel_id: String,
+        /// The recipient class the gate rules on, e.g. operator
+        #[arg(long)]
+        recipient_class: String,
+        /// Where the adapter delivers (never shown to the member)
+        #[arg(long)]
+        address: String,
+        /// The adapter that will carry it
+        #[arg(long, default_value = "email")]
+        adapter: String,
+        /// WHY: required, it is on the witnessed record
+        #[arg(long)]
+        reason: String,
+    },
+    /// List the outbox, newest first.
+    Outbox {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemberCmd {
+    /// Retire a member id: out of every governance-selection pool, grants revoked
+    /// in the same act (#990, on #1100's store). Reversible — see `reinstate`.
+    Retire {
+        /// The member id to retire (e.g. a probe-residue name)
+        plugin_id: String,
+        /// WHY — required, single line; carried on the retirement row and the
+        /// witnessed events. A prune without a stated basis cannot be challenged.
+        #[arg(long)]
+        reason: String,
+        /// The evidence pointer for the judgement (e.g. "dp 2026-09-08", a forum
+        /// post, a chain hash) — required, like the reason.
+        #[arg(long, rename_all = "kebab-case")]
+        r#ref: String,
+        /// Override the daemon's recently-acted guard: the id has acted in the
+        /// last 24h and you mean to revoke its grants anyway.
+        #[arg(long)]
+        confirm_active: bool,
+    },
+
+    /// Reinstate a retired member id: lift the retirement, return it to the
+    /// pools. Grants revoked at retirement are NOT restored.
+    Reinstate {
+        /// The member id to reinstate
+        plugin_id: String,
+        /// WHY — required; the witnessed `member_reinstated` pair carries it.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -564,6 +671,216 @@ enum HubCmd {
         #[arg(long, default_value = "")]
         target: String,
     },
+
+    /// Bind one canonical local child to the Hub mailbox identity/key that
+    /// receives for it. The Hub endpoint comes from --target, but the child may
+    /// have its OWN Hub member UUID and key on that same Hub.
+    ReceiverBind {
+        /// Local member reference: plugin id, canonical LCT, or verified legacy alias.
+        child: String,
+        /// Existing Hub connection used only as the endpoint/Hub identity template.
+        /// Several receiver children may share this same Hub URL.
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Hub member UUID whose mailbox belongs to this child. Omit to use the
+        /// template connection's own member identity.
+        #[arg(long)]
+        member_lct: Option<uuid::Uuid>,
+        /// Raw 32-byte Ed25519 channel-key seed file for --member-lct. Required
+        /// when the child uses a different Hub member than the template connection.
+        /// The encrypted routing table stores this PATH/HANDLE, never key bytes.
+        #[arg(long)]
+        channel_key: Option<String>,
+        /// Router/parent LCT to verify against (default: persisted local sovereign,
+        /// until the machine-entity migration gives the host its distinct LCT).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Why this hosting/transport binding is correct.
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Remove a child's local mailbox route.
+    ReceiverUnbind {
+        child: String,
+    },
+
+    /// Provision/request a DEDICATED Hub membership for the F3 machine router.
+    ///
+    /// This never reuses or rewrites the primary/legacy seat membership. The
+    /// UUID + raw unattended key are persisted before the join request so retry
+    /// after a lost response or pending Sovereign approval is identity-stable.
+    ReceiverRouterJoin {
+        /// Existing Hub connection used only as endpoint/Hub identity template.
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Hub display name for the dedicated router member (e.g. legion-router).
+        #[arg(long)]
+        name: String,
+        /// Router/parent canonical LCT (default: persisted local sovereign).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Why this dedicated router membership is being created.
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Bind a receipt-mode Hub mailbox to the router identity itself. Route
+    /// packets arrive here; this is not a child/member inbox.
+    ReceiverRouterBind {
+        #[arg(long, default_value = "")]
+        target: String,
+        #[arg(long)]
+        member_lct: Option<uuid::Uuid>,
+        #[arg(long)]
+        channel_key: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Issue a dual-signed router-interface certificate after re-verifying the
+    /// Hub pin and proving receipt mode with a non-destructive fetch.
+    ReceiverRouterCertify {
+        /// Existing Hub connection used only to identify the Hub endpoint.
+        #[arg(long, default_value = "")]
+        target: String,
+        /// Router/parent canonical LCT (default: persisted local Society).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Optional JSON file to write atomically; certificate is always printed.
+        #[arg(long)]
+        out: Option<String>,
+    },
+
+    /// Bind one canonical next-hop router LCT to its Hub transport address.
+    /// Peer Hub-member identity is derived from a verified router certificate,
+    /// not typed independently.
+    ReceiverNeighbor {
+        next_hop: String,
+        /// Local router interface UUID used to reach this neighbor's Hub.
+        #[arg(long)]
+        interface: uuid::Uuid,
+        /// JSON router-interface certificate exported by the peer.
+        #[arg(long)]
+        peer_certificate: String,
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Bind one historical peer/member spelling to the canonical END
+    /// member LCT used by F3. Exact alias only; no prefix/name inference.
+    ReceiverAlias {
+        legacy_address: String,
+        destination_lct: String,
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Change which delivery plane owns one exact legacy peer/member edge.
+    ///
+    /// New aliases default to legacy. F3 cutover is always an explicit,
+    /// reasoned operator action after measured parity.
+    ReceiverAliasAuthority {
+        legacy_address: String,
+        /// legacy | f3
+        authority: String,
+        #[arg(long)]
+        reason: String,
+        /// Recent witness rows inspected before a legacy -> F3 transition.
+        #[arg(long, default_value_t = 100)]
+        parity_limit: u64,
+        /// Minimum exact measured legacy/F3 Hub next-hop matches required.
+        #[arg(long, default_value_t = 1)]
+        min_matches: usize,
+        /// Router/parent LCT override for the current-route recheck.
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
+    /// Mechanical D3 readiness check for one exact legacy compatibility edge.
+    /// Does not mutate delivery authority.
+    ReceiverCutoverCheck {
+        legacy_address: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+        #[arg(long, default_value_t = 1)]
+        min_matches: usize,
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
+    /// Remove one legacy compatibility alias.
+    ReceiverUnalias {
+        legacy_address: String,
+    },
+
+    /// Evaluate how F3 WOULD route one legacy address without sending anything.
+    ReceiverShadow {
+        legacy_address: String,
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
+    /// Summarize recent LIVE legacy member_notify vs F3 shadow-routing evidence.
+    /// Delivery remains legacy-authoritative; this is observation only.
+    ReceiverParity {
+        #[arg(long, default_value_t = 100)]
+        limit: u64,
+    },
+
+    /// Originate one routed member notice from a canonical local child.
+    /// This is the additive F3 path; legacy peer/member member_notify is not
+    /// translated here.
+    ReceiverSend {
+        /// Local member reference; resolved to its canonical child LCT.
+        #[arg(long = "from")]
+        from_member: String,
+        /// Canonical Web4 destination LCT.
+        destination_lct: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        pointer: String,
+        /// Stable retry key. Reusing it with different send intent is refused.
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
+    /// Add/update an exact remote route: destination LCT -> next-hop LCT.
+    /// Local directly-connected children always win over static routes.
+    ReceiverRoute {
+        destination: String,
+        next_hop: String,
+        #[arg(long, default_value_t = 100)]
+        metric: u32,
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Set or clear the receiver's default gateway. Unknown destinations route
+    /// here after exact local/specific routes; they are not refused immediately.
+    ReceiverDefault {
+        next_hop: Option<String>,
+        #[arg(long, conflicts_with = "next_hop")]
+        clear: bool,
+        /// Why this default gateway is the right upstream route.
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Show the machine receiver routing table.
+    ReceiverRoutes,
+
+    /// Run one receipt-mode receive pass for every locally bound child.
+    /// Delivery is durable; this does NOT wake sessions.
+    ReceiverDrain {
+        #[arg(long)]
+        parent: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -652,6 +969,57 @@ enum PolicyCmd {
 
 #[derive(Subcommand, Debug)]
 enum ScopeCmd {
+    /// List pending scope requests, including the ones the GATE opened on a refused act (with
+    /// the act). Read-only: the operator rules them on the dashboard or the app.
+    Pending {
+        /// Print the daemon's scope-queue fields as one JSON value
+        #[arg(long)]
+        json: bool,
+        /// Asserted member id for the read session (default: the CLI's own)
+        #[arg(long = "as")]
+        as_member: Option<String>,
+        /// Daemon MCP endpoint
+        #[arg(long, default_value = "http://127.0.0.1:7711")]
+        endpoint: String,
+    },
+    /// Decide ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05:
+    /// scope escalations go to peers; the operator is the override). The asker can never decide
+    /// its own request, and an asserted (unproven) asker's request is the operator's.
+    Decide {
+        /// The pending request id (from the deny text, the mesh invitation, or `scope pending`)
+        request_id: String,
+        /// Approve THIS refused act once (claim window)
+        #[arg(long, group = "decision")]
+        once: bool,
+        /// Grant for the session (memory-only, expires)
+        #[arg(long, group = "decision")]
+        session: bool,
+        /// Grant standing (vault; survives restart until revoked)
+        #[arg(long, group = "decision")]
+        standing: bool,
+        /// Refuse it
+        #[arg(long, group = "decision")]
+        refuse: bool,
+        /// Grant at a directory ABOVE the asked path (needs --recursive; never the root)
+        #[arg(long)]
+        grant_path: Option<String>,
+        /// Include everything below the granted path
+        #[arg(long)]
+        recursive: bool,
+        /// What the grant lets the asker do: letters of r (read), w (write), e (execute),
+        /// d (delete), e.g. `--mode r`. Default: all four (#1345)
+        #[arg(long = "mode")]
+        modes: Option<String>,
+        /// Why — the asker reads it. Required in both directions.
+        #[arg(long)]
+        reason: String,
+        /// Which seat is deciding (its member id). Must not be the asker.
+        #[arg(long = "as")]
+        as_member: String,
+        /// Daemon MCP endpoint
+        #[arg(long, default_value = "http://127.0.0.1:7711")]
+        endpoint: String,
+    },
     /// Rule a pending scope request under an operator delegation (#952). Signs the ruling
     /// with this seat's member key from the vault and calls `hestia_scope_arbitrate`.
     Arbitrate {
@@ -796,6 +1164,24 @@ pub fn run() -> AnyResult<()> {
             }
             cmd_scope_arbitrate(&home, &endpoint, &request_id, grant, reason, &as_member, &target)
         }
+        Command::Scope(ScopeCmd::Decide { request_id, once, session, standing, refuse, grant_path,
+                                          recursive, modes, reason, as_member, endpoint }) => {
+            let decision = match (once, session, standing, refuse) {
+                (true, false, false, false) => "once",
+                (false, true, false, false) => "session",
+                (false, false, true, false) => "standing",
+                (false, false, false, true) => "refuse",
+                _ => anyhow::bail!("say exactly one of --once, --session, --standing or --refuse"),
+            };
+            if let Some(m) = &modes {
+                hestia::server::grant_modes::Modes::parse(m).map_err(|e| anyhow::anyhow!("--mode: {e}"))?;
+            }
+            hestia::gate_cli::scope_peer_decide(&endpoint, &as_member, &request_id, decision,
+                                                grant_path, recursive, modes, &reason)
+        }
+        Command::Scope(ScopeCmd::Pending { json, as_member, endpoint }) => {
+            hestia::gate_cli::scope_pending(&endpoint, as_member, "role:constellation:member", json)
+        }
         Command::Gate { cmd, endpoint, asserted_id, role } => {
             use hestia::gate_cli;
             match cmd {
@@ -806,6 +1192,9 @@ pub fn run() -> AnyResult<()> {
                 }
                 GateCmd::Poll { escalation_id, wait } => {
                     gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role, wait)
+                }
+                GateCmd::Lookup { request_key } => {
+                    gate_cli::lookup(&endpoint, &request_key, asserted_id, &role)
                 }
                 GateCmd::Approve { escalation_id, reason } => gate_cli::arbitrate(
                     &endpoint, &escalation_id, true, Some(reason), asserted_id, &role,
@@ -818,6 +1207,22 @@ pub fn run() -> AnyResult<()> {
                 }
             }
         }
+        Command::Channel { cmd, endpoint, key } => match cmd {
+            ChannelCmd::Answer { outbox_id } => hestia::member_cli::channel_answer(&endpoint, &key, outbox_id),
+            ChannelCmd::Bind { member, channel_id, recipient_class, address, adapter, reason } => {
+                hestia::member_cli::channel_bind(&endpoint, &key, &member, &channel_id, &recipient_class,
+                                                 &adapter, &address, &reason)
+            }
+            ChannelCmd::Outbox { limit } => hestia::member_cli::channel_outbox(&endpoint, &key, limit),
+        },
+        Command::Member { cmd, endpoint, key } => match cmd {
+            MemberCmd::Retire { plugin_id, reason, r#ref, confirm_active } => {
+                hestia::member_cli::retire(&endpoint, &key, &plugin_id, &reason, &r#ref, confirm_active)
+            }
+            MemberCmd::Reinstate { plugin_id, reason } => {
+                hestia::member_cli::reinstate(&endpoint, &key, &plugin_id, &reason)
+            }
+        },
         Command::Vault(v) => match v {
             VaultCmd::List => cmd_vault_list(&home),
             VaultCmd::Get { name } => cmd_vault_get(&home, &name),
@@ -916,6 +1321,88 @@ pub fn run() -> AnyResult<()> {
             HubCmd::RecvSecrets { pair_id, target } => {
                 cmd_hub_recv_secrets(&home, pair_id, &target)
             }
+            HubCmd::ReceiverBind {
+                child, target, member_lct, channel_key, parent, reason
+            } => {
+                cmd_receiver_bind(
+                    &home, &child, &target, member_lct, channel_key,
+                    parent.as_deref(), &reason,
+                )
+            }
+            HubCmd::ReceiverUnbind { child } => cmd_receiver_unbind(&home, &child),
+            HubCmd::ReceiverRouterJoin {
+                target, name, parent, reason
+            } => cmd_receiver_router_join(
+                &home, &target, &name, parent.as_deref(), &reason,
+            ),
+            HubCmd::ReceiverRouterBind {
+                target, member_lct, channel_key, parent, reason
+            } => cmd_receiver_router_bind(
+                &home, &target, member_lct, channel_key, parent.as_deref(), &reason,
+            ),
+            HubCmd::ReceiverRouterCertify { target, parent, out } => {
+                cmd_receiver_router_certify(
+                    &home, &target, parent.as_deref(), out.as_deref(),
+                )
+            }
+            HubCmd::ReceiverNeighbor {
+                next_hop, interface, peer_certificate, reason
+            } => cmd_receiver_neighbor(
+                &home, &next_hop, interface, &peer_certificate, &reason,
+            ),
+            HubCmd::ReceiverAlias {
+                legacy_address, destination_lct, reason
+            } => cmd_receiver_alias(
+                &home, &legacy_address, &destination_lct, &reason,
+            ),
+            HubCmd::ReceiverAliasAuthority {
+                legacy_address, authority, reason, parity_limit, min_matches, parent
+            } => cmd_receiver_alias_authority(
+                &home,
+                &legacy_address,
+                &authority,
+                &reason,
+                parity_limit,
+                min_matches,
+                parent.as_deref(),
+            ),
+            HubCmd::ReceiverCutoverCheck {
+                legacy_address, limit, min_matches, parent
+            } => cmd_receiver_cutover_check(
+                &home,
+                &legacy_address,
+                limit,
+                min_matches,
+                parent.as_deref(),
+            ),
+            HubCmd::ReceiverUnalias { legacy_address } => {
+                cmd_receiver_unalias(&home, &legacy_address)
+            }
+            HubCmd::ReceiverShadow { legacy_address, parent } => {
+                cmd_receiver_shadow(&home, &legacy_address, parent.as_deref())
+            }
+            HubCmd::ReceiverParity { limit } => {
+                cmd_receiver_parity(&home, limit)
+            }
+            HubCmd::ReceiverSend {
+                from_member, destination_lct, kind, pointer, operation_id, parent
+            } => cmd_receiver_send(
+                &home,
+                &from_member,
+                &destination_lct,
+                &kind,
+                &pointer,
+                &operation_id,
+                parent.as_deref(),
+            ),
+            HubCmd::ReceiverRoute { destination, next_hop, metric, reason } => {
+                cmd_receiver_route(&home, &destination, &next_hop, metric, &reason)
+            }
+            HubCmd::ReceiverDefault { next_hop, clear, reason } => {
+                cmd_receiver_default(&home, next_hop.as_deref(), clear, &reason)
+            }
+            HubCmd::ReceiverRoutes => cmd_receiver_routes(&home),
+            HubCmd::ReceiverDrain { parent } => cmd_receiver_drain(&home, parent.as_deref()),
         },
         Command::Constellation(c) => match c {
             ConstellationCmd::Add { name, device_type } => cmd_constellation_add(&home, &name, &device_type),
@@ -1177,6 +1664,17 @@ fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: b
         None
     };
 
+    // Group commit (storage::durability): if a witness-chain fsync ever fails, the outcome of
+    // every unacknowledged entry is unknown and memory may be ahead of the chain. Exit non-zero
+    // so systemd (Restart=on-failure) restarts the daemon and state is rebuilt from the chain.
+    // The short grace lets in-flight waiters receive their `hestia.not_durable` replies.
+    hestia::storage::durability::set_fatal_hook(Box::new(|why: &str| {
+        eprintln!("[hestia] exiting for restart: witness chain durability lost ({why})");
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            std::process::exit(75);
+        });
+    }));
     let state = hestia::server::build_state(vault, home, &passphrase)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1418,6 +1916,12 @@ fn cmd_witness_attest(
     out: Option<String>,
 ) -> AnyResult<()> {
     use hestia::hub::MemberKeySource;
+    // R6, BEFORE the vault: an unattended session gets the reason, not the tty-only passphrase
+    // prompt, and a signature over a subject that is not a key-derived id is never made (it is
+    // well-formed, signed, and can never verify, reported far away as "quorum not met").
+    if let Err(why) = hestia::witness::canonical_subject_id(subject_lct_id) {
+        anyhow::bail!("not attesting: {why}");
+    }
     let vault = open_vault(home)?;
     let store = HubStore::load(&vault)?;
     // Resolve which connection's pinned key witnesses (the operational key the
@@ -1932,6 +2436,13 @@ fn cmd_lct_publish(home: &std::path::Path, send: bool) -> AnyResult<()> {
 }
 
 fn open_vault(home: &std::path::Path) -> AnyResult<Vault> {
+    Ok(open_vault_with_passphrase(home)?.0)
+}
+
+/// Receiver/drain paths also open SQLCipher stores with the SAME passphrase-derived
+/// storage key. Return the passphrase alongside the opened vault so they do not
+/// prompt twice or derive a different key.
+fn open_vault_with_passphrase(home: &std::path::Path) -> AnyResult<(Vault, String)> {
     let path = vault_path(home);
     if !path.exists() {
         anyhow::bail!(
@@ -1940,8 +2451,8 @@ fn open_vault(home: &std::path::Path) -> AnyResult<Vault> {
         );
     }
     let passphrase = prompt_passphrase("Vault passphrase: ")?;
-    let vault = Vault::open(path, passphrase)?;
-    Ok(vault)
+    let vault = Vault::open(path, passphrase.clone())?;
+    Ok((vault, passphrase))
 }
 
 // ---- policy commands ------------------------------------------------------
@@ -3031,6 +3542,1482 @@ fn cmd_hub_notifications(home: &std::path::Path, target: &str) -> AnyResult<()> 
     println!("{}", serde_json::to_string(&serde_json::json!({ "notifications": notices }))?);
     Ok(())
 }
+
+fn receiver_router_lct(vault: &Vault, explicit: Option<&str>) -> AnyResult<String> {
+    if let Some(v) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(v.to_string());
+    }
+    hestia::sovereign::Sovereign::persisted_lct_id(vault).ok_or_else(|| anyhow::anyhow!(
+        "no persisted router/parent LCT; pass --parent explicitly (the current fallback is the \
+         local sovereign until the machine-entity migration lands)"
+    ))
+}
+
+fn cmd_receiver_bind(
+    home: &std::path::Path,
+    child: &str,
+    target: &str,
+    member_lct: Option<uuid::Uuid>,
+    channel_key: Option<String>,
+    parent: Option<&str>,
+    reason: &str,
+) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let resolved = registry.resolve_child_of(&router_lct, child)?;
+    let (plugin_id, child_lct) = match resolved {
+        hestia::member_registry::LocalChildResolution::Local(m) => {
+            (m.plugin_id.to_string(), m.lct.lct_id())
+        }
+        hestia::member_registry::LocalChildResolution::KnownButNotChild(m) => anyhow::bail!(
+            "'{child}' resolves to '{}' ({}) but is not parent-bound to router {}; \
+             refusing to create a local mailbox route",
+            m.plugin_id, m.lct.lct_id(), router_lct
+        ),
+        hestia::member_registry::LocalChildResolution::Unknown => anyhow::bail!(
+            "'{child}' does not resolve to a registered local member"
+        ),
+    };
+
+    // HubStore is only an ENDPOINT template here. It historically models one CLI
+    // identity per Hub URL and therefore deliberately rejects a second connection
+    // to the same URL. The receiver interface below carries its OWN Hub member
+    // identity/key, so N children can share this endpoint without changing that
+    // older contract.
+    let hubs = HubStore::load(&vault)?;
+    let template = pick_connection(&hubs, target)?;
+    let hub_member_lct = member_lct.unwrap_or(template.our_lct_id);
+    let key_source = match channel_key {
+        Some(path) => MemberKeySource::ChannelKeyFile { path },
+        None if hub_member_lct == template.our_lct_id => template.member_key_source.clone(),
+        None => anyhow::bail!(
+            "--member-lct {hub_member_lct} differs from the template connection's member {}; \
+             provide --channel-key <raw-32-byte-seed-file> so Hestia does not guess a credential",
+            template.our_lct_id
+        ),
+    };
+
+    let keypair = member_signing_keypair(&vault, &key_source)
+        .context("resolving receiver mailbox credential")?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let rest = abs_rest(&template.url, &template.rest_endpoint);
+
+    // Verify both halves NOW; drain re-verifies them every pass.
+    let discovered = rt.block_on(client.discover(&template.url))
+        .context("re-discovering Hub before receiver bind")?;
+    anyhow::ensure!(
+        discovered.hub_lct_id == template.hub_lct_id,
+        "refusing receiver bind: endpoint {} now advertises Hub {}, expected {}",
+        template.url, discovered.hub_lct_id, template.hub_lct_id
+    );
+    let pinned = rt
+        .block_on(client.resolve_member_pubkey(&rest, template.hub_lct_id, hub_member_lct))
+        .with_context(|| format!("resolving Hub pin for {hub_member_lct}"))?;
+    anyhow::ensure!(
+        pinned.to_hex() == keypair.verifying_key().to_hex(),
+        "refusing receiver bind: configured key differs from the Hub pin for {hub_member_lct}"
+    );
+
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let binding_id = uuid::Uuid::new_v4();
+    table.bind_local(hestia::receiver_routing::LocalMailboxBinding {
+        binding_id,
+        child_lct: child_lct.clone(),
+        hub_url: template.url.clone(),
+        hub_lct_id: template.hub_lct_id,
+        rest_endpoint: rest,
+        hub_member_lct,
+        member_key_source: key_source,
+        reason: reason.trim().to_string(),
+        set_by: "hestia-cli".into(),
+        set_at: chrono::Utc::now().timestamp().max(0) as u64,
+    })?;
+    table.save(&mut vault)?;
+
+    println!("Receiver local interface bound:");
+    println!("  router:       {router_lct}");
+    println!("  child:        {plugin_id} ({child_lct})");
+    println!("  interface:    {binding_id}");
+    println!("  hub:          {} ({})", template.hub_lct_id, template.url);
+    println!("  hub member:   {hub_member_lct}");
+    println!("  credential:   verified against Hub pin");
+    println!("  wake:         none (delivery only)");
+    Ok(())
+}
+
+fn write_new_router_channel_key(
+    home: &std::path::Path,
+    member_lct: uuid::Uuid,
+    seed: &[u8; 32],
+) -> AnyResult<String> {
+    use std::io::Write;
+
+    let dir = home.join("router-memberships");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating router membership directory {}", dir.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing router membership directory {}", dir.display()))?;
+    }
+
+    let path = dir.join(format!("{member_lct}.key"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(&path)
+        .with_context(|| format!("creating dedicated router key {}", path.display()))?;
+    file.write_all(seed)
+        .with_context(|| format!("writing dedicated router key {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing dedicated router key {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        // The vault record written next makes this pathname authoritative.
+        // fsync the directory entry before that record can commit, otherwise a
+        // power loss can leave "membership persisted, key filename vanished"
+        // even though the key file's own bytes were synced.
+        let dir_handle = std::fs::File::open(&dir)
+            .with_context(|| format!("opening router membership directory {}", dir.display()))?;
+        dir_handle
+            .sync_all()
+            .with_context(|| format!("syncing router membership directory {}", dir.display()))?;
+    }
+
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn cmd_receiver_router_join(
+    home: &std::path::Path,
+    target: &str,
+    name: &str,
+    parent: Option<&str>,
+    reason: &str,
+) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+    use hestia::router_membership::{RouterMembership, RouterMembershipStore};
+
+    anyhow::ensure!(!name.trim().is_empty(), "--name is required");
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+
+    let mut vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    anyhow::ensure!(
+        router_lct.starts_with("lct:web4:mb32:"),
+        "router identity must be canonical lct:web4:mb32:*, got {router_lct}"
+    );
+
+    let hubs = HubStore::load(&vault)?;
+    let template = pick_connection(&hubs, target)?;
+    let rest = abs_rest(&template.url, &template.rest_endpoint);
+
+    let mut memberships = RouterMembershipStore::load(&vault)?;
+    let existing = memberships
+        .find(template.hub_lct_id, &router_lct)
+        .cloned();
+
+    let membership = if let Some(existing) = existing {
+        anyhow::ensure!(
+            existing.name == name.trim(),
+            "router membership already exists as name '{}' on Hub {}; retry with that exact --name",
+            existing.name,
+            existing.hub_lct_id
+        );
+        anyhow::ensure!(
+            existing.reason == reason.trim(),
+            "router membership already exists with reason '{}'; retries must not rewrite provenance",
+            existing.reason
+        );
+        existing
+    } else {
+        let keypair = web4_core::crypto::KeyPair::generate();
+        let member_lct = uuid::Uuid::new_v4();
+        let seed = keypair.secret_key_bytes();
+        let key_path = write_new_router_channel_key(home, member_lct, &seed)?;
+
+        let created = RouterMembership {
+            router_lct: router_lct.clone(),
+            hub_lct_id: template.hub_lct_id,
+            hub_url: template.url.clone(),
+            rest_endpoint: rest.clone(),
+            hub_member_lct: member_lct,
+            channel_key_path: key_path,
+            name: name.trim().to_string(),
+            reason: reason.trim().to_string(),
+            requested_at: chrono::Utc::now().timestamp().max(0) as u64,
+            admitted_at: None,
+            interface_binding_id: None,
+            certificate: None,
+        };
+
+        // Persist identity BEFORE network I/O. A dropped join response must not
+        // mint a second UUID/key when the operator retries this command.
+        memberships.insert_new(created.clone())?;
+        memberships.save(&mut vault)?;
+        created
+    };
+
+    let key_source = MemberKeySource::ChannelKeyFile {
+        path: membership.channel_key_path.clone(),
+    };
+    let keypair = member_signing_keypair(&vault, &key_source)
+        .context("loading persisted dedicated router key")?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let discovered = rt
+        .block_on(client.discover(&template.url))
+        .context("re-discovering Hub before router join")?;
+    anyhow::ensure!(
+        discovered.hub_lct_id == membership.hub_lct_id,
+        "refusing router join: endpoint {} advertises Hub {}, persisted request belongs to {}",
+        template.url,
+        discovered.hub_lct_id,
+        membership.hub_lct_id
+    );
+
+    let outcome = rt.block_on(client.join(
+        &rest,
+        membership.hub_lct_id,
+        membership.hub_member_lct,
+        &keypair,
+        Some(membership.name.clone()),
+    ))?;
+
+    match outcome {
+        hestia::hub::JoinOutcome::Escalated { reason: escalation } => {
+            println!("Dedicated router membership submitted — pending Sovereign approval:");
+            println!("  router LCT:   {}", membership.router_lct);
+            println!("  Hub:          {} ({})", membership.hub_lct_id, membership.hub_url);
+            println!("  Hub member:   {}", membership.hub_member_lct);
+            println!("  display name: {}", membership.name);
+            println!("  key handle:   {}", membership.channel_key_path);
+            println!("  status:       pending ({escalation})");
+            println!();
+            println!("After the Hub operator admits THIS SAME member UUID, rerun this exact command.");
+            println!("The persisted UUID/key will be reused; no second router identity is minted.");
+            return Ok(());
+        }
+        hestia::hub::JoinOutcome::Admitted(_resp) => {}
+    }
+
+    // Admission is not trusted merely because /join said success: resolve the
+    // pinned key back from the Hub and compare it to the persisted unattended
+    // key before binding any routing interface.
+    let pinned = rt
+        .block_on(client.resolve_member_pubkey(
+            &rest,
+            membership.hub_lct_id,
+            membership.hub_member_lct,
+        ))
+        .context("resolving admitted router member pin")?;
+    anyhow::ensure!(
+        pinned.to_hex() == keypair.verifying_key().to_hex(),
+        "admitted router member {} is pinned to a different key",
+        membership.hub_member_lct
+    );
+
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+
+    let existing_interface = table
+        .router_ingress
+        .iter()
+        .find(|b| {
+            b.router_lct == membership.router_lct
+                && b.hub_lct_id == membership.hub_lct_id
+                && b.hub_member_lct == membership.hub_member_lct
+        })
+        .map(|b| b.binding_id);
+
+    let interface_binding_id = if let Some(id) = existing_interface {
+        id
+    } else {
+        let id = uuid::Uuid::new_v4();
+        table.bind_router_ingress(hestia::receiver_routing::RouterIngressBinding {
+            binding_id: id,
+            router_lct: membership.router_lct.clone(),
+            hub_url: template.url.clone(),
+            hub_lct_id: membership.hub_lct_id,
+            rest_endpoint: rest.clone(),
+            hub_member_lct: membership.hub_member_lct,
+            member_key_source: key_source,
+            reason: membership.reason.clone(),
+            set_by: "hestia-cli:receiver-router-join".into(),
+            set_at: chrono::Utc::now().timestamp().max(0) as u64,
+        })?;
+        table.save(&mut vault)?;
+        id
+    };
+
+    {
+        let stored = memberships
+            .find_mut(membership.hub_lct_id, &membership.router_lct)
+            .ok_or_else(|| anyhow::anyhow!("persisted router membership disappeared"))?;
+        stored.admitted_at.get_or_insert_with(|| {
+            chrono::Utc::now().timestamp().max(0) as u64
+        });
+        stored.interface_binding_id = Some(interface_binding_id);
+    }
+    memberships.save(&mut vault)?;
+
+    println!("Dedicated router membership admitted and bound:");
+    println!("  router LCT:   {}", membership.router_lct);
+    println!("  Hub:          {} ({})", membership.hub_lct_id, template.url);
+    println!("  Hub member:   {}", membership.hub_member_lct);
+    println!("  interface:    {interface_binding_id}");
+    println!("  key handle:   {}", membership.channel_key_path);
+    println!("  primary Hub connection: unchanged");
+    println!();
+    println!("REQUIRED operator step (one-way, run on the Hub operator plane):");
+    println!(
+        "  POST /admin/api/members/{}/mailbox-receipts  {{\"reason\":\"F3 dedicated router interface for {}\"}}",
+        membership.hub_member_lct,
+        membership.router_lct
+    );
+    println!("Do NOT substitute the legacy seat/machine member UUID here.");
+    println!("After enrollment, hestia hub receiver-drain is the receipt-mode proof.");
+    Ok(())
+}
+
+fn cmd_receiver_router_bind(
+    home: &std::path::Path,
+    target: &str,
+    member_lct: Option<uuid::Uuid>,
+    channel_key: Option<String>,
+    parent: Option<&str>,
+    reason: &str,
+) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let hubs = HubStore::load(&vault)?;
+    let template = pick_connection(&hubs, target)?;
+    let hub_member_lct = member_lct.unwrap_or(template.our_lct_id);
+    let key_source = match channel_key {
+        Some(path) => MemberKeySource::ChannelKeyFile { path },
+        None if hub_member_lct == template.our_lct_id => template.member_key_source.clone(),
+        None => anyhow::bail!(
+            "--member-lct {hub_member_lct} differs from the template connection's member {}; \
+             provide --channel-key so the router does not guess a credential",
+            template.our_lct_id
+        ),
+    };
+
+    let keypair = member_signing_keypair(&vault, &key_source)
+        .context("resolving router interface credential")?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let rest = abs_rest(&template.url, &template.rest_endpoint);
+    let discovered = rt.block_on(client.discover(&template.url))
+        .context("re-discovering Hub before router interface bind")?;
+    anyhow::ensure!(
+        discovered.hub_lct_id == template.hub_lct_id,
+        "refusing router bind: endpoint {} now advertises Hub {}, expected {}",
+        template.url, discovered.hub_lct_id, template.hub_lct_id
+    );
+    let pinned = rt.block_on(
+        client.resolve_member_pubkey(&rest, template.hub_lct_id, hub_member_lct)
+    ).with_context(|| format!("resolving Hub pin for router member {hub_member_lct}"))?;
+    anyhow::ensure!(
+        pinned.to_hex() == keypair.verifying_key().to_hex(),
+        "refusing router bind: configured key differs from Hub pin for {hub_member_lct}"
+    );
+
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let binding_id = uuid::Uuid::new_v4();
+    table.bind_router_ingress(hestia::receiver_routing::RouterIngressBinding {
+        binding_id,
+        router_lct: router_lct.clone(),
+        hub_url: template.url.clone(),
+        hub_lct_id: template.hub_lct_id,
+        rest_endpoint: rest,
+        hub_member_lct,
+        member_key_source: key_source,
+        reason: reason.trim().to_string(),
+        set_by: "hestia-cli".into(),
+        set_at: chrono::Utc::now().timestamp().max(0) as u64,
+    })?;
+    table.save(&mut vault)?;
+
+    println!("Router interface bound:");
+    println!("  router:       {router_lct}");
+    println!("  interface:    {binding_id}");
+    println!("  hub:          {} ({})", template.hub_lct_id, template.url);
+    println!("  hub member:   {hub_member_lct}");
+    println!("  credential:   verified against Hub pin");
+    println!("  delivery:     receipt-mode route.forward only");
+    Ok(())
+}
+
+fn write_public_evidence_atomic(path: &std::path::Path, bytes: &[u8]) -> AnyResult<()> {
+    use std::io::Write;
+
+    anyhow::ensure!(
+        !path.exists(),
+        "refusing to overwrite public certificate evidence {}; choose a new --out path",
+        path.display()
+    );
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating certificate directory {}", parent.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().and_then(|v| v.to_str()).unwrap_or("router-cert"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .with_context(|| format!("creating temporary certificate {}", tmp.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing temporary certificate {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("fsync temporary certificate {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("publishing router certificate {}", path.display()))?;
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+fn cmd_receiver_router_certify(
+    home: &std::path::Path,
+    target: &str,
+    parent: Option<&str>,
+    out: Option<&str>,
+) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+    use hestia::router_certificate::{
+        RouterInterfaceCertificate, RouterInterfaceCertificatePayload,
+        RECEIPT_PROTOCOL, ROUTER_CERT_PROTOCOL,
+    };
+    use hestia::router_membership::RouterMembershipStore;
+
+    let mut vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let hubs = HubStore::load(&vault)?;
+    let template = pick_connection(&hubs, target)?;
+    let mut memberships = RouterMembershipStore::load(&vault)?;
+    let membership = memberships
+        .find(template.hub_lct_id, &router_lct)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(
+            "no dedicated router membership for {} on Hub {}; run receiver-router-join first",
+            router_lct, template.hub_lct_id
+        ))?;
+    anyhow::ensure!(
+        membership.admitted_at.is_some(),
+        "dedicated router membership {} is not recorded as admitted",
+        membership.hub_member_lct
+    );
+    let interface_id = membership.interface_binding_id.ok_or_else(|| anyhow::anyhow!(
+        "dedicated router membership {} has no bound router interface",
+        membership.hub_member_lct
+    ))?;
+
+    let table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let iface = table.router_ingress_by_id(interface_id)
+        .ok_or_else(|| anyhow::anyhow!(
+            "router membership points at missing interface {interface_id}"
+        ))?;
+    anyhow::ensure!(
+        iface.router_lct == membership.router_lct
+            && iface.hub_lct_id == membership.hub_lct_id
+            && iface.hub_member_lct == membership.hub_member_lct,
+        "router membership/interface identity tuple does not match"
+    );
+
+    let member_source = MemberKeySource::ChannelKeyFile {
+        path: membership.channel_key_path.clone(),
+    };
+    let member_key = member_signing_keypair(&vault, &member_source)
+        .context("loading dedicated router membership key")?;
+    let router_key = hestia::sovereign::Sovereign::persisted_signing_keypair(&vault)
+        .context("loading persisted canonical router/Society key")?;
+    anyhow::ensure!(
+        web4_core::derive_lct_id(&router_key.verifying_key()) == membership.router_lct,
+        "persisted router/Society key does not derive {}",
+        membership.router_lct
+    );
+
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let discovered = rt.block_on(client.discover(&membership.hub_url))
+        .context("re-discovering Hub before router certification")?;
+    anyhow::ensure!(
+        discovered.hub_lct_id == membership.hub_lct_id,
+        "router certificate endpoint advertises Hub {}, expected {}",
+        discovered.hub_lct_id, membership.hub_lct_id
+    );
+    let rest = abs_rest(&membership.hub_url, &membership.rest_endpoint);
+    let pinned = rt.block_on(client.resolve_member_pubkey(
+        &rest,
+        membership.hub_lct_id,
+        membership.hub_member_lct,
+    )).context("resolving dedicated router Hub-member pin")?;
+    anyhow::ensure!(
+        pinned.to_hex() == member_key.verifying_key().to_hex(),
+        "dedicated router member {} is pinned to a different key",
+        membership.hub_member_lct
+    );
+
+    // Capability proof is intentionally non-destructive. On a legacy mailbox
+    // notifications_fetch refuses; on a receipt mailbox it returns the current
+    // page without consuming or ACKing any notice.
+    let channel = rt.block_on(client.open_channel(&membership.hub_url, uuid::Uuid::new_v4()))
+        .context("opening Hub channel for receipt-mode proof")?;
+    anyhow::ensure!(
+        channel.hub_lct_id == membership.hub_lct_id,
+        "receipt probe opened the wrong Hub identity"
+    );
+    let probe = rt.block_on(client.channel_query(
+        &rest,
+        &channel,
+        &member_key,
+        membership.hub_member_lct,
+        "notifications_fetch",
+        serde_json::json!({"limit": 1}),
+    )).context("probing dedicated router receipt-mode mailbox")?;
+    anyhow::ensure!(
+        probe.get("protocol").and_then(serde_json::Value::as_str) == Some(RECEIPT_PROTOCOL),
+        "dedicated router mailbox did not return receipt protocol {RECEIPT_PROTOCOL}"
+    );
+    anyhow::ensure!(
+        probe.get("notifications").is_some_and(serde_json::Value::is_array),
+        "receipt-mode proof returned no notifications array"
+    );
+
+    let payload = RouterInterfaceCertificatePayload {
+        protocol: ROUTER_CERT_PROTOCOL.to_string(),
+        router_lct: membership.router_lct.clone(),
+        router_pubkey_hex: router_key.verifying_key().to_hex(),
+        hub_lct_id: membership.hub_lct_id,
+        hub_member_lct: membership.hub_member_lct,
+        hub_member_pubkey_hex: pinned.to_hex(),
+        interface_binding_id: interface_id,
+        receipt_protocol: RECEIPT_PROTOCOL.to_string(),
+        issued_at: chrono::Utc::now().timestamp().max(1) as u64,
+    };
+    let cert = RouterInterfaceCertificate::issue(payload, &router_key, &member_key)?;
+    let fingerprint = cert.fingerprint()?;
+
+    memberships
+        .find_mut(membership.hub_lct_id, &membership.router_lct)
+        .ok_or_else(|| anyhow::anyhow!("persisted router membership disappeared"))?
+        .certificate = Some(cert.clone());
+    memberships.save(&mut vault)?;
+
+    let bytes = serde_json::to_vec_pretty(&cert)?;
+    if let Some(path) = out.map(str::trim).filter(|v| !v.is_empty()) {
+        write_public_evidence_atomic(std::path::Path::new(path), &bytes)?;
+    }
+    println!("{}", String::from_utf8(bytes).expect("certificate JSON is UTF-8"));
+    eprintln!("router certificate fingerprint: {fingerprint}");
+    eprintln!("receipt-mode capability: verified non-destructively");
+    Ok(())
+}
+
+fn cmd_receiver_neighbor(
+    home: &std::path::Path,
+    next_hop: &str,
+    interface: uuid::Uuid,
+    peer_certificate: &str,
+    reason: &str,
+) -> AnyResult<()> {
+    anyhow::ensure!(!next_hop.trim().is_empty(), "next_hop is required");
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let cert_bytes = std::fs::read(peer_certificate)
+        .with_context(|| format!("reading peer router certificate {peer_certificate}"))?;
+    let cert = hestia::router_certificate::RouterInterfaceCertificate::from_json_bytes(&cert_bytes)
+        .context("verifying peer router-interface certificate")?;
+    anyhow::ensure!(
+        cert.payload.router_lct == next_hop.trim(),
+        "--next-hop {} does not match certificate router {}",
+        next_hop.trim(), cert.payload.router_lct
+    );
+
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let iface = table.router_ingress_by_id(interface).cloned()
+        .ok_or_else(|| anyhow::anyhow!("router interface {interface} does not exist"))?;
+    anyhow::ensure!(
+        iface.router_lct != next_hop.trim(),
+        "a router cannot install itself as its own next hop"
+    );
+    anyhow::ensure!(
+        iface.hub_lct_id == cert.payload.hub_lct_id,
+        "peer certificate belongs to Hub {}, local interface {} belongs to Hub {}",
+        cert.payload.hub_lct_id, interface, iface.hub_lct_id
+    );
+
+    // Re-prove our side of the link and compare the peer certificate against
+    // the Hub's live key projection. The certificate proves possession at
+    // issuance; the live pin check prevents accepting a stale cert after rekey.
+    let keypair = member_signing_keypair(&vault, &iface.member_key_source)
+        .context("resolving local router interface credential")?;
+    let client = HubClient::new();
+    let rt = tokio::runtime::Runtime::new()?;
+    let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
+    let ours = rt.block_on(
+        client.resolve_member_pubkey(&rest, iface.hub_lct_id, iface.hub_member_lct)
+    ).with_context(|| format!("resolving local Hub pin for {}", iface.hub_member_lct))?;
+    anyhow::ensure!(
+        ours.to_hex() == keypair.verifying_key().to_hex(),
+        "router interface {interface} credential no longer matches its Hub pin"
+    );
+    let peer_pin = rt.block_on(client.resolve_member_pubkey(
+        &rest,
+        iface.hub_lct_id,
+        cert.payload.hub_member_lct,
+    )).with_context(|| format!(
+        "peer Hub member {} is not resolvable on {}",
+        cert.payload.hub_member_lct, iface.hub_url
+    ))?;
+    anyhow::ensure!(
+        peer_pin.to_hex() == cert.payload.hub_member_pubkey_hex,
+        "peer certificate key is stale or does not match the live Hub pin for {}",
+        cert.payload.hub_member_lct
+    );
+
+    let fingerprint = cert.fingerprint()?;
+    let candidate_link_id = uuid::Uuid::new_v4();
+    table.bind_neighbor(hestia::receiver_routing::RouterNeighbor {
+        link_id: candidate_link_id,
+        next_hop_lct: cert.payload.router_lct.clone(),
+        interface_binding_id: interface,
+        next_hop_hub_member_lct: cert.payload.hub_member_lct,
+        peer_certificate: Some(cert.clone()),
+        reason: reason.trim().to_string(),
+        set_by: "hestia-cli:verified-router-certificate".into(),
+        set_at: chrono::Utc::now().timestamp().max(0) as u64,
+    })?;
+    let link_id = table
+        .neighbor(&cert.payload.router_lct)
+        .map(|n| n.link_id)
+        .ok_or_else(|| anyhow::anyhow!(
+            "certified neighbor disappeared before save"
+        ))?;
+    table.save(&mut vault)?;
+
+    println!("Router neighbor bound from certificate:");
+    println!("  next hop:     {}", cert.payload.router_lct);
+    println!("  link:         {link_id}");
+    println!("  local iface:  {interface}");
+    println!("  peer iface:   {}", cert.payload.interface_binding_id);
+    println!("  Hub member:   {}", cert.payload.hub_member_lct);
+    println!("  certificate:  {fingerprint}");
+    println!("  live Hub pin: verified");
+    Ok(())
+}
+
+
+fn cmd_receiver_unbind(home: &std::path::Path, child: &str) -> AnyResult<()> {
+    // This removes a CHILD-SPECIFIC HUB INGRESS interface, not the child's
+    // parent/local route. Only direct Hub receipt custody pins this resource.
+    let (mut vault, passphrase) = open_vault_with_passphrase(home)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let canonical = registry
+        .resolve_reference(child)?
+        .map(|m| m.lct.lct_id())
+        .unwrap_or_else(|| child.to_string());
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let binding = table
+        .local_binding(&canonical)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(
+            "no receiver local mailbox binding for '{child}' ({canonical})"
+        ))?;
+
+    let store_key = hestia::storage::storage_key(home, &passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+    let inflight = inbox.hub_receipt_inflight_count(binding.binding_id)?;
+    anyhow::ensure!(
+        inflight == 0,
+        "refusing to remove receiver Hub ingress interface {} for {}: {inflight} direct Hub receipt(s) \
+         are still in flight; drain/ACK them first",
+        binding.binding_id, canonical
+    );
+
+    anyhow::ensure!(table.unbind_local(&canonical), "receiver route disappeared during unbind");
+    table.save(&mut vault)?;
+    println!("Receiver local interface removed: {canonical} ({})", binding.binding_id);
+    Ok(())
+}
+
+fn cmd_receiver_alias(
+    home: &std::path::Path,
+    legacy_address: &str,
+    destination_lct: &str,
+    reason: &str,
+) -> AnyResult<()> {
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    table.bind_legacy_alias(hestia::receiver_routing::LegacyRouteAlias {
+        legacy_address: legacy_address.trim().to_string(),
+        destination_lct: destination_lct.trim().to_string(),
+        delivery_authority: hestia::receiver_routing::LegacyDeliveryAuthority::Legacy,
+        authority_reason: None,
+        authority_set_by: String::new(),
+        authority_set_at: 0,
+        reason: reason.trim().to_string(),
+        set_by: "hestia-cli".into(),
+        set_at: chrono::Utc::now().timestamp().max(0) as u64,
+    })?;
+    table.save(&mut vault)?;
+    println!(
+        "Legacy route alias: {} -> {}  ({})",
+        legacy_address.trim(),
+        destination_lct.trim(),
+        reason.trim()
+    );
+    Ok(())
+}
+
+fn receiver_cutover_preflight(
+    home: &std::path::Path,
+    vault: &Vault,
+    passphrase: &str,
+    legacy_address: &str,
+    limit: u64,
+    min_matches: usize,
+    parent: Option<&str>,
+) -> AnyResult<serde_json::Value> {
+    anyhow::ensure!(limit > 0 && limit <= 10_000, "--limit/--parity-limit must be 1..10000");
+    anyhow::ensure!(min_matches > 0 && min_matches <= 10_000, "--min-matches must be 1..10000");
+
+    let legacy_address = legacy_address.trim();
+    let router_lct = receiver_router_lct(vault, parent)?;
+    let registry = hestia::member_registry::load_members(vault);
+    let table = hestia::receiver_routing::ReceiverRoutingTable::load(vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let alias = table.legacy_alias(legacy_address).cloned();
+
+    let shadow = table.shadow_legacy_route(&registry, &router_lct, legacy_address)?;
+    let mut structural_blockers = Vec::<String>::new();
+    let mut current_next_hop_lct: Option<String> = None;
+    let mut current_hub_member_lct: Option<String> = None;
+    let mut current_peer_certificate_fingerprint: Option<String> = None;
+    let mut current_peer_certificate_issued_at: Option<u64> = None;
+    let mut current_local_certificate_fingerprint: Option<String> = None;
+    let mut current_local_certificate_issued_at: Option<u64> = None;
+
+    let authority = match alias.as_ref() {
+        Some(a) => {
+            if a.delivery_authority
+                != hestia::receiver_routing::LegacyDeliveryAuthority::Legacy
+            {
+                structural_blockers.push(format!(
+                    "edge authority is already '{}'; D3 cutover preflight requires legacy-authoritative shadow traffic",
+                    a.delivery_authority.as_str()
+                ));
+            }
+            Some(a.delivery_authority.as_str().to_string())
+        }
+        None => {
+            structural_blockers.push("exact legacy alias is not configured".to_string());
+            None
+        }
+    };
+
+    match &shadow {
+        hestia::receiver_routing::LegacyRouteShadow::Resolved { decision, .. } => {
+            match decision {
+                hestia::receiver_routing::RouteDecision::Forward {
+                    next_hop_lct, ..
+                } => {
+                    current_next_hop_lct = Some(next_hop_lct.clone());
+                    match table.neighbor(next_hop_lct) {
+                        Some(n) => {
+                            current_hub_member_lct =
+                                Some(n.next_hop_hub_member_lct.to_string());
+
+                            if let Some(iface) =
+                                table.router_ingress_by_id(n.interface_binding_id)
+                            {
+                                let client = HubClient::new();
+                                let rest = abs_rest(&iface.hub_url, &iface.rest_endpoint);
+                                let runtime = tokio::runtime::Runtime::new();
+
+                                // Peer proof: dual signatures + exact routing
+                                // tuple + current Hub pin. A certificate whose
+                                // key was later rotated is stale evidence.
+                                match n.peer_certificate.as_ref() {
+                                    None => structural_blockers.push(format!(
+                                        "neighbor '{}' has no router-interface certificate",
+                                        next_hop_lct
+                                    )),
+                                    Some(cert) => {
+                                        let mut peer_ok = true;
+                                        if let Err(e) = cert.verify() {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' router certificate does not verify: {e:#}",
+                                                next_hop_lct
+                                            ));
+                                            peer_ok = false;
+                                        }
+                                        if cert.payload.router_lct != *next_hop_lct {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' certificate names router '{}'",
+                                                next_hop_lct, cert.payload.router_lct
+                                            ));
+                                            peer_ok = false;
+                                        }
+                                        if cert.payload.hub_member_lct
+                                            != n.next_hop_hub_member_lct
+                                        {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' certificate Hub member {} differs from configured {}",
+                                                next_hop_lct,
+                                                cert.payload.hub_member_lct,
+                                                n.next_hop_hub_member_lct
+                                            ));
+                                            peer_ok = false;
+                                        }
+                                        if cert.payload.hub_lct_id != iface.hub_lct_id {
+                                            structural_blockers.push(format!(
+                                                "neighbor '{}' certificate is for Hub {}, local interface uses Hub {}",
+                                                next_hop_lct,
+                                                cert.payload.hub_lct_id,
+                                                iface.hub_lct_id
+                                            ));
+                                            peer_ok = false;
+                                        }
+
+                                        if peer_ok {
+                                            match &runtime {
+                                                Err(e) => {
+                                                    structural_blockers.push(format!(
+                                                        "could not create runtime for live neighbor pin verification: {e}"
+                                                    ));
+                                                    peer_ok = false;
+                                                }
+                                                Ok(rt) => match rt.block_on(
+                                                    client.resolve_member_pubkey(
+                                                        &rest,
+                                                        iface.hub_lct_id,
+                                                        n.next_hop_hub_member_lct,
+                                                    ),
+                                                ) {
+                                                    Ok(live_peer_key) => {
+                                                        if live_peer_key.to_hex()
+                                                            != cert.payload.hub_member_pubkey_hex
+                                                        {
+                                                            structural_blockers.push(format!(
+                                                                "neighbor '{}' certificate key no longer matches live Hub pin for {}",
+                                                                next_hop_lct,
+                                                                n.next_hop_hub_member_lct
+                                                            ));
+                                                            peer_ok = false;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        structural_blockers.push(format!(
+                                                            "could not re-verify live Hub pin for neighbor '{}': {e:#}",
+                                                            next_hop_lct
+                                                        ));
+                                                        peer_ok = false;
+                                                    }
+                                                },
+                                            }
+                                        }
+                                        if peer_ok {
+                                            match cert.fingerprint() {
+                                                Ok(fp) => {
+                                                    current_peer_certificate_fingerprint =
+                                                        Some(fp);
+                                                    current_peer_certificate_issued_at =
+                                                        Some(cert.payload.issued_at);
+                                                }
+                                                Err(e) => structural_blockers.push(format!(
+                                                    "neighbor '{}' certificate fingerprint failed: {e:#}",
+                                                    next_hop_lct
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Local proof: same exact local interface/member
+                                // tuple, dual signatures, and CURRENT Hub pin.
+                                match hestia::router_membership::RouterMembershipStore::load(vault) {
+                                    Err(e) => structural_blockers.push(format!(
+                                        "could not load local router membership evidence: {e:#}"
+                                    )),
+                                    Ok(store) => {
+                                        match store.find(iface.hub_lct_id, &router_lct) {
+                                            None => structural_blockers.push(format!(
+                                                "local router {} has no dedicated membership record on Hub {}",
+                                                router_lct, iface.hub_lct_id
+                                            )),
+                                            Some(m) => match m.certificate.as_ref() {
+                                                None => structural_blockers.push(format!(
+                                                    "local router interface {} has no issued router certificate",
+                                                    iface.binding_id
+                                                )),
+                                                Some(cert) => {
+                                                    let mut local_ok = true;
+                                                    if let Err(e) = cert.verify() {
+                                                        structural_blockers.push(format!(
+                                                            "local router certificate does not verify: {e:#}"
+                                                        ));
+                                                        local_ok = false;
+                                                    }
+                                                    if cert.payload.router_lct != router_lct
+                                                        || cert.payload.hub_lct_id
+                                                            != iface.hub_lct_id
+                                                        || cert.payload.hub_member_lct
+                                                            != iface.hub_member_lct
+                                                        || cert.payload.interface_binding_id
+                                                            != iface.binding_id
+                                                    {
+                                                        structural_blockers.push(
+                                                            "local router certificate does not bind the current interface/member tuple"
+                                                                .to_string(),
+                                                        );
+                                                        local_ok = false;
+                                                    }
+
+                                                    if local_ok {
+                                                        match &runtime {
+                                                            Err(e) => {
+                                                                structural_blockers.push(format!(
+                                                                    "could not create runtime for live local pin verification: {e}"
+                                                                ));
+                                                                local_ok = false;
+                                                            }
+                                                            Ok(rt) => match rt.block_on(
+                                                                client.resolve_member_pubkey(
+                                                                    &rest,
+                                                                    iface.hub_lct_id,
+                                                                    iface.hub_member_lct,
+                                                                ),
+                                                            ) {
+                                                                Ok(live_local_key) => {
+                                                                    if live_local_key.to_hex()
+                                                                        != cert.payload.hub_member_pubkey_hex
+                                                                    {
+                                                                        structural_blockers.push(format!(
+                                                                            "local router certificate key no longer matches live Hub pin for {}",
+                                                                            iface.hub_member_lct
+                                                                        ));
+                                                                        local_ok = false;
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    structural_blockers.push(format!(
+                                                                        "could not re-verify live Hub pin for local router member {}: {e:#}",
+                                                                        iface.hub_member_lct
+                                                                    ));
+                                                                    local_ok = false;
+                                                                }
+                                                            },
+                                                        }
+                                                    }
+                                                    if local_ok {
+                                                        match cert.fingerprint() {
+                                                            Ok(fp) => {
+                                                                current_local_certificate_fingerprint =
+                                                                    Some(fp);
+                                                                current_local_certificate_issued_at =
+                                                                    Some(cert.payload.issued_at);
+                                                            }
+                                                            Err(e) => structural_blockers.push(format!(
+                                                                "local router certificate fingerprint failed: {e:#}"
+                                                            )),
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                        }
+                                    }
+                                }
+                            } else {
+                                structural_blockers.push(format!(
+                                    "neighbor '{}' references missing local router interface {}",
+                                    next_hop_lct, n.interface_binding_id
+                                ));
+                            }
+                        }
+                        None => structural_blockers.push(format!(
+                            "current F3 route chooses next hop '{next_hop_lct}' but no neighbor binding exists"
+                        )),
+                    }
+                }
+                hestia::receiver_routing::RouteDecision::Local { .. } => {
+                    structural_blockers.push(
+                        "D3 parity cutover guard currently requires a remote forward edge; local compatibility-edge cutover needs its own measured delivery parity".to_string()
+                    );
+                }
+                hestia::receiver_routing::RouteDecision::LocalUnavailable { reason, .. } => {
+                    structural_blockers.push(format!(
+                        "current F3 shadow route is local-unavailable: {reason}"
+                    ));
+                }
+                hestia::receiver_routing::RouteDecision::Unreachable { reason, .. } => {
+                    structural_blockers.push(format!(
+                        "current F3 shadow route is unreachable: {reason}"
+                    ));
+                }
+            }
+        }
+        hestia::receiver_routing::LegacyRouteShadow::MissingAlias { .. } => {
+            if !structural_blockers.iter().any(|b| b.contains("alias")) {
+                structural_blockers.push("current F3 shadow has no exact alias".to_string());
+            }
+        }
+        hestia::receiver_routing::LegacyRouteShadow::NotRouted { .. } => {
+            structural_blockers.push(
+                "legacy address is not a routed peer/member edge; D3 remote cutover guard does not apply"
+                    .to_string(),
+            );
+        }
+    }
+
+    let store_key = hestia::storage::storage_key(home, passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let chain = hestia::storage::SqliteChainStore::open(
+        home.join("witness.db"),
+        store_key,
+    )?;
+    let rows = chain.read_recent_route_shadow(limit)?;
+    let parity = hestia::legacy_parity::cutover_check(
+        &rows,
+        legacy_address,
+        min_matches,
+    );
+
+    // Parity evidence proves the route that existed WHEN THE SAMPLE WAS
+    // MEASURED. Re-check it against the route/neighbor we would use NOW.
+    // Otherwise a config edit after a successful shadow run could silently
+    // borrow stale evidence for a different next hop.
+    if let (Some(now_hop), Some(now_member)) = (
+        current_next_hop_lct.as_deref(),
+        current_hub_member_lct.as_deref(),
+    ) {
+        structural_blockers.extend(
+            hestia::legacy_parity::current_route_evidence_blockers(
+                &parity.parity,
+                now_hop,
+                now_member,
+            ),
+        );
+    }
+
+
+    let ready = parity.ready && structural_blockers.is_empty();
+    Ok(serde_json::json!({
+        "legacy_address": legacy_address,
+        "router_lct": router_lct,
+        "authority": authority,
+        "alias_destination_lct": alias.as_ref().map(|a| a.destination_lct.clone()),
+        "current_shadow": shadow,
+        "current_next_hop_lct": current_next_hop_lct,
+        "current_hub_member_lct": current_hub_member_lct,
+        "current_peer_certificate_fingerprint": current_peer_certificate_fingerprint,
+        "current_peer_certificate_issued_at": current_peer_certificate_issued_at,
+        "current_local_certificate_fingerprint": current_local_certificate_fingerprint,
+        "current_local_certificate_issued_at": current_local_certificate_issued_at,
+        "parity": parity,
+        "structural_blockers": structural_blockers,
+        "ready": ready,
+    }))
+}
+
+fn cmd_receiver_cutover_check(
+    home: &std::path::Path,
+    legacy_address: &str,
+    limit: u64,
+    min_matches: usize,
+    parent: Option<&str>,
+) -> AnyResult<()> {
+    let (vault, passphrase) = open_vault_with_passphrase(home)?;
+    let report = receiver_cutover_preflight(
+        home,
+        &vault,
+        &passphrase,
+        legacy_address,
+        limit,
+        min_matches,
+        parent,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    anyhow::ensure!(
+        report.get("ready").and_then(serde_json::Value::as_bool) == Some(true),
+        "F3 cutover preflight HOLD for '{}'",
+        legacy_address.trim()
+    );
+    Ok(())
+}
+
+fn cmd_receiver_alias_authority(
+    home: &std::path::Path,
+    legacy_address: &str,
+    authority: &str,
+    reason: &str,
+    parity_limit: u64,
+    min_matches: usize,
+    parent: Option<&str>,
+) -> AnyResult<()> {
+    let authority = hestia::receiver_routing::LegacyDeliveryAuthority::parse(authority)
+        .ok_or_else(|| anyhow::anyhow!("authority must be 'legacy' or 'f3'"))?;
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+
+    let (mut vault, passphrase) = open_vault_with_passphrase(home)?;
+
+    if authority == hestia::receiver_routing::LegacyDeliveryAuthority::F3 {
+        let report = receiver_cutover_preflight(
+            home,
+            &vault,
+            &passphrase,
+            legacy_address,
+            parity_limit,
+            min_matches,
+            parent,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "cutover_preflight": report
+        }))?);
+        anyhow::ensure!(
+            report.get("ready").and_then(serde_json::Value::as_bool) == Some(true),
+            "refusing legacy -> F3 authority transition for '{}': cutover preflight is HOLD",
+            legacy_address.trim()
+        );
+    }
+
+    // Rollback (F3 -> legacy) deliberately has no parity gate. If a live
+    // falsifier trips, returning authority to the known legacy plane must stay
+    // immediate and explicit rather than waiting for more observations.
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    table.set_legacy_authority(
+        legacy_address.trim(),
+        authority,
+        reason,
+        "hestia-cli",
+        chrono::Utc::now().timestamp().max(0) as u64,
+    )?;
+    table.save(&mut vault)?;
+    println!(
+        "Legacy route authority: {} -> {}  ({})",
+        legacy_address.trim(),
+        authority.as_str(),
+        reason.trim()
+    );
+    Ok(())
+}
+
+fn cmd_receiver_unalias(
+    home: &std::path::Path,
+    legacy_address: &str,
+) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let alias = table
+        .legacy_alias(legacy_address.trim())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(
+            "no legacy route alias for '{}'", legacy_address.trim()
+        ))?;
+    anyhow::ensure!(
+        alias.delivery_authority
+            == hestia::receiver_routing::LegacyDeliveryAuthority::Legacy,
+        "refusing to remove F3-authoritative alias '{}': first switch its authority          back to legacy with receiver-alias-authority and a rollback reason",
+        legacy_address.trim()
+    );
+    anyhow::ensure!(
+        table.unbind_legacy_alias(legacy_address.trim())?,
+        "legacy route alias disappeared during removal"
+    );
+    table.save(&mut vault)?;
+    println!("Legacy route alias removed: {}", legacy_address.trim());
+    Ok(())
+}
+
+fn cmd_receiver_shadow(
+    home: &std::path::Path,
+    legacy_address: &str,
+    parent: Option<&str>,
+) -> AnyResult<()> {
+    let vault = open_vault(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    let shadow = table.shadow_legacy_route(
+        &registry,
+        &router_lct,
+        legacy_address.trim(),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&shadow)?);
+    Ok(())
+}
+
+fn cmd_receiver_parity(
+    home: &std::path::Path,
+    limit: u64,
+) -> AnyResult<()> {
+    anyhow::ensure!(limit > 0 && limit <= 10_000, "--limit must be 1..10000");
+    let (_vault, passphrase) = open_vault_with_passphrase(home)?;
+    let store_key = hestia::storage::storage_key(home, &passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let chain = hestia::storage::SqliteChainStore::open(
+        home.join("witness.db"),
+        store_key,
+    )?;
+    let rows = chain.read_recent_route_shadow(limit)?;
+    let report = hestia::legacy_parity::summarize(&rows);
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn cmd_receiver_send(
+    home: &std::path::Path,
+    from_member: &str,
+    destination_lct: &str,
+    kind: &str,
+    pointer: &str,
+    operation_id: &str,
+    parent: Option<&str>,
+) -> AnyResult<()> {
+    let (vault, passphrase) = open_vault_with_passphrase(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let registry = hestia::member_registry::load_members(&vault);
+    let origin_lct = match registry.resolve_child_of(&router_lct, from_member)? {
+        hestia::member_registry::LocalChildResolution::Local(member) => member.lct.lct_id(),
+        hestia::member_registry::LocalChildResolution::KnownButNotChild(member) => {
+            anyhow::bail!(
+                "'{from_member}' resolves to '{}' ({}) but is not parent-bound to router {}",
+                member.plugin_id,
+                member.lct.lct_id(),
+                router_lct
+            )
+        }
+        hestia::member_registry::LocalChildResolution::Unknown => {
+            anyhow::bail!("'{from_member}' does not resolve to a registered local member")
+        }
+    };
+    anyhow::ensure!(
+        destination_lct.starts_with("lct:web4:mb32:"),
+        "destination must be a canonical lct:web4:mb32:* identity, not a legacy alias"
+    );
+
+    let store_key = hestia::storage::storage_key(home, &passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+    let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
+    let content_hash = compute_content_hash(pointer);
+    let rt = tokio::runtime::Runtime::new()?;
+    let report = rt.block_on(hestia::router_forwarder::originate_once(
+        &vault,
+        &router_lct,
+        &origin_lct,
+        destination_lct,
+        kind,
+        pointer,
+        &content_hash,
+        operation_id,
+        &inbox,
+        &chain,
+    ))?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn cmd_receiver_route(
+    home: &std::path::Path,
+    destination: &str,
+    next_hop: &str,
+    metric: u32,
+    reason: &str,
+) -> AnyResult<()> {
+    anyhow::ensure!(!destination.trim().is_empty(), "destination is required");
+    anyhow::ensure!(!next_hop.trim().is_empty(), "next_hop is required");
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    table.set_route(hestia::receiver_routing::StaticRoute {
+        destination_lct: destination.trim().to_string(),
+        next_hop_lct: next_hop.trim().to_string(),
+        metric,
+        reason: reason.trim().to_string(),
+    });
+    table.save(&mut vault)?;
+    println!(
+        "Receiver route: {} -> {}  metric={} ({})",
+        destination.trim(), next_hop.trim(), metric, reason.trim()
+    );
+    Ok(())
+}
+
+fn cmd_receiver_default(
+    home: &std::path::Path,
+    next_hop: Option<&str>,
+    clear: bool,
+    reason: &str,
+) -> AnyResult<()> {
+    anyhow::ensure!(!reason.trim().is_empty(), "--reason is required");
+    anyhow::ensure!(
+        clear || next_hop.is_some(),
+        "provide NEXT_HOP or --clear"
+    );
+    let mut vault = open_vault(home)?;
+    let mut table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    if clear {
+        table.set_default(None);
+        println!("Receiver default route cleared ({})", reason.trim());
+    } else {
+        let hop = next_hop.unwrap().trim();
+        anyhow::ensure!(!hop.is_empty(), "default next hop must not be empty");
+        table.set_default(Some(hestia::receiver_routing::DefaultRoute {
+            next_hop_lct: hop.to_string(),
+            reason: reason.trim().to_string(),
+            set_by: "hestia-cli".into(),
+            set_at: chrono::Utc::now().timestamp().max(0) as u64,
+        }));
+        println!("Receiver default route: * -> {hop} ({})", reason.trim());
+    }
+    table.save(&mut vault)?;
+    Ok(())
+}
+
+fn cmd_receiver_routes(home: &std::path::Path) -> AnyResult<()> {
+    use hestia::hub::MemberKeySource;
+
+    let vault = open_vault(home)?;
+    let table = hestia::receiver_routing::ReceiverRoutingTable::load(&vault)
+        .context("loading receiver routing table (unreadable is not empty)")?;
+    println!("Receiver routing table (hop-limit {}):", table.hop_limit);
+    println!("  directly connected / local mailbox interfaces:");
+    if table.local_mailboxes.is_empty() {
+        println!("    (none)");
+    }
+    for b in &table.local_mailboxes {
+        let credential = match &b.member_key_source {
+            MemberKeySource::VaultIdentity => "vault-identity",
+            MemberKeySource::ChannelKeyFile { .. } => "channel-key-file",
+        };
+        println!(
+            "    {} -> local inbox  if={}  hub={} member={} credential={}  ({})",
+            b.child_lct, b.binding_id, b.hub_url, b.hub_member_lct, credential, b.reason
+        );
+    }
+    println!("  router interfaces:");
+    if table.router_ingress.is_empty() {
+        println!("    (none)");
+    }
+    for b in &table.router_ingress {
+        let credential = match &b.member_key_source {
+            MemberKeySource::VaultIdentity => "vault-identity",
+            MemberKeySource::ChannelKeyFile { .. } => "channel-key-file",
+        };
+        println!(
+            "    {}  if={}  hub={} member={} credential={}  ({})",
+            b.router_lct, b.binding_id, b.hub_url, b.hub_member_lct, credential, b.reason
+        );
+    }
+    println!("  neighbors:");
+    if table.neighbors.is_empty() {
+        println!("    (none)");
+    }
+    for n in &table.neighbors {
+        let cert = match n.peer_certificate.as_ref() {
+            Some(cert) => cert
+                .fingerprint()
+                .unwrap_or_else(|e| format!("INVALID:{e}")),
+            None => "UNCERTIFIED".to_string(),
+        };
+        println!(
+            "    {} -> hub-member {} via if={} link={} cert={}  ({})",
+            n.next_hop_lct, n.next_hop_hub_member_lct,
+            n.interface_binding_id, n.link_id, cert, n.reason
+        );
+    }
+    println!("  legacy compatibility aliases (shadow/cutover edge only):");
+    if table.legacy_aliases.is_empty() {
+        println!("    (none)");
+    }
+    for a in &table.legacy_aliases {
+        println!(
+            "    {} -> {}  authority={}  binding=({})  cutover=({})",
+            a.legacy_address,
+            a.destination_lct,
+            a.delivery_authority.as_str(),
+            a.reason,
+            a.authority_reason.as_deref().unwrap_or("not explicitly changed"),
+        );
+    }
+    println!("  specific routes:");
+    if table.routes.is_empty() {
+        println!("    (none)");
+    }
+    for r in &table.routes {
+        println!(
+            "    {} -> {}  metric={}  ({})",
+            r.destination_lct, r.next_hop_lct, r.metric, r.reason
+        );
+    }
+    match &table.default_route {
+        Some(r) => println!("  default: * -> {}  ({})", r.next_hop_lct, r.reason),
+        None => println!("  default: (none; no-route is terminal)"),
+    }
+    Ok(())
+}
+
+fn cmd_receiver_drain(home: &std::path::Path, parent: Option<&str>) -> AnyResult<()> {
+    let (vault, passphrase) = open_vault_with_passphrase(home)?;
+    let router_lct = receiver_router_lct(&vault, parent)?;
+    let store_key = hestia::storage::storage_key(home, &passphrase)
+        .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
+    let inbox = hestia::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+    let chain = hestia::storage::SqliteChainStore::open(home.join("witness.db"), store_key)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let local = rt.block_on(hestia::fleet_receiver::drain_once(
+        &vault, &router_lct, &inbox, &chain,
+    ))?;
+    let router = rt.block_on(hestia::router_forwarder::drain_router_once(
+        &vault, &router_lct, &inbox, &chain,
+    ))?;
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "local": local,
+        "router": router,
+    }))?);
+    anyhow::ensure!(
+        local.errors + router.errors == 0,
+        "receiver pass completed with {} local + {} router error(s); durable state was retained for retry",
+        local.errors, router.errors
+    );
+    Ok(())
+}
+
 
 /// Bind a notice to a specific version of the pointed-at substance via a
 /// self-describing, scheme-tagged content hash (mesh H-008, tag scheme agreed with

@@ -1,0 +1,475 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -455,6 +455,10 @@
+     member_id: str
+     #: Repo names and `path:` grants. `["*"]` = deliberately unscoped, and must be declared.
+     scope: tuple = ()
++    #: Roots this member may READ and nothing more: the read-only society floor (dp,
++    #: 2026-10-19, "the governed see the law" — every member reads the governance snapshot).
++    #: Consulted by evaluate() only for an act that is a read; never widens a write.
++    read_scope: tuple = ()
+     #: Where this policy was resolved from, carried so a reader never has to guess which store
+     #: won. A policy that cannot say where it came from is not auditable.
+     source: str = "unresolved"
+@@ -909,9 +913,18 @@
+                         return AgentPolicy(member_id=profile.member_id, scope=(),
+                                            source="vault-expired", stale=True,
+                                            generation=gen, expires_at=exp)
++                    # Read-only roots, parsed inside the same guard: bad data here reads
++                    # as no read-only roots, never as a traceback and never as reach.
++                    read_raw = got.get("in_scope_read")
++                    try:
++                        read_parsed = (_parse_scope_entries(read_raw)
++                                       if isinstance(read_raw, list) else ())
++                    except Exception:
++                        read_parsed = ()
+                     return AgentPolicy(
+                         member_id=profile.member_id, scope=parsed, source="vault",
+                         generation=gen, expires_at=exp,
++                        read_scope=tuple(read_parsed or ()),
+                     )
+ 
+     # 2. Local replica — fail-closed fallback, marked stale.
+@@ -2981,6 +2994,52 @@
+ 
+ 
+ # ── The decision ─────────────────────────────────────────────────────────────────────────
++#: Tools whose path is only READ. The read-only floor admits these and nothing else. Each is
++#: also a reader in the governance closure (`_READ_PATH_TOOLS`), which
++#: tools/closure_read_tool_names_test.py pins: a tool the scope layer lets read a root must
++#: not be one the closure treats as writing it.
++READ_ONLY_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead",
++                                  "read_file", "read_many_files", "glob",
++                                  "search_file_content", "list_directory"})
++
++
++#: Shell verbs that only read: no option and no operand of theirs names a file they write.
++#: Deliberately tiny. The degraded mode's read grammar is NOT reused here: it admits verbs that
++#: write through an option or an operand (`uniq IN OUT`, `sort -oFILE`, `git diff
++#: --output=FILE`; Codex HOLD 28057 on this change, and the closure's copy of the hole is #1348).
++#: Excluded on purpose: sed (its `w` command writes), awk, find (-fprint, -delete), sort, uniq,
++#: git, tee, xargs, and every interpreter.
++READ_ONLY_ROOT_VERBS = frozenset({"cat", "head", "tail", "grep", "wc", "ls", "stat"})
++
++
++def _read_only_root_command(command: str) -> bool:
++    """True iff every simple command in the line is a bare READ_ONLY_ROOT_VERBS verb, joined
++    only by pipes or && / || / ;. Any redirect, substitution, heredoc, newline, background `&`,
++    environment prefix or path-qualified verb makes it False: a miss refuses, never leaks."""
++    if any(tok in command for tok in (">", "<", "$(", "`", "\n", "\r")):
++        return False
++    if "&" in command.replace("&&", ""):
++        return False
++    for chunk_or in command.split("||"):
++        for chunk_and in chunk_or.split("&&"):
++            for chunk_semi in chunk_and.split(";"):
++                for seg in chunk_semi.split("|"):
++                    words = seg.strip().split()
++                    if not words:
++                        continue
++                    if words[0] not in READ_ONLY_ROOT_VERBS:
++                        return False
++    return True
++
++
++def _read_only_admits(event: NormalizedEvent, p: str, read_scopes: list, ws: str,
++                      profile: HarnessProfile) -> bool:
++    """Does the read-only floor admit this path for this act? Only a reader tool, only
++    inside a read-only root. No read-only roots means no."""
++    return (bool(read_scopes) and event.tool in READ_ONLY_PATH_TOOLS
++            and path_in_scope(p, read_scopes, ws, profile, event.cwd))
++
++
+ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
+              workspace: Optional[str] = None,
+              policy: Optional[AgentPolicy] = None) -> Verdict:
+@@ -2999,6 +3058,7 @@
+     # ONE object rather than three stores and an absence.
+     pol = policy if policy is not None else resolve_agent_policy(profile)
+     scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
++    read_scopes = list(getattr(pol, "read_scope", ()) or ())
+     forbidden = forbidden_tokens(profile)
+ 
+     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
+@@ -3067,7 +3127,8 @@
+                     f"scope (granted: {'+'.join(scopes)})",
+                 )
+     for p in ([] if event.repos else event.paths):
+-        if not path_in_scope(p, scopes, ws, profile, event.cwd):
++        if (not path_in_scope(p, scopes, ws, profile, event.cwd)
++                and not _read_only_admits(event, p, read_scopes, ws, profile)):
+             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
+             # on any long path truncates away the very component that tripped the gate — the
+             # member is handed a string that does not contain its own reason. That is the
+@@ -3090,6 +3151,12 @@
+         ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd,
+                                                      forbidden=forbidden,
+                                                      home_markers=profile.home_markers)
++        # A command that only READS may also reach the read-only roots, by a strict verb
++        # allowlist (READ_ONLY_ROOT_VERBS): anything outside it refuses rather than leaks.
++        if not ok and read_scopes and _read_only_root_command(event.command):
++            ok, offending, refused = command_scope_reach(
++                event.command, scopes + read_scopes, ws, event.cwd,
++                forbidden=forbidden, home_markers=profile.home_markers)
+         if not ok:
+             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
+             # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+--- a/plugins/_shared/hestia_gate_mechanism.py
++++ b/plugins/_shared/hestia_gate_mechanism.py
+@@ -1209,6 +1209,11 @@
+             # that serves a floor, and no deployed daemon did yet.
+             "society_floor": [],
+             "society_floor_digest": None,
++            # Read-only floor roots (dp, 2026-10-19: "the governed see the law"). Kept apart
++            # from `in_scope` because a grant carries reach and no mode (#1098 §2, #1345):
++            # an entry here admits READ acts only, and only in a core that knows the key.
++            "society_floor_read": [],
++            "in_scope_read": [],
+             "generation": None,
+             "expires_at": None,
+         }
+@@ -1284,13 +1289,26 @@
+             # Absent on an older daemon, in which case every line below is a no-op and the
+             # snapshot is exactly the pre-floor one: a member talking to a daemon that has no
+             # floor gets no floor, rather than an error or a guess.
++            # `recursive` rides the floor entry since the floor learned subtrees; absent on
++            # an older daemon, which reads as exact — the floor's meaning before it existed.
+             floor = scope.get("society_floor")
+             if isinstance(floor, list):
+                 for f in floor:
+                     p = f.get("path") if isinstance(f, dict) else None
+                     if isinstance(p, str) and p.strip():
+                         snap["society_floor"].append(p.strip())
+-                        snap["in_scope"].append(_scope_entry_for_grant(p))
++                        snap["in_scope"].append(
++                            _scope_entry_for_grant(p, f.get("recursive") is True))
++            # The READ-ONLY floor: the same mapping, into a list the core consults for read
++            # acts alone. Absent on an older daemon, so nothing extra is admitted.
++            floor_read = scope.get("society_floor_read")
++            if isinstance(floor_read, list):
++                for f in floor_read:
++                    p = f.get("path") if isinstance(f, dict) else None
++                    if isinstance(p, str) and p.strip():
++                        snap["society_floor_read"].append(p.strip())
++                        snap["in_scope_read"].append(
++                            _scope_entry_for_grant(p, f.get("recursive") is True))
+             floor_digest = scope.get("society_floor_digest")
+             if isinstance(floor_digest, str) and len(floor_digest) == 64:
+                 snap["society_floor_digest"] = floor_digest
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -456,6 +456,10 @@
+     member_id: str
+     #: Repo names and `path:` grants. `["*"]` = deliberately unscoped, and must be declared.
+     scope: tuple = ()
++    #: Roots this member may READ and nothing more: the read-only society floor (dp,
++    #: 2026-10-19, "the governed see the law" — every member reads the governance snapshot).
++    #: Consulted by evaluate() only for an act that is a read; never widens a write.
++    read_scope: tuple = ()
+     #: Where this policy was resolved from, carried so a reader never has to guess which store
+     #: won. A policy that cannot say where it came from is not auditable.
+     source: str = "unresolved"
+@@ -910,9 +914,18 @@
+                         return AgentPolicy(member_id=profile.member_id, scope=(),
+                                            source="vault-expired", stale=True,
+                                            generation=gen, expires_at=exp)
++                    # Read-only roots, parsed inside the same guard: bad data here reads
++                    # as no read-only roots, never as a traceback and never as reach.
++                    read_raw = got.get("in_scope_read")
++                    try:
++                        read_parsed = (_parse_scope_entries(read_raw)
++                                       if isinstance(read_raw, list) else ())
++                    except Exception:
++                        read_parsed = ()
+                     return AgentPolicy(
+                         member_id=profile.member_id, scope=parsed, source="vault",
+                         generation=gen, expires_at=exp,
++                        read_scope=tuple(read_parsed or ()),
+                     )
+ 
+     # 2. Local replica — fail-closed fallback, marked stale.
+@@ -2982,6 +2995,52 @@
+ 
+ 
+ # ── The decision ─────────────────────────────────────────────────────────────────────────
++#: Tools whose path is only READ. The read-only floor admits these and nothing else. Each is
++#: also a reader in the governance closure (`_READ_PATH_TOOLS`), which
++#: tools/closure_read_tool_names_test.py pins: a tool the scope layer lets read a root must
++#: not be one the closure treats as writing it.
++READ_ONLY_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead",
++                                  "read_file", "read_many_files", "glob",
++                                  "search_file_content", "list_directory"})
++
++
++#: Shell verbs that only read: no option and no operand of theirs names a file they write.
++#: Deliberately tiny. The degraded mode's read grammar is NOT reused here: it admits verbs that
++#: write through an option or an operand (`uniq IN OUT`, `sort -oFILE`, `git diff
++#: --output=FILE`; Codex HOLD 28057 on this change, and the closure's copy of the hole is #1348).
++#: Excluded on purpose: sed (its `w` command writes), awk, find (-fprint, -delete), sort, uniq,
++#: git, tee, xargs, and every interpreter.
++READ_ONLY_ROOT_VERBS = frozenset({"cat", "head", "tail", "grep", "wc", "ls", "stat"})
++
++
++def _read_only_root_command(command: str) -> bool:
++    """True iff every simple command in the line is a bare READ_ONLY_ROOT_VERBS verb, joined
++    only by pipes or && / || / ;. Any redirect, substitution, heredoc, newline, background `&`,
++    environment prefix or path-qualified verb makes it False: a miss refuses, never leaks."""
++    if any(tok in command for tok in (">", "<", "$(", "`", "\n", "\r")):
++        return False
++    if "&" in command.replace("&&", ""):
++        return False
++    for chunk_or in command.split("||"):
++        for chunk_and in chunk_or.split("&&"):
++            for chunk_semi in chunk_and.split(";"):
++                for seg in chunk_semi.split("|"):
++                    words = seg.strip().split()
++                    if not words:
++                        continue
++                    if words[0] not in READ_ONLY_ROOT_VERBS:
++                        return False
++    return True
++
++
++def _read_only_admits(event: NormalizedEvent, p: str, read_scopes: list, ws: str,
++                      profile: HarnessProfile) -> bool:
++    """Does the read-only floor admit this path for this act? Only a reader tool, only
++    inside a read-only root. No read-only roots means no."""
++    return (bool(read_scopes) and event.tool in READ_ONLY_PATH_TOOLS
++            and path_in_scope(p, read_scopes, ws, profile, event.cwd))
++
++
+ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
+              workspace: Optional[str] = None,
+              policy: Optional[AgentPolicy] = None) -> Verdict:
+@@ -3000,6 +3059,7 @@
+     # ONE object rather than three stores and an absence.
+     pol = policy if policy is not None else resolve_agent_policy(profile)
+     scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
++    read_scopes = list(getattr(pol, "read_scope", ()) or ())
+     forbidden = forbidden_tokens(profile)
+ 
+     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
+@@ -3068,7 +3128,8 @@
+                     f"scope (granted: {'+'.join(scopes)})",
+                 )
+     for p in ([] if event.repos else event.paths):
+-        if not path_in_scope(p, scopes, ws, profile, event.cwd):
++        if (not path_in_scope(p, scopes, ws, profile, event.cwd)
++                and not _read_only_admits(event, p, read_scopes, ws, profile)):
+             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
+             # on any long path truncates away the very component that tripped the gate — the
+             # member is handed a string that does not contain its own reason. That is the
+@@ -3091,6 +3152,12 @@
+         ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd,
+                                                      forbidden=forbidden,
+                                                      home_markers=profile.home_markers)
++        # A command that only READS may also reach the read-only roots, by a strict verb
++        # allowlist (READ_ONLY_ROOT_VERBS): anything outside it refuses rather than leaks.
++        if not ok and read_scopes and _read_only_root_command(event.command):
++            ok, offending, refused = command_scope_reach(
++                event.command, scopes + read_scopes, ws, event.cwd,
++                forbidden=forbidden, home_markers=profile.home_markers)
+         if not ok:
+             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
+             # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is
+diff --git a/hooks-gt/_shared/hestia_gate_mechanism.py b/hooks-gt/_shared/hestia_gate_mechanism.py
+--- a/hooks-gt/_shared/hestia_gate_mechanism.py
++++ b/hooks-gt/_shared/hestia_gate_mechanism.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 34026f2c12b3b5e96190e3f070f6543e93dbea962de3fe8161c48229bc857983  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903  (published ground truth; manifest: hooks-gt)
+ """Shared in-process daemon-query mechanism — the society-safety verdict path.
+ 
+ PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
+@@ -1210,6 +1210,11 @@
+             # that serves a floor, and no deployed daemon did yet.
+             "society_floor": [],
+             "society_floor_digest": None,
++            # Read-only floor roots (dp, 2026-10-19: "the governed see the law"). Kept apart
++            # from `in_scope` because a grant carries reach and no mode (#1098 §2, #1345):
++            # an entry here admits READ acts only, and only in a core that knows the key.
++            "society_floor_read": [],
++            "in_scope_read": [],
+             "generation": None,
+             "expires_at": None,
+         }
+@@ -1285,13 +1290,26 @@
+             # Absent on an older daemon, in which case every line below is a no-op and the
+             # snapshot is exactly the pre-floor one: a member talking to a daemon that has no
+             # floor gets no floor, rather than an error or a guess.
++            # `recursive` rides the floor entry since the floor learned subtrees; absent on
++            # an older daemon, which reads as exact — the floor's meaning before it existed.
+             floor = scope.get("society_floor")
+             if isinstance(floor, list):
+                 for f in floor:
+                     p = f.get("path") if isinstance(f, dict) else None
+                     if isinstance(p, str) and p.strip():
+                         snap["society_floor"].append(p.strip())
+-                        snap["in_scope"].append(_scope_entry_for_grant(p))
++                        snap["in_scope"].append(
++                            _scope_entry_for_grant(p, f.get("recursive") is True))
++            # The READ-ONLY floor: the same mapping, into a list the core consults for read
++            # acts alone. Absent on an older daemon, so nothing extra is admitted.
++            floor_read = scope.get("society_floor_read")
++            if isinstance(floor_read, list):
++                for f in floor_read:
++                    p = f.get("path") if isinstance(f, dict) else None
++                    if isinstance(p, str) and p.strip():
++                        snap["society_floor_read"].append(p.strip())
++                        snap["in_scope_read"].append(
++                            _scope_entry_for_grant(p, f.get("recursive") is True))
+             floor_digest = scope.get("society_floor_digest")
+             if isinstance(floor_digest, str) and len(floor_digest) == 64:
+                 snap["society_floor_digest"] = floor_digest
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,12 +7,12 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7",
++      "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+       "path": "hestia_gate_mechanism.py",
+-      "sha256": "34026f2c12b3b5e96190e3f070f6543e93dbea962de3fe8161c48229bc857983",
++      "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903",
+       "source": "plugins/_shared/hestia_gate_mechanism.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e"
++  "gt_version": "799aa5143f852451e488d3e8dcdfb8e2dcbe99373156292767fd6cd6f2e37aca"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e",
++    "gt_version": "799aa5143f852451e488d3e8dcdfb8e2dcbe99373156292767fd6cd6f2e37aca",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7"
++        "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "34026f2c12b3b5e96190e3f070f6543e93dbea962de3fe8161c48229bc857983"
++        "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "220148268d3a9e47c29aad377c19e8eab7bc0f561aafddcac133fd0dc7a55e7d"
++  "gt_version": "10908dada0bd4c37622d1fc4b20e9dfd9077dfbd57e3359165e969b27e2b9a75"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e",
++    "gt_version": "799aa5143f852451e488d3e8dcdfb8e2dcbe99373156292767fd6cd6f2e37aca",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7"
++        "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "34026f2c12b3b5e96190e3f070f6543e93dbea962de3fe8161c48229bc857983"
++        "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "106b12929ac2ab452be1025ee93756bbed08201b278cd93848706c75b301e364"
++  "gt_version": "997e6e007ea6a07783f3636258b20aa4d976209ec142c92467a13238a868d78a"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e",
++    "gt_version": "799aa5143f852451e488d3e8dcdfb8e2dcbe99373156292767fd6cd6f2e37aca",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7"
++        "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "34026f2c12b3b5e96190e3f070f6543e93dbea962de3fe8161c48229bc857983"
++        "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "79c5a7f3f3823b3d976a823c4ea8999e272a909e98e3e1733bad8be569e20abc"
++  "gt_version": "ba3f50744034ae9a71e96b7596be70a9a6cedca3fb6582eec9f9a71e4e1c7bb2"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "a2d552990ec842139d7391f2b6d7f646a8fef3cafc8cfe29be884727c6cbe15e",
++    "gt_version": "799aa5143f852451e488d3e8dcdfb8e2dcbe99373156292767fd6cd6f2e37aca",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "d3d5daff50a7a9b2e8dda9bec5c2eb2bb9e589f2dd422a11f411bace355b3aa7"
++        "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "34026f2c12b3b5e96190e3f070f6543e93dbea962de3fe8161c48229bc857983"
++        "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "55197b22043388e7755e7934eaf1118dfe94164bbc6b153d4ba3504b6b360a03"
++  "gt_version": "e5c1fc03e5bb0b56cb2e54ea58f332a61db789bf32de6a3d95e6b85be41d69ff"
+ }

@@ -106,7 +106,10 @@ EOF
   echo "!! OVERRIDE: installing from inside an agent session on an explicit operator ack."
 fi
 
-build_id="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+# ONLY RELEASE TAGS NAME A BUILD (web4#904): the same glob core/build.rs bakes in, so the
+# authority's build_id is spelled like the binary's --version even when an app-v* tag (the
+# Android APKs, ancestors of main) sits nearer than the last release.
+build_id="$(git -C "$REPO_ROOT" describe --tags --match 'v[0-9]*' --always --dirty 2>/dev/null || echo unknown)"
 head_sha="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 case "$build_id" in
   *-dirty)
@@ -122,6 +125,42 @@ log "  build     : $build_id"
 log "  home      : $HESTIA_HOME"
 [ "$DRY_RUN" = "1" ] && log "  MODE      : DRY RUN (nothing will be written)"
 log ""
+
+# THE LOCATOR IS CHECKED BEFORE ANYTHING IS PLANNED, INSTALLED OR REGISTERED (Codex review 17401 of #1245).
+# deploy/register-members.py renders HESTIA_HOME onto every gate and witness line and refuses a path it will
+# not write onto a shell line; that refusal used to arrive first, at PLAN, so nothing was planned, nothing
+# installed, and the run took the "no member installed" exit 0 -- the same unsafe path that the publication
+# step below refuses (#1188 review) was swallowed. Same allowlist, checked here once, before any write
+# (DRY_RUN included); a home that does not exist yet is checked as spelled (the step below creates it).
+_hh_early="$(cd "$HESTIA_HOME" 2>/dev/null && pwd -P || printf '%s' "$HESTIA_HOME")"
+case "$_hh_early" in
+  *[!A-Za-z0-9/._+@,:-]*)
+    die "HESTIA_HOME resolves to '$_hh_early', which contains characters this installer will not write onto a hook line, into a sourced shell file or environment.d (allowed: letters, digits and / . _ + @ , : -). Move it to such a path." ;;
+esac
+
+# THE MEMBER MESH RUNTIME IS CHECKED HERE TOO, before any member file is written (Nova, #1374 review). Its
+# refusals are repo-side -- a manifest name that is not a bare filename, a source that is a symlink, a
+# plugins/member-mesh that resolves outside this checkout -- so they answer the same for every member; found
+# inside the member loop they would die after that member's own hooks were already written, a partial install.
+# The per-member block below uses mesh_names as validated here. Host-side anomalies (a symlinked TARGET, a
+# LOSS) stay per member: they skip that member's mesh, said aloud, and never stop the run.
+mesh_root="$REPO_ROOT/plugins/member-mesh"
+mesh_manifest="$mesh_root/RUNTIME_MANIFEST.txt"
+mesh_names=()
+if [ -f "$mesh_manifest" ]; then
+  mesh_real="$(cd "$mesh_root" && pwd -P)"
+  repo_real="$(cd "$REPO_ROOT" && pwd -P)"
+  [ "$mesh_real" = "$repo_real/plugins/member-mesh" ] || die "plugins/member-mesh resolves to $mesh_real, outside this checkout's plugins/"
+  mapfile -t mesh_names < <(sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*#/d' -e '/^$/d' "$mesh_manifest")
+  for name in "${mesh_names[@]}"; do
+    case "$name" in
+      .*|*/*|"") die "plugins/member-mesh/RUNTIME_MANIFEST.txt: '$name' is not a bare filename" ;;
+    esac
+    [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || die "plugins/member-mesh/RUNTIME_MANIFEST.txt: '$name' is not a bare filename"
+    [ -L "$mesh_root/$name" ] && die "mesh runtime source $mesh_root/$name is a symlink"
+    [ -f "$mesh_root/$name" ] || die "mesh runtime source $mesh_root/$name does not exist"
+  done
+fi
 
 # ORDER IS LOAD-BEARING: the engine is installed and $HESTIA_HOME/shared is repointed
 # BEFORE any hook entrypoint is written. Hooks import their decision engine from that
@@ -293,24 +332,46 @@ installed_json="["
 first_entry=1
 any_installed=0
 any_skipped=0
+seeds_json=""   # identity seeds placed or found, per member (#1250); written into the manifest
 
-# --- REGISTER FIRST, THEN INSTALL (dp, 2026-09-27, #1133) ------------------------------------
+# --- PLAN, INSTALL, THEN REGISTER (dp 2026-09-27 #1133; #1142 review 2026-09-28) -----------
 # "the auto install process is supposed to take care of all this. isn't there a script? editing
 # files by hand is unacceptable friction for product we're trying to release generally."
 # This script derives every target from the harness's OWN registration and never writes one —
-# correct (#315), and the reason an unregistered hook could sit skipped forever: codex's
-# witness.py was declared, shipped, and "not registered on this host" for 14 days while no
-# codex act reached the chain. deploy/register-members.py renders each installed member's
-# hooks/hooks.json into that member's config, idempotently, so the loop below then finds the
-# hook registered and installs it. A registration failure is LOUD and does not stop the
-# install of what is already registered. DRY_RUN passes through (it writes nothing).
+# correct (#315). deploy/register-members.py renders each member's hooks/hooks.json into that
+# member's config. The ORDER is the invariant (#1142 review): registering first left live
+# registrations pointing into a directory nothing had created, and the loop below then died on
+# it. So: (1) ask the registrar which hooks it WOULD add and where (`--plan`); (2) the member loop
+# creates each planned destination and installs its file exactly as it installs a registered
+# one; (3) only then does the registrar write registrations, and it refuses any whose target file
+# is not on disk (PENDING). No registration ever points at a missing file. A matcher narrower
+# than the template's (a gate on `Read` only) is reported NARROW and left untouched.
+declare -A planned=()
 if [ "${HESTIA_SKIP_REGISTER:-0}" != "1" ]; then
-  log "REGISTER (deploy/register-members.py)"
-  if ! DRY_RUN="$DRY_RUN" python3 "$REPO_ROOT/deploy/register-members.py" 2>&1 | sed 's/^/  /'; then
-    log "  WARN register-members.py failed (rc=${PIPESTATUS[0]}) — installing what is already registered"
+  log "PLAN (deploy/register-members.py --plan)"
+  plan_rc=0
+  # HESTIA_HOME is passed explicitly: the registrar renders it onto every gate and witness line
+  # (@HESTIA_HOME@, resolved to an absolute path) and refuses when it is unset, and this script's
+  # env-first-else-standard resolution above does not export a defaulted value.
+  plan_out="$(HESTIA_HOME="$HESTIA_HOME" python3 "$REPO_ROOT/deploy/register-members.py" --plan 2>&1)" || plan_rc=$?
+  if [ "$plan_rc" != "0" ]; then
+    log "  WARN register-members.py --plan failed (rc=$plan_rc): ${plan_out:0:200}"
     any_skipped=1
+    plan_out=""
   fi
+  while IFS=$'\t' read -r p_member p_base p_target; do
+    [ -n "${p_target:-}" ] || continue
+    planned["$p_member/$p_base"]="$p_target"
+    log "  plan  $p_member: $p_base -> $(dirname "$p_target") (installed first, then registered)"
+  done <<< "$plan_out"
+  [ "${#planned[@]}" -gt 0 ] || log "  nothing to add: every templated hook is registered or its member is absent"
 fi
+
+has_plan() {   # has_plan <member> — any planned hook for this member?
+  local k
+  for k in "${!planned[@]}"; do [ "${k%%/*}" = "$1" ] && return 0; done
+  return 1
+}
 
 for expects in "$REPO_ROOT"/plugins/*/expects.json; do
   [ -e "$expects" ] || continue
@@ -375,7 +436,14 @@ PY
 )" || reg_rc=$?
   case "$reg_rc" in
     2) log "SKIP  $member — declares no install.registration (nothing to derive a target from)"; any_skipped=1; continue ;;
-    3) log "SKIP  $member — its harness registration file is absent (member not on this host)"; any_skipped=1; continue ;;
+    3) if has_plan "$member"; then
+         # The harness is here (its config DIR exists; the registrar checked) but has no
+         # registration file yet: install the planned hooks, then the registrar writes it.
+         log "  $member: no registration file yet — installing its planned hooks, then registering"
+         reg_out=""
+       else
+         log "SKIP  $member — its harness registration file is absent (member not on this host)"; any_skipped=1; continue
+       fi ;;
     4) log "SKIP  $member — registration file present but unparseable; refusing to guess a target"; any_skipped=1; continue ;;
     5) die  "$member declares an unknown install.registration.reader" ;;
   esac
@@ -415,12 +483,26 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
 
   log "MEMBER $member"
   member_files_json=""
+  seed_anchor=""
   for rel in "${files[@]}"; do
     src="$REPO_ROOT/plugins/$member/$rel"
     [ -f "$src" ] || die "$member declares '$rel' but $src does not exist"
     base="$(basename "$rel")"
 
     target="${registered[$base]:-}"
+    is_planned=""
+    if [ -z "$target" ] && [ -n "${planned[$member/$base]:-}" ]; then
+      target="${planned[$member/$base]}"
+      is_planned=1
+      if [ ! -d "$(dirname "$target")" ]; then
+        if [ "$DRY_RUN" = "1" ]; then
+          log "  would create $(dirname "$target")"
+        else
+          mkdir -p -m 0755 "$(dirname "$target")"
+          log "  made  $(dirname "$target")"
+        fi
+      fi
+    fi
     if [ -z "$target" ]; then
       # NOT an error and NOT a silent success: a host that does not register this hook has
       # nothing to deploy, which is a different outcome from "deployed". Same reason the
@@ -430,7 +512,13 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
       continue
     fi
     target_dir="$(dirname "$target")"
-    [ -d "$target_dir" ] || die "$member/$base is registered at $target but $target_dir does not exist"
+    if [ ! -d "$target_dir" ]; then
+      if [ -n "$is_planned" ] && [ "$DRY_RUN" = "1" ]; then
+        :   # a dry run creates nothing; the planned directory is named above
+      else
+        die "$member/$base is registered at $target but $target_dir does not exist"
+      fi
+    fi
     if [ -n "$declared" ] && [ "$target_dir" != "$declared" ]; then
       warn "$member/$base: expects.json declares '$declared' but the harness invokes it from '$target_dir' — installing to the REGISTERED path. The declared value is a per-seat CLAIM this run just checked, not a fleet-wide target: layouts differ by seat, so this divergence may be structural rather than a stale string to correct"
     fi
@@ -456,7 +544,94 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
     # actually went — not where a manifest said they would. An audit that reads this can
     # now be checked against the live registration instead of against the same claim.
     member_files_json="$member_files_json{\"file\":\"$base\",\"path\":\"$target\",\"sha256\":\"$src_hash\"},"
+    # Where the hooks actually run from anchors the identity seed below. hydrate.sh's fallback is
+    # $(dirname "$0")/.., so its own directory wins when it is one of the files.
+    if [ -z "$seed_anchor" ] || [ "$base" = "hydrate.sh" ]; then seed_anchor="$target_dir"; fi
   done
+
+  # --- THE MEMBER MESH RUNTIME (#1373) ------------------------------------------------------------
+  # A member that declares install.mesh_member carries the mesh: its template registers the two mesh
+  # hooks, and both run $(dirname "$0")/hestia-mesh.py. The three files are ONE shared runtime listed in
+  # plugins/member-mesh/RUNTIME_MANIFEST.txt (the _shared engine's shape), never copied into a member's
+  # plugin dir and never named by a path that leaves it.
+  #   WHERE: the directory the member's mesh hook is registered or planned at -- derived (invariant 1) --
+  #     and only when that is the member's own install.dest. A mesh hook registered anywhere else was put
+  #     there by hand (CBP's ~/.claude/hooks/member-mesh); it is left to plugins/member-mesh/install.sh,
+  #     whose pin and loss refusals own that layout, and said aloud.
+  #   WHAT (Nova, #1374 review): every manifest name is a bare filename; a source that is a symlink, or a
+  #     plugins/member-mesh that resolves outside this checkout, is refused at the preflight, before any
+  #     member file is written; a target that is a symlink skips this member's mesh, said aloud.
+  #   LOSS (member-mesh/install.sh's rule, kimi notice 352): an installed session-mesh-inbox.sh -- the
+  #     hook, where a member's grain is set -- that ASSIGNS a HESTIA_* the pinned line does not is not
+  #     overwritten: the overwrite would silently change the member's grain. Refused for this member,
+  #     named, and left for the operator. Only the pinned pair is credited, never the new source: a text
+  #     scan cannot tell the source's echoed banner from a live assignment, and crediting it would mask
+  #     exactly the loss this exists to catch (kimi, #1374 v2 review). hestia-mesh.py is not scanned,
+  #     as in install.sh: its HESTIA_*= text is docstrings and f-strings, so scanning it would refuse
+  #     every upgrade.
+  # Same backup (2) and per-file verify (3); each file is a row in the manifest.
+  # mesh_member is a presence flag here: there is one shared runtime and one manifest, not one per id.
+  mesh_id="$(python3 -c '
+import json,sys
+print((json.load(open(sys.argv[1])).get("install") or {}).get("mesh_member") or "")' "$expects")"
+  if [ -n "$mesh_id" ]; then
+    [ -f "$mesh_manifest" ] || die "$member declares mesh_member but $mesh_manifest is missing"
+    mesh_anchor="${registered[session-mesh-inbox.sh]:-${planned[$member/session-mesh-inbox.sh]:-}}"
+    mesh_dir=""; mesh_skip=""
+    if [ -z "$mesh_anchor" ]; then
+      mesh_skip="its mesh hooks are neither registered nor planned on this host"
+    else
+      mesh_dir="$(dirname "$mesh_anchor")"
+      if [ -n "$declared" ] && [ "$mesh_dir" != "$declared" ]; then
+        mesh_skip="its mesh hooks run from $mesh_dir, not hestia's dest $declared (hand-installed: plugins/member-mesh/install.sh owns that layout)"
+      fi
+    fi
+    if [ -z "$mesh_skip" ]; then
+      for name in "${mesh_names[@]}"; do
+        src="$mesh_root/$name"   # name, source and directory validated before any write (preflight above)
+        t="${registered[$name]:-${planned[$member/$name]:-}}"
+        if [ -n "$t" ] && [ "$(dirname "$t")" != "$mesh_dir" ]; then
+          mesh_skip="its $name is registered at $t, apart from session-mesh-inbox.sh in $mesh_dir"; break
+        fi
+        t="$mesh_dir/$name"
+        if [ -L "$t" ]; then mesh_skip="$t is a symlink"; break; fi
+        if [ "$name" = "session-mesh-inbox.sh" ] && [ -f "$t" ] && ! cmp -s "$src" "$t"; then
+          lost=""
+          for v in $(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*\/\//d' "$t" | grep -oE '(^|[[:space:]]|[;&(])HESTIA_[A-Z0-9_]*=' | grep -oE 'HESTIA_[A-Z0-9_]*' | sort -u); do
+            case "$v" in
+              HESTIA_MESH_PLUGIN|HESTIA_ROLE) : ;;
+              *) lost="$lost $v" ;;
+            esac
+          done
+          if [ -n "$lost" ]; then
+            mesh_skip="the installed $t assigns$lost, which its pinned line does not (see plugins/member-mesh/install.sh --check)"; break
+          fi
+        fi
+      done
+    fi
+    if [ -n "$mesh_skip" ]; then
+      log "  skip  member mesh — $mesh_skip"
+      any_skipped=1
+    else
+      for name in "${mesh_names[@]}"; do
+        src="$mesh_root/$name"; target="$mesh_dir/$name"
+        src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
+        if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$src_hash" ]; then
+          log "  ok    $name (member mesh, already current) -> $mesh_dir"
+        elif [ "$DRY_RUN" = "1" ]; then
+          log "  would $name (member mesh) -> $mesh_dir"
+        else
+          [ -d "$mesh_dir" ] || mkdir -p -m 0755 "$mesh_dir"
+          [ -f "$target" ] && cp -p "$target" "$target.pre-install.bak"
+          install -m 0755 "$src" "$target"
+          got="$(sha256sum "$target" | cut -d' ' -f1)"
+          [ "$got" = "$src_hash" ] || die "$member/$name verify FAILED (src $src_hash != installed $got)"
+          log "  wrote $name (member mesh) -> $mesh_dir"
+        fi
+        member_files_json="$member_files_json{\"file\":\"$name\",\"path\":\"$target\",\"sha256\":\"$src_hash\"},"
+      done
+    fi
+  fi
 
   # A member every one of whose files was unregistered installed NOTHING; recording it
   # would be invariant 4's failure one level down — a partial (here, empty) install
@@ -468,12 +643,97 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
   fi
   any_installed=1
 
+  # --- THE MEMBER'S IDENTITY SEED (#1250) ----------------------------------------------------
+  # A member that ships instance/identity.seed.json hydrates its live identity from it at its first
+  # session end: hydrate.sh reads ${<X>_PLUGIN_ROOT:-$(dirname "$0")/..}/instance/identity.seed.json,
+  # the directory ABOVE the one its hooks run from. Nothing installed it there. Kimi's and gemini's
+  # existed on CBP only because they were placed by hand once, codex's was missing (#1245 points
+  # codex's hydrate line at the deploy clone as a stopgap), and a fresh host had none: every
+  # hydrate's `cp "$SEED"` failed silently and the member never got a continuity file. Installed
+  # here, beside the hooks it serves, at a place derived from where those hooks actually went
+  # (invariant 1), never from a declared dest.
+  #
+  # NEVER OVERWRITTEN. Identity is per host: a seed already present is this host's and it is
+  # authoritative (an operator may have customised it -- kimi's README says to -- and the live
+  # identity.json it seeded has accrued state against it). An existing seed is reported and left
+  # byte-for-byte alone, even when it differs from this build's; only an ABSENT seed is written, and
+  # a writer that places one between the check and the move wins (`mv -n`). Recorded in the
+  # manifest's `identity_seeds` as installed or present, and never digested as a governed byte: a
+  # seed is continuity, not law.
+  seed_src="$REPO_ROOT/plugins/$member/instance/identity.seed.json"
+  if [ -f "$seed_src" ] && [ -n "$seed_anchor" ]; then
+    seed_dir="$(dirname "$seed_anchor")/instance"
+    seed_dst="$seed_dir/identity.seed.json"
+    seed_hash="$(sha256sum "$seed_src" | cut -d' ' -f1)"
+    if [ -e "$seed_dst" ] || [ -L "$seed_dst" ]; then
+      seed_state="present"
+      if [ "$(sha256sum "$seed_dst" 2>/dev/null | cut -d' ' -f1)" = "$seed_hash" ]; then
+        log "  ok    identity.seed.json (present) -> $seed_dir"
+      else
+        log "  ok    identity.seed.json (present and differs from this build's; this host's seed is authoritative, left as-is) -> $seed_dir"
+      fi
+    elif [ "$DRY_RUN" = "1" ]; then
+      seed_state="planned"
+      log "  would identity.seed.json -> $seed_dir"
+    else
+      mkdir -p -m 0755 "$seed_dir"
+      seed_tmp="$seed_dir/.identity.seed.json.$$"
+      seed_mv_rc=""
+      install -m 0644 "$seed_src" "$seed_tmp"
+      # mv -n's exit status on a refused overwrite differs across coreutils versions and BSD, so
+      # the OUTCOME is read from the filesystem, never from the status -- and a refusal counts as
+      # a lost race only with the destination there to prove it (Codex notice 20534: a rename
+      # that simply failed used to be recorded as "present" with no seed anywhere, and a current
+      # manifest then stopped every later cycle from retrying it).
+      mv -n "$seed_tmp" "$seed_dst" 2>/dev/null || seed_mv_rc=$?
+      if [ -e "$seed_tmp" ]; then
+        rm -f "$seed_tmp"
+        if [ -e "$seed_dst" ] || [ -L "$seed_dst" ]; then
+          # Another writer placed a seed between the check and the move: theirs stands.
+          seed_state="present"
+          log "  ok    identity.seed.json (appeared during this install; left as-is) -> $seed_dir"
+        else
+          die "$member identity seed was not placed at $seed_dst (mv rc=${seed_mv_rc:-0}, and no seed is there): nothing is recorded as installed"
+        fi
+      else
+        seed_state="installed"
+        # INVARIANT 3: prove the bytes landed.
+        [ -f "$seed_dst" ] && [ "$(sha256sum "$seed_dst" | cut -d' ' -f1)" = "$seed_hash" ] \
+          || die "$member identity seed verify FAILED at $seed_dst"
+        log "  wrote identity.seed.json -> $seed_dir"
+      fi
+    fi
+    seeds_json="$seeds_json{\"member\":\"$member\",\"path\":\"$seed_dst\",\"state\":\"$seed_state\"},"
+  fi
+
   [ $first_entry -eq 1 ] || installed_json="$installed_json,"
   first_entry=0
   installed_json="$installed_json{\"member\":\"$member\",\"declared_dest\":\"$declared\",\"files\":[${member_files_json%,}]}"
 done
 
 installed_json="$installed_json]"
+log ""
+
+# (3) REGISTER, now that every planned file is on disk. Since dp's 2026-10-06 ruling the registrar
+# is a RECONCILER: every hook line hestia installed (target = <install.dest>/<templated basename>)
+# is rewritten to the rendered template -- command, timeout, matcher -- and duplicates reduced to
+# one; lines it did not install are never touched. It refuses a target that is not on disk
+# (PENDING, rc 9), reports a FOREIGN line narrower than the template (NARROW, rc 8) without
+# touching it, refuses a config whose edit it cannot prove (rc 7), and fails closed on a config
+# it cannot parse or re-read (rc 6). Any of those is a gap in this deploy,
+# said loudly; none of them rolls back what installed correctly.
+if [ "${HESTIA_SKIP_REGISTER:-0}" != "1" ]; then
+  log "REGISTER (deploy/register-members.py)"
+  reg_rc=0
+  reg_log="$(DRY_RUN="$DRY_RUN" HESTIA_HOME="$HESTIA_HOME" python3 "$REPO_ROOT/deploy/register-members.py" 2>&1)" || reg_rc=$?
+  printf '%s\n' "$reg_log" | sed 's/^/  /'
+  case "$reg_rc" in
+    0) ;;
+    8) warn "a hook hestia does not own is registered under a matcher narrower than its template's (NARROW above) — not widened, not counted as registered"; any_skipped=1 ;;
+    9) warn "a planned hook's file is not on disk after install (PENDING above) — it was NOT registered"; any_skipped=1 ;;
+    *) warn "register-members.py failed (rc=$reg_rc) — installed files stand; their registration did not happen"; any_skipped=1 ;;
+  esac
+fi
 log ""
 
 if [ "$any_installed" = "0" ]; then
@@ -490,12 +750,89 @@ if [ "$DRY_RUN" = "1" ]; then
   exit 0
 fi
 
+# HESTIA_HOME REACHES EVERY SEAT, GLOBALLY (#1186; dp 2026-09-30: "that has to be part of the install
+# globally" ... "it has to be an exact path for the machine, hestia won't recognise $HOME").
+# The shared outcome witness records nothing unless HESTIA_HOME is in the SEAT's process environment:
+# it is the bootstrap locator, so the vault's shared config cannot supply it. Nothing set it durably,
+# so a harness launched from any terminal that had not exported it by hand (kimi, codex on 09-30)
+# silently witnessed nothing. The installer now publishes it, as an EXACT ABSOLUTE PATH resolved here
+# once — never `$HOME`, `~` or `%h` in anything written — to every place a seat's environment comes from:
+#   * ~/.config/environment.d (the systemd user manager: terminals and user services it starts),
+#   * the running user manager, at once (`systemctl --user set-environment`) — only when $HOME is this
+#     account's real home, so the isolated-HOME tests never touch a live session,
+#   * macOS: `launchctl setenv` for the GUI session,
+#   * a marked, idempotent block in ~/.profile and ~/.bashrc (GNOME terminals run non-login shells from
+#     an already-running terminal server, which does not see a new user-manager variable until relogin).
+HESTIA_HOME_ABS="$(cd "$HESTIA_HOME" 2>/dev/null && pwd -P || true)"
+[ -z "$HESTIA_HOME_ABS" ] && { mkdir -p "$HESTIA_HOME" && HESTIA_HOME_ABS="$(cd "$HESTIA_HOME" && pwd -P)"; }
+case "$HESTIA_HOME_ABS" in
+  /*) ;;
+  *) die "HESTIA_HOME did not resolve to an absolute path ('$HESTIA_HOME' -> '$HESTIA_HOME_ABS')" ;;
+esac
+# THE PATH IS WRITTEN INTO SOURCED SHELL AND INTO environment.d, so it is checked, not trusted (#1188 review):
+# a `$`, backtick, quote, backslash or space would be reinterpreted when ~/.profile is sourced, or split by
+# environment.d. Refused explicitly rather than written and silently changed.
+case "$HESTIA_HOME_ABS" in
+  *[!A-Za-z0-9/._+@,:-]*)
+    die "HESTIA_HOME resolves to '$HESTIA_HOME_ABS', which contains characters this installer will not write into a sourced shell file or environment.d (allowed: letters, digits and / . _ + @ , : -). Move it to such a path." ;;
+esac
+publish_hestia_home() {
+  local abs="$1" line="HESTIA_HOME=$1" envd="$HOME/.config/environment.d" f
+  local begin="# >>> hestia (managed by deploy/install-members.sh; do not hand-edit) >>>"
+  local end="# <<< hestia <<<"
+  if [ "$(uname -s)" = "Linux" ]; then
+    f="$envd/50-hestia.conf"
+    mkdir -p "$envd"
+    if [ "$(cat "$f" 2>/dev/null)" != "$line" ]; then
+      printf '%s\n' "$line" > "$f"
+      log "  env       : wrote $f ($line)"
+    fi
+  fi
+  # THE ACCOUNT'S REAL HOME, PORTABLY (#1188 review): `getent` does not exist on macOS, so the old lookup was
+  # always empty there and `launchctl setenv` never ran on the platform it exists for. Python's `pwd` answers
+  # on both. The live session is touched only when $HOME IS that home, so an isolated-HOME test never reaches
+  # it. `_HESTIA_TEST_ACCOUNT_HOME` exists ONLY so a test can make that condition true with `systemctl` /
+  # `launchctl` stubbed on PATH; nothing in the install sets it.
+  local real_home
+  real_home="${_HESTIA_TEST_ACCOUNT_HOME:-$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null || true)}"
+  if [ -n "$real_home" ] && [ "$HOME" = "$real_home" ]; then
+    if [ "$(uname -s)" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
+      systemctl --user set-environment "$line" 2>/dev/null \
+        || warn "could not set HESTIA_HOME in the running user manager; it applies from the next login"
+    elif [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
+      launchctl setenv HESTIA_HOME "$abs" 2>/dev/null \
+        || warn "launchctl setenv HESTIA_HOME failed; login shells still get it from ~/.profile"
+    fi
+  fi
+  for f in "$HOME/.profile" "$HOME/.bashrc"; do
+    [ "$f" = "$HOME/.bashrc" ] && [ ! -e "$f" ] && continue
+    local block
+    block="$(printf '%s\nexport HESTIA_HOME="%s"\n%s' "$begin" "$abs" "$end")"
+    if [ -e "$f" ] && grep -qF "$begin" "$f"; then
+      if ! grep -qxF "export HESTIA_HOME=\"$abs\"" "$f"; then
+        python3 - "$f" "$begin" "$end" "$block" <<'PY'
+import sys
+path, begin, end, block = sys.argv[1:5]
+text = open(path).read()
+a = text.index(begin); b = text.index(end, a) + len(end)
+open(path, "w").write(text[:a] + block + text[b:])
+PY
+        log "  env       : updated the hestia block in $f"
+      fi
+    else
+      printf '\n%s\n' "$block" >> "$f"
+      log "  env       : added the hestia block to $f"
+    fi
+  done
+}
+publish_hestia_home "$HESTIA_HOME_ABS"
+
 # INVARIANT 4: written last, only after every file verified.
 mkdir -p "$HESTIA_HOME"
 tmp="$AUTHORITY.$$.tmp"
-python3 - "$tmp" "$build_id" "$head_sha" "$installed_json" "$shared_engine_json" <<'PY'
+python3 - "$tmp" "$build_id" "$head_sha" "$installed_json" "$shared_engine_json" "[${seeds_json%,}]" <<'PY'
 import json, sys, time
-tmp, build_id, head_sha, installed, shared_engine = sys.argv[1:6]
+tmp, build_id, head_sha, installed, shared_engine, seeds = sys.argv[1:7]
 json.dump({
     "build_id": build_id,
     "head_sha": head_sha,
@@ -506,6 +843,9 @@ json.dump({
     # (core/src/server/dashboard.rs's deployment_health), so nothing existing
     # can be broken by a key it never looks up.
     "shared_engine": json.loads(shared_engine),
+    # Additive (#1250): each member's identity seed, "installed" by this run or "present" already
+    # (a host's seed is authoritative and never overwritten). Continuity, not law: no digest.
+    "identity_seeds": json.loads(seeds),
 }, open(tmp, "w"), indent=2, sort_keys=True)
 PY
 mv "$tmp" "$AUTHORITY"
@@ -592,3 +932,43 @@ verify_installed_gates() {
 }
 
 verify_installed_gates || exit 1
+
+# ---- every installed seat gets its seat document (#1186) ------------------------------------
+# A registered, hooked seat with no document in the vault has no rendered projection, and the
+# shared witness then records none of its allowed acts: every one returns `config.unbacked`,
+# silently, because the witness runs detached. On thor, codex and kimi-code were green for a
+# day like that until dp wrote their documents by hand. dp, 2026-09-30: "this all needs to be
+# automated in the install - we can't expect average users to fuss with this stuff."
+#
+# The seeder's --add-missing writes the minimum for each installed seat the vault does not
+# declare. It never modifies an existing document (the daemon re-checks every member is absent
+# under its own lock), and it grants nothing: no role and no scope. A seat with no HESTIA_ROLE
+# connects as the society default, role:constellation:member.
+#
+# NO OUTCOME FAILS THE INSTALL, the same rule as the gate verdict above. The hooks are installed
+# either way; a seat left without a document is named here, with the command that repairs it.
+add_missing_seat_documents() {
+    local seeder="$REPO_ROOT/tools/seed_seat_config.py" out rc=0 apply="--apply"
+    log "SEATS (tools/seed_seat_config.py --add-missing)"
+    if [ ! -f "$seeder" ]; then
+        log "  skipped: no seeder in this checkout ($seeder)"
+        return 0
+    fi
+    if [ ! -f "$HESTIA_HOME/operator.key" ]; then
+        log "  skipped: no operator key at $HESTIA_HOME/operator.key, so seat documents cannot be"
+        log "  written from here. Every hooked seat needs one, or its allowed acts go unwitnessed."
+        log "  As the operator:  HESTIA_HOME=$HESTIA_HOME python3 $seeder --add-missing --apply"
+        return 0
+    fi
+    [ "$DRY_RUN" = "1" ] && apply=""
+    out=$(HESTIA_HOME="$HESTIA_HOME" python3 "$seeder" --add-missing $apply 2>&1) || rc=$?
+    printf '%s\n' "$out" | while IFS= read -r line; do log "  $line"; done
+    if [ "$rc" != "0" ]; then
+        warn "seat documents were not all written (seeder exit $rc). Hooked seats without one"
+        warn "  record none of their allowed acts. Re-run as the operator:"
+        warn "    HESTIA_HOME=$HESTIA_HOME python3 $seeder --add-missing --apply"
+    fi
+    return 0
+}
+
+add_missing_seat_documents || exit 1

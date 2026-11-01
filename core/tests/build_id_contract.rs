@@ -35,7 +35,7 @@ fn version_parenthesized_substring_is_the_dashboard_running_build() {
 /// The documented recipe must keep naming the binary's self-report as the
 /// authority, and its example must not regress to a bare `g<hash>`. The
 /// original defect was exactly that example (`g8c44e7a`): a format
-/// `git describe --tags --always --dirty` can never emit, so a supervisor
+/// `git describe --tags --match 'v[0-9]*' --always --dirty` can never emit, so a supervisor
 /// following the doc produced a manifest that could never match — the
 /// permanently-amber failure this file exists to keep loud.
 ///
@@ -91,7 +91,7 @@ fn dashboard_doc_recipe_points_at_version_self_report() {
     // example — arm G, claude-code re-measure of the arm-C fix. The
     // landmine's own signature is spelling-independent, so close the hole
     // where the value actually lives: scan the WHOLE doc for a bare
-    // `g<hex>` token — a string `git describe --tags --always --dirty`
+    // `g<hex>` token — a string `git describe --tags --match 'v[0-9]*' --always --dirty`
     // never emits on its own (its hash always rides a `<tag>-<n>-` prefix,
     // which is why the left boundary below excludes '-', sparing the
     // `-ge720d0a` inside a real describe string). However the example is

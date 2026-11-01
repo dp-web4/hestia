@@ -489,8 +489,8 @@ for tpl in sorted(templates):
     # EVERY template, not just claude's. A member that cannot see its own
     # petitions is not one seat's property, and a renderer wired into one
     # template fixes one seat rather than the class.
-    check(f"C7 {tpl}: calls the renderer, time-bounded and failure-tolerated",
-          '$(timeout 5 python3 "$HERE_DIR/open-petitions.py" render "$PRIMER" 2>/dev/null || true)'
+    check(f"C7 {tpl}: calls the renderer through mesh-timeout.sh 5, failure-tolerated",
+          '$("$HERE_DIR/mesh-timeout.sh" 5 python3 "$HERE_DIR/open-petitions.py" render "$PRIMER" 2>/dev/null || true)'
           in src, tpl)
     check(f"C8 {tpl}: splices $PETITIONS_BLOCK into PROMPT",
           re.search(r'PROMPT="[^"]*\$PETITIONS_BLOCK', src, re.S) is not None

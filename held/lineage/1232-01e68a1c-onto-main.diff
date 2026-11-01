@@ -1,0 +1,2392 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -182,6 +182,9 @@
+     "hestia_gate_core.py",
+     "hestia_gate_mechanism.py",
+     "gate_self_protection_test.py",
++    # THE common gate (one-gate stage C): every seat's shim delegates its whole decision to
++    # it, so after the cutover it is the single file whose edit changes all four seats.
++    "hestia_single_gate.py",
+ )
+ 
+ 
+@@ -274,13 +277,54 @@
+         (),
+     ),
+     # ── degraded mode (Sprint F — §7.1 criterion 9; semantics ratified dp 2026-08-11) ────
++    # Re-ruled 2026-10-01/02 (dp, one-gate stage B, live since stage C): "align upward; no
++    # snapshot -> no read" and "no verdict, no act". Without the member's policy snapshot the
++    # common gate denies EVERY act, reads included, in every rollout mode. `degraded_verdict`
++    # below still runs first so an innate egress refusal keeps its own rule.
+     "gate.degraded": Remedy(
+-        "The policy authority could not be consulted (the daemon is unreachable), so the "
+-        "gate is in the ratified degraded mode: deny-writes-allow-reads. This is fault "
+-        "isolation, not a judgement of your act — the referee is missing, not ruling "
+-        "against you. Retry when the daemon returns; if it stays down, that is an operator "
+-        "matter and not something to work around. A shim may tighten this posture locally; "
+-        "it may never loosen it.",
++        "The policy authority could not be consulted (the daemon did not answer with this "
++        "member's policy snapshot), so no act is permitted, reads included: without the "
++        "snapshot the gate cannot certify scope. This is fault isolation, not a judgement of "
++        "your act — the referee is missing, not ruling against you. Retry when the daemon "
++        "returns; if it stays down, that is an operator matter and not something to work "
++        "around.",
++        (),
++    ),
++    # ── the common gate's own refusals (hestia_single_gate.decide; moved here from that
++    # module's GATE_REMEDIES in one-gate stage C, so every sentence a member reads after a
++    # refusal comes from this one table) ─────────────────────────────────────────────────
++    "invocation.superseded": Remedy(
++        "This call's approval was re-delivered to another invocation of the same act. Do not "
++        "retry this call; the invocation that reclaimed the approval carries it.",
++        (),
++    ),
++    "gate.evidence_uncommitted": Remedy(
++        "The gate reached a permit but could not commit its decision record before the "
++        "deadline, and a consequential act may not run unwitnessed (C11). This is not a "
++        "judgement of the act: retry once the daemon's witness path is answering.",
++        (),
++    ),
++    "gate.internal_error": Remedy(
++        "This is an infrastructure fault in the gate, not a judgement of the attempted act. "
++        "The gate fails closed until the decision path is healthy; please report it.",
++        (),
++    ),
++    # The shim could not establish how long its harness waits for it, so it cannot keep the
++    # safety invariant (the gate's deadline strictly below the timeout the harness enforces).
++    "gate.harness_timeout_unknown": Remedy(
++        "The gate could not read how long this harness waits for it, so it refuses rather than "
++        "risk being killed mid-decision (which this harness would treat as an allow). This is "
++        "an installation fault, not a judgement of your act: an operator registers the hook "
++        "with an explicit timeout (deploy/register-members.py). A non-harness caller declares "
++        "the timeout it enforces in HESTIA_HOOK_TIMEOUT_S.",
++        (),
++    ),
++    # The seat's vault projection does not authorise the role it was launched under
++    # (launch_role_verdict, #1084).
++    "config.miswired": Remedy(
++        "This seat's configuration does not match what the vault authorises for it. That is an "
++        "operator repair (Govern -> Runtime config), not a judgement of your act; retrying "
++        "will not help.",
+         (),
+     ),
+ }
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+--- a/plugins/_shared/hestia_gate_mechanism.py
++++ b/plugins/_shared/hestia_gate_mechanism.py
+@@ -61,8 +61,24 @@
+ # stall windows (#423: latency jitter 2-228ms + spikes past 2.5s, 10% idle CPU busy
+ # loop). 4000 x (1 try + 1 retry) absorbs stalls to ~8s, still well inside the
+ # measured engine clamps (codex 15s config, kimi 30s config).
++#
++# ONE-GATE STAGE C: THE CALLER'S DEADLINE. Every helper the common gate calls takes
++# `deadline=` (an absolute `time.monotonic()` bound): `query_society_safety`,
++# `fetch_policy_snapshot` (both attempts and the pause between them), `gate_self_call`,
++# `witness_gate_self`, `claim_self_write`, `tally_scope` and `record_decision`. With a deadline,
++# no request STARTS after it, and the two module budgets below do not apply: the deadline is the
++# shim's, derived from its harness's registered timeout minus a margin (plan §4), so it is always
++# strictly below what the harness enforces. `deadline=None` (the default) is today's behaviour
++# exactly, for callers that pass none (SAGE's being gateway imports this module).
++#
++# THE PER-REQUEST CAP (REQUEST_TIMEOUT_S, 5 s) applies only without a caller deadline. Measured
++# 2026-10-01: a never-seen member's first connect costs 4.6-5.1 s, so the cap turned a slow but
++# ALIVE daemon into a no-verdict even inside a 12 s deadline. A caller deadline already bounds
++# every request by what is left of it, so a second, smaller bound adds only that false denial.
+ TOTAL_BUDGET_MS = int(_num_env("HESTIA_PRE_TOTAL_BUDGET_MS", 4000, int))
+ REQUEST_TIMEOUT_S = float(_num_env("HESTIA_PRE_REQUEST_TIMEOUT_S", 5.0, float))
++#: `_McpHttp(request_cap=...)` sentinel: the module's REQUEST_TIMEOUT_S, read at request time.
++DEFAULT_REQUEST_CAP = "default"
+ MAX_POLLS = 5
+ MIN_POLL_SLEEP_MS = 50
+ PROTOCOL_VERSION = 1
+@@ -150,11 +166,22 @@
+ 
+ 
+ class _McpHttp:
+-    def __init__(self, endpoint: str, deadline: float) -> None:
++    def __init__(self, endpoint: str, deadline: float,
++                 request_cap: Any = DEFAULT_REQUEST_CAP) -> None:
+         self.endpoint = endpoint
+         self.session_id: Optional[str] = None
+         self.next_id = 0
+         self.deadline = deadline  # monotonic time after which we give up
++        # None: no per-request cap beyond the deadline (a caller deadline, stage C);
++        # DEFAULT_REQUEST_CAP: REQUEST_TIMEOUT_S; a number: that many seconds.
++        self.request_cap = request_cap
++
++    def _cap(self) -> Optional[float]:
++        if self.request_cap is None:
++            return None
++        if self.request_cap == DEFAULT_REQUEST_CAP:
++            return REQUEST_TIMEOUT_S
++        return float(self.request_cap)
+ 
+     def _id(self) -> int:
+         self.next_id += 1
+@@ -172,7 +199,8 @@
+         if self.session_id:
+             headers["mcp-session-id"] = self.session_id
+         req = urllib.request.Request(self.endpoint, data=data, headers=headers, method="POST")
+-        timeout = min(REQUEST_TIMEOUT_S, max(0.01, remaining))
++        cap = self._cap()
++        timeout = max(0.01, remaining) if cap is None else min(cap, max(0.01, remaining))
+         with urllib.request.urlopen(req, timeout=timeout) as resp:
+             if not self.session_id:
+                 sid = resp.headers.get("mcp-session-id")
+@@ -248,6 +276,92 @@
+         mask_next = tok.lstrip("-").rstrip(":").lower() in _MASKED_KEYS
+         out.append(tok)
+     return " ".join(out)
++
++
++#: Shapes that plausibly CARRY a credential: key material and its filenames, ssh/gpg config
++#: trees (a path can be the credential), http auth, and the flag/env spellings that appear in
++#: real commands. Moved here from the claude-code shim's `_attempted_summary` at the one-gate
++#: stage C cutover (kimi NOT-SAME review of #185 found seven of these shapes reaching the
++#: chain verbatim), so EVERY seat's `attempted` text is held to the strongest rule any seat
++#: had — align upward, no seat loses protection in the cutover.
++#:
++#: Substring on a lowered string, no regex over attacker-shaped text. Asymmetric on purpose:
++#: a false positive costs one vague escalation body; a false negative is a credential in the
++#: permanent, hash-chained record (which is easier to read and harder to expunge than the
++#: file a deny protected). The over-match bound lives in attempted_summary_test.py.
++_CREDENTIAL_SHAPES = (
++    # key material and its filenames
++    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".pem", ".p12", ".pfx",
++    "begin rsa private key", "begin openssh private key", "begin private key",
++    "begin ec private key", "begin certificate",
++    # ssh / gpg config trees
++    "/.ssh", ".ssh/", "/.gnupg", ".netrc", ".pgpass", ".htpasswd",
++    # http auth
++    "authorization:", "authorization ", "bearer ", "x-api-key", "proxy-authorization",
++    # generic credential words, and their flag/env spellings
++    "password", "passwd", "passphrase", "credential", "sec" "ret", "api_key", "apikey",
++    "access_key", "access-key", "private_key", "private-key", "client_sec" "ret",
++    "token=", "_token", "auth_token", "session_token", "refresh_token",
++    ".env", "dotenv",
++)
++
++#: The bounds the claude-code seat held for five weeks (#185, #941): a command body is cut at
++#: 220 chars and says so; a path keeps its TAIL (the filename a reviewer needs) and marks the
++#: head cut inside the bound, so a cut absolute path never reads as a relative one.
++ATTEMPTED_MAX = 220
++ATTEMPTED_PATH_MAX = 140
++
++
++def credential_shaped(text: str) -> bool:
++    """Does this text plausibly carry a credential? One helper for the command AND the path
++    branch, so the two cannot drift (the inconsistency #185 finding 2 named)."""
++    low = text.lower()
++    return any(shape in low for shape in _CREDENTIAL_SHAPES)
++
++
++def attempted_summary(tool_name: str, tool_input: Any, *, command: Optional[str] = None,
++                      targets: Optional[list] = None) -> str:
++    """WHAT was attempted, in one bounded, self-censoring line, for the record and for the
++    human who rules on an escalation (dp 2026-08-03: "they don't tell me what i'm approving").
++
++    The caller (the common gate) passes the act's command text, already normalised across
++    harness spellings, and any targets it parsed from a patch body. Two layers mask:
++      1. HERE, on the sending side: a credential-SHAPED command or path is withheld whole,
++         with its length stated (`[REDACTED — ...; N chars withheld ...]`); otherwise the
++         value after a credential-ish key is masked (`_mask_credential_values`).
++      2. The daemon (`handler.rs`) masks `key=value` / `--key value` again on receipt.
++    Only layer 1 covers key files, ssh/gpg paths, PEM blocks and credential-shaped paths."""
++    if not isinstance(tool_input, dict):
++        return f"{tool_name} (no inspectable input)"
++    if isinstance(command, str):
++        s = " ".join(command.split())
++        if credential_shaped(s):
++            return (f"{tool_name} [REDACTED — names a credential-shaped token; "
++                    f"{len(s)} chars withheld rather than copied into the record]")
++        s = _mask_credential_values(s)
++        return f"{tool_name}: {s[:ATTEMPTED_MAX]}" + (" …" if len(s) > ATTEMPTED_MAX else "")
++    paths = [tool_input.get(k) for k in ("file_path", "path", "notebook_path", "url")]
++    paths = [p for p in paths if isinstance(p, str) and p][:1] or [
++        t for t in (targets or []) if isinstance(t, str) and t]
++    if paths:
++        joined = ", ".join(paths)
++        if credential_shaped(joined):
++            return (f"{tool_name} [REDACTED — the target is a credential-shaped path; "
++                    f"{len(joined)} chars withheld rather than copied into the record]")
++        cut = ATTEMPTED_PATH_MAX - 1
++        return f"{tool_name} -> " + (
++            joined if len(joined) <= ATTEMPTED_PATH_MAX else "…" + joined[-cut:])
++    if isinstance(tool_name, str) and tool_name.startswith("mcp__") and tool_input:
++        try:
++            s = " ".join(json.dumps(tool_input, sort_keys=True, default=str).split())
++        except Exception:  # noqa: BLE001
++            s = " ".join(str(tool_input).split())
++        if credential_shaped(s):
++            return (f"{tool_name} [REDACTED — names a credential-shaped token; "
++                    f"{len(s)} chars withheld rather than copied into the record]")
++        s = _mask_credential_values(s)
++        return f"{tool_name}: {s[:ATTEMPTED_MAX]}" + (" …" if len(s) > ATTEMPTED_MAX else "")
++    return f"{tool_name} (no command or path in input)"
+ 
+ 
+ def _shell_target(command: str) -> str:
+@@ -391,10 +505,17 @@
+         if here not in sys.path:
+             sys.path.insert(0, here)
+         from hestia_gate_core import record_gate_unavailable  # type: ignore
+-        record_gate_unavailable(plugin_id, tool_name, cause, detail, home=str(DEFAULT_HESTIA_HOME))
++        record_gate_unavailable(plugin_id, tool_name, cause, detail, home=_telemetry_home())
+     except Exception:
+         pass
+     return SafetyVerdict(allow=False, decided=False, message=msg, cause=cause)
++
++
++def _telemetry_home() -> str:
++    """Where the availability series is written: the launcher's explicit HESTIA_HOME (the one
++    locator, #944) when set, else the home this module resolved at import. Before stage C it was
++    always the latter, so a fixture or a seat with its own HESTIA_HOME wrote into ~/.hestia."""
++    return os.environ.get("HESTIA_HOME") or str(DEFAULT_HESTIA_HOME)
+ 
+ 
+ def _witness_core():
+@@ -419,11 +540,29 @@
+         return None
+ 
+ 
++def _bound(deadline: Optional[float], budget_s: float) -> tuple:
++    """(absolute deadline, request cap) for one helper call. A caller deadline is used as given
++    and lifts the per-request cap (see REQUEST_TIMEOUT_S above); without one, the helper's own
++    budget and the default cap apply, exactly as before stage C."""
++    if deadline is not None:
++        return float(deadline), None
++    return time.monotonic() + budget_s, DEFAULT_REQUEST_CAP
++
++
++def _client(endpoint: str, deadline: float, cap: Any):
++    """`_McpHttp` for one helper call. The default cap constructs it exactly as before stage C
++    (two arguments), so a caller or test that substitutes `_McpHttp` keeps working."""
++    if cap == DEFAULT_REQUEST_CAP:
++        return _McpHttp(endpoint, deadline)
++    return _McpHttp(endpoint, deadline, request_cap=cap)
++
++
+ def query_society_safety(event: dict, *, plugin_id: str, host_agent: str,
+                          plugin_version: Optional[str] = None,
+                          host_agent_version: Optional[str] = None,
+                          host_session_id: Optional[str] = None,
+-                         correlation_key: Optional[str] = None) -> SafetyVerdict:
++                         correlation_key: Optional[str] = None,
++                         deadline: Optional[float] = None) -> SafetyVerdict:
+     """Obtain the daemon's society-safety verdict for a write/exec act, IN-PROCESS.
+ 
+     Replaces "spawn the claude gate as a subprocess" for a thin shim. Returns a SafetyVerdict;
+@@ -437,6 +576,9 @@
+     claude-code's gate alone, so on every other harness the witness could only record cold —
+     kimi 0 of 37 warned acts closed, codex 0 of 1. The cache is evidence plumbing: it is written
+     after the verdict exists and can never change it.
++
++    `deadline` (stage C): the caller's absolute `time.monotonic()` bound. No request starts after
++    it, and running out is a no-verdict (cause "timeout"). None keeps the module budget.
+     """
+     tool_name = event.get("tool_name") or "?"
+     tool_input = event.get("tool_input") or {}
+@@ -444,9 +586,12 @@
+         endpoint = _discover_endpoint()
+         if endpoint is None:
+             return _no_verdict(plugin_id, tool_name, "refused", "no daemon endpoint discovered")
+-        deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
++        deadline, cap = _bound(deadline, TOTAL_BUDGET_MS / 1000.0)
++        if deadline - time.monotonic() <= 0:
++            return _no_verdict(plugin_id, tool_name, "timeout",
++                               "the caller's deadline was exhausted before the society check")
+         target = _extract_target(tool_input, tool_name)
+-        client = _McpHttp(endpoint, deadline)
++        client = _client(endpoint, deadline, cap)
+         init = client.initialize()
+         if "result" not in init:
+             return _no_verdict(plugin_id, tool_name, "unknown", "initialize failed")
+@@ -518,37 +663,15 @@
+         return _no_verdict(plugin_id, tool_name, "unknown", f"unexpected: {type(e).__name__}")
+ 
+ 
+-# ── ONE deny recorder (Sprint E — PRD §3.3 bullets 4-6, §6.E) ─────────────────────────────────
+-# Before this, the deny recorder varied by vendor: codex reported to the chain (with its own
+-# private client), kimi recorded only inside a bare `except: pass`, claude wrote no refusal
+-# record at all on this path — and NO plugin's deny record carried the command/target (only
+-# claude's begin_action did), so the trust chain's denominator differed by harness and the
+-# record could not say WHAT was refused. Every shim now calls witness_decision_unified for
+-# refusal records. Contract:
+-#   - ALWAYS carries `target` (the audit hole) and `verdict_available` (kimi previously could
+-#     not distinguish a real deny from an infra fail-close — §3.3 bullet 5);
+-#   - NEVER raises and never changes the caller's decision (the deny stands regardless);
+-#   - NON-SILENT failure: if the daemon witness cannot be delivered, the full record — with the
+-#     delivery error — is appended to the per-shim diagnostic log
+-#     ~/.hestia/telemetry/gate-denies-<plugin_id>.jsonl (criterion 9(c) fallback witness), so a
+-#     dead daemon degrades the record's REACH, never its existence.
+-
+-def _deny_fallback_path(plugin_id: str) -> Path:
+-    home = Path(os.environ.get("HESTIA_HOME", str(DEFAULT_HESTIA_HOME)))
+-    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in (plugin_id or "unknown"))
+-    return home / "telemetry" / f"gate-denies-{safe}.jsonl"
+-
+-
+-def _append_deny_fallback(plugin_id: str, record: dict) -> None:
+-    """Criterion 9(c) fallback witness: append-only, per-shim, never raises."""
+-    try:
+-        path = _deny_fallback_path(plugin_id)
+-        path.parent.mkdir(parents=True, exist_ok=True)
+-        with open(path, "a", encoding="utf-8") as fh:
+-            fh.write(json.dumps(record, default=str) + "\n")
+-    except Exception:
+-        pass  # the fallback of the fallback is silence; the deny itself already stood
+-
++# ── TOMBSTONE: the Sprint E deny recorder (one-gate stage C) ───────────────────────────────────
++# `witness_decision_unified` and its `~/.hestia/telemetry/gate-denies-<member>.jsonl` fallback
++# are DELETED, not kept beside their successor. They recorded refusals only, read any outer RPC
++# `result` as delivered (a refused verdict and a failed chain append both arrive that way,
++# handler.rs `call_tool`), and guessed `~/.hestia` when HESTIA_HOME was unset (#944). Since stage
++# C every seat's gate is `hestia_single_gate.decide()`, which records EVERY final verdict through
++# `record_decision` below — receipt-validated, joined by `action_id` and `correlation_key`, with
++# its uncommitted fallback only under an explicit HESTIA_HOME. Two recorders were two rows per
++# refusal and two charges (plan §2, finding 4). One remains.
+ 
+ 
+ def _loaded_core_digest():
+@@ -559,80 +682,14 @@
+     except Exception:
+         return None
+ 
+-def witness_decision_unified(client_or_none, *, plugin_id: str, decision: str, rule: str,
+-                             tool_name: str, target: Optional[str], session_id: Optional[str],
+-                             verdict_available: bool, attempted_summary: str) -> bool:
+-    """Record a refusal (deny/warn) to the daemon's witness chain — the ONE deny recorder.
+-
+-    `client_or_none`: an already-initialized MCP client to reuse, or None to open a short
+-    single-shot session (deadline ~1.5s; only ever runs on the deny/warn path, so no
+-    hook-clamp pressure on allows). Returns True when the daemon acknowledged the record;
+-    False when it went to the fallback log instead. NEVER raises."""
+-    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+-    record = {
+-        "plugin_id": plugin_id,
+-        "decision": decision,                       # deny | warn
+-        "rule": (rule or "")[:300],
+-        "tool_name": tool_name or "",
+-        "target": target,                           # ALWAYS present — the audit hole, closed
+-        "session_id": session_id,
+-        "verdict_available": bool(verdict_available),
+-        # Deployed-generation attestation (§7.2(7)): the digest of the core THIS process
+-        # imported, or absent when no core is loaded — never a bystander file hash.
+-        "core_digest": _loaded_core_digest(),
+-        "attempted": attempted_summary,
+-        "ts": ts,
+-    }
+-    try:
+-        client = client_or_none
+-        if client is None:
+-            endpoint = _discover_endpoint()
+-            if endpoint is None:
+-                raise RuntimeError("no daemon endpoint discovered")
+-            client = _McpHttp(endpoint, time.monotonic() + 1.5)
+-            if "result" not in client.initialize():
+-                raise RuntimeError("initialize failed")
+-            client.initialized()
+-        out = client.call_tool("hestia_witness_decision", {
+-            "plugin_id": plugin_id,
+-            "decision": decision,
+-            "adjudicator": f"plugin-gate:{plugin_id}",
+-            "reason": (rule or "")[:300],
+-            # False => the gate could not REACH a verdict (infra fail-close). Structurally not
+-            # conduct: "I could not judge" is not "I judged you badly" — derivation excludes
+-            # these from temperament with no exoneration needed (codex's discrimination, now
+-            # every harness's — §6.E).
+-            "verdict_available": bool(verdict_available),
+-            "tool_name": tool_name or "",
+-            "target": target,
+-            "session_id": session_id,
+-            "attempted": attempted_summary,
+-            # REPAIR 5 (GPT fleet-review blocker 5): the deployed-generation attestation
+-            # rides the HEALTHY witness call too, not only the fallback log — before this,
+-            # the digest that #7.2(7) exists for reached no chain record at all. The daemon
+-            # accepts extra arguments (hestia tools accept any argument), which ALSO means
+-            # a schema that does not persist this field would discard it SILENTLY - so the
+-            # local fallback record above keeps carrying it regardless, and daemon-side
+-            # persistence needs its own verification (R345_NOTES.md).
+-            "core_digest": record["core_digest"],
+-        })
+-        if not (isinstance(out, dict) and "result" in out):
+-            raise RuntimeError("witness call returned no result")
+-        return True
+-    except Exception as e:  # noqa: BLE001 — non-silent: the record survives in the fallback log
+-        record["witness_delivery_failed"] = f"{type(e).__name__}: {e}"
+-        _append_deny_fallback(plugin_id, record)
+-        return False
+-
+-
+ 
+ # ── ONE decision witness, receipt-validated (one-gate stage A) ──────────────────────────────────
+-# docs/one-gate-convergence-plan.md. `witness_decision_unified` above stays exactly as deployed:
+-# the four seats call it today, and stage A changes no seat. `record_decision` is the recorder
+-# the common orchestrator (stage B) will call for EVERY final verdict, and it differs in the one
+-# property C11 turns on:
++# docs/one-gate-convergence-plan.md. `record_decision` is the recorder the common orchestrator
++# calls for EVERY final verdict (and, since stage C, the only decision recorder: the Sprint E
++# refusal recorder is tombstoned above). It differs from that predecessor in the one property C11
++# turns on:
+ #
+-#   COMMITTED MEANS A RECEIPT. `witness_decision_unified` returns True when the reply has an outer
++#   COMMITTED MEANS A RECEIPT. The predecessor returned True when the reply had an outer
+ #   `result`. Every daemon tool error — a refused verdict, a failed chain append — arrives as a
+ #   successful MCP result carrying `_hestia_error` (handler.rs `call_tool`), so that check reads a
+ #   refusal as delivered. Here a decision is committed ONLY when the daemon returns a
+@@ -790,7 +847,8 @@
+             if endpoint is None:
+                 return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+                     status="unreachable", detail="no daemon endpoint discovered"))
+-            client = _McpHttp(endpoint, end)
++            client = _client(endpoint, end,
++                             None if deadline is not None else DEFAULT_REQUEST_CAP)
+             if "result" not in client.initialize():
+                 return _keep_uncommitted(plugin_id, record, DecisionReceipt(
+                     status="unreachable", detail="initialize failed"))
+@@ -933,7 +991,11 @@
+ _POLICY_SNAPSHOT_CACHE: dict = {}
+ 
+ 
+-def fetch_policy_snapshot(plugin_id, **kw):
++#: The pause between the snapshot's two attempts.
++SNAPSHOT_RETRY_PAUSE_S = 0.25
++
++
++def fetch_policy_snapshot(plugin_id, *, deadline: Optional[float] = None, **kw):
+     """One retry before None: the measured failure mode is TRANSIENT starvation (a
+     session-start hook herd overlapping the first tool calls — codex, 2026-08-14),
+     not a down daemon. A 250ms-backoff second attempt absorbs the blip; a genuinely
+@@ -943,22 +1005,29 @@
+     `declares_review_door=True` is the CALLER asserting it holds
+     `hestia_gate_escalation_corroborate` — see `_fetch_policy_snapshot_uncached`. Default
+     False: a library cannot know its caller's effectors, and the truthful default for a
+-    capability self-report is silence."""
+-    snap = _fetch_policy_snapshot_once(plugin_id, **kw)
++    capability self-report is silence.
++
++    `deadline` (stage C): one absolute bound for BOTH attempts and the pause between them. The
++    retry happens only if the pause still leaves time to ask; no request starts after it."""
++    snap = _fetch_policy_snapshot_once(plugin_id, deadline=deadline, **kw)
+     if snap is not None:
+         return snap
++    pause = SNAPSHOT_RETRY_PAUSE_S
++    if deadline is not None:
++        if deadline - time.monotonic() <= pause:
++            return None
+     try:
+-        import time as _t
+-        _t.sleep(0.25)
++        time.sleep(pause)
+     except Exception:
+         pass
+-    return _fetch_policy_snapshot_once(plugin_id, **kw)
++    return _fetch_policy_snapshot_once(plugin_id, deadline=deadline, **kw)
+ 
+ 
+ def _fetch_policy_snapshot_once(plugin_id: str, *, host_agent: Optional[str] = None,
+                           host_session_id: Optional[str] = None,
+                           use_cache: bool = True,
+-                          declares_review_door: bool = False) -> Optional[dict]:
++                          declares_review_door: bool = False,
++                          deadline: Optional[float] = None) -> Optional[dict]:
+     """Fetch this member's policy snapshot from the daemon, in-process. NEVER raises.
+ 
+     None  -> the daemon is unreachable / did not authenticate the session (no sessionId):
+@@ -973,7 +1042,8 @@
+     if use_cache and plugin_id in _POLICY_SNAPSHOT_CACHE:
+         return _POLICY_SNAPSHOT_CACHE[plugin_id]
+     snap = _fetch_policy_snapshot_uncached(plugin_id, host_agent, host_session_id,
+-                                           declares_review_door=declares_review_door)
++                                           declares_review_door=declares_review_door,
++                                           deadline=deadline)
+     if use_cache and snap is not None:
+         _POLICY_SNAPSHOT_CACHE[plugin_id] = snap
+     return snap
+@@ -1009,14 +1079,15 @@
+     try:
+         from hestia_gate_core import record_gate_unavailable  # type: ignore
+         record_gate_unavailable(plugin_id, "policy-snapshot", cause, detail,
+-                                home=str(DEFAULT_HESTIA_HOME))
++                                home=_telemetry_home())
+     except Exception:
+         pass
+ 
+ 
+ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
+                                     host_session_id: Optional[str],
+-                                    declares_review_door: bool = False) -> Optional[dict]:
++                                    declares_review_door: bool = False,
++                                    deadline: Optional[float] = None) -> Optional[dict]:
+     # Which step of the handshake was in flight when it failed. Named in the telemetry so a
+     # timeout on `hestia_operating_law` is distinguishable from one on `initialize`: the
+     # first is the daemon working, the second is the daemon absent, and they are different
+@@ -1027,8 +1098,12 @@
+         if endpoint is None:
+             _snapshot_unavailable(plugin_id, "no-endpoint")
+             return None
+-        deadline = time.monotonic() + (TOTAL_BUDGET_MS / 1000.0)
+-        client = _McpHttp(endpoint, deadline)
++        deadline, cap = _bound(deadline, TOTAL_BUDGET_MS / 1000.0)
++        if deadline - time.monotonic() <= 0:
++            _snapshot_unavailable(plugin_id, "deadline: the caller's deadline was exhausted "
++                                  "before the snapshot fetch", "timeout")
++            return None
++        client = _client(endpoint, deadline, cap)
+         stage = "initialize"
+         if "result" not in client.initialize():
+             _snapshot_unavailable(plugin_id, "init-no-result")
+@@ -1218,7 +1293,18 @@
+ # than a plausible default attributing its acts to somebody else.
+ 
+ 
+-def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None):
++def _step_timeout(fixed: float, deadline: Optional[float]) -> float:
++    """One request's timeout: its fixed budget, never past the caller's deadline. Raises
++    TimeoutError when the deadline leaves no time, so NO request starts after it (stage C)."""
++    if deadline is None:
++        return fixed
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        raise TimeoutError("the caller's deadline was exhausted before the request")
++    return min(fixed, remaining)
++
++
++def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None, deadline=None):
+     """Attest this gate's effective scope to the daemon, best effort.
+ 
+     `plugin_id` and `role_lct` are REQUIRED and keyword-only. In the seat-local copies both
+@@ -1226,10 +1312,14 @@
+     the function happened to live in. Making them arguments is what let one body serve every
+     seat; keyword-only is what stops the two ever being passed in the wrong order, since they
+     are both strings and a silent swap would attribute the attestation to a role.
++
++    `deadline` (stage C): no request starts after it (raises TimeoutError; the tally's caller
++    swallows it, accounting never changes a decision).
+     """
+     endpoint = endpoint or os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+ 
+     def post(payload, timeout, hdrs=None):
++        timeout = _step_timeout(timeout, deadline)
+         req = urllib.request.Request(
+             endpoint, data=json.dumps(payload).encode(),
+             headers={"Content-Type": "application/json",
+@@ -1319,7 +1409,8 @@
+     return "role:constellation:member"
+ 
+ 
+-def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=None):
++def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=None,
++                   deadline=None):
+     """One short daemon round trip for a gate-self event: initialize, connect (session-bound),
+     one tools/call. Returns the unwrapped result dict, or None on ANY failure.
+ 
+@@ -1329,10 +1420,14 @@
+     loss (witnesses).
+ 
+     `host_session_id`, when the caller has one, is threaded into the connect so the
+-    gate-self session this call mints joins to the per-wake session the outcome rows carry."""
++    gate-self session this call mints joins to the per-wake session the outcome rows carry.
++
++    `deadline` (stage C): an absolute `time.monotonic()` bound. Each step keeps its fixed budget
++    but never runs past it, and no step starts after it (that is a None: refusal or loss)."""
+     endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+ 
+     def post(payload, hdrs, timeout):
++        timeout = _step_timeout(timeout, deadline)
+         req = urllib.request.Request(
+             endpoint, data=json.dumps(payload).encode(),
+             headers={"Content-Type": "application/json",
+@@ -1396,7 +1491,8 @@
+ 
+ 
+ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
+-                      plugin_id, role, gate_path, client_name, host_session_id=None):
++                      plugin_id, role, gate_path, client_name, host_session_id=None,
++                      deadline=None):
+     """Record a governance-surface event as its OWN class — `gate_self_read` for a permitted
+     read, `gate_self_access` (appealable) for a refused write. The two stay distinct so an
+     alert on the refusal keeps its meaning. Best effort: a failed record never changes the
+@@ -1412,12 +1508,54 @@
+                        "severity": "record" if event_type == "gate_self_read" else "escalate",
+                        "role_lct": role}},
+         plugin_id=plugin_id, role=role, client_name=client_name,
+-        host_session_id=host_session_id) is not None
++        host_session_id=host_session_id, deadline=deadline) is not None
++
++
++RESOLVED_TARGET_MAX = 400
++MAX_RESOLVED_TARGETS = 16
++# A resolved target the gate could not price, said IN-BAND so it cannot be dropped silently. The
++# daemon prices any such entry at the HIGHEST bar (core `gate_escalation::UNPRICEABLE_PREFIX`):
++# missing pricing evidence must never read as the weaker bar (Codex review of #1239).
++UNPRICEABLE_PREFIX = "hestia:unpriceable:"
++
++
++def resolved_targets_for_claim(targets, complete=True):
++    """The resolved targets as they ride a claim: a list, possibly empty.
++
++    Each is whitespace-collapsed and tail-capped (the governed filename sits at the END of a
++    path, so a cap cuts the head). A path that is ITSELF credential-shaped is not copied onto the
++    witness chain — but it is not DROPPED either: it becomes the `credential-path` sentinel,
++    which the daemon prices at the highest bar. Redaction of the act summary does not touch
++    these: they are paths the gate itself resolved, carried independently of the summary. More
++    than MAX_RESOLVED_TARGETS, or a write set the gate could not enumerate (`complete=False`),
++    adds an `overflow` / `unenumerated` sentinel — again the highest bar, never a silent cut."""
++    out = []
++    overflow = False
++    for target in targets or ():
++        if not isinstance(target, str):
++            t = UNPRICEABLE_PREFIX + "malformed"
++        else:
++            t = " ".join(target.split())
++            if not t:
++                continue
++            t = UNPRICEABLE_PREFIX + "credential-path" if credential_shaped(t) else t[-RESOLVED_TARGET_MAX:]
++        if t in out:
++            continue
++        if len(out) >= MAX_RESOLVED_TARGETS:
++            overflow = True
++            continue
++        out.append(t)
++    if overflow:
++        out.append(UNPRICEABLE_PREFIX + "overflow")
++    if not complete:
++        out.append(UNPRICEABLE_PREFIX + "unenumerated")
++    return out
+ 
+ 
+ def claim_self_write(marker, tool_name, attempted, *,
+                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
+-                     supersession=None):
++                     supersession=None, deadline=None, resolved_targets=None,
++                     resolved_targets_complete=True):
+     """Ask ONCE whether a human has already approved this exact (member, marker) write.
+     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
+ 
+@@ -1425,7 +1563,19 @@
+     decides out of band; the member RE-ISSUES the write and the second attempt claims the
+     approval. Every failure — unreachable, malformed, a daemon with no escalation channel —
+     is a refusal: a daemon that cannot answer must not be a way to get a governance write
+-    through."""
++    through.
++
++    `resolved_targets` (#810; recut of #812, kimi-code) are the act's concrete targets — on the
++    live path EVERY write-position argument the closure resolved (`write_verdicts`), never
++    payload text, not only the first. The daemon prices the escalation's bar over the marker,
++    the act and every target, highest wins (core `gate_escalation::price`), so they can only
++    strengthen the bar; and it will not spend an approval granted under a lower bar than the
++    act now prices. They matter because `attempted` is a bounded, self-censoring summary that
++    can cut a filename out — and redacting that summary never drops them (see
++    `resolved_targets_for_claim`). `resolved_targets_complete=False` says the gate could not
++    enumerate the write set; the daemon then prices the highest bar. Not part of the request
++    key: they are derived from the same act. Old daemons ignore the key; callers that omit
++    it price exactly as before."""
+     claim_args = {
+         "plugin_id": plugin_id,
+         "role": role,
+@@ -1459,9 +1609,12 @@
+     # this spend, which only costs a lost answer a fresh petition.
+     if supersession:
+         claim_args["supersession"] = supersession
++    rts = resolved_targets_for_claim(resolved_targets, resolved_targets_complete)
++    if rts:
++        claim_args["resolved_targets"] = rts
+     r = gate_self_call("hestia_gate_escalation_claim", claim_args,
+                        plugin_id=plugin_id, role=role, client_name=client_name,
+-                       host_session_id=host_session_id)
++                       host_session_id=host_session_id, deadline=deadline)
+     if not isinstance(r, dict):
+         # A TIMEOUT IS AN UNKNOWN OUTCOME, NOT "NOTHING HAPPENED" (#1166): the daemon may have
+         # opened, matched or spent after the call's budget passed. Refuse, and say how to recover.
+@@ -1692,8 +1845,11 @@
+     return "not_opened", str(why), None
+ 
+ 
+-def tally_scope(allowed, *, tally_dir, tally_path, attest_every, plugin_id, role_lct):
+-    """Count this decision; emit an attestation when the window closes."""
++def tally_scope(allowed, *, tally_dir, tally_path, attest_every, plugin_id, role_lct,
++                deadline=None):
++    """Count this decision; emit an attestation when the window closes. `deadline` (stage C)
++    bounds the attestation's requests; an attestation that cannot finish in time keeps the
++    window open (the count is not reset), so the next invocation attests it."""
+     try:
+         os.makedirs(tally_dir, exist_ok=True)
+         try:
+@@ -1702,9 +1858,12 @@
+             t = {"allows": 0, "denies": 0}
+         t["allows" if allowed else "denies"] += 1
+         if t["allows"] + t["denies"] >= attest_every:
+-            emit_attestation(t["allows"], t["denies"],
+-                             plugin_id=plugin_id, role_lct=role_lct)
+-            t = {"allows": 0, "denies": 0}
++            try:
++                emit_attestation(t["allows"], t["denies"],
++                                 plugin_id=plugin_id, role_lct=role_lct, deadline=deadline)
++                t = {"allows": 0, "denies": 0}
++            except TimeoutError:
++                pass   # out of time: keep the window and its counts for the next invocation
+         json.dump(t, open(tally_path, "w"))
+     except Exception:
+         pass  # accounting must never change a decision
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -1,20 +1,21 @@
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+-One-gate stage B (docs/one-gate-convergence-plan.md §3). ADDITIVE AND UNWIRED: no seat calls
+-this module yet, and it is not in RUNTIME_MANIFEST.txt, so the installer does not deploy it.
+-Stage C replaces each seat's gate with the certified template, whose `main` calls `decide()`.
+-
+-A harness shim translates syntax into a GateEvent, calls `decide()`, and renders the
+-GateDecision in its harness's blocking protocol. It does not sequence governance. Everything
+-law-bearing is here, in ONE sequence, in this order:
+-
++One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
++hook (claude-code, codex, kimi: `hooks/pre_tool_use.py`; gemini: `hooks/before_tool.py`) is the
++certified template (`plugins/_template/shim_template.py`): it translates its harness's event into
++a GateEvent, asks `harness_bound()` for the deadline its harness's REAL registered timeout allows,
++calls `decide()`, and renders the GateDecision in its harness's blocking protocol. It does not
++sequence governance. Everything law-bearing is here, in ONE sequence, in this order:
++
++   0. launch     the seat's launch role against the roles its vault projection permits (#1084);
+    1. closure    the governance closure: a read is witnessed; a write needs a human approval
+                  claimed with this call's invocation key, else `gate.self_access` (innate);
+    2. egress     innate `egress.secret` over the egress surfaces the core's paths/command do
+                  not cover (web-tool urls/prompts/queries, the MCP transport context);
+    3. snapshot   the policy snapshot; with none, every act is DENIED (gate.degraded), reads
+                  included, in EVERY rollout mode — an integrity precondition, not a policy view;
+-   4. law        `core.evaluate` (innate denies always; tunable denies follow the rollout);
++   4. law        `core.evaluate`, plus command scope over the MCP transport context (innate
++                 denies always; tunable denies follow the rollout);
+    5. society    `mechanism.query_society_safety(..., correlation_key=KEY)` for EVERY act, reads
+                  included (dp 2026-10-01: align upward to claude-code's posture) — the ONLY
+                  writer of the action cache (C13). A superseded invocation, and a society
+@@ -26,29 +27,27 @@
+ 
+ THREE INVARIANTS, each tested in tools/one_gate_decide_contract_test.py:
+ 
+-ONE DEADLINE, THE CALLER'S. `decide()` runs inside ONE absolute deadline supplied by its caller
+-(`deadline=` absolute monotonic, or `budget_seconds=`); with neither, DEFAULT_DEADLINE_SECONDS.
+-The harness timeout behind it is the shim's fact, not the gate's (stage C). The phases (gate-self, snapshot,
+-society) must finish by `deadline - WITNESS_RESERVE_SECONDS`, so the final record keeps its own
+-slice of the same deadline; `record_decision` takes the deadline itself (stage A). A phase that
+-does not answer in time is a no-verdict, which fails closed.
+-
+-STAGE B'S DEADLINE IS COARSE, ON PURPOSE. B does not touch the deployed mechanism (dp,
+-2026-10-01: B must stay approvable without the sovereign bar), so `query_society_safety`,
+-`fetch_policy_snapshot` and the gate-self calls still mint their own budgets. `decide()` bounds
+-them from OUTSIDE: each runs in a daemon thread that is waited on only for the time the
+-invocation has left (`_bounded`), and a call that has not returned by then is abandoned and
+-read as a no-verdict. The harness sees the bound; the daemon may still see the abandoned request
+-arrive late (a begin_action recorded, a snapshot fetched for nobody). Stage C threads an
+-explicit `deadline=` through those helpers so that no request STARTS after the deadline, and
+-`_bounded` becomes a belt (plan §4).
++ONE DEADLINE, THE SHIM'S, ALWAYS BELOW THE HARNESS'S. A seat's shim passes `bound=` (from
++`harness_bound()`): the deadline is the hook process's start plus the timeout its harness
++ACTUALLY enforces, read from the live registration, minus the harness's declared margin — never
++a default or a template (dp 2026-10-02, the safety invariant). So whatever the registration
++says, `decide()` finishes — and fails CLOSED on a slow or cold daemon — before the harness can
++kill the hook and fail OPEN. A registration that cannot be read is `gate.harness_timeout_unknown`,
++denied at once and without a daemon round trip: with no known bound, any wait could outlive the
++harness. A caller that is not a seat (a test, a probe) may pass `deadline=`/`budget_seconds=`;
++with neither, DEFAULT_DEADLINE_SECONDS. The phases (gate-self, snapshot, society) must finish by
++`deadline - WITNESS_RESERVE_SECONDS`, so the final record keeps its own slice of the same deadline.
++
++THE DEADLINE IS THREADED, AND STILL BELTED. Since stage C every mechanism helper takes the
++deadline itself (`deadline=`), so no request STARTS after it. Each call still runs in a daemon
++thread waited on only for what the invocation has left (`_bounded`): a belt, so a helper that
++overruns its own bound cannot hold the hook past the harness's timeout.
+ 
+ COLD START. A daemon's first act after start, and a never-seen member's first connect, cost
+-~4.6-5.1 s (measured). The default 8 s absorbs one such leg; the deployed mechanism's 5 s
+-per-request cap can still fail a single request that is slower, and that is a no-verdict deny
+-inside the deadline, never a hang. Stage C warms the daemon for every member before the cutover
+-(~/.hestia/daemon-warmup.sh already does this as ExecStartPost) and must keep that warm-up
+-covering every registered member id.
++~4.6-5.1 s (measured). A registration of at least 10 s (every template) absorbs one such leg
++inside the margin; `deploy/daemon-warmup.sh` warms every rostered member at daemon start, so
++most cold connects are paid there. A shorter registration costs availability (a cold connect
++becomes a recorded no-verdict deny), never safety.
+ 
+ ONE KEY. `correlation_key(event.raw)` is computed ONCE, from the RAW harness event (C13): a
+ normalized event loses gemini's `source_event` and kimi's `tool_call_id`. The same key goes to
+@@ -66,6 +65,7 @@
+ import json
+ import os
+ import re
++import shlex
+ import threading
+ import time
+ from dataclasses import dataclass, field, replace
+@@ -75,47 +75,41 @@
+ import hestia_gate_mechanism as mechanism
+ import hestia_governance_closure as closure
+ 
+-GATE_API_VERSION = "decide/1"
++#: decide/2 (stage C): `decide(..., bound=, permitted_roles=)`, `harness_bound()` and `render()`
++#: are the shim contract. The template's REQUIRED_GATE_API must equal this.
++GATE_API_VERSION = "decide/2"
+ 
+ # ── THE DEADLINE IS THE CALLER'S ────────────────────────────────────────────────────────────
+ # dp, 2026-10-01: "one gate is law. shims are there to match the interface to peculiarities of
+ # each harness, timeouts being prime example." How long a harness waits for its hook, and what
+-# it does when the wait runs out, is a harness fact: each seat's shim declares its registered
+-# timeout and passes `deadline = harness_timeout - margin` (stage C registration contract, plan
+-# §4). decide() runs every leg, plus the record's reserve, inside whatever deadline it is given,
+-# and fails closed when it runs out. It does not defend against a harness that kills it early:
+-# that is the registration's job, sized against measured daemon latency.
++# it does when the wait runs out, is a harness fact: each seat's shim declares where its harness
++# records the registered timeout (its HARNESS data) and `harness_bound()` reads the real value.
+ #
+-# DEFAULT_DEADLINE_SECONDS is a DEFAULT for a caller that passes nothing, not law: the deployed
+-# mechanism's 4000 ms x (1 try + 1 retry), taken as the total across every leg. Measured basis
+-# (isolated daemon from this head, 2026-10-01): warm society-safety p99 39 ms (n=40), p99 156 ms
+-# under 2x CPU oversubscription (n=30); a never-seen member's first act 4.6-4.8 s (n=8), 5.0 s
+-# under load (n=5); a cold daemon's first act 5.1 s (n=1). 8 s absorbs one cold connect.
++# DEFAULT_DEADLINE_SECONDS is a DEFAULT for a caller that passes nothing (a test, a probe), not
++# law, and NEVER what a seat runs on: a seat always passes `bound=`. Measured basis (isolated
++# daemon, 2026-10-01): warm society-safety p99 39 ms (n=40), p99 156 ms under 2x CPU
++# oversubscription (n=30); a never-seen member's first act 4.6-4.8 s (n=8), 5.0 s under load
++# (n=5); a cold daemon's first act 5.1 s (n=1). 8 s absorbs one cold connect.
+ DEFAULT_DEADLINE_SECONDS = 8.0
+ #: The tail of the deadline kept for the final decision record (warm record ~10 ms), at most a
+ #: quarter of a short budget. A cold daemon's stall was measured to swallow a 0.5 s reserve.
+ WITNESS_RESERVE_SECONDS = 1.0
+-
+-#: The rollout knob. ONE name for every seat (the per-seat HESTIA_<SEAT>_GATE_MODE names are
+-#: stage C's projection work). Anything other than exactly "warn" is enforce: an unreadable
+-#: rollout fails tight.
++#: The declaration a NON-harness invoker (the deploy preflight, a test) makes of the timeout it
++#: enforces on this process. A harness invocation is bounded by its registration; when both are
++#: known the smaller wins, so this can only shorten a registered bound.
++HOOK_TIMEOUT_ENV = "HESTIA_HOOK_TIMEOUT_S"
++
++#: The rollout knob. ONE name for every seat, projected per seat by the vault as
++#: `<SEAT_TOKEN>__HESTIA_GATE_MODE` (the per-seat HESTIA_<SEAT>_GATE_MODE names are retired).
++#: Anything other than exactly "warn" is enforce: an unreadable rollout fails tight.
+ ROLLOUT_ENV = "HESTIA_GATE_MODE"
+ ROLLOUTS = ("enforce", "warn")
+ 
+-#: Rules this module mints that the core's REMEDIES table does not carry. Rendered from here,
+-#: never at a call site; stage C may move them into the core table.
+-GATE_REMEDIES = {
+-    "invocation.superseded": (
+-        "This call's approval was re-delivered to another invocation of the same act. Do not "
+-        "retry this call; the invocation that reclaimed the approval carries it."),
+-    "gate.evidence_uncommitted": (
+-        "The gate reached a permit but could not commit its decision record before the "
+-        "deadline, and a consequential act may not run unwitnessed (C11). This is not a "
+-        "judgement of the act: retry once the daemon's witness path is answering."),
+-    "gate.internal_error": (
+-        "This is an infrastructure fault in the gate, not a judgement of the attempted act. "
+-        "The gate fails closed until the decision path is healthy; please report it."),
+-}
++
++def _remedy(rule: str) -> str:
++    """The one remedy table is the core's (stage C moved this module's own entries there)."""
++    r = core.REMEDIES.get(rule)
++    return r.text if r is not None else core.UNREGISTERED_RULE_REMEDY
+ 
+ 
+ @dataclass(frozen=True)
+@@ -123,7 +117,7 @@
+     """Harness facts only. No law and no enforcement posture belongs here."""
+ 
+     member_id: str
+-    identity_path: str
++    identity_path: Optional[str]
+     home_markers: tuple = ()
+     launch_cwd_env: str = ""
+     workspace_env: str = "HESTIA_WORKSPACE"
+@@ -132,7 +126,7 @@
+     host_agent: str = ""
+     client_name: str = ""
+     gate_path: str = ""
+-    observe_dir: str = ""
++    observe_dir: Optional[str] = ""
+     attest_every: int = 200
+     #: Harness capability, not law: only a seat that holds the review effector says so (#1050).
+     declares_review_door: bool = False
+@@ -140,7 +134,7 @@
+     def core_profile(self) -> core.HarnessProfile:
+         return core.HarnessProfile(
+             member_id=self.member_id,
+-            identity_path=self.identity_path,
++            identity_path=self.identity_path or "",
+             home_markers=tuple(m for m in self.home_markers if m),
+             launch_cwd_env=self.launch_cwd_env,
+             mode_env="",   # the rollout is read here, once, never per seat
+@@ -189,6 +183,197 @@
+         return self.decision == "deny"
+ 
+ 
++# ── the harness bound: the deadline the REAL registered timeout allows ───────────────────────
++
++@dataclass(frozen=True)
++class HarnessBound:
++    """What a seat's registration lets this invocation spend. `deadline` is None when the
++    enforced timeout could not be established; `decide()` then refuses without waiting."""
++
++    deadline: Optional[float]             # absolute time.monotonic(); start + timeout - margin
++    timeout_seconds: Optional[float]      # the smallest timeout found for this hook
++    margin_seconds: float
++    on_timeout: str                       # what the harness does when the timeout expires
++    sources: tuple = ()                   # where each timeout came from, for the record
++    why: str = ""                         # why the bound is unknown, when it is
++
++
++_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
++
++
++def _expand(text: str, env, cwd: Optional[str]) -> Optional[str]:
++    """`${VAR:-default}`, `${VAR}`, `$VAR`, `~` and `{cwd}`. None when a variable with no default
++    is unset (that registration source does not exist for this process)."""
++    missing = []
++
++    def sub(m):
++        name, default, bare = m.group(1), m.group(2), m.group(3)
++        value = env.get(name or bare)
++        if value:
++            return value
++        if default is not None:
++            return default
++        missing.append(name or bare)
++        return ""
++
++    if "{cwd}" in text:
++        if not cwd:
++            return None
++        text = text.replace("{cwd}", cwd)
++    out = _VAR.sub(sub, text)
++    if missing:
++        return None
++    if out == "~" or out.startswith("~/"):
++        home = env.get("HOME")
++        if not home:
++            return None
++        out = home + out[1:]
++    return out
++
++
++def _command_targets(command: str, env) -> list:
++    """Every absolute path a hook command names, expanded the way the harness's shell would."""
++    try:
++        tokens = shlex.split(command)
++    except ValueError:
++        tokens = command.split()
++    out = []
++    for tok in tokens:
++        if "=" in tok and not tok.startswith(("/", "~", "$")):
++            continue                       # an environment assignment, not the program
++        t = _expand(tok, env, None)
++        if t and os.path.isabs(t):
++            out.append(t)
++    return out
++
++
++def _hook_entries(doc: Any, reader: str, layout: str, event: str) -> list:
++    """[(command, timeout-or-None)] for every hook registered on `event` in a parsed config."""
++    out = []
++    hooks = doc.get("hooks") if isinstance(doc, dict) else None
++    if layout == "flat":
++        for tbl in hooks if isinstance(hooks, list) else []:
++            if isinstance(tbl, dict) and tbl.get("event") == event and isinstance(tbl.get("command"), str):
++                out.append((tbl["command"], tbl.get("timeout")))
++        return out
++    groups = hooks.get(event) if isinstance(hooks, dict) else None
++    for group in groups if isinstance(groups, list) else []:
++        for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
++            if isinstance(h, dict) and isinstance(h.get("command"), str):
++                out.append((h["command"], h.get("timeout")))
++    return out
++
++
++def _load_config(path: str, reader: str):
++    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan")."""
++    with open(path, "rb") as fh:
++        raw = fh.read()
++    if reader == "json-hook-commands":
++        return json.loads(raw.decode("utf-8")), None
++    try:
++        import tomllib  # type: ignore
++    except ImportError:
++        return None, "scan"
++    return tomllib.loads(raw.decode("utf-8")), None
++
++
++def _scan_timeouts(path: str, base: str) -> Optional[list]:
++    """No TOML parser: every `timeout = N` in a file that names this hook at all. Conservative —
++    the smallest of them can only shorten the bound. None when the file does not name the hook."""
++    with open(path, encoding="utf-8", errors="replace") as fh:
++        text = fh.read()
++    if base not in text:
++        return None
++    return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
++
++
++def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
++                  env=None) -> HarnessBound:
++    """The deadline the harness's REAL registered timeout allows this hook process. NEVER raises.
++
++    `harness` is the shim's HARNESS data: where this harness records its hooks (`registrations`:
++    reader, layout, path with `~`/`${VAR:-default}`/`{cwd}`), the hook `event`, the timeout's
++    unit, the harness's own default when an entry omits it (None when unknown), `on_timeout`
++    and `margin_seconds`. Every registration of THIS file on the event counts (its realpath, or
++    failing any such match its basename), from every source that exists, and the SMALLEST
++    timeout wins: a smaller bound costs availability, never safety. A non-harness invoker's
++    HESTIA_HOOK_TIMEOUT_S joins the same minimum.
++
++    Returns `HarnessBound(deadline=start + timeout - margin, ...)`, or `deadline=None` with the
++    reason when no enforced timeout could be established."""
++    env = os.environ if env is None else env
++    margin = float(harness.get("margin_seconds") or 0.0)
++    on_timeout = str(harness.get("on_timeout") or "unknown")
++    try:
++        unit = float(harness.get("timeout_unit_seconds") or 1.0)
++        default = harness.get("default_timeout_seconds")
++        event = harness.get("event") or ""
++        me = os.path.realpath(self_path)
++        base = os.path.basename(me)
++        exact, by_name, sources, problems = [], [], [], []
++        for reg in harness.get("registrations") or ():
++            path = _expand(str(reg.get("path") or ""), env, cwd)
++            if not path or not os.path.isfile(path):
++                continue
++            reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
++            try:
++                doc, how = _load_config(path, reader)
++            except Exception as exc:  # noqa: BLE001 — an unreadable registration is no bound
++                problems.append(f"{path}: unreadable ({type(exc).__name__})")
++                continue
++            if how == "scan":
++                values = _scan_timeouts(path, base)
++                if values is None:
++                    continue
++                if not values and default is None:
++                    problems.append(f"{path}: names this hook but no timeout could be read")
++                    continue
++                vals = [v * unit for v in values] + ([float(default)] if default is not None else [])
++                by_name.append((min(vals), f"{path} (line scan, smallest timeout in the file)"))
++                continue
++            for command, timeout in _hook_entries(doc, reader, layout, event):
++                targets = _command_targets(command, env)
++                hit_exact = any(os.path.realpath(t) == me for t in targets)
++                hit_name = hit_exact or any(os.path.basename(t) == base for t in targets)
++                if not hit_name:
++                    continue
++                if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
++                    seconds = float(timeout) * unit
++                    where = f"{path}: timeout {timeout}"
++                elif default is not None:
++                    seconds = float(default)
++                    where = f"{path}: no timeout declared, harness default {default}s"
++                else:
++                    problems.append(f"{path}: registers this hook with no timeout, and this "
++                                    f"harness's default is not known")
++                    continue
++                (exact if hit_exact else by_name).append((seconds, where))
++        found = exact or by_name
++        declared = env.get(HOOK_TIMEOUT_ENV)
++        if declared:
++            try:
++                d = float(declared)
++                if d > 0:
++                    found = found + [(d, f"{HOOK_TIMEOUT_ENV}={declared} (the invoker's declaration)")]
++            except ValueError:
++                problems.append(f"{HOOK_TIMEOUT_ENV}={declared!r} is not a number")
++        if problems and not exact:
++            # A registration of this hook we could not read may carry the smaller timeout.
++            return HarnessBound(None, None, margin, on_timeout, tuple(w for _, w in found),
++                                "; ".join(problems))
++        if not found:
++            return HarnessBound(None, None, margin, on_timeout, (),
++                                f"no registration of {base} on {event or 'its event'} was found "
++                                f"in this harness's configuration, and no {HOOK_TIMEOUT_ENV} was "
++                                f"declared")
++        timeout = min(s for s, _ in found)
++        sources.extend(w for _, w in found)
++        return HarnessBound(start + timeout - margin, timeout, margin, on_timeout, tuple(sources))
++    except Exception as exc:  # noqa: BLE001 — a reader that breaks establishes nothing
++        return HarnessBound(None, None, margin, on_timeout, (),
++                            f"the registration reader failed ({type(exc).__name__}: {exc})")
++
++
+ # ── invocation context ───────────────────────────────────────────────────────────────────────
+ 
+ @dataclass
+@@ -226,7 +411,8 @@
+ 
+     Returns the call's value, or `_LATE` when there was no time to start it or it had not
+     returned by `end`. A call that raises re-raises here. The worker is a daemon thread, so an
+-    abandoned call never holds the hook process open (see "coarse" in the module docstring)."""
++    abandoned call never holds the hook process open. Since stage C the mechanism takes the
++    deadline itself; this is the belt."""
+     remaining = end - time.monotonic()
+     if remaining <= 0:
+         return _LATE
+@@ -337,17 +523,26 @@
+     return out
+ 
+ 
+-def attempted_of(event: GateEvent, limit: int = 400) -> str:
+-    """The bounded, credential-masked WHAT behind a verdict (the mechanism's one masker)."""
++def mcp_transport_reach(event: GateEvent) -> list:
++    """The MCP transport's LOCAL reach: its server `command`, every `args` leaf and its `cwd`.
++    An out-of-scope root handed to a filesystem server is an out-of-scope read the file gates
++    never see (gemini's Gate 1b scoped these since 2026-07-22; C10 makes it every seat's law).
++    The server `url` is a network endpoint, egress-checked only, never command-scoped."""
+     ti = event.tool_input if isinstance(event.tool_input, dict) else {}
+-    raw: Any = _command_text(ti) or ti.get("file_path") or ti.get("path") or ""
+-    if not raw and ti:
+-        try:
+-            raw = json.dumps(ti, sort_keys=True, default=str)
+-        except Exception:  # noqa: BLE001
+-            raw = str(ti)
+-    text = mechanism._mask_credential_values(" ".join(str(raw).split()))
+-    return text[:limit] + ("...[truncated]" if len(text) > limit else "")
++    ctx = ti.get("_hestia_mcp_context")
++    if not isinstance(ctx, dict):
++        return []
++    return [s for key in ("command", "args", "cwd") for s in _leaves(ctx.get(key)) if s.strip()]
++
++
++def attempted_of(event: GateEvent) -> str:
++    """The bounded, self-censoring WHAT behind a verdict, for every seat: the mechanism's one
++    summary (`attempted_summary`), fed this module's harness-normalised command text and any
++    patch-body targets. Since stage C every seat holds the claude-code seat's #185 rule."""
++    ti = event.tool_input
++    return mechanism.attempted_summary(
++        event.tool, ti, command=_command_text(ti) if isinstance(ti, dict) else None,
++        targets=_patch_targets(event.tool, ti))
+ 
+ 
+ def _target(event: GateEvent) -> Optional[str]:
+@@ -396,10 +591,11 @@
+         tally_dir = os.path.expanduser(observe)
+         # Accounting, bounded by the same deadline: once per window it attests over the wire.
+         _bounded(inv.deadline, mechanism.tally_scope, allowed, tally_dir=tally_dir,
+-                              tally_path=os.path.join(tally_dir, "scope-tally.json"),
+-                              attest_every=inv.profile.attest_every,
+-                              plugin_id=inv.profile.member_id,
+-                              role_lct=inv.role or _role(inv))
++                 tally_path=os.path.join(tally_dir, "scope-tally.json"),
++                 attest_every=inv.profile.attest_every,
++                 plugin_id=inv.profile.member_id,
++                 role_lct=inv.role or _role(inv),
++                 deadline=inv.deadline)
+     except Exception:  # noqa: BLE001 — accounting never changes a decision
+         pass
+ 
+@@ -418,7 +614,7 @@
+             d, decision="deny", rule="gate.evidence_uncommitted",
+             reason=(f"the gate reached '{d.decision}' ({d.rule}) but its decision record did not "
+                     f"commit before the deadline ({receipt.status}: {receipt.detail})"),
+-            remedy=GATE_REMEDIES["gate.evidence_uncommitted"],
++            remedy=_remedy("gate.evidence_uncommitted"),
+             verdict_available=False, anomaly=True, innate=True,
+             supersedes_uncommitted=d.decision)
+         second = _record(inv, denied, attempted=(
+@@ -458,12 +654,41 @@
+ 
+ # ── the sequence ─────────────────────────────────────────────────────────────────────────────
+ 
+-def _closure_view(event: GateEvent):
+-    """The closure classifier's verdict on this act. Tool-shape adaptation only: a lowercase
+-    shell tool or an argv list is the Bash form; an apply_patch is one Write per target."""
++def _launch_role(inv: _Invocation, permitted: str) -> Optional[GateDecision]:
++    """Step 0 (#1084, dp 2026-09-22: "all law goes into shared engine"): the role this seat was
++    launched under against the roles its vault projection permits. The shim's projection loader
++    keeps the permitted set aside, unjudged, and hands it here. No declared set: nothing to check."""
++    if not str(permitted or "").strip():
++        return None
++    miswire, _verified = core.launch_role_verdict(
++        permitted, os.environ.get("HESTIA_ROLE", ""),
++        f"projection {os.environ.get('HESTIA_PROJECTION_PATH', '')}")
++    if miswire is None:
++        return None
++    rule, why = miswire
++    return GateDecision("deny", rule, why, _remedy(rule), verdict_available=False,
++                        innate=True, anomaly=True)
++
++
++def _closure_shape(event: GateEvent):
++    """(tool, tool_input, patch_targets, is_patch): the tool-shape adaptation both closure reads
++    share. A lowercase shell tool or an argv list is the Bash form; an apply_patch is one Write
++    per target."""
+     tool, ti = event.tool, event.tool_input if isinstance(event.tool_input, dict) else {}
+     targets = _patch_targets(tool, ti)
+     if targets or (isinstance(tool, str) and tool.lower() == "apply_patch"):
++        return tool, ti, targets, True
++    if _shell_tool(tool) and tool not in ("Bash", "Shell"):
++        tool = "Bash"
++    if _shell_tool(tool) and not isinstance(ti.get("command"), str):
++        ti = dict(ti, command=_command_text(ti) or "")
++    return tool, ti, targets, False
++
++
++def _closure_view(event: GateEvent):
++    """The closure classifier's verdict on this act (the first governed target decides)."""
++    tool, ti, targets, is_patch = _closure_shape(event)
++    if is_patch:
+         found = None
+         for p in targets:
+             cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd)
+@@ -472,11 +697,39 @@
+             if cv.classification == "read" and found is None:
+                 found = cv
+         return found
+-    if _shell_tool(tool) and tool not in ("Bash", "Shell"):
+-        tool = "Bash"
+-    if _shell_tool(tool) and not isinstance(ti.get("command"), str):
+-        ti = dict(ti, command=_command_text(ti) or "")
+     return closure.classify(tool, ti, cwd=event.cwd)
++
++
++def _closure_write_set(event: GateEvent):
++    """(targets, complete): EVERY governed write-position path this act resolves into the
++    closure, in order — not only the first, which is all `_closure_view` reports (Codex review
++    of #1239, P1-2: a later sovereign target beyond the bounded summary priced as nothing).
++    Each target rides with the other spellings the closure matched it by (cwd-joined,
++    realpath'd), so an alias carries its destination (Codex review of #1239, P1-2).
++    `complete` is False when the write set could not be enumerated: an opaque writer, an
++    internal error, no target named, a command outside the grammar or unparseable (its
++    targets are vocabulary that matched, not resolved write positions: `$TARGET` names no
++    file), or a relative target with no cwd to resolve it against (P1-1). The daemon then
++    prices the highest bar; the targets that are known still ride. Never raises."""
++    try:
++        tool, ti, targets, is_patch = _closure_shape(event)
++        if is_patch:
++            verdicts = [v for p in targets
++                        for v in closure.write_verdicts("Write", {"file_path": p}, cwd=event.cwd)]
++        else:
++            verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd)
++        resolved = []
++        for v in verdicts:
++            if v.marker and v.resource:
++                resolved.append(v.resource)
++                resolved.extend(getattr(v, "resolved", ()))
++        complete = bool(resolved) and all(
++            v.marker and v.rule == closure.RULE_WRITE
++            and (os.path.isabs(v.resource) or getattr(v, "resolved", ()))
++            for v in verdicts)
++        return resolved, complete
++    except Exception:  # noqa: BLE001 — unenumerated is priced highest, never lowest
++        return [], False
+ 
+ 
+ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
+@@ -491,19 +744,29 @@
+             _bounded(inv.phase_deadline, mechanism.witness_gate_self,
+                      "gate_self_read", marker, ev.tool, cv.rule, plugin_id=prof.member_id,
+                      role=_role(inv), gate_path=prof.gate_path or "",
+-                     client_name=_client_name(prof), host_session_id=ev.session_id)
++                     client_name=_client_name(prof), host_session_id=ev.session_id,
++                     deadline=inv.phase_deadline)
+         except Exception:  # noqa: BLE001
+             pass
+         return None
++    write_set = _closure_write_set(ev)
+     try:
+         claimed = _bounded(
+             inv.phase_deadline, mechanism.claim_self_write,
+             marker, ev.tool, inv.attempted, plugin_id=prof.member_id, role=_role(inv),
+             client_name=_client_name(prof), host_session_id=ev.session_id,
+             invocation_key=inv.key,
+-            # THIS module stops a superseded invocation in every rollout mode (step 6), so it
++            # THIS module stops a superseded invocation in every rollout mode (step 5), so it
+             # may make the declaration that lets the daemon reclaim a lost answer (#1169).
+-            supersession=mechanism.SUPERSESSION_HARD_STOP)
++            supersession=mechanism.SUPERSESSION_HARD_STOP,
++            deadline=inv.phase_deadline,
++            # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
++            # path the closure resolved, not only the one `cv` reports. The daemon prices the bar
++            # over the marker, the act and all of them, highest wins — `inv.attempted` is a
++            # bounded, self-censoring summary that can cut a filename out (or withhold the whole
++            # command); these are carried independently of it. An unenumerable write set is
++            # said as such, and priced highest.
++            resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
+         if claimed is _LATE:
+             # Unknown, not "nothing happened": the daemon may have opened or matched an
+             # escalation after the bound (#1166). Re-issuing the identical act is safe.
+@@ -520,7 +783,8 @@
+         _bounded(inv.phase_deadline, mechanism.witness_gate_self,
+                  "gate_self_access", marker, ev.tool, cv.rule, plugin_id=prof.member_id,
+                  role=_role(inv), gate_path=prof.gate_path or "",
+-                 client_name=_client_name(prof), host_session_id=ev.session_id)
++                 client_name=_client_name(prof), host_session_id=ev.session_id,
++                 deadline=inv.phase_deadline)
+     except Exception:  # noqa: BLE001
+         pass
+     esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); re-issue the "
+@@ -554,7 +818,8 @@
+             inv.phase_deadline, mechanism.fetch_policy_snapshot,
+             prof.member_id, host_agent=prof.host_agent or prof.member_id,
+             host_session_id=inv.event.session_id,
+-            declares_review_door=prof.declares_review_door)
++            declares_review_door=prof.declares_review_door,
++            deadline=inv.phase_deadline)
+     except Exception:  # noqa: BLE001 — an unusable mechanism is an unreachable daemon
+         snapshot = None
+     if snapshot is _LATE or not isinstance(snapshot, dict):
+@@ -563,23 +828,34 @@
+         role = snapshot.get("role") if isinstance(snapshot, dict) else None
+         inv.role = _role(inv, role if isinstance(role, str) else None)
+         policy = core.resolve_agent_policy(cprofile, vault_reader=lambda _member: snapshot)
+-        v = core.evaluate(nev, cprofile, core.detect_workspace(cprofile), policy=policy)
+-        if v.blocks:
+-            # The rollout softens a TUNABLE policy disagreement, and only when there IS a policy.
+-            if v.innate or inv.rollout == "enforce":
+-                if v.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(v, "target", ""):
+-                    return _scope_escalation(inv, nev, cprofile, policy, v), False
+-                return _verdict_deny(v), False
+-            inv.warnings.append((v.rule, v.reason, True))
++        workspace = core.detect_workspace(cprofile)
++        # The act itself, then each piece of the MCP transport's local reach as a command of
++        # its own (C10: gemini's MCP command scoping, now every seat's). Same law, same order.
++        views = [nev] + [core.NormalizedEvent(tool=nev.tool, command=s, cwd=nev.cwd, raw=nev.raw)
++                         for s in mcp_transport_reach(inv.event)]
++        for i, view in enumerate(views):
++            v = core.evaluate(view, cprofile, workspace, policy=policy)
++            if v.blocks:
++                # The rollout softens a TUNABLE policy disagreement, and only when there IS a policy.
++                if v.innate or inv.rollout == "enforce":
++                    # A scope refusal of the ACT ITSELF is an escalation (#1232): a request a
++                    # NOT-SAME peer rules. The MCP transport's own reach (views[1:]) is operator
++                    # configuration, not an act a peer could rule on, and stays a plain refusal.
++                    if i == 0 and v.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(v, "target", ""):
++                        d = _scope_escalation(inv, nev, cprofile, policy, v)
++                        if d is not None:
++                            return d, False
++                        continue
++                    return _verdict_deny(v), False
++                inv.warnings.append((v.rule, v.reason, True))
+         return None, False
+     # NO SNAPSHOT, NO PERMIT — in EVERY rollout mode, for EVERY act class (dp 2026-10-01, "align
+     # upward; no snapshot -> no read"). Without the member's policy snapshot the gate cannot
+-    # certify scope, so the act is denied, reads included, as claude-code does today. This is an
+-    # infrastructure INTEGRITY precondition, not a policy opinion, so the rollout does not soften
+-    # it — the same posture as invocation supersession and C11 (GPT, 57bcd10 re-review: warn
+-    # rollout used to evaluate against an empty scope and let the act continue with warnings).
+-    # The core's degraded verdict still runs first so an innate egress refusal keeps its own rule
+-    # (and counts as conduct); everything else is the infrastructure denial.
++    # certify scope, so the act is denied, reads included, as claude-code did before stage C.
++    # This is an infrastructure INTEGRITY precondition, not a policy opinion, so the rollout does
++    # not soften it — the same posture as invocation supersession and C11 (GPT, 57bcd10
++    # re-review). The core's degraded verdict still runs first so an innate egress refusal keeps
++    # its own rule (and counts as conduct); everything else is the infrastructure denial.
+     v = core.degraded_verdict(nev, cprofile)
+     if v.blocks and v.innate:
+         return _verdict_deny(v), True
+@@ -698,7 +974,8 @@
+             plugin_id=prof.member_id,
+             host_agent=prof.host_agent or prof.member_id,
+             host_session_id=ev.session_id,
+-            correlation_key=inv.key)   # from the RAW event, computed once (C13)
++            correlation_key=inv.key,   # from the RAW event, computed once (C13)
++            deadline=inv.phase_deadline)
+         if safety is _LATE:
+             safety = mechanism.SafetyVerdict(
+                 allow=False, decided=False, cause="timeout",
+@@ -712,14 +989,14 @@
+         # An INTEGRITY fence, not a policy verdict (#1169): a stop in EVERY rollout mode, or
+         # this call runs beside the invocation that reclaimed its approval.
+         return GateDecision("deny", "invocation.superseded", safety.message,
+-                            GATE_REMEDIES["invocation.superseded"],
++                            _remedy("invocation.superseded"),
+                             verdict_available=False, innate=True)
+     if not safety.allow:
+         if safety.decided:
+             if inv.rollout == "enforce":
+                 return GateDecision("deny", "society.safety",
+                                     safety.message or "society law refused the act",
+-                                    core.REMEDIES["society.safety"].text,
++                                    _remedy("society.safety"),
+                                     action_id=safety.action_id)
+             inv.warnings.append(("society.safety", safety.message or "society law refused the act",
+                                  True))
+@@ -729,7 +1006,7 @@
+         # rollout may soften: the same posture as the no-snapshot stop, supersession and C11.
+         return GateDecision("deny", "society.unreachable",
+                             safety.message or "no usable society-safety verdict",
+-                            core.REMEDIES["society.unreachable"].text,
++                            _remedy("society.unreachable"),
+                             verdict_available=False, anomaly=True, innate=True,
+                             action_id=safety.action_id)
+     if safety.kind == "warn":
+@@ -737,8 +1014,12 @@
+     return _permit(inv, "gate.allow", action_id=safety.action_id, message=safety.message or "")
+ 
+ 
+-def _sequence(inv: _Invocation) -> GateDecision:
++def _sequence(inv: _Invocation, permitted_roles: str) -> GateDecision:
+     cprofile = inv.profile.core_profile()
++
++    d = _launch_role(inv, permitted_roles)
++    if d is not None:
++        return _finalize(inv, d, consequential=False)
+ 
+     d = _governance_closure(inv)
+     if d is not None:
+@@ -836,17 +1117,54 @@
+     return 120
+ 
+ 
++def _unbounded(bound: HarnessBound, profile: Any, event: Any, mode: str,
++               start: float) -> GateDecision:
++    """The harness bound could not be established, or leaves no time: refuse NOW. No daemon round
++    trip and no chain record — either could outlive a harness timeout nobody knows. The local
++    availability series records it (fast, never raises)."""
++    if bound.deadline is None:
++        why = bound.why or "the enforced timeout is unknown"
++    else:
++        why = (f"the registered timeout ({bound.timeout_seconds:g}s) leaves no time inside the "
++               f"harness margin ({bound.margin_seconds:g}s)")
++    member = getattr(profile, "member_id", "unknown")
++    tool = getattr(event, "tool", "unknown")
++    try:
++        core.record_gate_unavailable(member, str(tool), "unknown",
++                                     f"gate.harness_timeout_unknown: {why}"[:200])
++    except Exception:  # noqa: BLE001
++        pass
++    return GateDecision(
++        "deny", "gate.harness_timeout_unknown",
++        f"'{tool}' was not judged: {why}. Without the timeout its harness enforces, the gate "
++        f"cannot finish before the harness kills it ({bound.on_timeout})",
++        _remedy("gate.harness_timeout_unknown"),
++        verdict_available=False, anomaly=True, innate=True, rollout=mode,
++        budget_seconds=round(max(0.0, (bound.deadline or start) - start), 3))
++
+ 
+ def decide(event: GateEvent, profile: GateProfile, *, rollout: Optional[str] = None,
+            deadline: Optional[float] = None,
+-           budget_seconds: Optional[float] = None) -> GateDecision:
++           budget_seconds: Optional[float] = None,
++           bound: Optional[HarnessBound] = None,
++           permitted_roles: str = "") -> GateDecision:
+     """The one law-bearing sequence for every harness. NEVER raises.
+ 
+-    `deadline`: an absolute `time.monotonic()` bound from the caller (the shim: its harness's
+-    registered timeout minus its margin). `budget_seconds`: the same, relative to now. With
+-    neither, DEFAULT_DEADLINE_SECONDS. Every leg and the record's reserve run inside it; when it
+-    runs out the act fails closed."""
++    `bound`: a seat's `harness_bound()` — the deadline its harness's real registered timeout
++    allows. A seat ALWAYS passes it; an unknown bound is `gate.harness_timeout_unknown`, denied
++    at once. `deadline` / `budget_seconds`: an absolute `time.monotonic()` bound / the same
++    relative to now, for a caller that is not a seat. With none of the three,
++    DEFAULT_DEADLINE_SECONDS. `permitted_roles`: the launch roles the seat's vault projection
++    permits (its loader keeps them aside, unjudged). Every leg and the record's reserve run
++    inside the deadline; when it runs out the act fails closed."""
+     start = time.monotonic()
++    mode = rollout_of(rollout)
++    if bound is not None:
++        if not isinstance(bound, HarnessBound) or bound.deadline is None or bound.deadline <= start:
++            if not isinstance(bound, HarnessBound):
++                bound = HarnessBound(None, None, 0.0, "unknown", (), "the harness bound is malformed")
++            return _unbounded(bound, profile, event, mode, start)
++        deadline = bound.deadline
+     if deadline is not None:
+         budget = max(0.0, float(deadline) - start)
+     elif budget_seconds is not None:
+@@ -854,7 +1172,6 @@
+     else:
+         budget = DEFAULT_DEADLINE_SECONDS
+     deadline = start + budget
+-    mode = rollout_of(rollout)
+     inv: Optional[_Invocation] = None
+     try:
+         if not isinstance(event, GateEvent):
+@@ -864,7 +1181,7 @@
+         inv = _Invocation(event=event, profile=profile, rollout=mode, deadline=deadline,
+                           key=mechanism.correlation_key(event.raw), budget=budget)
+         inv.attempted = attempted_of(event)
+-        return _sequence(inv)
++        return _sequence(inv, permitted_roles)
+     except BaseException as exc:  # noqa: BLE001 — a gate that cannot decide must not allow
+         detail = f"{type(exc).__name__}: {exc}"[:300]
+         # NO VERDICT, NO ACT — a gate that could not decide denies in EVERY rollout mode, for
+@@ -872,7 +1189,7 @@
+         d = GateDecision(
+             "deny", "gate.internal_error",
+             "the common gate could not complete the decision: " + detail,
+-            GATE_REMEDIES["gate.internal_error"],
++            _remedy("gate.internal_error"),
+             verdict_available=False, anomaly=True, innate=True, rollout=mode)
+         if inv is None:
+             return d
+@@ -880,3 +1197,31 @@
+             return _finalize(inv, d, consequential=False)
+         except BaseException:  # noqa: BLE001
+             return d
++
++
++# ── the one renderer (C6): every seat shows a verdict in the same words ──────────────────────
++
++def render(decision: Any) -> str:
++    """The text a shim shows its harness for a GateDecision, the same on every seat (C6). A
++    shim chooses only the CHANNEL (exit code, stderr, a JSON payload); never the words.
++
++    Empty for a silent allow. A daemon-composed message (it starts with `hestia:`) is shown as
++    the daemon wrote it — that is its steering text — followed by the remedy when it does not
++    already carry it."""
++    lines = [str(n) for n in (getattr(decision, "notices", ()) or ()) if n]
++    verb = getattr(decision, "decision", "deny")
++    rule = getattr(decision, "rule", "") or ""
++    reason = (getattr(decision, "reason", "") or "").strip()
++    remedy = (getattr(decision, "remedy", "") or "").strip()
++    if verb == "allow":
++        if reason.startswith("hestia:"):
++            lines.append(reason)
++        return "\n".join(lines)
++    if reason.startswith("hestia:"):
++        text = reason
++    else:
++        text = f"hestia: {verb} [{rule}] — {reason}" if reason else f"hestia: {verb} [{rule}]"
++    if remedy and remedy not in text:
++        text = f"{text.rstrip('.')}. {remedy}"
++    lines.append(text)
++    return "\n".join(lines)
+diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.py
+--- a/plugins/_shared/test_gate_core.py
++++ b/plugins/_shared/test_gate_core.py
+@@ -724,18 +724,24 @@
+ 
+     Reports what it checked. With no shims present it says so rather than passing silently —
+     a green meaning 'nothing was inspected' is indistinguishable from 'inspected and clean',
+-    which is the null-state twin this thread keeps meeting."""
++    which is the null-state twin this thread keeps meeting.
++
++    One-gate stage C: the population is the REAL shims — the four seats' hook modules and the
++    template they are certified against — not a `shim_*.py` glob inside `_shared/`, which never
++    matched a shim (see the next test) and, once `shim_structure_test.py` landed, matched a test
++    whose job is to spell the banned tokens. A missing shim is reported, never skipped."""
+     here = os.path.dirname(os.path.abspath(__file__))
+-    shims = sorted(f for f in os.listdir(here)
+-                   if f.startswith("shim_") and f.endswith(".py"))
+-    if not shims:
+-        print("  note  shims_contain_no_policy: 0 shims present — NOTHING CHECKED "
+-              "(live the moment a shim_*.py lands)")
+-        return
++    plugins = os.path.dirname(here)
++    shims = [os.path.join(plugins, *rel) for rel in (
++        ("claude-code", "hooks", "pre_" + "tool_use.py"), ("codex", "hooks", "pre_" + "tool_use.py"),
++        ("kimi", "hooks", "pre_" + "tool_use.py"), ("gemini", "hooks", "before_tool.py"),
++        ("_template", "shim_template.py"))]
++    missing = [s for s in shims if not os.path.isfile(s)]
++    check("shims_present", not missing, f"shim(s) to inspect are missing: {missing}")
+     banned = ("in_scope", "FORBIDDEN", "REMEDIES", "Remedy(", "_deny(", "remedy=")
+     bad = []
+-    for f in shims:
+-        code = _strip_prose(open(os.path.join(here, f), encoding="utf-8").read())
++    for f in (s for s in shims if s not in missing):
++        code = _strip_prose(open(f, encoding="utf-8").read())
+         hits = [b for b in banned if b in code]
+         if hits:
+             bad.append((f, hits))
+@@ -782,7 +788,10 @@
+     # (§7.2(6)), never a hand-fork that would grow this number back.
+     # Slice 4: gemini's copy is deleted — its scope predicates are fail-closed delegates
+     # into the core now, so a fix to the core reaches gemini too. kimi is the last owner.
+-    KNOWN_DUPLICATE_OWNERS = {"kimi": 1}
++    # One-gate stage C: kimi's adapter pair left with the rest of the pre-template shim (every
++    # seat's gate is the template, and the common gate calls the core). The scope rule is
++    # defined in exactly one place now; a new entry here is a fork, said aloud in its PR.
++    KNOWN_DUPLICATE_OWNERS = {}
+ 
+     owners = {}
+     for root, _dirs, files in os.walk(plugins_dir):
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -71,7 +71,8 @@
+     """The shared engine as the gate imports it, with any staging overlay first."""
+     if str(SHARED) not in sys.path:
+         sys.path.insert(0, str(SHARED))
+-    for name in ("hestia_gate_mechanism", "hestia_single_gate"):
++    for name in ("hestia_witness_core", "hestia_gate_core", "hestia_governance_closure",
++                 "hestia_gate_mechanism", "hestia_single_gate"):
+         path = OVERLAY.get(name)
+         if path and name not in sys.modules:
+             spec = importlib.util.spec_from_file_location(name, path)
+@@ -281,6 +282,22 @@
+ SEATS = ("claude-code", "codex", "kimi", "gemini")
+ SEAT_SHIM = {"claude-code": "claude-code/hooks/pre_tool_use.py", "codex": "codex/hooks/pre_tool_use.py",
+              "kimi": "kimi/hooks/pre_tool_use.py", "gemini": "gemini/hooks/before_tool.py"}
++#: Staging only: {"seat": "/path/to/shim.py"} in place of the repo's shim (the shim twin of
++#: HESTIA_CONTRACT_OVERLAY; unset in the repo and in CI).
++SHIM_OVERRIDE = json.loads(os.getenv("HESTIA_CONTRACT_SHIMS") or "{}")
++
++
++def shim_path(seat) -> pathlib.Path:
++    return pathlib.Path(SHIM_OVERRIDE.get(seat) or PLUGINS / SEAT_SHIM[seat])
++
++
++def _shim_module(seat):
++    """The seat's shim, imported (its HARNESS and PROFILE are data the tests read)."""
++    spec = importlib.util.spec_from_file_location(f"contract_shim_{seat.replace('-', '_')}",
++                                                  shim_path(seat))
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
+ SEAT_MEMBER = {"claude-code": "claude-code", "codex": "codex", "kimi": "kimi-code", "gemini": "gemini"}
+ SEAT_HOME = {"claude-code": "~/.claude", "codex": "~/.codex", "kimi": "~/.kimi-code", "gemini": "~/.gemini"}
+ SEAT_MODE_ENV = {"codex": "HESTIA_CODEX_GATE_MODE", "kimi": "HESTIA_KIMI_GATE_MODE",
+@@ -496,8 +513,19 @@
+                    "call_tool", "globals"):
+         check(f"no-use-of-{banned}", banned not in names and banned not in attrs)
+     check("no-actions-dir-literal", "/tmp/hestia-actions" not in src and "hestia-actions" not in src)
++    # Stage C: the gate READS its seat's harness registration (harness_bound), so open() may
++    # appear — in a literal read mode only. Any other open is a private file write.
+     opens = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "open"]
+-    check("no-file-writes", not opens, len(opens))
++    def _mode(call):
++        if len(call.args) >= 2 and isinstance(call.args[1], ast.Constant):
++            return call.args[1].value
++        for kw in call.keywords:
++            if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
++                return kw.value.value
++        return "r" if len(call.args) < 2 and not any(k.arg == "mode" for k in call.keywords) else None
++    writes = [ast.unparse(n) for n in opens if _mode(n) not in ("r", "rb")]
++    check("no-file-writes", not writes, writes)
++    check("registration-reads-are-reads", len(opens) >= 1, len(opens))
+     recorders = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                  and getattr(n.func, "attr", None) == "record_decision"]
+     check("exactly-one-record_decision-call-site", len(recorders) == 1, len(recorders))
+@@ -516,9 +544,26 @@
+         direct = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                   and getattr(n.func, "attr", None) == name]
+         check(f"{name}-never-called-unbounded", not direct, len(direct))
+-    check("api-version", g.GATE_API_VERSION == "decide/1")
++    # Stage C: every bounded mechanism call ALSO hands the mechanism the deadline itself, so no
++    # request starts after it (`_bounded` is the belt).
++    mech_calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
++                  and getattr(n.func, "id", None) == "_bounded" and len(n.args) >= 2
++                  and isinstance(n.args[1], ast.Attribute)
++                  and getattr(n.args[1].value, "id", None) == "mechanism"]
++    check("mechanism-calls-found", len(mech_calls) >= 6, len(mech_calls))
++    for call in mech_calls:
++        check(f"{call.args[1].attr}-gets-the-deadline",
++              "deadline" in {k.arg for k in call.keywords}, ast.unparse(call)[:120])
++    check("api-version", g.GATE_API_VERSION == "decide/2")
+     for gone in ("GATE_DEADLINE_SECONDS", "MIN_HARNESS_TIMEOUT_SECONDS", "HARNESS_MARGIN_SECONDS"):
+         check(f"no-law-level-harness-timeout-{gone}", not hasattr(g, gone))
++    check("remedies-moved-to-the-core", not hasattr(g, "GATE_REMEDIES") and all(
++        r in core_remedies(g) for r in ("invocation.superseded", "gate.evidence_uncommitted",
++                                        "gate.internal_error", "gate.harness_timeout_unknown")))
++
++
++def core_remedies(g):
++    return g.core.REMEDIES
+ 
+ 
+ def test_one_deadline_bounds_the_whole_invocation(m, g, wc, home):
+@@ -561,9 +606,9 @@
+         check("short-deadline-bounded", took < 2.4, f"{took:.2f}s")
+     finally:
+         stub.close()
+-    # A daemon slower than the act can wait for: the deployed mechanism's own 4 s budget expires
+-    # first here (begin 4 s, then no time to poll), so this pins the composed result — a recorded
+-    # no-verdict deny inside the deadline. The cut BY the caller's deadline is the 2 s case above.
++    # A daemon slower than the act can wait for (begin 4 s, poll 4 s): the society phase runs to
++    # the phase deadline (the mechanism takes it itself since stage C), the poll is cut there, and
++    # the result is a recorded no-verdict deny from the reserve, inside the deadline.
+     stub = Stub(Policy(delays={"hestia_begin_action": 4.0, "hestia_query_policy": 4.0}))
+     try:
+         with _Env(m, stub.url, home):
+@@ -587,29 +632,31 @@
+         check("slow-daemon-not-a-permit", d.decision == "deny", d)
+     finally:
+         stub.close()
+-    # The seams run inside the bounded worker (C12b: each spy must be reached), and B passes
+-    # the deployed mechanism no `deadline=` it does not have (stage C adds it).
++    # The seams run inside the bounded worker (C12b: each spy must be reached), and since stage
++    # C each is handed the phase deadline itself: a value inside the invocation's deadline.
+     seen = {}
+     orig_q, orig_f = m.query_society_safety, m.fetch_policy_snapshot
+ 
+     def spy_q(*a, **kw):
+-        seen["q"] = (threading.current_thread().name, sorted(kw))
++        seen["q"] = (threading.current_thread().name, sorted(kw), kw.get("deadline"), time.monotonic())
+         return orig_q(*a, **kw)
+ 
+     def spy_f(*a, **kw):
+-        seen["f"] = (threading.current_thread().name, sorted(kw))
++        seen["f"] = (threading.current_thread().name, sorted(kw), kw.get("deadline"), time.monotonic())
+         return orig_f(*a, **kw)
+ 
+     stub = Stub()
+     m.query_society_safety, m.fetch_policy_snapshot = spy_q, spy_f
+     try:
+         with _Env(m, stub.url, home):
+-            _decide(g, "codex", "Bash", {"command": "ls"}, home)
++            t0 = time.monotonic()
++            _decide(g, "codex", "Bash", {"command": "ls"}, home, budget_seconds=6.0)
+         for k in ("q", "f"):
+             check(f"spy-{k}-reached", k in seen, seen)
+-            name, kws = seen.get(k, ("", []))
++            name, kws, dl, at = seen.get(k, ("", [], None, 0.0))
+             check(f"spy-{k}-ran-bounded", name == "hestia-decide-bounded", name)
+-            check(f"spy-{k}-no-deadline-kw-in-B", "deadline" not in kws, kws)
++            check(f"spy-{k}-deadline-threaded", isinstance(dl, float) and at < dl <= t0 + 6.0
++                  - g.WITNESS_RESERVE_SECONDS + 0.05, (dl, at, t0))
+     finally:
+         m.query_society_safety, m.fetch_policy_snapshot = orig_q, orig_f
+         stub.close()
+@@ -666,13 +713,63 @@
+         stub.close()
+ 
+ 
+-def test_b_leaves_the_deployed_mechanism_untouched(m, g, wc, home):
+-    """dp, 2026-10-01: B must not modify the mechanism (sovereign bar). Its budgets are the
+-    deployed ones; decide() bounds them from outside until stage C threads `deadline=`."""
++def test_c_threads_the_deadline_through_the_mechanism(m, g, wc, home):
++    """Stage C (plan §4 0b): every helper takes `deadline=`, backward-compatible (None is the
++    deployed behaviour), and NO request starts after it. The 5 s per-request cap applies only
++    without a caller deadline: a slow-but-alive cold connect inside a longer deadline answers."""
+     import inspect
+-    for fn in (m.query_society_safety, m._fetch_policy_snapshot_once, m.gate_self_call):
+-        check(f"{fn.__name__}-has-no-deadline-in-B", "deadline" not in inspect.signature(fn).parameters)
+-    check("record_decision-takes-the-deadline", "deadline" in inspect.signature(m.record_decision).parameters)
++    for fn in (m.query_society_safety, m.fetch_policy_snapshot, m._fetch_policy_snapshot_once,
++               m.gate_self_call, m.witness_gate_self, m.claim_self_write, m.tally_scope,
++               m.emit_attestation, m.record_decision):
++        p = inspect.signature(fn).parameters.get("deadline")
++        check(f"{fn.__name__}-takes-a-deadline", p is not None and p.default is None, p)
++    check("the-old-refusal-recorder-is-gone", not hasattr(m, "witness_decision_unified"))
++    # An exhausted deadline: no request is made at all, by any helper.
++    stub = Stub()
++    try:
++        with _Env(m, stub.url, home):
++            past = time.monotonic() - 0.01
++            v = m.query_society_safety({"tool_name": "Bash", "tool_input": {"command": "ls"}},
++                                       plugin_id="codex", host_agent="codex", deadline=past)
++            check("exhausted-society-is-a-no-verdict", not v.allow and not v.decided
++                  and v.cause == "timeout", v)
++            check("exhausted-snapshot-is-none", m.fetch_policy_snapshot(
++                "codex", deadline=past, use_cache=False) is None)
++            check("exhausted-gate-self-is-none", m.gate_self_call(
++                "hestia_request_witness", {}, plugin_id="codex", role="r", client_name="c",
++                deadline=past) is None)
++            r = m.record_decision(None, plugin_id="codex", decision="deny", rule="x", tool_name="Bash",
++                                  target=None, session_id=None, verdict_available=True,
++                                  attempted_summary="", deadline=past)
++            check("exhausted-record-is-unreachable", r.status == "unreachable", r)
++        check("exhausted-deadline-made-no-request", stub.calls == [], stub.calls)
++    finally:
++        stub.close()
++    # A snapshot deadline shorter than the retry pause skips the retry (and its sleep).
++    with _Env(m, closed_port_url(), home):
++        t0 = time.monotonic()
++        snap = m.fetch_policy_snapshot("codex", deadline=time.monotonic() + 0.2, use_cache=False)
++        took = time.monotonic() - t0
++    check("snapshot-retry-skipped-inside-a-short-deadline", snap is None and took < 0.3, took)
++    # The cap: a 5.5 s first connect (slower than REQUEST_TIMEOUT_S) inside a 9 s deadline answers;
++    # the same connect with no caller deadline is the deployed no-verdict.
++    stub = Stub(Policy(cold_connect=5.5))
++    try:
++        with _Env(m, stub.url, home):
++            v = m.query_society_safety({"tool_name": "Bash", "tool_input": {"command": "ls"}},
++                                       plugin_id="codex", host_agent="codex",
++                                       deadline=time.monotonic() + 9.0)
++        check("caller-deadline-lifts-the-5s-cap", v.allow and v.decided, v)
++    finally:
++        stub.close()
++    stub = Stub(Policy(cold_connect=5.5))
++    try:
++        with _Env(m, stub.url, home):
++            v = m.query_society_safety({"tool_name": "Bash", "tool_input": {"command": "ls"}},
++                                       plugin_id="kimi-code", host_agent="kimi-code")
++        check("no-deadline-keeps-the-deployed-cap", not v.decided, v)
++    finally:
++        stub.close()
+ 
+ 
+ def test_superseded_is_denied_in_every_mode(m, g, wc, home):
+@@ -1134,21 +1231,218 @@
+         stub.close()
+ 
+ 
+-def test_stage_b_is_unwired(m, g, wc, home):
+-    callers = []
+-    for root in ("plugins", "integrations", "hooks-gt"):
+-        base = REPO / root
+-        if not base.is_dir():
+-            continue
+-        for p in base.rglob("*.py"):
+-            # The certified template names the gate by design (stage C copies it); it is not a seat.
+-            if p.parent.name in ("_shared", "_template") or p.name.endswith("_test.py"):
+-                continue
+-            if "hestia_single_gate" in p.read_text(encoding="utf-8", errors="replace"):
+-                callers.append(str(p.relative_to(REPO)))
+-    check("no-seat-imports-the-common-gate-yet", callers == [], callers)
++def test_stage_c_wires_every_seat(m, g, wc, home):
++    """Every seat's gate IS the template: it loads hestia_single_gate, asks harness_bound() for its
++    deadline and passes it as `bound=`; nothing else in the shim calls the mechanism. The
++    installer deploys the gate (RUNTIME_MANIFEST.txt)."""
++    for seat in SEATS:
++        src = shim_path(seat).read_text(encoding="utf-8")
++        tree = ast.parse(src)
++        calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
++        check(f"{seat}-loads-the-common-gate", '"hestia_single_gate"' in src)
++        check(f"{seat}-asks-for-its-harness-bound", "gate.harness_bound" in calls, sorted(calls))
++        decides = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
++                   and ast.unparse(n.func) == "gate.decide"]
++        check(f"{seat}-decides-once-with-the-bound", len(decides) == 1
++              and "bound" in {k.arg for k in decides[0].keywords}, len(decides))
++        check(f"{seat}-no-mechanism-of-its-own", "hestia_gate_mechanism" not in src
++              and "hestia_gate_core" not in src and "witness_decision" not in src)
++        import re as _re
++        check(f"{seat}-no-per-seat-rollout-knob", not _re.search(r"HESTIA_[A-Z]+_GATE_MODE", src))
++        check(f"{seat}-drops-a-launcher-rollout", 'os.environ.pop("HESTIA_GATE_MODE", None)' in src)
+     manifest = (SHARED / "RUNTIME_MANIFEST.txt").read_text(encoding="utf-8")
+-    check("not-in-runtime-manifest-until-C", "hestia_single_gate" not in manifest)
++    check("in-the-runtime-manifest", "hestia_single_gate.py" in manifest.split())
++
++
++def _write_registration(path: pathlib.Path, seat: str, hook: pathlib.Path, timeout,
++                        extra_timeout=None) -> None:
++    """The harness's own config FORMAT, registering `hook` on its gate event: claude-code
++    nested JSON (seconds), codex nested TOML, kimi flat TOML, gemini nested JSON (ms). Written at
++    a NEUTRAL path naming a NEUTRAL hook (`gate_hook.py`): the reader under test is the format,
++    and no fixture carries a governed file name or config path. `extra_timeout` adds a second
++    registration of the same hook (the smallest must win); `timeout=None` omits the field."""
++    t = "" if timeout is None else f"\ntimeout = {timeout}"
++    def entry(tv):
++        e = {"type": "command", "command": f"python3 {hook}"}
++        if tv is not None:
++            e["timeout"] = tv
++        return e
++    if seat in ("claude-code", "gemini"):
++        ev = "BeforeTool" if seat == "gemini" else "PreToolUse"
++        groups = [{"matcher": "*", "hooks": [entry(timeout)]}]
++        if extra_timeout is not None:
++            groups.append({"matcher": "Bash", "hooks": [entry(extra_timeout)]})
++        path.write_text(json.dumps({"hooks": {ev: groups, "PostToolUse": [
++            {"hooks": [{"type": "command", "command": "python3 /x/other.py", "timeout": 1}]}]}}))
++    elif seat == "codex":
++        body = (f'[features]\ncodex_hooks = true\n\n[[hooks.PreToolUse]]\nmatcher = ".*"\n\n'
++                f'[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "python3 {hook}"{t}\n')
++        if extra_timeout is not None:
++            body += (f'\n[[hooks.PreToolUse]]\nmatcher = "shell"\n\n[[hooks.PreToolUse.hooks]]\n'
++                     f'type = "command"\ncommand = "python3 {hook}"\ntimeout = {extra_timeout}\n')
++        body += '\n[hooks.state]\n\n[hooks.state."x:pre:0:0"]\ntrusted_hash = "sha256:aa"\n'
++        path.write_text(body)
++    else:
++        body = f'[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {hook}"{t}\n'
++        if extra_timeout is not None:
++            body += f'\n[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {hook}"\ntimeout = {extra_timeout}\n'
++        body += '\n[[hooks]]\nevent = "SessionStart"\ncommand = "/x/other.sh"\ntimeout = 1\n'
++        path.write_text(body)
++
++
++def _neutral_harness(harness: dict, path: pathlib.Path) -> dict:
++    """The seat's REAL harness data with its primary registration's reader and layout, pointed at
++    a neutral fixture path."""
++    primary = dict(harness["registrations"][0])
++    primary["path"] = str(path)
++    return dict(harness, registrations=(primary,))
++
++
++#: Each seat's template registration timeout, in the harness's own unit.
++TEMPLATE_TIMEOUT = {"claude-code": 10, "codex": 15, "kimi": 15, "gemini": 15000}
++
++
++def test_the_bound_is_the_real_registration(m, g, wc, home):
++    """THE SAFETY INVARIANT (dp 2026-10-02): the deadline is the hook process's start plus the
++    timeout the harness REALLY enforces, read from its live registration, minus the margin — for
++    every seat, in each harness's own config shape and unit. Never the default, never a template;
++    the smallest of several registrations wins; an unreadable or absent one is refused."""
++    real_config = {"claude-code": ("json-hook-commands", "nested", "settings.json", 1, 60),
++                   "codex": ("toml-hook-commands", "nested", "config.toml", 1, None),
++                   "kimi": ("toml-hook-commands", "flat", "config.toml", 1, None),
++                   "gemini": ("json-hook-commands", "nested", "settings.json", 0.001, 60)}
++    for seat in SEATS:
++        shim_mod = _shim_module(seat)
++        reader, layout, cfg_name, unit, default = real_config[seat]
++        primary = shim_mod.HARNESS["registrations"][0]
++        check(f"{seat}-declares-its-real-config", primary["reader"] == reader
++              and primary.get("layout", "nested") == layout and primary["path"].endswith(cfg_name)
++              and shim_mod.HARNESS["timeout_unit_seconds"] == unit
++              and shim_mod.HARNESS["default_timeout_seconds"] == default, shim_mod.HARNESS)
++        with tempfile.TemporaryDirectory() as td:
++            h = pathlib.Path(td)
++            env = {"HOME": str(h)}
++            cfg = h / f"seat-config.{cfg_name.rsplit('.', 1)[1]}"
++            harness = _neutral_harness(shim_mod.HARNESS, cfg)
++            shim = h / "hooks" / "gate_hook.py"     # never created: realpath needs no file
++            t0 = time.monotonic()
++            b = g.harness_bound(harness, str(shim), t0, env=env)
++            check(f"{seat}-no-registration-no-bound", b.deadline is None and b.why, b)
++            # A registration timeout that differs from the template proves it is READ: 7 s.
++            seven = 7000 if seat == "gemini" else 7
++            _write_registration(cfg, seat, shim, seven)
++            b = g.harness_bound(harness, str(shim), t0, env=env)
++            check(f"{seat}-bound-is-the-registered-7s", b.timeout_seconds is not None
++                  and abs(b.timeout_seconds - 7.0) < 1e-9, b)
++            check(f"{seat}-deadline-strictly-below-the-harness", b.deadline is not None
++                  and b.deadline < t0 + 7.0 and abs(b.deadline - (t0 + 7.0 - harness["margin_seconds"])) < 1e-6, b)
++            check(f"{seat}-declares-what-the-harness-does", "fail-open" in b.on_timeout, b)
++            b2 = g.harness_bound(harness, str(shim), t0, env=dict(env, HESTIA_HOOK_TIMEOUT_S="4"))
++            check(f"{seat}-a-declaration-can-only-shorten", b2.timeout_seconds == 4.0, b2)
++            b3 = g.harness_bound(harness, str(shim), t0, env=dict(env, HESTIA_HOOK_TIMEOUT_S="60"))
++            check(f"{seat}-a-declaration-cannot-lengthen", abs(b3.timeout_seconds - 7.0) < 1e-9, b3)
++            # Two registrations of the same hook: the SMALLER one bounds this invocation.
++            _write_registration(cfg, seat, shim, seven, extra_timeout=4000 if seat == "gemini" else 4)
++            b = g.harness_bound(harness, str(shim), t0, env=env)
++            check(f"{seat}-the-smallest-registration-wins", b.timeout_seconds == 4.0, b)
++            # No timeout field: the harness's documented default, or a refusal when unknown.
++            _write_registration(cfg, seat, shim, None)
++            b = g.harness_bound(harness, str(shim), t0, env=env)
++            if default is None:
++                check(f"{seat}-untimed-with-unknown-default-refused", b.deadline is None, b)
++            else:
++                check(f"{seat}-untimed-uses-the-harness-default", b.timeout_seconds == float(default), b)
++            # An unreadable config that names the hook establishes nothing.
++            cfg.write_text("{not json or toml")
++            b = g.harness_bound(harness, str(shim), t0, env=env)
++            check(f"{seat}-unreadable-config-no-bound", b.deadline is None, b)
++
++
++def test_an_unknown_or_spent_bound_refuses_without_asking(m, g, wc, home):
++    stub = Stub()
++    try:
++        with _Env(m, stub.url, home):
++            raw = native_event("codex", "Bash", {"command": "ls"}, str(REPO), 11)
++            unknown = g.HarnessBound(None, None, 1.5, "fail-open: test", (), "no registration found")
++            d = g.decide(to_event(g, "codex", raw), profile_for(g, "codex", home), bound=unknown)
++            check("unknown-bound-denied", d.decision == "deny" and d.rule == "gate.harness_timeout_unknown"
++                  and d.innate and not d.verdict_available, d)
++            spent = g.HarnessBound(time.monotonic() - 0.1, 1.0, 1.5, "fail-open: test", ("t",))
++            d = g.decide(to_event(g, "codex", raw), profile_for(g, "codex", home), bound=spent)
++            check("spent-bound-denied", d.decision == "deny" and d.rule == "gate.harness_timeout_unknown", d)
++        check("refused-before-any-daemon-call", stub.calls == [], stub.calls)
++    finally:
++        stub.close()
++    # A real bound short enough that a cold connect cannot fit: a recorded fail-closed deny that
++    # ends INSIDE the bound (the harness never gets to kill the hook), never a permit.
++    stub = Stub(Policy(cold_connect=4.6))
++    try:
++        with _Env(m, stub.url, home):
++            raw = native_event("codex", "Bash", {"command": "ls"}, str(REPO), 12)
++            start = time.monotonic()
++            b = g.HarnessBound(start + 3.5, 5.0, 1.5, "fail-open: test", ("registered 5s",))
++            d = g.decide(to_event(g, "codex", raw), profile_for(g, "codex", home), bound=b)
++            took = time.monotonic() - start
++        print(f"  5 s registration, cold member: {d.decision} {d.rule} in {took:.2f}s")
++        check("short-registration-cold-connect-fails-closed", d.decision == "deny"
++              and d.rule in ("gate.degraded", "society.unreachable"), d)
++        check("short-registration-ends-inside-the-bound", took < 3.5 + 0.25, f"{took:.2f}s")
++    finally:
++        stub.close()
++
++
++def test_the_launch_role_bound_is_the_gates(m, g, wc, home):
++    """#1084 moved into the common gate: a projection that permits launch roles refuses any
++    other launch role, on every seat; no declared set checks nothing."""
++    stub = Stub()
++    saved = os.environ.get("HESTIA_ROLE")
++    try:
++        with _Env(m, stub.url, home):
++            os.environ["HESTIA_ROLE"] = "role:constellation:mesh-worker"
++            for seat in SEATS:
++                raw = native_event(seat, "Read", {"file_path": str(REPO / "README.md")}, str(REPO), 13)
++                d = g.decide(to_event(g, seat, raw), profile_for(g, seat, home),
++                             permitted_roles="role:constellation:interactive-dev")
++                check(f"{seat}-unlisted-launch-role-refused", d.decision == "deny"
++                      and d.rule == "config.miswired" and d.innate, d)
++                d = g.decide(to_event(g, seat, raw), profile_for(g, seat, home),
++                             permitted_roles="role:constellation:mesh-worker")
++                check(f"{seat}-listed-launch-role-proceeds", d.decision == "allow", d)
++                d = g.decide(to_event(g, seat, raw), profile_for(g, seat, home), permitted_roles="")
++                check(f"{seat}-no-declared-set-checks-nothing", d.decision == "allow", d)
++    finally:
++        if saved is None:
++            os.environ.pop("HESTIA_ROLE", None)
++        else:
++            os.environ["HESTIA_ROLE"] = saved
++        stub.close()
++
++
++def test_the_mcp_transport_is_command_scoped(m, g, wc, home):
++    """C10 (plan §4 0b), aligned upward from gemini: the MCP transport context's local reach
++    (server command, args, cwd) is command-scoped like a shell command; its url is egress only."""
++    stub = Stub()
++    try:
++        with _Env(m, stub.url, home):
++            sibling = REPO.parent / "decide-contract-ungranted-sibling"
++            sibling.mkdir(exist_ok=True)
++            try:
++                raw = native_event("gemini", "mcp_fs_read", {"path": "x"}, str(REPO), 14)
++                raw["mcp_context"] = {"server_name": "fs", "tool_name": "read", "command": "npx",
++                                      "args": ["-y", "server-filesystem", str(sibling)]}
++                d, = (g.decide(to_event(g, "gemini", raw), profile_for(g, "gemini", home)),)
++                check("mcp-arg-outside-scope-denied", d.decision == "deny" and d.rule == "mrh.command", d)
++                raw["mcp_context"]["args"] = ["-y", "server-filesystem", str(REPO)]
++                d = g.decide(to_event(g, "gemini", raw), profile_for(g, "gemini", home))
++                check("mcp-arg-inside-scope-allowed", d.decision == "allow", d)
++                raw["mcp_context"] = {"server_name": "web", "tool_name": "get",
++                                      "url": "https://mcp.example/sse"}
++                d = g.decide(to_event(g, "gemini", raw), profile_for(g, "gemini", home))
++                check("mcp-url-is-not-command-scoped", d.decision == "allow", d)
++            finally:
++                sibling.rmdir()
++    finally:
++        stub.close()
+ 
+ 
+ #: Tests that measure the deadline run at the real DEFAULT_DEADLINE_SECONDS. The others pin
+@@ -1166,7 +1460,7 @@
+     test_the_key_from_the_raw_event_reaches_every_join,
+     test_the_gate_owns_no_cache_no_client_and_one_recorder,
+     test_one_deadline_bounds_the_whole_invocation,
+-    test_b_leaves_the_deployed_mechanism_untouched,
++    test_c_threads_the_deadline_through_the_mechanism,
+     test_reads_meet_the_same_local_law_on_every_seat,
+     test_superseded_is_denied_in_every_mode,
+     test_daemon_verdicts_and_the_warn_rollout,
+@@ -1176,7 +1470,11 @@
+     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
+     test_closure_approval_lifts_only_the_closure_bar,
+     test_an_internal_error_fails_closed_through_the_one_recorder,
+-    test_stage_b_is_unwired,
++    test_stage_c_wires_every_seat,
++    test_the_bound_is_the_real_registration,
++    test_an_unknown_or_spent_bound_refuses_without_asking,
++    test_the_launch_role_bound_is_the_gates,
++    test_the_mcp_transport_is_command_scoped,
+ ]
+ 
+ 
+@@ -1296,6 +1594,15 @@
+         "`verdict.allow`, and gemini's spawned governor exit code, so a daemon WARN reached those "
+         "members as a silent allow; claude-code alone rendered it. decide() surfaces it on every "
+         "seat (C10 capability parity).") for s in ("codex", "kimi", "gemini")},
++    # Stage C: ONE rollout knob (HESTIA_GATE_MODE, projected per seat by the vault) replaces
++    # the per-seat HESTIA_<SEAT>_GATE_MODE names. claude-code had no knob at all, so under
++    # HESTIA_GATE_MODE=warn its TUNABLE denies now warn, as every other seat's did (C5: no
++    # per-seat law, and no odd seat out). The default is enforce; innate and no-verdict denies
++    # never soften. Visible only in the legacy comparison, which runs old claude-code at enforce.
++    **{("claude-code", c): (
++        "ONE ROLLOUT KNOB (C5): claude-code gains HESTIA_GATE_MODE; under warn a tunable deny "
++        "(a decided scope or society refusal) warns, as on every seat. Default enforce.")
++       for c in ("warn-scope-write-etc", "warn-daemon-denies-rm")},
+ }
+ 
+ 
+@@ -1314,6 +1621,11 @@
+ 
+ def _old_rule(text):
+     import re
++    # A stage-C shim renders `hestia: <verb> [<rule id>]` (hestia_single_gate.render).
++    first = re.search(r"hestia: (?:deny|warn) \[((?:gate|mrh|egress|society|invocation|config)\.[a-z_.]+)\]",
++                      text)
++    if first:
++        return first.group(1)
+     for pat in (r"governance-closure-[a-z-]+", r"\[gate-self(?:-access)?\]", r"gate\.self_access",
+                 r"egress\.secret", r"mrh\.(?:path|command|repo)", r"\[scope\]", r"\[degraded\]",
+                 r"gate\.degraded", r"\[fail-closed\]", r"\[safety\]", r"invocation-superseded",
+@@ -1331,16 +1643,29 @@
+     return json.loads(s)
+ 
+ 
+-def _seat_home(root: pathlib.Path, seat: str, endpoint: str) -> pathlib.Path:
+-    home = root / f"{seat}-{abs(hash(endpoint)) % 10**8}"
++SEAT_IDENTITY_ENV = {"claude-code": "HESTIA_CLAUDE_IDENTITY", "codex": "HESTIA_CODEX_IDENTITY",
++                     "kimi": "HESTIA_KIMI_IDENTITY", "gemini": "HESTIA_GEMINI_IDENTITY"}
++
++
++def _seat_home(root: pathlib.Path, seat: str, endpoint: str, shared: pathlib.Path,
++               shim: pathlib.Path, rollout: str = "enforce") -> pathlib.Path:
++    """A throwaway seat home: the vault projection the shim loads (its only config source, the
++    rollout included). The invoker's timeout declaration rides the environment (_seat_env)."""
++    home = root / f"{seat}-{abs(hash((endpoint, str(shared), str(shim), rollout))) % 10**8}"
+     if home.is_dir():
+         return home
+     (home / "seats").mkdir(parents=True)
+-    values = {"HESTIA_HOME": str(home), "HESTIA_SHARED_DIR": str(SHARED),
++    values = {"HESTIA_HOME": str(home), "HESTIA_SHARED_DIR": str(shared),
+               "HESTIA_WORKSPACE": str(REPO.parent), "HESTIA_ENDPOINT": endpoint}
+-    for member in {SEAT_MEMBER[seat], "claude-code"}:   # gemini's Gate 2 spawns claude-code's gate
++    for member in {SEAT_MEMBER[seat], "claude-code"}:   # the legacy gemini spawned claude-code's gate
++        token = "".join(c.upper() if c.isalnum() else "_" for c in member)
+         body = ["# rendered from the vault by hestia (decide-contract fixture)", f"# member: {member}"]
+         body += [f"{k}={values[k]}" for k in sorted(values)]
++        if member == SEAT_MEMBER[seat]:
++            body += [f"{token}__HESTIA_HARNESS_HOME={home / SEAT_HOME[seat][2:]}",
++                     f"{token}__{SEAT_IDENTITY_ENV[seat]}={home / 'identity.json'}",
++                     f"{token}__HESTIA_OBSERVE_DIR={home / 'observe'}",
++                     f"{token}__HESTIA_GATE_MODE={rollout}"]
+         (home / "seats" / f"{member}.env").write_text("\n".join(body) + "\n", encoding="utf-8")
+     (home / "identity.json").write_text(json.dumps({"plugin_id": SEAT_MEMBER[seat],
+                                                     "role": "role:constellation:member",
+@@ -1348,9 +1673,9 @@
+     return home
+ 
+ 
+-def _seat_env(seat, home, endpoint, rollout):
++def _seat_env(seat, home, endpoint, rollout, shared: pathlib.Path, legacy_claude: pathlib.Path = None):
+     env = {k: v for k, v in os.environ.items() if not k.startswith("HESTIA_")}
+-    env.update({"HOME": str(home), "HESTIA_HOME": str(home), "HESTIA_SHARED_DIR": str(SHARED),
++    env.update({"HOME": str(home), "HESTIA_HOME": str(home), "HESTIA_SHARED_DIR": str(shared),
+                 "HESTIA_WORKSPACE": str(REPO.parent), "HESTIA_ENDPOINT": endpoint,
+                 "HESTIA_STATE_DIR": str(home / "state"), "HESTIA_OBSERVE_DIR": str(home / "observe"),
+                 "HESTIA_KIMI_IDENTITY": str(home / "identity.json"),
+@@ -1358,12 +1683,24 @@
+                 "HESTIA_GEMINI_IDENTITY": str(home / "identity.json"),
+                 "HESTIA_KIMI_LAUNCH_CWD": str(REPO), "HESTIA_CODEX_LAUNCH_CWD": str(REPO),
+                 "HESTIA_GEMINI_LAUNCH_CWD": str(REPO),
+-                "HESTIA_SOCIETY_GATE": str(PLUGINS / SEAT_SHIM["claude-code"]),
++                # ONE rollout knob for every seat since stage C, and it is the VAULT's: the shim
++                # drops a launcher-supplied value. The launcher here always says warn; the seat
++                # must follow its projection (the case's rollout), or a cell diverges.
++                "HESTIA_GATE_MODE": "warn",
++                # The invoker's declaration of the timeout it enforces on the shim: the parity
++                # harness is not a registered harness (the registration READER is covered, per
++                # harness format, by test_the_bound_is_the_real_registration).
++                "HESTIA_HOOK_TIMEOUT_S": str(TEMPLATE_TIMEOUT[seat] / (1000 if seat == "gemini" else 1)),
+                 "PYTHONDONTWRITEBYTECODE": "1"})
+-    if seat in SEAT_MODE_ENV:
+-        env[SEAT_MODE_ENV[seat]] = rollout
++    if legacy_claude is not None:
++        # ... and, for a pre-C gate, the per-seat knob it read, and gemini's spawned governor.
++        if seat in SEAT_MODE_ENV:
++            env[SEAT_MODE_ENV[seat]] = rollout
++        env["HESTIA_SOCIETY_GATE"] = str(legacy_claude)
+     if OVERLAY:
+         env["HESTIA_CONTRACT_OVERLAY"] = json.dumps(OVERLAY)
++    if SHIM_OVERRIDE:
++        env["HESTIA_CONTRACT_SHIMS"] = json.dumps(SHIM_OVERRIDE)
+     env["HESTIA_CONTRACT_REPO"] = str(REPO)
+     return env
+ 
+@@ -1384,14 +1721,36 @@
+     return 0
+ 
+ 
+-def _probe_pair(stub, pol, seat, raw, env, rollout):
+-    """One seat's current gate and decide() on the same event, under the same stub policy."""
++def engine_dir(root: pathlib.Path) -> pathlib.Path:
++    """The engine a seat's shim loads in a fixture: every RUNTIME_MANIFEST module from
++    plugins/_shared — with HESTIA_CONTRACT_OVERLAY's staged copies in place of theirs — copied
++    into a fixture `shared` dir, because a shim's `_load_gate` requires the gate at its installed
++    name. Outside staging the parity arm points the shims at plugins/_shared itself."""
++    import shutil
++    dest = root / "engine" / "shared"
++    if dest.is_dir():
++        return dest
++    dest.mkdir(parents=True)
++    names = [ln.strip() for ln in (SHARED / "RUNTIME_MANIFEST.txt").read_text(encoding="utf-8").splitlines()
++             if ln.strip() and not ln.lstrip().startswith("#")]
++    for name in dict.fromkeys(names + [f"{m}.py" for m in OVERLAY]):
++        src = OVERLAY.get(name[:-3]) or SHARED / name
++        shutil.copyfile(src, dest / name)
++    return dest
++
++
++def _run_gate(argv, raw, env):
++    return subprocess.run(argv, input=json.dumps(raw), capture_output=True, text=True,
++                          cwd=str(REPO), env=env, timeout=60)
++
++
++def _probe_pair(stub, pol, seat, raw, env, rollout, gate_argv):
++    """One seat's gate (`gate_argv`: the real shim, or a legacy gate) and decide() on the same
++    event, under the same stub policy."""
+     if pol != "down":
+         stub.policy = POLICIES[pol]()
+     mark = len(stub.calls)
+-    old = subprocess.run([sys.executable, str(PLUGINS / SEAT_SHIM[seat])],
+-                         input=json.dumps(raw), capture_output=True, text=True,
+-                         cwd=str(REPO), env=env, timeout=60)
++    old = _run_gate(gate_argv, raw, env)
+     old_v, old_text = _classify_old(seat, old.returncode, old.stdout, old.stderr)
+     old_asked = sorted({p for t, a, p in stub.calls[mark:] if t == "hestia_begin_action"})
+     if pol != "down":
+@@ -1410,60 +1769,117 @@
+             "elapsed": nd.get("elapsed"), "old_text": old_text.strip()[-400:]}
+ 
+ 
+-def run_parity(report: bool = False):
++#: C8 (cross-seat verdict parity) after the cutover: the cases where the SAME act still gets a
++#: different verdict class on different seats, each with its reason. The test fails on a cell
++#: that differs undeclared and on a declaration that no longer differs.
++DECLARED_SEAT_DIFFERENCES = {
++    "scope-read-etc": (
++        "LAW GAP, pinned and reported to dp (stage B): codex reads only through its shell tool "
++        "(`cat /etc/hostname`), and the core's command scope judges only tokens under the "
++        "workspace, so the shell read is unscoped while the Read tool's path is scoped (mrh.path) "
++        "on the other three seats. Same law, two act shapes; the fix is a law change."),
++}
++
++
++def _legacy_tree(ref: str, root: pathlib.Path) -> pathlib.Path:
++    """The pre-cutover gates and their engine, exactly as committed at `ref`, extracted read-only
++    into a temp dir (`git archive | tar -x`): the stage B comparison, re-runnable after C."""
++    dest = root / "legacy"
++    dest.mkdir()
++    archive = subprocess.run(["git", "-C", str(REPO), "archive", ref, "plugins"],
++                             capture_output=True, check=True, timeout=120)
++    subprocess.run(["tar", "-x", "-C", str(dest)], input=archive.stdout, check=True, timeout=120)
++    return dest / "plugins"
++
++
++def run_parity(report: bool = False, legacy_ref: str = None):
++    """Default: each seat's REAL shim (its registration, its translation, its exit channel) vs
++    decide() on the same act — they must agree on every cell — and the four seats vs each other
++    (C8). `legacy_ref`: each seat's PRE-cutover gate at that ref vs decide(), against
++    DECLARED_DIVERGENCES (the stage B table, now live behaviour)."""
+     rows = []
+     with tempfile.TemporaryDirectory(prefix="decide-parity-") as tmp:
+         root = pathlib.Path(tmp)
++        legacy = _legacy_tree(legacy_ref, root) if legacy_ref else None
+         stub = Stub()
+         dead = closed_port_url()
+         try:
+             for n, (case, tool, tin, pol, rollout) in enumerate(PARITY_CASES, start=1):
+                 for seat in SEATS:
+                     hook = "before_tool.py" if seat == "gemini" else "pre_tool_use.py"
+-                    # The SAME input means the seat's own posture: claude-code has no rollout knob
+-                    # and always enforces, so both arms run it at enforce.
+-                    seat_rollout = rollout if seat in SEAT_MODE_ENV else "enforce"
+                     act = _render(tin, {"{REPO}": str(REPO), "{CRED}": CRED_PATH, "{HOME}": PROBE_HOME,
+                                         "{SELF}": seat, "{HOOK}": hook})
+                     raw = native_event(seat, tool, act, str(REPO), n)
+                     endpoint = dead if pol == "down" else stub.url
+                     if pol != "down":
+                         stub.policy = POLICIES[pol]()
+-                    home = _seat_home(root, seat, endpoint)
+-                    env = _seat_env(seat, home, endpoint, seat_rollout)
+-                    cell = _probe_pair(stub, pol, seat, raw, env, seat_rollout)
++                    if legacy is not None:
++                        # A pre-C gate read its own per-seat knob, and claude-code had none: the
++                        # legacy arm runs claude-code at enforce, as it always ran.
++                        gate_rollout = rollout if seat in SEAT_MODE_ENV else "enforce"
++                        shim = legacy / SEAT_SHIM[seat]
++                        gate_argv = [sys.executable, str(shim)]
++                        home = _seat_home(root, seat, endpoint, legacy / "_shared", shim, rollout)
++                        env = _seat_env(seat, home, endpoint, gate_rollout, legacy / "_shared",
++                                        legacy_claude=legacy / SEAT_SHIM["claude-code"])
++                    else:
++                        shim = shim_path(seat)
++                        gate_argv = [sys.executable, str(shim)]
++                        shared = engine_dir(root) if OVERLAY else SHARED
++                        home = _seat_home(root, seat, endpoint, shared, shim, rollout)
++                        env = _seat_env(seat, home, endpoint, rollout, shared)
++                    cell = _probe_pair(stub, pol, seat, raw, env, rollout, gate_argv)
+                     retried = False
+-                    if cell["old"] != cell["new"] and (seat, case) not in DECLARED_DIVERGENCES:
++                    declared = DECLARED_DIVERGENCES if legacy is not None else {}
++                    if cell["old"] != cell["new"] and (seat, case) not in declared:
+                         # A loaded box can stall a healthy loopback round trip past the
+                         # deadline (#423 class). Retry the PAIR once; a real divergence repeats.
+-                        cell = _probe_pair(stub, pol, seat, raw, env, seat_rollout)
++                        cell = _probe_pair(stub, pol, seat, raw, env, rollout, gate_argv)
+                         retried = True
+                     rows.append({"case": case, "seat": seat, "retried": retried, **cell})
+         finally:
+             stub.close()
+     found = {(r["seat"], r["case"]) for r in rows if r["old"] != r["new"]}
+-    undeclared = sorted(found - set(DECLARED_DIVERGENCES))
+-    stale = sorted(set(DECLARED_DIVERGENCES) - found)
+-    check("parity-no-undeclared-divergence", not undeclared,
++    declared = DECLARED_DIVERGENCES if legacy_ref else {}
++    undeclared = sorted(found - set(declared))
++    stale = sorted(set(declared) - found)
++    label = "legacy-parity" if legacy_ref else "shim-parity"
++    check(f"{label}-no-undeclared-divergence", not undeclared,
+           [(s, c, next((r["old"], r["old_rule"], r["new"], r["new_rule"], r["old_text"][-200:])
+                        for r in rows if (r["seat"], r["case"]) == (s, c))) for s, c in undeclared])
+-    check("parity-no-stale-declaration", not stale, stale)
+-    check("parity-decide-never-crashed", not any(r["new"] == "CRASH" for r in rows),
++    check(f"{label}-no-stale-declaration", not stale, stale)
++    check(f"{label}-decide-never-crashed", not any(r["new"] == "CRASH" for r in rows),
+           [r for r in rows if r["new"] == "CRASH"][:2])
+-    # Finding 1: gemini's governor asked the daemon AS claude-code; decide() asks as gemini.
+-    gem = [r for r in rows if r["seat"] == "gemini" and r["old_asked_as"]]
+-    check("finding-1-gemini-old-asked-as-claude-code",
+-          gem and all(r["old_asked_as"] == ["claude-code"] for r in gem), gem[:2])
++    if legacy_ref:
++        # Finding 1: gemini's governor asked the daemon AS claude-code; decide() asks as gemini.
++        gem = [r for r in rows if r["seat"] == "gemini" and r["old_asked_as"]]
++        check("finding-1-gemini-old-asked-as-claude-code",
++              gem and all(r["old_asked_as"] == ["claude-code"] for r in gem), gem[:2])
++    else:
++        # C8 over the real shims: the same act, the same verdict class, on every seat.
++        differing = {c for c, *_ in PARITY_CASES
++                     if len({r["old"] for r in rows if r["case"] == c}) > 1}
++        check("c8-no-undeclared-seat-difference", differing <= set(DECLARED_SEAT_DIFFERENCES),
++              {c: {r["seat"]: (r["old"], r["old_rule"]) for r in rows if r["case"] == c}
++               for c in sorted(differing - set(DECLARED_SEAT_DIFFERENCES))})
++        check("c8-no-stale-seat-difference", set(DECLARED_SEAT_DIFFERENCES) <= differing,
++              sorted(set(DECLARED_SEAT_DIFFERENCES) - differing))
++        # Every seat asks the daemon as ITSELF.
++        for r in rows:
++            check(f"{r['seat']}-{r['case']}-asks-as-itself",
++                  r["old_asked_as"] in ([], [SEAT_MEMBER[r["seat"]]]), r["old_asked_as"])
+     check("finding-1-gemini-decide-asks-as-gemini",
+           all(r["new_asked_as"] in ([], ["gemini"]) for r in rows if r["seat"] == "gemini"))
+     if report:
+-        print_report(rows)
+-    RAN.append(f"parity {len(PARITY_CASES)}x{len(SEATS)}")
++        print_report(rows, legacy_ref)
++    RAN.append(f"{label} {len(PARITY_CASES)}x{len(SEATS)}")
+     return rows
+ 
+ 
+-def print_report(rows):
+-    print("\n| case | " + " | ".join(SEATS) + " |")
++def print_report(rows, legacy_ref=None):
++    arm = f"legacy gate at {legacy_ref}" if legacy_ref else "real shim"
++    print(f"\ncells read `{arm} → decide()`\n")
++    print("| case | " + " | ".join(SEATS) + " |")
+     print("|---|" + "---|" * len(SEATS))
+     for case, *_ in PARITY_CASES:
+         cells = []
+@@ -1474,9 +1890,9 @@
+                     + f" <sub>{r['old_rule'] or '·'} / {r['new_rule'] or '·'}</sub>")
+             cells.append(cell)
+         print(f"| {case} | " + " | ".join(cells) + " |")
+-    print("\nsociety asked as (old → decide): " + "; ".join(
++    print("\nsociety asked as (gate → decide): " + ("; ".join(
+         f"{r['seat']}:{r['case']} {r['old_asked_as']}→{r['new_asked_as']}"
+-        for r in rows if r["old_asked_as"] != r["new_asked_as"]))
++        for r in rows if r["old_asked_as"] != r["new_asked_as"]) or "identical on every cell"))
+     again = [f"{r['seat']}:{r['case']}" for r in rows if r.get("retried")]
+     print(f"\nretried once after a diverging first probe: {again or 'none'}")
+     slow = max((r["elapsed"] or 0) for r in rows)
+@@ -1510,11 +1926,15 @@
+ 
+     with _Env(m, url, home):
+         # The FIRST consequential act may meet a cold daemon (4.4 s measured on a DEBUG build):
+-        # it is then an explicit society.unreachable deny inside the deadline, never a hang.
++        # it is then an explicit cold deny inside the deadline, never a hang. Which rule names it
++        # depends on which leg met the cold connect: the policy snapshot (`gate.degraded`, every
++        # act denied without it since dp 2026-10-01) or the society query (`society.unreachable`).
++        # Measured on the stage-C isolated daemon: the snapshot leg, gate.degraded in 8.0 s.
+         first = run("Bash", {"command": "ls -la"}, 1)
+         check("real-first-is-allow-or-explicit-cold-deny",
+               (first.decision == "allow" and first.evidence_committed)
+-              or (first.decision == "deny" and first.rule == "society.unreachable"), first)
++              or (first.decision == "deny" and first.rule in ("society.unreachable", "gate.degraded")),
++              first)
+         d = run("Bash", {"command": "ls -la"}, 2)
+         check("real-allow-committed-as-policy_allow", d.decision == "allow" and d.evidence_committed
+               and d.action_id, d)
+@@ -1549,6 +1969,7 @@
+     if "--decide-probe" in argv:
+         return decide_probe()
+     only = argv[argv.index("--only") + 1] if "--only" in argv else None
++    legacy_ref = argv[argv.index("--legacy-ref") + 1] if "--legacy-ref" in argv else None
+     m, g, wc = load_engine()
+     with tempfile.TemporaryDirectory(prefix="decide-contract-home-") as h:
+         home = pathlib.Path(h)
+@@ -1572,7 +1993,7 @@
+                 g.DEFAULT_DEADLINE_SECONDS = real_deadline
+         if only != "contract":
+             try:
+-                run_parity(report="--report" in argv)
++                run_parity(report="--report" in argv, legacy_ref=legacy_ref)
+             except Exception as e:  # noqa: BLE001
+                 import traceback
+                 FAILS.append(f"parity raised {type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}")

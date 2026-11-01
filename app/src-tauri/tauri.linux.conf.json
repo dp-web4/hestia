@@ -1,0 +1,10 @@
+{
+  "productName": "hestia-app",
+  "bundle": {
+    "linux": {
+      "deb": {
+        "desktopTemplate": "linux/hestia-app.desktop"
+      }
+    }
+  }
+}

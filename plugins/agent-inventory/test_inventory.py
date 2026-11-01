@@ -129,7 +129,8 @@ class _FakeRegistry:
 
 
 def build(tmp: Path, extra_hooks: list[tuple[str, str]], *,
-          post_command: str | None = None, declared: dict | None = None) -> dict:
+          post_command: str | None = None, declared: dict | None = None,
+          projection: bool = True, home_env: bool = True) -> dict:
     """One agent record, from a config holding a LIVE hestia gate plus `extra_hooks`.
 
     The live gate is the control: every case below is governed-but-for the extra hook,
@@ -171,9 +172,29 @@ def build(tmp: Path, extra_hooks: list[tuple[str, str]], *,
     # hestia's by declared install path; the `gone/` ones are dead and must be judged by the
     # attribution rules, so they are NOT declared.
     own(gate, witness, *sorted(tmp.glob("*.sh")))
+    # HERMETIC HESTIA_HOME (#1186): the witness check reads $HESTIA_HOME/seats/<member> + the projection
+    # suffix. Without this the verdict would depend on whether the machine running the suite happens to
+    # hold a real seat projection. Every case gets one unless it asks for none.
+    home = tmp / "hestia-home"
+    seats = home / "seats"
+    seats.mkdir(parents=True, exist_ok=True)
+    proj = seats / ("claude-code" + inventory.PROJECTION_SUFFIX)
+    if projection:
+        proj.write_text("# rendered seat projection (fixture)\n")
+    elif proj.exists():
+        proj.unlink()
+    old_home = os.environ.get("HESTIA_HOME")
+    if home_env:
+        os.environ["HESTIA_HOME"] = str(home)
+    else:
+        os.environ.pop("HESTIA_HOME", None)
     try:
         return inventory.inspect("claude", [])
     finally:
+        if old_home is None:
+            os.environ.pop("HESTIA_HOME", None)
+        else:
+            os.environ["HESTIA_HOME"] = old_home
         inventory._PROVENANCE = None
         (inventory.PLUGINS, inventory.config_scopes,
          inventory.real_executable, inventory.REGISTRY) = orig
@@ -219,6 +240,31 @@ def test_verdict(tmp: Path):
     check("E dead observer is not 3p-miswired", e["miswired_3p"], False)
     check("E dead observer still reported",
           inventory.has_tag(e["findings"], "DEAD_HOOK"), True)
+
+    # F. #1186: the witness is registered and live, but the seat has NO rendered projection, so every act
+    # returns config.unbacked, silently. Registration alone read green on codex and kimi for a day.
+    f = build(tmp, [], projection=False)
+    check("F unbacked witness is MISWIRED", f["miswired"], True)
+    check("F unbacked witness demotes governed", f["governed"], False)
+    check("F the finding names the missing projection",
+          any("no seat projection" in x and "#1186" in x for x in f["findings"]), True)
+
+    # G. the same seat WITH its projection is governed (the control for F).
+    g = build(tmp, [], projection=True)
+    check("G projection present: not miswired", g["miswired"], False)
+    check("G projection present: governed", g["governed"], True)
+
+    # H. kimi-code's #1187 review: the inventory resolves home as the witness does, with no ~/.hestia
+    # fallback. HESTIA_HOME unset where the inventory runs is UNVERIFIABLE (an unknown), not a pass and not
+    # MISWIRED, even with a projection sitting at ~/.hestia.
+    h = build(tmp, [], projection=True, home_env=False)
+    check("H unset home: not miswired", h["miswired"], False)
+    check("H unset home: an UNVERIFIABLE finding",
+          any(x.startswith("UNVERIFIABLE") and "HESTIA_HOME" in x for x in h["findings"]), True)
+    check("H unset home: carried as an unknown", bool(h["unknown"]), True)
+    check("H the finding names both operator acts",
+          any("seed_seat_config.py --add-missing" in x and "install-members.sh" in x
+              for x in h["findings"]), True)
 
 
 # --- unit: where the atlas is, and what a descriptor says ---------------------------

@@ -13,8 +13,31 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// THE RELEASE KEY (dp, 2026-10-14, web4#904 signing option b). CI writes keystore.properties
+// (storeFile, password, keyAlias, keyPassword) only when the release keystore is configured for
+// the repo; it is gitignored and never committed. Without it the release build falls back to the
+// debug keystore, so dry runs and forks still build. An APK signed by one key cannot be upgraded
+// in place by an APK signed by the other: once the release key ships, it is the key for good.
+val keystoreProperties = Properties().apply {
+    val propFile = rootProject.file("keystore.properties")
+    if (propFile.exists()) {
+        propFile.inputStream().use { load(it) }
+    }
+}
+val hasReleaseKey = keystoreProperties.getProperty("storeFile") != null
+
 android {
     compileSdk = 36
+    signingConfigs {
+        if (hasReleaseKey) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("password")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
     namespace = "com.web4.hestia"
     defaultConfig {
         // Cleartext ON: the app talks to hestia daemons over http:// —
@@ -48,12 +71,10 @@ android {
             // failure class. Revisit with proper tauri keep rules if size
             // matters later.
             isMinifyEnabled = false
-            // Sideload signing: release builds are signed with the debug
-            // keystore until a store-grade key lands (CI secret). Optimized
-            // Rust profile keeps the APK small vs ~535 MB for a
-            // debug-buildType build (dev-profile .so × 4 ABIs — run
-            // 27447945048). Replace with a real signingConfig for stores.
-            signingConfig = signingConfigs.getByName("debug")
+            // Signed with the release key when keystore.properties exists (see the top of this
+            // file), otherwise with the debug keystore. Optimized Rust profile keeps the APK small
+            // vs ~535 MB for a debug-buildType build (dev-profile .so × 4 ABIs — run 27447945048).
+            signingConfig = signingConfigs.getByName(if (hasReleaseKey) "release" else "debug")
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
                     .plus(getDefaultProguardFile("proguard-android-optimize.txt"))

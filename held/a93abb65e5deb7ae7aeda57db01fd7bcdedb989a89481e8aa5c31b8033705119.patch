@@ -1,0 +1,120 @@
+--- a/deploy/install-members.sh
++++ b/deploy/install-members.sh
+@@ -305,6 +305,7 @@
+ first_entry=1
+ any_installed=0
+ any_skipped=0
++seeds_json=""   # identity seeds placed or found, per member (#1250); written into the manifest
+ 
+ # --- PLAN, INSTALL, THEN REGISTER (dp 2026-09-27 #1133; #1142 review 2026-09-28) -----------
+ # "the auto install process is supposed to take care of all this. isn't there a script? editing
+@@ -455,6 +456,7 @@
+ 
+   log "MEMBER $member"
+   member_files_json=""
++  seed_anchor=""
+   for rel in "${files[@]}"; do
+     src="$REPO_ROOT/plugins/$member/$rel"
+     [ -f "$src" ] || die "$member declares '$rel' but $src does not exist"
+@@ -515,6 +517,9 @@
+     # actually went — not where a manifest said they would. An audit that reads this can
+     # now be checked against the live registration instead of against the same claim.
+     member_files_json="$member_files_json{\"file\":\"$base\",\"path\":\"$target\",\"sha256\":\"$src_hash\"},"
++    # Where the hooks actually run from anchors the identity seed below. hydrate.sh's fallback is
++    # $(dirname "$0")/.., so its own directory wins when it is one of the files.
++    if [ -z "$seed_anchor" ] || [ "$base" = "hydrate.sh" ]; then seed_anchor="$target_dir"; fi
+   done
+ 
+   # A member every one of whose files was unregistered installed NOTHING; recording it
+@@ -526,6 +531,69 @@
+     continue
+   fi
+   any_installed=1
++
++  # --- THE MEMBER'S IDENTITY SEED (#1250) ----------------------------------------------------
++  # A member that ships instance/identity.seed.json hydrates its live identity from it at its first
++  # session end: hydrate.sh reads ${<X>_PLUGIN_ROOT:-$(dirname "$0")/..}/instance/identity.seed.json,
++  # the directory ABOVE the one its hooks run from. Nothing installed it there. Kimi's and gemini's
++  # existed on CBP only because they were placed by hand once, codex's was missing (#1245 points
++  # codex's hydrate line at the deploy clone as a stopgap), and a fresh host had none: every
++  # hydrate's `cp "$SEED"` failed silently and the member never got a continuity file. Installed
++  # here, beside the hooks it serves, at a place derived from where those hooks actually went
++  # (invariant 1), never from a declared dest.
++  #
++  # NEVER OVERWRITTEN. Identity is per host: a seed already present is this host's and it is
++  # authoritative (an operator may have customised it -- kimi's README says to -- and the live
++  # identity.json it seeded has accrued state against it). An existing seed is reported and left
++  # byte-for-byte alone, even when it differs from this build's; only an ABSENT seed is written, and
++  # a writer that places one between the check and the move wins (`mv -n`). Recorded in the
++  # manifest's `identity_seeds` as installed or present, and never digested as a governed byte: a
++  # seed is continuity, not law.
++  seed_src="$REPO_ROOT/plugins/$member/instance/identity.seed.json"
++  if [ -f "$seed_src" ] && [ -n "$seed_anchor" ]; then
++    seed_dir="$(dirname "$seed_anchor")/instance"
++    seed_dst="$seed_dir/identity.seed.json"
++    seed_hash="$(sha256sum "$seed_src" | cut -d' ' -f1)"
++    if [ -e "$seed_dst" ] || [ -L "$seed_dst" ]; then
++      seed_state="present"
++      if [ "$(sha256sum "$seed_dst" 2>/dev/null | cut -d' ' -f1)" = "$seed_hash" ]; then
++        log "  ok    identity.seed.json (present) -> $seed_dir"
++      else
++        log "  ok    identity.seed.json (present and differs from this build's; this host's seed is authoritative, left as-is) -> $seed_dir"
++      fi
++    elif [ "$DRY_RUN" = "1" ]; then
++      seed_state="planned"
++      log "  would identity.seed.json -> $seed_dir"
++    else
++      mkdir -p -m 0755 "$seed_dir"
++      seed_tmp="$seed_dir/.identity.seed.json.$$"
++      seed_mv_rc=""
++      install -m 0644 "$seed_src" "$seed_tmp"
++      # mv -n's exit status on a refused overwrite differs across coreutils versions and BSD, so
++      # the OUTCOME is read from the filesystem, never from the status -- and a refusal counts as
++      # a lost race only with the destination there to prove it (Codex notice 20534: a rename
++      # that simply failed used to be recorded as "present" with no seed anywhere, and a current
++      # manifest then stopped every later cycle from retrying it).
++      mv -n "$seed_tmp" "$seed_dst" 2>/dev/null || seed_mv_rc=$?
++      if [ -e "$seed_tmp" ]; then
++        rm -f "$seed_tmp"
++        if [ -e "$seed_dst" ] || [ -L "$seed_dst" ]; then
++          # Another writer placed a seed between the check and the move: theirs stands.
++          seed_state="present"
++          log "  ok    identity.seed.json (appeared during this install; left as-is) -> $seed_dir"
++        else
++          die "$member identity seed was not placed at $seed_dst (mv rc=${seed_mv_rc:-0}, and no seed is there): nothing is recorded as installed"
++        fi
++      else
++        seed_state="installed"
++        # INVARIANT 3: prove the bytes landed.
++        [ -f "$seed_dst" ] && [ "$(sha256sum "$seed_dst" | cut -d' ' -f1)" = "$seed_hash" ] \
++          || die "$member identity seed verify FAILED at $seed_dst"
++        log "  wrote identity.seed.json -> $seed_dir"
++      fi
++    fi
++    seeds_json="$seeds_json{\"member\":\"$member\",\"path\":\"$seed_dst\",\"state\":\"$seed_state\"},"
++  fi
+ 
+   [ $first_entry -eq 1 ] || installed_json="$installed_json,"
+   first_entry=0
+@@ -651,9 +719,9 @@
+ # INVARIANT 4: written last, only after every file verified.
+ mkdir -p "$HESTIA_HOME"
+ tmp="$AUTHORITY.$$.tmp"
+-python3 - "$tmp" "$build_id" "$head_sha" "$installed_json" "$shared_engine_json" <<'PY'
++python3 - "$tmp" "$build_id" "$head_sha" "$installed_json" "$shared_engine_json" "[${seeds_json%,}]" <<'PY'
+ import json, sys, time
+-tmp, build_id, head_sha, installed, shared_engine = sys.argv[1:6]
++tmp, build_id, head_sha, installed, shared_engine, seeds = sys.argv[1:7]
+ json.dump({
+     "build_id": build_id,
+     "head_sha": head_sha,
+@@ -664,6 +732,9 @@
+     # (core/src/server/dashboard.rs's deployment_health), so nothing existing
+     # can be broken by a key it never looks up.
+     "shared_engine": json.loads(shared_engine),
++    # Additive (#1250): each member's identity seed, "installed" by this run or "present" already
++    # (a host's seed is authoritative and never overwritten). Continuity, not law: no digest.
++    "identity_seeds": json.loads(seeds),
+ }, open(tmp, "w"), indent=2, sort_keys=True)
+ PY
+ mv "$tmp" "$AUTHORITY"

@@ -166,6 +166,40 @@ export interface PendingScopeRequest {
   requested_at: number;
   expires_at: number;
   secs_remaining: number;
+  /**
+   * `gate_deny` when the GATE opened this on a refused act (2026-10-05); then `act` is what the
+   * operator rules on and `reason` is the gate's own sentence, not the member's. Absent on an
+   * older daemon, which reads as a member-filed ask.
+   */
+  origin?: "gate_deny" | "member_request";
+  rule?: string | null;
+  tool?: string | null;
+  act?: string | null;
+  reissues?: number;
+  /** The refused reach was a glob over this directory: only a recursive grant covers it. */
+  subtree?: boolean;
+  /** "This act once" is a choice only when the gate recorded an act to bind. */
+  once_available?: boolean;
+  /**
+   * dp, 2026-10-10 (#1232 narrowed): the gate could not enumerate what the refused act reaches
+   * (an expansion decides it), so the request names the ACT — `path` is the act-keyed
+   * `hestia:unpriceable:…` sentinel — and "this act once" is the only grant there is.
+   */
+  once_only?: boolean;
+  /** #1287 part 2: false when the request names no path (an act the gate could not enumerate). */
+  enumerable?: boolean;
+  /**
+   * #1287 part 2: the rulings the decide endpoint ACCEPTS for this request, from the same
+   * function its refusal reads. The card offers exactly these. Absent on an older daemon.
+   */
+  allowed_decisions?: ("once" | "session" | "standing" | "refuse")[];
+  /**
+   * dp, 2026-10-05: NOT-SAME peers invited to decide a gate-opened request. Non-empty = the
+   * request awaits a PEER and the operator's controls are an override; empty = no peer can
+   * clear it (an unproven asker, or no admissible peer) and it is the operator's.
+   */
+  invited_peers?: string[];
+  asker_basis?: "session" | "asserted" | null;
 }
 
 /**
@@ -204,6 +238,89 @@ export interface PendingEscalation {
   /** What else the bar still requires when this operator alone does not suffice. */
   still_needs: string[] | null;
   request_id: string | null;
+  /**
+   * What the retained act would DO, measured by the daemon (`evidence::write_effect`), never
+   * the member's description. Absent when the act is not measurable (then nothing is shown,
+   * rather than a guess). Two shapes: a copy (`cp <source> <governed>`) and, with `kind:
+   * "patch"`, a patch application (`git apply|am`, `patch -i|<`).
+   */
+  write_effect?: WriteEffect | null;
+}
+
+export interface PatchFileStat {
+  path: string;
+  added: number;
+  removed: number;
+  created: boolean;
+  deleted: boolean;
+  /** Present when the patch changes (or, on creation, sets) the file mode. */
+  old_mode?: string;
+  new_mode?: string;
+  renamed_from?: string;
+  copied_from?: string;
+  /** Binary content changes: `added`/`removed` do not count them. */
+  binary?: boolean;
+}
+
+export interface WriteEffect {
+  kind?: "patch";
+  // copy-shaped
+  source?: string;
+  source_readable?: boolean;
+  source_lines?: number;
+  /** false: the source was over the measurement cap (or unreadable) and was NOT read. */
+  source_read?: boolean;
+  source_bytes?: number | null;
+  compared_against?: { path: string; what: string } | null;
+  /** false: the enforcing copy could not be read, so no diff is claimed. */
+  enforcing_read?: boolean;
+  identical_to_enforcing?: boolean;
+  // patch-shaped
+  patch_path?: string;
+  patch_readable?: boolean;
+  /** false: the patch was over the measurement cap and was NOT read; counts are null. */
+  patch_read?: boolean;
+  patch_bytes?: number | null;
+  files?: PatchFileStat[] | null;
+  file_count?: number | null;
+  payload_unbound_reason?: string | null;
+  /**
+   * false whenever `incomplete` names something the summary does not represent (binary
+   * content, an unknown header, a cut hunk, an unsupported diff format...). A surface must
+   * say so: an incomplete summary read as the whole patch is an endorsement of unseen bytes.
+   */
+  summary_complete?: boolean;
+  incomplete?: string[];
+  // both
+  payload_sha256?: string | null;
+  added_lines?: number | null;
+  removed_lines?: number | null;
+  diff?: string[] | null;
+  diff_truncated?: boolean;
+  note?: string;
+}
+
+/**
+ * The app/daemon handshake (web4#904), classified in the Rust shell
+ * (app/src-tauri/src/handshake.rs). `compatible` and `skew` may use operator routes;
+ * every other state means the shell refuses them with `message`.
+ */
+export type CompatState =
+  | "compatible"
+  | "skew"
+  | "incompatible"
+  | "no_version_endpoint"
+  | "malformed"
+  | "unreachable";
+
+export interface Handshake {
+  state: CompatState;
+  app_version: string;
+  app_api_compat: number;
+  daemon_version: string | null;
+  daemon_build_id: string | null;
+  daemon_api_compat: number | null;
+  message: string;
 }
 
 export interface DaemonStatus {
@@ -212,6 +329,8 @@ export interface DaemonStatus {
   signed_in?: boolean;
   operator_lct?: string | null;
   url: string;
+  /** Present since v0.3.0: what is on the other end, and whether this app can talk to it. */
+  handshake?: Handshake;
 }
 
 export interface RemoteEntry {

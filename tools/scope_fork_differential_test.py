@@ -1,98 +1,69 @@
 #!/usr/bin/env python3
-"""Do the forked gate predicates DISAGREE with the shared engine, or only duplicate it?
+"""Does the gemini seat's scope answer AGREE with the hardened shared engine?
 
-`gate_collapse_meter.py` counts forks. A count is not a harm: a seat can define a name the
-shared engine owns and still answer identically, in which case collapsing it is tidiness.
-This asks the next question, which is the one that decides priority:
+History. This file was written as a divergence meter against gemini's forked scope predicates
+(path_in_scope, command_in_scope, _all_repos), which measured strictly fail-open: 6 of 12 rows
+SEAT GRANTS WHAT THE ENGINE DENIES. Those forks were replaced by thin delegates, and the file
+became a wiring pin that lifted the delegates out by AST. One-gate stage C removed the seat's
+predicates altogether: the gemini shim is now pure translation (`to_event`) and the law is the
+common gate's (`hestia_single_gate.normalized_event` -> `hestia_gate_core.evaluate`). So the
+"seat" column below is what the gemini seat's REAL translation produces when it reaches that
+law, for a native gemini `read_file` act on the same input — the path a re-fork would have to
+change to go red.
 
-    for the same input, does the seat's copy return a different verdict?
+WHY THESE INPUTS. Every case is a defect class the shared implementation's OWN DOCSTRING says
+it was hardened against, each naming the report that found it.
 
-and, when it does, which way -- a seat that DENIES more than the engine annoys its member;
-a seat that GRANTS what the engine denies is a hole.
+RATCHET. Pinned: the divergence count may fall, never rise (CI pins 0).
 
-WHY THESE INPUTS. Not random, and not adversarial invention. Every case below is a defect
-class the shared implementation's OWN DOCSTRING says it was hardened against, each naming
-the report that found it. So a divergence is not "two implementations differ" -- it is a
-bug that was already found, already fixed, and is still live in a copy nobody was measuring.
-That is the difference between duplication as debt and duplication as exposure.
+Exit: 0 the pin held; 1 it broke, or the ENGINE disagreed with its pinned answer (which means
+this harness is measuring its own setup and its numbers should not be read at all).
 
-WHAT THIS IS NOT. It does not execute the seat's gate. It lifts the predicate out by AST and
-calls it directly, so an import side effect cannot make the numbers up. It says nothing about
-whether the seat is currently running: a fork in a dormant-but-installed gate is exposure the
-day the seat is woken, and the meter's job is to see it before then, not after.
-
-RATCHET. Pinned like the meter: the divergence count may fall, never rise. Collapsing a
-forked predicate onto the shared one is what drives it to zero.
-
-Exit: 0 the pin held; 1 it broke, or a CONTROL disagreed (which means this harness is lying
-and its numbers should not be read at all).
+Staging seams (unset in the repo and in CI): HESTIA_CONTRACT_OVERLAY, HESTIA_CONTRACT_SHIMS.
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
+import importlib.util
+import json
 import os
-import re
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve()
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "_shared"))
+_OVERLAY = json.loads(os.environ.get("HESTIA_CONTRACT_OVERLAY") or "{}")
+for _n in ("hestia_gate_core", "hestia_governance_closure", "hestia_gate_mechanism",
+           "hestia_single_gate"):
+    if _OVERLAY.get(_n):
+        _s = importlib.util.spec_from_file_location(_n, _OVERLAY[_n])
+        _m = importlib.util.module_from_spec(_s)
+        sys.modules[_n] = _m
+        _s.loader.exec_module(_m)
 
 import hestia_gate_core as core          # noqa: E402
+import hestia_single_gate as gate        # noqa: E402
 
-GATE = ROOT / "plugins" / "gemini" / "hooks" / "before_tool.py"
-# POST-COLLAPSE, THIS IS A WIRING PIN, NOT A DIVERGENCE METER. The gemini forks this file
-# was written against (path_in_scope, command_in_scope, _all_repos, all measured strictly
-# fail-open: 6 of 12 rows SEAT GRANTS WHAT THE ENGINE DENIES) were deleted and replaced by
-# _scope_path/_scope_command, thin fail-closed delegates into hestia_gate_core. The rows
-# below now prove the seat's lifted predicate REACHES the hardened engine and returns its
-# pinned answers -- the property that goes red if anyone re-forks. The engine-answer check
-# stays primary: agreement between two implementations is still not evidence either is right.
-LIFT = {"_scope_path", "_scope_command"}
+GATE = Path(json.loads(os.environ.get("HESTIA_CONTRACT_SHIMS") or "{}").get("gemini")
+            or ROOT / "plugins" / "gemini" / "hooks" / "before_tool.py")
 
 
-def lift(path: Path, workspace: str, home: str, core_mod, profile) -> dict:
-    """Pull the predicates out of the seat module without importing it.
-
-    Importing would run the module's top level -- env reads, config loads, and on some seats
-    a daemon probe. The predicates are what is on trial; the module's startup is not.
-    The delegates close over `_core` and `_CORE_PROFILE` at module scope; the namespace
-    supplies both, bound to the same engine the expected answers are pinned against."""
-    src = path.read_text(encoding="utf-8", errors="replace")
-    lines = src.splitlines()
-    ns = {"os": os, "re": re, "WORKSPACE": workspace, "GEMINI_HOME": home,
-          "_core": core_mod, "_CORE_PROFILE": profile}
-    found = []
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.FunctionDef) and node.name in LIFT:
-            exec("\n".join(lines[node.lineno - 1:node.end_lineno]), ns)
-            found.append(node.name)
-    missing = LIFT - set(found)
-    if missing:
-        # The seat was collapsed, or renamed, or this file is stale. Either way the harness
-        # must not print a comfortable zero: nothing was compared.
-        print(f"cannot determine: {path.name} no longer defines {sorted(missing)}. If the "
-              f"fork was collapsed, delete the case from LIFT and lower the pin.",
-              file=sys.stderr)
-        raise SystemExit(1)
-    return ns
+def load_shim(path: Path):
+    spec = importlib.util.spec_from_file_location("scope_fork_gemini_shim", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def cases(ws: str, home: str):
     """(label, path, expected ENGINE verdict, defect class).
 
-    Every row pins what the hardened engine must answer, not merely that the two
-    implementations agree. An agreement-only control is worthless: the first draft of this
-    file built its synthetic workspace under `/tmp`, so `_under_temp_root` granted every
-    path, engine and seat agreed on True everywhere, four controls "passed", and the harness
-    reported 2 divergences instead of 6. Two implementations can agree by both being wrong.
-
-    Traversal targets are bland directory names on purpose. Spelling a credential directory
-    in a table of STRINGS trips the fleet's own egress scanner -- mention, not perform -- and
-    the segment arithmetic under test does not care what the last component is called."""
+    Every row pins what the hardened engine must answer, not merely that two paths agree: the
+    first draft built its workspace under `/tmp`, so the temp-root carve-out granted every path
+    and four controls "passed" by both sides being wrong. Traversal targets are bland names on
+    purpose (spelling a credential directory trips the fleet's own egress scanner)."""
     return [
         ("sibling-home",      home + "-evil/x",                False, "home judged by SUBSTRING, not boundary (GPT fleet-review blocker 8)"),
         ("home-traversal",    home + "/../elsewhere/x",        False, "traversal OUT of home still reads as home (blocker 8)"),
@@ -115,33 +86,31 @@ def main() -> int:
                     help="ratchet: fail if more inputs diverge than this")
     args = ap.parse_args()
 
-    # Hermetic, and deliberately NOT under a temp dir. Neither predicate touches the disk
-    # (the engine's only fs call is realpath on a home marker, which is defined for paths
-    # that do not exist), so synthetic absolute roots are enough -- and a synthetic root
-    # placed under /tmp would sit inside the engine's own temp-root carve-out and grant
-    # everything, which is exactly how the first draft of this file fooled itself.
+    # Hermetic, and deliberately NOT under a temp dir (see `cases`). Neither side touches the
+    # disk beyond realpath on a home marker, defined for paths that do not exist.
     ws = "/synthetic-workspace"
     home = "/synthetic-member-home"
     scopes = ("granted",)
-    profile = core.HarnessProfile(
-        member_id="gemini",
-        identity_path=home + "/identity.json",
-        home_markers=(home,),
-        launch_cwd_env="HESTIA_GEMINI_LAUNCH_CWD",
-    )
-    seat = lift(GATE, ws, home, core, profile)
+    shim = load_shim(GATE)
+    profile = gate.GateProfile(**{**shim.PROFILE, "identity_path": home + "/identity.json",
+                                  "home_markers": (home,), "observe_dir": None})
+    cprofile = profile.core_profile()
+    policy = core.resolve_agent_policy(
+        cprofile, vault_reader=lambda _m: {"in_scope": list(scopes), "role": "citizen"})
 
-    print(f"gate under test : {GATE.relative_to(ROOT)}")
-    print(f"predicates      : {', '.join(sorted(LIFT))}")
+    print(f"gate under test : {GATE.name} -> hestia_single_gate.normalized_event -> core.evaluate")
     print(f"scopes          : {scopes}")
     print()
-    hdr = f"{'case':<20}{'expect':>8}{'engine':>8}{'seat':>7}   {'':<14}defect class"
-    print(hdr)
+    print(f"{'case':<20}{'expect':>8}{'engine':>8}{'seat':>7}   {'':<14}defect class")
     print("-" * 120)
     diverged, engine_wrong = [], []
     for label, path, expect, why in cases(ws, home):
-        e = core.path_in_scope(path, scopes, ws, profile, cwd=ws)
-        s_ = seat["_scope_path"](path, scopes)
+        e = core.path_in_scope(path, scopes, ws, cprofile, cwd=ws)
+        raw = {"hook_event_name": shim.HARNESS["event"], "tool_name": "read_file",
+               "tool_input": {"absolute_path": path}, "cwd": ws, "session_id": "scope-fork"}
+        verdict = core.evaluate(gate.normalized_event(shim.to_event(gate, raw)), cprofile, ws,
+                                policy=policy)
+        s_ = not verdict.blocks
         if e != expect:
             engine_wrong.append((label, path, expect, e))
         if e != s_:
@@ -150,10 +119,6 @@ def main() -> int:
               f"{('  <-- DIVERGES' if e != s_ else ''):<17}{why}")
     print("-" * 120)
 
-    # The engine's own answers first. If the hardened implementation does not give the
-    # answer its docstring claims, this harness is measuring its own setup (or the engine
-    # regressed), and every divergence below is noise. Either way: stop, do not report a
-    # number. Agreement between two implementations is not evidence that either is right.
     if engine_wrong:
         print("\n::error::the SHARED ENGINE did not give the pinned answer. This harness is "
               "not measuring what it says -- do not read the divergence count.", file=sys.stderr)
@@ -173,7 +138,7 @@ def main() -> int:
     if args.max_divergences is not None:
         print(f"\nratchet divergences: {len(diverged)} vs limit {args.max_divergences}")
         if len(diverged) > args.max_divergences:
-            print(f"::error::forked scope predicates diverge from the shared engine on "
+            print(f"::error::the gemini seat's scope answer diverges from the shared engine on "
                   f"{len(diverged)} inputs, above the pinned {args.max_divergences}",
                   file=sys.stderr)
             return 1

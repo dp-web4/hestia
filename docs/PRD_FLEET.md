@@ -139,6 +139,392 @@ Two surfaces, sharply separated by the hub invariant (*witness, don't control; n
 - Cross-seat evidence composition follows **0018 exactly**: evidence graph, never merged histories; `cross_chain_checkpoint_v1` (signed, non-transitive) after the #313 → B2 substrate lands; no trust auto-propagation in the primitive. A fleet control plane is 0018's first real consumer — and 0018's correction stands: this is *construction of the evidence substrate*, not "hub-seam coordination."
 - Deploy/observability: the per-seat `current-build.json` authority files + the ask-the-process route (issue #577) become the fleet deployment truth the manifest work started.
 
+### 4.4.1 D2 cutover is per edge, explicit, and monotonic
+
+The historical `peer/member` compatibility surface does not disappear in one global
+flag flip. Each exact legacy alias carries a delivery authority:
+
+- `legacy` (default): historical queue/drain remains authoritative; F3 is shadow evidence only.
+- `f3`: the alias translates to its canonical end-member LCT and F3 is the **only**
+  delivery authority. Failure never falls back into the legacy queue.
+
+Changing authority is a separate operator act from creating the alias and requires a reason.
+Deleting an F3-authoritative alias is refused: rollback must first be an explicit
+`f3 -> legacy` authority change with its own reason. This prevents configuration deletion
+from silently moving traffic backwards.
+
+The cutover adapter preserves the shared pre-route contract before choosing a plane:
+authenticated live sender/session, law, structural flood bound, reply ownership/address,
+recipient-liveness evidence, and transport binding. The first witnessed `member_notice`
+freezes the chosen authority, canonical origin/destination, migration reason, and operation
+binding. A retry therefore resumes that first decision even if the alias changes later.
+
+**Retry identity migration.** F3-authoritative `hestia_member_notify` requires caller-stable
+`operation_id`. The exact same value crosses the adapter into D1
+`(canonical origin LCT, operation_id)`; the adapter never derives a packet-local replacement.
+
+**Acceptance migration.** A successful legacy send historically meant the Hub/egress path
+accepted the notice. F3 deliberately strengthens this to one witnessed custody boundary:
+
+- exact destination child durably accepted into its local inbox; or
+- the selected next-hop router's receipt-mode mailbox durably accepted the route packet.
+
+Neither claim means the end recipient has read or acted on the notice. Receipts must name this
+strengthening rather than call it parity.
+
+**Transport-binding preservation.** `direct_required` remains a hard refusal when the actual F3 route requires a network hop; a canonical destination that resolves to a directly-connected local child needs no carrier and remains local. For explicit
+direct/relay bindings, D1 constrains the **actual persisted first-hop interface** to the
+authorized carrier; a preflight comparison is insufficient because routing could change
+between check and send. A bound `reply_to_lct` must equal the canonical sender identity for
+the current F3 packet model; otherwise cutover refuses rather than changing reply identity.
+
+Canonical `lct:web4:mb32:...` destinations are first-class F3 addresses on the same
+`member_notify` surface. This is how an F3-delivered notice can be answered without reviving
+a historical peer/member spelling.
+
+### 4.5 Entity routing is TCP/IP-shaped: unknown means route, not refuse
+
+Web4's graph supplies the addressing semantics; Hestia supplies the local forwarding table.
+The analogy is deliberately broad, but the invariant is the same one that makes packet
+networks composable: **the destination identity is end-to-end; each hop decides only the next
+hop.**
+
+For an addressed LCT, a machine/router resolves in this order:
+
+1. **directly connected child** — a canonical child LCT whose witnessed parent binding names
+   this router; deliver only to that child's inbox;
+2. **specific route** — a known destination (later: a witnessed graph/subtree predicate) has
+   a more-specific next hop;
+3. **default route** — forward to the configured parent/upstream entity most likely to know;
+4. **unreachable** — only when there is no admissible route, a next hop explicitly refuses,
+   or the loop/hop-limit guard is exhausted.
+
+Consequences:
+
+- `Unknown` and `KnownButNotChild` are **demux facts, not terminal transport verdicts**.
+- A router NEVER rewrites the original addressed LCT into its own identity. The next-hop LCT
+  is transport metadata.
+- A directly connected local child whose transport is broken is `local-unavailable`, not
+  default-routed upward; otherwise a stale key/binding can create a loop or deliver the
+  child's mail elsewhere.
+- Every forwarded envelope carries a bounded hop budget / loop evidence. A terminal
+  `unreachable` names the original destination and the router that exhausted/refused the
+  route — ICMP-shaped failure, not silence.
+- The default route is explicit. Parent/upstream is the ordinary configuration, not a name
+  heuristic and not "whichever seat is around."
+- **Routing chooses an inbox; it does not choose a worker.** Delivery remains separate from
+  wake and from the claim-board rule in §4.4.
+
+F3's first implementation is intentionally conservative: direct local child routes, exact
+static routes, one default gateway, and a hop limit. Richer graph-derived routes can replace
+the exact-route matcher later without changing the custody contract or destination identity.
+
+#### 4.5.1 Route, interface and neighbor are different facts
+
+The forwarding implementation keeps the same separation as an IP stack:
+
+- **Route:** end-destination LCT → canonical next-hop LCT. This is a graph/reachability
+  decision and contains no key material.
+- **Router interface:** this router's own Hub member identity + credential handle on one Hub.
+  A router may have several interfaces; an interface may serve several neighbors.
+- **Neighbor:** next-hop LCT → (router interface, next-hop Hub member UUID). This is
+  link/transport resolution, not identity substitution.
+- **Packet:** retains the original destination and origin end-to-end. The next-hop Hub UUID
+  never becomes the packet destination.
+
+The route table may therefore change independently of how a known neighbor is reached, while
+a retry already in custody remains pinned to the interface/link and exact outbound packet that
+were persisted before the first network attempt.
+
+#### 4.5.2 Router transit has its own custody plane
+
+Do **not** reuse the historical member-egress rows for third-party routing. That older plane
+deliberately enforces split horizon: a seat/member forwarding drain is not an arbitrary
+third-party transit router. Relaxing it in place would silently change a security property of
+already-deployed member mesh code.
+
+Router transit instead owns a separate durable state machine:
+
+1. receipt-mode Hub fetch is non-destructive;
+2. open the Hub-sealed body and verify the **exact packet bytes** against the
+   Hub-witnessed hop hash;
+3. authenticate the clear Hub sender as a configured neighbor on **this exact
+   router interface**, and require the packet trace's last router to be that
+   neighbor's canonical LCT;
+4. only after step 3 may the receipt claim `packet_id` in the router's global
+   idempotency namespace;
+5. retain the complete fetched Hub notice and exact accepted route-packet bytes,
+   then witness local receipt staging;
+6. choose and persist one route decision **and exact outbound packet bytes before network I/O**;
+7. cross one custody boundary:
+   - atomic enqueue to the exact local child's inbox,
+   - durable acceptance by the next receipt-mode router,
+   - or a witnessed terminal unreachable / routed unreachable bounce;
+8. witness that completion;
+9. only then ACK the upstream Hub receipt.
+
+Ingress refused at step 3 is a **per-receipt** fact, not a packet fact. Hestia
+witnesses the refusal, persists the complete rejected Hub notice in a separate
+rejection table, and ACKs that receipt without creating a `router_packets` row.
+This ordering is security-critical: an unconfigured Hub citizen must not be able
+to guess a future packet UUID, send different bytes first, and poison the
+router's packet-id namespace.
+
+The same rule handles an already-known packet id arriving with different bytes
+from an otherwise authorized neighbor (for example an alternate-path duplicate
+with a different trace): witness/refuse/ACK that receipt; do not wedge the
+mailbox and do not mutate the first accepted packet.
+
+A crash at any step retries the same packet and the same persisted decision. A route-table
+change after the first attempt cannot silently redirect an in-flight packet.
+
+The transit plane is deliberately more general than a Hestia child inbox. Intermediate
+routers may carry application kinds they do not understand. **At the final Hestia child
+edge**, however, the receiver re-applies the member-notice write contract before enqueue:
+only the ordinary member-addressable kind families are admitted, and the pointer must remain
+a bounded single-line locator with no control characters. A packet that is valid Web4
+transport but invalid Hestia child mail is not inserted into the child inbox; it becomes a
+structured `unreachable` back to the origin. Daemon-only local kinds such as
+`disposition` cannot therefore be forged by a remote neighbor.
+
+Router→router hops use Web4's receipt-only `route_forward` channel operation. A next hop that
+has not opted into non-destructive fetch/ACK is not routable: using a consume-on-response
+mailbox would reintroduce the packet-loss boundary F3 exists to remove.
+
+**Receipt-mode router memberships are dedicated transport identities.** Enrollment is one-way:
+once a Hub member opts into receipt fetch/ACK, the historical destructive `notifications`
+consumer is refused. Therefore a machine/seat member still drained by legacy `hub-watch`
+MUST NOT be reused as an F3 router interface for an incremental edge cutover. Doing so would
+silently turn a one-edge pilot into a whole-mailbox migration.
+
+For migration, each machine provisions a distinct Hub membership/key for its router plane:
+
+- canonical machine/router LCT remains the routed identity;
+- dedicated Hub member UUID is only that router's transport membership;
+- its raw channel key is an unattended credential handle, distinct from seat/member keys;
+- join/admission follows ordinary Hub law;
+- receipt mode is enabled by a separate explicit Hub-operator act after admission;
+- the old seat/machine Hub membership remains untouched until its own measured retirement.
+
+Router membership bootstrap is retry-stable: the UUID/key are persisted **before** the network
+join request. Lost response, pending Sovereign admission, and retry all reuse the same identity;
+the primary Hestia Hub connection is never re-keyed or repointed. After admission, Hestia
+re-resolves the Hub pin and only then binds the dedicated member as a router interface.
+
+**Router interfaces and neighbors require portable certificate evidence before D3 cutover.**
+A router-interface certificate binds, in one versioned payload:
+
+- the canonical key-derived router LCT + router public key;
+- Hub LCT;
+- dedicated Hub member UUID + the Hub-pinned member public key;
+- exact Hestia router-interface binding UUID;
+- successful non-destructive receipt-mode capability proof;
+- issuance time.
+
+The payload is signed independently by **both** the canonical router/Society binding key and
+the dedicated Hub membership key. A verifier re-derives the router LCT from the router public
+key, verifies both signatures over deterministic domain-separated bytes, and then rechecks the
+Hub-member key against the **current live Hub pin**. Possession at issuance is therefore
+necessary but not sufficient after a re-key.
+
+A neighbor binding is not authorized by separately typed `next_hop_lct` and Hub-member UUID.
+The peer certificate is the evidence that those values belong together; the neighbor stores
+that certificate. Old/manual neighbor rows may remain readable for recovery, but they are
+**uncertified** and MUST NOT authorize a D3 legacy→F3 authority flip.
+
+The cutover preflight requires certificate evidence on **both sides of the active hop**:
+the local sending router interface must have its own persisted certificate, and the selected
+peer neighbor must carry the peer certificate. Both certificate member keys are rechecked
+against the live Hub immediately before READY. Missing, invalid, stale, wrong-Hub, or
+wrong-interface evidence is HOLD even when route parity is otherwise perfect.
+
+
+#### 4.5.3 Unreachable is a packet, not an exception
+
+When a data packet reaches a terminal routing failure, the router creates one structured
+`unreachable` packet addressed back to the original origin. It names the original packet,
+failed destination, router that exhausted/refused the route, and reason. That bounce follows
+the same route/default/neighbor machinery as any other packet.
+
+An unreachable packet is never recursively bounced. If its own return route fails, the router
+witnesses that terminal failure locally. This bounds failure traffic and prevents two default
+gateways from generating an error storm about each other's errors.
+
+#### 4.5.4 Origination: operation identity before legacy cutover
+
+A local child enters the F3 plane by **canonical LCT**, not by the historical
+`peer/member` edge syntax. The first additive origination surface therefore takes:
+
+- the canonical origin child LCT;
+- the canonical end-destination LCT;
+- member-notice kind + pointer + content hash;
+- a caller-stable `operation_id`.
+
+The retry key is scoped by origin LCT. Hestia atomically binds
+`(origin_lct, operation_id)` to one randomly generated packet UUID and an immutable send
+binding. Two different canonical origins may therefore use the same operation id independently;
+within one origin, a lost response reuses the first packet and using that id for different
+destination/content is refused. The packet's original hop limit and first persisted route
+decision also remain the ones captured on the first attempt — a configuration change between
+retries cannot silently turn one application act into a different network act.
+
+The operation mapping and packet are operational custody, not a second permanent ledger.
+After witnessed completion and the same retention horizon used by the receive plane, they may
+age out; the witness chain remains the durable evidence.
+
+This slice is intentionally **additive**. The old `peer/member` member-notice path and
+`egress-drain.sh` remain authoritative until a parity slice proves that translating that
+legacy address into a canonical destination preserves sender authorization, reply behavior,
+failure reporting, retry identity, and delivery outcomes. Cutover happens only after that
+measurement.
+
+#### 4.5.5 D2 compatibility aliases: names stop at the edge
+
+The historical address `peer/member` contains **two names**. The old peer resolver can prove
+at most the peer/machine LCT; that is not the identity the message is addressed to. F3 packets
+therefore MUST NOT translate `peer/member` by substituting the peer's router LCT, by prefix
+matching a Hub roster, or by synthesizing an LCT from the member name.
+
+During migration, Hestia holds an explicit compatibility alias:
+
+```
+exact legacy peer/member spelling -> canonical end-member lct:web4:mb32:...
+```
+
+Properties:
+
+- aliases are exact; no prefix or fuzzy match;
+- a local/bare member id is not an alias;
+- source-route-shaped names with more than two components are refused;
+- the alias target must already be a canonical `mb32` identity;
+- changing an alias is remove-then-add, so an identity remap is deliberate and reviewable;
+- the alias is an **edge adapter only**. The legacy spelling never enters a route packet,
+  route table, witness identity, or next-hop decision.
+
+D2 starts in shadow mode. Given a legacy address, the compatibility layer resolves its
+canonical target and runs the ordinary F3 `decide_route` function, returning
+local/forward/unreachable without sending anything. A missing alias is a first-class
+`missing_alias` result, not permission to infer one.
+
+The next slice feeds that same pure evaluator from the live legacy `member_notify` path and
+records legacy-vs-F3 outcomes under real traffic. The historical path remains authoritative
+until the parity falsifiers in #1210 are measured equal.
+
+#### 4.5.6 D2 live shadow: one pre-route contract, two route observations
+
+D2b does **not** implement a second copy of the legacy sender checks. That would make parity
+unprovable because the two paths could drift before routing even begins. Instead, live
+`member_notify` keeps one authoritative pre-route path:
+
+1. attributed live sender/session;
+2. member-notify law gate;
+3. structural flood bound;
+4. reply ownership + disposition-address check;
+5. transport-binding lookup/freeze.
+
+Only after those checks does a routed `peer/member` send evaluate the F3 alias+route table.
+The result is attached to the already-existing `member_notice` / refusal evidence as
+`f3_shadow`. **No F3 packet is emitted.** Legacy local/egress delivery remains authoritative.
+
+For a successful legacy routed enqueue, one paired `member_notice_route_shadow` witness records:
+- the authoritative legacy `member_notice` hash;
+- the durable legacy egress row id / peer;
+- sender/session, kind, pointer, reply binding, liveness and frozen transport stamp;
+- the pure F3 shadow result;
+- `delivery_authority: "legacy"`.
+
+If that additional parity witness cannot be written after the legacy row was already queued,
+the send remains successful and the caller is told that the parity evidence has a gap. Shadow
+instrumentation is observational; it must never become a new delivery failure mode.
+
+Existing refusal witnesses are reused rather than multiplied:
+- `transport_binding_unmet` carries the F3 shadow but remains a shared pre-route refusal;
+- `egress_queue_full` carries the F3 shadow so cutover can distinguish a route mismatch from
+  an explicit migration rule replacing the old queue/backpressure mechanism.
+
+`hestia hub receiver-parity` reads these rows through an event-type-indexed chain query, not a
+global tail window. For successful enqueues it also joins the later `egress_forwarded`
+witness by durable legacy row id. That join is how the report learns what transport actually
+happened; it never re-resolves the old peer name after the fact.
+
+The shadow also projects F3's canonical next-hop router through its configured
+`RouterNeighbor` to the Hub-member UUID F3 would actually address. This keeps the comparison
+namespace-correct: **legacy measured Hub recipient UUID ↔ F3 configured Hub neighbor UUID**,
+not Hub UUID ↔ canonical Web4 LCT.
+
+Classifications:
+- `next_hop_match`: both Hub-member next-hop identities are measured and equal;
+- `next_hop_mismatch`;
+- `legacy_queued_not_forwarded_yet`;
+- `legacy_recipient_unmeasured`: the old drain reported acceptance but not the actual
+  recipient LCT (expected until the corresponding SAGE drain instrumentation is deployed);
+- `f3_missing_neighbor`: F3 selected a canonical next-hop router but cannot resolve it to
+  an executable Hub neighbor;
+- `missing_alias`;
+- `shadow_unavailable`;
+- `route_divergence`;
+- `shared_transport_refusal`;
+- `legacy_queue_refusal`.
+
+Even `next_hop_match` is **next-hop parity only**, not delivery parity. D2 still has to
+measure downstream durable acceptance/read semantics, replies/failures and retry identity
+before cutover. A parity report must never turn missing evidence into equality.
+
+
+#### 4.5.7 D2c retry identity: named migration rule, not parity
+
+Legacy member-mesh historically had no daemon idempotency key. A client timeout was therefore
+`UNDETERMINED`: the write might have committed, but a blind retry could queue a second copy.
+The CLI added a best-effort content ledger to catch measured human/script re-runs, but that
+ledger is not atomic and, more importantly, **content identity is not operation identity**.
+Two intentional notices may be byte-identical.
+
+D2c adds optional `operation_id` to `hestia_member_notify`. Its scope on the legacy seam is
+the authenticated sender plugin id. One operation binds immutable application intent:
+
+```
+(to_plugin_id, kind, pointer_uri, in_reply_to)
+```
+
+and, once witnessed, the first act's session/role/liveness/transport/shadow evidence. The
+semantics are:
+
+- same sender + same operation id + same intent → recover the first result;
+- same sender + same operation id + different intent → refuse;
+- same content + different operation id → a distinct intentional send;
+- different senders may reuse one operation-id spelling;
+- a crash after the witness but before queue admission recovers the first witness by keyed
+  chain lookup and resumes its delivery consequence without re-running mutable law/flood state;
+- local/egress queue admission and the operation receipt commit atomically in the encrypted
+  inbox store;
+- routed operation admission freezes the transport stamp and D2 shadow join record in that
+  same transaction;
+- a lost response after queue commit returns the first queue id / witness receipt;
+- parity shadow witnessing remains observational and can be completed exactly once on replay.
+
+Calls without an operation id keep the historical behavior. The CLI therefore keeps its local
+content-resend guard only for unkeyed sends; keyed sends must reach the daemon so the daemon's
+operation record can arbitrate the retry.
+
+This is an **intentional semantic strengthening** for cutover, not something D2 should try to
+classify as equality. When legacy `peer/member` finally translates into F3 origination, the
+same caller operation id MUST be propagated into the canonical-origin D1 operation key. It
+must not be regenerated at the adapter, because doing so would turn one retryable application
+act back into two network acts.
+
+The cutover falsifier is simple: force the response to disappear at each boundary
+(witness-before-queue, queue-before-response, parity-witness-after-queue), retry with the same
+operation id, and observe exactly one member-notice witness, exactly one queue row, one stable
+queue id, and at most one parity witness. Then repeat with a new operation id and prove the
+identical payload is admitted as a second act.
+
+The first D2c slice deliberately does **not** age out `member_send_ops`. An operation tombstone
+cannot be removed merely because it is old while its egress consequence may still be pending,
+and guessing a retention horizon would turn timeout safety into a time-dependent race. Before
+cutover, pruning must be tied to a witnessed terminal queue/route outcome plus an explicit
+retry horizon; until then, bounded correctness takes precedence over premature cleanup.
+
+
 ## 5. Roles: pairing external and local agents, citizen by default
 
 ### 5.1 Pairing is occupancy — no new mechanism

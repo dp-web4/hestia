@@ -135,7 +135,7 @@ PINS = {
     ('744.grep-pattern-compound', 'right', 'repo'): ('allow', None),
     ('744.grep-pattern-compound', 'right', 'root'): ('allow', None),
     ('744.grep-pattern-compound', 'wrong', 'repo'): ('allow', None),
-    ('744.grep-pattern-compound', 'wrong', 'root'): ('deny', 'python'),
+    ('744.grep-pattern-compound', 'wrong', 'root'): ('allow', None),   # #1241 recut: a grep pattern is text
     ('ctl.granted-absolute-read', 'right', 'repo'): ('allow', None),
     ('ctl.granted-absolute-read', 'right', 'root'): ('allow', None),
     ('ctl.granted-absolute-read', 'wrong', 'repo'): ('allow', None),
