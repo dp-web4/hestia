@@ -273,7 +273,12 @@ impl Snapshot {
         members: &crate::member_registry::MemberRegistry,
         roles: &web4_core::RoleRegistry,
     ) -> Self {
-        Self::build_with_key(vault, &std::fs::read_to_string(home.join("operator.key")), members, roles)
+        let mut read = std::fs::read_to_string(home.join("operator.key"));
+        let snap = Self::build_with_key(vault, &read, members, roles);
+        if let Ok(text) = read.as_mut() {
+            zeroize::Zeroize::zeroize(text);
+        }
+        snap
     }
 
     /// [`Snapshot::build`] with the `operator.key` read already made, so the verifier is parsed
@@ -324,12 +329,30 @@ impl Snapshot {
 /// vault). Content, not size+mtime: equal metadata is not evidence of equal bytes, and a key
 /// replaced under a preserved mtime must not stay trusted. A read error is fingerprinted by its
 /// kind, so a key becoming unreadable also rebuilds.
+///
+/// The key is held as a SHA-256 of the bytes read, never the bytes: `operator.key` carries the
+/// signing secret (`secret_key_hex`), and this struct lives as long as the daemon and derives
+/// `Debug` (#1323 review). The digest of a 32-byte secret is not a route back to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Fingerprint {
     vault_generation: u64,
     members: usize,
     roles: usize,
-    operator_key: Result<String, std::io::ErrorKind>,
+    operator_key: Result<[u8; 32], std::io::ErrorKind>,
+}
+
+/// SHA-256 of the key file's bytes, or the read error's kind (a distinct state: a key that
+/// becomes unreadable must rebuild, and must not compare equal to any content).
+fn key_digest(read: &std::io::Result<String>) -> Result<[u8; 32], std::io::ErrorKind> {
+    use sha2::Digest;
+    match read {
+        Ok(text) => {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&sha2::Sha256::digest(text.as_bytes()));
+            Ok(out)
+        }
+        Err(e) => Err(e.kind()),
+    }
 }
 
 /// The daemon's handle: the cached snapshot, refreshed at every state-lock release whose
@@ -362,22 +385,26 @@ impl DelegationGate {
         members: &crate::member_registry::MemberRegistry,
         roles: &web4_core::RoleRegistry,
     ) {
-        // ONE read: the fingerprint and the verifier come from the same bytes.
-        let key_read = std::fs::read_to_string(self.home.join("operator.key"));
+        // ONE read: the fingerprint and the verifier come from the same bytes. The bytes are
+        // a transient: digested, parsed, then zeroized; only the digest is cached.
+        let mut key_read = std::fs::read_to_string(self.home.join("operator.key"));
         let fp = Fingerprint {
             vault_generation: vault.generation(),
             members: members.iter_sorted().len(),
             roles: roles.len(),
-            operator_key: key_read.as_ref().map(Clone::clone).map_err(|e| e.kind()),
+            operator_key: key_digest(&key_read),
         };
-        {
+        let unchanged = {
             let r = self.cache.read().unwrap_or_else(|p| p.into_inner());
-            if r.as_ref().is_some_and(|(cached, _)| *cached == fp) {
-                return;
-            }
+            r.as_ref().is_some_and(|(cached, _)| *cached == fp)
+        };
+        if !unchanged {
+            let snap = Arc::new(Snapshot::build_with_key(vault, &key_read, members, roles));
+            *self.cache.write().unwrap_or_else(|p| p.into_inner()) = Some((fp, snap));
         }
-        let snap = Arc::new(Snapshot::build_with_key(vault, &key_read, members, roles));
-        *self.cache.write().unwrap_or_else(|p| p.into_inner()) = Some((fp, snap));
+        if let Ok(text) = key_read.as_mut() {
+            zeroize::Zeroize::zeroize(text);
+        }
     }
 
     /// The current snapshot. Never blocks on the state lock.
@@ -801,6 +828,40 @@ pub fn law_section(snap: &Snapshot, plugin_id: &str, role: &str, now: DateTime<U
 mod tests {
     use super::*;
     use web4_core::crypto::KeyPair;
+
+    /// #1323 review: the long-lived cache must hold a digest of operator.key, never its text
+    /// (which carries the signing secret), and a read error must be its own state.
+    #[test]
+    fn cached_fingerprint_holds_no_key_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = crate::vault::Vault::init(dir.path().join("v"), "test-passphrase".into()).unwrap();
+        let secret_hex = hex::encode([7u8; 32]);
+        let text = json!({ "secret_key_hex": secret_hex }).to_string();
+        std::fs::write(dir.path().join("operator.key"), &text).unwrap();
+        let gate = DelegationGate::new(dir.path().to_path_buf());
+        let members = crate::member_registry::MemberRegistry::default();
+        let roles = web4_core::RoleRegistry::new();
+        gate.refresh(&vault, &members, &roles);
+        assert_eq!(
+            gate.snapshot().operator_key,
+            Some(KeyPair::from_secret_bytes(&[7u8; 32]).verifying_key())
+        );
+        let shown = {
+            let c = gate.cache.read().unwrap();
+            let (fp, snap) = c.as_ref().expect("refresh built the cache");
+            assert!(fp.operator_key.is_ok());
+            format!("{fp:?} {snap:?} {gate:?}")
+        };
+        assert!(!shown.contains(&secret_hex), "cache Debug must not carry the secret");
+        assert!(!shown.contains("secret_key_hex"), "cache Debug must not carry the key file text");
+        // Equal content digests equal; a read error is distinct from every content.
+        let read: std::io::Result<String> = Ok(text.clone());
+        assert_eq!(key_digest(&read), key_digest(&Ok(text)));
+        let missing: std::io::Result<String> =
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(key_digest(&missing), Err(std::io::ErrorKind::NotFound));
+        assert_ne!(key_digest(&missing), key_digest(&read));
+    }
 
     #[test]
     fn mode_parses_only_its_three_words() {

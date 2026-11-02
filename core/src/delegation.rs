@@ -435,7 +435,9 @@ pub fn operator_delegator_from(
     vault: &crate::vault::Vault,
     read: &std::io::Result<String>,
 ) -> Result<(Uuid, KeyPair)> {
-    let secret_hex: String = match read {
+    // The secret's transient copies are zeroized on drop (#1323 review). The parsed JSON value
+    // still holds a copy until it drops; serde_json offers no zeroizing value type.
+    let secret_hex: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(match read {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             anyhow::bail!("operator.key exists but could not be read ({e}); refusing to fall back to another key")
         }
@@ -454,13 +456,15 @@ pub fn operator_delegator_from(
                  ai_identity_secret) — a delegation must be signed by the operator's own key, \
                  not a throwaway"
             ))?,
-    };
-    let bytes = hex::decode(secret_hex.trim()).context("operator key is not hex")?;
-    let arr: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("operator key is not 32 bytes"))?;
-    let kp = KeyPair::from_secret_bytes(&arr);
+    });
+    let bytes = zeroize::Zeroizing::new(hex::decode(secret_hex.trim()).context("operator key is not hex")?);
+    let arr: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new(
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("operator key is not 32 bytes"))?,
+    );
+    let kp = KeyPair::from_secret_bytes(&*arr);
     let lct_id = web4_core::derive_lct_id(&kp.verifying_key());
     Ok((agent_key_for_lct(&lct_id), kp))
 }
