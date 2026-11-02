@@ -828,6 +828,27 @@ mod tests {
     }
 
     #[test]
+    fn post_rename_failure_leaves_disk_outcome_ambiguous_to_caller() {
+        let (_dir, path) = temp_path();
+        let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
+        vault.put_document("fixture", "record", b"old".to_vec()).unwrap();
+        let original_generation = vault.generation();
+        storage::fail_next_save_after_rename();
+        assert!(vault.put_document("fixture", "record", b"new".to_vec()).is_err());
+        assert_eq!(vault.get_document("fixture", "record"), Some(b"old".as_slice()));
+        assert_eq!(vault.generation(), original_generation);
+
+        let reopened = Vault::open(path.clone(), "p".into()).unwrap();
+        assert_eq!(reopened.get_document("fixture", "record"), Some(b"new".as_slice()));
+        assert_eq!(reopened.generation(), original_generation + 1);
+        let next = vault.put_document("unrelated", "record", b"later".to_vec());
+        assert!(matches!(next, Err(CoreError::VaultGenerationConflict { .. })));
+        let final_read = Vault::open(path, "p".into()).unwrap();
+        assert_eq!(final_read.get_document("fixture", "record"), Some(b"new".as_slice()));
+        assert!(final_read.get_document("unrelated", "record").is_none());
+    }
+
+    #[test]
     fn init_and_open_round_trip() {
         let (_dir, path) = temp_path();
         let _v = Vault::init(path.clone(), "passphrase".into()).unwrap();
