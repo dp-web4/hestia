@@ -6434,9 +6434,13 @@ async fn scope_standing_recursive_impl(
         .map(|g| g.recursive);
     let live_rows: Vec<(String, bool, String, u64)> = s.scope_requests.values()
         .filter(|r| r.plugin_id == plugin_id && r.reach_path() == path && r.is_live(now))
-        .take(if require_binding { 2 } else { 1 })
+        .take(2)
         .map(|r| (r.id.clone(), r.recursive, r.ext.modes.to_string(), r.expires_at)).collect();
     let live = live_rows.first().cloned();
+    if live_rows.len() > 1 {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "multiple live grants share this path; refresh and resolve them first", "moved": true})));
+    }
     if require_binding {
         let expected_generation = body.get("expected_generation").and_then(|v| v.as_u64());
         let expected_standing = body.get("expected_standing");
@@ -6451,12 +6455,6 @@ async fn scope_standing_recursive_impl(
         {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
                 "error": "expected_generation, expected_standing and expected_live are required"})));
-        }
-        // A snapshot cannot safely name an arbitrary member of several live
-        // grants. Refuse rather than silently choosing a different one.
-        if live_rows.len() > 1 {
-            return (StatusCode::CONFLICT, Json(serde_json::json!({
-                "error": "multiple live grants share this path; refresh and resolve them first", "moved": true})));
         }
         let actual_standing = serde_json::json!(standing_now);
         let actual_live = live.as_ref().map(|(id, rec, modes, expires)|
@@ -6477,6 +6475,13 @@ async fn scope_standing_recursive_impl(
     }
     let standing_changes = standing_now.is_some_and(|cur| cur != recursive);
     let live_changes = live.as_ref().is_some_and(|(_, cur, _, _)| *cur != recursive);
+    // An older client cannot bind the hidden twin. Refuse any paired change,
+    // including one where only the hidden lifetime would actually move.
+    if !require_binding && standing_now.is_some() && live.is_some() && (standing_changes || live_changes) {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "live and standing grants share this path; use a client that shows and binds both",
+            "moved": true})));
+    }
     if !standing_changes && !live_changes {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
             "error": format!("that grant is already {}; nothing to change, nothing witnessed",
@@ -11392,9 +11397,11 @@ mod disposition_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let gen0 = state.lock().await.standing_scope.generation;
-        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
+        let resp = scope_standing_recursive_bound(State(state.clone()), bound_reach_test_gate(), Json(serde_json::json!({
             "plugin_id": "kimi-code", "path": "/w/tree", "recursive": true,
-            "reason": "it works the whole worktree"}))).await.into_response();
+            "reason": "it works the whole worktree", "expected_generation": gen0,
+            "expected_standing": false, "expected_live": {"id":"scope-live-2", "recursive":false,
+                "modes":"rwed", "expires_at":now + 3600}}))).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         {
             let s = state.lock().await;
@@ -11410,8 +11417,11 @@ mod disposition_tests {
                        "the generation the commit ACTUALLY produced, not a prediction");
         }
         // back to exact needs no reason
-        let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
-            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": false}))).await.into_response();
+        let resp = scope_standing_recursive_bound(State(state.clone()), bound_reach_test_gate(), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/tree", "recursive": false,
+            "expected_generation":gen0 + 1, "expected_standing":true,
+            "expected_live":{"id":"scope-live-2", "recursive":true, "modes":"rwed",
+                "expires_at":now + 3600}}))).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(!state.lock().await.has_scope_grant("kimi-code", "/w/tree/child.py"));
     }
@@ -11512,6 +11522,48 @@ mod disposition_tests {
         let response = scope_standing_recursive_bound(State(state.clone()), None, Json(body)).await.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(state.lock().await.recent_chain(50).is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_reach_refuses_hidden_twins_even_when_only_one_would_change() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-bound".into(), live_req("scope-live-bound", "/w/tree", now));
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "r".into(), expires_at: None,
+                request_id: None, recursive: true, modes: crate::server::grant_modes::Modes::ALL,
+            })).unwrap();
+        }
+        let (generation, chain_len) = { let s = state.lock().await;
+            (s.standing_scope.generation, s.recent_chain(50).len()) };
+        let body = serde_json::json!({"plugin_id":"kimi-code", "path":"/w/tree",
+            "recursive": true, "reason":"needed"});
+        let response = scope_standing_recursive(State(state.clone()), Json(body)).await.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.generation, generation);
+        assert_eq!(s.recent_chain(50).len(), chain_len);
+        assert!(s.standing_scope.grants[0].recursive);
+        assert!(!s.scope_requests["scope-live-bound"].recursive);
+    }
+
+    #[tokio::test]
+    async fn legacy_reach_refuses_ambiguous_multiple_live_grants() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        { let mut s = state.lock().await;
+          s.scope_requests.insert("first".into(), live_req("first", "/w/tree", now));
+          s.scope_requests.insert("second".into(), live_req("second", "/w/tree", now)); }
+        let body = serde_json::json!({"plugin_id":"kimi-code", "path":"/w/tree",
+            "recursive":true, "reason":"needed"});
+        let response = scope_standing_recursive(State(state.clone()), Json(body)).await.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let s = state.lock().await;
+        assert!(!s.scope_requests["first"].recursive && !s.scope_requests["second"].recursive);
+        assert!(s.recent_chain(50).is_empty());
     }
 
     /// A no-op (already that reach) is a 409: nothing witnessed, generation unmoved.
