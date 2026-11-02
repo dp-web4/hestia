@@ -15,7 +15,10 @@ This guard reduces accidental collisions; it does not protect against hostile sa
 Set `HESTIA_1314_PATCH_SHA` to the exact digest for `verify.py`; it refuses ambiguous or
 digest-mismatched inputs and reports core/battery/contract mismatches as failures. Other patch
 files receive only this script's partial hunk-context check, not an independent byte-for-byte or
-full patch-engine verification. `sep.sh` now exits
+full patch-engine verification. The shared parser rejects renames, no-newline markers, malformed
+or overlapping hunks, and inconsistent hunk positions/counts. A structural scan of `cb68c3fc`
+found nine unique files and 32 structurally consistent hunks, with no rename or no-newline markers;
+that is not reconstruction. `sep.sh` now exits
 nonzero when any battery arm does, including the historical main arm with expected differences;
 inspect the reported arm results rather than reading that status as an all-green verdict.
 Editing or running these scratch scripts is not approval to apply a held patch or change an

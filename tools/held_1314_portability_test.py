@@ -148,6 +148,21 @@ class ScratchAndPatchTests(unittest.TestCase):
             apply_lib.apply("expected\n", ["@@ -1 +1 @@\n", "?invalid\n"])
         with self.assertRaises(ValueError):
             apply_lib.apply("expected\n", ["@@ -3 +3 @@\n", " expected\n"])
+        for lines in (["@@ -1,2 +1 @@\n", "-expected\n", "+replacement\n"],
+                      ["@@ -1 +2 @@\n", "-expected\n", "+replacement\n"],
+                      ["@@ malformed @@\n", "-expected\n", "+replacement\n"],
+                      ["@@ -1 +1 @@\n", "-expected\n", "+replacement\n",
+                       "\\ No newline at end of file\n"]):
+            with self.subTest(lines=lines), self.assertRaises(ValueError):
+                apply_lib.apply("expected\n", lines)
+        with self.assertRaises(ValueError):
+            apply_lib.split("diff --git a/x b/y\n")
+        self.assertEqual(apply_lib.apply("old\n", ["@@ -0,0 +1 @@\n", "+new\n"]),
+                         "new\nold\n")
+        self.assertEqual(apply_lib.apply("old\n", ["@@ -1 +0,0 @@\n", "-old\n"]), "")
+        self.assertEqual(apply_lib.apply("a\nb\nc\n", [
+            "@@ -1 +1 @@\n", "-a\n", "+A\n",
+            "@@ -3 +3,2 @@\n", " c\n", "+d\n"]), "A\nb\nc\nd\n")
 
     def test_verifier_fails_on_synthetic_reconstruction_mismatch(self):
         # Neither real repository data nor a held patch is read: git and the
