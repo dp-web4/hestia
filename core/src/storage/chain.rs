@@ -2631,6 +2631,26 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_refuses_to_replace_a_destination_with_an_open_writer() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let destination_path = dir.path().join("destination.db");
+        let source = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        source.append("source-event", json!({"n": 1}), "test-signer").unwrap();
+        let destination = SqliteChainStore::open(&destination_path, TEST_KEY).unwrap();
+        destination.append("destination-event", json!({"n": 2}), "test-signer").unwrap();
+
+        let result = SqliteChainStore::backup_encrypted(&source_path, &destination_path, TEST_KEY);
+        if result.is_ok() {
+            if let Err(error) = SqliteChainStore::open(&destination_path, TEST_KEY) {
+                panic!("snapshot reported success, but destination cannot be reopened: {error:#}");
+            }
+        }
+        assert!(result.is_err(), "replacing an open SQLite database risks reusing its WAL: {result:?}");
+        assert_eq!(destination.read_recent(10).unwrap()[0].event_type, "destination-event");
+    }
+
+    #[test]
     fn snapshot_source_removed_after_check_is_not_recreated() {
         let dir = TempDir::new().unwrap();
         let source_path = dir.path().join("source.db");
