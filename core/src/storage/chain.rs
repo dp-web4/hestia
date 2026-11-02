@@ -530,8 +530,19 @@ impl SqliteChainStore {
         destination_path: impl AsRef<Path>,
         key: [u8; 32],
     ) -> Result<()> {
-        let source_path = source_path.as_ref();
-        let destination_path = destination_path.as_ref();
+        Self::backup_encrypted_after_alias_check(
+            source_path.as_ref(), destination_path.as_ref(), key, || {},
+        )
+    }
+
+    // The callback allows tests to exercise a filesystem change immediately
+    // after path validation; normal callers always pass a no-op.
+    fn backup_encrypted_after_alias_check<F: FnOnce()>(
+        source_path: &Path,
+        destination_path: &Path,
+        key: [u8; 32],
+        after_alias_check: F,
+    ) -> Result<()> {
         anyhow::ensure!(
             source_path != destination_path,
             "chain snapshot destination must differ from its source"
@@ -542,6 +553,7 @@ impl SqliteChainStore {
             })?;
         }
         refuse_snapshot_alias(source_path, destination_path)?;
+        after_alias_check();
         if destination_path.exists() {
             std::fs::remove_file(destination_path).with_context(|| {
                 format!(
@@ -2552,6 +2564,24 @@ mod tests {
         let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY);
         assert!(!source_path.exists(), "a read-only snapshot must not create its source");
         assert!(result.is_err(), "a missing source must not produce an empty snapshot");
+    }
+
+    #[test]
+    fn snapshot_source_removed_after_check_is_not_recreated() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let snapshot_path = dir.path().join("existing.db");
+        drop(SqliteChainStore::open(&source_path, TEST_KEY).unwrap());
+        std::fs::write(&snapshot_path, b"keep existing destination").unwrap();
+
+        let result = SqliteChainStore::backup_encrypted_after_alias_check(
+            &source_path, &snapshot_path, TEST_KEY,
+            || std::fs::remove_file(&source_path).unwrap(),
+        );
+
+        assert!(!source_path.exists(), "a removed source must not be recreated");
+        assert!(result.is_err(), "a removed source cannot produce a snapshot");
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination");
     }
 
     #[test]
