@@ -819,6 +819,14 @@ is the operator's. The record names the peer (`granted_by: peer:<id>`), the chan
 the queue and peer rulings read-only and keep the operator's override and revoke; the queue is
 announced as awaiting the operator only for requests no peer can clear.
 
+**What a peer reads before it rules (#1450 phase 0 follow-up, 2026-11-02).** `hestia_scope_status`
+answers only for the member whose session asks (#1460), so it cannot show a peer another member's
+request. `hestia_scope_request_view` (`request_id` + the peer's own `session_id`) serves the ONE
+request: asker, path, refused act, reason, status, and `may_decide`, the directions this peer may
+rule. It goes only to a member `hestia_scope_peer_decide` would let rule it, by the same
+eligibility (live session, never the asker or its aliases, `arbiter::eligibility_for`), and it
+never carries the asker's grants, floor or other requests.
+
 **The decision** (`POST /api/scope/decide` for the operator's override, both surfaces,
 `docs/operator-surfaces`; the same rules for a peer):
 duration — `once` (gate-opened requests only: they recorded an act to bind), session (memory,
