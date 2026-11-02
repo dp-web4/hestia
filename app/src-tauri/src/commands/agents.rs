@@ -98,10 +98,10 @@ fn retire_outcome(status: reqwest::StatusCode, body: serde_json::Value) -> Resul
 
 fn reinstate_outcome(status: reqwest::StatusCode, body: serde_json::Value) -> Result<serde_json::Value, String> {
     if status.is_success() {
-        // Older daemons report a committed reinstatement with HTTP 200 when
-        // the terminal append fails. Preserve that evidence, not a clean success.
+        // Older daemons report a committed reinstatement as 200 even when its
+        // terminal witness append failed; the explicit null preserves that evidence.
         if body.get("intentEntryHash").is_some()
-            && body.get("witnessEntryHash").is_some_and(serde_json::Value::is_null)
+            && body.get("witnessEntryHash").is_some_and(|v| v.is_null())
         {
             return Ok(serde_json::json!({ "outcome": "reinstated_unrecorded", "result": body }));
         }
@@ -310,6 +310,26 @@ mod tests {
         })).unwrap();
         assert_eq!(old_daemon["outcome"], "reinstated_unrecorded");
         assert_eq!(old_daemon["result"]["intentEntryHash"], "intent-old");
+    }
+
+    #[test]
+    fn old_daemon_reinstatement_with_null_witness_is_unrecorded() {
+        let legacy = json!({
+            "ok": true, "plugin_id": "member", "retired": false, "generation": 3,
+            "intentEntryHash": "intent", "witnessEntryHash": null,
+            "grants_not_restored": ["/w/a"]
+        });
+        let out = reinstate_outcome(StatusCode::OK, legacy.clone()).unwrap();
+        assert_eq!(out["outcome"], "reinstated_unrecorded");
+        assert_eq!(out["result"], legacy);
+
+        let recorded = reinstate_outcome(StatusCode::OK, json!({
+            "intentEntryHash": "intent", "witnessEntryHash": "terminal"
+        })).unwrap();
+        assert_eq!(recorded["outcome"], "reinstated");
+        // Missing is not the older daemon's explicit failure signal.
+        let missing = reinstate_outcome(StatusCode::OK, json!({"ok": true})).unwrap();
+        assert_eq!(missing["outcome"], "reinstated");
     }
 
     /// Last edit wins in the engine; the app must not overwrite a retirement it did not see.
