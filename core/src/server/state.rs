@@ -2737,6 +2737,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canceled_detached_audit_does_not_allow_an_overlapping_reader() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_dir, raw) = make_state();
+        let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task_state = state.clone();
+        let first = tokio::spawn(async move {
+            verify_standing_projection_with(&task_state, move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Err(anyhow::anyhow!("synthetic reader released"))
+            }).await
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second_started = Arc::new(AtomicBool::new(false));
+        let seen = second_started.clone();
+        let _ = verify_standing_projection_with(&state, move |_| {
+            seen.store(true, Ordering::SeqCst);
+            Err(anyhow::anyhow!("synthetic second reader"))
+        }).await;
+        // Always release the blocking worker before asserting, including on the
+        // intentionally failing baseline, so a failed test cannot hang runtime shutdown.
+        release_tx.send(()).unwrap();
+        assert!(!second_started.load(Ordering::SeqCst),
+                "canceling the waiter must not release the reader's capacity");
+        let s = state.lock().await;
+        assert!(s.standing_projection_audit.as_ref().map_or(true, |a| !a.matches),
+                "a busy or canceled read must never publish a successful audit");
+    }
+
+    #[tokio::test]
     async fn an_older_detached_audit_cannot_replace_a_newer_attempt() {
         let (_dir, raw) = make_state();
         let state = Arc::new(super::super::state_lock::StateCell::new(raw));
