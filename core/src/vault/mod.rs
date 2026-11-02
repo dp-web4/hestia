@@ -604,6 +604,36 @@ mod tests {
     }
 
     #[test]
+    fn failed_single_document_save_does_not_change_live_document() {
+        let (_dir, path) = temp_path();
+        let mut vault = Vault::init(path, "p".into()).unwrap();
+        vault.put_document("scope", "standing", b"old".to_vec()).unwrap();
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+
+        assert!(vault.put_document("scope", "standing", b"failed".to_vec()).is_err());
+        assert_eq!(vault.get_document("scope", "standing").unwrap(), b"old");
+        assert!(vault.put_document("scope", "new", b"failed".to_vec()).is_err());
+        assert!(vault.get_document("scope", "new").is_none());
+    }
+
+    #[test]
+    fn failed_single_document_save_cannot_ride_on_later_unrelated_save() {
+        let (_dir, path) = temp_path();
+        let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
+        vault.put_document("scope", "standing", b"old".to_vec()).unwrap();
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+        assert!(vault.put_document("scope", "standing", b"failed".to_vec()).is_err());
+        assert_eq!(Vault::open(path.clone(), "p".into()).unwrap()
+            .get_document("scope", "standing").unwrap(), b"old");
+
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        vault.put_document("unrelated", "record", b"new".to_vec()).unwrap();
+        let reopened = Vault::open(path, "p".into()).unwrap();
+        assert_eq!(reopened.get_document("scope", "standing").unwrap(), b"old");
+        assert_eq!(reopened.get_document("unrelated", "record").unwrap(), b"new");
+    }
+
+    #[test]
     fn init_and_open_round_trip() {
         let (_dir, path) = temp_path();
         let _v = Vault::init(path.clone(), "passphrase".into()).unwrap();
