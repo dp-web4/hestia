@@ -2585,6 +2585,22 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_source_removed_after_check_preserves_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let snapshot_path = dir.path().join("existing.db");
+        drop(SqliteChainStore::open(&source_path, TEST_KEY).unwrap());
+        std::fs::write(&snapshot_path, b"keep existing destination").unwrap();
+
+        let _result = SqliteChainStore::backup_encrypted_after_alias_check(
+            &source_path, &snapshot_path, TEST_KEY,
+            || std::fs::remove_file(&source_path).unwrap(),
+        );
+
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination");
+    }
+
+    #[test]
     fn online_backup_includes_wal_frames_and_stays_encrypted() {
         let dir = TempDir::new().unwrap();
         let source_path = dir.path().join("live.db");
