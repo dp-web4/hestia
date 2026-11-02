@@ -6649,7 +6649,8 @@ async fn agent_delegation_revoke(
     };
     if let Err(e) = store.revoke(deleg_id).and_then(|_| store.save(&mut s.vault)) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("still in force: {e}"), "intentEntryHash": intent.hash })));
+            "error": format!("revocation outcome is unknown: {e}. Inspect and reconcile the delegation state and witness before retrying"),
+            "intentEntryHash": intent.hash })));
     }
     let mut done = record;
     if let Some(m) = done.as_object_mut() { m.insert("intent".into(), serde_json::json!(intent.hash)); }
