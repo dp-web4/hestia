@@ -268,6 +268,9 @@ hestia/
 
 ## Versions and releases
 
+Before an upgrade, check the [operator upgrade notes](docs/UPGRADE_NOTES.md) for audit-format
+changes and their verification steps. An item listed there applies only once a release includes it.
+
 **One version, one tag.** The daemon (`core`), the desktop app (`app`: `package.json`,
 `src-tauri/Cargo.toml`, `tauri.conf.json`), the shared wire crate (`wire`) and the three plugin
 SDKs release in lockstep (dp, 2026-10-11; web4#904). The number lives in the root
