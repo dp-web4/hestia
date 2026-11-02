@@ -747,6 +747,27 @@ mod tests {
     }
 
     #[test]
+    fn witness_vouch_false_must_not_imply_no_effect_after_rename() {
+        let (dir, mut vault) = fresh_vault();
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let key = web4_core::crypto::KeyPair::generate();
+        let pubkey = key.verifying_key();
+        crate::vault::storage::fail_next_save_after_rename();
+        let ok = vouch_witnessing_key(&mut vault, &mut registry, "test-seat", pubkey.clone());
+        let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let disk_has_key = load_members_checked(&reopened).unwrap().get("test-seat").unwrap()
+            .operational_key_for(web4_core::WITNESS_PURPOSE) == Some(pubkey.clone());
+        let memory_has_key = registry.get("test-seat").unwrap()
+            .operational_key_for(web4_core::WITNESS_PURPOSE) == Some(pubkey);
+        assert!(!ok && disk_has_key && !memory_has_key,
+                "fault must reproduce an ambiguous saved effect, not a pre-commit failure");
+        // The current bool return cannot represent this third state. This
+        // expectation remains red until callers can handle unknown outcomes.
+        assert!(ok || !disk_has_key, "false cannot be interpreted as proof of no durable effect");
+    }
+
+    #[test]
     fn ensure_member_mints_persists_and_is_idempotent() {
         let (_dir, mut vault) = fresh_vault();
         let mut reg = MemberRegistry::default();
