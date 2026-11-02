@@ -5809,6 +5809,47 @@ mod retirement_authority_cli_tests {
         assert!(format!("{err:#}").contains("loading retirement authority"));
         assert_eq!(std::fs::read(&path).unwrap(), before, "refusal must not modify the vault");
     }
+
+    #[test]
+    fn unreadable_member_registry_must_not_hide_retired_delegation_target() {
+        if std::env::var_os("HESTIA_SYNTHETIC_REGISTRY_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("cli::retirement_authority_cli_tests::unreadable_member_registry_must_not_hide_retired_delegation_target")
+                .arg("--test-threads=1")
+                .env("HESTIA_SYNTHETIC_REGISTRY_CHILD", "1")
+                .env("HESTIA_PASSPHRASE", "synthetic-passphrase")
+                .output().unwrap();
+            assert!(output.status.success(), "child test failed: {} {}",
+                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = vault_path(dir.path());
+        let mut vault = Vault::init(path.clone(), "synthetic-passphrase".into()).unwrap();
+        let mut registry = hestia::member_registry::load_members(&vault);
+        let lct = hestia::member_registry::ensure_member(&mut vault, &mut registry,
+            "test-seat", false, "", "synthetic-anchor").expect("synthetic member persisted");
+        let agent = delegation::agent_key_for_lct(&lct).to_string();
+        let mut retired = hestia::server::retirement::RetirementStore::default();
+        retired.retire(hestia::server::retirement::RetiredMember {
+            plugin_id: "test-seat".into(), retired_at: 1, reason: "synthetic".into(),
+            evidence_ref: "test".into(), revoked_paths: vec![], was_active: false,
+            retired_by: "test".into(),
+        });
+        hestia::server::retirement::save(&mut vault, &retired).unwrap();
+        vault.put_document("members", "registry", b"not json".to_vec()).unwrap();
+        drop(vault);
+        std::fs::write(dir.path().join("operator.key"),
+            serde_json::json!({"secret_key_hex": hex::encode([7u8; 32])}).to_string()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result = cmd_delegate_grant(dir.path(), &agent, vec!["witness".into()], vec![], None);
+        let after = std::fs::read(&path).unwrap();
+        assert!(result.is_err() && before == after,
+                "an unreadable identity map must not authorize the retired key; result_ok={}, vault_changed={}",
+                result.is_ok(), before != after);
+    }
 }
 
 /// Print the delegation key for a seat (#952). Reads the member registry, derives the
