@@ -11908,6 +11908,17 @@ mod disposition_tests {
         assert_eq!(response.0["vault_revocation_saved"], true);
         assert_eq!(response.0["witness_status"], "unknown");
         assert!(response.0["intentEntryHash"].is_string());
+
+        // A retry may succeed only if it can also account for the missing
+        // terminal record; otherwise it must preserve the unresolved outcome.
+        let (retry_status, retry_response) = agent_delegation_revoke(
+            State(state.clone()), Path(("test-seat".into(), id)),
+            Json(serde_json::json!({"reason": "synthetic retry"})),
+        ).await;
+        let after_retry = state.lock().await.recent_chain(50);
+        let has_terminal = after_retry.iter().any(|e| e.event_type == "delegation_revoked");
+        assert!(retry_status != StatusCode::OK || has_terminal,
+                "retry reported success without a terminal record: {}", retry_response.0);
     }
 
     /// dp's fourth ask, the half #1079 left: manage an agent's delegated authority from the
