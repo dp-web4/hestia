@@ -735,6 +735,10 @@ mod tests {
         }
         let report = summarize(&HashMap::new(), 7, 0, &Utc::now(), &[]);
         assert_eq!(report["outcome_limitation"], OUTCOME_LIMITATION);
+        let limitation = report["outcome_limitation"].as_str().unwrap();
+        assert!(limitation.contains("refusal lift"));
+        assert!(limitation.contains("grant edit"));
+        assert!(limitation.contains("not linked to requests"));
         assert!(render_markdown(&report).contains(OUTCOME_LIMITATION));
     }
 
