@@ -97,6 +97,48 @@ def strict_apply(old_text, section):
     return "".join(out)
 
 
+def repair_cache(source):
+    """Transform the neutral candidate only; refuse source drift, never edit the gate."""
+    old = '''    st = os.stat(path)
+    key = (path, reader, st.st_mtime_ns, st.st_size)
+    hit = _CONFIG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    out = _load_config_uncached(path, reader)
+    _CONFIG_CACHE[key] = out
+    return out
+
+
+def _load_config_uncached(path: str, reader: str):
+    with open(path, "rb") as fh:
+        raw = fh.read()
+'''
+    new = '''    # Parse exactly the bytes compared to the cached entry. File metadata can
+    # collide on equal-size rapid rewrites, and a second read can race a rename.
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    key = (path, reader)
+    hit = _CONFIG_CACHE.get(key)
+    if hit is not None and hit[0] == raw:
+        return hit[1]
+    out = _load_config_uncached(raw, reader)
+    _CONFIG_CACHE[key] = (raw, out)
+    return out
+
+
+def _load_config_uncached(raw: bytes, reader: str):
+'''
+    old_doc = '''    Cached on (path, reader, mtime, size): the timeout bound and the registered-surface read
+    parse each registration once per process, and a changed file is re-read. The cached
+    document is what keeps every marked object alive, so a mark's identity holds across hits.'''
+    new_doc = '''    Cached by path and reader only while the bytes are identical: the timeout bound and
+    registered-surface read parse unchanged content once per process. The cached document
+    keeps every marked object alive, so a mark's identity holds across hits. This does not
+    guarantee that the file remains unchanged after the read.'''
+    assert source.count(old) == 1 and source.count(old_doc) == 1, "cache transform drift"
+    return source.replace(old, new).replace(old_doc, new_doc)
+
+
 def main():
     change = sections((HERE / "source-1262.diff").read_text(encoding="utf-8"))
     assert set(change) <= set(SOURCES), set(change) - set(SOURCES)
@@ -105,6 +147,8 @@ def main():
     for path, name in SOURCES.items():
         patched[path] = (apply_offset_tolerant(path, change[path], blob(path).decode())
                          if path in change else blob(path).decode())
+        if path == "plugins/_shared/hestia_single_gate.py":
+            patched[path] = repair_cache(patched[path])
         (OUT / name).write_text(patched[path], encoding="utf-8")
 
     sys.path.insert(0, str(WT / "tools"))

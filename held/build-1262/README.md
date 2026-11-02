@@ -39,3 +39,22 @@ build's neutral copies overlaid):
 Governed (plugins/_shared, hooks-gt): it needs dp's escalation. `git apply` of the patch on a
 `main` worktree at `95d6d0b7`, then the test above unmodified. If main has moved, re-run
 `build_1262.py <worktree> <out>`, which re-cuts offset-tolerantly or stops.
+
+## Review-only cache experiment
+
+The builder on the review branch additionally transforms the neutral gate candidate to read
+each registration once and cache a parse only while the bytes are identical. It keeps one entry
+per path and reader, and preserves duplicate-key evidence. This addresses the reported same-size,
+same-mtime collision; it does **not** prove that the registration remains stable after the read.
+The transform refuses source drift and does not edit the governed gate.
+
+Against base `827b3e7da93b00321adc0e2c5253246457213b81`, two independent output directories
+produced SHA-256 `e612a448a1ac59da2381a9aee0cc72960dd7faa58b28a280c7f6d66df05f0aa9`.
+`cache_contract_test.py <base-worktree> <output>/sg_rev.py` tests equal metadata with changed
+bytes, malformed replacement, one-read parsing, reader isolation and duplicate marks. Its
+same-metadata arm fails against the prior candidate and passes against this one. These are
+synthetic tests, not deployment evidence. The contract runner now propagates pipeline failures.
+
+The output is a **held artifact**, not an applied patch: independent source, regression,
+compatibility and exact-base reviews plus the applicable operator approval remain required.
+Do not run the applying instructions above on the strength of this experiment.

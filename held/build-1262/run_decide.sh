@@ -2,6 +2,7 @@
 # The #1262 decide() contract against a main worktree with build_1262.py's neutral copies overlaid.
 # argv: <main worktree> <build out dir> [gate copy to overlay instead of <out>/sg_rev.py]
 # Run the worktree from under the shared checkout, not /tmp (a /tmp fixture is implicitly granted).
+set -o pipefail
 WT="$1"
 OUT="$2"
 GATE="${3:-$OUT/sg_rev.py}"
