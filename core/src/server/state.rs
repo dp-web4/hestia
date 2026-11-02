@@ -2601,6 +2601,33 @@ mod tests {
         (dir, state)
     }
 
+    #[test]
+    fn retirement_unreadable_malformed_vault_document_refuses_startup() {
+        let dir = TempDir::new().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        vault.put_document("members", "retired", b"not json".to_vec()).unwrap();
+        assert!(ServerState::open(vault, dir.path(), "p").is_err(),
+                "unreadable retirement authority must not be treated as an empty list");
+    }
+
+    #[test]
+    fn retirement_unreadable_sealed_vault_document_refuses_startup() {
+        let dir = TempDir::new().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        vault.seal_document("members", "retired", b"{}", "other-key").unwrap();
+        assert!(ServerState::open(vault, dir.path(), "p").is_err(),
+                "a present sealed authority record must not be treated as absent");
+    }
+
+    #[test]
+    fn retirement_unreadable_malformed_legacy_document_refuses_startup() {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        std::fs::write(dir.path().join("retired-members.json"), b"not json").unwrap();
+        assert!(ServerState::open(vault, dir.path(), "p").is_err(),
+                "an unreadable legacy retirement record must not become an empty list");
+    }
+
     /// B2 (#339): the daemon's chain rows are witnessed by the Society key, name the real
     /// key-derived sovereign LCT rather than the placeholder anchor, and bind the published
     /// policy generation — which moves when the law does.
