@@ -1676,7 +1676,7 @@ impl ServerState {
     /// the operator's intent is the one in memory. Choosing silently would make the verifier
     /// an authority, which is exactly what the ruling says it must not be.
     pub fn verify_standing_projection(&self, now: u64) -> Result<crate::server::standing_scope::ProjectionAudit> {
-        use crate::server::standing_scope::{ProjectionAudit, StandingScopeStore};
+        use crate::server::standing_scope::{ProjectionAudit, ProjectionAuditStatus, StandingScopeStore};
         // `load_doc(&self.vault, ...)` reads the already-open Vault's document
         // cache, not the durable file. Reopen it so a lost, unreadable or older
         // file cannot be certified by a matching in-memory copy.
@@ -1685,7 +1685,10 @@ impl ServerState {
             crate::vault::load_doc(&durable_vault, "scope", "standing", "standing-scope.json")?;
         let divergence = self.standing_scope.divergence_from(&vault_copy);
         Ok(ProjectionAudit {
-            verified_at: now,
+            verified_at: Some(now),
+            attempted_at: Some(now),
+            status: if divergence.is_empty() { ProjectionAuditStatus::ObservedMatch }
+                    else { ProjectionAuditStatus::ObservedDivergence },
             matches: divergence.is_empty(),
             runtime_generation: self.standing_scope.generation,
             vault_generation: vault_copy.generation,
@@ -2615,7 +2618,7 @@ where
     F: FnOnce(crate::vault::DetachedVaultReader)
         -> anyhow::Result<(u64, u64, crate::server::standing_scope::StandingScopeStore)> + Send + 'static,
 {
-    use crate::server::standing_scope::ProjectionAudit;
+    use crate::server::standing_scope::{ProjectionAudit, ProjectionAuditStatus};
     let (attempt, instance, generation, revision, runtime, reader, permit) = {
         let mut s = state.lock().await;
         let Ok(permit) = s.standing_projection_reader_slot.clone().try_acquire_owned() else {
@@ -2647,7 +2650,9 @@ where
         return false;
     }
     let failure = |s: &ServerState, why: &str| ProjectionAudit {
-        verified_at: observed_at,
+        verified_at: None,
+        attempted_at: Some(observed_at),
+        status: ProjectionAuditStatus::Unverifiable,
         matches: false,
         runtime_generation: s.standing_scope.generation,
         vault_generation: 0,
@@ -2673,7 +2678,10 @@ where
         divergence.push("durable vault generation differs from the open vault".to_owned());
     }
     let audit = ProjectionAudit {
-        verified_at: read_at,
+        verified_at: Some(read_at),
+        attempted_at: Some(observed_at),
+        status: if divergence.is_empty() { ProjectionAuditStatus::ObservedMatch }
+                else { ProjectionAuditStatus::ObservedDivergence },
         matches: divergence.is_empty(),
         runtime_generation: runtime.generation,
         vault_generation: durable.generation,
@@ -2728,6 +2736,21 @@ mod tests {
         let wire = serde_json::to_value(audit).unwrap();
         assert!(wire["verified_at"].is_null(), "a failed read did not observe the vault");
         assert!(wire["attempted_at"].is_u64(), "the failed attempt remains observable");
+        assert_eq!(wire["status"], "unverifiable");
+    }
+
+    #[test]
+    fn legacy_projection_audit_does_not_invent_new_evidence_fields() {
+        use crate::server::standing_scope::{ProjectionAudit, ProjectionAuditStatus};
+        let legacy = serde_json::json!({
+            "verified_at": 123, "matches": true,
+            "runtime_generation": 1, "vault_generation": 1,
+            "runtime_digest": "synthetic", "vault_digest": "synthetic", "divergence": []
+        });
+        let audit: ProjectionAudit = serde_json::from_value(legacy).unwrap();
+        assert_eq!(audit.verified_at, Some(123));
+        assert_eq!(audit.attempted_at, None);
+        assert_eq!(audit.status, ProjectionAuditStatus::Unverifiable);
     }
 
     #[tokio::test]
@@ -2760,6 +2783,8 @@ mod tests {
         let s = state.lock().await;
         let audit = s.standing_projection_audit.as_ref().unwrap();
         assert!(!audit.matches && audit.divergence.iter().any(|d| d.contains("changed during")));
+        assert_eq!(audit.verified_at, None, "a stale comparison is not a current observation");
+        assert_eq!(audit.status, crate::server::standing_scope::ProjectionAuditStatus::Unverifiable);
     }
 
     #[tokio::test]
@@ -2881,7 +2906,9 @@ mod tests {
         let s = state.lock().await;
         let audit = s.standing_projection_audit.as_ref().unwrap();
         assert!(!audit.matches && audit.divergence.iter().any(|d| d.contains("generation differs")));
-        assert_eq!(audit.verified_at, 123, "freshness is the observation time, not the completion time");
+        assert_eq!(audit.verified_at, Some(123), "freshness is the observation time, not the completion time");
+        assert_eq!(audit.status, crate::server::standing_scope::ProjectionAuditStatus::ObservedDivergence);
+        assert!(audit.attempted_at.is_some());
     }
 
     #[tokio::test]

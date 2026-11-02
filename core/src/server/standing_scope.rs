@@ -266,15 +266,33 @@ impl AuthorityStatus {
     }
 }
 
-/// One periodic proof that the runtime projection still equals the vault's authority.
+/// Result of a periodic runtime-versus-vault comparison.
 ///
 /// dp's ruling, 2026-08-29: "on a clock, compare vault truth to every published/runtime
 /// projection, report a freshness timestamp and exact divergence ... Silence is not health."
-/// So this carries a timestamp even when it matches, because a verifier that only speaks up
-/// on failure is indistinguishable from one that stopped running.
+/// `verified_at` is an observation time only when a comparison was actually made;
+/// `attempted_at` records a completed attempt even when the durable read failed.
+/// A comparison is an observation, not a lease against later changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionAuditStatus {
+    ObservedMatch,
+    ObservedDivergence,
+    #[default]
+    Unverifiable,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProjectionAudit {
-    pub verified_at: u64,
+    /// Absent when no valid comparison was completed.
+    pub verified_at: Option<u64>,
+    /// Completion time of the attempt; may be absent in older serialized records.
+    #[serde(default)]
+    pub attempted_at: Option<u64>,
+    /// Older records without this field deserialize conservatively as unverifiable.
+    #[serde(default)]
+    pub status: ProjectionAuditStatus,
+    /// Compatibility flag: false for both observed divergence and unverifiable.
     pub matches: bool,
     pub runtime_generation: u64,
     pub vault_generation: u64,

@@ -24710,7 +24710,9 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         "authority_status": s.authority_status.as_str(),
         // FRESHNESS, REPORTED EVEN WHEN IT MATCHES. `null` means no completed result is
         // currently available (not yet run, in flight, or canceled); silence is not health.
-        "projection_verified_at": s.standing_projection_audit.as_ref().map(|a| a.verified_at),
+        "projection_verified_at": s.standing_projection_audit.as_ref().and_then(|a| a.verified_at),
+        "projection_attempted_at": s.standing_projection_audit.as_ref().and_then(|a| a.attempted_at),
+        "projection_status": s.standing_projection_audit.as_ref().map(|a| a.status),
         "projection_matches_vault": s.standing_projection_audit.as_ref().map(|a| a.matches),
         "projection_divergence": s.standing_projection_audit
             .as_ref()
