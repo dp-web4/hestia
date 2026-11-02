@@ -241,6 +241,25 @@ impl PolicyPublication {
         })
     }
 
+    /// The policy GENERATION a chain-witness signature binds (#339, decision 0014 §6.1):
+    /// `policy:sha256:<hex>` over [`Self::canonical`], with hub law identified by its file
+    /// digest rather than a `Debug` rendering.
+    ///
+    /// Content-addressed rather than `version`, because `version` restarts at 0 with every
+    /// daemon boot: "generation 3" today and yesterday name different law, which is exactly
+    /// the cross-epoch replay the binding exists to prevent. Two epochs with byte-identical
+    /// law share a generation, and replaying between them changes nothing a reader relies on.
+    pub fn policy_generation(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut c = self.canonical();
+        c["law_gate"] = match self.law_gate.as_deref() {
+            None => json!(null),
+            Some(g) => json!(g.law_sha256().unwrap_or("invalid")),
+        };
+        let bytes = serde_json::to_vec(&c).unwrap_or_default();
+        format!("policy:sha256:{}", hex::encode(Sha256::digest(&bytes)))
+    }
+
     /// Canonical content (everything but `version` and the shared handles), for the debug
     /// staleness check and the equivalence tests. HashMap order is normalised.
     pub fn canonical(&self) -> Value {
