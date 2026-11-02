@@ -27527,6 +27527,26 @@ mod standing_scope_surface_tests {
         assert_eq!(stale["caller_bound"], json!(false));
     }
 
+    #[tokio::test]
+    async fn an_unverifiable_projection_does_not_report_a_verified_time() {
+        use crate::server::standing_scope::{ProjectionAudit, ProjectionAuditStatus};
+        let (_d, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            *s.standing_projection_audit = Some(ProjectionAudit {
+                verified_at: None, attempted_at: Some(123), status: ProjectionAuditStatus::Unverifiable,
+                matches: false, runtime_generation: 1, vault_generation: None,
+                runtime_digest: "synthetic".into(), vault_digest: None,
+                divergence: vec!["synthetic unreadable".into()],
+            });
+        }
+        let view = tool_scope_status(&state, &json!({"plugin_id": "synthetic"})).await.unwrap();
+        assert!(view["projection_verified_at"].is_null());
+        assert_eq!(view["projection_attempted_at"], 123);
+        assert_eq!(view["projection_status"], "unverifiable");
+        assert_eq!(view["projection_matches_vault"], false);
+    }
+
     /// #483 acceptance 5: one non-empty floor is served byte-for-byte identically to
     /// different members, including a member with zero personal grants. The shared
     /// generation/digest identify the same daemon policy revision; personal expansions do
@@ -27800,7 +27820,8 @@ mod standing_scope_surface_tests {
 
         let audit = s.verify_standing_projection(now).unwrap();
         assert!(!audit.matches, "an ungoverned widening must not verify");
-        assert_ne!(audit.runtime_generation, audit.vault_generation);
+        assert!(audit.vault_generation.is_some(), "the durable generation was observed");
+        assert_ne!(Some(audit.runtime_generation), audit.vault_generation);
         assert!(
             audit.divergence.iter().any(|d| d.contains("PHANTOM") && d.contains("/w/not-granted")),
             "the divergence must name the phantom grant and its direction: {:?}",
@@ -27880,7 +27901,7 @@ mod standing_scope_surface_tests {
         let clean = s.verify_standing_projection(now).unwrap();
         assert!(clean.matches, "a untouched projection must verify: {:?}", clean.divergence);
         assert!(clean.divergence.is_empty());
-        assert_eq!(clean.runtime_digest, clean.vault_digest);
+        assert_eq!(Some(&clean.runtime_digest), clean.vault_digest.as_ref());
 
         // Same member, same path, same generation. Only the expiry moves, and it moves
         // LATER, which is a widening: reach the vault never authorised.
@@ -27891,8 +27912,9 @@ mod standing_scope_surface_tests {
             !audit.matches,
             "an expiry-only widening must not report as matching"
         );
+        assert!(audit.vault_digest.is_some(), "the durable digest was observed");
         assert_ne!(
-            audit.runtime_digest, audit.vault_digest,
+            Some(&audit.runtime_digest), audit.vault_digest.as_ref(),
             "the digest must see it too, or the two surfaces disagree again"
         );
         assert!(
@@ -27907,7 +27929,7 @@ mod standing_scope_surface_tests {
             audit.divergence
         );
         assert_eq!(
-            audit.runtime_generation, audit.vault_generation,
+            Some(audit.runtime_generation), audit.vault_generation,
             "generation is unmoved here on purpose: an ungoverned edit does not bump it, \
              which is why the generation alone cannot be the detector"
         );

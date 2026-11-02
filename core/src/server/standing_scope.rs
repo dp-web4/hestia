@@ -295,9 +295,11 @@ pub struct ProjectionAudit {
     /// Compatibility flag: false for both observed divergence and unverifiable.
     pub matches: bool,
     pub runtime_generation: u64,
-    pub vault_generation: u64,
+    /// Absent when no durable authority was observed.
+    pub vault_generation: Option<u64>,
     pub runtime_digest: String,
-    pub vault_digest: String,
+    /// Absent when no durable authority was observed.
+    pub vault_digest: Option<String>,
     /// Empty when `matches`. Each entry names one difference and its direction.
     pub divergence: Vec<String>,
 }

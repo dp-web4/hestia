@@ -1675,7 +1675,7 @@ impl ServerState {
     /// grant should lose to the vault, but a LOST grant may mean the vault write failed and
     /// the operator's intent is the one in memory. Choosing silently would make the verifier
     /// an authority, which is exactly what the ruling says it must not be.
-    pub fn verify_standing_projection(&self, now: u64) -> Result<crate::server::standing_scope::ProjectionAudit> {
+    pub fn verify_standing_projection(&self, _requested_at: u64) -> Result<crate::server::standing_scope::ProjectionAudit> {
         use crate::server::standing_scope::{ProjectionAudit, ProjectionAuditStatus, StandingScopeStore};
         // `load_doc(&self.vault, ...)` reads the already-open Vault's document
         // cache, not the durable file. Reopen it so a lost, unreadable or older
@@ -1685,15 +1685,17 @@ impl ServerState {
             crate::vault::load_doc(&durable_vault, "scope", "standing", "standing-scope.json")?;
         let divergence = self.standing_scope.divergence_from(&vault_copy);
         Ok(ProjectionAudit {
-            verified_at: Some(now),
-            attempted_at: Some(now),
+            // This older synchronous path does not record when its durable
+            // bytes were read. Do not present the caller's timestamp as one.
+            verified_at: None,
+            attempted_at: Some(crate::server::gate_escalation::now_secs()),
             status: if divergence.is_empty() { ProjectionAuditStatus::ObservedMatch }
                     else { ProjectionAuditStatus::ObservedDivergence },
             matches: divergence.is_empty(),
             runtime_generation: self.standing_scope.generation,
-            vault_generation: vault_copy.generation,
+            vault_generation: Some(vault_copy.generation),
             runtime_digest: self.standing_scope.authority_digest(),
-            vault_digest: vault_copy.authority_digest(),
+            vault_digest: Some(vault_copy.authority_digest()),
             divergence,
         })
     }
@@ -2655,9 +2657,9 @@ where
         status: ProjectionAuditStatus::Unverifiable,
         matches: false,
         runtime_generation: s.standing_scope.generation,
-        vault_generation: 0,
+        vault_generation: None,
         runtime_digest: s.standing_scope.authority_digest(),
-        vault_digest: String::new(),
+        vault_digest: None,
         divergence: vec![why.to_owned()],
     };
     if !Arc::ptr_eq(&s.vault.instance_identity(), &instance) || s.vault.generation() != generation
@@ -2684,9 +2686,9 @@ where
                 else { ProjectionAuditStatus::ObservedDivergence },
         matches: divergence.is_empty(),
         runtime_generation: runtime.generation,
-        vault_generation: durable.generation,
+        vault_generation: Some(durable.generation),
         runtime_digest: runtime.authority_digest(),
-        vault_digest: durable.authority_digest(),
+        vault_digest: Some(durable.authority_digest()),
         divergence,
     };
     if !audit.matches {
@@ -2737,6 +2739,8 @@ mod tests {
         assert!(wire["verified_at"].is_null(), "a failed read did not observe the vault");
         assert!(wire["attempted_at"].is_u64(), "the failed attempt remains observable");
         assert_eq!(wire["status"], "unverifiable");
+        assert!(wire["vault_generation"].is_null(), "an unread vault has no observed generation");
+        assert!(wire["vault_digest"].is_null(), "an unread vault has no observed digest");
     }
 
     #[test]
@@ -2751,6 +2755,19 @@ mod tests {
         assert_eq!(audit.verified_at, Some(123));
         assert_eq!(audit.attempted_at, None);
         assert_eq!(audit.status, ProjectionAuditStatus::Unverifiable);
+        assert_eq!(audit.vault_generation, Some(1));
+        assert_eq!(audit.vault_digest.as_deref(), Some("synthetic"));
+    }
+
+    #[test]
+    fn synchronous_projection_does_not_present_caller_time_as_observation() {
+        use crate::server::standing_scope::ProjectionAuditStatus;
+        let (_dir, state) = make_state();
+        let audit = state.verify_standing_projection(u64::MAX).unwrap();
+        assert!(audit.matches);
+        assert_eq!(audit.status, ProjectionAuditStatus::ObservedMatch);
+        assert_eq!(audit.verified_at, None);
+        assert!(audit.attempted_at.is_some_and(|t| t < u64::MAX));
     }
 
     #[tokio::test]
