@@ -11596,6 +11596,54 @@ mod disposition_tests {
     }
 
     #[tokio::test]
+    async fn retire_uncertain_post_rename_failure_must_not_claim_no_change() {
+        let (dir, state) = test_state().await;
+        crate::vault::storage::fail_next_save_after_rename();
+        let (status, body) = retire_if_unretired(&state, "old-id",
+            serde_json::json!({"reason":"synthetic", "ref":"test"})).await;
+        let reopened = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let on_disk = crate::server::retirement::load(&reopened).is_retired("old-id");
+        let s = state.lock().await;
+        let in_memory = s.retired_members.is_retired("old-id");
+        let chain = s.recent_chain(50);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(on_disk && !in_memory, "fault did not land between replacement and publication");
+        assert!(chain.iter().any(|e| e.event_type == "member_retire_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "member_retired"));
+        let error = body["error"].as_str().unwrap_or("");
+        assert!(error.contains("outcome is unknown") && !error.contains("NOTHING changed"),
+                "misleading response: {error}; reopened retired={on_disk}, in-memory retired={in_memory}");
+    }
+
+    #[tokio::test]
+    async fn reinstate_uncertain_post_rename_failure_must_not_claim_still_retired() {
+        let (dir, state) = test_state().await;
+        let (status, body) = retire_if_unretired(&state, "old-id",
+            serde_json::json!({"reason":"synthetic", "ref":"test"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        crate::vault::storage::fail_next_save_after_rename();
+        let response = agent_reinstate(
+            State(state.clone()), None, Path("old-id".into()),
+            Json(serde_json::json!({"reason":"synthetic"})),
+        ).await.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let reopened = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let on_disk = crate::server::retirement::load(&reopened).is_retired("old-id");
+        let s = state.lock().await;
+        let in_memory = s.retired_members.is_retired("old-id");
+        let chain = s.recent_chain(50);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!on_disk && in_memory, "fault did not land between replacement and publication");
+        assert!(chain.iter().any(|e| e.event_type == "member_reinstate_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "member_reinstated"));
+        let error = body["error"].as_str().unwrap_or("");
+        assert!(error.contains("outcome is unknown") && !error.contains("still retired"),
+                "misleading response: {error}; reopened retired={on_disk}, in-memory retired={in_memory}");
+    }
+
+    #[tokio::test]
     async fn conditional_retire_does_not_replace_a_tombstone_after_preflight() {
         let (_dir, state) = test_state().await;
         // The app's view/preflight sees no retirement, then another actor wins.
