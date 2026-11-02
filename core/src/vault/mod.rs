@@ -284,8 +284,12 @@ impl Vault {
     /// operator authority before reaching here, because ratifying an already-tampered gate
     /// is precisely how an attacker would launder one.
     pub fn set_gate_expectations(&mut self, e: gate_integrity::GateExpectations) -> Result<()> {
-        self.data.gate_expectations = e;
-        self.save()
+        let before = std::mem::replace(&mut self.data.gate_expectations, e);
+        if let Err(error) = self.save() {
+            self.data.gate_expectations = before;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Replace the vault's policy state and persist.
@@ -810,7 +814,7 @@ mod tests {
             ratified_at: chrono::Utc::now(), note: "synthetic".into(),
         });
         vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
-        assert!(vault.set_gate_expectations(expectations).is_err());
+        assert!(vault.set_gate_expectations(expectations.clone()).is_err());
         let rejected_in_memory = !vault.gate_expectations().is_empty();
         assert!(Vault::open(path.clone(), "p".into()).unwrap().gate_expectations().is_empty());
         vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
@@ -818,6 +822,9 @@ mod tests {
         let reopened = Vault::open(path, "p".into()).unwrap();
         assert!(!rejected_in_memory && reopened.gate_expectations().is_empty(),
                 "rejected expectations remained staged");
+        vault.set_gate_expectations(expectations.clone()).unwrap();
+        assert_eq!(vault.gate_expectations(), expectations);
+        assert_eq!(Vault::open(reopened.path().to_path_buf(), "p".into()).unwrap().gate_expectations(), expectations);
     }
 
     #[test]
@@ -880,6 +887,8 @@ mod tests {
                 ..
             }
         ));
+        assert!(stale.get_document("seat-config", "codex").is_none(),
+                "a generation-conflicted write must not remain staged");
 
         let reopened = Vault::open(path, "p".into()).unwrap();
         assert_eq!(reopened.generation(), 1);
