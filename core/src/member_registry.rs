@@ -701,6 +701,22 @@ mod tests {
     }
 
     #[test]
+    fn citizenship_attach_must_not_succeed_or_publish_with_unreadable_registry() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let before = serde_json::to_vec(registry.get("test-seat").unwrap()).unwrap();
+        vault.put_document(MEMBERS_NAMESPACE, MEMBERS_DOC, b"not json".to_vec()).unwrap();
+        let reference = web4_core::BirthCertificateRef {
+            issuing_society: "synthetic-society".into(), entry_id: "1".into(), entry_hash: "test".into(),
+        };
+        let success = attach_citizenship(&mut vault, &mut registry, "test-seat", reference);
+        let after = serde_json::to_vec(registry.get("test-seat").unwrap()).unwrap();
+        assert!(!success && before == after,
+                "unreadable registry must not report or publish a citizenship attachment");
+    }
+
+    #[test]
     fn failed_witness_vouch_must_not_land_on_unrelated_save() {
         let (dir, mut vault) = fresh_vault();
         let mut registry = MemberRegistry::default();
