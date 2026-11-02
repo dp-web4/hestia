@@ -24,7 +24,8 @@
 //!
 //! It does not print commands, paths, reasons or arbitrary marker names. Member identifiers and
 //! small counts remain in the output; their suitability for sharing needs a privacy decision.
-//! A later refusal lift does not change a request's reported refused outcome or its re-ask split.
+//! A later refusal lift or grant edit does not change the reported outcome or re-ask split;
+//! chain-wide lift/edit counts are not linked to individual requests.
 //!
 //! Sealed-at-rest is respected the way `appeal_floor` does it: the encrypted DB is snapshotted to a
 //! temp copy, the key never leaves this process, plaintext never hits disk. Read-only: this bin
@@ -53,7 +54,7 @@ use serde_json::{Value, json};
 const UNPRICEABLE_PREFIX: &str = "hestia:unpriceable:";
 
 const TEMP_ROOTS: &[&str] = &["/tmp", "/var/tmp"];
-const OUTCOME_LIMITATION: &str = "A later refusal lift does not change a request's refused outcome or its re-ask classification; chain-wide lift counts are not linked to requests.";
+const OUTCOME_LIMITATION: &str = "A later refusal lift or grant edit does not change a request's reported outcome or its re-ask classification; chain-wide lift/edit counts are not linked to requests.";
 const SYSTEM_ROOTS: &[&str] = &[
     "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/var", "/proc", "/sys", "/dev",
     "/boot", "/root", "/run", "/srv",
