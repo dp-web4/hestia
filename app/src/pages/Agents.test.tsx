@@ -318,6 +318,26 @@ describe("Agents", () => {
       expect(screen.getByRole("alert").textContent).toContain("intent-123");
     });
 
+    it("keeps unrecorded reinstatement evidence visible after refreshing away the row", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValue(inventory([claude]));
+      getDashboard.mockResolvedValueOnce({ retired: ["caude-code"], members: ["caude-code"], trust: [] })
+        .mockResolvedValue({ retired: [], members: [], trust: [] });
+      reinstateAgent.mockResolvedValue({ outcome: "reinstated_unrecorded", result: {
+        retired: false, recorded: false, intentEntryHash: "intent-reinstate", grants_not_restored: ["/w/a"],
+      }});
+      render(<Agents />);
+      await screen.findByText("caude-code");
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "restore" } });
+      fireEvent.click(screen.getByRole("button", { name: "Reinstate" }));
+      const warning = await screen.findByRole("alert");
+      expect(warning.textContent).toContain("Reinstatement for caude-code committed, but its terminal witness failed");
+      expect(warning.textContent).toContain("intent-reinstate");
+      expect(warning.textContent).toContain("/w/a");
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Reinstate" })).toBeNull());
+      expect(screen.getByRole("alert").textContent).toContain("intent-reinstate");
+    });
+
     it("the live-member refusal is a question with its evidence, confirmed only by the operator", async () => {
       operatorStatus.mockResolvedValue(signedIn);
       agentsInventory.mockResolvedValue(inventory([claude]));

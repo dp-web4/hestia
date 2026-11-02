@@ -8250,13 +8250,27 @@ async fn agent_reinstate(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
             "error": format!("still retired: {e}"), "intentEntryHash": intent.hash })));
     }
-    let entry = s.append_chain("member_reinstated", stamp_gate(record, &gate)).ok();
+    let mut done = record;
+    if let Some(m) = done.as_object_mut() {
+        m.insert("intent".into(), serde_json::json!(intent.hash));
+    }
+    let entry = match s.append_chain("member_reinstated", stamp_gate(done, &gate)) {
+        Ok(entry) => entry,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("reinstatement committed, but the terminal witness failed; \
+                              inspect the current record before retrying: {error}"),
+            "retired": false, "recorded": false,
+            "grants_not_restored": existing.revoked_paths,
+            "generation": s.retired_members.generation,
+            "intentEntryHash": intent.hash,
+        }))),
+    };
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "retired": false,
         "generation": s.retired_members.generation,
         "grants_not_restored": existing.revoked_paths,
         "intentEntryHash": intent.hash,
-        "witnessEntryHash": entry.map(|e| e.hash),
+        "witnessEntryHash": entry.hash,
         "note": "the standing grants revoked at retirement were NOT restored — re-grant any that \
                  are still wanted, deliberately.",
     })))
@@ -11649,6 +11663,32 @@ mod disposition_tests {
         assert_eq!(chain.iter().filter(|e| e.event_type == "member_retired").count(), 0);
     }
 
+    // The mutation can commit before its terminal witness; report the actual
+    // state, never success, and retain the intent and revocation evidence.
+    #[tokio::test]
+    async fn reinstate_terminal_witness_failure_reports_the_commit() {
+        let (dir, state) = test_state().await;
+        let (status, _) = retire_if_unretired(&state, "old-id", serde_json::json!({"reason":"first", "ref":"r1"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_reinstate_terminal BEFORE INSERT ON chain_entries \
+             WHEN NEW.event_type = 'member_reinstated' \
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let (status, body) = reinstate(&state, "old-id", serde_json::json!({"reason":"restore"})).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["retired"], false);
+        assert_eq!(body["recorded"], false);
+        assert!(body["intentEntryHash"].is_string());
+        assert!(body["error"].as_str().unwrap().contains("committed"));
+        let s = state.lock().await;
+        assert!(!s.retired_members.is_retired("old-id"));
+        let chain = s.recent_chain(100);
+        assert_eq!(chain.iter().filter(|e| e.event_type == "member_reinstate_intent").count(), 1);
+        assert_eq!(chain.iter().filter(|e| e.event_type == "member_reinstated").count(), 0);
+    }
+
     /// The same call carrying the gate witness the `operator_gate` middleware inserts —
     /// the shape the production route always runs with (tests calling a handler directly
     /// must opt in; `None` is the dev-override / direct-call shape).
@@ -12281,6 +12321,9 @@ mod disposition_tests {
         assert_eq!(st, StatusCode::OK, "{b}");
         let s = state.lock().await;
         let chain = s.recent_chain(20);
+        let terminal = chain.iter().find(|e| e.event_type == "member_reinstated").unwrap();
+        assert_eq!(terminal.event_data["intent"], b["intentEntryHash"],
+                   "the terminal record names its intent, not merely a nearby row");
         for t in ["member_reinstate_intent", "member_reinstated"] {
             let rec = chain.iter().find(|e| e.event_type == t)
                 .unwrap_or_else(|| panic!("{t} is witnessed"));

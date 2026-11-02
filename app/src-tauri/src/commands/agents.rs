@@ -100,6 +100,12 @@ fn reinstate_outcome(status: reqwest::StatusCode, body: serde_json::Value) -> Re
     if status.is_success() {
         return Ok(serde_json::json!({ "outcome": "reinstated", "result": body }));
     }
+    if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        && body.get("retired").and_then(|v| v.as_bool()) == Some(false)
+        && body.get("recorded").and_then(|v| v.as_bool()) == Some(false)
+    {
+        return Ok(serde_json::json!({ "outcome": "reinstated_unrecorded", "result": body }));
+    }
     let why = body.get("error").and_then(|v| v.as_str()).unwrap_or("").to_string();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(serde_json::json!({ "outcome": "already_reinstated", "detail": why }));
@@ -276,6 +282,13 @@ mod tests {
         assert_eq!(partial["result"]["revoked_standing_paths"], json!(["/w/a"]));
         assert_eq!(partial["result"]["revoked_delegations"], json!(["delegation-id"]));
         assert!(reinstate_outcome(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "still retired: disk"})).is_err());
+        let partial = reinstate_outcome(StatusCode::INTERNAL_SERVER_ERROR, json!({
+            "retired": false, "recorded": false, "intentEntryHash": "intent-reinstate",
+            "grants_not_restored": ["/w/a"]
+        })).unwrap();
+        assert_eq!(partial["outcome"], "reinstated_unrecorded");
+        assert_eq!(partial["result"]["intentEntryHash"], "intent-reinstate");
+        assert_eq!(partial["result"]["grants_not_restored"], json!(["/w/a"]));
     }
 
     #[test]

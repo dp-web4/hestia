@@ -127,7 +127,7 @@ function MemberLifecycle({
   inventoryFresh: boolean;
   inventoryGeneration: number;
   onActed: () => void;
-  onUnrecorded: (member: string, result: Record<string, unknown>) => void;
+  onUnrecorded: (member: string, act: "Retirement" | "Reinstatement", result: Record<string, unknown>) => void;
 }) {
   const [reason, setReason] = useState("");
   const [ref, setRef] = useState("");
@@ -149,8 +149,8 @@ function MemberLifecycle({
       if (out.outcome === "needs_confirmation") {
         setAnswer({ generation: inventoryGeneration, question: out });
         setConfirm(false);
-      } else if (out.outcome === "retired_unrecorded") {
-        onUnrecorded(m.id, out.result);
+      } else if (out.outcome === "retired_unrecorded" || out.outcome === "reinstated_unrecorded") {
+        onUnrecorded(m.id, out.outcome === "retired_unrecorded" ? "Retirement" : "Reinstatement", out.result);
         onActed();
       } else if (out.outcome === "already_retired" || out.outcome === "already_reinstated") {
         setMsg(out.detail);
@@ -216,7 +216,7 @@ export function Agents() {
   const [confirming, setConfirming] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [actError, setActError] = useState<string | null>(null);
-  const [unrecorded, setUnrecorded] = useState<{ member: string; result: Record<string, unknown> }[]>([]);
+  const [unrecorded, setUnrecorded] = useState<{ member: string; act: "Retirement" | "Reinstatement"; result: Record<string, unknown> }[]>([]);
   const refreshGeneration = useRef(0);
 
   const refresh = useCallback(async () => {
@@ -315,7 +315,7 @@ export function Agents() {
 
       {unrecorded.map((item, index) => (
         <div role="alert" className="error-banner" key={index}>
-          Retirement for {item.member} committed, but its terminal witness failed. Inspect before retrying.
+          {item.act} for {item.member} committed, but its terminal witness failed. Inspect before retrying.
           <pre>{JSON.stringify(item.result, null, 2)}</pre>
         </div>
       ))}
@@ -467,7 +467,7 @@ export function Agents() {
                 </span>
               </h3>
               <MemberLifecycle m={m} inventoryFresh={inventoryFresh} inventoryGeneration={inventoryGeneration} onActed={refresh}
-                onUnrecorded={(member, result) => setUnrecorded((items) => [...items, { member, result }])} />
+                onUnrecorded={(member, act, result) => setUnrecorded((items) => [...items, { member, act, result }])} />
             </article>
           ))}
         </section>
