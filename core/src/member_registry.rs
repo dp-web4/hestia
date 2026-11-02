@@ -650,6 +650,23 @@ mod tests {
     }
 
     #[test]
+    fn checked_member_registry_rejects_unbound_or_wrong_custodial_key() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let bytes = vault.get_document(MEMBERS_NAMESPACE, MEMBERS_DOC).unwrap().to_vec();
+        let original: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let mut unsigned = original.clone();
+        unsigned[0]["lct"]["binding_proof"] = serde_json::Value::Null;
+        vault.put_document(MEMBERS_NAMESPACE, MEMBERS_DOC, serde_json::to_vec(&unsigned).unwrap()).unwrap();
+        assert!(load_members_checked(&vault).is_err(), "an unsigned member binding is not verified identity");
+        let mut wrong_secret = original;
+        wrong_secret[0]["keypair_secret_hex"] = serde_json::json!(hex::encode([9u8; 32]));
+        vault.put_document(MEMBERS_NAMESPACE, MEMBERS_DOC, serde_json::to_vec(&wrong_secret).unwrap()).unwrap();
+        assert!(load_members_checked(&vault).is_err(), "a custodial secret must bind the stored identity");
+    }
+
+    #[test]
     fn member_mint_must_not_overwrite_unreadable_registry() {
         for sealed in [false, true] {
             let (dir, mut vault) = fresh_vault();
