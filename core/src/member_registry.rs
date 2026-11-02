@@ -259,6 +259,27 @@ pub fn load_members(vault: &crate::vault::Vault) -> MemberRegistry {
     let persisted: Vec<PersistedMember> =
         crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
             .unwrap_or_default();
+    registry_from_persisted(persisted)
+}
+
+/// An authority-sensitive caller must not treat an unreadable or ambiguous
+/// identity map as a known-empty registry.
+pub fn load_members_checked(vault: &crate::vault::Vault) -> anyhow::Result<MemberRegistry> {
+    let persisted: Vec<PersistedMember> = crate::vault::load_doc_checked(
+        vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE,
+    )?;
+    let mut ids = HashSet::new();
+    let mut identities = HashSet::new();
+    for member in &persisted {
+        anyhow::ensure!(!member.plugin_id.trim().is_empty() && member.plugin_id.trim() == member.plugin_id,
+                        "member registry contains an empty or noncanonical member id");
+        anyhow::ensure!(ids.insert(member.plugin_id.clone()), "member registry contains a duplicate member id");
+        anyhow::ensure!(identities.insert(member.lct.lct_id()), "member registry contains a duplicate member identity");
+    }
+    Ok(registry_from_persisted(persisted))
+}
+
+fn registry_from_persisted(persisted: Vec<PersistedMember>) -> MemberRegistry {
     let mut members = HashMap::new();
     let mut fillers = HashSet::new();
     for p in persisted {
@@ -570,6 +591,35 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         (dir, vault)
+    }
+
+    #[test]
+    fn checked_member_registry_refuses_ambiguous_ids_and_preserves_valid() {
+        let (_dir, mut vault) = fresh_vault();
+        assert!(load_members_checked(&vault).unwrap().is_empty());
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        assert!(load_members_checked(&vault).unwrap().get("test-seat").is_some());
+        let original = vault.get_document(MEMBERS_NAMESPACE, MEMBERS_DOC).unwrap().to_vec();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&original).unwrap();
+        let mut same_id = rows.clone();
+        same_id.push(rows[0].clone());
+        vault.put_document(MEMBERS_NAMESPACE, MEMBERS_DOC, serde_json::to_vec(&same_id).unwrap()).unwrap();
+        assert!(load_members_checked(&vault).is_err(), "duplicate member id must refuse");
+        let mut same_lct = rows.clone();
+        let mut other = rows[0].clone();
+        other["plugin_id"] = serde_json::json!("other-seat");
+        same_lct.push(other);
+        vault.put_document(MEMBERS_NAMESPACE, MEMBERS_DOC, serde_json::to_vec(&same_lct).unwrap()).unwrap();
+        assert!(load_members_checked(&vault).is_err(), "duplicate canonical identity must refuse");
+    }
+
+    #[test]
+    fn checked_member_registry_rejects_sealed_document_even_with_legacy() {
+        let (dir, mut vault) = fresh_vault();
+        std::fs::write(dir.path().join(MEMBERS_LEGACY_FILE), b"[]").unwrap();
+        vault.seal_document(MEMBERS_NAMESPACE, MEMBERS_DOC, b"[]", "other-key").unwrap();
+        assert!(load_members_checked(&vault).is_err());
     }
 
     #[test]

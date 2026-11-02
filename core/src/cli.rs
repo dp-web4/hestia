@@ -5722,14 +5722,18 @@ fn cmd_delegate_grant(
     // the reverse is a scan, done once, here.
     // Loaded once, for both refusals below: the retired-member check (#1106) and the action
     // check (#1110). Two loads would be two readings of the registry that could disagree.
-    let registry = hestia::member_registry::load_members(&vault);
+    let registry = hestia::member_registry::load_members_checked(&vault)
+        .context("loading member identity authority before delegation")?;
     {
         let retired = hestia::server::retirement::load(&vault)
             .context("loading retirement authority before delegation")?;
         if !retired.retired.is_empty() {
-            let who = registry.iter_sorted().into_iter().find(|(_, lct)| {
+            let matches: Vec<_> = registry.iter_sorted().into_iter().filter(|(_, lct)| {
                 delegation::agent_key_for_lct(&lct.lct_id()) == agent_id
-            }).map(|(id, _)| id.clone());
+            }).collect();
+            anyhow::ensure!(matches.len() <= 1,
+                            "delegation key resolves to more than one member; nothing was delegated");
+            let who = matches.first().map(|(id, _)| (*id).clone());
             if let Some(plugin_id) = who {
                 if let Some(r) = retired.get(&plugin_id) {
                     anyhow::bail!(
@@ -5839,16 +5843,50 @@ mod retirement_authority_cli_tests {
             retired_by: "test".into(),
         });
         hestia::server::retirement::save(&mut vault, &retired).unwrap();
-        vault.put_document("members", "registry", b"not json".to_vec()).unwrap();
         drop(vault);
         std::fs::write(dir.path().join("operator.key"),
             serde_json::json!({"secret_key_hex": hex::encode([7u8; 32])}).to_string()).unwrap();
+        let valid_before = std::fs::read(&path).unwrap();
+        let valid_result = cmd_delegate_grant(dir.path(), &agent, vec!["witness".into()], vec![], None);
+        assert!(format!("{:#}", valid_result.expect_err("valid retired member must be refused")).contains("RETIRED"));
+        assert_eq!(std::fs::read(&path).unwrap(), valid_before, "valid retirement refusal must not write");
+        let mut vault = Vault::open(path.clone(), "synthetic-passphrase".into()).unwrap();
+        vault.put_document("members", "registry", b"not json".to_vec()).unwrap();
+        drop(vault);
         let before = std::fs::read(&path).unwrap();
         let result = cmd_delegate_grant(dir.path(), &agent, vec!["witness".into()], vec![], None);
         let after = std::fs::read(&path).unwrap();
         assert!(result.is_err() && before == after,
                 "an unreadable identity map must not authorize the retired key; result_ok={}, vault_changed={}",
                 result.is_ok(), before != after);
+    }
+
+    #[test]
+    fn known_empty_registry_preserves_external_delegation() {
+        if std::env::var_os("HESTIA_SYNTHETIC_EXTERNAL_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("cli::retirement_authority_cli_tests::known_empty_registry_preserves_external_delegation")
+                .arg("--test-threads=1")
+                .env("HESTIA_SYNTHETIC_EXTERNAL_CHILD", "1")
+                .env("HESTIA_PASSPHRASE", "synthetic-passphrase")
+                .output().unwrap();
+            assert!(output.status.success(), "child test failed: {} {}",
+                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = vault_path(dir.path());
+        drop(Vault::init(path.clone(), "synthetic-passphrase".into()).unwrap());
+        std::fs::write(dir.path().join("operator.key"),
+            serde_json::json!({"secret_key_hex": hex::encode([7u8; 32])}).to_string()).unwrap();
+        let agent = "00000000-0000-0000-0000-000000000001";
+        cmd_delegate_grant(dir.path(), agent, vec!["witness".into()], vec![], None).unwrap();
+        let vault = Vault::open(path, "synthetic-passphrase".into()).unwrap();
+        let store = DelegationStore::load(&vault).unwrap();
+        assert_eq!(store.delegations.len(), 1);
+        assert_eq!(store.delegations[0].agent_lct_id.to_string(), agent);
     }
 }
 

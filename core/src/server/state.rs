@@ -905,6 +905,7 @@ impl ServerState {
     pub fn open(mut vault: Vault, home: &Path, passphrase: &str) -> Result<Self> {
         // Validate retirement authority before startup can mint identities or open mutation paths.
         let retired_members = crate::server::retirement::load(&vault)?;
+        let member_registry = crate::member_registry::load_members_checked(&vault)?;
         // One stable storage key (Argon2 once) seals both the witness chain
         // (SQLCipher) and the trust files.
         let store_key = crate::storage::storage_key(home, passphrase)
@@ -1012,7 +1013,6 @@ impl ServerState {
             &sovereign.lct_id(),
         );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
-        let member_registry = crate::member_registry::load_members(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault
@@ -2631,6 +2631,36 @@ mod tests {
         assert!(ServerState::open(vault, dir.path(), "p").is_err(),
                 "an unreadable legacy retirement record must not become an empty list");
         assert!(!dir.path().join("witness.db").exists(), "refuse before opening writable stores");
+    }
+
+    #[test]
+    fn member_registry_unreadable_refuses_startup_before_writable_stores() {
+        let dir = TempDir::new().unwrap();
+        let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        vault.put_document("members", "registry", b"not json".to_vec()).unwrap();
+        assert!(ServerState::open(vault, dir.path(), "p").is_err());
+        assert!(!dir.path().join("witness.db").exists());
+    }
+
+    #[test]
+    fn startup_authority_preserves_valid_member_and_retirement() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.enc");
+        let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
+        let mut registry = crate::member_registry::MemberRegistry::default();
+        crate::member_registry::ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let mut retired = crate::server::retirement::RetirementStore::default();
+        retired.retire(crate::server::retirement::RetiredMember {
+            plugin_id: "test-seat".into(), retired_at: 1, reason: "synthetic".into(),
+            evidence_ref: "test".into(), revoked_paths: vec![], was_active: false,
+            retired_by: "test".into(),
+        });
+        crate::server::retirement::save(&mut vault, &retired).unwrap();
+        drop(vault);
+        let reopened = Vault::open(path, "p".into()).unwrap();
+        let state = ServerState::open(reopened, dir.path(), "p").unwrap();
+        assert!(state.retired_members.is_retired("test-seat"));
+        assert!(state.member_registry.get("test-seat").is_some());
     }
 
     /// B2 (#339): the daemon's chain rows are witnessed by the Society key, name the real

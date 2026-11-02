@@ -557,6 +557,37 @@ pub fn load_doc<T: serde::de::DeserializeOwned + Default>(
     Ok(T::default())
 }
 
+/// Authority-sensitive read: only a genuinely absent item defaults. A present
+/// sealed, duplicate or unreadable item is not evidence of an empty store.
+pub fn load_doc_checked<T: serde::de::DeserializeOwned + Default>(
+    vault: &Vault, namespace: &str, name: &str, legacy_filename: &str,
+) -> anyhow::Result<T> {
+    use anyhow::Context;
+    let matching = vault.document_index().into_iter()
+        .filter(|item| item.namespace == namespace && item.name == name).count();
+    anyhow::ensure!(matching <= 1, "duplicate authority documents {namespace}/{name}");
+    if matching == 1 {
+        let bytes = vault.get_document(namespace, name)
+            .ok_or_else(|| anyhow::anyhow!("authority document {namespace}/{name} is sealed or unreadable"))?;
+        return serde_json::from_slice(bytes).with_context(|| format!("parsing authority document {namespace}/{name}"));
+    }
+    if let Some(home) = vault.home_dir() {
+        let legacy = home.join(legacy_filename);
+        match std::fs::read(&legacy) {
+            Ok(bytes) => return serde_json::from_slice(&bytes).with_context(|| format!("parsing legacy authority {legacy_filename}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&legacy) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {},
+                    Ok(_) => return Err(e).with_context(|| format!("reading legacy authority {legacy_filename}")),
+                    Err(other) => return Err(other).with_context(|| format!("checking legacy authority {legacy_filename}")),
+                }
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading legacy authority {legacy_filename}")),
+        }
+    }
+    Ok(T::default())
+}
+
 /// Persist a serde value as an encrypted master-tier vault document, then remove
 /// any legacy plaintext sidecar (completing migration).
 pub fn save_doc<T: serde::Serialize>(

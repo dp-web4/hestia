@@ -116,34 +116,7 @@ impl RetirementStore {
 
 /// Missing authority is an empty store; present but unreadable authority is not.
 pub fn load(vault: &crate::vault::Vault) -> anyhow::Result<RetirementStore> {
-    use anyhow::Context;
-
-    let matches: Vec<_> = vault.document_index().into_iter()
-        .filter(|item| item.namespace == RETIRED_NAMESPACE && item.name == RETIRED_DOC)
-        .collect();
-    anyhow::ensure!(matches.len() <= 1, "duplicate retirement authority documents");
-    if !matches.is_empty() {
-        let bytes = vault.get_document(RETIRED_NAMESPACE, RETIRED_DOC)
-            .ok_or_else(|| anyhow::anyhow!("retirement authority document is sealed or unreadable"))?;
-        return serde_json::from_slice(bytes).context("parsing retirement authority document");
-    }
-
-    if let Some(home) = vault.home_dir() {
-        let legacy = home.join(RETIRED_LEGACY_FILE);
-        match std::fs::read(&legacy) {
-            Ok(bytes) => return serde_json::from_slice(&bytes).context("parsing legacy retirement authority"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // A dangling symlink is present but unreadable, not a missing record.
-                match std::fs::symlink_metadata(&legacy) {
-                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {},
-                    Ok(_) => return Err(e).context("reading legacy retirement authority"),
-                    Err(other) => return Err(other).context("checking legacy retirement authority"),
-                }
-            }
-            Err(e) => return Err(e).context("reading legacy retirement authority"),
-        }
-    }
-    Ok(RetirementStore::default())
+    crate::vault::load_doc_checked(vault, RETIRED_NAMESPACE, RETIRED_DOC, RETIRED_LEGACY_FILE)
 }
 
 pub fn save(
