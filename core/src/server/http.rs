@@ -10610,6 +10610,35 @@ mod disposition_tests {
                 "false no-change response: {error}; reopened={persisted:?}, snapshot={snapshot:?}, chain_len={chain_len}");
     }
 
+    #[tokio::test]
+    async fn delegation_revoke_save_error_after_rename_must_not_claim_still_in_force() {
+        let (dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "test-seat").await;
+        let (status, granted) = deleg(&state, "test-seat", Some(serde_json::json!({
+            "roles": ["witness"], "reason": "synthetic grant"}))).await;
+        assert_eq!(status, StatusCode::OK, "{granted}");
+        let id = granted["delegation_id"].as_str().unwrap().to_string();
+
+        crate::vault::storage::fail_next_save_after_rename();
+        let (status, response) = agent_delegation_revoke(
+            State(state.clone()), Path(("test-seat".into(), id.clone())),
+            Json(serde_json::json!({"reason": "synthetic revoke"})),
+        ).await;
+        let reopened = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let persisted = crate::delegation::DelegationStore::load(&reopened).unwrap();
+        let revoked = persisted.delegations.iter().find(|d| d.id.to_string() == id)
+            .expect("the synthetic delegation remains inspectable").revoked;
+        let chain = state.lock().await.recent_chain(50);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(revoked, "the injected fault must occur after the revoked state was published");
+        assert!(chain.iter().any(|e| e.event_type == "delegation_revoke_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "delegation_revoked"));
+        let error = response.0["error"].as_str().unwrap_or("");
+        assert!(error.contains("outcome is unknown") && !error.contains("still in force"),
+                "false certainty: {error}; reopened revoked={revoked}");
+    }
+
     /// dp's fourth ask, the half #1079 left: manage an agent's delegated authority from the
     /// agent. The key is DERIVED from the registry; the body may not name an agent at all.
     #[tokio::test]
