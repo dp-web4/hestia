@@ -161,17 +161,25 @@ impl Vault {
             return Err(CoreError::CredentialAlreadyExists(entry.name));
         }
         self.data.entries.push(entry);
-        self.save()
+        if let Err(error) = self.save() {
+            self.data.entries.pop();
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Replace an entry (or add it if it doesn't exist).
     pub fn upsert(&mut self, entry: VaultEntry) -> Result<()> {
         if let Some(idx) = self.data.entries.iter().position(|e| e.name == entry.name) {
-            self.data.entries[idx] = entry;
+            let before = std::mem::replace(&mut self.data.entries[idx], entry);
+            if let Err(error) = self.save() {
+                self.data.entries[idx] = before;
+                return Err(error);
+            }
+            Ok(())
         } else {
-            self.data.entries.push(entry);
+            self.add(entry)
         }
-        self.save()
     }
 
     /// Remove an entry by name. Returns the removed entry.
@@ -188,7 +196,10 @@ impl Vault {
             .position(|e| e.name == name)
             .ok_or_else(|| CoreError::CredentialNotFound(name.to_string()))?;
         let removed = self.data.entries.remove(idx);
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.data.entries.insert(idx, removed);
+            return Err(error);
+        }
         Ok(removed)
     }
 
@@ -726,6 +737,9 @@ mod tests {
                 _ => vault.remove("existing").is_err(),
             };
             assert!(failed);
+            assert!(vault.get("new").is_none(), "{op}: rejected addition remained in memory");
+            assert_eq!(vault.get("existing").map(|e| e.secret.as_str()), Some("original"),
+                       "{op}: failed edit changed the in-memory entry");
             let before = Vault::open(path.clone(), "p".into()).unwrap();
             assert!(before.get("new").is_none());
             assert_eq!(before.get("existing").unwrap().secret, "original");
