@@ -1633,6 +1633,7 @@ mod recursion_audit_tests {
                 modes,
             }],
             floor: vec![],
+            refusals: vec![],
         }
     }
 
