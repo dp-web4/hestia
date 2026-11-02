@@ -682,6 +682,29 @@ mod tests {
     }
 
     #[test]
+    fn rejected_policy_lists_cannot_ride_on_later_document_save() {
+        let (_dir, path) = temp_path();
+        let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
+        let generation = vault.policy_lists_generation();
+        let mut lists = policy_lists::PolicyLists::new();
+        lists.insert("synthetic".into(), policy_lists::PolicyList {
+            name: "synthetic".into(), description: "test only".into(),
+            kind: policy_lists::ListKind::Allow, entries: vec!["synthetic".into()],
+            bound_to: vec!["synthetic".into()], grants: vec![], enabled: true,
+        });
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+        assert!(vault.set_policy_lists(lists).is_err());
+        assert!(Vault::open(path.clone(), "p".into()).unwrap().policy_lists().is_empty());
+
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        vault.put_document("unrelated", "record", b"new".to_vec()).unwrap();
+        let reopened = Vault::open(path, "p".into()).unwrap();
+        assert!(reopened.policy_lists().is_empty());
+        assert!(vault.policy_lists().is_empty());
+        assert_eq!(vault.policy_lists_generation(), generation);
+    }
+
+    #[test]
     fn init_and_open_round_trip() {
         let (_dir, path) = temp_path();
         let _v = Vault::init(path.clone(), "passphrase".into()).unwrap();
