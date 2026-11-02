@@ -2584,6 +2584,22 @@ mod tests {
     }
 
     #[test]
+    fn failed_backup_with_wrong_key_preserves_existing_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let snapshot_path = dir.path().join("existing.db");
+        let store = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        store.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+        drop(store);
+        std::fs::write(&snapshot_path, b"keep existing destination").unwrap();
+
+        let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, [9u8; 32]);
+        assert!(result.is_err(), "the wrong key must fail the backup");
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination",
+                   "a failed backup must not replace its destination");
+    }
+
+    #[test]
     fn snapshot_source_removed_after_check_is_not_recreated() {
         let dir = TempDir::new().unwrap();
         let source_path = dir.path().join("source.db");
