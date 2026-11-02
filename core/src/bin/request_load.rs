@@ -96,15 +96,19 @@ fn classify_path(path: &str, workspaces: &[String], home: &str) -> &'static str 
     "other"
 }
 
-/// The FIRST path component under `home` when it is a dotdir (`.claude`, `.hestia`, ...): a
-/// directory name only, nothing deeper. None for anything else.
+/// Only explicitly public product names may leave this process. An arbitrary
+/// first component can itself be sensitive; bucket it instead of printing it.
 fn home_dotdir_name(path: &str, home: &str) -> Option<String> {
     let home = home.trim_end_matches('/');
     if home.is_empty() || !under(path, home) {
         return None;
     }
     let first = path[home.len()..].trim_start_matches('/').split('/').next().unwrap_or("");
-    first.starts_with('.').then(|| first.to_string())
+    if !first.starts_with('.') {
+        return None;
+    }
+    const PUBLIC_NAMES: &[&str] = &[".hestia", ".claude", ".codex"];
+    Some(if PUBLIC_NAMES.contains(&first) { first } else { "other" }.to_string())
 }
 
 /// Governance file and directory names the gate itself publishes (`hestia_governance_closure`'s
@@ -129,6 +133,40 @@ fn published_marker_name(marker: &str) -> &'static str {
     }
     let base = m.rsplit('/').next().unwrap_or(m);
     PUBLISHED_GOVERNANCE_NAMES.iter().find(|n| !n.contains('/') && base == **n).copied().unwrap_or("other")
+}
+
+/// Witness callers can name non-reserved event types. Do not print arbitrary
+/// event names just because they contain `scope`.
+fn public_event_type(event: &str) -> Option<&'static str> {
+    match event {
+        "gate_escalation_opened" => Some("gate_escalation_opened"),
+        "scope_requested" => Some("scope_requested"),
+        "scope_grant_intent" => Some("scope_grant_intent"),
+        "scope_granted" => Some("scope_granted"),
+        "scope_refused" => Some("scope_refused"),
+        "scope_revoked" => Some("scope_revoked"),
+        "scope_standing_revoked" => Some("scope_standing_revoked"),
+        "scope_standing_promote_intent" => Some("scope_standing_promote_intent"),
+        "scope_reach_change_intent" => Some("scope_reach_change_intent"),
+        "scope_reach_changed" => Some("scope_reach_changed"),
+        "scope_reassign_intent" => Some("scope_reassign_intent"),
+        "scope_reassigned" => Some("scope_reassigned"),
+        "scope_reroot_intent" => Some("scope_reroot_intent"),
+        "scope_rerooted" => Some("scope_rerooted"),
+        "scope_once_reserved" => Some("scope_once_reserved"),
+        "scope_once_released" => Some("scope_once_released"),
+        "scope_once_spent" => Some("scope_once_spent"),
+        _ if event.contains("scope") => Some("other_scope_event"),
+        _ => None,
+    }
+}
+
+fn public_scope_rule(rule: &str) -> &'static str {
+    match rule {
+        "mrh.path" => "mrh.path",
+        "mrh.command" => "mrh.command",
+        _ => "other",
+    }
 }
 
 /// The coarse class of a governance escalation's marker (a file name the gate protects).
@@ -188,13 +226,33 @@ struct Req {
     no_peer: bool,
     opened: Option<DateTime<Utc>>,
     expires_at: Option<i64>,
-    outcome: &'static str, // open | granted | refused | lapsed | withdrawn
+    outcome: &'static str, // open | incomplete | granted | refused | lapsed | withdrawn
     ruler: &'static str,
     ruled_at: Option<DateTime<Utc>>,
 }
 
 fn s<'a>(d: &'a Value, k: &str) -> Option<&'a str> {
     d.get(k).and_then(Value::as_str)
+}
+
+/// Apply one scope event to a tracked request. Kept separate so synthetic
+/// sequences exercise the actual report logic without opening a live chain.
+fn observe_scope_outcome(r: &mut Req, event: &str, d: &Value, at: DateTime<Utc>) {
+    if r.ruled_at.is_some() {
+        return;
+    }
+    if event == "scope_grant_intent" {
+        // Intent alone proves neither a committed grant nor a failure. A
+        // later terminal event can still resolve it, even after expiry.
+        r.outcome = "incomplete";
+        return;
+    }
+    if matches!(event, "scope_granted" | "scope_refused") {
+        r.outcome = if event == "scope_refused" { "refused" } else { "granted" };
+        r.ruler = classify_ruler(s(d, "granted_by").or_else(|| s(d, "decided_by")),
+                                 s(d, "via").or_else(|| s(d, "decided_via")), None);
+        r.ruled_at = Some(at);
+    }
 }
 
 fn pct(sorted: &[i64], p: f64) -> Option<i64> {
@@ -207,6 +265,17 @@ fn pct(sorted: &[i64], p: f64) -> Option<i64> {
 
 fn bump(m: &mut BTreeMap<String, u64>, k: &str) {
     *m.entry(k.to_string()).or_default() += 1;
+}
+
+fn snapshot_tempdir() -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("hestia-request-load-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().context("creating private temp copy dir")
 }
 
 fn main() -> Result<()> {
@@ -250,9 +319,10 @@ fn main() -> Result<()> {
     let passphrase = read_passphrase(&home)?;
     let key = storage_key(&home, &passphrase).context("deriving storage key")?;
     let src_db = home.join("witness.db");
-    let tmp_dir = std::env::temp_dir().join(format!("hestia-request-load-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir).context("creating temp copy dir")?;
-    let copy_db = tmp_dir.join("witness.db");
+    // An exclusively created directory is ours to clean up; never adopt a
+    // predictable existing path that could alias the source or contain data.
+    let tmp_dir = snapshot_tempdir()?;
+    let copy_db = tmp_dir.path().join("witness.db");
     SqliteChainStore::backup_encrypted(&src_db, &copy_db, key)
         .with_context(|| format!("snapshotting sealed chain {}", src_db.display()))?;
     let store = SqliteChainStore::open(&copy_db, key)
@@ -261,9 +331,9 @@ fn main() -> Result<()> {
     let now = Utc::now();
     let since = now - chrono::Duration::days(days);
     let mut reqs: HashMap<String, Req> = HashMap::new();
-    // Chain-wide (not windowed): every event type whose NAME contains "scope", or is the
-    // escalation-opened event, with its count and first/last timestamp. Answers "did the event
-    // start then, or change name" — event type names are schema, not content.
+    // Chain-wide (not windowed): known scope event types and the escalation-opened
+    // event, with first/last times. Unknown scope-like names are one bucket because
+    // a witness caller may choose an event name containing arbitrary content.
     let mut type_census: BTreeMap<String, (u64, DateTime<Utc>, DateTime<Utc>)> = BTreeMap::new();
     let mut scanned = 0u64;
     let page = 50_000u64;
@@ -276,8 +346,8 @@ fn main() -> Result<()> {
         cursor = batch.last().expect("non-empty batch").chain_position;
         for e in &batch {
             scanned += 1;
-            if e.event_type.contains("scope") || e.event_type == "gate_escalation_opened" {
-                let c = type_census.entry(e.event_type.clone()).or_insert((0, e.timestamp, e.timestamp));
+            if let Some(kind) = public_event_type(&e.event_type) {
+                let c = type_census.entry(kind.to_string()).or_insert((0, e.timestamp, e.timestamp));
                 c.0 += 1;
                 c.1 = c.1.min(e.timestamp);
                 c.2 = c.2.max(e.timestamp);
@@ -295,7 +365,7 @@ fn main() -> Result<()> {
                         kind: "scope",
                         path_key: format!("{member}\u{0}{path}"),
                         member,
-                        rule: if gate_opened { s(d, "rule").unwrap_or("?").to_string() } else { "member_asked".into() },
+                        rule: if gate_opened { public_scope_rule(s(d, "rule").unwrap_or("")).into() } else { "member_asked".into() },
                         path_class: classify_path(path, &workspaces, &home_dir),
                         home_dotdir: home_dotdir_name(path, &home_dir),
                         other_marker: None,
@@ -311,12 +381,7 @@ fn main() -> Result<()> {
                 "scope_granted" | "scope_grant_intent" | "scope_refused" => {
                     let Some(id) = s(d, "request_id") else { continue };
                     if let Some(r) = reqs.get_mut(&format!("s:{id}")) {
-                        if r.ruled_at.is_none() {
-                            r.outcome = if e.event_type == "scope_refused" { "refused" } else { "granted" };
-                            r.ruler = classify_ruler(s(d, "granted_by").or_else(|| s(d, "decided_by")),
-                                                     s(d, "via").or_else(|| s(d, "decided_via")), None);
-                            r.ruled_at = Some(e.timestamp);
-                        }
+                        observe_scope_outcome(r, &e.event_type, d, e.timestamp);
                     }
                 }
                 "gate_escalation_opened" if e.timestamp >= since => {
@@ -363,8 +428,6 @@ fn main() -> Result<()> {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-
     // A request with no ruling and a past expiry lapsed: scope requests emit no expiry event.
     let now_secs = now.timestamp();
     for r in reqs.values_mut() {
@@ -394,10 +457,8 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
         "operator: granted_by/decided_by 'operator' or via 'operator_session'; delegate: 'delegate:*' or via 'delegation'; \
          peer: 'peer:*', via 'peer_not_same', or another member id; asker: an escalation ruled by its own asker (a withdrawal); \
          other: anything else"));
-    let mut path_key_counts: HashMap<&str, u64> = HashMap::new();
     let mut groups: HashMap<&str, Vec<&Req>> = HashMap::new();
     for r in reqs.values().filter(|r| r.kind == "scope") {
-        *path_key_counts.entry(r.path_key.as_str()).or_default() += 1;
         groups.entry(r.path_key.as_str()).or_default().push(r);
     }
     let reasks = reask_split(groups.into_values().collect());
@@ -412,7 +473,7 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
         let mut by_outcome_ruler = BTreeMap::new();
         let mut by_sub = BTreeMap::new();
         let mut latencies: Vec<i64> = Vec::new();
-        let (mut gate_opened, mut no_peer, mut reasked) = (0u64, 0u64, 0u64);
+        let (mut gate_opened, mut no_peer) = (0u64, 0u64);
         for r in &rs {
             bump(&mut by_member, &r.member);
             bump(&mut by_rule, &r.rule);
@@ -432,9 +493,6 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
             }
             if kind == "scope" {
                 bump(&mut by_path, r.path_class);
-                if path_key_counts.get(r.path_key.as_str()).copied().unwrap_or(0) > 1 {
-                    reasked += 1;
-                }
             }
             if let (Some(o), Some(t)) = (r.opened, r.ruled_at) {
                 latencies.push((t - o).num_seconds());
@@ -449,7 +507,7 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
         if kind == "scope" {
             k.insert("gate_opened_with_no_admissible_peer".into(), json!(no_peer));
             k.insert("by_path_class".into(), json!(by_path));
-            k.insert("reasked_same_member_and_path".into(), json!(reasked));
+            k.insert("reasked_same_member_and_path".into(), reasks["reasks"].clone());
             k.insert("home_dotdir_by_first_component".into(), json!(by_sub));
             k.insert("reasks".into(), reasks.clone());
         } else {
@@ -502,22 +560,24 @@ fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
     })
 }
 
-fn print_markdown(r: &Value) {
-    println!("## Request load — last {} days (aggregate only)\n", r["window_days"]);
-    println!("- generated {}; {} chain entries scanned\n", r["generated_at"].as_str().unwrap_or(""), r["chain_entries_scanned"]);
+fn render_markdown(r: &Value) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    writeln!(out, "## Request load — last {} days (aggregate only)\n", r["window_days"]).unwrap();
+    writeln!(out, "- generated {}; {} chain entries scanned\n", r["generated_at"].as_str().unwrap_or(""), r["chain_entries_scanned"]).unwrap();
     for kind in ["scope", "escalation"] {
         let k = &r[kind];
-        println!("### {} ({} opened, {} by the gate)\n", if kind == "scope" { "Scope requests" } else { "Governance escalations" },
-                 k["total"], k["gate_opened"]);
+        writeln!(out, "### {} ({} opened, {} by the gate)\n", if kind == "scope" { "Scope requests" } else { "Governance escalations" },
+                 k["total"], k["gate_opened"]).unwrap();
         if kind == "scope" {
-            println!("- gate-opened with no admissible peer (operator only): {}", k["gate_opened_with_no_admissible_peer"]);
-            println!("- re-asked (same member and path more than once): {}", k["reasked_same_member_and_path"]);
+            writeln!(out, "- gate-opened with no admissible peer (operator only): {}", k["gate_opened_with_no_admissible_peer"]).unwrap();
+            writeln!(out, "- re-asked after the first (same member and path): {}", k["reasked_same_member_and_path"]).unwrap();
             let ra = &k["reasks"];
-            println!("- re-asks after the first: {}; by outcome of the first ask: {}; within 10 min of the previous ruling: {}; previous unruled: {}",
-                     ra["reasks"], ra["by_outcome_of_first_ask"], ra["within_10_min_of_previous_ruling"], ra["previous_request_unruled"]);
+            writeln!(out, "- re-asks after the first: {}; by outcome of the first ask: {}; within 10 min of the previous ruling: {}; previous unruled: {}",
+                     ra["reasks"], ra["by_outcome_of_first_ask"], ra["within_10_min_of_previous_ruling"], ra["previous_request_unruled"]).unwrap();
         }
         let t = &k["time_to_ruling_secs"];
-        println!("- ruled: {}; time to ruling median {} s, p90 {} s", k["ruled_count"], t["median"], t["p90"]);
+        writeln!(out, "- ruled: {}; time to ruling median {} s, p90 {} s", k["ruled_count"], t["median"], t["p90"]).unwrap();
         let facets: &[&str] = if kind == "scope" {
             &["by_outcome", "by_ruler", "by_outcome_and_ruler", "by_path_class", "home_dotdir_by_first_component", "by_rule", "by_member", "by_day"]
         } else {
@@ -525,18 +585,23 @@ fn print_markdown(r: &Value) {
         };
         for f in facets {
             let parts: Vec<String> = k[*f].as_object().map(|m| m.iter().map(|(a, b)| format!("{a} {b}")).collect()).unwrap_or_default();
-            println!("- {}: {}", f.trim_start_matches("by_").replace('_', " "), if parts.is_empty() { "—".into() } else { parts.join(", ") });
+            writeln!(out, "- {}: {}", f.trim_start_matches("by_").replace('_', " "), if parts.is_empty() { "—".into() } else { parts.join(", ") }).unwrap();
         }
-        println!();
+        writeln!(out).unwrap();
     }
-    println!("### Chain-wide event types (whole chain, not the window)\n");
+    writeln!(out, "### Chain-wide event types (whole chain, not the window)\n").unwrap();
     if let Some(m) = r["chain_wide_event_types"].as_object() {
         for (k, v) in m {
-            println!("- {k}: {} (first {}, last {})", v["count"], v["first"].as_str().unwrap_or(""), v["last"].as_str().unwrap_or(""));
+            writeln!(out, "- {k}: {} (first {}, last {})", v["count"], v["first"].as_str().unwrap_or(""), v["last"].as_str().unwrap_or("")).unwrap();
         }
     }
-    println!();
-    println!("Who ruled: {}", r["ruler_classification"].as_str().unwrap_or(""));
+    writeln!(out).unwrap();
+    writeln!(out, "Who ruled: {}", r["ruler_classification"].as_str().unwrap_or("")).unwrap();
+    out
+}
+
+fn print_markdown(r: &Value) {
+    print!("{}", render_markdown(r));
 }
 
 fn read_passphrase(home: &std::path::Path) -> Result<String> {
@@ -619,6 +684,81 @@ mod tests {
         assert_eq!(home_dotdir_name("/home/u/notes/.x", HOME), None);
         assert_eq!(home_dotdir_name("/home/user2/.x", HOME), None);
         assert_eq!(home_dotdir_name("/etc/x", HOME), None);
+    }
+
+    #[test]
+    fn unknown_home_directory_names_never_leave_the_report() {
+        let private = ".synthetic-private-project";
+        let bucket = home_dotdir_name("/home/u/.synthetic-private-project/file", HOME);
+        assert_eq!(bucket.as_deref(), Some("other"));
+        let mut requests = HashMap::new();
+        requests.insert("r".to_string(), Req { kind: "scope", path_class: "home_dotdir",
+            home_dotdir: bucket, ..Default::default() });
+        let report = summarize(&requests, 7, 1, &Utc::now(), &[]);
+        assert!(!report.to_string().contains(private));
+        assert!(!render_markdown(&report).contains(private));
+        assert_eq!(report["scope"]["home_dotdir_by_first_component"]["other"], 1);
+    }
+
+    #[test]
+    fn unrecognized_event_and_rule_names_do_not_leak_in_report_formats() {
+        let secret = "scope_synthetic_private_value";
+        assert_eq!(public_event_type(secret), Some("other_scope_event"));
+        assert_eq!(public_event_type("scope_granted"), Some("scope_granted"));
+        assert_eq!(public_event_type("unrelated"), None);
+        assert_eq!(public_scope_rule(secret), "other");
+        assert_eq!(public_scope_rule("mrh.path"), "mrh.path");
+        let mut requests = HashMap::new();
+        requests.insert("r".into(), Req { kind: "scope", rule: public_scope_rule(secret).into(),
+            ..Default::default() });
+        let mut report = summarize(&requests, 7, 1, &Utc::now(), &[]);
+        report["chain_wide_event_types"] = json!({
+            (public_event_type(secret).unwrap()): {"count":1, "first":"x", "last":"y"}
+        });
+        assert!(!report.to_string().contains(secret));
+        assert!(!render_markdown(&report).contains(secret));
+    }
+
+    #[test]
+    fn a_grant_intent_is_not_a_completed_ruling() {
+        let mut r = Req { kind: "scope", outcome: "open", ..Default::default() };
+        let at = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
+        let evidence = json!({"granted_by":"operator"});
+        observe_scope_outcome(&mut r, "scope_grant_intent", &evidence, at);
+        assert_eq!(r.outcome, "incomplete");
+        assert!(r.ruled_at.is_none());
+        observe_scope_outcome(&mut r, "scope_granted", &evidence, at);
+        assert_eq!(r.outcome, "granted");
+        assert_eq!(r.ruled_at, Some(at));
+        let mut refused = Req { kind: "scope", outcome: "open", ..Default::default() };
+        observe_scope_outcome(&mut refused, "scope_grant_intent", &evidence, at);
+        observe_scope_outcome(&mut refused, "scope_refused", &evidence, at);
+        assert_eq!(refused.outcome, "refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_directories_are_private_distinct_and_owned() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = snapshot_tempdir().unwrap();
+        let second = snapshot_tempdir().unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_eq!(std::fs::metadata(first.path()).unwrap().permissions().mode() & 0o077, 0);
+        let owned = first.path().to_path_buf();
+        drop(first);
+        assert!(!owned.exists());
+        assert!(second.path().exists());
+    }
+
+    #[test]
+    fn repeated_request_count_excludes_the_first_ask() {
+        let mut requests = HashMap::new();
+        requests.insert("a".into(), req("same", 100, "refused", Some(200)));
+        requests.insert("b".into(), req("same", 300, "open", None));
+        requests.insert("c".into(), req("same", 400, "open", None));
+        let report = summarize(&requests, 7, 3, &Utc::now(), &[]);
+        assert_eq!(report["scope"]["reasked_same_member_and_path"], 2);
+        assert_eq!(report["scope"]["reasks"]["reasks"], 2);
     }
 
     #[test]

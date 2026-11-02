@@ -39,6 +39,7 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # System
 dirs = "5"
+tempfile = "3"
 
 # Errors
 thiserror = "2"
@@ -102,6 +103,3 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "blo
 regex = "1"
 globset = "0.4"
 chrono-tz = "0.10"
-
-[dev-dependencies]
-tempfile = "3"
