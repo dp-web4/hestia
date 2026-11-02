@@ -10640,6 +10640,37 @@ mod disposition_tests {
                 "false certainty: {error}; reopened revoked={revoked}");
     }
 
+    #[tokio::test]
+    async fn delegation_revoke_terminal_witness_failure_must_not_report_complete() {
+        let (dir, state) = test_state().await;
+        seed_operator_key(&state).await;
+        register_member(&state, "test-seat").await;
+        let (status, granted) = deleg(&state, "test-seat", Some(serde_json::json!({
+            "roles": ["witness"], "reason": "synthetic grant"}))).await;
+        assert_eq!(status, StatusCode::OK, "{granted}");
+        let id = granted["delegation_id"].as_str().unwrap().to_string();
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER no_delegation_terminal BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'delegation_revoked' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+
+        let (status, response) = agent_delegation_revoke(
+            State(state.clone()), Path(("test-seat".into(), id.clone())),
+            Json(serde_json::json!({"reason": "synthetic revoke"})),
+        ).await;
+        let reopened = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let persisted = crate::delegation::DelegationStore::load(&reopened).unwrap();
+        let revoked = persisted.delegations.iter().find(|d| d.id.to_string() == id)
+            .expect("the synthetic delegation remains inspectable").revoked;
+        let chain = state.lock().await.recent_chain(50);
+        assert!(revoked, "the vault mutation happened before the injected witness failure");
+        assert!(chain.iter().any(|e| e.event_type == "delegation_revoke_intent"));
+        assert!(!chain.iter().any(|e| e.event_type == "delegation_revoked"));
+        assert_ne!(status, StatusCode::OK,
+                   "unwitnessed revocation was reported complete: {}", response.0);
+    }
+
     /// dp's fourth ask, the half #1079 left: manage an agent's delegated authority from the
     /// agent. The key is DERIVED from the registry; the body may not name an agent at all.
     #[tokio::test]
