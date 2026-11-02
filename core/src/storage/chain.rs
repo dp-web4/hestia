@@ -569,19 +569,20 @@ impl SqliteChainStore {
             .pragma_update(None, "query_only", true)
             .with_context(|| "making chain snapshot source query-only")?;
 
-        if destination_path.exists() {
-            std::fs::remove_file(destination_path).with_context(|| {
-                format!(
-                    "removing prior chain snapshot {}",
-                    destination_path.display()
-                )
-            })?;
-        }
-
-        let mut destination = Connection::open(destination_path).with_context(|| {
+        // Build in a private directory on the destination filesystem. A failed
+        // open, key check, or backup must not destroy the previous snapshot.
+        let parent = match destination_path.parent() {
+            Some(path) if !path.as_os_str().is_empty() => path,
+            _ => Path::new("."),
+        };
+        let staging_dir = tempfile::Builder::new().prefix(".hestia-snapshot-")
+            .tempdir_in(parent).context("creating private chain snapshot staging directory")?;
+        let staged = tempfile::NamedTempFile::new_in(staging_dir.path())
+            .context("creating private chain snapshot staging file")?;
+        let mut destination = Connection::open(staged.path()).with_context(|| {
             format!(
-                "opening chain snapshot destination {}",
-                destination_path.display()
+                "opening staged chain snapshot for {}",
+                destination_path.display(),
             )
         })?;
         destination
@@ -592,6 +593,16 @@ impl SqliteChainStore {
         backup
             .run_to_completion(256, std::time::Duration::from_millis(10), None)
             .with_context(|| "copying encrypted chain snapshot")?;
+        drop(backup);
+        destination.close().map_err(|(_, error)| error)
+            .context("closing staged chain snapshot")?;
+        staged.as_file().sync_all().context("syncing staged chain snapshot")?;
+        // This is a second check, not a guarantee against uncooperative path
+        // replacement between the check and rename.
+        refuse_snapshot_alias(source_path, destination_path)?;
+        staged.persist(destination_path)
+            .map_err(|error| error.error)
+            .context("publishing staged chain snapshot")?;
         Ok(())
     }
 
@@ -2597,6 +2608,26 @@ mod tests {
         assert!(result.is_err(), "the wrong key must fail the backup");
         assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination",
                    "a failed backup must not replace its destination");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".hestia-snapshot-")
+        }), "a failed backup must clean up its staging directory");
+    }
+
+    #[test]
+    fn successful_backup_replaces_existing_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let snapshot_path = dir.path().join("existing.db");
+        let store = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        store.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+        std::fs::write(&snapshot_path, b"old snapshot").unwrap();
+
+        SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY).unwrap();
+        let snapshot = SqliteChainStore::open(&snapshot_path, TEST_KEY).unwrap();
+        assert_eq!(snapshot.read_recent(10).unwrap()[0].event_type, "synthetic");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".hestia-snapshot-")
+        }), "a successful backup must clean up its staging directory");
     }
 
     #[test]
