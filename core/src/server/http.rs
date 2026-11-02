@@ -10557,6 +10557,35 @@ mod disposition_tests {
         assert_eq!((b.0["mode"].as_str(), b.0["reason"].as_str()), (Some("enforce"), Some("coverage granted")));
     }
 
+    #[tokio::test]
+    async fn refused_mode_save_must_not_later_change_unwitnessed() {
+        use crate::server::delegation_gate::{load_mode, GateMode};
+        let (dir, state) = test_state().await;
+        let before = {
+            let mut s = state.lock().await;
+            s.vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+            s.chain_store.len().unwrap()
+        };
+        let (status, response) = delegation_mode_set(
+            State(state.clone()), None,
+            Json(serde_json::json!({"mode":"enforce", "reason":"synthetic"})),
+        ).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.0["error"].as_str().unwrap().contains("nothing changed"));
+        let (staged, chain_after) = {
+            let mut s = state.lock().await;
+            let staged = load_mode(&s.vault).unwrap().map(|d| d.mode);
+            s.vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+            s.vault.put_document("fixture", "unrelated", b"test".to_vec()).unwrap();
+            (staged, s.chain_store.len().unwrap())
+        };
+        let reopened = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let persisted = load_mode(&reopened).unwrap().map(|d| d.mode);
+        let observed = state.published().delegation_gate.snapshot().effective_mode();
+        assert!(staged.is_none() && persisted.is_none() && observed == GateMode::Record,
+                "failed save leaked: staged={staged:?}, persisted={persisted:?}, observed={observed:?}, chain_before={before}, chain_after={chain_after}");
+    }
+
     /// dp's fourth ask, the half #1079 left: manage an agent's delegated authority from the
     /// agent. The key is DERIVED from the registry; the body may not name an agent at all.
     #[tokio::test]
