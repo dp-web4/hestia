@@ -24708,8 +24708,8 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // from "this society's grants were never migrated", and #596 is what the second one
         // costs when it is invisible.
         "authority_status": s.authority_status.as_str(),
-        // FRESHNESS, REPORTED EVEN WHEN IT MATCHES. `null` means no verification has run in
-        // this process yet, which is information rather than health; silence is not health.
+        // FRESHNESS, REPORTED EVEN WHEN IT MATCHES. `null` means no completed result is
+        // currently available (not yet run, in flight, or canceled); silence is not health.
         "projection_verified_at": s.standing_projection_audit.as_ref().map(|a| a.verified_at),
         "projection_matches_vault": s.standing_projection_audit.as_ref().map(|a| a.matches),
         "projection_divergence": s.standing_projection_audit
@@ -27848,6 +27848,12 @@ mod standing_scope_surface_tests {
         assert!(Vault::open(vault_path, "p".into()).is_ok());
         let audit = s.verify_standing_projection(now).unwrap();
         assert!(!audit.matches, "a readable but older durable record must be compared");
+        assert!(audit.divergence.iter().any(|d| d.contains("PHANTOM") && d.contains("/fixture/second")));
+        drop(s);
+        assert!(!crate::server::state::verify_standing_projection_detached(&state).await);
+        let s = state.lock().await;
+        let audit = s.standing_projection_audit.as_ref().unwrap();
+        assert!(!audit.matches);
         assert!(audit.divergence.iter().any(|d| d.contains("PHANTOM") && d.contains("/fixture/second")));
     }
 

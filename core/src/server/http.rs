@@ -1943,38 +1943,14 @@ pub async fn serve_with_callback(
         ));
         loop {
             tick.tick().await;
-            let now = super::gate_escalation::now_secs();
             let (_, durable) = crate::storage::durability::durable_scope(async {
-            let mut s = verify_state.lock().await;
-            match s.verify_standing_projection(now) {
-                Ok(audit) => {
-                    if !audit.matches {
-                        tracing::error!(
-                            runtime_generation = audit.runtime_generation,
-                            vault_generation = audit.vault_generation,
-                            divergence = ?audit.divergence,
-                            "standing-scope projection DIVERGED from the vault authority"
-                        );
+                // Retry a moving state a bounded number of times; the last
+                // stale attempt stays visibly non-matching if it never settles.
+                for _ in 0..3 {
+                    if !super::state::verify_standing_projection_detached(&verify_state).await {
+                        break;
                     }
-                    *s.standing_projection_audit = Some(audit);
                 }
-                // A vault that cannot be read is itself a finding, and leaving the previous
-                // audit in place would let a stale "matches: true" outlive the evidence for
-                // it. Record the failure as a non-match with the reason.
-                Err(e) => {
-                    tracing::error!("standing-scope projection unverifiable: {e}");
-                    *s.standing_projection_audit =
-                        Some(super::standing_scope::ProjectionAudit {
-                            verified_at: now,
-                            matches: false,
-                            runtime_generation: s.standing_scope.generation,
-                            vault_generation: 0,
-                            runtime_digest: s.standing_scope.authority_digest(),
-                            vault_digest: String::new(),
-                            divergence: vec![format!("vault authority unreadable: {e}")],
-                        });
-                }
-            }
             })
             .await;
             if let Err(e) = durable {

@@ -58,11 +58,16 @@ use super::standing_scope::{AuthorityStatus, ProjectionAudit, StandingGrant, Sta
 pub struct Watched<T> {
     value: T,
     dirty: bool,
+    revision: u64,
 }
 
 impl<T> Watched<T> {
     pub fn new(value: T) -> Self {
-        Self { value, dirty: true }
+        Self { value, dirty: true, revision: 0 }
+    }
+    /// A non-resetting mutation marker; saturation is reported as unknown.
+    pub(crate) fn revision(&self) -> Option<u64> {
+        (self.revision != u64::MAX).then_some(self.revision)
     }
     /// Was this field mutably accessed since the last call? Clears the bit.
     pub(crate) fn take_dirty(&mut self) -> bool {
@@ -80,6 +85,7 @@ impl<T> Deref for Watched<T> {
 impl<T> DerefMut for Watched<T> {
     fn deref_mut(&mut self) -> &mut T {
         self.dirty = true;
+        self.revision = self.revision.saturating_add(1);
         &mut self.value
     }
 }

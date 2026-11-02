@@ -655,9 +655,11 @@ pub struct ServerState {
     /// rather than silently empty.
     pub authority_status: crate::server::published::Watched<crate::server::standing_scope::AuthorityStatus>,
     /// The most recent proof that the runtime projection still equals the vault. `None`
-    /// until the first verification runs, which is itself information: it means no
-    /// verification has happened yet, not that everything is fine.
+    /// when no completed verification is currently available (including before the first
+    /// run, while one is in flight, or after cancellation); absence is not health.
     pub standing_projection_audit: crate::server::published::Watched<Option<crate::server::standing_scope::ProjectionAudit>>,
+    /// Process-local identity used to discard superseded off-lock audit results.
+    standing_projection_attempt: Option<Arc<()>>,
     /// TRUE while the in-memory standing store is TIGHTER than the persisted vault copy —
     /// set when a revoke's vault write fails after the row was already removed from memory
     /// (memory keeps the tighter state on purpose). While set, the revoke surface accepts a
@@ -1174,6 +1176,7 @@ impl ServerState {
             // construction agreeing with itself is not a proof, and claiming one here would
             // make the freshness timestamp lie from the first second.
             standing_projection_audit: crate::server::published::Watched::new(None),
+            standing_projection_attempt: None,
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
             #[cfg(test)]
@@ -2593,6 +2596,85 @@ fn row_instance_lct(r: &ChainEntry) -> Option<String> {
 /// The daemon's shared state behind its one global lock, instrumented (see `state_lock`).
 pub type SharedState = Arc<super::state_lock::StateCell<ServerState>>;
 
+/// Refresh the periodic comparison without holding the shared state lock while
+/// the durable file is opened and decrypted. Returns true if a concurrent
+/// state change makes this attempt stale and the caller should retry.
+pub(crate) async fn verify_standing_projection_detached(state: &SharedState) -> bool {
+    verify_standing_projection_with(state, |reader| {
+        reader.read_doc::<crate::server::standing_scope::StandingScopeStore>(
+            "scope", "standing", "standing-scope.json")
+    }).await
+}
+
+async fn verify_standing_projection_with<F>(state: &SharedState, read: F) -> bool
+where
+    F: FnOnce(crate::vault::DetachedVaultReader)
+        -> anyhow::Result<(u64, u64, crate::server::standing_scope::StandingScopeStore)> + Send + 'static,
+{
+    use crate::server::standing_scope::ProjectionAudit;
+    let (attempt, instance, generation, revision, runtime, reader) = {
+        let mut s = state.lock().await;
+        // Supersede any in-flight attempt even if this one cannot start.
+        let attempt = Arc::new(());
+        s.standing_projection_attempt = Some(attempt.clone());
+        let Some(revision) = s.standing_scope.revision() else {
+            *s.standing_projection_audit = None;
+            return false;
+        };
+        // An old successful result is not evidence while a new read is in flight.
+        *s.standing_projection_audit = None;
+        (attempt, s.vault.instance_identity(), s.vault.generation(), revision,
+         (*s.standing_scope).clone(), s.vault.detached_reader())
+    };
+    let result = tokio::task::spawn_blocking(move || read(reader)).await;
+    let observed_at = crate::server::gate_escalation::now_secs();
+    let mut s = state.lock().await;
+    // A later attempt owns the published slot; an older result must not replace it.
+    if !s.standing_projection_attempt.as_ref().is_some_and(|current| Arc::ptr_eq(current, &attempt)) {
+        return false;
+    }
+    let failure = |s: &ServerState, why: &str| ProjectionAudit {
+        verified_at: observed_at,
+        matches: false,
+        runtime_generation: s.standing_scope.generation,
+        vault_generation: 0,
+        runtime_digest: s.standing_scope.authority_digest(),
+        vault_digest: String::new(),
+        divergence: vec![why.to_owned()],
+    };
+    if !Arc::ptr_eq(&s.vault.instance_identity(), &instance) || s.vault.generation() != generation
+        || s.standing_scope.revision() != Some(revision)
+        || *s.standing_scope != runtime {
+        *s.standing_projection_audit = Some(failure(&s, "authority changed during verification; retry"));
+        return true;
+    }
+    let (file_generation, read_at, durable) = match result {
+        Ok(Ok(value)) => value,
+        _ => {
+            *s.standing_projection_audit = Some(failure(&s, "durable authority unreadable or verification failed"));
+            return false;
+        }
+    };
+    let mut divergence = runtime.divergence_from(&durable);
+    if file_generation != generation {
+        divergence.push("durable vault generation differs from the open vault".to_owned());
+    }
+    let audit = ProjectionAudit {
+        verified_at: read_at,
+        matches: divergence.is_empty(),
+        runtime_generation: runtime.generation,
+        vault_generation: durable.generation,
+        runtime_digest: runtime.authority_digest(),
+        vault_digest: durable.authority_digest(),
+        divergence,
+    };
+    if !audit.matches {
+        tracing::error!(divergence = ?audit.divergence, "standing-scope projection DIVERGED from the vault authority");
+    }
+    *s.standing_projection_audit = Some(audit);
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2603,6 +2685,145 @@ mod tests {
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = ServerState::open(vault, dir.path(), "p").unwrap();
         (dir, state)
+    }
+
+    #[tokio::test]
+    async fn detached_projection_audit_marks_unreadable_storage_unverified() {
+        let (_dir, raw) = make_state();
+        let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        assert!(!verify_standing_projection_detached(&state).await);
+        let path = {
+            let s = state.lock().await;
+            assert!(s.standing_projection_audit.as_ref().unwrap().matches);
+            s.vault.path().to_path_buf()
+        };
+        std::fs::write(&path, b"synthetic corrupt vault").unwrap();
+        assert!(!verify_standing_projection_detached(&state).await);
+        let s = state.lock().await;
+        let audit = s.standing_projection_audit.as_ref().unwrap();
+        assert!(!audit.matches && audit.divergence.iter().any(|d| d.contains("unreadable")));
+    }
+
+    #[tokio::test]
+    async fn detached_projection_audit_releases_lock_and_rejects_changed_state() {
+        let (_dir, raw) = make_state();
+        let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            verify_standing_projection_with(&task_state, move |reader| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                reader.read_doc("scope", "standing", "standing-scope.json")
+            }).await
+        });
+        started_rx.await.unwrap();
+        {
+            let mut s = tokio::time::timeout(std::time::Duration::from_secs(2), state.lock())
+                .await.expect("the durable read must not hold the state lock");
+            assert!(s.standing_projection_audit.is_none());
+            // An ABA that returns to identical bytes and generation must still
+            // invalidate a read made while the projection was moving.
+            let before = s.standing_scope.generation;
+            s.standing_scope.generation = before + 1;
+            s.standing_scope.generation = before;
+        }
+        release_tx.send(()).unwrap();
+        assert!(task.await.unwrap(), "a changed state needs retry");
+        let s = state.lock().await;
+        let audit = s.standing_projection_audit.as_ref().unwrap();
+        assert!(!audit.matches && audit.divergence.iter().any(|d| d.contains("changed during")));
+    }
+
+    #[tokio::test]
+    async fn an_older_detached_audit_cannot_replace_a_newer_attempt() {
+        let (_dir, raw) = make_state();
+        let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task_state = state.clone();
+        let old = tokio::spawn(async move {
+            verify_standing_projection_with(&task_state, move |reader| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                reader.read_doc("scope", "standing", "standing-scope.json")
+            }).await
+        });
+        started_rx.await.unwrap();
+        assert!(!verify_standing_projection_with(&state, |_| Err(anyhow::anyhow!("synthetic failure"))).await);
+        release_tx.send(()).unwrap();
+        assert!(!old.await.unwrap());
+        let s = state.lock().await;
+        let audit = s.standing_projection_audit.as_ref().unwrap();
+        assert!(!audit.matches && audit.divergence.iter().any(|d| d.contains("unreadable")));
+    }
+
+    #[tokio::test]
+    async fn detached_audit_rejects_mismatched_durable_vault_generation() {
+        let (_dir, raw) = make_state();
+        let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        let (generation, runtime) = {
+            let s = state.lock().await;
+            (s.vault.generation(), (*s.standing_scope).clone())
+        };
+        assert!(!verify_standing_projection_with(&state, move |_| Ok((generation + 1, 123, runtime))).await);
+        let s = state.lock().await;
+        let audit = s.standing_projection_audit.as_ref().unwrap();
+        assert!(!audit.matches && audit.divergence.iter().any(|d| d.contains("generation differs")));
+        assert_eq!(audit.verified_at, 123, "freshness is the observation time, not the completion time");
+    }
+
+    #[tokio::test]
+    async fn detached_audit_rejects_replaced_vault_at_the_same_generation() {
+        let (_dir, raw) = make_state();
+        let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            verify_standing_projection_with(&task_state, move |reader| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                reader.read_doc("scope", "standing", "standing-scope.json")
+            }).await
+        });
+        started_rx.await.unwrap();
+        {
+            let mut s = state.lock().await;
+            let before = s.vault.generation();
+            let replacement = s.vault.reopen().unwrap();
+            assert_eq!(replacement.generation(), before);
+            s.vault = replacement;
+        }
+        release_tx.send(()).unwrap();
+        assert!(task.await.unwrap(), "the replacement instance needs a fresh audit");
+        let s = state.lock().await;
+        let audit = s.standing_projection_audit.as_ref().unwrap();
+        assert!(!audit.matches && audit.divergence.iter().any(|d| d.contains("changed during")));
+    }
+
+    #[tokio::test]
+    async fn cancelling_detached_audit_does_not_leave_old_match_visible() {
+        let (_dir, raw) = make_state();
+        let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        assert!(!verify_standing_projection_detached(&state).await);
+        assert!(state.lock().await.standing_projection_audit.as_ref().unwrap().matches);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            verify_standing_projection_with(&task_state, move |reader| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                reader.read_doc("scope", "standing", "standing-scope.json")
+            }).await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        release_tx.send(()).unwrap();
+        let _ = task.await;
+        assert!(state.lock().await.standing_projection_audit.is_none());
     }
 
     /// B2 (#339): the daemon's chain rows are witnessed by the Society key, name the real

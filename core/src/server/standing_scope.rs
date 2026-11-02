@@ -137,7 +137,7 @@ pub fn covers_path(root: &str, recursive: bool, path: &str) -> bool {
 }
 
 /// The whole durable store, serialised as one vault document (`scope`/`standing`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandingScopeStore {
     /// Monotonic, incremented on EVERY mutation (grant and revoke alike). This is the
     /// counter the certified-replica honor logic requires: it answers "WHICH policy is

@@ -49,6 +49,9 @@ pub struct Vault {
     path: PathBuf,
     passphrase: String,
     data: VaultData,
+    /// Process-local identity, retained by an in-flight audit so allocator
+    /// reuse cannot make a replacement Vault look like the original.
+    instance_identity: std::sync::Arc<()>,
     /// Long-lived exclusive writer lease when this Vault is the daemon or an explicit
     /// break-glass writer. Read-only Vault opens do not acquire it. Ordinary short-lived
     /// writers acquire the same lease around each save in `storage::save_if_current`.
@@ -82,6 +85,17 @@ impl Vault {
         Self::open(self.path.clone(), self.passphrase.clone())
     }
 
+    /// A detached, read-only snapshot source for work that must not hold the
+    /// server state lock during key derivation or file I/O. The copied unlock
+    /// material is zeroized when the reader is dropped.
+    pub(crate) fn detached_reader(&self) -> DetachedVaultReader {
+        DetachedVaultReader { path: self.path.clone(), passphrase: Zeroizing::new(self.passphrase.clone()) }
+    }
+
+    pub(crate) fn instance_identity(&self) -> std::sync::Arc<()> {
+        self.instance_identity.clone()
+    }
+
     /// Open an existing vault file at `path` using `passphrase`.
     pub fn open(path: PathBuf, passphrase: String) -> Result<Self> {
         let data = storage::load(&path, &passphrase)?;
@@ -89,6 +103,7 @@ impl Vault {
             path,
             passphrase,
             data,
+            instance_identity: std::sync::Arc::new(()),
             writer_lease: None,
             policy_lists_gen: next_policy_lists_gen(),
             pre_save: None,
@@ -111,6 +126,7 @@ impl Vault {
             path,
             passphrase,
             data,
+            instance_identity: std::sync::Arc::new(()),
             writer_lease: None,
             policy_lists_gen: next_policy_lists_gen(),
             pre_save: None,
@@ -516,6 +532,43 @@ impl Vault {
     /// Directory the vault file lives in (where legacy plaintext sidecars sit).
     pub fn home_dir(&self) -> Option<&std::path::Path> {
         self.path.parent()
+    }
+}
+
+pub(crate) struct DetachedVaultReader {
+    path: PathBuf,
+    passphrase: Zeroizing<String>,
+}
+
+impl DetachedVaultReader {
+    /// Read the durable file and one document with the same legacy fallback
+    /// as `load_doc`. Return the file's generation with the document.
+    pub(crate) fn read_doc<T: serde::de::DeserializeOwned + Default>(
+        &self, namespace: &str, name: &str, legacy_filename: &str,
+    ) -> anyhow::Result<(u64, u64, T)> {
+        use anyhow::Context;
+        let (data, mut observed_at) = storage::load_observed(&self.path, self.passphrase.as_str())?;
+        let bytes = data.documents.iter().find(|d| d.namespace == namespace && d.name == name)
+            .and_then(|d| d.master_bytes());
+        let value = if let Some(bytes) = bytes {
+            serde_json::from_slice(bytes).with_context(|| format!("parsing vault document {namespace}/{name}"))?
+        } else if let Some(home) = self.path.parent() {
+            let legacy = home.join(legacy_filename);
+            match std::fs::read(&legacy) {
+                Ok(bytes) => {
+                    observed_at = crate::server::gate_escalation::now_secs();
+                    serde_json::from_slice(&bytes).with_context(|| format!("parsing legacy {legacy_filename}"))?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    observed_at = crate::server::gate_escalation::now_secs();
+                    T::default()
+                }
+                Err(error) => return Err(error).with_context(|| format!("reading legacy {legacy_filename}")),
+            }
+        } else {
+            T::default()
+        };
+        Ok((data.generation, observed_at, value))
     }
 }
 

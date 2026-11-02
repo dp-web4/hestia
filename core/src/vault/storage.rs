@@ -197,11 +197,19 @@ pub fn default_hestia_home() -> Result<PathBuf> {
 
 /// Read the vault file from disk, decrypt with the passphrase, return the data.
 pub fn load(path: &Path, passphrase: &str) -> Result<VaultData> {
+    load_observed(path, passphrase).map(|(data, _)| data)
+}
+
+/// Load and record when the encrypted bytes were read, not when the slower
+/// key derivation completed. The timestamp is an observation, not a lease.
+pub(super) fn load_observed(path: &Path, passphrase: &str) -> Result<(VaultData, u64)> {
     if !path.exists() {
         return Err(CoreError::VaultNotFound(path.to_path_buf()));
     }
 
     let raw = fs::read(path).map_err(|e| CoreError::io(path, e))?;
+    let observed_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs();
 
     if raw.len() < HEADER_LEN {
         return Err(CoreError::VaultCorrupted {
@@ -234,7 +242,7 @@ pub fn load(path: &Path, passphrase: &str) -> Result<VaultData> {
     let plaintext = decrypt(&key, &nonce, ciphertext)?;
 
     let data: VaultData = serde_json::from_slice(&plaintext)?;
-    Ok(data)
+    Ok((data, observed_at))
 }
 
 /// Encrypt the vault data with the passphrase and write atomically to `path`.
