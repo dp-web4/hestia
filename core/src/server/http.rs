@@ -10586,6 +10586,27 @@ mod disposition_tests {
                 "failed save leaked: staged={staged:?}, persisted={persisted:?}, observed={observed:?}, chain_before={before}, chain_after={chain_after}");
     }
 
+    #[tokio::test]
+    async fn mode_save_error_after_rename_must_not_claim_no_change() {
+        use crate::server::delegation_gate::load_mode;
+        let (dir, state) = test_state().await;
+        crate::vault::storage::fail_next_save_after_rename();
+        let (status, response) = delegation_mode_set(
+            State(state.clone()), None,
+            Json(serde_json::json!({"mode":"enforce", "reason":"synthetic"})),
+        ).await;
+        let reopened = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let persisted = load_mode(&reopened).unwrap().map(|d| d.mode);
+        let (snapshot, chain_len) = {
+            let s = state.lock().await;
+            (s.delegation_gate.snapshot().effective_mode(), s.chain_store.len().unwrap())
+        };
+        let error = response.0["error"].as_str().unwrap_or("");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!error.contains("nothing changed"),
+                "false no-change response: {error}; reopened={persisted:?}, snapshot={snapshot:?}, chain_len={chain_len}");
+    }
+
     /// dp's fourth ask, the half #1079 left: manage an agent's delegated authority from the
     /// agent. The key is DERIVED from the registry; the body may not name an agent at all.
     #[tokio::test]
