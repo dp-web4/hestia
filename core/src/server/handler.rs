@@ -27825,6 +27825,30 @@ mod standing_scope_surface_tests {
                 "unreadable durable authority must not reuse a cached matching copy");
     }
 
+    #[tokio::test]
+    async fn standing_projection_detects_an_older_readable_durable_vault() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        s.commit_standing_scope(|st| {
+            st.add(standing("synthetic", "/fixture/first", now, None))
+        }).unwrap();
+        let vault_path = dir.path().join("v.enc");
+        let earlier = std::fs::read(&vault_path).unwrap();
+        s.commit_standing_scope(|st| {
+            st.add(standing("synthetic", "/fixture/second", now, None))
+        }).unwrap();
+        assert!(s.verify_standing_projection(now).unwrap().matches);
+
+        // Simulate storage reverting to a valid earlier fixture, not a
+        // cooperating writer or an operator-approved recovery.
+        std::fs::write(&vault_path, earlier).unwrap();
+        assert!(Vault::open(vault_path, "p".into()).is_ok());
+        let audit = s.verify_standing_projection(now).unwrap();
+        assert!(!audit.matches, "a readable but older durable record must be compared");
+        assert!(audit.divergence.iter().any(|d| d.contains("PHANTOM") && d.contains("/fixture/second")));
+    }
+
     /// GPT re-review of #728: an expiry-only change is a reach change, and the report used to
     /// miss it because the digest compared four fields while the report keyed on two.
     ///
