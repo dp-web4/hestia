@@ -197,12 +197,30 @@ mod tests {
 
     #[test]
     fn raw_flattened_rows_refuse_duplicate_or_conflicting_selectors() {
+        // Positive raw-JSON controls make the negatives discriminating: they
+        // must not pass simply because no raw flattened row can deserialize.
+        for (wire, expected) in [
+            (r#"{"member":"test","granted_at":10,"path":"/a"}"#,
+             GrantTarget::Path { path: "/a".into(), recursive: false }),
+            (r#"{"member":"test","granted_at":10,"path":"/a","recursive":true,"modes":"r","expires_at":20}"#,
+             GrantTarget::Path { path: "/a".into(), recursive: true }),
+            (r#"{"member":"test","granted_at":10,"repo":"OWNER/A"}"#,
+             GrantTarget::Repository(RepositoryTarget::parse("owner/a").unwrap())),
+        ] {
+            let row: Row = serde_json::from_str(wire).expect("valid flattened raw row");
+            assert_eq!(row.member, "test");
+            assert_eq!(row.target, expected);
+        }
         for wire in [
             r#"{"member":"test","granted_at":10,"path":"/a","path":"/b"}"#,
             r#"{"member":"test","granted_at":10,"repo":"owner/a","repo":"owner/b"}"#,
             r#"{"member":"test","granted_at":10,"repo":"owner/a","recursive":false,"recursive":true}"#,
             r#"{"member":"test","granted_at":10,"path":"/a","repo":"owner/b"}"#,
             r#"{"member":"test","granted_at":10,"repo":"owner/a","recusrive":true}"#,
+            r#"{"member":"test","granted_at":10,"path":"/a","expire_at":20}"#,
+            r#"{"member":"test","granted_at":10,"repo":"owner/a","mode":"r"}"#,
+            r#"{"member":"test","granted_at":10,"repo":"bad"}"#,
+            r#"{"member":"test","member":"other","granted_at":10,"path":"/a"}"#,
         ] {
             assert!(serde_json::from_str::<Row>(wire).is_err(), "accepted {wire}");
         }
