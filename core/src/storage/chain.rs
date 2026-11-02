@@ -25,7 +25,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -554,6 +554,21 @@ impl SqliteChainStore {
         }
         refuse_snapshot_alias(source_path, destination_path)?;
         after_alias_check();
+        // The alias check and open are separate operations. Do not recreate a
+        // source removed between them, and do not replace a destination if
+        // the source cannot be opened.
+        let key_hex = hex::encode(key);
+        let source = Connection::open_with_flags(
+            source_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ).with_context(|| format!("opening chain snapshot source {}", source_path.display()))?;
+        source
+            .pragma_update(None, "key", &key_hex)
+            .with_context(|| "keying chain snapshot source")?;
+        source
+            .pragma_update(None, "query_only", true)
+            .with_context(|| "making chain snapshot source query-only")?;
+
         if destination_path.exists() {
             std::fs::remove_file(destination_path).with_context(|| {
                 format!(
@@ -562,16 +577,6 @@ impl SqliteChainStore {
                 )
             })?;
         }
-
-        let key_hex = hex::encode(key);
-        let source = Connection::open(source_path)
-            .with_context(|| format!("opening chain snapshot source {}", source_path.display()))?;
-        source
-            .pragma_update(None, "key", &key_hex)
-            .with_context(|| "keying chain snapshot source")?;
-        source
-            .pragma_update(None, "query_only", true)
-            .with_context(|| "making chain snapshot source query-only")?;
 
         let mut destination = Connection::open(destination_path).with_context(|| {
             format!(
