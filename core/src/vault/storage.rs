@@ -12,8 +12,9 @@
 //! The ciphertext, when decrypted, is JSON serialization of a `VaultData`
 //! struct (which holds the list of entries + metadata).
 //!
-//! Atomic writes use temp-file-and-rename so a crash during write doesn't
-//! corrupt the vault. Writer serialization is a separate property: a stable
+//! Atomic replacement uses temp-file-and-rename. Without a parent-directory
+//! durability protocol this alone is not a guarantee across a crash. Writer
+//! serialization is a separate property: a stable
 //! sibling lock artifact plus a persisted generation prevents an older in-memory
 //! snapshot from atomically overwriting newer authority.
 
@@ -31,6 +32,17 @@ use crate::error::{CoreError, Result};
 const MAGIC: &[u8; 4] = b"HSTV";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 4 + 1 + 16 + 12; // = 33
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fail one vault save on this test thread immediately before publication.
+#[cfg(test)]
+pub(crate) fn fail_next_save_before_rename() {
+    FAIL_BEFORE_RENAME.with(|flag| flag.set(true));
+}
 
 /// The cleartext contents of the vault — serialized to JSON, then encrypted on disk.
 ///
@@ -237,7 +249,28 @@ pub fn load(path: &Path, passphrase: &str) -> Result<VaultData> {
     Ok(data)
 }
 
-/// Encrypt the vault data with the passphrase and write atomically to `path`.
+/// Stage encrypted bytes in an exclusively created sibling of the target.
+fn stage_ciphertext(parent: &Path, buffer: &[u8]) -> Result<tempfile::NamedTempFile> {
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".hestia-vault-")
+        .tempfile_in(parent)
+        .map_err(|e| CoreError::io(parent, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| CoreError::io(tmp.path(), e))?;
+    }
+    tmp.write_all(buffer)
+        .map_err(|e| CoreError::io(tmp.path(), e))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| CoreError::io(tmp.path(), e))?;
+    Ok(tmp)
+}
+
+/// Encrypt the vault data with the passphrase and replace `path` atomically.
 /// A fresh salt + nonce are generated on every write.
 pub fn save(path: &Path, passphrase: &str, data: &VaultData) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -258,35 +291,33 @@ pub fn save(path: &Path, passphrase: &str, data: &VaultData) -> Result<()> {
     buffer.extend_from_slice(&nonce);
     buffer.extend_from_slice(&ciphertext);
 
-    // Atomic write: temp file + rename
-    let tmp_path = path.with_extension("enc.tmp");
-    {
-        let mut tmp = File::create(&tmp_path).map_err(|e| CoreError::io(&tmp_path, e))?;
-        tmp.write_all(&buffer)
-            .map_err(|e| CoreError::io(&tmp_path, e))?;
-        tmp.sync_all().map_err(|e| CoreError::io(&tmp_path, e))?;
-    }
-    fs::rename(&tmp_path, path).map_err(|e| CoreError::io(path, e))?;
+    // Same-directory placement is required for atomic replacement on supported filesystems.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let tmp = stage_ciphertext(parent, &buffer)?;
 
-    // Tighten permissions on Unix (rwx for owner only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)
-            .map_err(|e| CoreError::io(path, e))?
-            .permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(path, perms).map_err(|e| CoreError::io(path, e))?;
+    #[cfg(test)]
+    if FAIL_BEFORE_RENAME.with(|flag| flag.replace(false)) {
+        return Err(CoreError::io(
+            path,
+            std::io::Error::other("synthetic pre-rename failure"),
+        ));
     }
+
+    tmp.persist(path)
+        .map_err(|e| CoreError::io(path, e.error))?;
 
     Ok(())
 }
 
 /// Persist one mutation while the caller already owns the writer lease.
 ///
-/// Crash atomicity comes from `save`; authority atomicity comes from comparing the loaded
-/// generation to the current encrypted file before the rename. The caller's changed data is
-/// never written when the snapshot is stale.
+/// Replacement uses `save`; authority atomicity among cooperating writers comes from comparing
+/// the loaded generation to the current encrypted file before the rename. The caller's changed
+/// data is never written when the cooperating snapshot is stale. This does not prove crash
+/// durability or containment in an adversarially writable parent directory.
 pub(super) fn save_if_current_locked(
     path: &Path,
     passphrase: &str,
@@ -303,10 +334,12 @@ pub(super) fn save_if_current_locked(
         });
     }
 
-    let next_generation = expected.checked_add(1).ok_or_else(|| CoreError::VaultCorrupted {
-        path: path.to_path_buf(),
-        reason: "vault generation overflow".into(),
-    })?;
+    let next_generation = expected
+        .checked_add(1)
+        .ok_or_else(|| CoreError::VaultCorrupted {
+            path: path.to_path_buf(),
+            reason: "vault generation overflow".into(),
+        })?;
     let mut next = data.clone();
     next.generation = next_generation;
     save(path, passphrase, &next)?;
@@ -394,6 +427,71 @@ mod tests {
         let perms = fs::metadata(&path).unwrap().permissions();
         // 0o600 = rw for owner only
         assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_follow_preexisting_legacy_temp_symlink() {
+        use std::os::unix::fs::symlink;
+        let (dir, path) = temp_vault();
+        let sentinel = dir.path().join("unrelated");
+        fs::write(&sentinel, b"unchanged").unwrap();
+        symlink(&sentinel, path.with_extension("enc.tmp")).unwrap();
+
+        save(&path, "p", &VaultData::default()).unwrap();
+
+        assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged");
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
+        load(&path, "p").unwrap();
+    }
+
+    #[test]
+    fn save_leaves_preexisting_legacy_temp_file_untouched() {
+        let (_dir, path) = temp_vault();
+        let old_temp = path.with_extension("enc.tmp");
+        fs::write(&old_temp, b"old temp").unwrap();
+        save(&path, "p", &VaultData::default()).unwrap();
+        assert_eq!(fs::read(&old_temp).unwrap(), b"old temp");
+        load(&path, "p").unwrap();
+    }
+
+    #[test]
+    fn pre_rename_failure_preserves_old_file_and_cleans_private_temp() {
+        let (dir, path) = temp_vault();
+        save(&path, "p", &VaultData::default()).unwrap();
+        let before = fs::read(&path).unwrap();
+        FAIL_BEFORE_RENAME.with(|flag| flag.set(true));
+        assert!(save(&path, "p", &VaultData::default()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        load(&path, "p").unwrap();
+        assert!(!fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".hestia-vault-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_files_are_distinct_private_and_not_yet_published() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, path) = temp_vault();
+        let first = stage_ciphertext(dir.path(), b"synthetic one").unwrap();
+        let second = stage_ciphertext(dir.path(), b"synthetic two").unwrap();
+        assert_ne!(first.path(), second.path());
+        assert!(!path.exists());
+        assert_eq!(
+            first.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            second.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(first.path()).unwrap(), b"synthetic one");
+        assert_eq!(fs::read(second.path()).unwrap(), b"synthetic two");
     }
 
     #[test]

@@ -1,0 +1,65 @@
+name: vault storage portability
+
+on:
+  pull_request:
+    paths:
+      - 'core/src/vault/**'
+      - 'core/Cargo.toml'
+      - 'core/Cargo.lock'
+      - 'web4.pin'
+      - '.github/workflows/vault-portability.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'core/src/vault/**'
+      - 'core/Cargo.toml'
+      - 'core/Cargo.lock'
+      - 'web4.pin'
+      - '.github/workflows/vault-portability.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  macos-vault-storage:
+    name: macOS vault storage tests (pinned Web4)
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Read release dependency pin
+        id: web4pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev="$(grep -oiE '[0-9a-f]{40}' hestia/web4.pin | head -1)"
+          test -n "$rev"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          ref: ${{ steps.web4pin.outputs.rev }}
+          path: web4
+
+      - name: Verify inputs
+        shell: bash
+        env:
+          EXPECTED_WEB4: ${{ steps.web4pin.outputs.rev }}
+          EXPECTED_HESTIA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C hestia rev-parse HEAD)" = "$EXPECTED_HESTIA"
+          test "$(git -C web4 rev-parse HEAD)" = "$EXPECTED_WEB4"
+          uname -sm
+
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test vault storage
+        working-directory: hestia/core
+        run: 'cargo test --locked --lib vault::storage::tests:: -- --test-threads=2'
