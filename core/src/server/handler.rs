@@ -27806,6 +27806,25 @@ mod standing_scope_surface_tests {
         );
     }
 
+    #[tokio::test]
+    async fn standing_projection_cannot_verify_an_unreadable_durable_vault() {
+        let (dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        let mut s = state.lock().await;
+        s.commit_standing_scope(|st| {
+            st.add(standing("synthetic", "/fixture/path", now, None))
+        }).unwrap();
+        assert!(s.verify_standing_projection(now).unwrap().matches);
+
+        // A synthetic storage failure after the known-good state was loaded.
+        // This is not a cooperating second writer and touches only this temp vault.
+        let vault_path = dir.path().join("v.enc");
+        std::fs::write(&vault_path, b"synthetic corrupt vault").unwrap();
+        assert!(Vault::open(vault_path, "p".into()).is_err());
+        assert!(s.verify_standing_projection(now).is_err(),
+                "unreadable durable authority must not reuse a cached matching copy");
+    }
+
     /// GPT re-review of #728: an expiry-only change is a reach change, and the report used to
     /// miss it because the digest compared four fields while the report keyed on two.
     ///
