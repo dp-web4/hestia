@@ -2,6 +2,7 @@ pub mod agents;
 pub mod chain;
 pub mod config;
 pub mod dashboard;
+pub mod delegations;
 pub mod decide;
 pub mod gates;
 pub mod grants;

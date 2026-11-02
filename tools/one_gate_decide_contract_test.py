@@ -1832,6 +1832,18 @@ PARITY_CASES = [
     ("warn-society-no-verdict-read", "Read", {"file_path": "{REPO}/README.md"}, "no-verdict", "warn"),
     ("warn-society-no-verdict-edit", "Edit", {"file_path": "{REPO}/core/src/server/state.rs",
                                               "old_string": "a", "new_string": "b"}, "no-verdict", "warn"),
+    # TIGHTENING: an unreadable patch on a write-class apply fails closed (hestia #1197, last
+    # comment; corpus cells digest-apply-missing-*). Measured 2026-10-04: every seat's current
+    # gate (governance-closure-opaque-writer) AND decide() (gate.self_access) deny, so these are
+    # MATCHING cells, not DECLARED_DIVERGENCES. kimi's 8 hostile-probe "divergences" came from
+    # comparing a missing-patch run against a baseline measured with the patch present. Pinned
+    # here so neither side can loosen it silently.
+    ("apply-missing-patch", "Bash",
+     {"command": "git -C {REPO} apply {REPO}/scratchpad/decide-parity-missing.patch"},
+     "allow", "enforce"),
+    ("apply-missing-patch-chained", "Bash",
+     {"command": "git -C {REPO} apply {REPO}/scratchpad/decide-parity-missing.patch"
+                 " && git -C {REPO} commit -m x"}, "allow", "enforce"),
 ]
 
 POLICIES = {
@@ -2101,6 +2113,8 @@ def run_parity(report: bool = False, legacy_ref: str = None):
     decide() on the same act — they must agree on every cell — and the four seats vs each other
     (C8). `legacy_ref`: each seat's PRE-cutover gate at that ref vs decide(), against
     DECLARED_DIVERGENCES (the stage B table, now live behaviour)."""
+    missing_patch = REPO / "scratchpad" / "decide-parity-missing.patch"
+    check("missing-patch-fixture-is-absent", not missing_patch.exists(), str(missing_patch))
     rows = []
     with tempfile.TemporaryDirectory(prefix="decide-parity-") as tmp:
         root = pathlib.Path(tmp)
@@ -2152,6 +2166,16 @@ def run_parity(report: bool = False, legacy_ref: str = None):
           [(s, c, next((r["old"], r["old_rule"], r["new"], r["new_rule"], r["old_text"][-200:])
                        for r in rows if (r["seat"], r["case"]) == (s, c))) for s, c in undeclared])
     check(f"{label}-no-stale-declaration", not stale, stale)
+    # Agreement alone would let both arms loosen together; the tightening is a verdict, not a pair.
+    missing = [r for r in rows if r["case"].startswith("apply-missing-patch")]
+    expected_missing = {(seat, case) for seat in SEATS
+                        for case in ("apply-missing-patch", "apply-missing-patch-chained")}
+    check("tightening-missing-patch-all-cells-measured",
+          {(r["seat"], r["case"]) for r in missing} == expected_missing)
+    check("tightening-missing-patch-apply-denied-both-arms",
+          missing and all(r["old"] == "deny" and r["new"] == "deny" for r in missing),
+          [(r["seat"], r["case"], r["old"], r["new"]) for r in missing
+           if (r["old"], r["new"]) != ("deny", "deny")])
     check(f"{label}-decide-never-crashed", not any(r["new"] == "CRASH" for r in rows),
           [r for r in rows if r["new"] == "CRASH"][:2])
     if legacy_ref:
