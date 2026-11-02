@@ -440,8 +440,8 @@ impl Vault {
     }
 
     /// Remove SEVERAL documents as ONE commit — the inverse of [`put_documents`](Self::put_documents),
-    /// with the same all-or-none rule: on a failed save the in-memory index is rolled back, so
-    /// memory and disk agree. Absent names are no-ops. Used to undo a seed whose record failed.
+    /// with the same in-memory rollback on a failed save. The disk outcome may still be unknown
+    /// if a failure follows rename. Absent names are no-ops. Used to undo a seed whose record failed.
     pub fn remove_documents(&mut self, namespace: &str, names: &[String]) -> Result<()> {
         let snapshot = self.data.documents.clone();
         self.data
@@ -473,10 +473,22 @@ impl Vault {
     ) -> Result<()> {
         let doc = Document::sealed(namespace, name, bytes, credential)?;
         match self.doc_pos(namespace, name) {
-            Some(i) => self.data.documents[i] = doc,
-            None => self.data.documents.push(doc),
+            Some(i) => {
+                let before = std::mem::replace(&mut self.data.documents[i], doc);
+                if let Err(error) = self.save() {
+                    self.data.documents[i] = before;
+                    return Err(error);
+                }
+            }
+            None => {
+                self.data.documents.push(doc);
+                if let Err(error) = self.save() {
+                    self.data.documents.pop();
+                    return Err(error);
+                }
+            }
         }
-        self.save()
+        Ok(())
     }
 
     /// Open a document INTO MEMORY. For a sealed document, `credential` is its
@@ -497,8 +509,12 @@ impl Vault {
         let i = self
             .doc_pos(namespace, name)
             .ok_or_else(|| CoreError::CredentialNotFound(format!("{namespace}/{name}")))?;
-        self.data.documents.remove(i);
-        self.save()
+        let removed = self.data.documents.remove(i);
+        if let Err(error) = self.save() {
+            self.data.documents.insert(i, removed);
+            return Err(error);
+        }
+        Ok(())
     }
 
     // ---- Recursion: a sub-vault is a sealed document whose plaintext is itself
@@ -758,23 +774,26 @@ mod tests {
     #[test]
     fn rejected_sealed_and_removed_documents_cannot_ride_on_later_save() {
         let mut leaked = Vec::new();
-        for op in ["seal", "remove"] {
+        for op in ["seal", "seal_new", "remove"] {
             let (_dir, path) = temp_path();
             let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
             vault.put_document("fixture", "existing", b"old".to_vec()).unwrap();
             vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
             let failed = match op {
                 "seal" => vault.seal_document("fixture", "existing", b"new", "p").is_err(),
+                "seal_new" => vault.seal_document("fixture", "new", b"new", "p").is_err(),
                 _ => vault.remove_document("fixture", "existing").is_err(),
             };
             assert!(failed);
-            let memory_old = vault.get_document("fixture", "existing") == Some(b"old".as_slice());
+            let memory_old = vault.get_document("fixture", "existing") == Some(b"old".as_slice())
+                && !vault.document_index().iter().any(|item| item.namespace == "fixture" && item.name == "new");
             let before = Vault::open(path.clone(), "p".into()).unwrap();
             assert_eq!(before.get_document("fixture", "existing"), Some(b"old".as_slice()));
             vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
             vault.put_document("unrelated", "record", b"new".to_vec()).unwrap();
             let after = Vault::open(path, "p".into()).unwrap();
-            if !memory_old || after.get_document("fixture", "existing") != Some(b"old".as_slice()) {
+            if !memory_old || after.get_document("fixture", "existing") != Some(b"old".as_slice())
+                || after.document_index().iter().any(|item| item.namespace == "fixture" && item.name == "new") {
                 leaked.push(op);
             }
         }
