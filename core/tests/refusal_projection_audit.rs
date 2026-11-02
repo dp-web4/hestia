@@ -33,6 +33,55 @@ fn missing_refusal_is_reported_as_projection_divergence() {
     assert!(!vault.divergence_from(&runtime).is_empty());
 }
 
+#[test]
+fn refusal_field_changes_are_detected_without_exposing_record_contents() {
+    use hestia::server::grant_modes::Modes;
+    let (_, base) = pair();
+    for field in ["member", "path", "recursive", "refused_at", "refused_by", "reason", "request_id", "modes"] {
+        let mut changed = base.clone();
+        let row = &mut changed.refusals[0];
+        match field {
+            "member" => row.member = "another-member".into(),
+            "path" => row.path = "/other/private".into(),
+            "recursive" => row.recursive = false,
+            "refused_at" => row.refused_at += 1,
+            "refused_by" => row.refused_by = "peer:someone".into(),
+            "reason" => row.reason = "private reason".into(),
+            "request_id" => row.request_id = Some("private-request".into()),
+            "modes" => row.modes = Some(Modes::READ),
+            _ => unreachable!(),
+        }
+        assert_ne!(base.authority_digest(), changed.authority_digest(), "{field}");
+        for report in [base.divergence_from(&changed), changed.divergence_from(&base)] {
+            assert_eq!(report, vec!["standing refusal projection differs"], "{field}");
+            assert!(!format!("{report:?}").contains("private"));
+        }
+    }
+}
+
+#[test]
+fn overlapping_refusal_order_changes_observed_record_and_audit() {
+    let (_, mut first) = pair();
+    let mut second_row = first.refusals[0].clone();
+    second_row.path = "/synthetic/work/child".into();
+    second_row.reason = "different reason".into();
+    first.refusals.push(second_row);
+    let mut second = first.clone();
+    second.refusals.reverse();
+    assert_ne!(first.refusal_for("member", "/synthetic/work/child").unwrap().reason,
+               second.refusal_for("member", "/synthetic/work/child").unwrap().reason);
+    assert_ne!(first.authority_digest(), second.authority_digest());
+    assert!(!first.divergence_from(&second).is_empty());
+}
+
+#[test]
+fn no_refusal_preserves_the_existing_empty_store_digest() {
+    use sha2::{Digest, Sha256};
+    let (empty, _) = pair();
+    assert_eq!(empty.authority_digest(), hex::encode(Sha256::digest(7_u64.to_be_bytes())));
+    assert!(empty.divergence_from(&empty.clone()).is_empty());
+}
+
 #[tokio::test]
 async fn temporary_vault_verifier_rejects_missing_refusal_at_same_generation() {
     let home = tempfile::tempdir().unwrap();
