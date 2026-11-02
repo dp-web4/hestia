@@ -617,6 +617,15 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::tool_scope_peer_decide", &[
         "if arb.plugin_id == req.plugin_id || s.same_entity(&arb.plugin_id, &req.plugin_id) {",
     ], SiteClass::Predicate),
+    // #1450 phase 0 follow-up (2026-11-02): `tool_scope_request_view` serves ONE request to a
+    // member that may rule it, and REFUSES the asker under any name
+    // (`hestia.scope_request_view_self`), the same comparison as the decide above. A false
+    // "different" would serve the asker its own request through this door instead of
+    // `hestia_scope_status` and then stop at `eligibility_for`, which runs after it; it reveals
+    // nothing the asker does not already hold. Predicate.
+    ("server/handler.rs::tool_scope_request_view", &[
+        "if viewer.plugin_id == req.plugin_id || s.same_entity(&viewer.plugin_id, &req.plugin_id) {",
+    ], SiteClass::Predicate),
     // ADDED 2026-08-14 (claude-code, Sprint F R1 — the standing-scope surface). The census
     // went red the moment the site was written — the instrument working.
     //
@@ -816,6 +825,9 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     ]),
     ("server/handler.rs::tool_scope_peer_decide", &[
         "if arb.plugin_id == req.plugin_id || s.same_entity(&arb.plugin_id, &req.plugin_id) {",
+    ]),
+    ("server/handler.rs::tool_scope_request_view", &[
+        "if viewer.plugin_id == req.plugin_id || s.same_entity(&viewer.plugin_id, &req.plugin_id) {",
     ]),
     // The arbiter pool filter: a candidate whose member LCT equals the
     // appellant's is dropped. Documents its own reach in `handler.rs`
