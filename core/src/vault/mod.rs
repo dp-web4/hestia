@@ -387,12 +387,7 @@ impl Vault {
     /// Store a master-tier document (config / metadata / state). Plaintext is
     /// held inside the outer-encrypted vault. Upserts by (namespace, name).
     pub fn put_document(&mut self, namespace: &str, name: &str, bytes: Vec<u8>) -> Result<()> {
-        let doc = Document::master(namespace, name, bytes);
-        match self.doc_pos(namespace, name) {
-            Some(i) => self.data.documents[i] = doc,
-            None => self.data.documents.push(doc),
-        }
-        self.save()
+        self.put_documents(namespace, &[(name.to_owned(), bytes)])
     }
 
     /// Store SEVERAL master-tier documents as ONE commit: all of them land, or none does.
