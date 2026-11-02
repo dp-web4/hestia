@@ -11630,7 +11630,9 @@ mod disposition_tests {
     #[tokio::test]
     async fn retirement_terminal_witness_failure_reports_the_commit() {
         let (dir, state) = test_state().await;
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
         let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
         conn.execute_batch("CREATE TRIGGER fail_retire_terminal BEFORE INSERT ON chain_entries \
              WHEN NEW.event_type = 'member_retired' \
              BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
