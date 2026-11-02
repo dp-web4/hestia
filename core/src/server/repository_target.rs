@@ -11,6 +11,21 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RepositoryTarget(String);
 
+// Persist only the canonical identity, never an unchecked newtype representation.
+// In particular, deriving Deserialize would bypass parse() and admit paths/URLs.
+impl serde::Serialize for RepositoryTarget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RepositoryTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidRepositoryTarget;
 
@@ -61,6 +76,67 @@ impl std::str::FromStr for RepositoryTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_identity_roundtrips_canonically() {
+        let target: RepositoryTarget = serde_json::from_str(r#""Dp-Web4/Hestia""#).unwrap();
+        assert_eq!(target, RepositoryTarget::parse("dp-web4/hestia").unwrap());
+        let saved = serde_json::to_string(&target).unwrap();
+        assert_eq!(saved, r#""dp-web4/hestia""#);
+        assert_eq!(
+            serde_json::from_str::<RepositoryTarget>(&saved).unwrap(),
+            target
+        );
+        let foreign: RepositoryTarget = serde_json::from_str(r#""foreign/hestia""#).unwrap();
+        assert_ne!(target, foreign);
+        assert_ne!(target.scope_entry(), foreign.scope_entry());
+    }
+
+    #[test]
+    fn persisted_identity_revalidates_untrusted_strings() {
+        for raw in [
+            "",
+            "hestia",
+            "/home/owner/name",
+            "repo:owner/name",
+            "https://github.com/owner/name",
+            "owner/*",
+            "../name",
+            "owner/name/extra",
+            "owner/name\n",
+            "owner/na\u{200b}me",
+        ] {
+            let saved = serde_json::to_string(raw).unwrap();
+            assert!(
+                serde_json::from_str::<RepositoryTarget>(&saved).is_err(),
+                "accepted {raw:?}"
+            );
+        }
+        for byte in 0..=127u8 {
+            if byte.is_ascii_control() || byte == b' ' {
+                let saved = serde_json::to_string(&format!("owner/name{}", byte as char)).unwrap();
+                assert!(serde_json::from_str::<RepositoryTarget>(&saved).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn persisted_identity_rejects_non_string_shapes() {
+        for saved in [
+            "null",
+            "true",
+            "42",
+            "[]",
+            r#"["owner/name"]"#,
+            r#"{"repo":"owner/name"}"#,
+            r#"{"0":"owner/name"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<RepositoryTarget>(saved).is_err(),
+                "accepted {saved}"
+            );
+        }
+    }
 
     #[test]
     fn preserves_owner_and_canonicalizes_case() {
