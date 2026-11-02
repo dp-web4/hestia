@@ -5724,7 +5724,8 @@ fn cmd_delegate_grant(
     // check (#1110). Two loads would be two readings of the registry that could disagree.
     let registry = hestia::member_registry::load_members(&vault);
     {
-        let retired = hestia::server::retirement::load(&vault);
+        let retired = hestia::server::retirement::load(&vault)
+            .context("loading retirement authority before delegation")?;
         if !retired.retired.is_empty() {
             let who = registry.iter_sorted().into_iter().find(|(_, lct)| {
                 delegation::agent_key_for_lct(&lct.lct_id()) == agent_id
@@ -5774,6 +5775,40 @@ fn cmd_delegate_grant(
         println!("  note:    '{a}' is not a verb this daemon interprets -- stored as given, NOT validated");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retirement_authority_cli_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_retirement_authority_refuses_delegation_before_writing() {
+        if std::env::var_os("HESTIA_SYNTHETIC_CLI_CHILD").is_none() {
+            // Child-only environment: no global passphrase mutation in the shared test runner.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("cli::retirement_authority_cli_tests::malformed_retirement_authority_refuses_delegation_before_writing")
+                .arg("--test-threads=1")
+                .env("HESTIA_SYNTHETIC_CLI_CHILD", "1")
+                .env("HESTIA_PASSPHRASE", "synthetic-passphrase")
+                .output().unwrap();
+            assert!(output.status.success(), "child test failed: {}", String::from_utf8_lossy(&output.stderr));
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("1 passed"), "child test did not run: {text}");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = vault_path(dir.path());
+        let mut vault = Vault::init(path.clone(), "synthetic-passphrase".into()).unwrap();
+        vault.put_document("members", "retired", b"not json".to_vec()).unwrap();
+        drop(vault);
+        let before = std::fs::read(&path).unwrap();
+        let result = cmd_delegate_grant(dir.path(), "00000000-0000-0000-0000-000000000001",
+                                        vec!["witness".into()], vec![], None);
+        let err = result.expect_err("malformed retirement state must refuse delegation");
+        assert!(format!("{err:#}").contains("loading retirement authority"));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "refusal must not modify the vault");
+    }
 }
 
 /// Print the delegation key for a seat (#952). Reads the member registry, derives the

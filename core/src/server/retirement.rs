@@ -75,7 +75,6 @@ pub struct RetirementStore {
     /// `StandingScopeStore` has one.
     #[serde(default)]
     pub generation: u64,
-    #[serde(default)]
     pub retired: Vec<RetiredMember>,
 }
 
@@ -115,9 +114,36 @@ impl RetirementStore {
     }
 }
 
-pub fn load(vault: &crate::vault::Vault) -> RetirementStore {
-    crate::vault::load_doc(vault, RETIRED_NAMESPACE, RETIRED_DOC, RETIRED_LEGACY_FILE)
-        .unwrap_or_default()
+/// Missing authority is an empty store; present but unreadable authority is not.
+pub fn load(vault: &crate::vault::Vault) -> anyhow::Result<RetirementStore> {
+    use anyhow::Context;
+
+    let matches: Vec<_> = vault.document_index().into_iter()
+        .filter(|item| item.namespace == RETIRED_NAMESPACE && item.name == RETIRED_DOC)
+        .collect();
+    anyhow::ensure!(matches.len() <= 1, "duplicate retirement authority documents");
+    if !matches.is_empty() {
+        let bytes = vault.get_document(RETIRED_NAMESPACE, RETIRED_DOC)
+            .ok_or_else(|| anyhow::anyhow!("retirement authority document is sealed or unreadable"))?;
+        return serde_json::from_slice(bytes).context("parsing retirement authority document");
+    }
+
+    if let Some(home) = vault.home_dir() {
+        let legacy = home.join(RETIRED_LEGACY_FILE);
+        match std::fs::read(&legacy) {
+            Ok(bytes) => return serde_json::from_slice(&bytes).context("parsing legacy retirement authority"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is present but unreadable, not a missing record.
+                match std::fs::symlink_metadata(&legacy) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {},
+                    Ok(_) => return Err(e).context("reading legacy retirement authority"),
+                    Err(other) => return Err(other).context("checking legacy retirement authority"),
+                }
+            }
+            Err(e) => return Err(e).context("reading legacy retirement authority"),
+        }
+    }
+    Ok(RetirementStore::default())
 }
 
 pub fn save(
@@ -141,6 +167,42 @@ mod tests {
             was_active: false,
             retired_by: String::new(),
         }
+    }
+
+    #[test]
+    fn retirement_checked_load_preserves_absence_valid_records_and_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        assert!(load(&vault).unwrap().retired.is_empty());
+        let mut old = RetirementStore::default();
+        old.retire(rec("test-seat"));
+        // The older wire shape can omit generation, but must still carry the list.
+        let legacy = serde_json::json!({"retired": &old.retired});
+        std::fs::write(dir.path().join(RETIRED_LEGACY_FILE), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let loaded = load(&vault).unwrap();
+        assert!(loaded.is_retired("test-seat"));
+        assert_eq!(loaded.generation, 0);
+        save(&mut vault, &old).unwrap();
+        // A valid current document wins over stale or malformed legacy data.
+        std::fs::write(dir.path().join(RETIRED_LEGACY_FILE), b"not json").unwrap();
+        assert!(load(&vault).unwrap().is_retired("test-seat"));
+    }
+
+    #[test]
+    fn retirement_checked_load_rejects_incomplete_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        vault.put_document(RETIRED_NAMESPACE, RETIRED_DOC, b"{}".to_vec()).unwrap();
+        assert!(load(&vault).is_err(), "missing retired field is not a measured empty list");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retirement_checked_load_rejects_dangling_legacy_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join(RETIRED_LEGACY_FILE)).unwrap();
+        assert!(load(&vault).is_err(), "a present but unreadable legacy record is not absent");
     }
 
     #[test]

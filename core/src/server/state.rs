@@ -903,6 +903,8 @@ impl ServerState {
     /// `passphrase` is the vault passphrase — used to derive the storage key
     /// that seals the witness chain + trust files.
     pub fn open(mut vault: Vault, home: &Path, passphrase: &str) -> Result<Self> {
+        // Validate retirement authority before startup can mint identities or open mutation paths.
+        let retired_members = crate::server::retirement::load(&vault)?;
         // One stable storage key (Argon2 once) seals both the witness chain
         // (SQLCipher) and the trust files.
         let store_key = crate::storage::storage_key(home, passphrase)
@@ -1011,7 +1013,6 @@ impl ServerState {
         );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
         let member_registry = crate::member_registry::load_members(&vault);
-        let retired_members = crate::server::retirement::load(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
         let policy_config = vault
@@ -2608,6 +2609,7 @@ mod tests {
         vault.put_document("members", "retired", b"not json".to_vec()).unwrap();
         assert!(ServerState::open(vault, dir.path(), "p").is_err(),
                 "unreadable retirement authority must not be treated as an empty list");
+        assert!(!dir.path().join("witness.db").exists(), "refuse before opening writable stores");
     }
 
     #[test]
@@ -2615,8 +2617,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         vault.seal_document("members", "retired", b"{}", "other-key").unwrap();
+        std::fs::write(dir.path().join("retired-members.json"), br#"{"retired":[]}"#).unwrap();
         assert!(ServerState::open(vault, dir.path(), "p").is_err(),
-                "a present sealed authority record must not be treated as absent");
+                "a sealed authority record must not be treated as absent or fall back to legacy");
+        assert!(!dir.path().join("witness.db").exists(), "refuse before opening writable stores");
     }
 
     #[test]
@@ -2626,6 +2630,7 @@ mod tests {
         std::fs::write(dir.path().join("retired-members.json"), b"not json").unwrap();
         assert!(ServerState::open(vault, dir.path(), "p").is_err(),
                 "an unreadable legacy retirement record must not become an empty list");
+        assert!(!dir.path().join("witness.db").exists(), "refuse before opening writable stores");
     }
 
     /// B2 (#339): the daemon's chain rows are witnessed by the Society key, name the real
