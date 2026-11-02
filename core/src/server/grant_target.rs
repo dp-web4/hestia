@@ -194,4 +194,17 @@ mod tests {
             assert!(serde_json::from_value::<Row>(wire).is_err());
         }
     }
+
+    #[test]
+    fn raw_flattened_rows_refuse_duplicate_or_conflicting_selectors() {
+        for wire in [
+            r#"{"member":"test","granted_at":10,"path":"/a","path":"/b"}"#,
+            r#"{"member":"test","granted_at":10,"repo":"owner/a","repo":"owner/b"}"#,
+            r#"{"member":"test","granted_at":10,"repo":"owner/a","recursive":false,"recursive":true}"#,
+            r#"{"member":"test","granted_at":10,"path":"/a","repo":"owner/b"}"#,
+            r#"{"member":"test","granted_at":10,"repo":"owner/a","recusrive":true}"#,
+        ] {
+            assert!(serde_json::from_str::<Row>(wire).is_err(), "accepted {wire}");
+        }
+    }
 }
