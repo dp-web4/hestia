@@ -98,6 +98,13 @@ fn retire_outcome(status: reqwest::StatusCode, body: serde_json::Value) -> Resul
 
 fn reinstate_outcome(status: reqwest::StatusCode, body: serde_json::Value) -> Result<serde_json::Value, String> {
     if status.is_success() {
+        // Older daemons report a committed reinstatement with HTTP 200 when
+        // the terminal append fails. Preserve that evidence, not a clean success.
+        if body.get("intentEntryHash").is_some()
+            && body.get("witnessEntryHash").is_some_and(serde_json::Value::is_null)
+        {
+            return Ok(serde_json::json!({ "outcome": "reinstated_unrecorded", "result": body }));
+        }
         return Ok(serde_json::json!({ "outcome": "reinstated", "result": body }));
     }
     if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
@@ -297,6 +304,12 @@ mod tests {
         assert_eq!(out["outcome"], "already_reinstated");
         let out = reinstate_outcome(StatusCode::OK, json!({"ok": true, "grants_not_restored": ["/w"]})).unwrap();
         assert_eq!(out["result"]["grants_not_restored"], json!(["/w"]));
+        let old_daemon = reinstate_outcome(StatusCode::OK, json!({
+            "ok": true, "retired": false, "intentEntryHash": "intent-old",
+            "witnessEntryHash": null, "grants_not_restored": ["/w/a"]
+        })).unwrap();
+        assert_eq!(old_daemon["outcome"], "reinstated_unrecorded");
+        assert_eq!(old_daemon["result"]["intentEntryHash"], "intent-old");
     }
 
     /// Last edit wins in the engine; the app must not overwrite a retirement it did not see.

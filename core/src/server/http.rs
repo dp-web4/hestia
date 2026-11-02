@@ -11687,6 +11687,12 @@ mod disposition_tests {
         let chain = s.recent_chain(100);
         assert_eq!(chain.iter().filter(|e| e.event_type == "member_reinstate_intent").count(), 1);
         assert_eq!(chain.iter().filter(|e| e.event_type == "member_reinstated").count(), 0);
+        drop(s);
+        conn.execute_batch("DROP TRIGGER fail_reinstate_terminal").unwrap();
+        let s = state.lock().await;
+        s.append_chain("after_injected_failure", serde_json::json!({"ok": true})).unwrap();
+        assert_eq!(s.chain_store.verify_integrity().unwrap(), s.chain_store.len().unwrap(),
+                   "the failed append did not corrupt the subsequent chain");
     }
 
     /// The same call carrying the gate witness the `operator_gate` middleware inserts —
