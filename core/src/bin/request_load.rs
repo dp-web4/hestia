@@ -15,15 +15,16 @@
 //! * scope requests (`scope_requested`) and governance escalations (`gate_escalation_opened`):
 //!   totals, per member, per rule (scope) or marker CLASS (escalation), per day, gate-opened vs
 //!   member-asked, and how many had no admissible peer (so only the operator could rule);
-//! * outcome: granted / refused / lapsed (no ruling and past `expires_at`) / withdrawn / open;
+//! * outcome: granted / refused / incomplete / lapsed / withdrawn / open;
 //! * who ruled: `operator`, `peer`, `delegate`, `asker` (the asker withdrew its own escalation),
 //!   `other` — see [`classify_ruler`];
 //! * time to ruling (median, p90) for the ruled ones;
 //! * scope request path CLASS (never the path) — see [`classify_path`];
 //! * re-asks: requests whose (member, path) was asked more than once in the window.
 //!
-//! It never prints a command, a path, a reason or a marker name: the cross-seat rule is counts only
-//! (dp, 2026-10-14), and the output is meant to be posted fleet-wide.
+//! It does not print commands, paths, reasons or arbitrary marker names. Member identifiers and
+//! small counts remain in the output; their suitability for sharing needs a privacy decision.
+//! A later refusal lift does not change a request's reported refused outcome or its re-ask split.
 //!
 //! Sealed-at-rest is respected the way `appeal_floor` does it: the encrypted DB is snapshotted to a
 //! temp copy, the key never leaves this process, plaintext never hits disk. Read-only: this bin
@@ -52,6 +53,7 @@ use serde_json::{Value, json};
 const UNPRICEABLE_PREFIX: &str = "hestia:unpriceable:";
 
 const TEMP_ROOTS: &[&str] = &["/tmp", "/var/tmp"];
+const OUTCOME_LIMITATION: &str = "A later refusal lift does not change a request's refused outcome or its re-ask classification; chain-wide lift counts are not linked to requests.";
 const SYSTEM_ROOTS: &[&str] = &[
     "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/var", "/proc", "/sys", "/dev",
     "/boot", "/root", "/run", "/srv",
@@ -144,6 +146,10 @@ fn public_event_type(event: &str) -> Option<&'static str> {
         "scope_grant_intent" => Some("scope_grant_intent"),
         "scope_granted" => Some("scope_granted"),
         "scope_refused" => Some("scope_refused"),
+        "scope_refusal_lift_intent" => Some("scope_refusal_lift_intent"),
+        "scope_refusal_lifted" => Some("scope_refusal_lifted"),
+        "scope_grant_edit_intent" => Some("scope_grant_edit_intent"),
+        "scope_grant_edited" => Some("scope_grant_edited"),
         "scope_revoked" => Some("scope_revoked"),
         "scope_standing_revoked" => Some("scope_standing_revoked"),
         "scope_standing_promote_intent" => Some("scope_standing_promote_intent"),
@@ -453,6 +459,7 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
     out.insert("window_days".into(), json!(days));
     out.insert("chain_entries_scanned".into(), json!(scanned));
     out.insert("workspace_roots_counted".into(), json!(workspaces.len()));
+    out.insert("outcome_limitation".into(), json!(OUTCOME_LIMITATION));
     out.insert("ruler_classification".into(), json!(
         "operator: granted_by/decided_by 'operator' or via 'operator_session'; delegate: 'delegate:*' or via 'delegation'; \
          peer: 'peer:*', via 'peer_not_same', or another member id; asker: an escalation ruled by its own asker (a withdrawal); \
@@ -597,6 +604,7 @@ fn render_markdown(r: &Value) -> String {
     }
     writeln!(out).unwrap();
     writeln!(out, "Who ruled: {}", r["ruler_classification"].as_str().unwrap_or("")).unwrap();
+    writeln!(out, "Outcome limitation: {}", r["outcome_limitation"].as_str().unwrap_or("")).unwrap();
     out
 }
 
@@ -717,6 +725,17 @@ mod tests {
         });
         assert!(!report.to_string().contains(secret));
         assert!(!render_markdown(&report).contains(secret));
+    }
+
+    #[test]
+    fn published_lift_and_edit_events_remain_distinct_and_limitation_is_reported() {
+        for event in ["scope_refusal_lift_intent", "scope_refusal_lifted",
+                      "scope_grant_edit_intent", "scope_grant_edited"] {
+            assert_eq!(public_event_type(event), Some(event));
+        }
+        let report = summarize(&HashMap::new(), 7, 0, &Utc::now(), &[]);
+        assert_eq!(report["outcome_limitation"], OUTCOME_LIMITATION);
+        assert!(render_markdown(&report).contains(OUTCOME_LIMITATION));
     }
 
     #[test]
