@@ -1,5 +1,5 @@
-import pathlib
-p = pathlib.Path("/tmp/s1314e/core_rev.py")
+from scratch import require_scratch
+p = require_scratch() / "core_rev.py"
 s = p.read_text()
 
 def sub1(old, new):

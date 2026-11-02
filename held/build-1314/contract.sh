@@ -1,5 +1,7 @@
 #!/bin/bash
 : "${HESTIA_1314_BASE:?Set HESTIA_1314_BASE to the separate historical base checkout}"
+scratch=$(python3 "$(dirname "$0")/scratch.py" --check) || exit 1
+overlay=$(python3 -c 'import json,sys; print(json.dumps({"hestia_gate_core":sys.argv[1]}))' "$scratch/core_rev.py") || exit 1
 cd "$HESTIA_1314_BASE" || exit 1
 base_root=$(git rev-parse --show-toplevel) || exit 1
 head=$(git rev-parse --verify HEAD) || exit 1
@@ -10,9 +12,9 @@ if [ "$head" != "$base" ] || [ -n "$status" ]; then
   exit 1
 fi
 HESTIA_CONTRACT_REPO="$base_root" \
-HESTIA_CONTRACT_OVERLAY='{"hestia_gate_core": "/tmp/s1314e/core_rev.py"}' \
-timeout 900 python3 /tmp/s1314e/contract_held.py > /tmp/s1314e/contract_out.txt 2>&1
+HESTIA_CONTRACT_OVERLAY="$overlay" \
+timeout 900 python3 "$scratch/contract_held.py" > "$scratch/contract_out.txt" 2>&1
 rc=$?
 echo "exit $rc"
-tail -5 /tmp/s1314e/contract_out.txt
+tail -5 "$scratch/contract_out.txt"
 exit "$rc"

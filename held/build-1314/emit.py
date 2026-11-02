@@ -1,6 +1,7 @@
 import os, sys, pathlib, difflib, hashlib, subprocess
+from scratch import require_scratch
 WT = pathlib.Path(os.environ["HESTIA_1314_BASE"]).resolve()
-S = pathlib.Path("/tmp/s1314e")
+S = require_scratch()
 def git(*args):
     return subprocess.check_output(["git", "-C", str(WT), *args], text=True).strip()
 if git("rev-parse", "HEAD") != git("rev-parse", "2d79644f^{commit}"):

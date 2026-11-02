@@ -1,14 +1,25 @@
 # Rebuild scripts for the #1314 held patch (68e951fc round)
 
-These scripts are kept here because the scratch copies of earlier rounds were wiped. All of them work in `/tmp/s1314e`.
+These scripts are kept here because the scratch copies of earlier rounds were wiped. Earlier
+rounds used `/tmp/s1314e`; the revised scripts require a separate scratch workspace instead.
 
-The scripts no longer name an installation-specific repository. `HESTIA_1314_REPO` must name a
-repository containing the historical base, and `HESTIA_1314_BASE` must name a separate, clean
-checkout at `2d79644f` for the contract and emission steps. Those two steps refuse a different or
-dirty checkout. The build scripts still use the fixed scratch directory `/tmp/s1314e`: they can
-overwrite files there and do not yet provide a safe, unique scratch-directory protocol. Do not run
-them without first reviewing their effects and arranging an explicitly disposable scratch area.
-Editing these scripts is not approval to apply any held patch or change an installed gate.
+The scripts no longer name an installation-specific repository. Set `HESTIA_1314_REPO` to a
+repository containing the historical base, and `HESTIA_1314_BASE` to a separate, clean checkout
+at `2d79644f` for the contract and emission steps. Those steps refuse a different or dirty
+checkout. `python3 held/build-1314/scratch.py --create` creates a unique owner-only Unix scratch
+directory; set `HESTIA_1314_SCRATCH` to its printed absolute path. Scripts refuse an unmarked,
+non-private, missing or symlinked scratch directory. They intentionally overwrite intermediate
+files *inside* this workspace across rounds; use a new one for each independent reconstruction.
+This guard reduces accidental collisions; it does not protect against hostile same-user races.
+
+Set `HESTIA_1314_PATCH_SHA` to the exact digest for `verify.py`; it refuses ambiguous or
+digest-mismatched inputs and reports core/battery/contract mismatches as failures. Other patch
+files receive only this script's partial hunk-context check, not an independent byte-for-byte or
+full patch-engine verification. `sep.sh` now exits
+nonzero when any battery arm does, including the historical main arm with expected differences;
+inspect the reported arm results rather than reading that status as an all-green verdict.
+Editing or running these scratch scripts is not approval to apply a held patch or change an
+installed gate. Full reconstruction has not been rerun as part of this tooling change.
 
 1. `apply.py`: extracts the previous held patch (saved as `held.txt`) and applies it in memory to `2d79644f` text, writing `core_held.py`, `battery_held.py`, `contract_held.py` and the `*_main.py` copies.
 2. `edit_core.py` and `edit_battery.py`: this round's edits, as exact-once replaces on the held copies, producing `core_rev.py` and `battery_rev.py`.
@@ -33,5 +44,5 @@ c5e8c860 round: the f08a274b outputs were kept as `core_f08.py` / `battery_f08.p
 
 cb68c3fc round: the c5e8c860 outputs were kept as `core_c5e.py` / `battery_c5e.py`. `edit_core5.py` was applied
 to a copy of `core_c5e.py`, and `edit_battery5.py` to a copy of `battery_c5e.py`. Steps 3 to 6 were rerun; step 3
-used `core_c5e.py` as the held core. Before step 5, the previous `*.patch` was moved out of `/tmp/s1314e`,
-because `verify.py` takes the first 64-hex patch it finds there.
+used `core_c5e.py` as the held core. Historically the previous `*.patch` was moved out before step 5
+because the old verifier selected the first matching file; the revised verifier requires an exact digest.
