@@ -8182,7 +8182,19 @@ async fn agent_retire_inner(
         m.insert("revoked_delegations".into(), serde_json::json!(revoked.delegations));
         m.insert("intent".into(), serde_json::json!(intent.hash));
     }
-    let entry = s.append_chain("member_retired", stamp_gate(done, &gate)).ok();
+    let entry = match s.append_chain("member_retired", stamp_gate(done, &gate)) {
+        Ok(entry) => entry,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("retirement and revocations committed, but the terminal witness failed; \
+                              inspect the current record before retrying: {error}"),
+            "retired": true, "recorded": false,
+            "revoked_standing_paths": revoked.standing,
+            "revoked_live_paths": revoked.live,
+            "revoked_delegations": revoked.delegations,
+            "generation": s.retired_members.generation,
+            "intentEntryHash": intent.hash,
+        }))),
+    };
     let gen = s.retired_members.generation;
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true, "plugin_id": plugin_id, "retired": true,
@@ -8191,7 +8203,7 @@ async fn agent_retire_inner(
         "revoked_delegations": revoked.delegations,
         "generation": gen,
         "intentEntryHash": intent.hash,
-        "witnessEntryHash": entry.map(|e| e.hash),
+        "witnessEntryHash": entry.hash,
         "note": "not deleted: the chain keeps every act this id made, and `show retired` in the \
                  agents view still lists it. Reversible with /reinstate, which does NOT restore \
                  the revoked grants.",
@@ -11613,6 +11625,26 @@ mod disposition_tests {
         let chain = s.recent_chain(100);
         assert_eq!(chain.iter().filter(|e| e.event_type == "member_retire_intent").count(), 1);
         assert_eq!(chain.iter().filter(|e| e.event_type == "member_retired").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn retirement_terminal_witness_failure_reports_the_commit() {
+        let (dir, state) = test_state().await;
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_retire_terminal BEFORE INSERT ON chain_entries \
+             WHEN NEW.event_type = 'member_retired' \
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;").unwrap();
+        let (status, body) = retire_if_unretired(&state, "old-id", serde_json::json!({"reason":"first", "ref":"r1"})).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["retired"], true);
+        assert_eq!(body["recorded"], false);
+        assert!(body["intentEntryHash"].is_string());
+        assert!(body["error"].as_str().unwrap().contains("committed"));
+        let s = state.lock().await;
+        assert!(s.retired_members.is_retired("old-id"));
+        let chain = s.recent_chain(100);
+        assert_eq!(chain.iter().filter(|e| e.event_type == "member_retire_intent").count(), 1);
+        assert_eq!(chain.iter().filter(|e| e.event_type == "member_retired").count(), 0);
     }
 
     /// The same call carrying the gate witness the `operator_gate` middleware inserts —
