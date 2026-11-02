@@ -158,7 +158,7 @@ The gate grants three roots on top of the member's MRH. They are design choices,
   readable by every other member on the box, and anything they write there is reachable by gemini.
   Treat `/tmp` as public, never as a place to stage anything scoped. (It also swallowed CBP's first
   smoke run whole — a test workspace under `/tmp` makes every out-of-scope path trivially "contained",
-  which is why `tests/gate_holes_repro.sh` refuses to sandbox there.)
+  which is why `tests/gate_holes_test.py` refuses to sandbox there.)
 - the **launch cwd's repo** — a per-session dynamic grant (see `HESTIA_GEMINI_LAUNCH_CWD`), so a
   task-specific launch dir is reachable without widening the standing grant.
 
@@ -204,9 +204,9 @@ Smoke-tested against synthetic `BeforeTool` events (2026-07-22, on Nomad):
 the smoke tests above while still allowing all four of these. Regression tests live in `tests/`:
 
 ```sh
-plugins/gemini/tests/gate_holes_repro.sh          # 20/20 — the scope/egress/MCP holes, per case
+plugins/gemini/tests/gate_holes_test.py           # 19/19 — the scope/egress/MCP holes, per case, through the common gate
 plugins/gemini/tests/channel_contract_test.py     # 20/20 — the two-channel deny contract
-plugins/gemini/tests/wrapper_failclosed_test.py   # 5/5 — fault-injects the deny-on-exception wrapper
+plugins/gemini/tests/wrapper_failclosed_test.py   # 7/7 — fault-injects every step of the shim's main
 plugins/gemini/tests/runner_decision.py           # not a test: gemini's own result parser, transcribed
 ```
 

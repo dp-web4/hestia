@@ -304,7 +304,10 @@ pub fn get_preset(name: &str) -> Option<PresetDefinition> {
     match name {
         "permissive" => Some(PresetDefinition {
             name: "permissive".into(),
-            description: "Pure observation — no rules, all actions allowed".into(),
+            // Said as narrowly as it is true: the preset governs only the society-safety stage.
+            // Governance closure, the innate secret-egress rule and MRH scope run before it in
+            // the gate and are not relaxed by any preset (hestia_single_gate._sequence).
+            description: "No society-safety rules (observe only). Scope, governance closure and secret egress still apply".into(),
             config: PolicyConfig {
                 default_policy: PolicyDecision::Allow,
                 enforce: false,

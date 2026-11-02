@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 use web4_trust_core::EntityTrust;
 
@@ -90,11 +89,13 @@ pub struct InFlightAction {
 
 /// An operator's scoped exception to society law for one `(plugin_id, role)`.
 ///
-/// Held in memory only — see `ServerState::instance_grants`. Carries WHO granted it and WHY,
+/// Held in memory — see `ServerState::instance_grants` — and, when it carries an expiry, ALSO in
+/// the vault (`EXPIRING_GRANTS_DOC`, dp 2026-10-28 on #1306) so a deploy's restart does not revoke
+/// it before the operator's own bound. Carries WHO granted it and WHY,
 /// because a loosening whose rationale is not recorded is indistinguishable after the fact from
 /// a misconfiguration, and this is the one control in the system that can widen what an agent
 /// may do.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstanceGrant {
     /// Preset the grant applies to this member instead of the society baseline.
     pub preset: String,
@@ -104,7 +105,42 @@ pub struct InstanceGrant {
     pub reason: String,
     /// Wall-clock expiry, when the operator set one. `None` means it lasts until revoked or
     /// until the daemon restarts — which it always eventually does, so no grant is permanent.
+    /// `Some` means it is ALSO kept in the vault and survives a restart until this second, and no
+    /// later: the bound the operator chose is the only thing that ends it short of a revoke.
     pub expires_at: Option<u64>,
+}
+
+/// The vault document holding the loosenings that carry an expiry: `(namespace, name, legacy file)`.
+///
+/// WHY (dp, 2026-10-28, #1306 option 2). A memory-only loosening was revoked by the next deploy's
+/// restart, and hestia-deploy restarts the daemon whenever main moves (every 4 h on the fleet), so an
+/// operator's per-member `permissive` lasted until an unrelated deploy, not a working day, and nothing
+/// said it had gone (dp, 10-13). The 2026-08-01 reason for memory-only still holds for a grant WITHOUT
+/// an expiry: a widening nobody remembers to revoke must not become permanent, and restart is what ends
+/// it. A grant WITH an expiry already has that end, set by the operator, so it can be durable without
+/// becoming permanent by inattention. Expired rows are never restored and are dropped on the next write.
+pub const EXPIRING_GRANTS_DOC: (&str, &str, &str) = ("policy", "expiring-grants", "expiring-grants.json");
+
+/// The longest an expiring loosening may last (nomad's HOLD on #1430). The durable kind's safety is
+/// "its end is the operator's own bound", which holds only if the bound is bounded: an
+/// `expires_in_secs` of a century would survive every restart, the permanence the 08-01 rule exists
+/// to prevent. Seven days covers "a working day" and a week away; longer is a STANDING decision, made
+/// on the standing surface, not a loosening that happens to outlive restarts. Refused above, never clamped.
+pub const MAX_EXPIRING_LOOSENING_SECS: u64 = 7 * 24 * 3600;
+
+/// One persisted expiring loosening: the key `ServerState::instance_grants` holds it under, and the grant.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExpiringGrantRow {
+    pub plugin_id: String,
+    pub role: String,
+    pub grant: InstanceGrant,
+}
+
+impl PartialEq for InstanceGrant {
+    fn eq(&self, o: &Self) -> bool {
+        (self.preset.as_str(), self.granted_by.as_str(), self.granted_at, self.reason.as_str(), self.expires_at)
+            == (o.preset.as_str(), o.granted_by.as_str(), o.granted_at, o.reason.as_str(), o.expires_at)
+    }
 }
 
 impl InstanceGrant {
@@ -174,6 +210,118 @@ pub struct ScopeRequest {
     /// facts, and the member's `hestia_scope_status` must be able to say which.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked: Option<ScopeRevocation>,
+    /// What 2026-10-05 added: the gate-opened origin, the one-time answer, and the breadth the
+    /// operator chose. One struct so every existing construction stays a one-line default.
+    #[serde(default)]
+    pub ext: ScopeRequestExt,
+}
+
+/// The fields a GATE-OPENED scope request carries, and the operator's answer shape.
+///
+/// dp, 2026-10-05: *"yes on gate gap, let's fix it. escalation should allow standing grants (i
+/// recall it being discussed but it's not implemented that i can see)."* It was discussed:
+/// PRD_ALLOWLISTS §5 — *"on denial escalation, the operator should have the choice of expansion
+/// being one-time, session, or member-permanent."* An `mrh.path` / `mrh.command` refusal used to
+/// be a plain deny: nothing reached the operator unless the member chose to file. Now the gate
+/// asks `hestia_scope_claim`, which opens a request in THIS store (not a new one) carrying what
+/// was refused, and the operator answers with one of the three durations — and, for session and
+/// standing, the breadth.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScopeRequestExt {
+    /// `Some` when the gate opened this request on a refusal; `None` when the member filed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateDenyOrigin>,
+    /// For a MEMBER-FILED ask: whether the asker was resolved from a live session when it was
+    /// recorded, or merely asserted (hestia#1409). A gate-opened request carries this on
+    /// `gate.asker_basis`. A NOT-SAME peer may REFUSE a session-attributed member-filed ask;
+    /// granting one stays the operator's. Rows written before this field read as asserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asker_basis: Option<crate::arbiter::AskerBasis>,
+    /// The operator answered ONE-TIME: this exact act (`gate.act_digest`), once, inside the
+    /// claim window. Never a live grant: it is not served in `live_grants`, so no snapshot
+    /// carries it; only `hestia_scope_claim` can spend it.
+    #[serde(default)]
+    pub once: bool,
+    /// When the one-time approval was spent. A spent approval permits nothing more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spent_at: Option<u64>,
+    /// The breadth the operator granted, when it differs from the asked path: the asked path or
+    /// an ANCESTOR of it (always recursive then — an exact grant on an ancestor would not reach
+    /// the asked path). `None` = exactly the asked path. The asked path is never rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_path: Option<String>,
+    /// RESERVE / COMMIT (Codex re-review of #1232, P2): the gate's operation key holding this
+    /// one-time approval while the act's final evidence is recorded. A reservation is released
+    /// (the act was denied), committed (the act was permitted), or — if neither arrives before
+    /// `reserved_until` — it LAPSES INTO SPENT: an outcome nobody reported is treated as an act
+    /// that may have run, so the approval can never be spent twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_until: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<u64>,
+    /// dp, 2026-10-05: *"scope escalations should go to peers not to me."* The NOT-SAME peers
+    /// invited to rule a gate-opened request (mesh `review_request` notices).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invited_peers: Vec<String>,
+    /// For a request a PEER decided: `{"arbiter", "asker", "asker_basis", "independence"}` — the
+    /// NOT-SAME basis the ruling rested on. `None` for an operator ruling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_basis: Option<serde_json::Value>,
+    /// What the live grant lets the member DO at its reach (#1345). Set by the decider, like
+    /// `recursive`; all four by default, which is what every live grant meant before.
+    #[serde(default, skip_serializing_if = "crate::server::grant_modes::is_all")]
+    pub modes: crate::server::grant_modes::Modes,
+    /// When the operator's "make standing" converted this live grant into a standing one
+    /// (#1400). From then on the standing row carries the reach, with this request's id as its
+    /// provenance, and this record is no longer a grant in force: not revoked (nothing was taken
+    /// from the member, so no revocation notice), but PROMOTED. Before this, the live grant
+    /// stayed in force beside its standing copy until it lapsed, and the standing grant's Edit
+    /// refused it as a live twin: "converted, then could not be edited".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at: Option<u64>,
+}
+
+impl ScopeRequestExt {
+    /// A reservation that is neither released nor committed.
+    pub fn reservation_open(&self) -> bool {
+        self.reserved_by.is_some() && self.released_at.is_none() && self.spent_at.is_none()
+    }
+
+    /// An open reservation past its deadline: consumed (see `reserved_by`).
+    pub fn reservation_lapsed(&self, now: u64) -> bool {
+        self.reservation_open() && self.reserved_until.is_some_and(|t| now >= t)
+    }
+}
+
+/// What the gate knew when it opened a request: the refusal it is answering.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateDenyOrigin {
+    /// `mrh.path` | `mrh.command`.
+    pub rule: String,
+    pub tool: String,
+    /// The attempted act as the gate rendered it (masked, truncated at the gate). This is what
+    /// the operator rules on — not a rationale: the member did not choose to ask.
+    pub act: String,
+    /// sha256 over `tool \x1f act`: a one-time approval is spent only by the act it was shown.
+    pub act_digest: String,
+    /// sha256 over `"hestia:scope-request-key" \x1f member \x1f path` — re-issues find this row.
+    pub request_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_session_id: Option<String>,
+    /// The refused reach was a glob over this directory (`dir/*`): only a recursive grant
+    /// covers it, and the operator is told so.
+    #[serde(default)]
+    pub subtree: bool,
+    /// How many times the member re-issued the refused act while this was pending.
+    #[serde(default)]
+    pub reissues: u32,
+    /// Whether the asker was resolved from a live session (`session`) or asserted. NOT-SAME
+    /// peers may rule only a PROVEN asker's request (`arbiter::eligibility_for` clause 0); an
+    /// asserted asker's request is the operator's. Rows written before this field are asserted.
+    #[serde(default)]
+    pub asker_basis: crate::arbiter::AskerBasis,
 }
 
 /// What a retirement actually removed, by channel.
@@ -201,7 +349,28 @@ impl ScopeRequest {
     /// inline now asks this, so a revocation cannot be honoured in one place and missed in
     /// another.
     pub fn is_live(&self, now: u64) -> bool {
-        self.granted == Some(true) && now < self.expires_at && self.revoked.is_none()
+        // A ONE-TIME approval is not a grant of reach: it is spent by one act through
+        // `hestia_scope_claim`, and must never ride a policy snapshot (where every act in the
+        // window would pass). PRD_ALLOWLISTS §5.2: "no code path for session or permanent calls
+        // the claim verb" — and, the converse, no one-time answer is served as policy.
+        self.granted == Some(true) && now < self.expires_at && self.revoked.is_none() && !self.ext.once
+            && self.ext.promoted_at.is_none()
+    }
+
+    /// The path a live grant reaches from: the operator's chosen breadth, else the asked path.
+    pub fn reach_path(&self) -> &str {
+        self.ext.granted_path.as_deref().unwrap_or(&self.path)
+    }
+
+    /// A one-time approval that can still be spent: approved, not spent, not revoked, inside
+    /// its claim window (`expires_at` is set to decided_at + the claim window at decide time).
+    pub fn once_spendable(&self, now: u64) -> bool {
+        self.ext.once
+            && self.granted == Some(true)
+            && self.ext.spent_at.is_none()
+            && !self.ext.reservation_open()
+            && self.revoked.is_none()
+            && now < self.expires_at
     }
 
     /// Live = granted, and not past its window. A refused or expired request grants nothing,
@@ -209,8 +378,14 @@ impl ScopeRequest {
     /// Reach is by the grant's own rule (`covers_path`): exact unless the operator made it
     /// recursive — the same rule the standing store uses, so the two channels agree.
     pub fn grants(&self, path: &str, now: u64) -> bool {
+        self.grants_for(path, now, crate::server::grant_modes::Modes::ALL)
+    }
+
+    /// `grants`, and the grant includes every mode in `needed` (#1345).
+    pub fn grants_for(&self, path: &str, now: u64, needed: crate::server::grant_modes::Modes) -> bool {
         self.is_live(now)
-            && crate::server::standing_scope::covers_path(&self.path, self.recursive, path)
+            && self.ext.modes.includes(needed)
+            && crate::server::standing_scope::covers_path(self.reach_path(), self.recursive, path)
     }
 
     /// One word for the whole record. `expires_at` means the same thing in both phases — the
@@ -221,6 +396,16 @@ impl ScopeRequest {
     pub fn status(&self, now: u64) -> &'static str {
         if self.revoked.is_some() {
             return "revoked";
+        }
+        if self.ext.promoted_at.is_some() {
+            // #1400: carried on by the standing grant that names this request as its provenance.
+            return "promoted";
+        }
+        if self.ext.once && (self.ext.spent_at.is_some() || self.ext.reservation_lapsed(now)) {
+            return "spent";
+        }
+        if self.ext.once && self.ext.reservation_open() {
+            return "reserved";
         }
         match self.granted {
             Some(true) if now < self.expires_at => "granted",
@@ -251,7 +436,14 @@ pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
 /// | TIGHTENING          | vault (`instance_overlays`)         | **yes**          |
 /// | LIVE loosening      | memory (`instance_grants`,          | **no**           |
 /// |                     |  `scope_requests`)                  |                  |
+/// | EXPIRING loosening  | vault (`policy/expiring-grants`)    | **until expiry** |
+/// |                     |  + memory (`instance_grants`)       |                  |
 /// | STANDING loosening  | vault (`scope`/`standing` document) | **yes**          |
+///
+/// EXPIRING (dp, 2026-10-28, #1306 option 2): an operator's per-member preset loosening that carries
+/// an `expires_at` is restored after a restart until that second, because a deploy restarts the
+/// daemon every few hours and was revoking it early. It can't become permanent by inattention: its
+/// end is the operator's own bound. A loosening with no expiry is still LIVE (memory-only).
 ///
 /// The first two rows are the 2026-08-01 doctrine and are unchanged: a RESTRICTION has to be
 /// durable — a member restricted for cause must not be freed by a reboot — and a LIVE
@@ -300,7 +492,7 @@ pub struct ServerState {
     /// answers a narrower question the daemon's build id cannot — whether a caller ever said
     /// it understood a newly served field. #481 remains the integrity boundary for proving
     /// which installed bytes made that report.
-    pub gate_capabilities: HashMap<String, HashSet<String>>,
+    pub gate_capabilities: Arc<crate::server::published::GateCapabilities>,
     /// Member → wall-clock time its current seat-config finding was FIRST observed.
     ///
     /// The edge, not the level. A stateless check can only ever report "miswired again" on every
@@ -349,7 +541,7 @@ pub struct ServerState {
     /// a tally would make the ATTESTATION rather than the chain the source of truth.
     pub scope_tally: std::collections::HashMap<(String, String), (u64, u64)>,
     pub vault: Vault,
-    pub sessions: HashMap<Uuid, Session>,
+    pub sessions: crate::server::published::Sessions,
     pub actions: HashMap<Uuid, InFlightAction>,
     /// BEHIND AN `Arc` SO A HEAVY READ NEED NOT HOLD THE GLOBAL STATE LOCK.
     ///
@@ -375,6 +567,10 @@ pub struct ServerState {
     /// that outer lock. The store's internal `Mutex<Connection>` remains the sole
     /// serialization point, and existing field reads dereference transparently.
     pub chain_store: Arc<SqliteChainStore>,
+    /// One-gate stage A: the committed decision rows per `(member, action_id)` and the one row
+    /// whose charge was applied — exactly one, whatever writes the rows and in whatever order.
+    /// Rebuilt at startup. See `decision_witness::DecisionLedger`.
+    pub decision_ledger: super::decision_witness::DecisionLedger,
     pub trust_store: TrustStore,
     /// Durable inbound mailbox (entity-edge inbox): still-sealed notices parked
     /// by `hestia_notify {defer: true}` before the hub is ACKed, drained by
@@ -399,17 +595,17 @@ pub struct ServerState {
     /// verifiable legacy alias to its `member_lct` label. See `member_registry`.
     pub member_registry: crate::member_registry::MemberRegistry,
     pub shared_context: serde_json::Map<String, serde_json::Value>,
-    pub policy_engine: crate::policy::PolicyEngine,
+    pub policy_engine: crate::server::published::Watched<crate::policy::PolicyEngine>,
     /// Per-constellation-role policy engines (#403 role-scoped law), built from
     /// the vault's `role_overlays`. A session's declared role selects its engine;
     /// its verdict is folded into `policy_engine` by strictest-wins in
     /// `query_policy`, so a role can only tighten the base, never loosen it.
-    pub role_policy_engines: HashMap<String, crate::policy::PolicyEngine>,
+    pub role_policy_engines: crate::server::published::Watched<HashMap<String, crate::policy::PolicyEngine>>,
     /// Per-`(instance, role)` policy engines (the finest grain), keyed by
     /// `(plugin_id, role)`. Selected AFTER the role engine and folded strictest-
     /// wins in the gate, so a specific orchestrator can only tighten its role's
     /// law, never loosen it. Built from the vault's `instance_overlays`.
-    pub instance_policy_engines: HashMap<(String, String), crate::policy::PolicyEngine>,
+    pub instance_policy_engines: crate::server::published::Watched<HashMap<(String, String), crate::policy::PolicyEngine>>,
     /// OPERATOR GRANTS — per-`(plugin_id, role)`, and the ONLY input in the whole fold that
     /// may LOOSEN (dp, 2026-08-01).
     ///
@@ -433,7 +629,7 @@ pub struct ServerState {
     ///
     /// Society baseline is NOT this. The baseline lives in society law and moves only by
     /// amendment — a grant is a scoped exception to it, never an edit of it.
-    pub instance_grants: HashMap<(String, String), InstanceGrant>,
+    pub instance_grants: crate::server::published::Watched<HashMap<(String, String), InstanceGrant>>,
     /// Scope requests and the operator's answers, keyed by request id. See `ScopeRequest`.
     ///
     /// Memory-only for the same reason `instance_grants` is: this widens reach, so it must
@@ -443,13 +639,13 @@ pub struct ServerState {
     /// Deliberately keyed by id and not by `(plugin, path)`: the record of an ASK that was
     /// refused is as much of the account as the record of one that was granted, and a map
     /// keyed by target would let a re-ask overwrite a refusal.
-    pub scope_requests: HashMap<String, ScopeRequest>,
+    pub scope_requests: crate::server::published::Watched<HashMap<String, ScopeRequest>>,
     /// STANDING scope grants — the third row of `POLICY_SCOPE_ASYMMETRY`: durable,
     /// operator-decided, vault-persisted (`scope`/`standing` document), generation-counted.
     /// Loaded at startup, written back through `persist_standing_scope` on every operator
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
-    pub standing_scope: crate::server::standing_scope::StandingScopeStore,
+    pub standing_scope: crate::server::published::Watched<crate::server::standing_scope::StandingScopeStore>,
     /// Ids the operator has retired on THIS seat: no longer parties, their standing grants
     /// revoked in the same commit, hidden from the default agent view. Rebuilt from the vault
     /// at load like `member_registry`. Never deletion -- see `server::retirement`.
@@ -457,11 +653,11 @@ pub struct ServerState {
     /// What was found where the standing authority should be, at launch. Set once during
     /// construction and served beside the envelope so an unmigrated society is legible
     /// rather than silently empty.
-    pub authority_status: crate::server::standing_scope::AuthorityStatus,
+    pub authority_status: crate::server::published::Watched<crate::server::standing_scope::AuthorityStatus>,
     /// The most recent proof that the runtime projection still equals the vault. `None`
     /// until the first verification runs, which is itself information: it means no
     /// verification has happened yet, not that everything is fine.
-    pub standing_projection_audit: Option<crate::server::standing_scope::ProjectionAudit>,
+    pub standing_projection_audit: crate::server::published::Watched<Option<crate::server::standing_scope::ProjectionAudit>>,
     /// TRUE while the in-memory standing store is TIGHTER than the persisted vault copy —
     /// set when a revoke's vault write fails after the row was already removed from memory
     /// (memory keeps the tighter state on purpose). While set, the revoke surface accepts a
@@ -470,14 +666,29 @@ pub struct ServerState {
     /// Never persisted: a restart reloads the vault copy, at which point memory and vault
     /// agree again (the grant resurrects, visibly, and a fresh revoke takes the normal path).
     pub standing_scope_dirty: bool,
+    /// TEST SEAMS for the two-phase witness arms that no external injection can time: a chain
+    /// append that fails for the named event types only (so an intent lands and its success row
+    /// does not), and a `persist_standing_scope` that fails (the memory-first rollback's vault
+    /// write). Compiled out of the daemon.
+    #[cfg(test)]
+    pub chain_fault_on: std::collections::HashSet<String>,
+    #[cfg(test)]
+    pub vault_fault_on_persist: bool,
+    /// Moves on every policy republish (`server::published`).
+    pub publication_version: u64,
+    /// The vault policy-list generation the current publication was built from.
+    published_lists_gen: u64,
     /// Transport bindings (#1030): which hub identity carries each member's routed acts,
     /// and where the answer belongs. Operator-written through `commit_transport_bindings`,
     /// vault-persisted, read by `member_notify` at enqueue and by the egress plane.
     pub transport_bindings: crate::server::transport_binding::TransportBindingStore,
+    /// Channel bindings (#1344): where each member's `hestia_channel_send` to a channel goes.
+    /// Operator-written through `commit_channel_bindings`, vault-persisted.
+    pub channel_bindings: crate::server::channel::ChannelBindingStore,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
-    pub law_gate: Option<crate::policy::LawGate>,
+    pub law_gate: crate::server::published::Watched<Option<Arc<crate::policy::LawGate>>>,
     /// Plugin IDs that self-declared as synthetic (test harnesses,
     /// fuzzers, etc.). Excluded from operator-facing aggregations by
     /// default. Enclosed in the vault (document `presence`/`synthetic`).
@@ -542,6 +753,102 @@ pub fn normalize_scope_path(path: &str) -> String {
     }
 }
 
+/// The "path" of a scope request for an act whose reach the gate could NOT ENUMERATE (dp,
+/// 2026-10-10, #1232 narrowed): #1274's sentinel (`gate_escalation::UNPRICEABLE_PREFIX` +
+/// `unenumerated` | `overflow`), keyed on the act by `#` and the first 16 hex of its complete-act
+/// digest — `hestia:unpriceable:unenumerated#0123456789abcdef`. Nothing an expansion produces is
+/// modelled any more, so a command whose reach depends on one names no path at all; the gate asks
+/// for THE ACT instead. Such a request can be granted ONCE (that act, exactly) or refused —
+/// never for a session or standing, because there is no path a grant could name. Returns the
+/// canonical spelling, or `None` for anything else (a real path is `normalize_scope_path`'s).
+pub fn unpriceable_scope_path(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let rest = t.strip_prefix(crate::server::gate_escalation::UNPRICEABLE_PREFIX)?;
+    let (class, key) = rest.split_once('#')?;
+    if !matches!(class, "unenumerated" | "overflow") {
+        return None;
+    }
+    if key.len() != 16 || !key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+/// Whether a scope request's path is an UNENUMERATED act (see `unpriceable_scope_path`).
+pub fn is_unpriceable_scope_path(path: &str) -> bool {
+    unpriceable_scope_path(path).is_some()
+}
+
+/// The ruling KINDS a pending scope request can take: `once` (this act, exactly), `session`
+/// (memory-only, expires), `standing` (vault), `refuse`.
+pub const SCOPE_DECISION_KINDS: [&str; 4] = ["once", "session", "standing", "refuse"];
+
+/// Which kind a decide body asks for. A refusal is `refuse` whatever else it carries; the
+/// decide endpoint rejects the malformed combinations (once+standing, a standing refusal) on
+/// their own terms before this matters.
+pub fn scope_decision_kind(granted: bool, once: bool, standing: bool) -> &'static str {
+    match (granted, once, standing) {
+        (false, _, _) => "refuse",
+        (true, true, _) => "once",
+        (true, false, true) => "standing",
+        (true, false, false) => "session",
+    }
+}
+
+/// THE decisions a pending scope request accepts (#1287 part 2) — the one source both the decide
+/// endpoint's refusal and every operator surface's offer read, so the UI cannot offer a ruling
+/// the endpoint then refuses after the click.
+///
+/// * `once` only when the GATE opened the request: it binds to the act the gate refused, and a
+///   member-filed ask names no act.
+/// * `session` and `standing` only when the request names a PATH: an act whose reach the gate
+///   could not enumerate (`is_unpriceable_scope_path`, #1232) names none a grant could reach.
+/// * `refuse` always.
+///
+/// Order is `SCOPE_DECISION_KINDS` order, so surfaces can render it as given.
+pub fn scope_allowed_decisions(path: &str, gate_act: bool) -> Vec<&'static str> {
+    let enumerable = !is_unpriceable_scope_path(path);
+    SCOPE_DECISION_KINDS
+        .into_iter()
+        .filter(|k| match *k {
+            "once" => gate_act,
+            "session" | "standing" => enumerable,
+            _ => true,
+        })
+        .collect()
+}
+
+/// How long a peer-routed scope request waits for a NOT-SAME peer before it ESCALATES to the
+/// operator (dp, 2026-10-13: "escalate to me after a timeout"). On 10-13 every gate-opened
+/// request invited peers (codex, kimi-code), none ruled, and requests sat 8 h unseen. Default
+/// 30 min; `HESTIA_SCOPE_PEER_WINDOW_SECS` overrides it.
+pub const SCOPE_PEER_WINDOW_SECS_DEFAULT: u64 = 1800;
+
+pub fn scope_peer_window_secs() -> u64 {
+    std::env::var("HESTIA_SCOPE_PEER_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(SCOPE_PEER_WINDOW_SECS_DEFAULT)
+}
+
+/// Who a pending scope request is waiting on, and whether its peer window has lapsed.
+/// Authority does not change: peers may still decide after the window, and the operator could
+/// always override. What changes is whose queue it is in -- after the window it is the
+/// operator's, and the surfaces show it as awaiting the operator.
+/// Returns `("peer", false)` inside the window, `("operator", true)` once it has lapsed, and
+/// `("operator", false)` for a request no peer was invited to (it was always the operator's).
+pub fn scope_decided_by(gate_opened: bool, invited_peers: usize, requested_at: u64, now: u64,
+                        window_secs: u64) -> (&'static str, bool) {
+    if !(gate_opened && invited_peers > 0) {
+        return ("operator", false);
+    }
+    if now.saturating_sub(requested_at) >= window_secs {
+        ("operator", true)
+    } else {
+        ("peer", false)
+    }
+}
+
 /// A `path:` scope grant MUST be stored absolute (#722). A relative grant renders in the seat's
 /// grant set — e.g. `path:home/dp/ai-workspace` with no leading slash — but can never match a
 /// resolved absolute candidate under #597 prefix containment (`_within_path_grant`/`_scope_parts`),
@@ -601,8 +908,35 @@ impl ServerState {
         let store_key = crate::storage::storage_key(home, passphrase)
             .map_err(|e| anyhow::anyhow!("deriving storage key: {e}"))?;
         let chain_store = Arc::new(SqliteChainStore::open(home.join("witness.db"), store_key)?);
+        // The vault never reaches disk ahead of the chain rows that justify its writes (group
+        // commit): every save first makes everything committed to the chain durable.
+        {
+            let durability = chain_store.durability().clone();
+            vault.set_pre_save_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
         let trust_store = TrustStore::open(home.join("trust"), store_key)?;
+        // Durable cache: no trust file reaches disk ahead of the chain row it projects.
+        {
+            let durability = chain_store.durability().clone();
+            trust_store.persister().set_pre_write_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
+        // TRUST IS A PROJECTION OF THE CHAIN (#1271). `since` is the projection EPOCH (fixed;
+        // the decision ledger derives charges from the chain from there); `from` is where replay
+        // starts — the cache's checkpoint only where its manifest verifies against the files,
+        // else the epoch (see `TrustStore::recover`).
+        let (trust_projection_since, trust_projection_from) = trust_store.recover(chain_store.len()?)?;
         let inbox_store = crate::storage::SqliteInboxStore::open(home.join("inbox.db"), store_key)?;
+        // Durable reads: inbox rows carry chain hashes; no inbox write reaches disk ahead of them.
+        {
+            let durability = chain_store.durability().clone();
+            inbox_store.set_pre_write_barrier(Arc::new(move || {
+                durability.flush_committed_blocking().map_err(|e| format!("{e:#}"))
+            }));
+        }
         // The disposition projection cursor is initialized HERE — synchronously,
         // at state open, before any ruling surface is reachable (revised #480
         // review, blocker 2). The r3 shape initialized it lazily on the worker's
@@ -703,6 +1037,34 @@ impl ServerState {
                  acts under carriers nobody bound",
             )?
         };
+        let channel_bindings: crate::server::channel::ChannelBindingStore = {
+            use anyhow::Context;
+            crate::vault::load_doc(&vault, "channel", "bindings", "channel-bindings.json").context(
+                "channel-binding store unreadable: failing closed rather than sending members' \
+                 messages to recipients nobody bound",
+            )?
+        };
+        // #1306: the expiring loosenings, restored only while live. Unreadable fails CLOSED the
+        // other way from standing scope: an unreadable store restores NOTHING (no widening comes
+        // back on a doubt) and the daemon still starts, because losing a loosening is the safe side.
+        let restored_grants: HashMap<(String, String), InstanceGrant> = {
+            let (ns, name, legacy) = EXPIRING_GRANTS_DOC;
+            let rows: Vec<ExpiringGrantRow> = crate::vault::load_doc(&vault, ns, name, legacy).unwrap_or_else(|e| {
+                tracing::warn!("expiring-grants store unreadable ({e:#}): no expiring loosening restored");
+                Vec::new()
+            });
+            let now = crate::server::gate_escalation::now_secs();
+            rows.into_iter()
+                .filter(|r| r.grant.expires_at.is_some() && r.grant.is_live(now))
+                .map(|r| {
+                    // said, not silent (nomad on #1430): after a deploy a reader can see a loosening is live
+                    tracing::info!(plugin_id = %r.plugin_id, role = %r.role, preset = %r.grant.preset,
+                                   expires_at = ?r.grant.expires_at,
+                                   "restored an expiring loosening from the vault (#1306)");
+                    ((r.plugin_id, r.role), r.grant)
+                })
+                .collect()
+        };
         let standing_doc_present = vault.get_document("scope", "standing").is_some();
         let standing_scope: crate::server::standing_scope::StandingScopeStore = {
             use anyhow::Context;
@@ -726,7 +1088,7 @@ impl ServerState {
         };
 
         let mut st = Self {
-            gate_capabilities: HashMap::new(),
+            gate_capabilities: Arc::new(crate::server::published::GateCapabilities::default()),
             // REBUILT FROM THE CHAIN, not started empty. Starting empty loses the ability to
             // close any finding opened before this restart, because the pass that opened it
             // also repaired the artifact — so the next pass sees clean, has nothing to close,
@@ -736,8 +1098,16 @@ impl ServerState {
             seat_live: HashMap::new(),
             scope_tally: std::collections::HashMap::new(),
             vault,
-            sessions: HashMap::new(),
+            sessions: crate::server::published::Sessions::default(),
             actions: HashMap::new(),
+            // Rebuilt from the chain + settle record, so a late witness for an action from before
+            // this restart finds its row and its charge state (one-gate stage A). Evaluated
+            // before `chain_store` moves into the struct below.
+            decision_ledger: super::decision_witness::rehydrate_from(
+                &chain_store,
+                &home.join(super::decision_witness::SETTLED_FILE),
+                trust_projection_since,
+            ),
             chain_store,
             trust_store,
             inbox_store: Arc::new(inbox_store),
@@ -747,27 +1117,35 @@ impl ServerState {
             member_registry,
             retired_members,
             shared_context: serde_json::Map::new(),
-            policy_engine,
-            role_policy_engines,
-            instance_policy_engines,
-            // Empty at every startup, by design: grants do not survive a restart. Escalations
-            // DO — see the rehydrate call after construction. The two are opposite on purpose:
-            // a human's ruling must survive a deploy, a standing permission must not.
-            instance_grants: HashMap::new(),
+            policy_engine: crate::server::published::Watched::new(policy_engine),
+            role_policy_engines: crate::server::published::Watched::new(role_policy_engines),
+            instance_policy_engines: crate::server::published::Watched::new(instance_policy_engines),
+            // Empty at every startup EXCEPT for loosenings that carry an expiry (#1306): those
+            // are restored from the vault until their own `expires_at`. A grant with no expiry
+            // still does not survive a restart: restart is what ends a widening nobody revokes.
+            // Escalations DO survive — see the rehydrate call after construction.
+            instance_grants: crate::server::published::Watched::new(restored_grants),
             // Same reasoning, same lifetime: a widening dies with the daemon.
-            scope_requests: HashMap::new(),
+            scope_requests: crate::server::published::Watched::new(HashMap::new()),
             // The deliberate exception (row 3): standing grants are durable and were just
             // loaded from the vault, so an operator's standing ruling survives the deploy.
-            standing_scope,
-            authority_status,
+            standing_scope: crate::server::published::Watched::new(standing_scope),
+            authority_status: crate::server::published::Watched::new(authority_status),
             // No verification has run yet. Deliberately not a synthetic "matches: true":
             // construction agreeing with itself is not a proof, and claiming one here would
             // make the freshness timestamp lie from the first second.
-            standing_projection_audit: None,
+            standing_projection_audit: crate::server::published::Watched::new(None),
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
+            #[cfg(test)]
+            chain_fault_on: std::collections::HashSet::new(),
+            #[cfg(test)]
+            vault_fault_on_persist: false,
+            publication_version: 0,
+            published_lists_gen: u64::MAX,
             transport_bindings,
-            law_gate,
+            channel_bindings,
+            law_gate: crate::server::published::Watched::new(law_gate.map(Arc::new)),
             synthetic_plugins,
             home: home.to_path_buf(),
             member_notify_limiter: crate::policy::RateLimiter::new(),
@@ -810,6 +1188,12 @@ impl ServerState {
         // Log the zero too. "restored 0" and "did not look" are different facts, and only one of
         // them used to be visible.
         eprintln!("[hestia] restored {restored} live escalation(s) from the chain");
+        // Restore whatever the trust cache lost: replay from where it is current.
+        match st.replay_trust_projection(trust_projection_from) {
+            Ok(n) if n > 0 => eprintln!("[hestia] trust projection: replayed {n} row(s) from {trust_projection_from}"),
+            Ok(_) => {}
+            Err(e) => tracing::error!("trust projection replay failed: {e:#}"),
+        }
         Ok(st)
     }
 
@@ -871,6 +1255,22 @@ impl ServerState {
         // Self-contained credential the operator loads into their client: the
         // lct_id (so the client knows WHICH operator it is) + the raw Ed25519 seed
         // (hex) the client wraps + imports for signing. 0600, genesis handoff.
+        // Self-witnessing A, and FIRST (#1131 class A: this append's result used to be discarded
+        // after the key and the law were already written). The genesis act is recorded AS a
+        // bootstrap act, with the evidence available at genesis, BEFORE anything is written: a
+        // record that cannot be made leaves no key on disk and no operator in the law, the window
+        // stays open, and the next start retries. Recording first rather than undoing after means
+        // the undo never has to delete an operator.key.
+        self.append_chain(
+            "operator_bootstrap",
+            serde_json::json!({
+                "operator": lct_id,
+                "window": "genesis",
+                "evidence": "sovereign-process-minting-first-operator",
+                "note": "bounded self-terminating bootstrap; no re-entry once operator_access is non-empty",
+            }),
+        )
+        .map_err(|e| anyhow::anyhow!("recording the operator bootstrap: {e}; nothing was minted"))?;
         let key_path = self.home.join("operator.key");
         let cred = serde_json::json!({
             "lct_id": lct_id,
@@ -896,18 +1296,6 @@ impl ServerState {
             .set_policy(policy)
             .map_err(|e| anyhow::anyhow!("persisting bootstrapped operator: {e}"))?;
 
-        // Self-witnessing A: the genesis act is recorded AS a bootstrap act, with
-        // the evidence available at genesis (the sovereign process minting the
-        // first operator). The record makes the origin auditable, not silent.
-        let _ = self.append_chain(
-            "operator_bootstrap",
-            serde_json::json!({
-                "operator": lct_id,
-                "window": "genesis",
-                "evidence": "sovereign-process-minting-first-operator",
-                "note": "bounded self-terminating bootstrap; no re-entry once operator_access is non-empty",
-            }),
-        );
         eprintln!(
             "[hestia] OPERATOR BOOTSTRAP: minted genesis operator {lct_id}\n\
              [hestia]   private key written to {} (0600) — load it into your operator client;\n\
@@ -925,15 +1313,15 @@ impl ServerState {
             .policy()
             .resolve()
             .unwrap_or_else(|| crate::policy::get_preset("safety").unwrap().config);
-        self.policy_engine = crate::policy::PolicyEngine::new(config);
-        self.role_policy_engines = self
+        *self.policy_engine = crate::policy::PolicyEngine::new(config);
+        *self.role_policy_engines = self
             .vault
             .policy()
             .role_configs()
             .into_iter()
             .map(|(role, cfg)| (role, crate::policy::PolicyEngine::new(cfg)))
             .collect();
-        self.instance_policy_engines = self
+        *self.instance_policy_engines = self
             .vault
             .policy()
             .instance_configs()
@@ -942,7 +1330,7 @@ impl ServerState {
             .collect();
         // Re-read the machine-local hub law alongside vault policy so an
         // operator law update lands without a daemon restart.
-        self.law_gate = crate::policy::LawGate::load(&self.home);
+        *self.law_gate = crate::policy::LawGate::load(&self.home).map(Arc::new);
     }
 
     /// Issue a Soft LCT for a new session.
@@ -986,6 +1374,26 @@ impl ServerState {
     ///
     /// Callers must apply this BEFORE folding hub law, so ratified society law still binds. See
     /// the ordering note at the `gate_direct_tool` call site.
+    /// The full law fold for an action, on LIVE state (lock holders). One implementation with
+    /// the publication's: `published::evaluate_folded`.
+    pub fn evaluate_folded(
+        &self,
+        plugin_id: &str,
+        role: &str,
+        pa: &crate::policy::PolicyAction,
+    ) -> crate::policy::PolicyEvaluation {
+        crate::server::published::evaluate_folded(
+            &self.policy_engine,
+            &self.role_policy_engines,
+            &self.instance_policy_engines,
+            &self.instance_grants,
+            self.law_gate.as_deref(),
+            plugin_id,
+            role,
+            pa,
+        )
+    }
+
     pub fn apply_instance_grant(
         &self,
         plugin_id: &str,
@@ -1041,13 +1449,7 @@ impl ServerState {
     /// wildcard — narrow before broad, which is the same precedence every other layer uses.
     pub fn instance_grant(&self, plugin_id: &str, role: &str) -> Option<&InstanceGrant> {
         let now = crate::server::gate_escalation::now_secs();
-        self.instance_grants
-            .get(&(plugin_id.to_string(), role.to_string()))
-            .or_else(|| {
-                self.instance_grants
-                    .get(&(plugin_id.to_string(), "*".to_string()))
-            })
-            .filter(|g| g.is_live(now))
+        crate::server::published::instance_grant_in(&self.instance_grants, plugin_id, role, now)
     }
 
     /// Every live scope grant a member currently holds — what the gate consults, and what
@@ -1059,13 +1461,7 @@ impl ServerState {
     /// stop applying midway through the work it was granted for.
     pub fn live_scope_grants(&self, plugin_id: &str) -> Vec<&ScopeRequest> {
         let now = crate::server::gate_escalation::now_secs();
-        let mut live: Vec<&ScopeRequest> = self
-            .scope_requests
-            .values()
-            .filter(|r| r.plugin_id == plugin_id && r.is_live(now))
-            .collect();
-        live.sort_by_key(|r| r.requested_at);
-        live
+        crate::server::published::live_scope_grants_in(&self.scope_requests, plugin_id, now)
     }
 
     /// Does this member hold a live grant for exactly this path?
@@ -1080,15 +1476,25 @@ impl ServerState {
     /// grant of record", not "is this filesystem object reachable". A symlink is still a
     /// symlink; see `docs/GATE_BYPASS_CATALOG.md`.
     pub fn has_scope_grant(&self, plugin_id: &str, path: &str) -> bool {
+        // ALL MODES (#1345): every caller of this asks "may the member act here", without
+        // saying how, and answers `already_granted` / `in_force: permits` on a yes. A grant
+        // narrower than rwed cannot answer that yes, or a read-only grant would be reported
+        // in force for a write.
+        self.has_scope_grant_for(plugin_id, path, crate::server::grant_modes::Modes::ALL)
+    }
+
+    /// `has_scope_grant` for an act that needs exactly `needed`.
+    pub fn has_scope_grant_for(&self, plugin_id: &str, path: &str,
+                               needed: crate::server::grant_modes::Modes) -> bool {
         let now = crate::server::gate_escalation::now_secs();
         let want = normalize_scope_path(path);
         self.scope_requests
             .values()
-            .any(|r| r.plugin_id == plugin_id && r.grants(&want, now))
+            .any(|r| r.plugin_id == plugin_id && r.grants_for(&want, now, needed))
             // A STANDING grant answers the same question — "is there a grant of record for
             // exactly this path" — so a member re-asking for a path it durably holds hears
             // `already_granted` instead of filing an ask nobody needs to rule on.
-            || self.standing_scope.has_live(plugin_id, &want, now)
+            || self.standing_scope.has_live_for(plugin_id, &want, now, needed)
     }
 
     /// Every live STANDING grant this member holds (durable row of the asymmetry).
@@ -1106,12 +1512,16 @@ impl ServerState {
     /// entry points below — `commit_standing_scope` for widenings, `apply_standing_revoke`
     /// for tightenings — which encode what a failed persist means for each direction.
     pub fn persist_standing_scope(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.vault_fault_on_persist {
+            anyhow::bail!("injected vault fault (test seam)");
+        }
         crate::vault::save_doc(
             &mut self.vault,
             "scope",
             "standing",
             "standing-scope.json",
-            &self.standing_scope,
+            &*self.standing_scope,
         )
     }
 
@@ -1122,6 +1532,24 @@ impl ServerState {
     /// it, while the error text claimed the store was unchanged. Here unchangedness is a
     /// property of the construction: on any persist failure the live store was never
     /// touched, generation included, so there is nothing to claim and nothing to restore.
+    /// The live loosenings that carry an expiry, as the vault holds them, without `exclude` (a revoke
+    /// computes its candidate this way before anything changes). Sorted, so the document is stable.
+    pub fn expiring_grant_rows(&self, exclude: Option<&(String, String)>) -> Vec<ExpiringGrantRow> {
+        let now = crate::server::gate_escalation::now_secs();
+        let mut rows: Vec<ExpiringGrantRow> = self.instance_grants.iter()
+            .filter(|(k, g)| Some(*k) != exclude && g.expires_at.is_some() && g.is_live(now))
+            .map(|((p, r), g)| ExpiringGrantRow { plugin_id: p.clone(), role: r.clone(), grant: g.clone() })
+            .collect();
+        rows.sort_by(|a, b| (&a.plugin_id, &a.role).cmp(&(&b.plugin_id, &b.role)));
+        rows
+    }
+
+    /// Persist exactly `rows` as the expiring-grants document (#1306).
+    pub fn save_expiring_grants(&mut self, rows: &[ExpiringGrantRow]) -> Result<()> {
+        let (ns, name, legacy) = EXPIRING_GRANTS_DOC;
+        crate::vault::save_doc(&mut self.vault, ns, name, legacy, &rows.to_vec())
+    }
+
     pub fn commit_standing_scope<F>(&mut self, mutate: F) -> Result<()>
     where
         F: FnOnce(&mut crate::server::standing_scope::StandingScopeStore),
@@ -1129,11 +1557,38 @@ impl ServerState {
         let mut candidate = self.standing_scope.clone();
         mutate(&mut candidate);
         crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &candidate)?;
-        self.standing_scope = candidate;
+        // Standing refusals the mutation removed by GRANTING over them (`StandingScopeStore::add`),
+        // witnessed after the commit so the record never says closed where the door is open
+        // (nomad on #1418). A refusal removed by the explicit lift route is witnessed by that
+        // route's own two-phase rows, not here.
+        let lifted: Vec<crate::server::standing_scope::StandingRefusal> = self.standing_scope.refusals.iter()
+            .filter(|old| !candidate.refusals.iter().any(|n| n.member == old.member && n.path == old.path))
+            .filter(|old| candidate.grants.iter().any(|g| old.lifted_by(g)))
+            .cloned()
+            .collect();
+        *self.standing_scope = candidate;
         // The vault now holds exactly what memory holds, so any earlier revoke-persist
         // failure has been overtaken: the synced state is the tighter one plus this
         // committed mutation.
         self.standing_scope_dirty = false;
+        for r in lifted {
+            let by = self.standing_scope.grants.iter()
+                .find(|g| r.lifted_by(g))
+                .map(|g| format!("grant {}", g.request_id.clone().unwrap_or_else(|| g.path.clone())))
+                .unwrap_or_else(|| "grant".into());
+            self.append_chain("scope_refusal_lifted", serde_json::json!({
+                "plugin_id": r.member,
+                "subject_instance_lct": self.member_lct(&r.member),
+                "path": r.path,
+                "recursive": r.recursive,
+                "lifted_by": by,
+                "via": "covering_standing_grant",
+                "refused_by": r.refused_by,
+                "refused_at": r.refused_at,
+                "reason": r.reason,
+                "standing_generation": self.standing_scope.generation,
+            }))?;
+        }
         Ok(())
     }
 
@@ -1148,6 +1603,19 @@ impl ServerState {
         let out = mutate(&mut candidate);
         crate::vault::save_doc(&mut self.vault, "transport", "bindings", "transport-bindings.json", &candidate)?;
         self.transport_bindings = candidate;
+        Ok(out)
+    }
+
+    /// Mutate the channel-binding store through a candidate persisted BEFORE it becomes live
+    /// (the `commit_transport_bindings` construction).
+    pub fn commit_channel_bindings<F, R>(&mut self, mutate: F) -> Result<R>
+    where
+        F: FnOnce(&mut crate::server::channel::ChannelBindingStore) -> R,
+    {
+        let mut candidate = self.channel_bindings.clone();
+        let out = mutate(&mut candidate);
+        crate::vault::save_doc(&mut self.vault, "channel", "bindings", "channel-bindings.json", &candidate)?;
+        self.channel_bindings = candidate;
         Ok(out)
     }
 
@@ -1394,7 +1862,7 @@ impl ServerState {
             if !standing.is_empty() {
                 crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &scope)
                     .context("NOTHING changed: the standing-scope document did not persist")?;
-                self.standing_scope = scope;
+                *self.standing_scope = scope;
                 self.standing_scope_dirty = false;
             }
         }
@@ -1460,8 +1928,14 @@ impl ServerState {
         event_type: &str,
         event_data: serde_json::Value,
     ) -> Result<ChainEntry> {
-        self.chain_store
-            .append(event_type, event_data, &self.sovereign_lct)
+        #[cfg(test)]
+        if self.chain_fault_on.contains(event_type) {
+            anyhow::bail!("injected chain fault on {event_type} (test seam)");
+        }
+        super::state_lock::time_section("chain.append", || {
+            self.chain_store
+                .append(event_type, event_data, &self.sovereign_lct)
+        })
     }
 
     /// Confer citizenship on `subject_lct_id` — birth into THIS society's MRH —
@@ -1600,7 +2074,7 @@ impl ServerState {
                 "outcome:failure"
             },
         };
-        self.apply_outcome_ctx(plugin_id, success, magnitude, &ctx)
+        self.apply_outcome_ctx(plugin_id, success, magnitude, &ctx, None)
     }
 
     /// Apply an outcome AND emit the trust movement as a role-scoped
@@ -1614,34 +2088,81 @@ impl ServerState {
         success: bool,
         magnitude: f64,
         ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
     ) -> Result<EntityTrust> {
-        // Trust accrues to the #403 (instance, role) grain, NOT the plugin type.
-        // Before this, a mesh-worker's failures and an interactive session's
-        // successes both landed on one `plugin:claude-code` entity — the deltas
-        // were role-scoped but the trust generating them was not. Keying the
-        // store on the (instance_lct, role_lct) pair closes that seam: a role's
-        // reputation is its own, and can't be diluted or poisoned by another
-        // capacity of the same instance.
-        let trust_key = self.trust_entity_key(plugin_id, ctx.role_lct);
-        let (before, after) = self
-            .trust_store
-            .update_returning_prior(&trust_key, success, magnitude)?;
-        // LCT-mapping (sequence head, `repemit-1`): resolve the durable member
-        // LCT for `plugin_id` before building the delta, so `subject_lct` is a
-        // ground-truth member identity minted under hestia's sovereign — never
-        // the raw `plugin:` string. Fail-closed: an unmapped plugin (synthetic
-        // or malformed) yields `None` and emits NO delta, so test harnesses
-        // never pollute the hub's reputation view and no un-mappable id reaches
-        // the emit path. Local trust bookkeeping above still runs for everyone.
-        if let Some(subject_lct) = self.member_lct(plugin_id) {
+        // Trust accrues to the #403 (instance, role) grain, NOT the plugin type: keyed on the
+        // (instance_lct, role_lct) pair so a role's reputation can't be diluted or poisoned by
+        // another capacity of the same instance.
+        let (base, lct) = self.trust_grain(plugin_id, ctx.role_lct, row);
+        self.apply_change(&base, lct.as_deref(), TrustChange::Outcome { success, magnitude }, ctx, row)
+    }
+
+    /// The trust grain for `(plugin_id, role)`: `<instance_lct>#<role>` for a mapped member,
+    /// `plugin:<id>#<role>` otherwise. Projected from a chain ROW, the LCT is the one the row
+    /// recorded at the time — so a replay keys exactly as the live write did, even if the member
+    /// was minted after the row.
+    fn trust_grain(
+        &self,
+        plugin_id: &str,
+        role_lct: &str,
+        row: Option<&ChainEntry>,
+    ) -> (String, Option<String>) {
+        let lct = match row {
+            Some(r) => row_instance_lct(r),
+            None => self.member_lct(plugin_id),
+        };
+        let base = match &lct {
+            Some(l) => format!("{l}#{role_lct}"),
+            None => format!("plugin:{plugin_id}#{role_lct}"),
+        };
+        (base, lct)
+    }
+
+    /// Apply one trust change. With a `row`, it is a PROJECTION of that chain row: idempotent by
+    /// position (an entity already projected through it skips it), clocked by the row, and the
+    /// delta is stamped with the row's time — so replaying the chain reproduces it exactly.
+    fn apply_change(
+        &self,
+        key: &str,
+        lct: Option<&str>,
+        change: TrustChange,
+        ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
+    ) -> Result<EntityTrust> {
+        let changed = super::state_lock::time_section("trust_store.update", || match (row, change) {
+            (Some(r), TrustChange::Outcome { success, magnitude }) => self.trust_store.update_at(
+                key, success, magnitude,
+                crate::storage::trust::RowAt { pos: r.chain_position, ts: r.timestamp },
+            ),
+            (Some(r), TrustChange::V3 { dimension, score }) => self.trust_store.update_v3_at(
+                key, dimension, score,
+                crate::storage::trust::RowAt { pos: r.chain_position, ts: r.timestamp },
+            ),
+            (None, TrustChange::Outcome { success, magnitude }) => {
+                self.trust_store.update_returning_prior(key, success, magnitude).map(Some)
+            }
+            (None, TrustChange::V3 { dimension, score }) => {
+                self.trust_store.update_v3_returning_prior(key, dimension, score).map(Some)
+            }
+        })?;
+        let Some((before, after)) = changed else {
+            return self.trust_store.get(key); // already projected through this row
+        };
+        // LCT-mapping (`repemit-1`): only a member with a durable LCT emits a delta; an unmapped
+        // plugin (synthetic or malformed) emits none. Local bookkeeping above runs for everyone.
+        if let Some(subject_lct) = lct {
             if let Some(delta) = crate::reputation::delta_from_change(
-                &subject_lct,
+                subject_lct,
                 ctx,
                 &before,
                 &after,
-                chrono::Utc::now(),
+                row.map(|r| r.timestamp).unwrap_or_else(chrono::Utc::now),
             ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+                if let Some(line) = crate::reputation::delta_line(&delta) {
+                    if let Err(e) = self.trust_store.append_after_trust(&self.reputation_sink(), line) {
+                        tracing::warn!("reputation delta not queued: {e:#}");
+                    }
+                }
             }
         }
         Ok(after)
@@ -1723,52 +2244,159 @@ impl ServerState {
         dimension: web4_core::v3::ValueDimension,
         score: f64,
         ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
     ) -> Result<EntityTrust> {
-        let key = self.adjudicated_entity_key(subject_plugin_id, ctx.role_lct);
-        let (before, after) = self
-            .trust_store
-            .update_v3_returning_prior(&key, dimension, score)?;
-        if let Some(subject_lct) = self.member_lct(subject_plugin_id) {
-            if let Some(delta) = crate::reputation::delta_from_change(
-                &subject_lct,
-                ctx,
-                &before,
-                &after,
-                chrono::Utc::now(),
-            ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
-            }
-        }
-        Ok(after)
+        let (base, lct) = self.trust_grain(subject_plugin_id, ctx.role_lct, row);
+        let key = format!("{base}#adjudicated");
+        self.apply_change(&key, lct.as_deref(), TrustChange::V3 { dimension, score }, ctx, row)
     }
 
-    /// Apply a judgment outcome to the judgment-axis entity and emit the delta
-    /// (same bridge as [`apply_outcome_ctx`]). The delta's `action_type`
-    /// (`"reversal"`) is what separates this stream from execution deltas in the
-    /// sink — the role_lct stays canonical so the hub fold doesn't fragment.
+    /// Apply a judgment outcome to the judgment-axis entity and emit the delta (same bridge as
+    /// [`apply_outcome_ctx`]; `action_type` `"reversal"` separates the stream in the sink).
     pub fn apply_judgment_ctx(
         &self,
         plugin_id: &str,
         success: bool,
         magnitude: f64,
         ctx: &crate::reputation::RepContext,
+        row: Option<&ChainEntry>,
     ) -> Result<EntityTrust> {
-        let key = self.judgment_entity_key(plugin_id, ctx.role_lct);
-        let (before, after) = self
-            .trust_store
-            .update_returning_prior(&key, success, magnitude)?;
-        if let Some(subject_lct) = self.member_lct(plugin_id) {
-            if let Some(delta) = crate::reputation::delta_from_change(
-                &subject_lct,
-                ctx,
-                &before,
-                &after,
-                chrono::Utc::now(),
-            ) {
-                crate::reputation::log_delta(&self.reputation_sink(), &delta);
+        let (base, lct) = self.trust_grain(plugin_id, ctx.role_lct, row);
+        let key = format!("{base}#judgment");
+        self.apply_change(&key, lct.as_deref(), TrustChange::Outcome { success, magnitude }, ctx, row)
+    }
+
+    /// TRUST IS A PROJECTION OF THE CHAIN (#1271): re-apply every trust-affecting row from
+    /// position `from`, through the same functions the live writes use. Idempotent per entity
+    /// (`through`), so it is safe over rows the cache already holds. Returns rows applied.
+    pub fn replay_trust_projection(&self, from: u64) -> Result<u64> {
+        let mut pos = from;
+        let mut applied = 0u64;
+        loop {
+            let rows = self.chain_store.read_from(pos, 2000)?;
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                if self.project_trust_row(r)? {
+                    applied += 1;
+                }
+                pos = r.chain_position + 1;
             }
         }
-        Ok(after)
+        Ok(applied)
+    }
+
+    /// The trust change one chain row carries, derived from the row's content alone — the same
+    /// rule every live write path follows. `true` if the row carries one.
+    fn project_trust_row(&self, r: &ChainEntry) -> Result<bool> {
+        use crate::reputation::{DeltaClass, RepContext};
+        let d = &r.event_data;
+        let st = |k: &str| d.get(k).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        match r.event_type.as_str() {
+            "outcome" => {
+                let success = d.get("success").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                let magnitude = d.get("magnitude").and_then(serde_json::Value::as_f64).unwrap_or(0.5);
+                let (plugin, role, tool, aid) = (st("plugin_id"), st("role_lct"), st("tool_name"), st("action_id"));
+                let ctx = RepContext {
+                    class: DeltaClass::Unclassified,
+                    role_lct: &role,
+                    action_type: "tool_execution",
+                    action_target: &tool,
+                    action_id: &aid,
+                    rule_triggered: "",
+                    reason: if success { "outcome:success" } else { "outcome:failure" },
+                };
+                self.apply_outcome_ctx(&plugin, success, magnitude, &ctx, Some(r))?;
+                Ok(true)
+            }
+            t if t == super::decision_witness::DECISION_EVENT || t == "decision_charge_settled" => {
+                let settled = t == "decision_charge_settled";
+                let has_action = d.get("action_id").and_then(serde_json::Value::as_str).is_some();
+                // Which rows charged, live: a keyed row with a charge and no `charge_held_by`
+                // (the first charge on its key); a seat row with no action id (adjudicator
+                // present); a settle row for an owed legacy charge. A daemon direct-tool deny
+                // (no action id, no adjudicator) never charged.
+                let spec = if settled {
+                    d.get("charge").and_then(super::decision_witness::ChargeSpec::from_settle)
+                } else if has_action {
+                    if d.get("charge_held_by").is_some() {
+                        None
+                    } else {
+                        super::decision_witness::ChargeSpec::from_row(d)
+                    }
+                } else if d.get("adjudicator").and_then(serde_json::Value::as_str).is_some() {
+                    super::decision_witness::ChargeSpec::from_row(d).map(|mut c| {
+                        c.conduct = false;
+                        c
+                    })
+                } else {
+                    None
+                };
+                let Some(c) = spec else { return Ok(false) };
+                let (plugin, aid) = (st(if settled { "member" } else { "plugin_id" }), st("action_id"));
+                let ctx = RepContext {
+                    class: if c.conduct { DeltaClass::Conduct } else { DeltaClass::Unclassified },
+                    role_lct: &c.role_lct,
+                    action_type: "policy_gate",
+                    action_target: &c.tool_name,
+                    action_id: &aid,
+                    rule_triggered: &c.rule_id,
+                    reason: &c.reason,
+                };
+                self.apply_outcome_ctx(&plugin, false, c.magnitude, &ctx, Some(r))?;
+                Ok(true)
+            }
+            "adjudication" => {
+                let Some(score) = d.get("score").and_then(serde_json::Value::as_f64) else {
+                    return Ok(false); // deferred: no trust change
+                };
+                let axis = st("axis");
+                let operator = d.pointer("/adjudicated_by/operator").and_then(serde_json::Value::as_bool) == Some(true);
+                // The two adjudication doors map axes differently; the row says which door.
+                let dimension = if operator {
+                    if axis == "validity" { web4_core::v3::ValueDimension::Validity } else { web4_core::v3::ValueDimension::Valuation }
+                } else {
+                    match crate::server::handler::axis_dimension(&axis) {
+                        Some(dim) => dim,
+                        None => return Ok(false),
+                    }
+                };
+                let (plugin, role, target) = (st("subject_plugin_id"), st("subject_role"), st("ref"));
+                let reason = format!("adjudication:{axis}:{}:{}", st("verdict"), st("method"));
+                let ctx = RepContext {
+                    class: DeltaClass::Conduct,
+                    role_lct: &role,
+                    action_type: "adjudication",
+                    action_target: &target,
+                    action_id: "",
+                    rule_triggered: "",
+                    reason: &reason,
+                };
+                self.apply_adjudication_ctx(&plugin, dimension, score, &ctx, Some(r))?;
+                Ok(true)
+            }
+            "reversal" => {
+                if d.get("validity_effect").and_then(serde_json::Value::as_str) != Some("refuted") {
+                    return Ok(false);
+                }
+                let magnitude = d.get("magnitude").and_then(serde_json::Value::as_f64).unwrap_or(0.5);
+                let (plugin, role, target) = (st("subject_plugin_id"), st("subject_role"), st("ref"));
+                let reason = format!("reversal:{}:{}", st("kind"), st("cause"));
+                let ctx = RepContext {
+                    class: DeltaClass::Conduct,
+                    role_lct: &role,
+                    action_type: "reversal",
+                    action_target: &target,
+                    action_id: "",
+                    rule_triggered: "",
+                    reason: &reason,
+                };
+                self.apply_judgment_ctx(&plugin, false, magnitude, &ctx, Some(r))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Read trust for a plugin in the default (member) capacity. Retained for the
@@ -1793,7 +2421,128 @@ impl ServerState {
     }
 }
 
-pub type SharedState = Arc<Mutex<ServerState>>;
+impl ServerState {
+    fn build_publication(&self) -> crate::server::published::PolicyPublication {
+        use crate::server::published::PolicyPublication;
+        PolicyPublication {
+            version: self.publication_version,
+            society: (*self.policy_engine).clone(),
+            roles: (*self.role_policy_engines).clone(),
+            instances: (*self.instance_policy_engines).clone(),
+            instance_grants: (*self.instance_grants).clone(),
+            law_gate: (*self.law_gate).clone(),
+            policy_lists: self.vault.policy_lists(),
+            scope_requests: (*self.scope_requests).clone(),
+            standing_scope: (*self.standing_scope).clone(),
+            authority_status: *self.authority_status,
+            standing_projection_audit: (*self.standing_projection_audit).clone(),
+            sessions: self.sessions.directory(),
+            gate_capabilities: self.gate_capabilities.clone(),
+            chain_durability: self.chain_store.durability().clone(),
+            observed_len: self.chain_store.len().unwrap_or(0),
+        }
+    }
+
+    /// Did any policy input change since the last publication? Clears every dirty bit (all of
+    /// them, not short-circuiting, so none stays set into the next release).
+    fn take_policy_dirty(&mut self) -> bool {
+        let mut d = false;
+        d |= self.policy_engine.take_dirty();
+        d |= self.role_policy_engines.take_dirty();
+        d |= self.instance_policy_engines.take_dirty();
+        d |= self.instance_grants.take_dirty();
+        d |= self.law_gate.take_dirty();
+        d |= self.scope_requests.take_dirty();
+        d |= self.standing_scope.take_dirty();
+        d |= self.authority_status.take_dirty();
+        d |= self.standing_projection_audit.take_dirty();
+        let lists_gen = self.vault.policy_lists_generation();
+        if lists_gen != self.published_lists_gen {
+            self.published_lists_gen = lists_gen;
+            d = true;
+        }
+        d
+    }
+}
+
+#[cfg(test)]
+impl ServerState {
+    /// Lose every pending dirty bit — the failure the debug staleness check exists to catch.
+    pub(crate) fn forget_policy_dirty_for_test(&mut self) {
+        let _ = self.take_policy_dirty();
+    }
+}
+
+impl super::state_lock::Publish for ServerState {
+    type Snapshot = crate::server::published::PolicyPublication;
+
+    fn initial_snapshot(&mut self) -> Self::Snapshot {
+        let _ = self.take_policy_dirty();
+        self.sessions.apply_pending();
+        self.build_publication()
+    }
+
+    fn on_release(&mut self, slot: &std::sync::RwLock<Arc<Self::Snapshot>>) {
+        // DURABLE READS: whatever this holder read or will reply with reflects every chain entry
+        // committed so far; its request (if any) must not reply before they are durable.
+        if crate::storage::durability::observing_releases() {
+            crate::storage::durability::note_observed(
+                self.chain_store.durability(),
+                self.chain_store.len().unwrap_or(0),
+            );
+        }
+        let dirty = self.take_policy_dirty();
+        if dirty {
+            self.publication_version += 1;
+        }
+        if dirty || self.sessions.has_pending() {
+            // Build outside the slot's write lock; swap (and apply staged session changes)
+            // inside it, so a reader sees one consistent (directory, publication) pair.
+            let fresh = if dirty { Some(Arc::new(self.build_publication())) } else { None };
+            let mut w = slot.write().unwrap_or_else(|p| p.into_inner());
+            self.sessions.apply_pending();
+            if let Some(f) = fresh {
+                *w = f;
+            }
+            return;
+        }
+        // THE STALENESS CHECK (debug builds, so every test): nothing was marked dirty, so the
+        // published snapshot must equal one built from the live state right now. A mutation that
+        // escaped `Watched` fails here, at the release that made it, naming nothing stale.
+        #[cfg(debug_assertions)]
+        {
+            if std::env::var_os("HESTIA_SKIP_PUBLICATION_CHECK").is_none() {
+                let current = slot.read().unwrap_or_else(|p| p.into_inner()).clone();
+                let fresh = self.build_publication();
+                let (a, b) = (fresh.canonical(), current.canonical());
+                assert!(
+                    a == b,
+                    "STALE POLICY PUBLICATION: a policy input changed without passing through                      `Watched` (or the vault list generation). live={a} published={b}"
+                );
+            }
+        }
+    }
+}
+
+/// One trust change, as a chain row carries it.
+#[derive(Clone, Copy)]
+enum TrustChange {
+    Outcome { success: bool, magnitude: f64 },
+    V3 { dimension: web4_core::v3::ValueDimension, score: f64 },
+}
+
+/// The member LCT a row recorded for its subject at the time (`instance_lct` on outcome and
+/// decision rows, `subject_instance_lct` on adjudications and reversals).
+fn row_instance_lct(r: &ChainEntry) -> Option<String> {
+    r.event_data
+        .get("instance_lct")
+        .or_else(|| r.event_data.get("subject_instance_lct"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// The daemon's shared state behind its one global lock, instrumented (see `state_lock`).
+pub type SharedState = Arc<super::state_lock::StateCell<ServerState>>;
 
 #[cfg(test)]
 mod tests {
@@ -1829,10 +2578,10 @@ mod tests {
         let dev = "role:constellation:interactive-dev";
         // Same plugin, mesh-worker role: two failures.
         state
-            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw))
+            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw), None)
             .unwrap();
         let mw_trust = state
-            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw))
+            .apply_outcome_ctx("claude-code", false, 0.8, &ctx_for(mw), None)
             .unwrap();
         // Same plugin, interactive-dev role: one success.
         let dev_trust = state
@@ -1844,6 +2593,7 @@ mod tests {
                     reason: "outcome:success",
                     ..ctx_for(dev)
                 },
+                None,
             )
             .unwrap();
         // Distinct entities: the two roles carry different entity_ids + scores.
@@ -2072,7 +2822,9 @@ mod tests {
     #[test]
     fn confer_citizenship_records_a_birth_cert_in_the_ledger_only_on_quorum() {
         let (_dir, state) = make_state();
-        let subject = "lct:web4:mb32:bsubjectcitizen";
+        // a real key-derived subject (R6): the readable stand-in had a 14-char body where a derived id has 52
+        let subject_id = web4_core::derive_lct_id(&web4_core::crypto::KeyPair::generate().verifying_key());
+        let subject = subject_id.as_str();
         let w: Vec<web4_core::crypto::KeyPair> = (0..3)
             .map(|_| web4_core::crypto::KeyPair::generate())
             .collect();
@@ -2201,8 +2953,10 @@ mod tests {
         // A real member: a moving outcome emits a delta whose subject_lct is the
         // mapped member LCT, not the raw plugin_id.
         state.apply_outcome("real-plugin", false, 0.7).unwrap();
+        crate::storage::trust::flush_all_for_test();
         let sink = state.reputation_sink();
         let expected = state.member_lct("real-plugin").unwrap();
+        crate::storage::trust::flush_all_for_test();
         let lines: Vec<String> = std::fs::File::open(&sink)
             .map(|f| {
                 std::io::BufReader::new(f)
@@ -2224,6 +2978,7 @@ mod tests {
         // A synthetic member: trust still updates locally, but NO delta is emitted.
         state.mark_synthetic("synthetic-plugin", 3).unwrap();
         state.apply_outcome("synthetic-plugin", false, 0.7).unwrap();
+        crate::storage::trust::flush_all_for_test();
         let after: Vec<String> = std::fs::File::open(&sink)
             .map(|f| {
                 std::io::BufReader::new(f)
@@ -2352,6 +3107,7 @@ mod tests {
             expires_at: None,
             request_id: None,
         recursive: false,
+        modes: crate::server::grant_modes::Modes::ALL,
         }
     }
 
@@ -2486,5 +3242,25 @@ mod tests {
             .find(|e| e.hash == intent_hash)
             .expect("the intent must be on the chain");
         assert_eq!(intent.event_data["plugin_id"].as_str(), Some("codex"));
+    }
+}
+
+#[cfg(test)]
+mod scope_peer_window_tests {
+    use super::scope_decided_by;
+
+    #[test]
+    fn a_peer_routed_request_escalates_to_the_operator_when_the_window_lapses() {
+        // invited peers, inside the window: the peers' queue
+        assert_eq!(scope_decided_by(true, 2, 1_000, 1_000 + 1_799, 1_800), ("peer", false));
+        // exactly at the window and after: escalated to the operator
+        assert_eq!(scope_decided_by(true, 2, 1_000, 1_000 + 1_800, 1_800), ("operator", true));
+        assert_eq!(scope_decided_by(true, 2, 1_000, 1_000 + 29_000, 1_800), ("operator", true));
+    }
+
+    #[test]
+    fn a_request_no_peer_was_invited_to_was_always_the_operators() {
+        assert_eq!(scope_decided_by(true, 0, 1_000, 1_001, 1_800), ("operator", false));
+        assert_eq!(scope_decided_by(false, 3, 1_000, 1_001, 1_800), ("operator", false));
     }
 }

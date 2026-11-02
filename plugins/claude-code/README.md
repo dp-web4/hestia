@@ -49,7 +49,14 @@ HESTIA_PASSPHRASE="$(cat ~/.hestia/.passphrase)" hestia init
 If the daemon isn't running, this plugin fails silently (one polite
 stderr hint, once). It doesn't block your tool calls or fail any work.
 
-## Install (manual, until marketplace listing lands)
+## Install
+
+`deploy/install-members.sh` registers this plugin's three hooks in `~/.claude/settings.json` from
+`hooks/hooks.json` (rendered to the declared install dest, merged by target basename, nothing already
+registered is touched) and then installs the files. Nothing below needs to be typed by hand on a host that
+runs the deploy; the manual steps stay for a host that does not.
+
+## Install (manual, on a host without the deploy)
 
 Clone the hestia repo somewhere, then add to `~/.claude/settings.json`:
 

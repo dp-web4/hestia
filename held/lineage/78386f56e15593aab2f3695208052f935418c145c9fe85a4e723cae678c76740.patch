@@ -1,0 +1,418 @@
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 8fcdc2566613636e073717c597f6fd58d40c1e5dd620c3c66c8ebb93e39e49c2  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: ef76ffbe698360301384d53c0a64bcfa8fb4b6bc0f716e8056c57b8d6e2eb915  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -1571,6 +1571,26 @@
+                       "value_opts": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"}}
+ _CMD_SPECS["script"] = {"code_opts": {"-c", "--command"}}
+ _CMD_SPECS["flock"] = {"code_opts": {"-c", "--command"}, "value_opts": {"-w", "--timeout"}}
++#: PROSE OPTIONS (#1287): values that are messages, not paths, for any command whose spec does not
++#: say otherwise — a reason, a body, a title. A seat's `--reason "$R"` with prose in R (a `*`, quotes)
++#: was made a once-only scope request by the literal rule although nothing in it is a path. The
++#: long spellings are generic; `-m` is a message only for the heads below (elsewhere `-m` is a
++#: mode, a module or a count). An UNQUOTED glob in the word itself is still judged (the shell
++#: expands it first), exactly as for every other string position.
++_PROSE_LONG_OPTS = frozenset(("--reason", "--message", "--body", "--argument", "--title",
++                              "--description", "--comment", "--note", "--notes", "--subject",
++                              "--summary", "--text", "--msg"))
++_PROSE_M_HEADS = frozenset(("hestia", "gh", "glab", "hg", "jj", "svn", "tea"))
++
++
++def _string_opts(head, spec) -> set:
++    """The options whose value is a plain string for `head`: its spec's, plus the prose options
++    the spec does not claim as file, value or code options."""
++    own = spec.get("file_opts", set()) | spec.get("value_opts", set()) | spec.get("code_opts", set())
++    prose = set(_PROSE_LONG_OPTS) | ({"-m"} if head in _PROSE_M_HEADS else set())
++    return set(spec.get("string_opts", set())) | {o for o in prose if o not in own}
++
++
+ #: Commands whose argv is built from STDIN: what they reach is another command's output.
+ _STDIN_ARGV = frozenset(("xargs", "parallel"))
+ #: Commands that resolve their relative arguments against a directory option (`-C D`).
+@@ -1886,6 +1906,26 @@
+ 
+     toks = _shell_words(cmd)
+     state = {}
++    # Names assigned a value holding a glob character anywhere in the command (#1287). In a data
++    # position such a name is still DATA when quoted; UNQUOTED, the shell expands the glob there —
++    # a directory read — so that one use is unenumerated.
++    globby = {m.group(1) for k, w_, _g in toks if k == "word"
++              for m in [re.match(r"([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)", w_, re.S)]
++              if m and any(c in m.group(2) for c in "*?[")}
++
++    def data(word):
++        """A word in a DATA position (a message, pattern or string operand): no path is judged.
++        Only an unquoted use of a glob-valued name is unenumerated (pathname expansion)."""
++        try:
++            spans = _expansion_spans(word)
++        except _Unmodelled as why:
++            found.unenum.append(str(why))
++            return
++        for a, b in spans:
++            ref = word[a:b]
++            name = ref[2:-1] if ref.startswith("${") else ref[1:]
++            if name in globby and not (a > 0 and word[a - 1] == _DQ_REF):
++                found.unenum.append(f"an unquoted ${name} whose value holds a glob")
+     # The literal rule binds only in the OUTER command's own statements: substitution bodies are
+     # appended after them by `_shell_words`, and a body is a subshell.
+     main_len = len(_tokenize(cmd)) if depth == 0 else 0
+@@ -2054,9 +2094,10 @@
+                 code(w)
+                 continue
+             if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
+-                    or opt in spec.get("string_opts", ())) and not uglob:
++                    or opt in _string_opts(head, spec)) and not uglob:
+                 if opt in spec.get("pattern_opts", ()):
+                     state["pattern_given"] = True
++                data(w)
+                 continue
+             if opt == "-c" and _HEREDOC_SHELL.match(head):
+                 code(w)
+@@ -2084,8 +2125,9 @@
+                     chdir(w[2:], uglob)
+                     emit(w[2:], uglob)
+                     continue
++            strs = _string_opts(head, spec)
+             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
+-                     | spec.get("string_opts", set()) | spec.get("file_opts", set())
++                     | strs | spec.get("file_opts", set())
+                      | spec.get("value_opts", set()) | spec.get("code_opts", set()))
+             if eq:
+                 if name in spec.get("code_opts", ()):
+@@ -2095,8 +2137,10 @@
+                     state["pattern_given"] = True
+                 if uglob or not (name in spec.get("delim_opts", ())
+                                  or name in spec.get("pattern_opts", ())
+-                                 or name in spec.get("string_opts", ())):
++                                 or name in strs):
+                     emit(val, uglob)
++                else:
++                    data(val)
+                 continue
+             if (_HEREDOC_SHELL.match(head) or _CODE_ARG_HEADS.match(head)) and not w.startswith("--") \
+                     and re.fullmatch(r"-[A-Za-z]*[ce][A-Za-z]*", w) \
+@@ -2165,9 +2209,11 @@
+         # (command, position) exception can make it a string or a pattern: `tr /x/* y` and
+         # `grep /x/*` read /x (Codex review 17029c). Exceptions apply to glob-free words only.
+         if mode in ("strings", "strings_noglob") and not uglob:
++            data(w)
+             continue
+         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
+                 and not uglob:
++            data(w)
+             continue
+         name, eq, val = w.partition("=")
+         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "8fcdc2566613636e073717c597f6fd58d40c1e5dd620c3c66c8ebb93e39e49c2",
++      "sha256": "ef76ffbe698360301384d53c0a64bcfa8fb4b6bc0f716e8056c57b8d6e2eb915",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "0112e0994efe530c616ea8ec8a2f7b9e877094b7cd8a41a6f144dee46a244a2d"
++  "gt_version": "ee4e08c5c195e036f998f150c04a0cb0881c2448d43c409a8acf1b7700dfa72a"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "0112e0994efe530c616ea8ec8a2f7b9e877094b7cd8a41a6f144dee46a244a2d",
++    "gt_version": "ee4e08c5c195e036f998f150c04a0cb0881c2448d43c409a8acf1b7700dfa72a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8fcdc2566613636e073717c597f6fd58d40c1e5dd620c3c66c8ebb93e39e49c2"
++        "sha256": "ef76ffbe698360301384d53c0a64bcfa8fb4b6bc0f716e8056c57b8d6e2eb915"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3f705c9c6cfe385416802ae70978627a94f38c5d7b55e7a6721313f96ab2f319"
++  "gt_version": "4ad2502cb8589b84ab4f8a9759b5d1988c8700d910040b9ca5cb6c20a512ff02"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "0112e0994efe530c616ea8ec8a2f7b9e877094b7cd8a41a6f144dee46a244a2d",
++    "gt_version": "ee4e08c5c195e036f998f150c04a0cb0881c2448d43c409a8acf1b7700dfa72a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8fcdc2566613636e073717c597f6fd58d40c1e5dd620c3c66c8ebb93e39e49c2"
++        "sha256": "ef76ffbe698360301384d53c0a64bcfa8fb4b6bc0f716e8056c57b8d6e2eb915"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "534e61c8700da2fcdcd98b46aada45f5e3f820d84a2322c7acacdb4fd1f07a48"
++  "gt_version": "8a57189f676b10cbb95ec893f9569a1b60b615a7775af79abf9b39c7ce5d839b"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "0112e0994efe530c616ea8ec8a2f7b9e877094b7cd8a41a6f144dee46a244a2d",
++    "gt_version": "ee4e08c5c195e036f998f150c04a0cb0881c2448d43c409a8acf1b7700dfa72a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8fcdc2566613636e073717c597f6fd58d40c1e5dd620c3c66c8ebb93e39e49c2"
++        "sha256": "ef76ffbe698360301384d53c0a64bcfa8fb4b6bc0f716e8056c57b8d6e2eb915"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "97713e75f66a655e687a78926274eaf7539aa8d9e6bc87a45ea57504ef6c9434"
++  "gt_version": "f6721a67f5d1ad82fc13b625fb9153d6ce33860066980e08a587ca4367eb481e"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "0112e0994efe530c616ea8ec8a2f7b9e877094b7cd8a41a6f144dee46a244a2d",
++    "gt_version": "ee4e08c5c195e036f998f150c04a0cb0881c2448d43c409a8acf1b7700dfa72a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8fcdc2566613636e073717c597f6fd58d40c1e5dd620c3c66c8ebb93e39e49c2"
++        "sha256": "ef76ffbe698360301384d53c0a64bcfa8fb4b6bc0f716e8056c57b8d6e2eb915"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "4bfd580402f7f071379d3da8132bd0f5bd2b1a24e2652d60907f257c2d37830e"
++  "gt_version": "48843a66967b0765f1d49393b18a25ee69f06dd6555c6b2aaf1c315ad47531c5"
+ }
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1570,6 +1570,26 @@
+                       "value_opts": {"-s", "--shell", "-g", "--group", "-G", "--supp-group"}}
+ _CMD_SPECS["script"] = {"code_opts": {"-c", "--command"}}
+ _CMD_SPECS["flock"] = {"code_opts": {"-c", "--command"}, "value_opts": {"-w", "--timeout"}}
++#: PROSE OPTIONS (#1287): values that are messages, not paths, for any command whose spec does not
++#: say otherwise — a reason, a body, a title. A seat's `--reason "$R"` with prose in R (a `*`, quotes)
++#: was made a once-only scope request by the literal rule although nothing in it is a path. The
++#: long spellings are generic; `-m` is a message only for the heads below (elsewhere `-m` is a
++#: mode, a module or a count). An UNQUOTED glob in the word itself is still judged (the shell
++#: expands it first), exactly as for every other string position.
++_PROSE_LONG_OPTS = frozenset(("--reason", "--message", "--body", "--argument", "--title",
++                              "--description", "--comment", "--note", "--notes", "--subject",
++                              "--summary", "--text", "--msg"))
++_PROSE_M_HEADS = frozenset(("hestia", "gh", "glab", "hg", "jj", "svn", "tea"))
++
++
++def _string_opts(head, spec) -> set:
++    """The options whose value is a plain string for `head`: its spec's, plus the prose options
++    the spec does not claim as file, value or code options."""
++    own = spec.get("file_opts", set()) | spec.get("value_opts", set()) | spec.get("code_opts", set())
++    prose = set(_PROSE_LONG_OPTS) | ({"-m"} if head in _PROSE_M_HEADS else set())
++    return set(spec.get("string_opts", set())) | {o for o in prose if o not in own}
++
++
+ #: Commands whose argv is built from STDIN: what they reach is another command's output.
+ _STDIN_ARGV = frozenset(("xargs", "parallel"))
+ #: Commands that resolve their relative arguments against a directory option (`-C D`).
+@@ -1885,6 +1905,26 @@
+ 
+     toks = _shell_words(cmd)
+     state = {}
++    # Names assigned a value holding a glob character anywhere in the command (#1287). In a data
++    # position such a name is still DATA when quoted; UNQUOTED, the shell expands the glob there —
++    # a directory read — so that one use is unenumerated.
++    globby = {m.group(1) for k, w_, _g in toks if k == "word"
++              for m in [re.match(r"([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)", w_, re.S)]
++              if m and any(c in m.group(2) for c in "*?[")}
++
++    def data(word):
++        """A word in a DATA position (a message, pattern or string operand): no path is judged.
++        Only an unquoted use of a glob-valued name is unenumerated (pathname expansion)."""
++        try:
++            spans = _expansion_spans(word)
++        except _Unmodelled as why:
++            found.unenum.append(str(why))
++            return
++        for a, b in spans:
++            ref = word[a:b]
++            name = ref[2:-1] if ref.startswith("${") else ref[1:]
++            if name in globby and not (a > 0 and word[a - 1] == _DQ_REF):
++                found.unenum.append(f"an unquoted ${name} whose value holds a glob")
+     # The literal rule binds only in the OUTER command's own statements: substitution bodies are
+     # appended after them by `_shell_words`, and a body is a subshell.
+     main_len = len(_tokenize(cmd)) if depth == 0 else 0
+@@ -2053,9 +2093,10 @@
+                 code(w)
+                 continue
+             if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
+-                    or opt in spec.get("string_opts", ())) and not uglob:
++                    or opt in _string_opts(head, spec)) and not uglob:
+                 if opt in spec.get("pattern_opts", ()):
+                     state["pattern_given"] = True
++                data(w)
+                 continue
+             if opt == "-c" and _HEREDOC_SHELL.match(head):
+                 code(w)
+@@ -2083,8 +2124,9 @@
+                     chdir(w[2:], uglob)
+                     emit(w[2:], uglob)
+                     continue
++            strs = _string_opts(head, spec)
+             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
+-                     | spec.get("string_opts", set()) | spec.get("file_opts", set())
++                     | strs | spec.get("file_opts", set())
+                      | spec.get("value_opts", set()) | spec.get("code_opts", set()))
+             if eq:
+                 if name in spec.get("code_opts", ()):
+@@ -2094,8 +2136,10 @@
+                     state["pattern_given"] = True
+                 if uglob or not (name in spec.get("delim_opts", ())
+                                  or name in spec.get("pattern_opts", ())
+-                                 or name in spec.get("string_opts", ())):
++                                 or name in strs):
+                     emit(val, uglob)
++                else:
++                    data(val)
+                 continue
+             if (_HEREDOC_SHELL.match(head) or _CODE_ARG_HEADS.match(head)) and not w.startswith("--") \
+                     and re.fullmatch(r"-[A-Za-z]*[ce][A-Za-z]*", w) \
+@@ -2164,9 +2208,11 @@
+         # (command, position) exception can make it a string or a pattern: `tr /x/* y` and
+         # `grep /x/*` read /x (Codex review 17029c). Exceptions apply to glob-free words only.
+         if mode in ("strings", "strings_noglob") and not uglob:
++            data(w)
+             continue
+         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
+                 and not uglob:
++            data(w)
+             continue
+         name, eq, val = w.partition("=")
+         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -1104,6 +1104,37 @@
+         stub.close()
+ 
+ 
++def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
++    """#1287 part 1 (2026-10-13): a seat put prose with `*` and quotes in R and passed "$R" as
++    `--reason`; the literal rule made the act a once-only scope request although nothing in it is a
++    path. A value that cannot bind is unenumerated only where its use is judged as a PATH. Every
++    seat: the exact shape is allowed (and asks society law); a glob-valued name in a path position
++    is still a request; an UNQUOTED glob-valued name in the message position is still a request."""
++    prose = ("Refused: no seat asked for this. The act is the deploy preflight's advisory hold probe "
++             "(deploy/from-main/hestia-deploy.sh ~L605, plugins/*/expects.json 'evaluate deploy hold'), "
++             "fired for ever …")
++    exact = f'cd {REPO}; R="{prose}"; hestia gate deny 0123abcd --as claude-code --reason "$R"'
++    unenum = g.core.UNENUMERATED_TARGET
++    for seat in SEATS:
++        stub = Stub(Policy())
++        try:
++            with _Env(m, stub.url, home):
++                d, _ = _decide(g, seat, "Bash", {"command": exact}, home)
++                check(f"1287-{seat}-prose-reason-allowed", d.decision == "allow", d)
++                check(f"1287-{seat}-prose-reason-asks-society", len(stub.named("hestia_begin_action")) == 1)
++                d, _ = _decide(g, seat, "Bash", {"command": 'F="a*"; cat $F'}, home)
++                check(f"1287-{seat}-glob-var-path-is-a-request", d.decision == "deny"
++                      and d.rule == "mrh.command" and "only ONCE" in d.reason, d)
++                d, _ = _decide(g, seat, "Bash", {"command": 'R="/tmp/review-probe/*"; hestia gate deny X --reason $R'}, home)
++                check(f"1287-{seat}-unquoted-glob-reason-is-a-request", d.decision == "deny"
++                      and d.rule == "mrh.command", d)
++            claims = [a for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
++            check(f"1287-{seat}-requests-are-unenumerated",
++                  claims and all(str(c.get("path", "")).startswith(unenum) for c in claims), claims)
++        finally:
++            stub.close()
++
++
+ def test_degraded_posture(m, g, wc, home):
+     dead = closed_port_url()
+     with _Env(m, dead, home):
+@@ -1529,6 +1560,7 @@
+     test_daemon_verdicts_and_the_warn_rollout,
+     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
+     test_an_unenumerated_reach_is_a_once_only_request,
++    test_prose_in_a_message_position_is_data_on_every_seat,
+     test_degraded_posture,
+     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
+     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -382,6 +382,35 @@
+             ("lit-after-a-python-c-literal",
+              "python3 -c \"print(open('/tmp/review-probe').read())\"; S=/tmp/review-probe; cat $S/x"),
+         ]
++        # #1287 part 1 (2026-10-13): a value that cannot bind is unenumerated only where its use
++        # is judged as a PATH. Message / pattern / string positions (and the prose options) are
++        # data; an UNQUOTED glob-valued name there is still a pathname expansion.
++        deny += [
++            ('1287-prose-flag-does-not-hide-a-file', 'R="x * y"; hestia gate deny X --reason "$R" /etc/hostname'),
++            ('1287-prose-flag-does-not-hide-a-glob', 'hestia gate deny X --reason /etc/*'),
++        ]
++        request += [
++            ('1287-path-glob-var', 'F="a*"; cat $F'),
++            ('1287-path-glob-var-quoted', 'F="a*"; cat "$F"'),
++            ('1287-unquoted-glob-var-in-echo', 'R="/tmp/review-probe/*"; echo $R'),
++            ('1287-unquoted-glob-var-in-reason', 'R="/tmp/review-probe/*"; hestia gate deny X --reason $R'),
++            ('1287-prose-var-also-used-as-a-path', 'R="a* b"; hestia gate deny X --reason "$R" $R'),
++            ('1287-dash-m-is-not-prose-for-python', 'R="a* b"; python3 -m "$R"'),
++            ('1287-dash-m-is-not-prose-for-mkdir', 'R="a* b"; mkdir -m "$R" x'),
++        ]
++        allow += [
++            ('1287-prose-1287-exact-shape', 'cd ~/ws/granted; R="Refused: no seat asked for this. The act is the deploy preflight\'s advisory hold probe (deploy/from-main/hestia-deploy.sh ~L605, plugins/*/expects.json \'evaluate deploy hold\'), fired for ever …"; hestia gate deny 0123abcd --as claude-code --reason "$R"'),
++            ('1287-prose-reason-eq', 'R="see plugins/*/x \'q\'"; hestia gate deny 1 --as claude-code --reason="$R"'),
++            ('1287-prose-gh-body', 'R="see plugins/*/expects.json \'q\'"; gh pr comment 1 --body "$R"'),
++            ('1287-prose-git-m', 'R="fix: plugins/*/x \'b\'"; git commit -m "$R"'),
++            ('1287-prose-hestia-m', 'R="x * y"; hestia mesh send peer -m "$R"'),
++            ('1287-prose-argument', 'R="plugins/*/x \'y\'"; hestia gate appeal X --argument "$R"'),
++            ('1287-prose-title-description', 'T="a * b"; D="c/* \'d\'"; gh pr create --title "$T" --description "$D"'),
++            ('1287-prose-echo-quoted', 'R="a/* b"; echo "$R"'),
++            ('1287-prose-printf-quoted', 'R="a/* b"; printf \'%s\\n\' "$R"'),
++            ('1287-prose-grep-pattern-quoted', 'R="a.*b"; grep -n "$R" a.txt'),
++            ('1287-prose-unknown-var-quoted-in-reason', 'hestia gate deny X --as claude-code --reason "$SCOPE_BATTERY_UNSET_VAR"'),
++        ]
+         # Codex's quote runner (docs/reviews/scope-1232-quote-regressions.py, notice 20554,
+         # 33bddc1c) and the marker / IFS rows that generalise it (2026-10-12).
+         deny += [

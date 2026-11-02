@@ -83,6 +83,34 @@
       "notes": "Custody differs by design today: the app keeps the key in a passphrase vault in Rust; the dashboard keeps the seed in browser storage. Revisit."
     },
     {
+      "id": "version-handshake",
+      "title": "Daemon version handshake (lockstep version, build id, operator API compat)",
+      "place": "me",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/version"
+      ],
+      "rules": [
+        "unknown-not-fine"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "planned",
+          "why": "the dashboard is served by the daemon it talks to, so it cannot be paired with a different release; showing the version in its header is wanted, not needed for compatibility"
+        },
+        "app": {
+          "status": "required"
+        }
+      },
+      "obligations": [
+        "the app reads GET /api/version before any other daemon route and compares api_compat with hestia_wire::OPERATOR_API_COMPAT: a different api_compat is shown as an incompatible-daemon state naming both versions, not as route errors",
+        "a daemon that answers but has no /api/version (404/405) is shown as an incompatible daemon (no version endpoint), never as offline and never as compatible",
+        "an equal api_compat with a different version is compatible and is shown as version skew"
+      ],
+      "notes": "Unauthenticated by design, like the challenge: the app must know whether it speaks the daemon's API before it signs in. web4#904 phase 1."
+    },
+    {
       "id": "snapshot",
       "title": "Live snapshot: members, trust, chain tail, pending decisions",
       "place": "activity",
@@ -202,7 +230,14 @@
         "app": {
           "status": "required"
         }
-      }
+      },
+      "obligations": [
+        "each pending escalation shows the daemon-MEASURED write effect of its retained act (evidence::write_effect), never the member's description of it; an act the daemon cannot measure shows no effect rather than a guessed one",
+        "a copy-shaped act (cp <source> <governed>) shows the source's line count and the sha256 the approval binds, and a +/- line diff against the copy currently ENFORCING, labelled as that (not as the act's destination); a no-op is said, not left to two zeros",
+        "a patch-application act (git apply|am <patch>, patch -i|<) shows the patch's sha256 the approval binds, the number of files, each target path with +/- counts and created/deleted, and the patch text; a patch the daemon cannot read is shown as unreadable, and a patch above the measurement cap says the approval does not bind its bytes",
+        "any rendered diff or patch text that was cut says so (\"TRUNCATED\"), so the reader never concludes they have seen the whole change",
+        "a patch's per-file summary represents mode changes, renames, copies and binary files (a file section with no ---/+++ pair is still a file), and when the summary does not represent the whole patch (summary_complete=false) the surface says INCOMPLETE and names what is missing; a patch or copy source above the measurement cap is NOT read, and the surface says so instead of showing counts"
+      ]
     },
     {
       "id": "decide-scope-request",
@@ -216,6 +251,8 @@
       "rules": [
         "reason-to-permit",
         "already-decided-409",
+        "bound-to-rendered-evidence",
+        "member-id",
         "signed-in-only"
       ],
       "surfaces": {
@@ -226,7 +263,18 @@
           "status": "required"
         }
       },
-      "notes": "The app sends standing/recursive at decide time; the dashboard makes those separate witnessed acts. Reconcile."
+      "obligations": [
+        "a request the GATE opened on a refused act (origin gate_deny) is shown as that: the rule (mrh.path / mrh.command), the tool, and the refused act verbatim, labelled as the act the operator is ruling on and never as the member's reason; how many times the member re-issued it is shown beside it",
+        "the operator chooses the DURATION at decide time, from exactly these: this act once (once:true; offered only when once_available, i.e. the gate recorded an act to bind), for the session (memory-only, expires), or standing (vault, survives restart); refusing is a separate control that needs no reason",
+        "the operator chooses the BREADTH at decide time for session and standing grants: the exact asked path (the default), or a directory above it, which is always recursive (grant_path + recursive:true); every offered directory is an ancestor of the asked path at a separator and never the root, and the control shows the path the grant will reach before it is sent",
+        "a request whose refused reach was a glob over a directory (subtree:true) says that only a recursive grant covers it, and the surface does not offer an exact session or standing grant for it",
+        "a one-time approval says that it is spent by the identical act, once, inside the claim window, and is never served as standing policy",
+        "an UNENUMERATED act (once_only:true; its path is the act-keyed hestia:unpriceable:… sentinel, dp 2026-10-10: the gate could not enumerate what the act reaches because an expansion decides it) offers ONLY this act once (and refusing): no session or standing duration and no breadth control is offered, and the sentinel is labelled as 'no path', never shown as a filesystem path",
+        "ONE SOURCE FOR THE OFFER AND THE CHECK (#1287 part 2): every pending request carries allowed_decisions (a subset of once, session, standing, refuse) and enumerable, computed by the same function (state::scope_allowed_decisions) the decide endpoint reads to refuse; the surface renders exactly those rulings, so no control it offers is refused after the click. A request with no session and no standing ruling renders exactly 'Approve once' (once:true) and 'Refuse', with one line saying why: 'what this act reaches is decided by an expansion, so only this exact act can be approved'. The dashboard's governance ledger renders its scope rows the same way",
+        "PEER ROUTING (dp, 2026-10-05: \"scope escalations should go to peers not to me\"): a gate-opened request from a proven asker is decided by a NOT-SAME peer (hestia_scope_peer_decide / hestia scope decide --as). The surface shows the invited peers and labels the queue as awaiting a peer, read-only; the decide controls are labelled as the OPERATOR OVERRIDE, never as the default route, and the queue is not announced as awaiting the operator. A request no peer can clear (asserted asker, or no admissible peer) is labelled as the operator's",
+        "a ruling made by a peer is shown read-only with the deciding peer (granted_by peer:<id>) and its NOT-SAME basis (independence, asker basis); the operator can revoke it (scope-revoke) like any grant"
+      ],
+      "notes": "Reconciled 2026-10-05 (scope refusal -> escalation with a standing option): both surfaces send duration (once / session / standing) and breadth (grant_path, recursive) in the one decide call. Peer routing 2026-10-05: the operator's decide is the override; peers decide through the MCP door, not this route."
     },
     {
       "id": "scope-grant",
@@ -253,13 +301,13 @@
     },
     {
       "id": "scope-standing",
-      "title": "Make a grant standing / recursive / reassign it",
+      "title": "Make a grant standing / change bound reach / reassign it",
       "place": "activity",
       "kind": "write",
       "risk": "high",
       "routes": [
         "POST /api/scope/standing/promote",
-        "POST /api/scope/standing/recursive",
+        "POST /api/scope/standing/recursive-if-unchanged",
         "POST /api/scope/standing/reassign"
       ],
       "rules": [
@@ -275,6 +323,49 @@
           "status": "required"
         }
       }
+    },
+    {
+      "id": "scope-standing-edit",
+      "title": "Edit a standing grant's path, reach and modes",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": ["POST /api/scope/standing/edit"],
+      "rules": ["reason-to-permit", "signed-in-only", "bound-to-rendered-evidence"],
+      "surfaces": {
+        "dashboard": {"status": "required"},
+        "app": {"status": "planned", "why": "Grant editing is not yet implemented in the app."}
+      }
+    },
+    {
+      "id": "society-floor",
+      "title": "Edit the society floor: what every member may do where none of its own grants reaches",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/scope/floor",
+        "POST /api/scope/floor/remove"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "after the dashboard's floor Edit row (hestia #1347)"
+        }
+      },
+      "obligations": [
+        "each floor entry is one row with the same r/w/e/d boxes and recursive (/**) control a grant has, DISABLED outside Edit; Edit stages the change and nothing is sent until Save, Cancel discards it (dp, 2026-10-23: 'we want granularity and edit'; Nova on #1347)",
+        "Save says in words what changes and whether it WIDENS (any added mode, or exact made recursive), asks for a reason every time because the change binds every member, and sends expected_generation so a store that moved since the edit was staged is refused (409) with nothing written",
+        "the surface says that a member's own grant decides wherever it reaches and the floor applies only where none does (PRD_ALLOWLISTS AC-1 as amended 2026-10-23: 'floor should not override the actual grants')",
+        "removing an entry narrows every member at once and asks for a reason"
+      ]
     },
     {
       "id": "scope-revoke",
@@ -722,6 +813,58 @@
       }
     },
     {
+      "id": "deployment-check",
+      "title": "Check whether a hestia update is available (installs nothing)",
+      "place": "me",
+      "kind": "write",
+      "risk": "low",
+      "routes": [
+        "POST /api/operator/deployment/check"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "obligations": [
+        "starts only the check unit (hestia-deploy --check): it syncs the deploy checkout and records a verdict; it never builds, installs or restarts",
+        "shown as \"check for updates\" only where the check unit is installed (deployment.check_capable); the header names when the last check ran"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "deployment-auto-update",
+      "title": "Switch scheduled deploys (the hestia-deploy timer) on or off",
+      "place": "me",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/operator/deployment/auto-update"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "obligations": [
+        "shown only where the timer unit is installed and the platform has a toggle (deployment.auto_update is on or off); absent or unavailable hides it",
+        "turning it on asks for confirmation first: the timer is Persistent=true, so a missed fire time can start a deploy at once"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
       "id": "vault",
       "title": "Vault: list names and policy, add, delete",
       "place": "me",
@@ -840,28 +983,80 @@
           "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
         }
       }
+    },
+    {
+      "id": "hub-memberships",
+      "title": "Hub memberships: which hubs this node is in (asked of each hub), apply, withdraw, remove from list",
+      "place": "communities",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "GET /api/hub/memberships",
+        "POST /api/hub/withdraw"
+      ],
+      "rules": [
+        "signed-in-only",
+        "unknown-not-fine",
+        "confirm-irreversible"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      },
+      "notes": "Enrollment is probed per hub (GET /v1/hubs/{hub}/members/{me}/pubkey): only 200/404 set it; unreachable or any other answer is UNKNOWN, rendered amber, never 'not a member'. Withdraw is the member's own exit (web4#804); 'remove from list' only forgets a URL locally. Apply reuses POST /api/hub/join + PUT /api/hub/urls/active (hub-act, hub-urls)."
+    },
+    {
+      "id": "channel-sends",
+      "title": "Channel sends (#1344, shadow): the outbox, and marking a send answered",
+      "place": "activity",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "GET /api/channel/outbox",
+        "POST /api/channel/outbox/:id/answer",
+        "GET /api/channel/binding"
+      ],
+      "rules": [
+        "signed-in-only",
+        "already-decided-409"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "slice 1 of #1344 is shadow and operator-only; the app view follows with the delivery slice"
+        }
+      },
+      "notes": "Marking answered is an attestation (the bound recipient replied), not a permit: it frees the member's unanswered budget and is witnessed once (409 after). Nothing in the outbox has left the machine in this slice."
     }
   ],
   "unsurfaced": [
+    {
+      "route": "POST /api/scope/standing/recursive",
+      "why": "Legacy unbound route kept for compatibility. Operator surfaces use the separate snapshot-bound endpoint; other legacy clients remain unbound."
+    },
     {
       "route": "GET /",
       "why": "serves the dashboard itself"
     },
     {
       "route": "POST /api/agents/:id/ungovern",
-      "why": "removes a harness's hooks with no reason and discards its chain append (let _ = append_chain); must be hardened (required reason, record-or-undo) before ANY surface exposes it"
-    },
-    {
-      "route": "POST /api/scope/floor",
-      "why": "the society floor: the widest escalation there is; CLI/operator-only until a surface is designed for it. A read-only view is wanted"
-    },
-    {
-      "route": "POST /api/scope/floor/remove",
-      "why": "as scope/floor"
+      "why": "hardened for #1131 (a reason is required; the intent is recorded before any hook is touched; a failed terminal record is reported, not hidden). Still unsurfaced by choice: removing a gate is the one act no view offers until the owner decides it should"
     },
     {
       "route": "POST /api/scope/reroot",
       "why": "rewrites the whole scope set; deliberately no UI"
+    },
+    {
+      "route": "POST /api/scope/standing/refusal/lift",
+      "why": "standing refusals (#1417): the operator's lift of a refusal that stands; no view offers it yet. The dashboard's scope pane should show refused_standing rows with a lift button (an additive follow-up to #1418)"
     },
     {
       "route": "GET /api/transport/binding",
@@ -884,6 +1079,10 @@
       "why": "no consumer yet"
     },
     {
+      "route": "GET /api/debug/locks",
+      "why": "diagnostic, not an operator act: the daemon state lock's wait/hold statistics, read by tools/daemon_concurrency_load.py (#1265); read-only and never takes the lock"
+    },
+    {
       "route": "GET /api/scope/requests",
       "why": "both surfaces read requests from the snapshot (GET /api/dashboard) instead"
     },
@@ -898,6 +1097,10 @@
     {
       "route": "GET /.well-known/openid-credential-issuer",
       "why": "wallet-facing metadata"
+    },
+    {
+      "route": "POST /api/channel/binding",
+      "why": "channel bindings (#1344): set with `hestia channel bind` (operator-signed, reason required); the dashboard shows bindings read-only"
     }
   ],
   "known_gaps": []

@@ -36,6 +36,7 @@ const snapshot = (over: Record<string, unknown> = {}) => ({
   members: ["claude-code", "hub-being", "caude-code"],
   retired: ["caude-code"],
   scope_grants: [live, standing],
+  scope_reach_live: [{ plugin_id: live.plugin_id, path: live.path, id: "r1", recursive: false, modes: "rwed", expires_at: 2000000000 }],
   standing_generation: 7,
   ...over,
 });
@@ -197,7 +198,7 @@ describe("Reach", () => {
     it("widening needs a reason; narrowing is sent without one", async () => {
       operatorStatus.mockResolvedValue(signedIn);
       getDashboard.mockResolvedValue(snapshot());
-      setReach.mockResolvedValue({ outcome: "done", result: {} });
+      setReach.mockResolvedValue({ outcome: "done", result: { applied_to: { standing: true, live: null } } });
       render(<Reach />);
       await screen.findByText(/dies at the next restart/);
       fireEvent.click(within("live:hub-being:/w/notes", "Include below…")!);
@@ -206,7 +207,65 @@ describe("Reach", () => {
       expect(setReach).not.toHaveBeenCalled();
       fireEvent.click(within("standing:hub-being:/w/home", "Make exact…")!);
       fireEvent.click(within("standing:hub-being:/w/home", "Make exact")!);
-      await waitFor(() => expect(setReach).toHaveBeenCalledWith(standing, false, null));
+      await waitFor(() => expect(setReach).toHaveBeenCalledWith(standing, false, null,
+        { generation: 7, standing: true, live: null }));
+    });
+
+    it("shows and binds a hidden live twin before changing a standing row", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      getDashboard.mockResolvedValue(snapshot({
+        scope_grants: [standing],
+        scope_reach_live: [{ plugin_id: standing.plugin_id, path: standing.path, id: "hidden-live", recursive: false, modes: "r", expires_at: 2000000000 }],
+      }));
+      setReach.mockResolvedValue({ outcome: "done", result: { applied_to: { standing: true, live: null } } });
+      render(<Reach />);
+      await screen.findByText("standing");
+      fireEvent.click(within("standing:hub-being:/w/home", "Make exact…")!);
+      expect(await screen.findByText(/live: hidden-live \(exact, modes r,/)).toBeTruthy();
+      fireEvent.click(within("standing:hub-being:/w/home", "Make exact")!);
+      await waitFor(() => expect(setReach).toHaveBeenCalledWith(standing, false, null,
+        { generation: 7, standing: true, live: { id: "hidden-live", recursive: false, modes: "r", expires_at: 2000000000 } }));
+      expect(await screen.findByText(/Standing: changed; live: unchanged/)).toBeTruthy();
+    });
+
+    it("refuses reach changes without the complete live snapshot", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      getDashboard.mockResolvedValue(snapshot({ scope_reach_live: undefined }));
+      render(<Reach />);
+      await screen.findByText("standing");
+      fireEvent.click(within("standing:hub-being:/w/home", "Make exact…")!);
+      expect(await screen.findByText(/complete, unambiguous reach snapshot/)).toBeTruthy();
+      expect(setReach).not.toHaveBeenCalled();
+    });
+
+    it("refuses ambiguous multiple live grants for one path", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      getDashboard.mockResolvedValue(snapshot({ scope_reach_live: [
+        { plugin_id: standing.plugin_id, path: standing.path, id: "r1", recursive: true, modes: "rwed", expires_at: 2000000000 },
+        { plugin_id: standing.plugin_id, path: standing.path, id: "r2", recursive: false, modes: "r", expires_at: 2000000000 },
+      ] }));
+      render(<Reach />);
+      await screen.findByText("standing");
+      fireEvent.click(within("standing:hub-being:/w/home", "Make exact…")!);
+      expect(await screen.findByText(/complete, unambiguous reach snapshot/)).toBeTruthy();
+      expect(setReach).not.toHaveBeenCalled();
+    });
+
+    it("sends the snapshot shown when the form opened, even after a refresh", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      getDashboard.mockResolvedValue(snapshot());
+      setReach.mockResolvedValue({ outcome: "moved", current: null });
+      render(<Reach />);
+      await screen.findByText("standing");
+      fireEvent.click(within("standing:hub-being:/w/home", "Make exact…")!);
+      getDashboard.mockResolvedValue(snapshot({ standing_generation: 8,
+        scope_reach_live: [{ plugin_id: standing.plugin_id, path: standing.path, id: "new-live", recursive: true, modes: "rwed", expires_at: 2000000000 }] }));
+      fireEvent.focus(window);
+      await screen.findByText(/standing store generation 8/);
+      fireEvent.click(within("standing:hub-being:/w/home", "Make exact")!);
+      await waitFor(() => expect(setReach).toHaveBeenCalledWith(standing, false, null,
+        { generation: 7, standing: true, live: null }));
+      expect(await screen.findByText(/shown grants changed; reach was not changed/)).toBeTruthy();
     });
 
     it("reassign chooses a recorded, unretired other member, needs a reason, and reports a moved row", async () => {

@@ -8,7 +8,7 @@ import {
   revokeReach,
   setReach,
 } from "../lib/tauri";
-import type { DashboardSnapshot, OperatorStatus, ScopeGrantRow, StandingActOutcome } from "../lib/types";
+import type { DashboardSnapshot, OperatorStatus, ScopeGrantRow, ScopeReachBinding, ScopeReachLive, StandingActOutcome } from "../lib/types";
 
 /**
  * Reach — what each member can touch, and the operator's own grant and revoke (Sprint 4a).
@@ -77,6 +77,10 @@ function GrantRow({
   g,
   signedIn,
   twin,
+  grants,
+  grantsComplete,
+  reachLive,
+  generation,
   members,
   onActed,
 }: {
@@ -84,6 +88,10 @@ function GrantRow({
   signedIn: boolean;
   /** For a live row: the standing grant on the same path, which "make standing" replaces. */
   twin: ScopeGrantRow | null;
+  grants: ScopeGrantRow[];
+  grantsComplete: boolean;
+  reachLive?: ScopeReachLive[] | null;
+  generation?: number;
   /** Recorded, unretired members — reassign destinations are chosen, never typed. */
   members: string[];
   onActed: (msg: string) => void;
@@ -93,9 +101,25 @@ function GrantRow({
   const [to, setTo] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [reachSeen, setReachSeen] = useState<ScopeReachBinding | null>(null);
   const label = `${g.plugin_id} · ${g.path}`;
 
   const openAct = (a: RowAct) => {
+    setReachSeen(null);
+    if (a === "widen") {
+      const standing = grants.filter((row) => row.lifetime === "standing" && row.plugin_id === g.plugin_id && row.path === g.path);
+      const live = reachLive?.filter((row) => row.plugin_id === g.plugin_id && row.path === g.path);
+      if (!grantsComplete || !Number.isSafeInteger(generation) || !live || live.length > 1 || standing.length > 1
+          || standing.some((row) => typeof row.recursive !== "boolean")
+          || live.some((row) => typeof row.id !== "string" || !row.id || typeof row.recursive !== "boolean"
+            || typeof row.modes !== "string" || !Number.isInteger(row.expires_at))) {
+        setErr("A complete, unambiguous reach snapshot is required. Refresh or update the daemon before changing reach.");
+        return;
+      }
+      setReachSeen({ generation: generation!, standing: standing.length ? !!standing[0].recursive : null,
+        live: live.length ? { id: live[0].id, recursive: live[0].recursive,
+          modes: live[0].modes, expires_at: live[0].expires_at } : null });
+    }
     setOpen(a);
     setReason("");
     setTo("");
@@ -139,7 +163,15 @@ function GrantRow({
           setErr("Reaching the whole subtree requires a reason: it widens one path into a tree.");
           return;
         }
-        report(g.recursive ? "now exactly this path" : "now reaches everything below", await setReach(g, !g.recursive, r));
+        if (!reachSeen) throw new Error("The shown reach snapshot is unavailable; refresh before acting.");
+        const out = await setReach(g, !g.recursive, r, reachSeen);
+        if (out.outcome === "done") {
+          const applied = out.result.applied_to as { standing?: boolean; live?: string | null } | undefined;
+          if (!applied || typeof applied.standing !== "boolean" || !("live" in applied))
+            onActed(`${label}: the daemon reported success without a complete affected-channel receipt; refresh and verify.`);
+          else onActed(`${label}: reach changed. Standing: ${applied.standing ? "changed" : "unchanged"}; live: ${applied.live ? `changed (${applied.live})` : "unchanged"}.`);
+        } else if (out.outcome === "moved") onActed(`${label}: the shown grants changed; reach was not changed. Refresh and review both lifetimes.`);
+        else onActed(`${label}: ${out.detail}`);
       } else if (open === "reassign") {
         if (!to) {
           setErr("Choose the member to move it to.");
@@ -184,7 +216,7 @@ function GrantRow({
           <div className="muted">until {new Date(g.expires_at * 1000).toLocaleString()}</div>
         ) : null}
       </td>
-      <td>{g.recursive ? "this path and everything below" : "exactly this path"}</td>
+      <td>{g.recursive ? "this path and everything below" : "exactly this path"}<div className="muted">modes: {g.modes ?? "unknown"}</div></td>
       <td>
         {g.reason || <span className="muted">— none recorded —</span>}
         <div className="muted">
@@ -207,6 +239,12 @@ function GrantRow({
               <div className="error-banner" data-replaces>
                 This REPLACES the standing grant on this path: {twin.recursive ? "subtree" : "exact"}, reason "
                 {twin.reason ?? ""}". Last edit wins.
+              </div>
+            )}
+            {open === "widen" && reachSeen && (
+              <div className="error-banner" data-reach-effects>
+                This acts on both lifetimes at this path. Standing: {reachSeen.standing === null ? "none" : reachSeen.standing ? "subtree" : "exact"}; live: {reachSeen.live === null ? "none" : `${reachSeen.live.id} (${reachSeen.live.recursive ? "subtree" : "exact"}, modes ${reachSeen.live.modes}, expires ${new Date(reachSeen.live.expires_at * 1000).toLocaleString()})`}.
+                Either may change; the daemon will refuse if the shown snapshot changes.
               </div>
             )}
             {open === "reassign" && (
@@ -454,6 +492,10 @@ export function Reach() {
                   g={g}
                   signedIn={signedIn}
                   twin={g.lifetime === "live" ? replacedBy(grants, g.plugin_id, g.path) : null}
+                  grants={grants}
+                  grantsComplete={Array.isArray(snap?.scope_grants)}
+                  reachLive={snap?.scope_reach_live}
+                  generation={snap?.standing_generation}
                   members={grantable}
                   onActed={acted}
                 />

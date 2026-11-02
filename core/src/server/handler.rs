@@ -81,7 +81,17 @@ impl ServerHandler for HestiaServer {
             .map(Value::Object)
             .unwrap_or(Value::Object(serde_json::Map::new()));
 
-        let dispatch = match name.as_str() {
+        // Every state-lock acquisition under this dispatch is attributed to the tool (#lock
+        // instrumentation): `GET /api/debug/locks` reports wait and hold per `mcp:<tool>`.
+        let lock_label = super::state_lock::intern_label("mcp:", &name);
+        // GROUP COMMIT: the reply waits until every chain entry this call appended is fsynced
+        // (storage::durability) — after the state lock is released, so the fsync no longer
+        // stalls every other member, and never before it, so "recorded" always means durable.
+        // DURABLE READS: tools that REPORT shared state (escalation status, inbox, history,
+        // appeals, evidence, a witness answered with an existing row) do not reply before what
+        // they read is durable. The gate's own hot path does not wait on other requests' rows.
+        let reports_shared_state = reports_shared_state(name.as_str());
+        let scoped = super::state_lock::with_label(lock_label, async { match name.as_str() {
             "hestia_connect" => tool_connect(&self.state, &args).await,
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
@@ -93,13 +103,18 @@ impl ServerHandler for HestiaServer {
             "hestia_my_appeals" => tool_my_appeals(&self.state, &args).await,
             "hestia_request_scope" => tool_request_scope(&self.state, &args).await,
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
+            "hestia_scope_claim" => tool_scope_claim(&self.state, &args).await,
+            "hestia_scope_peer_decide" => tool_scope_peer_decide(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
+            "hestia_escalation_evidence" => tool_escalation_evidence(&self.state, &args).await,
             "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
+            "hestia_gate_escalation_lookup" => tool_gate_escalation_lookup(&self.state, &args).await,
             "hestia_gate_escalation_corroborate" => {
                 tool_gate_escalation_corroborate(&self.state, &args).await
             }
             "hestia_gate_pending_escalations" => tool_gate_pending_escalations(&self.state, &args).await,
+            "hestia_gate_escalation_claimable" => tool_gate_escalation_claimable(&self.state, &args).await,
             "hestia_gate_arbitrate_escalation" => tool_gate_arbitrate_escalation(&self.state, &args).await,
             "hestia_scope_arbitrate" => tool_scope_arbitrate(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
@@ -114,6 +129,8 @@ impl ServerHandler for HestiaServer {
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
             "hestia_egress_pending" => tool_egress_pending(&self.state, &args).await,
             "hestia_transport_binding" => tool_transport_binding(&self.state, &args).await,
+            "hestia_channel_send" => tool_channel_send(&self.state, &args).await,
+            "hestia_channel_outbox" => tool_channel_outbox(&self.state, &args).await,
             "hestia_member_unanswered" => tool_member_unanswered(&self.state, &args).await,
             "hestia_inbox" => tool_inbox(&self.state, &args).await,
             "hestia_pair_inbox" => tool_pair_inbox(&self.state, &args).await,
@@ -121,6 +138,21 @@ impl ServerHandler for HestiaServer {
             _ => Ok(hestia_error_envelope(
                 "hestia.unknown_tool",
                 &format!("Unknown tool: {}", name),
+                Some(json!({"tool": name})),
+            )),
+        } });
+        let (dispatch, durable) = if reports_shared_state {
+            crate::storage::durability::durable_scope_observing(scoped).await
+        } else {
+            crate::storage::durability::durable_scope(scoped).await
+        };
+        let dispatch = match durable {
+            Ok(()) => dispatch,
+            // Durability lost (an fsync failed): whatever this call appended may or may not
+            // survive, so it must not be reported as recorded. The daemon is restarting.
+            Err(e) => Ok(hestia_error_envelope(
+                "hestia.not_durable",
+                &format!("{e:#}"),
                 Some(json!({"tool": name})),
             )),
         };
@@ -219,7 +251,22 @@ impl ServerHandler for HestiaServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         let uri = request.uri.clone();
-        let body = match read_resource_body(&self.state, &uri).await {
+        // Label by scheme + first segment (`hestia://adjudication`), never the whole uri: the
+        // tail is caller-chosen, and the interner is bounded but labels should stay meaningful.
+        let lock_label = super::state_lock::intern_label(
+            "resource:",
+            &uri.splitn(4, '/').take(3).collect::<Vec<_>>().join("/"),
+        );
+        // DURABLE READS: a resource answer (a ruling, an appeal, an escalation) must not be served
+        // before the chain rows it reflects are durable.
+        let (body, durable) = crate::storage::durability::durable_scope_observing(
+            super::state_lock::with_label(lock_label, read_resource_body(&self.state, &uri)),
+        )
+        .await;
+        if let Err(e) = durable {
+            return Err(ErrorData::internal_error(format!("hestia.not_durable: {e:#}"), None));
+        }
+        let body = match body {
             Ok(b) => b,
             Err(msg) => {
                 return Err(ErrorData::invalid_params(msg, None));
@@ -241,6 +288,39 @@ impl ServerHandler for HestiaServer {
 // =========================================================================
 // Tool surface metadata
 // =========================================================================
+
+/// DURABLE READS (#1268): the tools whose reply REPORTS shared state — rows other requests
+/// committed — and so waits until what it read is durable (`durable_scope_observing`). Every
+/// other tool waits only for its own appends (group commit). A fn, not an inline list, so the
+/// wiring is testable without an MCP request context.
+pub(crate) fn reports_shared_state(name: &str) -> bool {
+    matches!(
+        name,
+        "hestia_gate_escalation_poll"
+            | "hestia_channel_outbox"
+            | "hestia_gate_escalation_lookup"
+            | "hestia_gate_escalation_claimable"
+            | "hestia_gate_pending_escalations"
+            | "hestia_escalation_evidence"
+            | "hestia_gate_escalation_claim"
+            | "hestia_member_inbox"
+            | "hestia_member_unanswered"
+            | "hestia_inbox"
+            | "hestia_pair_inbox"
+            | "hestia_egress_pending"
+            | "hestia_query_history"
+            | "hestia_open_appeals"
+            | "hestia_my_appeals"
+            | "hestia_witness_decision"
+            // #1232 on #1268's rules: a scope claim answers `approved` / `in_force` /
+            // `pending` / `refused` / a reservation's state from rows OTHER requests
+            // committed (a peer's or the operator's ruling, the request itself), and the
+            // gate lets an act run on `approved`. So the reply waits for those rows to be
+            // durable. A peer decide may report a request it did not write the same way.
+            | "hestia_scope_claim"
+            | "hestia_scope_peer_decide"
+    )
+}
 
 fn hestia_tools() -> Vec<Tool> {
     fn schema_of(schema: Value) -> Arc<serde_json::Map<String, Value>> {
@@ -329,9 +409,20 @@ fn hestia_tools() -> Vec<Tool> {
             "What you may reach beyond your standing MRH right now, and every scope request you have filed with its ruling. Read-only and deliberately unwitnessed — reading your own permissions is not an act",
         ),
         t(
+            "hestia_scope_peer_decide",
+            "Rule ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05: scope escalations go to peers, the operator is the override). Pass your own live session_id, the request_id, decision = once | session | standing | refuse, a reason (the asker reads it), and for session/standing optionally grant_path (the asked path or a directory above it, never the root) with recursive=true, and modes (a string of r read, w write, e execute, d delete; default all four, #1345). Refused by name when: you are the asker (in either direction — the asker can never decide its own request); the asker was never proven against a session (NOT-SAME cannot peer-clear an asserted name, eligibility clause 0); you are not a recognised reasoner; the request was filed by the member rather than opened by the gate. The record names you (granted_by peer:<you>), the channel (peer_not_same) and your NOT-SAME basis",
+        ),
+        t(
+            "hestia_scope_claim",
+            "The GATE's question after it refuses you a path (mrh.path / mrh.command) — your gate calls this, you normally do not. It ASKS and READS; it never decides: a grant already in force answers in_force; a one-time approval the operator made for exactly this act (same act string) answers approved and is spent (single use, claim window); a request still pending for this path answers pending with the SAME id (a re-issue never mints a second ask); a refusal inside its window answers refused; otherwise a scope request is opened on the operator's queue, carrying the refused act, and the operator rules it once, for the session, or standing, at the breadth they choose. Watch it with hestia_scope_status and re-issue the identical act afterwards. Not the appeal channel: hestia_appeal disputes whether the deny was right",
+        ),
+        t(
             "hestia_gate_escalation_open",
             "Ask a HUMAN to approve a write to the governance surface (gate, witness, law_inject, the registration). Stage 2 of dp's 2026-07-29 ruling: the gate refuses these writes, and this is the channel that un-refuses a legitimate one. Returns an escalation_id and a deadline; NO DECISION WITHIN THE WINDOW IS A DENY, not a retry. Witnessed on open. Assurance A1: the operator shares this UID, so approval is tamper-EVIDENT, not tamper-proof. PASS answers_deny = the chain hash of the deny you are escalating (hestia_witness_decision returns it as witnessEntryHash): without it the escalation is witnessed but UNLINKED, and unlinked escalations cannot be credited as conduct — escalating instead of routing around is the top of the Temperament scale (1.0 on approval), and the link is what makes it readable. It is never inferred from timing. PASS act = the exact write you intend to perform, e.g. 'Edit -> plugins/<seat>/hooks/<file>'. REQUIRED: the approval is bound to this string (#539), and you must re-issue the SAME string to claim it. `reason` is your rationale and is NOT the act — an approval bound to a rationale can never be claimed, so an open without `act` is refused rather than granted-and-unspendable. ONE ACT, ONE RULING (#668): if this exact act is already \
-             pending from you, you get THAT escalation_id back with `coalesced: true` and nothing new is minted",
+             pending from you, you get THAT escalation_id back with `coalesced: true` and nothing new is minted. \
+             OPTIONAL resolved_targets = the paths the write reaches (#810; a single-string \
+             resolved_target is also accepted): the bar is priced over the marker, the act and \
+             every target, highest wins, so naming them can raise the bar and never lower it",
         ),
         t(
             "hestia_gate_pending_escalations",
@@ -381,6 +472,10 @@ fn hestia_tools() -> Vec<Tool> {
             }),
         ),
         t(
+            "hestia_gate_escalation_claimable",
+            "What approvals YOU can spend RIGHT NOW, newest decision first. REQUIRES a proven session_id from hestia_connect: this reports your OWN permissions, so a caller-supplied plugin_id is refused rather than trusted (it would let one member enumerate another's grants). Ask this after any deny, and again whenever you suspect a decision landed: an approval dies APPROVAL_CLAIM_WINDOW_SECS (600) after you first OBSERVE the ruling (an attributed hestia_gate_escalation_poll, or this call), or after the RULING if you never observed it, and never later than the record's expires_at + 600; a live seat is never woken, so the notice announcing your grant waits for a wake that never comes. ASKING IS OBSERVING: this call first observes the approved, unspent, never-observed grants that THIS session opened (a sibling session on the same seat observes nothing), so a grant whose ruling-anchored window already shut can reappear here with a fresh window, and observed_now names it. Each entry carries act_digest — the exact act the approval is bound to (#539), which you must re-issue verbatim — plus claim_window_secs_remaining (the CLAIM clock rather than the record clock), the absolute pre_migration_horizon and the pre_migration_horizon_basis it was anchored on. Not read-only (it may start your windows, never another session's), and it lists with the same predicate hestia_gate_escalation_claim spends against, so it can never advertise a claim that would fail. An empty list is a real answer: you hold nothing spendable",
+        ),
+        t(
             "hestia_gate_arbitrate_escalation",
             "Rule on ANOTHER member's governance-write escalation. NOT-SAME enforced server-side using the same independence rules as the appeal arbiter — you can never grant your own gate write, and an escalation whose asker was never proven against a session (asker_basis: asserted) cannot be peer-cleared at all; the operator decides those. Approving requires a stated reason; refusing does not. Records role@agent and the independence tier. At A1 a peer shares the operator's UID, so this is recorded SECOND-PARTY REVIEW, not an enforced boundary",
         ),
@@ -424,15 +519,50 @@ fn hestia_tools() -> Vec<Tool> {
             "hestia_gate_escalation_claim",
             "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
              already pending from you, the answer carries THAT escalation_id with `coalesced: true` \
-             — no second petition is minted and no peer is woken again; wait on the id you are given",
+             — no second petition is minted and no peer is woken again; wait on the id you are given. \
+             OPTIONAL resolved_targets = EVERY write-position path the gate's closure resolved \
+             (#810; an array; a single-string resolved_target is also accepted; an \
+             'hestia:unpriceable:<why>' entry prices the highest bar): the bar is priced over \
+             the marker, the act and every target, highest wins, so they can raise the bar and \
+             never lower it; omitted, pricing is unchanged. An approval granted under a LOWER \
+             bar than this act now prices is not spent for it",
+        ),
+        t_args(
+            "hestia_gate_escalation_lookup",
+            "What did the daemon do for this request? (#1166) A gate hook sends a `request_key` with every claim; when the hook's deadline passes, the outcome is UNKNOWN -- the daemon may still have opened, coalesced or claimed. This answers from the key: the escalation id, what was done, when, and the escalation's current status. READ-ONLY: it never observes an escalation and never starts or moves a claim window (unlike hestia_gate_escalation_poll, which is an observation, #667/#732). An unknown key is `found: false`, which means only that this daemon holds no record for it.",
+            json!({
+                "type": "object",
+                "required": ["request_key"],
+                "properties": {
+                    "request_key": {"type": "string", "description": "The 64-hex sha256 request key the refusal printed."}
+                }
+            }),
         ),
         t(
             "hestia_gate_escalation_poll",
             "Read the verdict on an escalation you opened. Read-only and deliberately NOT witnessed — a wait is not an act, and witnessing every poll would bury the opened/decided entries under one member's loop. Only status `approved` permits the write; `pending`, `denied`, `expired` and an UNKNOWN id all refuse, the last two identically on purpose",
         ),
+        t_args(
+            "hestia_escalation_evidence",
+            "Everything known about ONE pending governance escalation, in one read: what the write would DO (the incoming bytes, their hash, and a diff against the copy now enforcing), the asker's own stated reason and whether its identity was PROVEN or merely asserted, the bar in force when it was opened and the factors filed so far, every prior escalation on the same marker with how each was decided, and the rules this member has been refused under. Read-only and NOT witnessed — reading the case is not acting on it. The point is that a human and an automated reviewer read the SAME object: a reviewer shown less than the operator is a filter wearing a reviewer's clothes (PRD_ADJUDICATOR_LADDER §3.3). It does NOT carry a law_hash: call `hestia_operating_law` yourself and pin the hash IT returns, because that composition is per-caller and a hash minted for someone else proves nothing about what YOU read. An unknown id answers `found: false` rather than an empty bundle — 'no such escalation' and 'an escalation about which nothing is known' are different facts",
+            json!({
+                "type": "object",
+                // `true`, truthfully: this handler ignores unknown keys rather than refusing
+                // them by name, so a strict schema here would advertise a refusal the runtime
+                // does not perform — the inverse of the #962 defect, and just as false.
+                "additionalProperties": true,
+                "required": ["escalation_id"],
+                "properties": {
+                    "escalation_id": {
+                        "type": "string",
+                        "description": "The escalation to read, as `hestia_gate_escalation_open` or an invitation notice gave it to you",
+                    },
+                },
+            }),
+        ),
         t(
             "hestia_witness_decision",
-            "Witness an externally-adjudicated plugin-gate deny/warn (chain + gate-risk trust)",
+            "Witness an externally-adjudicated plugin-gate allow/warn/deny (chain + gate-risk trust; allow charges nothing)",
         ),
         t(
             "hestia_query_policy",
@@ -512,10 +642,46 @@ fn hestia_tools() -> Vec<Tool> {
                         "type": "integer",
                         "description": "Id of the notice this one answers. Expected on reply/ack/review_done — without it your response does not clear the sender's `unanswered` row. You may only bind to mail addressed to you."
                     },
+                    "operation_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Optional stable identity for ONE send operation. Retry the same operation_id after an uncertain response to recover the first witnessed/queued result. Reusing it with different recipient/kind/pointer/reply binding is refused. Identical notices with different operation ids remain distinct."
+                    },
                     "session_id": {
                         "type": "string",
                         "description": "Your own live session_id from hestia_connect. Attribution is never inherited: an unattributable sender cannot notify another member."
                     }
+                }
+            }),
+        ),
+        t_args(
+            "hestia_channel_send",
+            "SHADOW (#1344): ask to send a message to a channel the operator bound for you (e.g. \
+             'dp'). Nothing leaves this machine yet: the send is judged, witnessed and kept in your \
+             outbox, and the reply says what would have happened. The recipient is the operator's \
+             binding, never yours to choose. A message naming a credential or secret path is \
+             refused. At most 3 unanswered messages per channel per clock hour; the reply names \
+             them and when the count resets.",
+            json!({
+                "type": "object",
+                "required": ["channel_id", "content"],
+                "properties": {
+                    "channel_id": {"type": "string", "description": "REQUIRED. The bound channel's name, e.g. dp. hestia_channel_outbox lists yours."},
+                    "content": {"type": "string", "minLength": 1, "maxLength": 8000, "description": "REQUIRED. The message, plain text."},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."}
+                }
+            }),
+        ),
+        t_args(
+            "hestia_channel_outbox",
+            "Your own channel sends (#1344), newest first, with whether each was answered, and the \
+             channels bound for you. You see only your own messages.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."}
                 }
             }),
         ),
@@ -679,6 +845,34 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // THE REUSE ARM, LOCK-FREE (stage 2). The gate connects on every tool call, and for a known
+    // (member, host session) a connect is a liveness bump and nothing else (Guard A below). That
+    // answer is served from the session directory published beside the policy snapshot, without
+    // the state lock: before this every gate call's first step queued behind every write in the
+    // society. Same reply, same Guard A/C semantics (the key is (plugin_id, host_session_id),
+    // never the host id alone); a miss falls through to the locked path, which re-checks.
+    if let Some(hsid) = host_session_id.as_deref() {
+        let published = state.published();
+        if let Some(existing) = published.sessions.find_reuse(&plugin_id, hsid) {
+            existing.touch();
+            if let Some(capabilities) = gate_capabilities.as_ref() {
+                published.gate_capabilities.insert(plugin_id.clone(), capabilities.clone());
+            }
+            let honored = !declared_role.is_empty() && declared_role == existing.constellation_role;
+            return Ok(json!({
+                "sessionId": existing.session_id,
+                "softLct": existing.soft_lct,
+                "assignedRole": existing.assigned_role,
+                "constellationRole": existing.constellation_role,
+                "roleDeclarationHonored": honored,
+                "roleBasis": existing.role_basis,
+                "gateCapabilityReportAccepted": gate_capability_report_accepted,
+                "protocolVersion": 1,
+                "reused": true,
+            }));
+        }
+    }
+
     let mut s = state.lock().await;
 
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
@@ -700,11 +894,9 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     //     `plugin_id` is still asserted, proof-of-possession is #824's boundary, and #981's close
     //     predicate remains exact action/session identity, not this pair.
     if let Some(hsid) = host_session_id.as_deref() {
-        if let Some(existing) = s
-            .sessions
-            .values_mut()
-            .find(|sess| sess.plugin_id == plugin_id && sess.host_session_id.as_deref() == Some(hsid))
-        {
+        let reuse_id = s.sessions.find_reuse_id(&plugin_id, hsid);
+        let caps_table = s.gate_capabilities.clone();
+        if let Some(mut existing) = reuse_id.and_then(|id| s.sessions.get_mut(&id)) {
             existing.connected_at = Utc::now(); // Guard A: liveness only — no other field mutates
             // Guard A means a reused session keeps the role it was MINTED with — this
             // call's `role` argument is ignored outright. Report against the role the
@@ -722,11 +914,11 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "protocolVersion": 1,
                 "reused": true,
             });
+            drop(existing);
             // Store the report only after this call has been accepted as a real reuse. A
             // refused connect must never leave a green deployment-health residue.
             if let Some(capabilities) = gate_capabilities.as_ref() {
-                s.gate_capabilities
-                    .insert(plugin_id.clone(), capabilities.clone());
+                caps_table.insert(plugin_id.clone(), capabilities.clone());
             }
             return Ok(response);
         }
@@ -867,10 +1059,31 @@ pub(crate) async fn tool_begin_action(state: &SharedState, args: &Value) -> Tool
     let intent = optional_string(args, "intent");
     // The host agent's own stable session id (the real audit grain).
     let host_session_id = optional_string(args, "host_session_id");
+    // The tool INVOCATION this begin is for (#1169): its correlation key. The gate sends it
+    // from the society-safety check, which runs BEFORE the tool, so "a begin was seen for K"
+    // is the daemon's own evidence that invocation K reached execution. It can only ever make
+    // a reclaim LESS likely, so a caller naming someone else's key gains nothing.
+    let correlation_key = optional_string(args, "correlation_key")
+        .filter(|k| super::gate_escalation::valid_correlation_key(k));
 
     let mut s = state.lock().await;
     let action_id = Uuid::new_v4();
     let chain_position = s.chain_len();
+    if let Some(k) = &correlation_key {
+        // A FENCED invocation does not begin (#1169): its permit was re-delivered to another
+        // invocation by a reclaim. Refusing here makes the mechanism return no verdict, and the
+        // gate denies -- so the superseded original and its replacement can never both run.
+        if let Some((at, esc)) = s.gate_escalations.fenced_by(k).cloned() {
+            return Ok(hestia_error_envelope(
+                "hestia.invocation_superseded",
+                &format!("invocation {k} was superseded by a reclaim of escalation {esc} at {at}: \
+its permit now belongs to another invocation, so this one may not begin"),
+                Some(json!({"correlation_key": k, "escalation_id": esc, "fenced_at": at})),
+            ));
+        }
+        let now = super::gate_escalation::now_secs();
+        s.gate_escalations.record_begin(k, now);
+    }
 
     let session_id = resolve_session_uuid(&s, session_id_arg.as_deref()).unwrap_or_else(Uuid::nil);
 
@@ -1013,7 +1226,7 @@ pub(crate) async fn tool_record_outcome(state: &SharedState, args: &Value) -> To
             "outcome:failure"
         },
     };
-    let trust_state = s.apply_outcome_ctx(&plugin_id, success, magnitude, &rep_ctx)?;
+    let trust_state = s.apply_outcome_ctx(&plugin_id, success, magnitude, &rep_ctx, Some(&entry))?;
 
     Ok(json!({
         "witnessEntryHash": entry.hash,
@@ -1041,7 +1254,11 @@ pub(crate) async fn tool_record_outcome(state: &SharedState, args: &Value) -> To
 /// Composed in the order the gate itself folds, and every statement names the LAYER it
 /// came from, so a member can tell a society-wide norm from something bound to it alone.
 async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
-    let s = state.lock().await;
+    // LOCK-FREE (stage 2): composed from the published policy snapshot, never the state lock.
+    // The snapshot is swapped atomically at the release of any write that changed a policy
+    // input, so this reads the law before or after a change — never half of one.
+    let p = state.published();
+    p.observe();
     // ATTRIBUTED CALLERS ONLY — and "attributed" means RESOLVED, not "an id was supplied".
     //
     // The first fix here guarded on a MISSING session_id, which kimi measured as still
@@ -1057,7 +1274,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     // `resolve_attributed_caller` parses, looks up, and returns None on any failure — the
     // correct primitive, already in this file, thirty lines from the surface that needed
     // it. The error contract is now "a caller was attributed", not "an id was supplied".
-    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref())
+    let Some(who) = p.resolve(optional_session_id(args).as_deref())
     else {
         return Ok(hestia_error_envelope(
             "hestia.operating_law_unattributed",
@@ -1076,23 +1293,23 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     // which means this surface has to reflect the substitution, not merely mention it. A member
     // told "society: deny" while the gate runs it under a permissive grant has been told the
     // wrong law, and would waste a session obeying a rule nobody is applying to it.
-    let granted = s
+    let granted = p
         .instance_grant(&who.plugin_id, &who.role_lct)
         .and_then(|g| crate::policy::get_preset(&g.preset).map(|p| (g, p)));
-    let grant_engine = granted
-        .as_ref()
-        .map(|(_, p)| crate::policy::PolicyEngine::new(p.config.clone()));
+    let grant_engine = granted.as_ref().map(|(_, preset)| {
+        crate::policy::PolicyEngine::new(preset.config.clone())
+    });
 
-    let mut layers: Vec<(String, &crate::policy::PolicyEngine)> = Vec::new();
+    let mut layers: Vec<(String, &super::published::EngineView)> = Vec::new();
     if let Some(e) = grant_engine.as_ref() {
         layers.push(("operator-grant".to_string(), e));
     } else {
-        layers.push(("society".to_string(), &s.policy_engine));
-        if let Some(e) = s.role_policy_engines.get(&who.role_lct) {
+        layers.push(("society".to_string(), &p.society));
+        if let Some(e) = p.roles.get(&who.role_lct) {
             layers.push((format!("role:{}", who.role_lct), e));
         }
-        if let Some(e) = s
-            .instance_policy_engines
+        if let Some(e) = p
+            .instances
             .get(&(who.plugin_id.clone(), who.role_lct.clone()))
         {
             layers.push((format!("instance:{}", who.plugin_id), e));
@@ -1115,8 +1332,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     // Operator-authored lists bound to this member (vault-stored; see vault::policy_lists).
-    let lists = s.vault.policy_lists();
-    let bound = crate::vault::policy_lists::for_member(&lists, &who.plugin_id, &who.role_lct);
+    let bound = crate::vault::policy_lists::for_member(&p.policy_lists, &who.plugin_id, &who.role_lct);
     for l in &bound {
         use crate::vault::policy_lists::ListPerm;
         // METADATA VISIBILITY IS DECIDED, NOT INHERITED (kimi, finding 2). The first cut
@@ -1205,29 +1421,29 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // widening the subject cannot see is a trapdoor whether it widens a PRESET or a PATH.
         // Being in `body` means a grant appearing or lapsing moves `law_hash`, so a member that
         // pins the hash learns its reach changed instead of discovering it by trying.
-        "scope_grants": s.live_scope_grants(&who.plugin_id)
+        "scope_grants": p.live_scope_grants(&who.plugin_id)
             .iter()
-            .map(|r| json!({
-                "path": r.path,
+            .map(|r| with_modes(json!({
+                "path": r.reach_path(),
                 "granted_by": r.decided_by,
                 "requested_because": r.reason,
                 "decision_reason": r.decision_reason,
                 "expires_at": r.expires_at,
-            }))
+            }), r.ext.modes))
             .collect::<Vec<_>>(),
         // STANDING grants, disclosed beside the live ones and inside the same hashed body
         // (Sprint F R1): the durable widening is the one a member most needs to see, because
         // it is the one no restart will quietly retire. A standing grant appearing, expiring
         // or being revoked MOVES law_hash.
-        "standing_grants": s.live_standing_grants(&who.plugin_id)
+        "standing_grants": p.live_standing_grants(&who.plugin_id)
             .iter()
-            .map(|g| json!({
+            .map(|g| with_modes(json!({
                 "path": g.path,
                 "granted_by": g.granted_by,
                 "reason": g.reason,
                 "granted_at": g.granted_at,
                 "expires_at": g.expires_at,
-            }))
+            }), g.modes))
             .collect::<Vec<_>>(),
         "law": statements,
     });
@@ -1249,7 +1465,7 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     let mut out = body;
     if let Some(o) = out.as_object_mut() {
         o.insert("law_hash".into(), json!(law_hash));
-        o.insert("society_policy_hash".into(), json!(s.policy_engine.content_hash()));
+        o.insert("society_policy_hash".into(), json!(p.society.content_hash()));
     }
     Ok(json!({
         // FOURTH instance of the shape the comment below names, caught while adding this
@@ -1286,6 +1502,9 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // existing audit entries reference it.
         "law_hash": out.get("law_hash").cloned().unwrap_or(Value::Null),
         "society_policy_hash": out.get("society_policy_hash").cloned().unwrap_or(Value::Null),
+        // Outside the hashed body on purpose: it moves on ANY republish, the hash only when this
+        // member's law changed. A decision row records the same number (`policy_version`).
+        "publication_version": p.version,
         "note": "This is the law you operate under. If a rule blocks legitimate work, \
                  appeal it with `hestia_appeal` (the deny's chain hash + your reason) \
                  rather than rephrasing around it. An appeal is recorded conduct that can \
@@ -1299,16 +1518,24 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     let action_id_str = require_string(args, "action_id")?;
     let action_id =
         Uuid::parse_str(&action_id_str).map_err(|_| anyhow::anyhow!("invalid action_id"))?;
-    let mut s = state.lock().await;
-    let action = match s.actions.get(&action_id) {
-        Some(a) => a.clone(),
-        None => {
-            return Ok(hestia_error_envelope(
-                "hestia.action_not_found",
-                &format!("Action {} not found", action_id),
-                Some(json!({"action_id": action_id_str})),
-            ));
-        }
+    // PHASE 1 (state lock, brief): the in-flight action and who it belongs to.
+    let (action, session_identity) = {
+        let s = state.lock().await;
+        let action = match s.actions.get(&action_id) {
+            Some(a) => a.clone(),
+            None => {
+                return Ok(hestia_error_envelope(
+                    "hestia.action_not_found",
+                    &format!("Action {} not found", action_id),
+                    Some(json!({"action_id": action_id_str})),
+                ));
+            }
+        };
+        let who = s
+            .sessions
+            .get(&action.session_id)
+            .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()));
+        (action, who)
     };
 
     // Build a PolicyAction from the in-flight action + classify the tool.
@@ -1378,75 +1605,25 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // constellation-role overlay by STRICTEST verdict. A self-declared role can
     // only ever tighten the base (Deny > Warn > Allow), never loosen it — so
     // declaring a permissive role can't be used to escape the base floor.
-    let mut evaluation = s.policy_engine.evaluate(&pa);
-    let (session_plugin_id, session_role) = s
-        .sessions
-        .get(&action.session_id)
-        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
-        .unwrap_or_else(|| {
-            (
-                "unknown".to_string(),
-                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
-            )
-        });
-    if let Some(role_engine) = s.role_policy_engines.get(&session_role) {
-        evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
-    }
-    // Finest grain: the per-(instance, role) overlay for THIS orchestrator, folded
-    // AFTER the role overlay so a specific instance can only tighten its role's law.
-    if let Some(inst_engine) = s
-        .instance_policy_engines
-        .get(&(session_plugin_id.clone(), session_role.clone()))
-    {
-        evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
-    }
-    // OPERATOR GRANT — applied OUTSIDE the fold, because it is the one input allowed to
-    // loosen and `fold_strictest` would discard it by definition (dp, 2026-08-01: "if i want
-    // to grant permissive it should be my choice without setting all the rest to permissive").
-    //
-    // Deliberately NOT folded: folding is how every other input composes, and adding a
-    // "loosest-wins" branch to the fold would make the fold itself unsafe for the inputs that
-    // must only tighten. Keeping the grant a separate, explicit substitution means the
-    // invariant "law tightens as it gets more specific" still holds for all of role overlay,
-    // instance overlay and hub law, and the one exception is legible at the call site rather
-    // than hidden inside a comparator.
-    //
-    // Society baseline is untouched: a grant is an exception FOR one member, never an edit of
-    // the law. The baseline moves only by amendment.
-    //
-    // ORDERING, and it is a decision rather than an accident: the grant lands BEFORE the hub-law
-    // fold, so ratified society law still folds strictest-wins OVER it and a local operator
-    // cannot grant past it. dp's own framing forces this — "society baseline is encoded in
-    // society law, and can only be changed through law amendment process" — and a grant that
-    // could override hub law WOULD be a law change without an amendment, made by one machine's
-    // operator. So a grant loosens the local baseline (preset + role + instance overlays) and
-    // nothing above it. If that turns out to be too narrow in practice, the fix is an
-    // amendment, which is the correct place for that argument to happen.
-    evaluation = s.apply_instance_grant(&session_plugin_id, &session_role, &pa, evaluation);
-    // Third fold input (consolidation 2026-07-10): hub law via the
-    // canonical web4-policy engine. Strictest-wins like the role overlay —
-    // law can only tighten, never loosen.
-    if let Some(gate) = &s.law_gate {
-        evaluation = crate::policy::fold_strictest(evaluation, gate.evaluate(&pa, &session_role));
-    }
+    let (session_plugin_id, session_role) = session_identity.unwrap_or_else(|| {
+        (
+            "unknown".to_string(),
+            crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
+        )
+    });
+    // PHASE 2 (NO state lock): evaluate against the published law. Role-scoped law (#403)
+    // folds strictest-wins, so a self-declared role only tightens; an operator grant substitutes
+    // its preset before ratified hub law folds over it — the same fold, one implementation
+    // (`published::evaluate_folded`), now outside the lock: this evaluation was the global
+    // lock's second-largest holder (~3-4 ms a call, measured on #1267).
+    let published = state.published();
+    let policy_version = published.version;
+    let evaluation = published.evaluate(&session_plugin_id, &session_role, &pa);
+    let (plugin_id_for_chain, role_lct) = (session_plugin_id.clone(), session_role.clone());
 
-    // Witness the policy decision when the verdict is anything other
-    // than `allow`. Deny + warn + would-deny (audit-only) are all
-    // operationally interesting events — denies in particular block
-    // a tool call before it runs, so PostToolUse never fires and the
-    // outcome would otherwise never reach the chain. This is the
-    // structural place to capture them: any policy gate flow that
-    // calls query_policy gets witnessed automatically.
-    let (plugin_id_for_chain, role_lct) = s
-        .sessions
-        .get(&action.session_id)
-        .map(|sess| (sess.plugin_id.clone(), sess.constellation_role.clone()))
-        .unwrap_or_else(|| {
-            (
-                "unknown".to_string(),
-                crate::reputation::DEFAULT_CONSTELLATION_ROLE.to_string(),
-            )
-        });
+    // PHASE 3 (state lock): only the writes this verdict needs — the scope tally, the decision
+    // row and its charge.
+    let mut s = state.lock().await;
     // SCOPE ATTESTATION — count what the gate judged, allows included.
     //
     // The window, not the action, is the unit of evidence. 1,000 in-scope calls attest
@@ -1512,15 +1689,43 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         );
     }
 
+    // The hash of the daemon's own decision row, when one was written AND committed. Returned
+    // as `decisionEntryHash` and kept on the in-flight action (one-gate stage A): a gate that
+    // then witnesses this same verdict is answered with this row, not a duplicate of it.
+    let mut decision_entry_hash: Option<String> = None;
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
+        // DURABLE READS: a refusal may answer with a row another request committed.
+        crate::storage::durability::note_observed(s.chain_store.durability(), s.chain_len());
         // A deny blocks before execution, so this is the ONLY witnessed record of a
         // denied action — carry the full accountability WHO (instance + role +
         // session) and WHY (actor intent) here, or they're lost for everything the
         // gate blocks. Computed inside the gate branch so Allow decisions skip it.
         let instance_lct = s.member_lct(&plugin_id_for_chain);
-        let _ = s.append_chain(
-            "policy_decision",
-            json!({
+        let verdict = super::decision_witness::Verdict::parse(evaluation.decision.as_str())
+            .expect("a non-allow PolicyDecision is warn or deny");
+        // ONE VERDICT, ONE ROW. The daemon asked to rule the same action again, with the same
+        // verdict for the same member, answers with the row it already committed: no append.
+        // Its owed charge, if a trust write failed earlier, is settled here (once).
+        if let Some(existing) = s
+            .decision_ledger
+            .existing_row(&plugin_id_for_chain, action_id, verdict)
+            .map(str::to_string)
+        {
+            decision_entry_hash = Some(existing);
+            let _ = settle_decision_charge(&mut s, &plugin_id_for_chain, action_id, None);
+        } else {
+        // Settle an owed charge first, so this row can name the row that holds the charge.
+        let _ = settle_decision_charge(&mut s, &plugin_id_for_chain, action_id, None);
+        // ONE CHARGE PER (MEMBER, ACTION), known before the append so the row can say so: if a
+        // committed row for this member and action already charged (a seat's witness that
+        // named this action first), this row is evidence only.
+        let charge_held_by =
+            s.decision_ledger.charge_holder(&plugin_id_for_chain, action_id).map(str::to_string);
+        let mut own_data = json!({
+                // WHICH published law this verdict was evaluated under (stage 2): the same
+                // `publication_version` `hestia_operating_law` returns beside its law_hash, so a
+                // decision row can be joined to the exact law a gate fetched.
+                "policy_version": policy_version,
                 "action_id": action_id_str,
                 "tool_name": action.tool_name,
                 "target": target,
@@ -1552,8 +1757,19 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                     .map(|a| if a.chars().count() > ATTEMPTED_MAX {
                         a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
                     } else { a }),
-            }),
-        );
+            });
+        if let Some(h) = &charge_held_by {
+            own_data["charge_held_by"] = json!(h);
+        }
+        let own_row = s.append_chain("policy_decision", own_data);
+        // The verdict never depends on this append (as before: a failed append was, and is,
+        // not a reason to change the ruling). What changes is that its success is no longer
+        // discarded: only a COMMITTED row is remembered, reported — or charged (below).
+        if let Ok(row) = &own_row {
+            decision_entry_hash = Some(row.hash.clone());
+            let charge = super::decision_witness::ChargeSpec::from_row(&row.event_data);
+            s.decision_ledger.record_row(&plugin_id_for_chain, action_id, verdict, &row.hash, charge);
+        }
 
         // Wire the gate's risk judgment into trust. Before this, trust evolved
         // ONLY on execution outcomes (all success → it saturated at the ceiling)
@@ -1567,36 +1783,17 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // action was blocked) is a stronger negative than `warn` (flagged but
         // allowed to proceed — it also gets an execution outcome later, so its
         // weight is intentionally light to avoid over-penalising). Magnitudes are
-        // conservative first-cut defaults; tune if the reliability curve warrants.
-        let risk_magnitude = match evaluation.decision {
-            crate::policy::PolicyDecision::Deny => 0.5,
-            crate::policy::PolicyDecision::Warn => 0.2,
-            _ => 0.0,
-        };
-        if risk_magnitude > 0.0 {
-            // P3a: emit the gate's trust movement as a role-scoped ReputationDelta
-            // to the local bridge sink (the first source of hestia->hub reputation).
-            let reason = format!("gate:{}", evaluation.decision.as_str());
-            let rep_ctx = crate::reputation::RepContext {
-                // The DAEMON's own gate evaluation. Reachability is established by
-                // construction here: if this code is running, the referee answered.
-                // A fail-closed deny (the infra case) never reaches this branch —
-                // it cannot be witnessed through the daemon it could not reach, and
-                // there is no spool (ratified dp 2026-08-04: the chain witnesses
-                // member events, not infra telemetry).
-                class: crate::reputation::DeltaClass::Conduct,
-                role_lct: &role_lct,
-                action_type: "policy_gate",
-                action_target: &action.tool_name,
-                action_id: &action_id_str,
-                // The rule id is in scope HERE — the same `evaluation` whose
-                // rule_id/rule_name go into the policy_decision chain entry
-                // above. Until plumbed, this delta row was the deny record that
-                // could not name the rule that charged the member.
-                rule_triggered: evaluation.rule_id.as_deref().unwrap_or(""),
-                reason: &reason,
-            };
-            let _ = s.apply_outcome_ctx(&plugin_id_for_chain, false, risk_magnitude, &rep_ctx);
+        // conservative first-cut defaults (`Verdict::risk_magnitude`); tune if the reliability
+        // curve warrants.
+        //
+        // DECISION REPUTATION FOLLOWS THE COMMITTED DECISION WITNESS. No committed row → no
+        // movement: a failed append used to leave this charge applied with no row behind it,
+        // and the gate's later witness of the same verdict (finding no row to answer with)
+        // appended one and charged the member a second time. The charge is now the committed
+        // row's own, applied once per (member, action) by `settle_decision_charge` — and a
+        // failed trust write leaves it OWED for the next decision on the key, not lost. The
+        // verdict never depends on it, so its error is not this reply's error.
+        let _ = settle_decision_charge(&mut s, &plugin_id_for_chain, action_id, own_row.as_ref().ok());
         }
     }
 
@@ -1635,6 +1832,10 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // Clients surface it verbatim on their deny channel and never parse
         // it; `reason`/`ruleName` stay the machine-readable fields.
         "guidance": evaluation.guidance(),
+        // The chain hash of the daemon's own witness of this verdict: present only when the
+        // verdict was not `allow` AND its `policy_decision` row committed. Absent is not
+        // "witnessed elsewhere" — an allow writes no row here.
+        "decisionEntryHash": decision_entry_hash,
         "ruleId": evaluation.rule_id,
         "ruleName": evaluation.rule_name,
         "policyId": evaluation.rule_id, // alias kept for backward compat with v0 SDKs
@@ -1645,6 +1846,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // already handle both branches per spec §3.4.1.
         "status": "decided",
         "nextPollMs": serde_json::Value::Null,
+        "policyVersion": policy_version,
     }))
 }
 
@@ -1811,28 +2013,9 @@ fn gate_direct_tool(
         target: Some(target),
         full_command: None,
     };
-    let mut evaluation = s.policy_engine.evaluate(&pa);
-    if let Some(role_engine) = s.role_policy_engines.get(&who.role_lct) {
-        evaluation = crate::policy::fold_strictest(evaluation, role_engine.evaluate(&pa));
-    }
-    // Finest grain: the per-(instance, role) overlay for this caller, folded after
-    // the role overlay — the direct-call gate must honor the same instance law.
-    if let Some(inst_engine) = s
-        .instance_policy_engines
-        .get(&(who.plugin_id.clone(), who.role_lct.clone()))
-    {
-        evaluation = crate::policy::fold_strictest(evaluation, inst_engine.evaluate(&pa));
-    }
-    // Operator grant — the ENFORCEMENT path. Applied here and not only on the advisory
-    // surfaces, because a grant that shows up in `operating_law` and not in the gate tells a
-    // member it may act and then refuses it. Before the hub-law fold, so ratified society law
-    // still binds and a local operator cannot grant past an amendment-only baseline.
-    evaluation = s.apply_instance_grant(&who.plugin_id, &who.role_lct, &pa, evaluation);
-    // Hub-law third input applies to the vault gate too — a norm that
-    // denies secret reads must bind here, not only on tool calls.
-    if let Some(gate) = &s.law_gate {
-        evaluation = crate::policy::fold_strictest(evaluation, gate.evaluate(&pa, &who.role_lct));
-    }
+    // The full fold (base, role, instance, operator grant, hub law) — one implementation,
+    // shared with the lock-free publication (`published::evaluate_folded`).
+    let evaluation = s.evaluate_folded(&who.plugin_id, &who.role_lct, &pa);
     if evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced {
         let instance_lct = s.member_lct(&who.plugin_id);
         let _ = s.append_chain(
@@ -1961,7 +2144,10 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
     // DISCLOSURE — the actual theft step — left no trace on the evidence plane while the
     // WRITE was witnessed. The secret value is never recorded, only the name, the reader,
     // and whether the read went through the exposed bypass.
-    let _ = s.append_chain(
+    //
+    // RECORDED OR NOT RELEASED (#1131 class A): the append's result used to be discarded, so a
+    // chain failure released the secret with no trace — exactly the case the record exists for.
+    if let Err(e) = s.append_chain(
         "vault_get",
         json!({
             "name": name,
@@ -1970,7 +2156,13 @@ async fn tool_vault_get(state: &SharedState, args: &Value) -> ToolResult {
             "session_id": who.session_uuid,
             "exposed": exposed,
         }),
-    );
+    ) {
+        return Ok(hestia_error_envelope(
+            "hestia.vault_release_unrecorded",
+            &format!("the release of '{name}' could not be recorded ({e}); the value was not released"),
+            Some(json!({"name": name})),
+        ));
+    }
     Ok(json!({"value": entry.secret}))
 }
 
@@ -2291,6 +2483,8 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
 const RESERVED_EVENT_TYPES: &[&str] = &[
     "outcome",
     "policy_decision",
+    // The allow half of the one decision witness (one-gate stage A): daemon-written only.
+    super::decision_witness::ALLOW_EVENT,
     "policy_edit",
     "vault_set",
     "orchestrator_connect",
@@ -2298,6 +2492,11 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "reversal",
     "appeal",
     "adjudication",
+    // #1344: daemon-written only; a member must not forge a send or its failure record.
+    "channel_send",
+    "channel_send_unrecorded",
+    "channel_answer",
+    "channel_binding_set",
 ];
 
 /// Reversal kinds — the operational shape of a reversal, distinct from the
@@ -2337,7 +2536,7 @@ const ADJUDICATION_AXES: [&str; 3] = ["validity", "veracity", "valuation"];
 const ADJUDICATION_VERDICTS: [&str; 4] = ["upheld", "partial", "refuted", "deferred"];
 const ADJUDICATION_METHODS: [&str; 6] = ["tests", "review", "reversal", "merge", "usage", "other"];
 
-fn axis_dimension(axis: &str) -> Option<web4_core::v3::ValueDimension> {
+pub(crate) fn axis_dimension(axis: &str) -> Option<web4_core::v3::ValueDimension> {
     use web4_core::v3::ValueDimension as D;
     match axis {
         "validity" => Some(D::Validity),
@@ -2553,7 +2752,7 @@ async fn tool_witness_adjudication(state: &SharedState, args: &Value) -> ToolRes
             reason: &adj_reason,
         };
         adjudicated_state =
-            Some(s.apply_adjudication_ctx(&subject_plugin_id, dimension, score, &rep_ctx)?);
+            Some(s.apply_adjudication_ctx(&subject_plugin_id, dimension, score, &rep_ctx, Some(&entry))?);
     }
 
     Ok(json!({
@@ -2700,7 +2899,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
     };
     let judgment_mutated = cause.refutes_validity();
     let judgment_state = if judgment_mutated {
-        s.apply_judgment_ctx(&subject_plugin_id, false, magnitude, &rep_ctx)?
+        s.apply_judgment_ctx(&subject_plugin_id, false, magnitude, &rep_ctx, Some(&entry))?
     } else {
         s.judgment_for_role(&subject_plugin_id, subject_role)
     };
@@ -2749,6 +2948,7 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
             web4_core::v3::ValueDimension::Validity,
             0.0,
             &adj_ctx,
+            Some(&adj_entry),
         )?;
         adjudication_hash = Some(adj_entry.hash);
     }
@@ -2781,6 +2981,15 @@ async fn tool_record_reversal(state: &SharedState, args: &Value) -> ToolResult {
 /// Upper bound on a stored attempt. Long enough to reconstruct intent (a shell line, a
 /// patch header), short enough that a runaway heredoc cannot inflate the chain.
 const ATTEMPTED_MAX: usize = 400;
+
+/// The act carried on a scope request is ruled on by a NOT-SAME peer whose only view of it is
+/// the record (dp 2026-10-05: scope escalations go to peers), so the record carries it at
+/// review depth, not display depth — #648: on 2026-10-13 a peer refused five scope requests
+/// because the stored act truncated inside the command it was asked to approve. Same value
+/// and marker as the gate's `SCOPE_ACT_MAX`/`SCOPE_ACT_MARK`
+/// (plugins/_shared/hestia_gate_mechanism.py) — change them together: the truncation census
+/// lesson was "same marker, same number, three sites, no shared constant".
+const SCOPE_ACT_MAX: usize = 4000;
 
 /// Gate decisions per scope attestation. Small enough that a working member earns
 /// evidence within a session, large enough that the chain does not grow by one entry per
@@ -3226,6 +3435,23 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
         .iter_sorted()
         .into_iter()
         .map(|(id, _)| id.clone())
+        // The two names that can never answer, excluded by TYPE, exactly as at
+        // `resolve_invitation` (#990) — and this pool is MORE rivalrous, not
+        // less: it spends ONE slot where invitations spend up to a cap. The
+        // exclusions are needed here on top of the reasoner check because
+        // `is_recognised_reasoner` is a lineage PREFIX match, so residue names
+        // (`codex-cli`, `claudecode`) pass it, and act-liveness can rank one
+        // first: codex acting as `codex` while its gate witnessed as
+        // `codex-cli` is the measured case recorded in this file's own history.
+        // An operator who retires such a name reasonably reads it as out of
+        // EVERY selection path; leaving this pool open routed the appeal to a
+        // mailbox nobody reads — the silent-routing failure the reasoner check
+        // was added to stop, one clause downstream of it.
+        // RETIRED reads `retired_members` — the store the operator's one retire
+        // verb (`POST /api/agents/:id/retire`, #1100) writes — so the exclusion
+        // takes effect on the surface the operator actually uses.
+        .filter(|id| !s.retired_members.is_retired(id))
+        .filter(|id| !s.member_registry.is_filler(id))
         .filter(|id| {
             // Only drop a candidate PROVEN to be the same entity. member_lct fails closed to
             // None for synthetic ids, and select_arbiter refuses unrecognised reasoners
@@ -3860,15 +4086,52 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
 }
 
 async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
+    use super::decision_witness::{bounded_core_digest, Verdict};
     let plugin_id = require_string(args, "plugin_id")?;
     let decision = require_string(args, "decision")?;
-    if decision != "deny" && decision != "warn" {
+    // ONE decision witness for every verdict (one-gate stage A). `allow` was refused here until
+    // the common orchestrator needed it; it lands as its own event type and charges nothing —
+    // see `decision_witness` for why each of those is the correct semantics, not a convenience.
+    let Some(verdict) = Verdict::parse(&decision) else {
         return Ok(hestia_error_envelope(
             "hestia.witness_decision_kind",
-            &format!("decision '{decision}' must be 'deny' or 'warn'"),
+            &format!("decision '{decision}' must be 'allow', 'warn' or 'deny'"),
             Some(json!({"decision": decision})),
         ));
-    }
+    };
+    // THE JOIN KEYS. `action_id` names the action the gate began (decision row ↔ outcome row);
+    // `correlation_key` is the core's Pre/Post key for this tool invocation (C13). Both are
+    // optional — a decision reached before any action began has neither — but a key that was
+    // SENT and is unusable is refused, never dropped: a dropped join key is a receipt that does
+    // not name its input, and the join it was sent for silently fails.
+    let action_id: Option<Uuid> = match args.get("action_id") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_str().and_then(|a| Uuid::parse_str(a).ok()) {
+            Some(u) => Some(u),
+            None => {
+                return Ok(hestia_error_envelope(
+                    "hestia.witness_decision_arg",
+                    "action_id must be the actionId string hestia_begin_action returned",
+                    Some(json!({"arg": "action_id"})),
+                ))
+            }
+        },
+    };
+    let correlation_key: Option<String> = match args.get("correlation_key") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_str().filter(|k| super::gate_escalation::valid_correlation_key(k)) {
+            Some(k) => Some(k.to_string()),
+            None => {
+                return Ok(hestia_error_envelope(
+                    "hestia.witness_decision_arg",
+                    "correlation_key must be 1-200 chars of [A-Za-z0-9_.-] \
+                     (hestia_witness_core.correlation_key)",
+                    Some(json!({"arg": "correlation_key"})),
+                ))
+            }
+        },
+    };
+    let core_digest = bounded_core_digest(args.get("core_digest"));
     let adjudicator = require_string(args, "adjudicator")?;
     let reason = optional_string(args, "reason").unwrap_or_default();
     let tool_name = optional_string(args, "tool_name").unwrap_or_default();
@@ -3931,59 +4194,212 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let declared_role = optional_string(args, "role").unwrap_or_default();
     let role_lct = crate::reputation::normalize_constellation_role(&declared_role);
 
-    let s = state.lock().await;
+    let mut s = state.lock().await;
+    // ONE VERDICT, ONE ROW. A committed row already witnesses this verdict for this member and
+    // action — the daemon's own (`query_policy` on the society-safety path), or this same
+    // witness delivered twice. The gate's witness of the same verdict IS that row: hand back
+    // its hash and append nothing. Before this, a seat that recorded its society deny (codex
+    // does) wrote a second `policy_decision` and charged the member twice. If that row's charge
+    // is still OWED (its trust write failed), this retry settles it — once; a settle that fails
+    // again is an error, so the caller's receipt check retries rather than reading it as done.
+    let existing = action_id
+        .and_then(|a| s.decision_ledger.existing_row(&plugin_id, a, verdict))
+        .map(str::to_string);
+    if let (Some(hash), Some(a)) = (existing, action_id) {
+        let settled = settle_decision_charge(&mut s, &plugin_id, a, None)?;
+        return Ok(json!({
+            "witnessEntryHash": hash,
+            "eventType": verdict.event_type(),
+            "decision": verdict.as_str(),
+            "recorded": "existing",
+            "charged": settled.is_some(),
+            "chargedRow": settled.as_ref().map(|(h, _)| h.clone()),
+            "actionId": action_id.map(|a| a.to_string()),
+            "correlationKey": correlation_key,
+            "updatedTrust": settled.map(|(_, t)| trust_state_json(&t)).unwrap_or(Value::Null),
+        }));
+    }
+    let action_resident = action_id.is_some_and(|a| s.actions.contains_key(&a));
+    // An OWED charge on this key (an earlier row committed, its trust write failed) is settled
+    // before this row is written, so the row can name the row that holds the charge. Its error is
+    // not this append's error: the charge stays owed and the settle below tries again.
+    let mut settled = None;
+    if let Some(a) = action_id {
+        settled = settle_decision_charge(&mut s, &plugin_id, a, None).ok().flatten();
+    }
+    // ONE CHARGE PER (MEMBER, ACTION). A DIFFERENT verdict for an action this member was already
+    // charged for (a warn-rollout seat's `warn` after the daemon's charged `deny`, or the reverse
+    // order) is appended — it is real evidence of what the member experienced — but names the
+    // row that charged instead of charging again.
+    let charge_held_by = action_id
+        .and_then(|a| s.decision_ledger.charge_holder(&plugin_id, a))
+        .map(str::to_string);
     let instance_lct = s.member_lct(&plugin_id);
-    let entry = s.append_chain(
-        "policy_decision",
-        json!({
-            "tool_name": tool_name,
-            "target": target,
-            "plugin_id": plugin_id,
-            "instance_lct": instance_lct,
-            "role_lct": role_lct,
-            "session_id": session_id,
-            "decision": decision,
-            "enforced": true,
-            "adjudicator": adjudicator,
-            "reason": reason,
-            "payload_sha256": payload_sha256,
-            "attempted": attempted,
-            "rule_id": rule_id,
-            "verdict_available": verdict_available,
-        }),
-    )?;
-    // Same asymmetric gate-risk trust as the daemon's own gate decisions.
-    let risk_magnitude = if decision == "deny" { 0.5 } else { 0.2 };
-    let gate_reason = format!("gate:{decision} ({adjudicator})");
-    let rep_ctx = crate::reputation::RepContext {
-        // CALLER-REPORTED gate decision from a hook. Hestia did NOT establish
-        // this cause — it received a claim — so it cannot honestly assert
-        // Conduct, and it must NOT infer one from `decision`/`reason`/rule
-        // names: those are descriptive evidence, not causal proof, and
-        // inferring from them is exactly the infrastructure-as-conduct defect
-        // one layer downstream. Held as Unclassified until the hook states a
-        // class of its own; the hub records and counts it either way.
-        class: crate::reputation::DeltaClass::Unclassified,
-        role_lct,
-        action_type: "policy_gate",
-        action_target: &tool_name,
-        action_id: "",
-        // Caller-reported decision (the hook layer's own gate). The `reason`
-        // reaching this row is the daemon-built `gate:{decision} ({adjudicator})`
-        // above — the caller's free text goes to the chain entry, not here — so
-        // attribution rides the dedicated `rule_id` arg, not a parse of the
-        // parenthetical. Empty while no caller sends one, correctly: the day-one
-        // check is that the field VARIES on policy_gate rows, not that it is
-        // never empty.
-        rule_triggered: &rule_id,
-        reason: &gate_reason,
-    };
-    let trust_state = s.apply_outcome_ctx(&plugin_id, false, risk_magnitude, &rep_ctx)?;
+    let mut row = json!({
+        "tool_name": tool_name,
+        "target": target,
+        "plugin_id": plugin_id,
+        "instance_lct": instance_lct,
+        "role_lct": role_lct,
+        "session_id": session_id,
+        "decision": verdict.as_str(),
+        "enforced": true,
+        "adjudicator": adjudicator,
+        "reason": reason,
+        "payload_sha256": payload_sha256,
+        "attempted": attempted,
+        "rule_id": rule_id,
+        "verdict_available": verdict_available,
+    });
+    // Join keys and the deployed-generation attestation ride the row only when SENT, so a
+    // deployed refusal shim that sends none of them writes exactly the row it always wrote.
+    // `core_digest` was sent by every shim since REPAIR 5 and dropped here until now.
+    if let Some(obj) = row.as_object_mut() {
+        if let Some(a) = action_id {
+            obj.insert("action_id".into(), json!(a.to_string()));
+            // Whether the daemon could see the named action when the decision landed. False is
+            // not a refusal (a restart empties the RAM action table); it says the join key was
+            // carried on the caller's word.
+            obj.insert("action_resident".into(), json!(action_resident));
+        }
+        if let Some(k) = &correlation_key {
+            obj.insert("correlation_key".into(), json!(k));
+        }
+        if let Some(d) = &core_digest {
+            obj.insert("core_digest".into(), json!(d));
+        }
+        if let Some(h) = &charge_held_by {
+            obj.insert("charge_held_by".into(), json!(h));
+        }
+    }
+    // A failed append is an `Err` → `hestia.internal_error` on the wire, with no hash: the
+    // caller's receipt check then reads it as NOT committed, which is the point.
+    let entry = s.append_chain(verdict.event_type(), row)?;
+    if let Some(a) = action_id {
+        // The row's own charge, read back from what was committed (the same reading the startup
+        // replay makes), applied once per key by the settle — now, or on the next decision.
+        let charge = super::decision_witness::ChargeSpec::from_row(&entry.event_data);
+        s.decision_ledger.record_row(&plugin_id, a, verdict, &entry.hash, charge);
+        if settled.is_none() {
+            settled = settle_decision_charge(&mut s, &plugin_id, a, Some(&entry))?;
+        }
+    } else if let Some(risk_magnitude) = verdict.risk_magnitude() {
+        // No action named: no ledger key, so the pre-ledger behaviour — charge this row now.
+        // Same asymmetric gate-risk trust as the daemon's own gate decisions.
+        let gate_reason = format!("gate:{} ({adjudicator})", verdict.as_str());
+        let rep_ctx = crate::reputation::RepContext {
+            // CALLER-REPORTED gate decision from a hook. Hestia did NOT establish
+            // this cause — it received a claim — so it cannot honestly assert
+            // Conduct, and it must NOT infer one from `decision`/`reason`/rule
+            // names: those are descriptive evidence, not causal proof, and
+            // inferring from them is exactly the infrastructure-as-conduct defect
+            // one layer downstream. Held as Unclassified until the hook states a
+            // class of its own; the hub records and counts it either way.
+            class: crate::reputation::DeltaClass::Unclassified,
+            role_lct,
+            action_type: "policy_gate",
+            action_target: &tool_name,
+            action_id: "",
+            // Caller-reported decision (the hook layer's own gate). The `reason`
+            // reaching this row is the daemon-built `gate:{decision} ({adjudicator})`
+            // above — the caller's free text goes to the chain entry, not here — so
+            // attribution rides the dedicated `rule_id` arg, not a parse of the
+            // parenthetical.
+            rule_triggered: &rule_id,
+            reason: &gate_reason,
+        };
+        let trust_state = s.apply_outcome_ctx(&plugin_id, false, risk_magnitude, &rep_ctx, Some(&entry))?;
+        settled = Some((entry.hash.clone(), trust_state));
+    }
+    // THE RECEIPT names every input it acted on, so a caller can tell "committed what I sent"
+    // from "committed something" — an older daemon that ignores `action_id` echoes no
+    // `actionId`, and a receipt-checking caller reads that as not committed.
     Ok(json!({
         "witnessEntryHash": entry.hash,
-        "decision": decision,
-        "updatedTrust": trust_state_json(&trust_state),
+        "eventType": verdict.event_type(),
+        "decision": verdict.as_str(),
+        "recorded": "appended",
+        // Whether THIS call applied the key's one charge, and which row it belongs to (this
+        // row, or an earlier row whose charge was owed).
+        "charged": settled.is_some(),
+        "chargedRow": settled.as_ref().map(|(h, _)| h.clone()),
+        // Present only when this row is evidence-only because another row holds this member's
+        // charge for this action: the hash of that row.
+        "chargeHeldBy": charge_held_by,
+        "actionId": action_id.map(|a| a.to_string()),
+        "correlationKey": correlation_key,
+        "updatedTrust": settled.map(|(_, t)| trust_state_json(&t)).unwrap_or(Value::Null),
     }))
+}
+
+/// Settle the OWED decision charge on `(member, action_id)`, if there is one: apply the charging
+/// row's own charge (see `decision_witness::ChargeSpec`), then mark the key settled — in RAM
+/// and in the durable settle record. `Ok(Some((row, trust)))` when this call applied it;
+/// `Ok(None)` when nothing was owed (settled already, or nothing chargeable committed); `Err`
+/// when the trust write failed, leaving it owed for the next decision on the key.
+///
+/// Called with the state lock held, so two settles of one key are serialised and the second
+/// finds nothing owed: exactly one charge per key.
+///
+/// The class is the row's: the DAEMON's own gate evaluation is Conduct — reachability is
+/// established by construction (if this code is running, the referee answered; a fail-closed
+/// deny never reaches it, and there is no spool: ratified dp 2026-08-04, the chain witnesses
+/// member events, not infra telemetry). A CALLER-REPORTED gate decision is Unclassified: hestia
+/// received a claim, did not establish the cause, and must not infer one from decision, reason
+/// or rule names. Either way the delta names the rule that charged the member.
+fn settle_decision_charge(
+    s: &mut super::state::ServerState,
+    member: &str,
+    action_id: Uuid,
+    current: Option<&crate::storage::chain::ChainEntry>,
+) -> anyhow::Result<Option<(String, EntityTrust)>> {
+    let Some((row, c)) = s.decision_ledger.owed(member, action_id) else {
+        return Ok(None);
+    };
+    // TRUST IS A PROJECTION OF THE CHAIN (#1271): the charge is projected from a row. Normally
+    // that is the row just committed. An OWED charge from an earlier row (legacy: a trust write
+    // that failed before projection) is settled by its own `decision_charge_settled` row, so a
+    // replay applies it at exactly this position.
+    let settle_entry;
+    let at: &crate::storage::chain::ChainEntry = match current {
+        Some(cur) if cur.hash == row => cur,
+        _ => {
+            let instance_lct = s.member_lct(member);
+            settle_entry = s.append_chain("decision_charge_settled", json!({
+                "member": member,
+                "action_id": action_id.to_string(),
+                "row": row,
+                "instance_lct": instance_lct,
+                "charge": c.to_settle(),
+            }))?;
+            &settle_entry
+        }
+    };
+    let action_id_text = action_id.to_string();
+    let rep_ctx = crate::reputation::RepContext {
+        class: if c.conduct {
+            crate::reputation::DeltaClass::Conduct
+        } else {
+            crate::reputation::DeltaClass::Unclassified
+        },
+        role_lct: &c.role_lct,
+        action_type: "policy_gate",
+        action_target: &c.tool_name,
+        action_id: &action_id_text,
+        rule_triggered: &c.rule_id,
+        reason: &c.reason,
+    };
+    let trust = s.apply_outcome_ctx(member, false, c.magnitude, &rep_ctx, Some(at))?;
+    if s.decision_ledger.record_charge(member, action_id, &row) {
+        // Written only after the charge's trust write is durable (same ordered persister), so a
+        // crash can never leave "settled" on disk for a charge whose trust write was lost.
+        let path = s.home.join(super::decision_witness::SETTLED_FILE);
+        let line = super::decision_witness::settled_line(member, action_id, &row);
+        if let Err(e) = s.trust_store.append_after_trust(&path, line) {
+            tracing::warn!("decision settle record not queued: {e:#}");
+        }
+    }
+    Ok(Some((row, trust)))
 }
 
 async fn tool_request_witness(state: &SharedState, args: &Value) -> ToolResult {
@@ -4519,6 +4935,164 @@ const MAX_POINTER_URI_BYTES: usize = 512;
 const MEMBER_NOTIFY_MAX_PER_WINDOW: u32 = 30;
 const MEMBER_NOTIFY_WINDOW_MS: u64 = 600_000;
 
+/// Collision-free witness-key encoding for one member-notify operation.
+///
+/// Member ids forbid '/' but not ':', and operation ids deliberately allow
+/// punctuation. Plain `sender:operation` concatenation therefore aliases
+/// (sender="a:b", op="c") with (sender="a", op="b:c"). Length-prefix every
+/// variable component; the key is opaque and is never parsed back.
+fn member_notify_operation_event_key(
+    namespace: &str,
+    sender_plugin: &str,
+    operation_id: &str,
+) -> String {
+    format!(
+        "member-notify:{namespace}:{}:{}:{}:{}",
+        sender_plugin.len(),
+        sender_plugin,
+        operation_id.len(),
+        operation_id
+    )
+}
+
+#[cfg(test)]
+mod member_notify_operation_key_tests {
+    use super::member_notify_operation_event_key;
+
+    #[test]
+    fn separator_characters_cannot_alias_sender_and_operation_boundaries() {
+        let a = member_notify_operation_event_key("act", "a:b", "c");
+        let b = member_notify_operation_event_key("act", "a", "b:c");
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            member_notify_operation_event_key("act", "a:b", "c"),
+            "same pair must remain stable"
+        );
+        assert_ne!(
+            a,
+            member_notify_operation_event_key("shadow", "a:b", "c"),
+            "event namespaces must not alias"
+        );
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MemberNotifyF3Plan {
+    origin_lct: String,
+    router_lct: String,
+    destination_lct: String,
+    authority_source: String,
+    authority_reason: String,
+}
+
+/// Resolve ONLY the delivery-plane choice for member_notify after the common
+/// pre-route gates have passed. Bare plugin ids remain local legacy delivery.
+/// Canonical mb32 destinations are intrinsically F3; historical peer/member
+/// spellings become F3 only when their exact alias was explicitly cut over.
+///
+/// This is intentionally pure/read-only. No packet is minted here.
+fn member_notify_f3_plan(
+    s: &crate::server::state::ServerState,
+    sender_plugin: &str,
+    to: &str,
+) -> anyhow::Result<Option<MemberNotifyF3Plan>> {
+    let canonical_destination = to.starts_with("lct:web4:mb32:");
+    let legacy_routed = to.contains('/');
+    if !canonical_destination && !legacy_routed {
+        return Ok(None);
+    }
+
+    let sender = s
+        .member_registry
+        .resolve_reference(sender_plugin)?
+        .ok_or_else(|| anyhow::anyhow!(
+            "sender '{sender_plugin}' has no canonical member LCT"
+        ))?;
+    let origin_lct = sender.lct.lct_id();
+    let parents: Vec<String> = sender
+        .lct
+        .mrh
+        .bound
+        .iter()
+        .filter(|edge| edge.edge_type == "parent")
+        .map(|edge| edge.lct_id.clone())
+        .collect();
+    let router_lct = match parents.as_slice() {
+        [parent] => parent.clone(),
+        [] => anyhow::bail!(
+            "canonical sender {origin_lct} has no parent/router binding"
+        ),
+        _ => anyhow::bail!(
+            "canonical sender {origin_lct} has {} parent/router bindings; expected exactly one",
+            parents.len()
+        ),
+    };
+
+    let fresh_vault = s.vault.reopen()
+        .map_err(|e| anyhow::anyhow!(
+            "receiver routing vault snapshot is unavailable; delivery authority cannot be proven: {e}"
+        ))?;
+    let table = crate::receiver_routing::ReceiverRoutingTable::load(&fresh_vault)
+        .map_err(|e| anyhow::anyhow!(
+            "receiver routing table is unavailable; delivery authority cannot be proven: {e}"
+        ))?;
+
+    let (destination_lct, authority_source, authority_reason) =
+        if canonical_destination {
+            (
+                to.to_string(),
+                "canonical_lct".to_string(),
+                "canonical Web4 destination selects F3 routing".to_string(),
+            )
+        } else {
+            let Some(alias) = table.legacy_alias(to) else {
+                return Ok(None);
+            };
+            if alias.delivery_authority
+                != crate::receiver_routing::LegacyDeliveryAuthority::F3
+            {
+                return Ok(None);
+            }
+            (
+                alias.destination_lct.clone(),
+                "legacy_alias_cutover".to_string(),
+                alias.authority_reason.clone().ok_or_else(|| anyhow::anyhow!(
+                    "legacy alias '{to}' is marked f3 without a migration reason"
+                ))?,
+            )
+        };
+
+    Ok(Some(MemberNotifyF3Plan {
+        origin_lct,
+        router_lct,
+        destination_lct,
+        authority_source,
+        authority_reason,
+    }))
+}
+
+fn member_notify_f3_plan_from_witness(
+    event: &Value,
+) -> anyhow::Result<Option<MemberNotifyF3Plan>> {
+    if event.get("delivery_authority").and_then(Value::as_str) != Some("f3") {
+        return Ok(None);
+    }
+    let required = |key: &str| -> anyhow::Result<String> {
+        event.get(key).and_then(Value::as_str).map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!(
+                "recovered F3 member_notice is missing '{key}'"
+            ))
+    };
+    Ok(Some(MemberNotifyF3Plan {
+        origin_lct: required("f3_origin_lct")?,
+        router_lct: required("f3_router_lct")?,
+        destination_lct: required("f3_destination_lct")?,
+        authority_source: required("f3_authority_source")?,
+        authority_reason: required("f3_authority_reason")?,
+    }))
+}
+
 async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     let to_plugin = require_string(args, "to_plugin_id")?;
     let kind = require_string(args, "kind")?;
@@ -4621,6 +5195,23 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             }
         },
     };
+    let operation_id = match args.get("operation_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(v))
+            if !v.is_empty()
+                && v.len() <= 128
+                && !v.chars().any(char::is_control) =>
+        {
+            Some(v.clone())
+        }
+        Some(v) => {
+            return Ok(hestia_error_envelope(
+                "hestia.member_notify_bad_operation_id",
+                "operation_id must be a 1..128 byte string with no control characters",
+                Some(json!({"operation_id": v})),
+            ));
+        }
+    };
 
     let mut s = state.lock().await;
     // No latest-session fallback here — attribution must be proven, not
@@ -4633,6 +5224,133 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             None,
         ));
     };
+
+    // D2c retry identity. The key is scoped by the authenticated LEGACY actor
+    // (plugin_id); the immutable binding names the application send intent and
+    // deliberately excludes live law/liveness/routing state. If this operation
+    // already committed, this call is a replay, not a new act: do not re-run
+    // mutable policy/flood accounting and do not mint a second witness/queue row.
+    let operation_binding = operation_id.as_ref().map(|_| {
+        json!({
+            "protocol": "hestia-member-notify-op-v1",
+            "to_plugin_id": to_plugin,
+            "kind": kind,
+            "pointer_uri": pointer_uri,
+            "in_reply_to": in_reply_to,
+        })
+    });
+    let operation_binding_json = operation_binding
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    if let (Some(op_id), Some(binding_json)) =
+        (operation_id.as_deref(), operation_binding_json.as_deref())
+    {
+        if let Some(op) = s
+            .inbox_store
+            .member_send_operation(&sender.plugin_id, op_id)
+            .map_err(|e| anyhow::anyhow!("reading member-notify operation: {e}"))?
+        {
+            if op.binding_json != binding_json {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_operation_conflict",
+                    "this operation_id is already bound to a different send intent; use a new operation_id for a new act",
+                    Some(json!({
+                        "operation_id": op_id,
+                        "sender_plugin_id": sender.plugin_id,
+                    })),
+                ));
+            }
+
+            let mut out = op.response_json.clone();
+            out["operation_id"] = json!(op_id);
+            out["replayed"] = json!(true);
+
+            // Shadow evidence is observational but retryable. If the authoritative
+            // queue committed and the daemon died before the shadow witness, the
+            // exact shadow record was stored in the same queue transaction; replay
+            // can fill the evidence gap without changing delivery.
+            if let Some(hash) = op.shadow_witness_hash {
+                out["f3_shadow_witness_hash"] = json!(hash);
+            } else if let Some(record_json) = op.shadow_record_json {
+                match serde_json::from_str::<Value>(&record_json) {
+                    Ok(record) => {
+                        let key = member_notify_operation_event_key(
+                            "shadow", &sender.plugin_id, op_id
+                        );
+                        match s.chain_store.append_once(
+                            &key,
+                            "member_notice_route_shadow",
+                            record,
+                            &s.sovereign_lct,
+                        ) {
+                            Ok((entry, _)) => {
+                                if let Err(e) = s.inbox_store.set_member_send_shadow_witness(
+                                    &sender.plugin_id,
+                                    op_id,
+                                    &entry.hash,
+                                ) {
+                                    out["f3_shadow_warning"] = json!(format!(
+                                        "operation replay recovered shadow witness {}, but could not persist its retry watermark: {e}",
+                                        entry.hash
+                                    ));
+                                } else {
+                                    out["f3_shadow_witness_hash"] = json!(entry.hash);
+                                }
+                            }
+                            Err(e) => {
+                                out["f3_shadow_warning"] = json!(format!(
+                                    "operation replay recovered delivery, but D2 shadow witness is unavailable: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        out["f3_shadow_warning"] = json!(format!(
+                            "operation replay recovered delivery, but stored D2 shadow evidence is unreadable: {e}"
+                        ));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+    }
+
+    // The second crash boundary: the witness DB may have committed while the
+    // queue/op transaction did not. Recover the FIRST witnessed fact by its
+    // operation key. That fact owns first-session attribution and all evidence
+    // used by the original act; retry resumes its delivery consequence instead
+    // of rebuilding the act under today's mutable state.
+    let operation_witness_key = operation_id.as_deref().map(|op_id| {
+        member_notify_operation_event_key("act", &sender.plugin_id, op_id)
+    });
+    let recovered_operation_witness = match operation_witness_key.as_deref() {
+        Some(key) => s
+            .chain_store
+            .event_by_key(key)
+            .map_err(|e| anyhow::anyhow!("recovering member-notify witness: {e}"))?,
+        None => None,
+    };
+    if let Some(existing) = &recovered_operation_witness {
+        let expected_binding = operation_binding.as_ref().expect("operation binding exists");
+        let recorded_binding = existing.event_data.get("operation_binding");
+        if existing.event_type != "member_notice"
+            || recorded_binding != Some(expected_binding)
+            || existing.event_data.get("from_plugin_id").and_then(Value::as_str)
+                != Some(sender.plugin_id.as_str())
+        {
+            return Ok(hestia_error_envelope(
+                "hestia.member_notify_operation_conflict",
+                "this operation_id already names a different witnessed act; use a new operation_id for a new act",
+                Some(json!({
+                    "operation_id": operation_id,
+                    "witnessEntryHash": existing.hash,
+                })),
+            ));
+        }
+    }
+
     if sender.plugin_id == to_plugin {
         return Ok(hestia_error_envelope(
             "hestia.member_notify_self",
@@ -4640,11 +5358,15 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             None,
         ));
     }
-    // Law-gated: role overlays can deny who may wake whom.
-    if let Some(denied) =
-        gate_direct_tool(&mut s, &sender, "hestia_member_notify", "member_notify", &kind)
-    {
-        return Ok(denied);
+    // Law is evaluated on the first execution. A recovered witnessed
+    // operation already passed the gate before that witness existed; replay is
+    // recovery of its delivery consequence, not a new authorization request.
+    if recovered_operation_witness.is_none() {
+        if let Some(denied) =
+            gate_direct_tool(&mut s, &sender, "hestia_member_notify", "member_notify", &kind)
+        {
+            return Ok(denied);
+        }
     }
     // Structural flood guard (Kimi review 2026-07-24, Findings 2+5): the gate
     // above is law and default-allow on a permissive base; this bound is
@@ -4659,23 +5381,25 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // configuration. Denials are deliberately NOT witnessed per-deny: under
     // flood, per-deny chain writes would turn the guard itself into a
     // chain-growth vector.
-    let flood = s.member_notify_limiter.check(
-        &sender.plugin_id,
-        MEMBER_NOTIFY_MAX_PER_WINDOW,
-        MEMBER_NOTIFY_WINDOW_MS,
-    );
-    if !flood.allowed {
-        return Ok(hestia_error_envelope(
-            "hestia.member_notify_rate_limited",
-            &format!(
-                "sender '{}' exceeded {} notices per {}s — the mesh is a wake channel, \
-                 not a payload channel; batch pointers into one notice",
-                sender.plugin_id,
-                flood.limit,
-                MEMBER_NOTIFY_WINDOW_MS / 1000
-            ),
-            Some(json!({"current": flood.current, "limit": flood.limit})),
-        ));
+    if recovered_operation_witness.is_none() {
+        let flood = s.member_notify_limiter.check(
+            &sender.plugin_id,
+            MEMBER_NOTIFY_MAX_PER_WINDOW,
+            MEMBER_NOTIFY_WINDOW_MS,
+        );
+        if !flood.allowed {
+            return Ok(hestia_error_envelope(
+                "hestia.member_notify_rate_limited",
+                &format!(
+                    "sender '{}' exceeded {} notices per {}s — the mesh is a wake channel, \
+                     not a payload channel; batch pointers into one notice",
+                    sender.plugin_id,
+                    flood.limit,
+                    MEMBER_NOTIFY_WINDOW_MS / 1000
+                ),
+                Some(json!({"current": flood.current, "limit": flood.limit})),
+            ));
+        }
     }
     // You may only answer mail that was addressed to YOU. Without this, any
     // member could mark another member's notice answered and the unanswered
@@ -4687,7 +5411,12 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // A binding to an id that is no longer on record is ACCEPTED, not rejected:
     // notices age out on the TTL, so "not found" means unverifiable, not forged
     // — and `binding_verified` in the witnessed event says which one it was.
-    let mut binding_verified = false;
+    let mut binding_verified = recovered_operation_witness
+        .as_ref()
+        .and_then(|entry| entry.event_data.get("binding_verified"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if recovered_operation_witness.is_none() {
     if let Some(rid) = in_reply_to {
         match s
             .inbox_store
@@ -4742,35 +5471,235 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             }
         }
     }
-    // TRANSPORT BINDING (#1030), resolved for routed sends only, and BEFORE the limiter
-    // records or anything is witnessed as sent. A member bound `direct_required` must sign
-    // its mesh acts as itself and holds no carrier yet, so there is no identity this host may
-    // put on the envelope: the send is refused in the sender's own turn, where it can be
-    // acted on, instead of being queued for a drain that would sign it with somebody else's
-    // key. That silent fallback is the defect this binding exists to end (falsifier 2).
-    let routed = to_plugin.contains('/');
-    let transport_binding = if routed {
+    }
+    // D2d delivery-plane selection happens only AFTER the common law/flood/reply
+    // gates above. A recovered operation uses the FIRST witnessed authority
+    // decision; changing an alias after a crash cannot reroute the retry.
+    let f3_plan = if let Some(existing) = &recovered_operation_witness {
+        match member_notify_f3_plan_from_witness(&existing.event_data) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_f3_recovery_invalid",
+                    &format!("cannot recover the first F3 delivery decision: {e}"),
+                    Some(json!({
+                        "operation_id": operation_id,
+                        "witnessEntryHash": existing.hash,
+                    })),
+                ));
+            }
+        }
+    } else {
+        match member_notify_f3_plan(&s, &sender.plugin_id, &to_plugin) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_delivery_authority_unavailable",
+                    &format!("cannot prove routed delivery authority: {e}"),
+                    Some(json!({"to_plugin_id": to_plugin})),
+                ));
+            }
+        }
+    };
+
+    if let Some(plan) = &f3_plan {
+        if plan.destination_lct == plan.origin_lct {
+            return Ok(hestia_error_envelope(
+                "hestia.member_notify_self",
+                "notifying your own canonical LCT is the same no-op as notifying your plugin id",
+                Some(json!({
+                    "origin_lct": plan.origin_lct,
+                    "destination_lct": plan.destination_lct,
+                })),
+            ));
+        }
+    }
+
+    if f3_plan.is_some() && operation_id.is_none() {
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_f3_operation_id_required",
+            "F3-authoritative member_notify requires caller-stable operation_id.              The same id crosses the legacy compatibility adapter into canonical              route origination so a lost response cannot mint a second packet.",
+            Some(json!({"to_plugin_id": to_plugin, "delivery_authority": "f3"})),
+        ));
+    }
+
+    // TRANSPORT BINDING (#1030), resolved for every non-local send and BEFORE
+    // anything is witnessed as sent. F3 does not erase this authorization layer:
+    // an explicit carrier promise must still match the first-hop router interface.
+    let routed = to_plugin.contains('/') || to_plugin.starts_with("lct:web4:mb32:");
+    let recovered_transport_record = recovered_operation_witness
+        .as_ref()
+        .and_then(|entry| entry.event_data.get("transport").cloned());
+    let transport_binding = if routed && recovered_operation_witness.is_none() {
         s.transport_bindings
             .get(&sender.plugin_id, crate::server::transport_binding::ANY_HUB)
             .cloned()
     } else {
         None
     };
+
+    // D2 SHADOW ONLY. Everything above this point is the SAME legacy pre-route
+    // contract the eventual cutover must preserve: attributed live session, law,
+    // structural flood bound, reply ownership/disposition address, and transport
+    // binding lookup. We compare only the routing/queue decision below.
+    //
+    // Shadow evaluation must never change legacy delivery. A missing/corrupt
+    // routing document, missing alias, or unresolved canonical origin is captured
+    // as evidence and the historical path continues unchanged.
+    let f3_route_shadow: Option<Value> = if let Some(existing) =
+        &recovered_operation_witness
+    {
+        existing.event_data.get("f3_shadow").cloned()
+    } else {
+        to_plugin.contains('/').then(|| {
+        let resolved_origin = s.member_registry.resolve_reference(&sender.plugin_id);
+        let (origin_lct, router_lct, identity_error) = match resolved_origin {
+            Ok(Some(member)) => {
+                let origin_lct = member.lct.lct_id();
+                let parents: Vec<String> = member
+                    .lct
+                    .mrh
+                    .bound
+                    .iter()
+                    .filter(|edge| edge.edge_type == "parent")
+                    .map(|edge| edge.lct_id.clone())
+                    .collect();
+                match parents.as_slice() {
+                    [parent] => (Some(origin_lct), Some(parent.clone()), None),
+                    [] => (
+                        Some(origin_lct),
+                        None,
+                        Some("canonical sender has no parent/router binding".to_string()),
+                    ),
+                    _ => (
+                        Some(origin_lct),
+                        None,
+                        Some(format!(
+                            "canonical sender has {} parent/router bindings; expected exactly one",
+                            parents.len()
+                        )),
+                    ),
+                }
+            }
+            Ok(None) => (
+                None,
+                None,
+                Some("sender has no canonical member LCT".to_string()),
+            ),
+            Err(e) => (
+                None,
+                None,
+                Some(format!("sender canonical identity is ambiguous/invalid: {e}")),
+            ),
+        };
+
+        let Some(router_lct) = router_lct else {
+            return json!({
+                "mode": "shadow",
+                "origin_lct": origin_lct,
+                "legacy_address": to_plugin,
+                "status": "unavailable",
+                "error": identity_error.unwrap_or_else(|| "router identity unavailable".to_string()),
+            });
+        };
+
+        match crate::receiver_routing::ReceiverRoutingTable::load(&s.vault) {
+            Ok(table) => match table.shadow_legacy_route(
+                &s.member_registry,
+                &router_lct,
+                &to_plugin,
+            ) {
+                Ok(shadow) => {
+                    // Resolve the F3 L3 next-hop into the actual Hub member UUID
+                    // the router would use. This is the value D2 can compare with
+                    // legacy hub-notify's measured recipient_lct; comparing the
+                    // canonical router LCT to a Hub UUID would cross namespaces
+                    // and manufacture a mismatch.
+                    let neighbor = match &shadow {
+                        crate::receiver_routing::LegacyRouteShadow::Resolved {
+                            decision: crate::receiver_routing::RouteDecision::Forward {
+                                next_hop_lct,
+                                ..
+                            },
+                            ..
+                        } => match table.neighbor(next_hop_lct) {
+                            Some(n) => json!({
+                                "status": "resolved",
+                                "next_hop_lct": next_hop_lct,
+                                "hub_member_lct": n.next_hop_hub_member_lct,
+                                "link_id": n.link_id,
+                                "interface_binding_id": n.interface_binding_id,
+                            }),
+                            None => json!({
+                                "status": "missing_neighbor",
+                                "next_hop_lct": next_hop_lct,
+                            }),
+                        },
+                        _ => json!({"status": "not_applicable"}),
+                    };
+                    json!({
+                        "mode": "shadow",
+                        "router_lct": router_lct,
+                        "origin_lct": origin_lct,
+                        "legacy_address": to_plugin,
+                        "result": shadow,
+                        "f3_neighbor": neighbor,
+                        "shared_pre_route": {
+                            "sender_plugin_id": sender.plugin_id,
+                            "from_session_id": sender.session_uuid,
+                            "law_gate": "passed",
+                            "flood_guard": "passed",
+                            "reply_binding_verified": binding_verified,
+                        }
+                    })
+                },
+                Err(e) => json!({
+                    "mode": "shadow",
+                    "router_lct": router_lct,
+                    "origin_lct": origin_lct,
+                    "legacy_address": to_plugin,
+                    "status": "unavailable",
+                    "error": format!("route evaluation failed: {e}"),
+                }),
+            },
+            Err(e) => json!({
+                "mode": "shadow",
+                "router_lct": router_lct,
+                "origin_lct": origin_lct,
+                "legacy_address": to_plugin,
+                "status": "unavailable",
+                "error": format!("routing table unavailable: {e}"),
+            }),
+        }
+        })
+    };
+
     if let Some(b) = transport_binding
         .as_ref()
-        .filter(|b| b.mode == crate::server::transport_binding::TransportMode::DirectRequired)
+        .filter(|b| {
+            b.mode == crate::server::transport_binding::TransportMode::DirectRequired
+                && !matches!(
+                    f3_plan.as_ref(),
+                    Some(plan) if plan.authority_source == "canonical_lct"
+                )
+        })
     {
+        let mut refusal_record = json!({
+            "reason": "transport_binding_unmet",
+            "to_plugin_id": to_plugin,
+            "from_plugin_id": sender.plugin_id,
+            "from_role_lct": sender.role_lct,
+            "kind": kind,
+            "transport": b.stamp(),
+            "binding_reason": b.reason,
+            "d2_shadow": true,
+        });
+        if let Some(shadow) = &f3_route_shadow {
+            refusal_record["f3_shadow"] = shadow.clone();
+        }
         let refusal = s.append_chain(
             "member_notice_refused",
-            json!({
-                "reason": "transport_binding_unmet",
-                "to_plugin_id": to_plugin,
-                "from_plugin_id": sender.plugin_id,
-                "from_role_lct": sender.role_lct,
-                "kind": kind,
-                "transport": b.stamp(),
-                "binding_reason": b.reason,
-            }),
+            refusal_record,
         )?;
         return Ok(hestia_error_envelope(
             "hestia.member_notify_transport_unmet",
@@ -4790,15 +5719,50 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             })),
         ));
     }
+    // D2d migration rule: explicit legacy carrier/reply promises survive
+    // cutover. The F3 packet separates actor/origin from router carrier, but an
+    // operator-authored direct/relay binding is still law for WHICH Hub identity
+    // may carry the first hop. If F3 cannot prove the same carrier, refuse.
+    if recovered_operation_witness.is_none() {
+        if let (Some(plan), Some(binding)) = (&f3_plan, &transport_binding) {
+            if let Some(reply_to) = binding
+                .reply_to_lct
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                if reply_to != plan.origin_lct {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_f3_reply_binding_unmet",
+                        "F3 cutover would change the operator-bound reply identity.                          Rebind reply_to_lct to the sender's canonical member LCT                          before moving this edge to F3.",
+                        Some(json!({
+                            "to_plugin_id": to_plugin,
+                            "origin_lct": plan.origin_lct,
+                            "reply_to_lct": reply_to,
+                            "delivery_authority": "f3",
+                        })),
+                    ));
+                }
+            }
+
+        }
+    }
+
     // What the act's record and receipt say about how it will travel: the stamp when bound,
     // the literal "unbound" when routed without a binding, absent when local.
-    let transport_record: Option<Value> = routed.then(|| {
-        transport_binding
-            .as_ref()
-            .map(|b| b.stamp())
-            .unwrap_or_else(|| json!("unbound"))
-    });
-    s.member_notify_limiter.record(&sender.plugin_id);
+    let transport_record: Option<Value> = if recovered_operation_witness.is_some() {
+        recovered_transport_record
+    } else {
+        routed.then(|| {
+            transport_binding
+                .as_ref()
+                .map(|b| b.stamp())
+                .unwrap_or_else(|| json!("unbound"))
+        })
+    };
+    if recovered_operation_witness.is_none() {
+        s.member_notify_limiter.record(&sender.plugin_id);
+    }
     // What is known about the recipient's reachability, resolved BEFORE the
     // witness so the chain entry carries it (an act's record must include the
     // evidence relied upon — CLAUDE.md clause A). Same shape as
@@ -4807,113 +5771,543 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
     // relocate the failure rather than remove it (a member setting up a new
     // watcher would be silenced by the bookkeeping, which is the
     // `unbound_notice` argument verbatim).
-    let (liveness, liveness_evidence) = recipient_liveness(&s.inbox_store, &to_plugin);
+    let (liveness, liveness_evidence) = if let Some(existing) =
+        &recovered_operation_witness
+    {
+        (
+            existing
+                .event_data
+                .get("recipient_liveness")
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable")
+                .to_string(),
+            existing
+                .event_data
+                .get("recipient_liveness_evidence")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+    } else {
+        let (state, evidence) = recipient_liveness(&s.inbox_store, &to_plugin);
+        (state.to_string(), evidence)
+    };
+
     // Witness FIRST (the act is the send; delivery is a consequence), then queue
     // with the chain hash so every parked notice is anchored to its witnessed act.
-    let mut notice_record = json!({
+    // A half-commit retry reuses the exact first witness and therefore its first
+    // session/role/evidence rather than rewriting history with the retrying session.
+    let effective_from_role = recovered_operation_witness
+        .as_ref()
+        .and_then(|entry| entry.event_data.get("from_role_lct"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| sender.role_lct.clone());
+    let effective_from_session = recovered_operation_witness
+        .as_ref()
+        .and_then(|entry| entry.event_data.get("from_session_id"))
+        .cloned()
+        .unwrap_or_else(|| json!(sender.session_uuid));
+
+    let mut notice_record = if let Some(existing) = &recovered_operation_witness {
+        existing.event_data.clone()
+    } else {
+        json!({
+            "to_plugin_id": to_plugin,
+            "from_plugin_id": sender.plugin_id,
+            "from_role_lct": effective_from_role,
+            "from_session_id": effective_from_session,
+            "kind": kind,
+            "pointer_uri": pointer_uri,
+            "in_reply_to": in_reply_to,
+            "binding_verified": binding_verified,
+            "recipient_liveness": liveness,
+            "recipient_liveness_evidence": liveness_evidence,
+        })
+    };
+    if recovered_operation_witness.is_none() {
+        if let Some(t) = &transport_record {
+            notice_record["transport"] = t.clone();
+        }
+        if let Some(shadow) = &f3_route_shadow {
+            notice_record["f3_shadow"] = shadow.clone();
+            notice_record["d2_shadow"] = json!(true);
+        }
+        if let Some(plan) = &f3_plan {
+            notice_record["delivery_authority"] = json!("f3");
+            notice_record["f3_origin_lct"] = json!(plan.origin_lct);
+            notice_record["f3_router_lct"] = json!(plan.router_lct);
+            notice_record["f3_destination_lct"] = json!(plan.destination_lct);
+            notice_record["f3_authority_source"] = json!(plan.authority_source);
+            notice_record["f3_authority_reason"] = json!(plan.authority_reason);
+            notice_record["f3_expected_carrier_lct"] = transport_record
+                .as_ref()
+                .and_then(|v| v.get("carrier_lct"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            notice_record["d2_migration_rule"] = json!(
+                "F3 strengthens legacy Hub acceptance to witnessed local delivery or durable next-hop mailbox acceptance"
+            );
+        } else if routed {
+            notice_record["delivery_authority"] = json!("legacy");
+        }
+        if let (Some(op_id), Some(binding)) = (&operation_id, &operation_binding) {
+            notice_record["operation_id"] = json!(op_id);
+            notice_record["operation_binding"] = binding.clone();
+        }
+    }
+
+    let entry = if let Some(existing) = recovered_operation_witness.clone() {
+        existing
+    } else if let Some(key) = operation_witness_key.as_deref() {
+        s.chain_store
+            .append_once(key, "member_notice", notice_record, &s.sovereign_lct)
+            .map_err(|e| anyhow::anyhow!("witnessing operation-keyed member notice: {e}"))?
+            .0
+    } else {
+        s.append_chain("member_notice", notice_record)?
+    };
+
+    // Build the first receipt BEFORE queue admission. Operation-keyed queue
+    // methods add queued_id/egress_queued_to and persist this receipt in the SAME
+    // transaction as admission, so a lost response can be reproduced exactly.
+    let mut response_template = json!({
+        "witnessEntryHash": entry.hash,
         "to_plugin_id": to_plugin,
-        "from_plugin_id": sender.plugin_id,
-        "from_role_lct": sender.role_lct,
-        "from_session_id": sender.session_uuid,
         "kind": kind,
-        "pointer_uri": pointer_uri,
         "in_reply_to": in_reply_to,
         "binding_verified": binding_verified,
         "recipient_liveness": liveness,
         "recipient_liveness_evidence": liveness_evidence,
     });
-    if let Some(t) = &transport_record {
-        notice_record["transport"] = t.clone();
+    if let Some(op_id) = &operation_id {
+        response_template["operation_id"] = json!(op_id);
+        response_template["replayed"] = json!(recovered_operation_witness.is_some());
     }
-    let entry = s.append_chain("member_notice", notice_record)?;
-    // ---- r6-routing branch 2: is it for someone I know? then forward ------------
-    // `peer/member` addresses a member on ANOTHER machine. A bare id stays local,
-    // so no existing caller changes. Explicit rather than inferred: the sender
-    // states the scale it is crossing, and `/` is the fractal seam made syntactic.
+    if let Some(note) = liveness_note(&liveness, &to_plugin) {
+        response_template["recipient_note"] = json!(note);
+    }
+    if let Some(plan) = &f3_plan {
+        response_template["delivery_authority"] = json!("f3");
+        response_template["canonical_destination_lct"] = json!(plan.destination_lct);
+        response_template["acceptance_semantics"] = json!(
+            "witnessed local delivery or durable next-hop mailbox acceptance; not end-recipient read"
+        );
+        response_template["migration_rule"] = json!(
+            "intentional strengthening from legacy Hub witnessed/accepted semantics"
+        );
+    } else if routed {
+        response_template["delivery_authority"] = json!("legacy");
+    }
+
+    if let Some(t) = &transport_record {
+        if *t == json!("unbound") {
+            response_template["transport_note"] = json!(
+                "no transport binding: the forwarding drain chooses which hub identity signs                  this notice, and a reply follows THAT identity, so it may not come back to                  you. See hestia_transport_binding."
+            );
+        }
+        response_template["transport"] = t.clone();
+    }
+    if in_reply_to.is_none() && kind_under(MEMBER_KINDS_ARE_DISPOSITIONS, &kind) {
+        response_template["unbound_notice"] = json!(format!(
+            "kind '{kind}' is a disposition — pass in_reply_to:<notice id> so the notice              it answers stops counting as unanswered"
+        ));
+    }
+
+    // D2d CUTOVER. Everything before this branch is the shared contract:
+    // live attribution, law, structural flood guard, reply ownership/addressing,
+    // transport binding, liveness evidence, and the application-level member_notice
+    // witness. Only the DELIVERY CONSEQUENCE changes here.
     //
-    // SPLIT-HORIZON, not TTL. Only a notice from a LOCAL sender is egressed, so a
-    // packet that arrived from outside can never be forwarded back outside. Thor
-    // refuted the per-packet hop counter this proposal originally carried — a bound
-    // the sender writes is not a bound. Sender identity here is
-    // transport-authenticated, so the loop bound contains no forgeable field.
-    // Cost: no third-party transit in v1. Deliberate.
+    // Critically, no Hub I/O happens while SharedState is locked. Vault::reopen()
+    // snapshots the durable authority/credential documents; inbox + chain are Arc
+    // stores with their own internal serialization.
+    if let Some(plan) = f3_plan.clone() {
+        let op_id = operation_id
+            .clone()
+            .expect("F3 plan is refused above without operation_id");
+        let expected_carrier = transport_record
+            .as_ref()
+            .and_then(|v| v.get("carrier_lct"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let vault = match s.vault.reopen() {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_f3_vault_unavailable",
+                    &format!("cannot snapshot F3 routing authority: {e}"),
+                    Some(json!({
+                        "operation_id": op_id,
+                        "witnessEntryHash": entry.hash,
+                    })),
+                ));
+            }
+        };
+
+        // Native canonical addressing can still resolve to a directly-connected
+        // child. direct_required means no carrier may sign this member's routed
+        // traffic, not that canonical syntax is forbidden. Decide against the SAME
+        // immutable vault snapshot D1 receives below: local delivery is allowed;
+        // an actual Forward is refused before packet origination/network I/O.
+        if transport_record
+            .as_ref()
+            .and_then(|v| v.get("mode"))
+            .and_then(Value::as_str)
+            == Some("direct_required")
+        {
+            let routes = match crate::receiver_routing::ReceiverRoutingTable::load(&vault) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_f3_vault_unavailable",
+                        &format!("cannot read F3 routes for direct_required check: {e}"),
+                        Some(json!({"operation_id": op_id})),
+                    ));
+                }
+            };
+            let registry = crate::member_registry::load_members(&vault);
+            let decision = match crate::receiver_routing::decide_route(
+                &registry,
+                &routes,
+                &plan.router_lct,
+                &plan.destination_lct,
+                &crate::receiver_routing::RouteTrace::fresh(&routes),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok(hestia_error_envelope(
+                        "hestia.member_notify_f3_route_unavailable",
+                        &format!("cannot decide F3 route under direct_required: {e}"),
+                        Some(json!({"operation_id": op_id})),
+                    ));
+                }
+            };
+            if let crate::receiver_routing::RouteDecision::Forward {
+                next_hop_lct,
+                ..
+            } = &decision
+            {
+                let refusal_key = member_notify_operation_event_key(
+                    "refusal-f3-direct-required",
+                    &sender.plugin_id,
+                    &op_id,
+                );
+                let refusal = s.chain_store.append_once(
+                    &refusal_key,
+                    "member_notice_refused",
+                    json!({
+                        "reason": "transport_binding_unmet",
+                        "delivery_authority": "f3",
+                        "operation_id": op_id,
+                        "to_plugin_id": to_plugin,
+                        "canonical_destination_lct": plan.destination_lct,
+                        "from_plugin_id": sender.plugin_id.clone(),
+                        "origin_lct": plan.origin_lct,
+                        "router_lct": plan.router_lct,
+                        "next_hop_lct": next_hop_lct,
+                        "transport": transport_record,
+                        "member_notice_witness": entry.hash.clone(),
+                    }),
+                    &s.sovereign_lct,
+                )?.0;
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_transport_unmet",
+                    "this sender is bound direct_required and the canonical F3 destination currently requires a network hop. No route packet was originated. This operation has already frozen the direct_required transport fact: retry the SAME operation_id only if the destination becomes directly local. If you bind a carrier, issue a NEW operation_id so the new act can witness the new transport binding.",
+                    Some(json!({
+                        "operation_id": op_id,
+                        "delivery_authority": "f3",
+                        "canonical_destination_lct": plan.destination_lct,
+                        "next_hop_lct": next_hop_lct,
+                        "witnessEntryHash": entry.hash.clone(),
+                        "refusalEntryHash": refusal.hash,
+                    })),
+                ));
+            }
+        }
+
+        let inbox = std::sync::Arc::clone(&s.inbox_store);
+        let chain = std::sync::Arc::clone(&s.chain_store);
+        let sovereign_lct = s.sovereign_lct.clone();
+        let sender_plugin_id = sender.plugin_id.clone();
+        let member_notice_hash = entry.hash.clone();
+        let pointer = pointer_uri
+            .as_deref()
+            .expect("member_notify pointer was validated above")
+            .to_string();
+        let route_kind = kind.clone();
+        let content_hash = format!(
+            "sha256-pointer:{}",
+            web4_core::sha256_hex(pointer.as_bytes())
+        );
+        let cutover_event_key = member_notify_operation_event_key(
+            "f3-delivery",
+            &sender_plugin_id,
+            &op_id,
+        );
+        let was_recovered = recovered_operation_witness.is_some();
+
+        // Release the daemon-wide state mutex before any network operation.
+        drop(s);
+
+        let route = match crate::router_forwarder::originate_once_constrained(
+            &vault,
+            &plan.router_lct,
+            &plan.origin_lct,
+            &plan.destination_lct,
+            &route_kind,
+            &pointer,
+            &content_hash,
+            &op_id,
+            inbox.as_ref(),
+            chain.as_ref(),
+            expected_carrier.as_deref(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_f3_incomplete",
+                    &format!(
+                        "F3 delivery did not cross a durable completion boundary yet: {e}. \
+                         Retry with the SAME operation_id; D1 will resume the same packet."
+                    ),
+                    Some(json!({
+                        "operation_id": op_id,
+                        "delivery_authority": "f3",
+                        "canonical_destination_lct": plan.destination_lct,
+                        "witnessEntryHash": member_notice_hash,
+                        "retry": "same_operation_id",
+                    })),
+                ));
+            }
+        };
+
+        let accepted = matches!(
+            route.outcome.as_str(),
+            "destination_local" | "next_hop_durable"
+        );
+        let evidence = json!({
+            "protocol": "hestia-member-notify-f3-cutover-v1",
+            "operation_id": op_id,
+            "from_plugin_id": sender_plugin_id,
+            "member_notice_witness": member_notice_hash,
+            "requested_address": to_plugin,
+            "origin_lct": plan.origin_lct,
+            "router_lct": plan.router_lct,
+            "destination_lct": plan.destination_lct,
+            "authority_source": plan.authority_source,
+            "authority_reason": plan.authority_reason,
+            "expected_carrier_lct": expected_carrier,
+            "transport": transport_record.clone().unwrap_or_else(|| json!("unbound")),
+            "route_packet_id": route.packet_id,
+            "route_outcome": route.outcome,
+            "route_completion_kind": route.completion_kind,
+            "route_completion_witness_hash": route.completion_witness_hash,
+            "accepted": accepted,
+            "acceptance_semantics":
+                "witnessed local delivery or durable next-hop mailbox acceptance; not end-recipient read",
+            "migration_rule":
+                "F3 intentionally strengthens legacy Hub witnessed/accepted semantics",
+        });
+        let cutover_witness = chain.append_once(
+            &cutover_event_key,
+            "member_notice_f3_delivery",
+            evidence,
+            &sovereign_lct,
+        );
+
+        let cutover_witness_hash = match cutover_witness {
+            Ok((entry, _)) => Some(entry.hash),
+            Err(e) => {
+                // Delivery may already be durably accepted. Do not lie that the
+                // send failed and invite a new operation id; return the acceptance
+                // plus an explicit evidence warning.
+                let mut out = response_template.clone();
+                out["operation_id"] = json!(op_id);
+                out["replayed"] = json!(route.replayed || was_recovered);
+                out["f3_packet_id"] = json!(route.packet_id);
+                out["f3_outcome"] = json!(route.outcome);
+                out["f3_completion_kind"] = json!(route.completion_kind);
+                out["f3_completion_witness_hash"] = json!(route.completion_witness_hash);
+                out["f3_cutover_witness_warning"] = json!(format!(
+                    "delivery crossed its durable F3 boundary but cutover evidence could not be appended: {e}"
+                ));
+                if accepted {
+                    return Ok(out);
+                }
+                return Ok(hestia_error_envelope(
+                    "hestia.member_notify_f3_unreachable",
+                    "F3 completed with an unreachable outcome; the sender's application act \
+                     is witnessed, but the destination was not durably accepted.",
+                    Some(out),
+                ));
+            }
+        };
+
+        let mut out = response_template;
+        out["operation_id"] = json!(op_id);
+        out["replayed"] = json!(route.replayed || was_recovered);
+        out["f3_packet_id"] = json!(route.packet_id);
+        out["f3_outcome"] = json!(route.outcome);
+        out["f3_completion_kind"] = json!(route.completion_kind);
+        out["f3_completion_witness_hash"] = json!(route.completion_witness_hash);
+        out["f3_cutover_witness_hash"] = json!(cutover_witness_hash);
+        out["egress_queued_to"] = Value::Null;
+        out["queued_id"] = Value::Null;
+
+        if accepted {
+            return Ok(out);
+        }
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_f3_unreachable",
+            "F3 completed with an unreachable outcome; no legacy egress row was created. \
+             This is the cutover contract: one delivery authority, never fallback-after-failure.",
+            Some(out),
+        ));
+    }
+
+    // Legacy-authoritative peer/member delivery. F3 shadow remains observation
+    // only on this branch; there is never a fallback from an F3-authoritative
+    // attempt into this queue.
     let egress_peer = to_plugin.split_once('/').map(|(peer, _)| peer.to_string());
+    let shadow_template = if let (Some(peer), Some(shadow)) = (&egress_peer, &f3_route_shadow) {
+        Some(json!({
+            "legacy_member_notice": entry.hash,
+            "legacy_outcome": "egress_queued",
+            // The operation-keyed storage transaction fills this with the row id.
+            "legacy_egress_row_id": Value::Null,
+            "legacy_dest_peer": peer,
+            "legacy_address": to_plugin,
+            "from_plugin_id": sender.plugin_id,
+            "from_role_lct": effective_from_role,
+            "from_session_id": effective_from_session,
+            "kind": kind,
+            "pointer_uri": pointer_uri,
+            "in_reply_to": in_reply_to,
+            "binding_verified": binding_verified,
+            "recipient_liveness": liveness,
+            "transport": transport_record.clone().unwrap_or_else(|| json!("unbound")),
+            "f3_shadow": shadow,
+            "delivery_authority": "legacy",
+        }))
+    } else {
+        None
+    };
+
+    let mut operation_result: Option<crate::storage::inbox::MemberSendOperation> = None;
     let queued_id = match &egress_peer {
         Some(peer) => {
             let remote_member = to_plugin.split_once('/').map(|(_, m)| m).unwrap_or("");
             if peer.is_empty() || remote_member.is_empty() {
                 return Ok(hestia_error_envelope(
                     "hestia.member_notify_bad_address",
-                    "a routed address is `peer/member`; both halves must be non-empty",
+                    "a routed address is peer/member; both halves must be non-empty",
                     Some(json!({ "to_plugin_id": to_plugin })),
                 ));
             }
-            // The egress plane's admission bound (`MAX_EGRESS_QUEUE`) refuses rather
-            // than evicting: a parked forward has no report path on this branch, so
-            // dropping one is a silent loss, while refusing the newest send reaches a
-            // caller who is live and holds the receipt. Named error, not a bare
-            // anyhow — "the forwarding plane is backed up" is a fact the sender can
-            // act on (and it says how backed up).
-            match s.inbox_store.enqueue_egress(
-                peer,
-                remote_member,
-                &sender.plugin_id,
-                &sender.role_lct,
-                &kind,
-                pointer_uri.as_deref(),
-                &entry.hash,
-            ) {
+
+            let operation_attempt = if let (Some(op_id), Some(binding_json)) =
+                (operation_id.as_deref(), operation_binding_json.as_deref())
+            {
+                let frozen_stamp = transport_record
+                    .as_ref()
+                    .filter(|v| v.is_object())
+                    .map(Value::to_string);
+                Some(s.inbox_store.enqueue_egress_operation(
+                    &sender.plugin_id,
+                    op_id,
+                    binding_json,
+                    peer,
+                    remote_member,
+                    &sender.plugin_id,
+                    &effective_from_role,
+                    &kind,
+                    pointer_uri.as_deref(),
+                    &entry.hash,
+                    frozen_stamp.as_deref(),
+                    &response_template,
+                    shadow_template.as_ref(),
+                ))
+            } else {
+                None
+            };
+
+            let admission = match operation_attempt {
+                Some(result) => result.map(|op| {
+                    let id = op.queued_id.expect("queued operation carries a row id");
+                    operation_result = Some(op);
+                    id
+                }),
+                None => s.inbox_store.enqueue_egress(
+                    peer,
+                    remote_member,
+                    &sender.plugin_id,
+                    &effective_from_role,
+                    &kind,
+                    pointer_uri.as_deref(),
+                    &entry.hash,
+                ),
+            };
+
+            match admission {
                 Ok(id) => {
-                    // Stamped under the same server lock as the enqueue, so no drainer can
-                    // list the row between the two writes. If the stamp write itself fails
-                    // the row is left unstamped while its sender IS bound, which the list
-                    // arm reads as a changed binding and fails toward the sender, so the
-                    // error below cannot become a seat-signed send.
-                    if let Some(b) = &transport_binding {
-                        s.inbox_store
-                            .set_egress_transport_stamp(id, &b.stamp().to_string())
-                            .map_err(|e| anyhow::anyhow!("stamping egress row {id} with its transport binding: {e}"))?;
+                    // No-key legacy sends preserve the historical separate stamp
+                    // write. Keyed sends froze the stamp inside the queue/op
+                    // transaction above.
+                    if operation_id.is_none() {
+                        if let Some(b) = &transport_binding {
+                            s.inbox_store
+                                .set_egress_transport_stamp(id, &b.stamp().to_string())
+                                .map_err(|e| anyhow::anyhow!(
+                                    "stamping egress row {id} with its transport binding: {e}"
+                                ))?;
+                        }
                     }
                     id
                 }
                 Err(e) => {
-                    // The refusal gets its OWN chain entry (McNugget T3 on `17a928d`).
-                    // The witness above says `member_notice` and reads, to any third
-                    // party, as an accepted send — the chain cannot distinguish "queued"
-                    // from "refused" without this. The envelope used to assert "the
-                    // refusal is on record too" while appending nothing, which made the
-                    // one path built to keep backpressure attributable the one path that
-                    // left no evidence, and made the claim in its own error text false.
-                    // Appending here rather than moving the witness below the queue
-                    // decision keeps the existing shape deliberate — the act IS the send,
-                    // delivery is a consequence — and `witnessed_entry` joins the two.
-                    //
-                    // Cheap under flood by construction: this fires only when admission
-                    // is REFUSED, i.e. at most once per send that produced no row, and
-                    // the refusal is what a flooding sender is already being told to stop
-                    // doing. That is the opposite of the eviction-counter case, which is
-                    // a mark rather than a witness precisely because evictions happen at
-                    // flood rates.
                     let depth = s.inbox_store.egress_queued().unwrap_or(0);
-                    let refusal = s.append_chain(
-                        "member_notice_refused",
-                        json!({
-                            "reason": "egress_queue_full",
-                            "to_plugin_id": to_plugin,
-                            "dest_peer": peer,
-                            "from_plugin_id": sender.plugin_id,
-                            "from_role_lct": sender.role_lct,
-                            "egress_queued": depth,
-                            // the `member_notice` entry this refusal voids
-                            "witnessed_entry": entry.hash,
-                        }),
-                    )?;
+                    let mut refusal_record = json!({
+                        "reason": "egress_queue_full",
+                        "to_plugin_id": to_plugin,
+                        "dest_peer": peer,
+                        "from_plugin_id": sender.plugin_id,
+                        "from_role_lct": effective_from_role,
+                        "egress_queued": depth,
+                        "d2_shadow": true,
+                        "witnessed_entry": entry.hash,
+                    });
+                    if let Some(shadow) = &f3_route_shadow {
+                        refusal_record["f3_shadow"] = shadow.clone();
+                    }
+                    if let Some(op_id) = &operation_id {
+                        refusal_record["operation_id"] = json!(op_id);
+                    }
+
+                    let refusal = if let Some(op_id) = &operation_id {
+                        let key = member_notify_operation_event_key(
+                            "refusal-egress-queue-full", &sender.plugin_id, op_id
+                        );
+                        if let Some(existing) = s.chain_store.event_by_key(&key)? {
+                            existing
+                        } else {
+                            s.chain_store
+                                .append_once(
+                                    &key,
+                                    "member_notice_refused",
+                                    refusal_record,
+                                    &s.sovereign_lct,
+                                )?
+                                .0
+                        }
+                    } else {
+                        s.append_chain("member_notice_refused", refusal_record)?
+                    };
                     return Ok(hestia_error_envelope(
                         "hestia.member_notify_egress_queue_full",
                         &format!(
-                            "the forwarding plane is not draining, so this notice was \
-                             NOT queued: {e}. Both the act and its refusal are on the \
-                             chain — see witnessEntryHash and refusalEntryHash."
+                            "the forwarding plane is not draining, so this notice was                              NOT queued: {e}. Both the act and its refusal are on the                              chain — see witnessEntryHash and refusalEntryHash."
                         ),
                         Some(json!({
                             "to_plugin_id": to_plugin,
@@ -4921,76 +6315,149 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
                             "egress_queued": depth,
                             "witnessEntryHash": entry.hash,
                             "refusalEntryHash": refusal.hash,
+                            "operation_id": operation_id,
                         })),
                     ));
                 }
             }
         }
-        None => s
-            .inbox_store
-            .enqueue_member(
-                &to_plugin,
-                &sender.plugin_id,
-                &sender.role_lct,
-                &kind,
-                pointer_uri.as_deref(),
-                &entry.hash,
-                in_reply_to,
-            )
-            .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?,
-    };
-    let mut out = json!({
-        "queued_id": queued_id,
-        "witnessEntryHash": entry.hash,
-        "to_plugin_id": to_plugin,
-        // `egress_queued_to` present => this took the forwarding branch (branch 2)
-        // and its `queued_id` is an EGRESS row, not a local inbox row. Absent =>
-        // local. Naming which branch fired is the point: a receipt that cannot say
-        // how it was routed is the black hole with a success code.
-        //
-        // Was `forwarded_to` until 2026-07-27 (Kimi, notice 123 §3). At this line
-        // nothing has been forwarded: the row is parked for a drain that runs when
-        // it runs, against a hub that may be down. The commit that shipped the field
-        // named the distinction in its own message — "'the mesh accepted it' and
-        // 'the recipient read it' are different facts" — and then gave the field the
-        // name of the fact it was warning about. This thread is the one about
-        // receipts that overclaim; a receipt is exactly where the overclaim does its
-        // damage, because it is the only artifact the sender keeps.
-        "egress_queued_to": egress_peer,
-        "kind": kind,
-        "in_reply_to": in_reply_to,
-        "binding_verified": binding_verified,
-        // The send still succeeds and still returns a queued_id; it just stops
-        // reading like uniform success. `queued` never meant `delivered`, and
-        // until now nothing in the receipt said so.
-        "recipient_liveness": liveness,
-        "recipient_liveness_evidence": liveness_evidence,
-    });
-    if let Some(note) = liveness_note(liveness, &to_plugin) {
-        out["recipient_note"] = json!(note);
-    }
-    // How the act will travel, told to the author at the moment it acts (#1030 falsifier 9).
-    // Unbound is reported, not refused: every seat on the fleet mesh is unbound today, and
-    // enforcement arrives per member, by binding.
-    if let Some(t) = transport_record {
-        if t == json!("unbound") {
-            out["transport_note"] = json!(
-                "no transport binding: the forwarding drain chooses which hub identity signs \
-                 this notice, and a reply follows THAT identity, so it may not come back to \
-                 you. See hestia_transport_binding."
-            );
+        None => {
+            if let (Some(op_id), Some(binding_json)) =
+                (operation_id.as_deref(), operation_binding_json.as_deref())
+            {
+                let op = s.inbox_store.enqueue_member_operation(
+                    &sender.plugin_id,
+                    op_id,
+                    binding_json,
+                    &to_plugin,
+                    &sender.plugin_id,
+                    &effective_from_role,
+                    &kind,
+                    pointer_uri.as_deref(),
+                    &entry.hash,
+                    in_reply_to,
+                    &response_template,
+                    None,
+                ).map_err(|e| anyhow::anyhow!("queueing operation-keyed member notice: {e}"))?;
+                let id = op.queued_id.expect("queued operation carries a row id");
+                operation_result = Some(op);
+                id
+            } else {
+                s.inbox_store
+                    .enqueue_member(
+                        &to_plugin,
+                        &sender.plugin_id,
+                        &effective_from_role,
+                        &kind,
+                        pointer_uri.as_deref(),
+                        &entry.hash,
+                        in_reply_to,
+                    )
+                    .map_err(|e| anyhow::anyhow!("queueing member notice: {e}"))?
+            }
         }
-        out["transport"] = t;
+    };
+
+    let mut f3_shadow_witness_hash: Option<String> = None;
+    let mut f3_shadow_warning: Option<String> = None;
+    if let (Some(_peer), Some(shadow)) = (&egress_peer, &f3_route_shadow) {
+        if let (Some(op_id), Some(op)) = (operation_id.as_deref(), operation_result.as_mut()) {
+            // For a keyed send the exact shadow record (including the egress
+            // row id) was persisted atomically with queue admission.
+            if let Some(hash) = &op.shadow_witness_hash {
+                f3_shadow_witness_hash = Some(hash.clone());
+            } else if let Some(record_json) = &op.shadow_record_json {
+                match serde_json::from_str::<Value>(record_json) {
+                    Ok(record) => {
+                        let key = member_notify_operation_event_key(
+                            "shadow", &sender.plugin_id, op_id
+                        );
+                        match s.chain_store.append_once(
+                            &key,
+                            "member_notice_route_shadow",
+                            record,
+                            &s.sovereign_lct,
+                        ) {
+                            Ok((witness, _)) => {
+                                match s.inbox_store.set_member_send_shadow_witness(
+                                    &sender.plugin_id,
+                                    op_id,
+                                    &witness.hash,
+                                ) {
+                                    Ok(()) => {
+                                        op.shadow_witness_hash = Some(witness.hash.clone());
+                                        f3_shadow_witness_hash = Some(witness.hash);
+                                    }
+                                    Err(e) => {
+                                        f3_shadow_warning = Some(format!(
+                                            "legacy send queued and D2 shadow witnessed, but its retry watermark could not be persisted: {e}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                f3_shadow_warning = Some(format!(
+                                    "legacy send queued, but D2 parity witness could not be written: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        f3_shadow_warning = Some(format!(
+                            "legacy send queued, but its persisted D2 shadow record is unreadable: {e}"
+                        ));
+                    }
+                }
+            }
+        } else {
+            let record = json!({
+                "legacy_member_notice": entry.hash,
+                "legacy_outcome": "egress_queued",
+                "legacy_egress_row_id": queued_id,
+                "legacy_dest_peer": egress_peer,
+                "legacy_address": to_plugin,
+                "from_plugin_id": sender.plugin_id,
+                "from_role_lct": effective_from_role,
+                "from_session_id": effective_from_session,
+                "kind": kind,
+                "pointer_uri": pointer_uri,
+                "in_reply_to": in_reply_to,
+                "binding_verified": binding_verified,
+                "recipient_liveness": liveness,
+                "transport": transport_record.clone().unwrap_or_else(|| json!("unbound")),
+                "f3_shadow": shadow,
+                "delivery_authority": "legacy",
+            });
+            match s.append_chain("member_notice_route_shadow", record) {
+                Ok(witness) => f3_shadow_witness_hash = Some(witness.hash),
+                Err(e) => {
+                    f3_shadow_warning = Some(format!(
+                        "legacy send queued, but D2 parity witness could not be written: {e}"
+                    ));
+                }
+            }
+        }
     }
-    // Nudge, not a gate: for the two kinds whose disposition IS a response, an
-    // unbound send is what leaves the sender's notice sitting "unanswered"
-    // forever. Refusing it would be worse — a member with something to say and
-    // a lost id would be silenced by the bookkeeping.
-    if in_reply_to.is_none() && kind_under(MEMBER_KINDS_ARE_DISPOSITIONS, &kind) {
-        out["unbound_notice"] = json!(format!(
-            "kind '{kind}' is a disposition — pass in_reply_to:<notice id> so the notice \
-             it answers stops counting as unanswered"
-        ));
+
+    let mut out = if let Some(op) = &operation_result {
+        op.response_json.clone()
+    } else {
+        let mut response = response_template;
+        response["queued_id"] = json!(queued_id);
+        response["egress_queued_to"] = match &egress_peer {
+            Some(peer) => json!(peer),
+            None => Value::Null,
+        };
+        response
+    };
+    if let Some(op_id) = &operation_id {
+        out["operation_id"] = json!(op_id);
+    }
+    if let Some(hash) = f3_shadow_witness_hash {
+        out["f3_shadow_witness_hash"] = json!(hash);
+    }
+    if let Some(warning) = f3_shadow_warning {
+        out["f3_shadow_warning"] = json!(warning);
     }
     Ok(out)
 }
@@ -5482,6 +6949,189 @@ async fn tool_transport_binding(state: &SharedState, args: &Value) -> ToolResult
     Ok(out)
 }
 
+/// `hestia_channel_send` (#1344, slice 1, SHADOW): a member's message to a channel the operator
+/// bound for it. Judged and recorded exactly as it would be enforced; NOTHING LEAVES THE MACHINE.
+/// The order is the contract (`server::channel`): attribute, binding, gate on the binding's
+/// target, innate secret sweep, unanswered budget, record (chain row, then outbox row).
+async fn tool_channel_send(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::channel::{forbidden_token, window, MAX_CONTENT_CHARS, UNANSWERED_LIMIT};
+    let channel_id = require_string(args, "channel_id")?.trim().to_string();
+    let content = require_string(args, "content")?;
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unattributed",
+            "hestia_channel_send requires your own live session_id (from hestia_connect): a message \
+             is sent as the member who asked, so the member must be known",
+            None,
+        ));
+    };
+    // A DIFFERENT CODE FROM AN UNKNOWN SESSION (SAGE #529 review): a caller reconnects once on
+    // `channel_unattributed`, which cures a stale session and nothing else. A member with no
+    // member LCT stays one after a reconnect, so it must not share the code a retry keys on.
+    let Some(member_lct) = s.member_lct(&who.plugin_id) else {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_no_member_lct",
+            "this member has no member LCT, so its sends cannot be counted against it; nothing \
+             was recorded, and reconnecting will not change that",
+            None,
+        ));
+    };
+    // 2. THE BINDING. The recipient is the operator's choice, never the member's.
+    let Some(binding) = s.channel_bindings.get(&who.plugin_id, &channel_id).cloned() else {
+        let bound: Vec<String> =
+            s.channel_bindings.for_member(&who.plugin_id).iter().map(|b| b.channel_id.clone()).collect();
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unbound",
+            &if bound.is_empty() {
+                format!("no channel '{channel_id}' is bound for you, and you have no bound channels \
+                         yet. A channel is bound by the operator; nothing was sent or recorded.")
+            } else {
+                format!("no channel '{channel_id}' is bound for you. Your bound channels: {}. \
+                         Nothing was sent or recorded.", bound.join(", "))
+            },
+            Some(json!({"bound_channels": bound})),
+        ));
+    };
+    // 3. THE GATE, on the target built from the binding alone.
+    let target = binding.target();
+    if let Some(denied) = gate_direct_tool(&mut s, &who, "hestia_channel_send", "channel_egress", &target) {
+        return Ok(denied);
+    }
+    let chars = content.chars().count();
+    if chars == 0 || chars > MAX_CONTENT_CHARS {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_content_size",
+            &format!("a message is 1 to {MAX_CONTENT_CHARS} characters; this one is {chars}. Nothing \
+                      was sent or recorded."),
+            None,
+        ));
+    }
+    let base = json!({
+        "member": who.plugin_id, "member_lct": member_lct, "role_lct": who.role_lct,
+        "session_id": who.session_uuid, "channel_id": binding.channel_id,
+        "recipient_class": binding.recipient_class, "target": target,
+        "binding_version": binding.version, "shadow": true,
+    });
+    // 4. THE INNATE SECRET SWEEP. The deny and its rule are recorded; the content is not, and
+    // neither is its hash (#1344 amendment: no content_sha256 on a secret-denied row).
+    if let Some(tok) = forbidden_token(&content) {
+        let mut row = base.clone();
+        row["decision"] = json!("deny");
+        row["rule"] = json!("egress.secret");
+        row["innate"] = json!(true);
+        let entry = s.append_chain("channel_send", row)?;
+        return Ok(hestia_error_envelope(
+            "hestia.channel_secret",
+            &format!("not sent: the message names '{tok}', a credential or secret path, and that \
+                      never leaves this machine. The refusal is recorded; the message is not."),
+            Some(json!({"rule": "egress.secret", "witnessEntryHash": entry.hash})),
+        ));
+    }
+    // 5. THE UNANSWERED BUDGET, counted from the outbox rows of the current clock hour.
+    let now = crate::server::gate_escalation::now_secs();
+    let (start, resets_at) = window(now);
+    // THE SENDER AND ITS ALIASES SHARE ONE BUDGET: a count keyed on one spelling of the member
+    // would give each alias its own three (a name-gate failing open; see member_presence_census).
+    let unanswered: Vec<_> = s
+        .inbox_store
+        .channel_unanswered_on_channel(&binding.channel_id, start)?
+        .into_iter()
+        .filter(|r| r.member == who.plugin_id || s.same_entity(&r.member, &who.plugin_id))
+        .collect();
+    let would_deny = unanswered.len() as u32 >= UNANSWERED_LIMIT;
+    let budget = json!({
+        "limit": UNANSWERED_LIMIT, "window": "1h", "unanswered": unanswered.len(),
+        "would_deny": would_deny, "window_resets_at": resets_at,
+        "unanswered_ids": unanswered.iter().map(|r| r.id).collect::<Vec<_>>(),
+    });
+    let sha = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(content.as_bytes()))
+    };
+    // 6. RECORD: the chain row first (the outbox row names it), then the outbox row.
+    let mut row = base.clone();
+    row["decision"] = json!(if would_deny { "would_deny" } else { "would_send" });
+    row["rule"] = json!(if would_deny { "channel.unanswered_budget" } else { "" });
+    row["content_sha256"] = json!(sha);
+    row["content_chars"] = json!(chars);
+    row["budget"] = budget.clone();
+    row["arrived_at"] = json!(now);
+    let entry = s.append_chain("channel_send", row)?;
+    let outbox_id = match s.inbox_store.channel_outbox_insert(&crate::storage::inbox::NewChannelOutbox {
+        member: &who.plugin_id, member_lct: &member_lct, channel_id: &binding.channel_id,
+        recipient_class: &binding.recipient_class, binding_version: binding.version,
+        content: &content, content_sha256: &sha, created: now, would_deny, chain_hash: &entry.hash,
+    }) {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = s.append_chain("channel_send_unrecorded", json!({
+                "channel_send": entry.hash, "member": who.plugin_id, "error": e.to_string(),
+            }));
+            return Ok(hestia_error_envelope(
+                "hestia.channel_unrecorded",
+                "the send was witnessed but its outbox row could not be written, so it is not \
+                 counted and would not be delivered. The failure is recorded; this is the \
+                 operator's to repair, not yours.",
+                Some(json!({"witnessEntryHash": entry.hash})),
+            ));
+        }
+    };
+    let at = |t: u64| {
+        chrono::DateTime::from_timestamp(t as i64, 0)
+            .map(|d| d.format("%H:%M UTC").to_string())
+            .unwrap_or_else(|| t.to_string())
+    };
+    let note = if would_deny {
+        format!(
+            "Shadow: nothing left this machine. Once sends are enforced this one would NOT go: you \
+             have {} unanswered messages on '{}' this hour ({}), and the limit is {UNANSWERED_LIMIT}. \
+             It is kept in your outbox as outbox #{outbox_id}. The count resets at {}, or as soon as \
+             one of them is answered.",
+            unanswered.len(), binding.channel_id,
+            unanswered.iter().map(|r| format!("#{} at {}", r.id, at(r.created))).collect::<Vec<_>>().join(", "),
+            at(resets_at),
+        )
+    } else {
+        format!(
+            "Shadow: nothing left this machine. Once sends are enforced this would go to '{}' ({}). \
+             It is in your outbox as #{outbox_id}. Unanswered on this channel this hour, counting \
+             it: {} of {UNANSWERED_LIMIT}.",
+            binding.channel_id, binding.recipient_class, unanswered.len() + 1,
+        )
+    };
+    Ok(json!({
+        "shadow": true, "sent": false, "outbox_id": outbox_id,
+        "channel_id": binding.channel_id, "recipient_class": binding.recipient_class,
+        "decision": if would_deny { "would_deny" } else { "would_send" },
+        "budget": budget, "witnessEntryHash": entry.hash, "note": note,
+    }))
+}
+
+/// `hestia_channel_outbox` (#1344): the caller's OWN outbox rows, newest first, and its bound
+/// channels (without their addresses: who a message reaches is the operator's). A member reads
+/// its own rows only.
+async fn tool_channel_outbox(state: &SharedState, args: &Value) -> ToolResult {
+    let s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unattributed",
+            "hestia_channel_outbox requires your own live session_id (from hestia_connect): it \
+             shows the asking member's own messages, so the member must be known",
+            None,
+        ));
+    };
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20).min(100) as u32;
+    let rows = s.inbox_store.channel_outbox_list(Some(&who.plugin_id), limit)?;
+    let channels: Vec<Value> = s
+        .channel_bindings
+        .for_member(&who.plugin_id)
+        .iter()
+        .map(|b| json!({"channel_id": b.channel_id, "recipient_class": b.recipient_class, "adapter": b.adapter}))
+        .collect();
+    Ok(json!({"member": who.plugin_id, "channels": channels, "outbox": rows, "shadow": true}))
+}
+
 /// Retire an egress row that has exhausted its attempts, and pay what it owes.
 ///
 /// Named in three comments across two files since 2026-07-26, always in the present
@@ -5695,6 +7345,11 @@ pub(crate) fn ensure_disposition_lane(
         tracing::warn!("disposition lane for {} NOT written: no committed ruling hash to project", esc.id);
         return false;
     }
+    // DURABLE READS: a lane line names a ruling hash; it may never reach disk ahead of it.
+    if let Err(e) = s.chain_store.durability().flush_committed_blocking() {
+        tracing::warn!("disposition lane for {} NOT written: chain not durable ({e:#})", esc.id);
+        return false;
+    }
     let dir = s.home.join(DISPOSITION_LANE_DIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("disposition lane dir {dir:?} unavailable ({e}) - the asker will not be told");
@@ -5778,9 +7433,7 @@ Anything else lets this lapse. Ruling {hash}.",
         "pre_migration_horizon": horizon,
         "pre_migration_horizon_utc": horizon_utc,
         "pre_migration_horizon_basis": if esc.observed_at.is_some() { "observed_at" } else { "decided_at" },
-        "pre_migration_horizon_model":
-            "min(observed_at or decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS; observation is \
-store-only and resets on replay (#850). NOT the canonical delivery-started deadline (#845 R5).",
+        "pre_migration_horizon_model": PRE_MIGRATION_HORIZON_MODEL,
         "expires_at": esc.expires_at,
         "expires_at_utc": utc(esc.expires_at),
         "act_digest": esc.act_digest,
@@ -6065,12 +7718,18 @@ pub(crate) fn project_dispositions(
     chain: &crate::storage::chain::SqliteChainStore,
     inbox: &crate::storage::SqliteInboxStore,
 ) -> anyhow::Result<DispositionProjection> {
+    // DURABLE READS: make everything committed durable first (one group fsync per pass, off the
+    // state lock), then read only durable rows — so a pass never acts outward on a row an OS
+    // crash could still take back, and nothing committed waits a whole extra pass.
+    chain.durability().flush_committed_blocking()?;
     // The cursor is the NEXT UNREAD position (chain positions start at 0, so
     // "last processed" has no empty-chain representation). Cold start = the
     // current tail: `len` is the next position an append will take, so nothing
     // already on the chain is ever backfilled.
     let Some(cursor) = inbox.projection_cursor(DISPOSITION_PROJECTION_CURSOR)? else {
-        let tail = chain.len()?;
+        // Cold start at the DURABLE tail: nothing already durable is backfilled, and anything
+        // committed past it is projected once it is durable.
+        let tail = chain.durability().frontier().durable;
         inbox.set_projection_cursor(DISPOSITION_PROJECTION_CURSOR, tail)?;
         return Ok(DispositionProjection {
             projected: 0,
@@ -6078,7 +7737,9 @@ pub(crate) fn project_dispositions(
             caught_up: true,
         });
     };
-    let rows = chain.read_from(cursor, DISPOSITION_PROJECTION_PAGE)?;
+    // DURABLE READS: the projector acts outward (an inbox obligation) on what it reads, so it
+    // reads only rows an OS crash can no longer take back.
+    let rows = chain.read_from_durable(cursor, DISPOSITION_PROJECTION_PAGE)?;
     let mut advanced_to = cursor;
     let mut projected = 0usize;
     for row in &rows {
@@ -6629,10 +8290,10 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
 ///
 /// Two properties this surface must keep, both learned the hard way:
 ///
-/// 1. It is **unanswered**, not undelivered. A notice read and deliberately
-///    not answered is forensically identical here to one nobody ever picked
-///    up (`drained_at` separates those two, and only those two). Named
-///    "undelivered" it would re-create absence-read-as-pass with better
+/// 1. It is **unanswered**, not undelivered. `drained_at` is a drain mark, not
+///    a per-notice read receipt: peeks leave it null, and the local drain may
+///    mark expired ordinary notices that its SELECT did not return.
+///    Named "undelivered" it would re-create absence-read-as-pass with better
 ///    tooling.
 /// 2. It closes the loop for RESPONSIVENESS, not for ACTION. The INERT
 ///    signature — woke, ran, did nothing — is still not representable. The
@@ -6687,22 +8348,66 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (mine, theirs): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|n| n.to_plugin == who.plugin_id);
+    // #1354: a transient ask dies with its target. A `review_request` row whose
+    // pointer names a scope request that is TERMINAL (ruled, revoked, or past its
+    // window) is moot: it stops counting as debt and moves to `*_moot`. Derivation
+    // is read-time against the live request map — no sweep — so a request the map
+    // no longer holds (a restart; scope requests are memory-only) reads UNKNOWN,
+    // and unknown is NOT moot: the row stays owed and fails toward visibility, the
+    // pointer resolver's "UNKNOWN, not refused" principle one level up. That also
+    // makes mootness NON-MONOTONIC across an eviction/restart (moot -> owed), which
+    // is intentional: the durable fix (event-driven `mooted_at` evidence at the
+    // terminal transition) is #1354's named follow-up, not this slice.
+    //
+    // KIND-RESTRICTED (nova's P1 on #1357): only a transient ASK dies with its
+    // target. A durable `reply` carrying a terminal scope pointer is CONTENT the
+    // recipient is still owed — mooting it would silently erase debt. The match is
+    // by kind ROOT, because the send gate admits dotted specializations
+    // (review_request.pr) and the ledger's own kind matching is by prefix; the two
+    // must agree here too.
+    //
+    // In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness —
+    // the misroute is sender-actionable, mootness is not.
+    let now = super::gate_escalation::now_secs();
+    let scope_moot = |kind: &str, pointer_uri: &Option<String>| -> bool {
+        if kind.split('.').next() != Some("review_request") {
+            return false;
+        }
+        let Some(p) = pointer_uri.as_deref() else {
+            return false;
+        };
+        let Some(rest) = p.strip_prefix("hestia://scope/") else {
+            return false;
+        };
+        let id = rest.split('#').next().unwrap_or(rest);
+        match s.scope_requests.get(id) {
+            Some(req) => {
+                req.granted.is_some() || req.revoked.is_some() || now >= req.expires_at
+            }
+            None => false,
+        }
+    };
+    let (mine, mine_moot): (Vec<_>, Vec<_>) =
+        mine.into_iter().partition(|n| !scope_moot(&n.kind, &n.pointer_uri));
     // Arm the strong asker (the fire primer) with the distinction that matters
     // on THIS side of the ledger: "live and unanswered" is a member choosing
     // not to reply; "never seen locally" is a misroute, and the two want
     // opposite responses from the sender. Carried on `owed_to_me` only — on
     // `i_owe` the recipient is the caller, who just proved its own liveness by
     // asking, so the field would be a constant.
-    let theirs: Vec<Value> = theirs
+    let (theirs, theirs_moot): (Vec<(bool, Value)>, Vec<(bool, Value)>) = theirs
         .into_iter()
         .map(|n| {
+            let moot = scope_moot(&n.kind, &n.pointer_uri);
             let (liveness, evidence) = recipient_liveness(&s.inbox_store, &n.to_plugin);
             let mut row = serde_json::to_value(&n).unwrap_or_else(|_| json!({}));
             row["recipient_liveness"] = json!(liveness);
             row["recipient_liveness_evidence"] = evidence;
-            row
+            (moot && liveness != "unknown", row)
         })
-        .collect();
+        .partition(|(mooted, _)| !mooted);
+    let theirs_moot: Vec<Value> = theirs_moot.into_iter().map(|(_, row)| row).collect();
+    let theirs: Vec<Value> = theirs.into_iter().map(|(_, row)| row).collect();
     Ok(json!({
         "plugin_id": who.plugin_id,
         "older_than_secs": older_than_secs,
@@ -6711,13 +8416,29 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "i_owe": mine,
         // Notices I sent that nobody answered: did my wake land?
         "owed_to_me": theirs,
+        // Transient rows whose target is terminal: answered by time, not by a
+        // member. Counted nowhere; visible here so a late wake can still bind a
+        // disposition to one (binding is unchanged by mootness).
+        "i_owe_moot": mine_moot,
+        "owed_to_me_moot": theirs_moot,
+        "moot_scope": "moot = a review_request row (the transient ASK kind — a durable \
+                       reply never moots) whose pointer names a scope request that is \
+                       TERMINAL (ruled, revoked, or past its window), derived at read \
+                       time against the live request map — no sweep (#1354). A request \
+                       the memory-only map no longer holds reads UNKNOWN, and unknown \
+                       stays owed: absence of evidence is not mootness. Eviction or \
+                       restart therefore reverts moot -> owed; that non-monotonicity is \
+                       intentional until durable mooted_at evidence lands (the #1354 \
+                       follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
+                       outranks mootness — the misroute is sender-actionable.",
         "scope": "unanswered = no notice binds in_reply_to to it; \
-                  drained_at:null additionally means it was never picked up; \
+                  drained_at:null means the drain mark is absent; a peek may still \
+                  have seen it. A mark does not prove it was returned or read; \
                   each row carries its OWN in_reply_to - group by that, not by \
                   pointer_uri, or distinct dispositions anchored at one section \
                   read as duplicates",
-        "recipient_liveness_scope": "liveness measures the DELIVERY PATH (did that member \
-                                     read its mailbox), not the member's ability to act — a \
+        "recipient_liveness_scope": "liveness measures mailbox touches under that seat, \
+                                     not an interactive member's ability to act — a \
                                      watcher polling for a broken CLI reads as live. \
                                      'unknown' means never seen on THIS mesh, which is the \
                                      dead-letter class and usually a misroute",
@@ -7050,7 +8771,8 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         // coordination-safe metadata and REDACTS the bearer fields. `session/own` still returns the full
         // session: you may hold your OWN capability, never a peer's.
         let mut sessions: Vec<&Session> = s.sessions.values().collect();
-        sessions.sort_by_key(|sess| sess.connected_at);
+        // Liveness includes lock-free reuse bumps (stage 2), which land in the directory.
+        sessions.sort_by_key(|sess| s.sessions.last_seen(sess));
         let safe: Vec<Value> = sessions
             .iter()
             .map(|sess| {
@@ -7058,7 +8780,7 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
                     "host_agent": sess.host_agent,
                     "host_agent_version": sess.host_agent_version,
                     "role": sess.constellation_role,
-                    "connected_at": sess.connected_at,
+                    "connected_at": s.sessions.last_seen(sess),
                     // The coordination-safe NAME: host_session_id NAMES a session (so a sibling/launcher
                     // can say "session X holds this") without conferring capability (Guard B — never an
                     // authz key). session_id + soft_lct remain OMITTED (bearer tokens in the vault path).
@@ -7587,6 +9309,9 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "stated_reason": esc.stated_reason,
             "stated_detail": esc.stated_detail,
             "bar": esc.bar,
+            // Every marker the act reaches; the bar is the highest over them (`price`).
+            "matched_markers": esc.matched_markers,
+            "resolved_targets": esc.resolved_targets,
             "factors_present": esc.factors,
             "invited_peers": esc.invited_peers,
             "asker_basis": esc.asker_basis,
@@ -7892,7 +9617,7 @@ fn resolve_session_uuid(
     state
         .sessions
         .values()
-        .max_by_key(|sess| sess.connected_at)
+        .max_by_key(|sess| state.sessions.last_seen(sess))
         .map(|sess| sess.session_id)
 }
 
@@ -7951,7 +9676,9 @@ mod accountability_tests {
 
     /// Read every delta the sink has collected, newest last.
     async fn sink_deltas(state: &SharedState) -> Vec<serde_json::Value> {
+        crate::storage::trust::flush_all_for_test();
         let path = state.lock().await.reputation_sink();
+        crate::storage::trust::flush_all_for_test();
         std::fs::read_to_string(path)
             .unwrap_or_default()
             .lines()
@@ -9336,7 +11063,7 @@ mod accountability_tests {
         // deterministically, independent of the fresh vault's default policy.
         {
             let mut s = state.lock().await;
-            s.policy_engine = crate::policy::PolicyEngine::new(
+            *s.policy_engine = crate::policy::PolicyEngine::new(
                 crate::policy::get_preset("safety").unwrap().config,
             );
         }
@@ -9408,7 +11135,7 @@ mod accountability_tests {
         let (_dir, state) = test_state().await;
         {
             let mut s = state.lock().await;
-            s.policy_engine = crate::policy::PolicyEngine::new(
+            *s.policy_engine = crate::policy::PolicyEngine::new(
                 crate::policy::get_preset("safety").unwrap().config,
             );
         }
@@ -9481,7 +11208,7 @@ mod accountability_tests {
         let (_dir, state) = test_state().await;
         {
             let mut s = state.lock().await;
-            s.policy_engine = crate::policy::PolicyEngine::new(
+            *s.policy_engine = crate::policy::PolicyEngine::new(
                 crate::policy::get_preset("safety").unwrap().config,
             );
         }
@@ -10895,9 +12622,9 @@ mod member_mesh_tests {
     }
 
     /// The row is only useful where the question gets asked. `owed_to_me` is
-    /// what the fire primer renders, so that is where "live and unanswered"
-    /// (a member choosing not to reply) must separate from "never seen here"
-    /// (a misroute) — they want opposite responses from the sender.
+    /// what the fire primer renders, so mailbox liveness must separate from
+    /// "never seen here" without claiming that an interactive member read a
+    /// particular notice or deliberately chose not to answer.
     #[tokio::test]
     async fn unanswered_owed_to_me_carries_recipient_liveness() {
         let (_dir, state) = test_state().await;
@@ -10930,9 +12657,14 @@ mod member_mesh_tests {
         };
         assert_eq!(by_to("thor"), json!("unknown"), "{rows}");
         assert_eq!(by_to("kimi-code"), json!("live"), "{rows}");
-        // Liveness is about the delivery path, not about acting — say so in
-        // the payload, where a reader cannot skip past it.
-        assert!(rows["recipient_liveness_scope"].is_string(), "{rows}");
+        // Mailbox touch and drain are not interactive-session read receipts.
+        let liveness_scope = rows["recipient_liveness_scope"].as_str().unwrap();
+        assert!(liveness_scope.contains("mailbox touches"), "{rows}");
+        assert!(liveness_scope.contains("watcher"), "{rows}");
+        let scope = rows["scope"].as_str().unwrap();
+        assert!(scope.contains("drain mark is absent"), "{rows}");
+        assert!(scope.contains("a peek"), "{rows}");
+        assert!(scope.contains("does not prove it was returned or read"), "{rows}");
     }
 
     /// **The site the fractal change could have broken silently, and the reason it is
@@ -11123,6 +12855,199 @@ mod member_mesh_tests {
             scope.contains("group by"),
             "scope must tell the reader HOW to group: {scope}"
         );
+    }
+
+    /// #1354: a transient ask dies with its target. A `review_request` row pointing at a
+    /// scope request that is TERMINAL (ruled, revoked, or past its window) leaves the debt
+    /// fold for `i_owe_moot`; a pending request, an UNKNOWN id (the map is memory-only —
+    /// post-restart every id is unknown, and unknown fails toward owed), a durable
+    /// pointer (no `hestia://scope/` referent), and any DURABLE kind (a `reply` carrying
+    /// a terminal scope pointer is content, still owed — nova's P1) all stay owed. A
+    /// dotted specialization of the ask kind moots exactly like its root. Evicting the
+    /// request from the map moves the row BACK to owed (moot -> owed): read-time
+    /// derivation is deliberately non-monotonic until durable mooted_at evidence lands.
+    /// In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness,
+    /// because the misroute is the sender-actionable signal. Binding to a mooted row
+    /// still works: mootness reclassifies the debt, it does not close the row.
+    #[tokio::test]
+    async fn unanswered_moots_rows_whose_scope_target_is_terminal() {
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let claude = connect(&state, "claude-code").await;
+        let now = crate::server::gate_escalation::now_secs();
+        use crate::server::state::ScopeRequest;
+
+        // claude -> kimi, one ask per target state.
+        for ptr in [
+            "hestia://scope/scope-moot-decided#peer-decide",
+            "hestia://scope/scope-moot-expired#peer-decide",
+            "hestia://scope/scope-moot-pending#peer-decide",
+            "hestia://scope/scope-never-heard#peer-decide",
+            "pr/1354",
+        ] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                        "pointer_uri": ptr, "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        // nova's P1 on #1357: a durable `reply` carrying a TERMINAL scope pointer is
+        // content the recipient is still owed — it must NEVER moot. And a dotted
+        // specialization of the ask kind (review_request.pr — the send gate admits it,
+        // the ledger matches it by prefix) MUST moot: the three surfaces agree or the
+        // kind restriction is a lie.
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "reply",
+                    "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide;reply-content-still-owed",
+                    "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request.pr",
+                    "pointer_uri": "hestia://scope/scope-moot-expired#peer-decide",
+                    "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        // kimi -> claude: a scope ask whose request is decided (mootable), and the same
+        // shape to a never-seen recipient (misroute: must NOT moot).
+        let mut decided_ask_id = None;
+        for to in ["claude-code", "ghost-member"] {
+            let out = tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": to, "kind": "review_request",
+                        "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide",
+                        "session_id": kimi}),
+            )
+            .await
+            .unwrap();
+            if to == "claude-code" {
+                decided_ask_id = Some(out["queued_id"].as_u64().unwrap());
+            }
+        }
+        // claude is a live recipient (reads its mailbox); ghost-member never has.
+        tool_member_inbox(&state, &json!({"session_id": claude})).await.unwrap();
+
+        {
+            let mut s = state.lock().await;
+            let req = |id: &str, granted: Option<bool>, expires_at: u64| ScopeRequest {
+                id: id.into(),
+                plugin_id: "cbp-being".into(),
+                role: String::new(),
+                path: "/w/x".into(),
+                reason: "a scope ask whose state pins a mootness arm".into(),
+                requested_at: now,
+                expires_at,
+                granted,
+                decided_by: granted.map(|_| "operator".to_string()),
+                decided_at: granted.map(|_| now),
+                decision_reason: None,
+                recursive: false,
+                revoked: None,
+                ext: Default::default(),
+            };
+            s.scope_requests
+                .insert("scope-moot-decided".into(), req("scope-moot-decided", Some(true), now + 3600));
+            s.scope_requests
+                .insert("scope-moot-expired".into(), req("scope-moot-expired", None, now - 3600));
+            s.scope_requests
+                .insert("scope-moot-pending".into(), req("scope-moot-pending", None, now + 3600));
+        }
+
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let ptrs = |key: &str| -> Vec<String> {
+            rows[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} missing: {rows}"))
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r["to_plugin"].as_str().unwrap_or("?"),
+                        r["pointer_uri"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        };
+        let i_owe = ptrs("i_owe");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-moot-pending#peer-decide".to_string()), "{rows}");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-never-heard#peer-decide".to_string()),
+                "unknown id stays owed — absence of evidence is not mootness: {rows}");
+        assert!(i_owe.contains(&"kimi-code|pr/1354".to_string()),
+                "a durable pointer never moots: {rows}");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide;reply-content-still-owed".to_string()),
+                "a durable reply never moots, even on a terminal scope pointer: {rows}");
+        let i_moot = ptrs("i_owe_moot");
+        assert!(i_moot.contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
+        assert_eq!(
+            i_moot.iter().filter(|p| *p == "kimi-code|hestia://scope/scope-moot-expired#peer-decide").count(),
+            2,
+            "the expired ask moots under BOTH the bare kind and its dotted specialization: {rows}"
+        );
+        assert_eq!(i_moot.len(), 3, "exactly the terminal review_request rows moot: {rows}");
+
+        let owed = ptrs("owed_to_me");
+        assert!(owed.contains(&"ghost-member|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "misroute outranks mootness: {rows}");
+        let owed_moot = ptrs("owed_to_me_moot");
+        assert!(owed_moot.contains(&"claude-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
+        assert_eq!(owed_moot.len(), 1, "{rows}");
+
+        // Eviction/restart regression (dp-web4 review of #1357): the request map is
+        // memory-only, so losing the request must move the row BACK to owed. Mootness
+        // is a read-time property of available evidence, not a row state — the
+        // non-monotonicity is intentional until durable `mooted_at` evidence lands
+        // (the #1354 follow-up), and this transition is the proof it fails toward
+        // visibility rather than silently staying moot.
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.remove("scope-moot-decided");
+        }
+        let rows2 = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let ptrs2 = |key: &str| -> Vec<String> {
+            rows2[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} missing: {rows2}"))
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r["to_plugin"].as_str().unwrap_or("?"),
+                        r["pointer_uri"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        };
+        assert!(ptrs2("i_owe").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "evicted request: moot -> owed, the row fails back toward visibility: {rows2}");
+        assert!(!ptrs2("i_owe_moot").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "nothing stays moot on absent evidence: {rows2}");
+
+        // Mootness reclassifies; it does not close. The ASKED member can still bind late.
+        let late = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "reply",
+                    "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide;window-missed;via=claude-code",
+                    "in_reply_to": decided_ask_id.unwrap(), "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        assert!(late["queued_id"].is_u64(), "binding to a mooted row stays legal: {late}");
     }
 
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /
@@ -11690,10 +13615,19 @@ mod tests {
             if !l.contains("scope") {
                 continue;
             }
+            // `hestia_scope_claim` (2026-10-05) ASKS and READS on the gate's behalf after a scope
+            // refusal; the behavioural tests `scope_claim_*` hold the line this name cannot:
+            // it never sets `granted`, never reaches the standing store, and spends only an
+            // operator's one-time approval for this member's own act.
             assert!(
                 l == "hestia_request_scope"
                     || l == "hestia_scope_status"
-                    || l == "hestia_scope_arbitrate",
+                    || l == "hestia_scope_arbitrate"
+                    || l == "hestia_scope_claim"
+                    // dp 2026-10-05: gate-opened scope requests go to NOT-SAME peers. Held by
+                    // the behavioural tests `scope_peer_decide_*` (self refused in both
+                    // directions, asserted asker refused, record names peer and basis).
+                    || l == "hestia_scope_peer_decide",
                 "MCP tool `{n}` reaches the scope surface. Member-callable doors are ASKING \
                  (hestia_request_scope), READING (hestia_scope_status), and ruling ANOTHER \
                  member's request under an operator delegation (hestia_scope_arbitrate). \
@@ -11786,7 +13720,7 @@ mod tests {
             decided_at: Some(110),
             decision_reason: Some("yes, that file".into()),
             recursive: false,
-            revoked: None,
+            revoked: None, ext: Default::default(),
         };
         assert!(r.grants("/mnt/c/exe/dpx/notes.md", 150));
         // The sibling, the parent and the child are all OUTSIDE the grant.
@@ -11842,7 +13776,7 @@ mod tests {
             decided_at: None,
             decision_reason: None,
             recursive: false,
-            revoked: None,
+            revoked: None, ext: Default::default(),
         };
         assert_eq!(r.status(50), "pending");
         assert_eq!(r.status(100), "expired");
@@ -12774,7 +14708,7 @@ mod tests {
             ))
             .unwrap();
         let state = super::super::state::ServerState::open(vault, dir.path(), "p").unwrap();
-        (dir, std::sync::Arc::new(tokio::sync::Mutex::new(state)))
+        (dir, std::sync::Arc::new(crate::server::state_lock::StateCell::new(state)))
     }
 
     pub(super) fn deny_credential_access_engine() -> PolicyEngine {
@@ -13431,6 +15365,292 @@ mod tests {
     ///
     /// The exclusion is narrow by construction, and the control arm is the point: a member that
     /// declares NOTHING is unknown, not doorless, and is still invited.
+    /// #1166 / #774 / #1169 through the REAL claim handler. A reclaim recovers ONE lost answer;
+    /// it is never repeat authority. GPT's review of #1169: the first version reclaimed on the
+    /// ACT, so an identical command after a delivered, executed permit got a second permit --
+    /// and the test that shipped with it called the handler twice after success, which
+    /// demonstrated the bug. Each arm below is one of the cases that review named.
+    #[tokio::test]
+    async fn a_reclaim_recovers_one_lost_answer_and_never_repeats_a_delivered_permit() {
+        use crate::server::gate_escalation::{Channel, EscalationStore};
+        let (_dir, shared) = make_shared_state();
+        let sid = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                "host_session_id": "hs-1"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let key = "a".repeat(64);
+        let claim = |inv: &str| json!({
+            "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
+            "marker": "pre_tool_use.py", "reason": "Bash: git apply /tmp/p/fix.patch",
+            "request_key": key, "invocation_key": inv, "supersession": "hard_stop",
+        });
+        let approve = |shared: SharedState, id: String| async move {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now).unwrap();
+        };
+
+        // The open's answer is lost; the re-issue folds into it and lookup finds it.
+        let first = tool_gate_escalation_claim(&shared, &claim("inv-1")).await.unwrap();
+        let esc_id = first["escalation_id"].as_str().unwrap().to_string();
+        let again = tool_gate_escalation_claim(&shared, &claim("inv-2")).await.unwrap();
+        assert_eq!(again["coalesced"], json!(true), "{again}");
+        let looked = tool_gate_escalation_lookup(&shared, &json!({"request_key": key})).await.unwrap();
+        assert_eq!(looked["escalation_id"], json!(esc_id));
+
+        // (a) DELIVERED AND EXECUTED: the permit is spent by inv-3, whose gate then reaches
+        //     the society-safety begin_action (execution path). A NEW identical invocation
+        //     must NOT inherit it.
+        approve(shared.clone(), esc_id.clone()).await;
+        let spent = tool_gate_escalation_claim(&shared, &claim("inv-3")).await.unwrap();
+        assert_eq!(spent["claimed"], json!(true), "{spent}");
+        tool_begin_action(&shared, &json!({"tool_name": "Bash", "session_id": sid,
+                                           "correlation_key": "inv-3"})).await.unwrap();
+        let repeat = tool_gate_escalation_claim(&shared, &claim("inv-4")).await.unwrap();
+        assert_eq!(repeat["permits_write"], json!(false), "a delivered, executed permit is not inherited: {repeat}");
+        assert!(repeat["reclaim_refused"].as_str().unwrap_or("").contains("reached execution"), "{repeat}");
+
+        // (b) GENUINELY UNRESOLVED: a second approval is spent by inv-5 and no begin for
+        //     inv-5 ever arrives (the hook denied on the lost answer). A new invocation
+        //     reclaims ONCE; a further retry is refused.
+        let esc2 = repeat["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), esc2.clone()).await;
+        let spent2 = tool_gate_escalation_claim(&shared, &claim("inv-5")).await.unwrap();
+        assert_eq!(spent2["claimed"], json!(true), "{spent2}");
+        let observed_before = shared.lock().await.gate_escalations.get(&esc2).unwrap().observed_at;
+        let re = tool_gate_escalation_claim(&shared, &claim("inv-6")).await.unwrap();
+        assert_eq!(re["reclaimed"], json!(true), "{re}");
+        assert_eq!(re["permits_write"], json!(true));
+        assert_eq!(re["escalation_id"], json!(esc2));
+        assert!(re["witnessEntryHash"].as_str().is_some(), "the reclaim is durably witnessed: {re}");
+        let twice = tool_gate_escalation_claim(&shared, &claim("inv-7")).await.unwrap();
+        assert_eq!(twice["permits_write"], json!(false), "only once: {twice}");
+        assert!(twice["reclaim_refused"].as_str().unwrap_or("").contains("already reclaimed"), "{twice}");
+        // Lookup is read-only.
+        let _ = tool_gate_escalation_lookup(&shared, &json!({"request_key": key})).await.unwrap();
+        assert_eq!(shared.lock().await.gate_escalations.get(&esc2).unwrap().observed_at, observed_before);
+
+        // (c) THE SAME INVOCATION retried: its permit was delivered to it.
+        let esc3 = twice["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), esc3.clone()).await;
+        let spent3 = tool_gate_escalation_claim(&shared, &claim("inv-8")).await.unwrap();
+        assert_eq!(spent3["claimed"], json!(true), "{spent3}");
+        let same = tool_gate_escalation_claim(&shared, &claim("inv-8")).await.unwrap();
+        assert_eq!(same["permits_write"], json!(false), "{same}");
+        assert!(same["reclaim_refused"].as_str().unwrap_or("").contains("same invocation"), "{same}");
+
+        // A replay rebuilds the key map, and a replayed claim is never reclaimable.
+        let entries = {
+            let s = shared.lock().await;
+            let mut v = s.chain_store.read_recent(400).unwrap();
+            v.sort_by_key(|e| e.timestamp);
+            v
+        };
+        let mut rebuilt = EscalationStore::default();
+        rebuilt.rehydrate(&entries, crate::server::gate_escalation::now_secs() + 1);
+        assert!(rebuilt.request_key(&key).is_some(), "the key survives a restart");
+        let after_restart = rebuilt.reclaimable(&key, "codex", "pre_tool_use.py",
+            Some("Bash: git apply /tmp/p/fix.patch"), None, Some("hs-1"), Some("inv-9"),
+            crate::server::gate_escalation::Bar::SingleApprover,
+            crate::server::gate_escalation::now_secs() + 1);
+        assert!(after_restart.is_err(), "a claim older than this daemon is not reclaimable");
+    }
+
+    /// THE CLAIM/BEGIN RACE (GPT review of 8056dce). A claims successfully; before A's
+    /// begin_action, B (same request key, different invocation) reclaims -- no begin for A exists
+    /// yet, so the reclaim is permitted. Without a fence, A and B then both reach begin_action and
+    /// both run. With it: the reclaim fences A in the same state change, A's begin is refused,
+    /// B's proceeds -- at most one invocation authorized. Also: the other order (A begins first)
+    /// refuses the reclaim; replay rebuilds the fence; eviction pressure refuses the reclaim.
+    #[tokio::test]
+    async fn a_reclaim_fences_the_superseded_invocation_so_only_one_runs() {
+        use crate::server::gate_escalation::{Channel, EscalationStore, BEGINS_SEEN_CAP};
+        let (_dir, shared) = make_shared_state();
+        let sid = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                "host_session_id": "hs-1"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let key = "f".repeat(64);
+        let claim = |inv: &str| json!({
+            "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
+            "marker": "pre_tool_use.py", "reason": "Bash: git apply /tmp/p/race.patch",
+            "request_key": key, "invocation_key": inv, "supersession": "hard_stop",
+        });
+        let begin = |inv: &str| json!({"tool_name": "Bash", "session_id": sid, "correlation_key": inv});
+        let approve = |shared: SharedState, id: String| async move {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now).unwrap();
+        };
+
+        // (a) the race: claim A, reclaim B BEFORE A begins.
+        let opened = tool_gate_escalation_claim(&shared, &claim("inv-A0")).await.unwrap();
+        let esc = opened["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), esc.clone()).await;
+        let a = tool_gate_escalation_claim(&shared, &claim("inv-A")).await.unwrap();
+        assert_eq!(a["claimed"], json!(true), "{a}");
+        let b = tool_gate_escalation_claim(&shared, &claim("inv-B")).await.unwrap();
+        assert_eq!(b["reclaimed"], json!(true), "B reclaims: A has not begun: {b}");
+        let begin_a = tool_begin_action(&shared, &begin("inv-A")).await.unwrap();
+        assert_eq!(begin_a["_hestia_error"]["code"], json!("hestia.invocation_superseded"),
+                   "A's begin is refused once B holds the permit: {begin_a}");
+        let begin_b = tool_begin_action(&shared, &begin("inv-B")).await.unwrap();
+        assert!(begin_b.get("actionId").is_some(), "B's begin proceeds: {begin_b}");
+        let row = {
+            let s = shared.lock().await;
+            s.chain_store.read_recent(80).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_reclaimed").unwrap()
+        };
+        assert_eq!(row.event_data["fenced_invocation_key"], json!("inv-A"));
+
+        // A third invocation cannot reclaim again, and B cannot be superseded.
+        let c = tool_gate_escalation_claim(&shared, &claim("inv-C")).await.unwrap();
+        assert_eq!(c["permits_write"], json!(false), "{c}");
+
+        // (e) replay rebuilds the fence from the reclaimed row.
+        let entries = {
+            let s = shared.lock().await;
+            let mut v = s.chain_store.read_recent(400).unwrap();
+            v.sort_by_key(|e| e.timestamp);
+            v
+        };
+        let mut rebuilt = EscalationStore::default();
+        rebuilt.rehydrate(&entries, crate::server::gate_escalation::now_secs());
+        assert!(rebuilt.fenced_by("inv-A").is_some(), "a restart keeps the fence");
+        assert!(rebuilt.fenced_by("inv-B").is_none());
+
+        // (b) the other order: claim D, begin D, then a reclaim is REFUSED.
+        let e2 = c["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), e2.clone()).await;
+        let d = tool_gate_escalation_claim(&shared, &claim("inv-D")).await.unwrap();
+        assert_eq!(d["claimed"], json!(true), "{d}");
+        let begin_d = tool_begin_action(&shared, &begin("inv-D")).await.unwrap();
+        assert!(begin_d.get("actionId").is_some(), "{begin_d}");
+        let late = tool_gate_escalation_claim(&shared, &claim("inv-E")).await.unwrap();
+        assert_eq!(late["permits_write"], json!(false), "{late}");
+        assert!(late["reclaim_refused"].as_str().unwrap_or("").contains("reached execution"), "{late}");
+
+        // (d) eviction under pressure inside the window refuses the reclaim.
+        let e3 = late["escalation_id"].as_str().unwrap().to_string();
+        approve(shared.clone(), e3.clone()).await;
+        let g = tool_gate_escalation_claim(&shared, &claim("inv-G")).await.unwrap();
+        assert_eq!(g["claimed"], json!(true), "{g}");
+        {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            for i in 0..=BEGINS_SEEN_CAP {
+                s.gate_escalations.record_begin(&format!("filler-{i}"), now);
+            }
+        }
+        let h = tool_gate_escalation_claim(&shared, &claim("inv-H")).await.unwrap();
+        assert_eq!(h["permits_write"], json!(false), "evicted evidence is not recovery authority: {h}");
+        assert!(h["reclaim_refused"].as_str().unwrap_or("").contains("evicted"), "{h}");
+    }
+
+    /// GPT review of ca5f394: a fence is only a cancellation if the superseded invocation's OWN
+    /// hook stops on it in every rollout mode. A spend whose seat did not declare
+    /// `supersession: "hard_stop"` is therefore never reclaimed -- the retry gets a new petition
+    /// instead, and the original keeps its permit unfenced. The declared arm is the control.
+    #[tokio::test]
+    async fn a_reclaim_needs_the_original_seat_to_hard_stop_supersession() {
+        use crate::server::gate_escalation::Channel;
+        let (_dir, shared) = make_shared_state();
+        let sid = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                "host_session_id": "hs-1"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let approve = |shared: SharedState, id: String| async move {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now).unwrap();
+        };
+        // Each arm has its OWN invocations: a begin for one arm's A is execution evidence that
+        // would (correctly) refuse the other arm's reclaim inside the same second.
+        for (key, declared, a_inv, b_inv) in [("1".repeat(64), false, "inv-A1", "inv-B1"),
+                                              ("2".repeat(64), true, "inv-A2", "inv-B2")] {
+            let claim = |inv: &str, sup: bool| {
+                let mut a = json!({
+                    "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
+                    "marker": "pre_tool_use.py", "reason": format!("Bash: git apply /tmp/p/{key}.patch"),
+                    "request_key": key, "invocation_key": inv,
+                });
+                if sup {
+                    a["supersession"] = json!("hard_stop");
+                }
+                a
+            };
+            let opened = tool_gate_escalation_claim(&shared, &claim(&format!("{a_inv}-0"), declared)).await.unwrap();
+            approve(shared.clone(), opened["escalation_id"].as_str().unwrap().to_string()).await;
+            let a = tool_gate_escalation_claim(&shared, &claim(a_inv, declared)).await.unwrap();
+            assert_eq!(a["claimed"], json!(true), "{a}");
+            let row = {
+                let s = shared.lock().await;
+                s.chain_store.read_recent(80).unwrap().into_iter()
+                    .filter(|e| e.event_type == "gate_escalation_claimed")
+                    .find(|e| e.event_data["request_key"] == json!(key)).unwrap()
+            };
+            // B ALWAYS declares: the capability that matters is the ORIGINAL's.
+            let b = tool_gate_escalation_claim(&shared, &claim(b_inv, true)).await.unwrap();
+            let begin_a = tool_begin_action(&shared, &json!({"tool_name": "Bash", "session_id": sid,
+                                                              "correlation_key": a_inv})).await.unwrap();
+            if declared {
+                assert_eq!(row.event_data["supersession"], json!("hard_stop"), "recorded on the spend");
+                assert_eq!(b["reclaimed"], json!(true), "control: a declared seat is reclaimable: {b}");
+                assert_eq!(begin_a["_hestia_error"]["code"], json!("hestia.invocation_superseded"));
+            } else {
+                assert_eq!(row.event_data["supersession"], json!(null), "{row:?}");
+                assert_eq!(b["permits_write"], json!(false), "no reclaim without hard-stop: {b}");
+                assert!(b["reclaim_refused"].as_str().unwrap_or("").contains("hard-stops"), "{b}");
+                assert!(begin_a.get("actionId").is_some(), "A was never fenced: {begin_a}");
+            }
+        }
+    }
+
+    /// (d) FAIL CLOSED (#1169 P1-2): if the reclaim's witness cannot be appended, nothing is
+    /// granted and no reclaimed projection is recorded.
+    #[tokio::test]
+    async fn a_reclaim_whose_witness_fails_grants_nothing() {
+        use crate::server::gate_escalation::RequestKeyRecord;
+        let (_dir, shared) = make_shared_state();
+        let key = "e".repeat(64);
+        let rec = RequestKeyRecord {
+            outcome: "claimed".into(), escalation_id: "E9".into(),
+            at: crate::server::gate_escalation::now_secs(), plugin_id: "codex".into(),
+            marker: "pre_tool_use.py".into(), act_digest: None, payload_sha256: None,
+            host_session_id: None, invocation_key: Some("inv-1".into()),
+            supersession_hard_stop: true,
+        };
+        let mut s = shared.lock().await;
+        s.gate_escalations.record_request_key(&key, rec.clone());
+        let out = commit_reclaim(&mut s, &rec, &key, "Bash", None, Some("inv-2"),
+                                 crate::server::gate_escalation::now_secs(),
+                                 |_, _, _| Err(anyhow::anyhow!("disk full")))
+            .unwrap();
+        assert_eq!(out["permits_write"], json!(false), "{out}");
+        assert_eq!(out["claimed"], json!(false));
+        assert_eq!(out["refused"], json!("reclaim_not_recorded"));
+        assert!(out["error"].as_str().unwrap().contains("disk full"));
+        assert_eq!(s.gate_escalations.request_key(&key).unwrap().outcome, "claimed",
+                   "no reclaimed projection without its witness");
+        assert!(s.gate_escalations.fenced_by("inv-1").is_none(),
+                "nothing granted, so nothing superseded: the fence is lifted");
+        // Control: the same call with a working append grants.
+        let ok = commit_reclaim(&mut s, &rec, &key, "Bash", None, Some("inv-2"),
+                                crate::server::gate_escalation::now_secs(),
+                                |s, kind, payload| s.append_chain(kind, payload)).unwrap();
+        assert_eq!(ok["permits_write"], json!(true), "{ok}");
+        assert_eq!(s.gate_escalations.request_key(&key).unwrap().outcome, "reclaimed");
+        assert!(s.gate_escalations.fenced_by("inv-1").is_some(), "a granted reclaim fences the original");
+    }
+
+    fn spent_at(entries: &[crate::storage::chain::ChainEntry], esc_id: &str) -> u64 {
+        entries.iter()
+            .find(|e| e.event_type == "gate_escalation_claimed"
+                      && e.event_data["escalation_id"] == json!(esc_id))
+            .map(|e| e.timestamp.timestamp() as u64)
+            .expect("a claimed row")
+    }
+
     #[tokio::test]
     async fn an_invitation_skips_a_member_that_declared_no_review_door() {
         let (_dir, shared) = make_shared_state();
@@ -13618,6 +15838,142 @@ mod tests {
         );
     }
 
+
+    /// #810 (recut of #812, kimi-code), through the door the gate hook actually calls. The
+    /// hook's act is a 220-char summary that can cut the filename out; the claim's
+    /// `resolved_targets` still name it, and the bar is priced from them. The opened chain
+    /// entry carries the targets and the strong bar; a targetless claim prices exactly as
+    /// before; and a restart restores what the entry recorded.
+    #[tokio::test]
+    async fn the_claim_door_prices_the_bar_from_the_resolved_target() {
+        let (_dir, shared) = make_shared_state();
+        let out = tool_connect(&shared, &json!({ "plugin_id": "claude-code", "host_agent": "h" }))
+            .await
+            .unwrap();
+        let sid = out["sessionId"].as_str().expect("a session").to_string();
+        let target = "/w/hestia/plugins/claude-code/hooks/pre_tool_use.py";
+        let ordinary = "/w/hestia/plugins/claude-code/hooks/notes.txt";
+        // The filename is past the summary's cut.
+        let act = "Bash: cd /w/hestia && cp /tmp/scratch/staged/long/path/new_gate.py /w/hes …";
+        let ask = |reason: &'static str, targets: Value| {
+            let shared = shared.clone();
+            let sid = sid.clone();
+            async move {
+                let mut args = json!({
+                    "plugin_id": "claude-code",
+                    "tool_name": "Bash",
+                    "marker": "plugins/*/hooks",
+                    "reason": reason,
+                    "session_id": sid,
+                });
+                if !targets.is_null() {
+                    args["resolved_targets"] = targets;
+                }
+                tool_gate_escalation_claim(&shared, &args).await.unwrap()
+            }
+        };
+        // The sovereign target is SECOND: every target is priced, not the first.
+        let strong = ask(act, json!([ordinary, target])).await;
+        let strong_id = strong["escalation_id"].as_str().expect("an id").to_string();
+        let weak = ask("Bash: cd /w/hestia && cp a b …", Value::Null).await;
+        let weak_id = weak["escalation_id"].as_str().expect("an id").to_string();
+
+        let s = shared.lock().await;
+        let chain = s.recent_chain(200);
+        let opened = |id: &str| {
+            chain
+                .iter()
+                .find(|e| e.event_type == "gate_escalation_opened" && e.event_data["escalation_id"] == id)
+                .expect("the open is witnessed")
+                .event_data
+                .clone()
+        };
+        let o = opened(&strong_id);
+        assert_eq!(o["bar"], "sovereign_plus_peer", "{o}");
+        assert_eq!(o["resolved_targets"], json!([ordinary, target]), "{o}");
+        assert_eq!(o["matched_markers"], json!(["plugins/*/hooks", "notes.txt", "pre_tool_use.py"]), "{o}");
+        let w = opened(&weak_id);
+        assert_eq!(w["bar"], "single_approver", "{w}");
+        assert_eq!(w["resolved_targets"], json!([]), "explicit empty when absent: {w}");
+
+        let entries: Vec<_> = chain
+            .iter()
+            .filter(|e| e.event_type == "gate_escalation_opened")
+            .cloned()
+            .collect();
+        let mut replay = crate::server::gate_escalation::EscalationStore::default();
+        replay.rehydrate(&entries, crate::server::gate_escalation::now_secs());
+        let r = replay.get(&strong_id).expect("restored");
+        assert_eq!(r.bar, crate::server::gate_escalation::Bar::SovereignPlusPeer);
+        assert_eq!(r.resolved_targets, vec![ordinary.to_string(), target.to_string()]);
+    }
+
+    /// Codex P1-1 on #1239, through the claim door: an APPROVED single-approver escalation
+    /// (opened by a targetless claim whose summary cut the sovereign filename out) is not
+    /// spent — and not reclaimed — for the same act once the claim's resolved target prices it
+    /// two-factor. The answer names the shortfall; the weak row is neither consumed nor
+    /// repriced; the stronger ask is minted at its own bar. Control: the same act at its own
+    /// price still spends the weak approval.
+    #[tokio::test]
+    async fn an_approved_weak_escalation_is_not_spent_or_reclaimed_for_a_stronger_target() {
+        use crate::server::gate_escalation::{Bar, Channel};
+        let (_dir, shared) = make_shared_state();
+        let sid = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                "host_session_id": "hs-1"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let act = "Bash: cd /w/hestia && cp /tmp/scratch/staged/long/path/new_gate.py /w/hes …";
+        let target = "/w/hestia/plugins/_shared/hestia_single_gate.py";
+        let key = "b".repeat(64);
+        let claim = |inv: &str, with_target: bool| {
+            let mut a = json!({
+                "plugin_id": "codex", "session_id": sid, "tool_name": "Bash",
+                "marker": "plugins/_shared", "reason": act,
+                "request_key": key, "invocation_key": inv, "supersession": "hard_stop",
+            });
+            if with_target {
+                a["resolved_targets"] = json!([target]);
+            }
+            a
+        };
+        let approve = |shared: SharedState, id: String| async move {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now).unwrap();
+        };
+
+        // A targetless claim opens the weak row; it is approved.
+        let first = tool_gate_escalation_claim(&shared, &claim("inv-1", false)).await.unwrap();
+        let weak_id = first["escalation_id"].as_str().unwrap().to_string();
+        assert_eq!(shared.lock().await.gate_escalations.get(&weak_id).unwrap().bar, Bar::SingleApprover);
+        approve(shared.clone(), weak_id.clone()).await;
+
+        // SPEND: the same act, now carrying the sovereign target, must not consume it.
+        let stronger = tool_gate_escalation_claim(&shared, &claim("inv-2", true)).await.unwrap();
+        assert_eq!(stronger["claimed"], json!(false), "{stronger}");
+        assert_eq!(stronger["permits_write"], json!(false), "{stronger}");
+        assert_eq!(stronger["bar_shortfall"]["escalation_id"], json!(weak_id), "{stronger}");
+        assert_eq!(stronger["bar_shortfall"]["incoming_bar"], json!("sovereign_plus_peer"));
+        let strong_id = stronger["escalation_id"].as_str().unwrap().to_string();
+        assert_ne!(strong_id, weak_id, "the stronger ask is its own escalation");
+        {
+            let s = shared.lock().await;
+            let w = s.gate_escalations.get(&weak_id).unwrap();
+            assert_eq!(w.consumed_at, None, "the weak approval is not spent");
+            assert_eq!(w.bar, Bar::SingleApprover, "and its record is not repriced");
+            assert_eq!(s.gate_escalations.get(&strong_id).unwrap().bar, Bar::SovereignPlusPeer);
+        }
+
+        // RECLAIM: a targetless invocation spends the weak approval (control: its own price),
+        // its answer is "lost" (no begin_action), and the retry carries the target. Recovery
+        // of a lost answer never covers a stronger act.
+        let spent = tool_gate_escalation_claim(&shared, &claim("inv-3", false)).await.unwrap();
+        assert_eq!(spent["claimed"], json!(true), "control: same act, own price: {spent}");
+        let retry = tool_gate_escalation_claim(&shared, &claim("inv-4", true)).await.unwrap();
+        assert_ne!(retry["reclaimed"], json!(true), "{retry}");
+        assert_eq!(retry["permits_write"], json!(false), "{retry}");
+        assert!(retry["reclaim_refused"].as_str().unwrap_or("").contains("prices above"), "{retry}");
+    }
 
     /// #668, ONE ACT ONE RULING, through the door the gate hook actually calls. The hook
     /// re-trips on the same refused act (25 of 49 same-digest re-opens in the 08-02..09-01
@@ -14234,6 +16590,205 @@ mod tests {
             pp.absent + pp.invited_without_reader,
             invited.len(),
             "and every invited seat is still accounted for somewhere: {pp:?}"
+        );
+    }
+
+    /// #990's remedy at the pool: a RETIRED name is excluded by administrative act,
+    /// and the exclusion stands until an operator lifts it.
+    ///
+    /// This is NOT the evidence-based exclusion dp's rule forbids ("it reorders
+    /// routing, it never excludes" — pinned one test above). The retirement row is
+    /// not evidence: it is an operator's witnessed judgement (`POST
+    /// /api/agents/:id/retire`, #1100 — the one retire verb, whose store this pool
+    /// now reads), the administrative remove the append-only registry never had.
+    /// The two halves pinned here: the retired name takes no slot WHILE the row
+    /// stands, and `reinstate` returns it to the pool — the reversibility that
+    /// keeps the act a single-operator call rather than a quorum one.
+    #[tokio::test]
+    async fn a_retired_member_holds_no_invitation_slot_until_reinstated() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "kimi-code", "attest-probe", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        // The operator act, applied directly to the state's copy of the store the
+        // route commits (the HTTP door — grant revocation included — is tested
+        // beside it in http.rs): retire the probe name.
+        {
+            let mut s = shared.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "attest-probe".into(),
+                retired_at: crate::server::gate_escalation::now_secs(),
+                reason: "probe residue — never a real seat".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: false,
+                retired_by: "lct:web4:operator:test".into(),
+            });
+        }
+
+        let claim = |act: &str| {
+            let shared = shared.clone();
+            let sid = session_of["codex"].clone();
+            let act = act.to_string();
+            async move {
+                tool_gate_escalation_claim(
+                    &shared,
+                    &json!({
+                        "plugin_id": "codex",
+                        "session_id": sid,
+                        "tool_name": "Edit",
+                        "marker": "pre_tool_use.py",
+                        "reason": act,
+                    }),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let invited_of = |claimed: serde_json::Value| -> Vec<String> {
+            claimed["invited_peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let invited = invited_of(claim("Edit -> file one").await);
+        assert!(
+            !invited.contains(&"attest-probe".to_string()),
+            "the retired name holds no slot: {invited:?}"
+        );
+        assert!(
+            invited.contains(&"kimi-code".to_string())
+                && invited.contains(&"claude-code".to_string()),
+            "the live seats are untouched: {invited:?}"
+        );
+
+        // Reversibility, visible at the pool: reinstated, the name is invited again.
+        {
+            let mut s = shared.lock().await;
+            assert!(
+                s.retired_members.reinstate("attest-probe").is_some(),
+                "the row existed to remove"
+            );
+        }
+        let invited = invited_of(claim("Edit -> file two").await);
+        assert!(
+            invited.contains(&"attest-probe".to_string()),
+            "a reinstated name returns to the pool: {invited:?}"
+        );
+    }
+
+    /// The same exclusion by TYPE: a filler is minted never-a-member, so the pool
+    /// never spends a slot on it — the residue defect one field over, caught at the
+    /// type mark rather than waiting for an operator to prune each filler by hand.
+    #[tokio::test]
+    async fn a_filler_is_never_spent_an_invitation_slot() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        {
+            let mut s = shared.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            crate::member_registry::ensure_filler(
+                vault,
+                member_registry,
+                "ollama:test-model@sha256:ff",
+                "sid",
+                "anchor",
+            )
+            .expect("the filler mints");
+        }
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "reason": "Edit -> a governance file",
+            }),
+        )
+        .await
+        .unwrap();
+        let invited: Vec<String> = claimed["invited_peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            invited.contains(&"claude-code".to_string()),
+            "the real peer is invited: {invited:?}"
+        );
+        assert!(
+            !invited.contains(&"ollama:test-model@sha256:ff".to_string()),
+            "the filler holds no slot, even with slots free: {invited:?}"
+        );
+    }
+
+    /// The scope peer pool is the THIRD selection pool and the most rivalrous of them:
+    /// `take(3)` over an ALPHABETICAL list with no liveness ranking, so residue sorts in
+    /// early (claude-code's re-review, 2026-10-13, measured on the live chain:
+    /// `claudecode` and `codex-cli` took two of three slots on a real scope request
+    /// within the hour). The exclusion is the same two type-marks as the invitation and
+    /// appeal pools (#990), seeded here on the store the one retire verb commits.
+    /// The control half runs first: the prefix-recognised residue name IS pooled while
+    /// active, so the exclusion assert below is what removes it.
+    #[tokio::test]
+    async fn a_retired_name_holds_no_scope_peer_slot() {
+        let (_dir, shared) = make_shared_state();
+        for id in ["claude-code", "claudecode", "codex", "kimi-code"] {
+            tool_connect(&shared, &json!({"plugin_id": id, "host_agent": "h",
+                                          "gate_capabilities": ["society-floor:v1", REVIEW_CAPABILITY]}))
+                .await.unwrap();
+        }
+        // CONTROL: recognised (the `claude` prefix) + door-declared residue is pooled.
+        let before = {
+            let s = shared.lock().await;
+            scope_peer_pool(&s, "kimi-code")
+        };
+        assert!(
+            before.contains(&"claudecode".to_string()),
+            "control: the residue name takes a slot while active: {before:?}"
+        );
+        {
+            let mut s = shared.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "claudecode".into(),
+                retired_at: 1,
+                reason: "probe residue".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: false,
+                retired_by: "op".into(),
+            });
+        }
+        let after = {
+            let s = shared.lock().await;
+            scope_peer_pool(&s, "kimi-code")
+        };
+        assert!(
+            !after.contains(&"claudecode".to_string()),
+            "the retired name holds no slot: {after:?}"
+        );
+        assert!(
+            after.contains(&"claude-code".to_string()) && after.contains(&"codex".to_string()),
+            "the real seats are untouched: {after:?}"
         );
     }
 
@@ -15573,6 +18128,200 @@ mod tests {
         );
     }
 
+    /// #366 through the REAL claim handler: a grant approved 900 s ago and never observed
+    /// (lapsed) is claimed by the asker session's byte-identical re-issue, instead of minting a
+    /// duplicate petition (cf54d46850bcdfe0 → d9b167e12a7283b8, 2026-10-21). A sibling session
+    /// on the same seat re-issuing the same act does not claim it, and neither does the asker
+    /// re-issuing a different act; the grant stays lapsed and unobserved for both.
+    #[tokio::test]
+    async fn the_askers_exact_reissue_claims_a_grant_ruled_while_it_was_idle() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+        let (_dir, shared) = make_shared_state();
+        let connect = |hs: &'static str| {
+            let shared = shared.clone();
+            async move {
+                tool_connect(
+                    &shared,
+                    &json!({ "plugin_id": "claude-code", "host_agent": "h", "host_session_id": hs }),
+                )
+                .await
+                .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let asker = connect("hs-asker").await;
+        let sibling = connect("hs-sibling").await;
+        const ACT: &str = "Bash: git -C /tmp/wt apply /tmp/gt.patch";
+        let claim = |sid: &str, act: &str, inv: &str| json!({
+            "plugin_id": "claude-code", "session_id": sid, "tool_name": "Bash",
+            "marker": "hestia_governance_closure.py", "reason": act, "invocation_key": inv,
+        });
+
+        let opened = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-open")).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(&id, true, "operator", "role:constellation:sovereign",
+                        Channel::OperatorSession, None, Some("k"), now_secs() - 900)
+                .expect("the sovereign channel approves");
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert_eq!(e.host_session_id.as_deref(), Some("hs-asker"), "fixture: asker recorded");
+            assert!(e.observed_at.is_none() && !e.is_claimable(now_secs()), "precondition: lapsed unobserved");
+        }
+
+        let sib = tool_gate_escalation_claim(&shared, &claim(&sibling, ACT, "inv-sib")).await.unwrap();
+        assert_ne!(sib["claimed"], json!(true), "a sibling session's re-issue claimed the asker's grant: {sib}");
+        let other = tool_gate_escalation_claim(&shared, &claim(&asker, "Bash: git apply /tmp/other.patch", "inv-other"))
+            .await.unwrap();
+        assert_ne!(other["claimed"], json!(true), "a different act claimed the grant: {other}");
+        {
+            let s = shared.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert!(e.observed_at.is_none() && e.consumed_at.is_none(), "untouched by both: {e:?}");
+        }
+
+        // Nova's review of #1363: observation only AFTER the authenticated session binding.
+        // (a) No session at all: an unattributed caller naming the asker's member and exact act
+        //     has no proven host session, so nothing is observed and nothing is claimed.
+        let anon = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "claude-code", "tool_name": "Bash", "marker": "hestia_governance_closure.py",
+            "reason": ACT, "invocation_key": "inv-anon",
+        })).await;
+        if let Ok(v) = &anon {
+            assert_ne!(v["claimed"], json!(true), "an unattributed re-issue claimed the asker's grant: {v}");
+        }
+        // (b) The asker's own session, but ASSERTING another host session: the precedence block
+        //     refuses the call before observation, so the grant stays unobserved.
+        let mut forged = claim(&asker, ACT, "inv-forged");
+        forged["host_session_id"] = json!("hs-sibling");
+        let refused = tool_gate_escalation_claim(&shared, &forged).await;
+        assert!(refused.is_err(), "a mismatched host_session_id must be refused: {refused:?}");
+        {
+            let s = shared.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert!(e.observed_at.is_none() && e.consumed_at.is_none(),
+                    "neither the unattributed nor the forged call may observe or spend: {e:?}");
+        }
+
+        let mine = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-reissue")).await.unwrap();
+        assert_eq!(mine["claimed"], json!(true), "the asker's exact re-issue must claim its lapsed grant: {mine}");
+        assert_eq!(mine["escalation_id"], json!(id), "{mine}");
+    }
+
+    /// THE CLAIMABLE REPLY STATES THE ANCHOR ITS OWN CALL USES (GPT review of #613 @ dd3f1b1).
+    ///
+    /// `hestia_gate_escalation_claimable` observes the asking session's own grants before it
+    /// lists, which re-anchors a lapsed grant on the observation -- while the reply advertised
+    /// `claim_window_anchor: "decided_at"` and "a grant past its horizon will not reappear". A
+    /// member applying that anchor to a row this very call had revived computes a window that
+    /// shut 300 s ago and discards a spendable approval. The store tests and the source-order
+    /// pin could not see it: they never read the RETURNED fields. This test reads only those.
+    ///
+    /// Three calls against one grant ruled 900 s ago and never observed: a SIBLING session on
+    /// the same seat (observes nothing, lists nothing, and must not say `"decided_at"` as the
+    /// global anchor either), the ASKER's first call (late first observation: listed, basis
+    /// `observed_at`, a full window, absolute horizon = observed_at + window), and the asker's
+    /// second call (repeated observation: nothing newly observed, horizon unchanged).
+    #[tokio::test]
+    async fn the_claimable_reply_states_the_anchor_its_own_observation_set() {
+        use crate::server::gate_escalation::{now_secs, APPROVAL_CLAIM_WINDOW_SECS as W};
+        let (_dir, shared) = make_shared_state();
+        let connect = |hs: &'static str| {
+            let shared = shared.clone();
+            async move {
+                tool_connect(
+                    &shared,
+                    &json!({ "plugin_id": "claude-code", "host_agent": "h", "host_session_id": hs }),
+                )
+                .await
+                .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let asker = connect("hs-asker").await;
+        let sibling = connect("hs-sibling").await;
+        assert_ne!(asker, sibling, "fixture: two distinct sessions on one seat");
+
+        const ACT: &str = "Bash -> /repo/tools/late_grant.sh";
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "session_id": asker, "tool_name": "Bash",
+                "marker": "policy.json", "act": ACT, "reason": ACT,
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let ruled_at = now_secs() - 900;
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &id, true, "operator", "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None, Some("k"), ruled_at,
+                )
+                .expect("the sovereign channel approves");
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert_eq!(e.host_session_id.as_deref(), Some("hs-asker"), "fixture: asker recorded");
+            assert!(e.observed_at.is_none() && !e.is_claimable(now_secs()), "precondition: lapsed unobserved");
+        }
+        let ask = |sid: String| {
+            let shared = shared.clone();
+            async move { tool_gate_escalation_claimable(&shared, &json!({ "session_id": sid })).await.unwrap() }
+        };
+        // No response may advertise the ruling as THE anchor: it is one arm of two.
+        let anchor_is_honest = |r: &Value| {
+            assert_ne!(r["claim_window_anchor"], "decided_at", "the global anchor is the stale one: {r}");
+            assert_eq!(r["claim_window_anchor"], "observed_at_else_decided_at", "{r}");
+            assert_eq!(r["claim_window_model"], PRE_MIGRATION_HORIZON_MODEL, "{r}");
+            let note = r["note"].as_str().unwrap();
+            assert!(note.contains("reappear here with a fresh window"), "the note must say a lapsed grant can come back: {r}");
+        };
+
+        // SIBLING: same seat, different session. Observes nothing, revives nothing.
+        let sib = ask(sibling).await;
+        anchor_is_honest(&sib);
+        assert_eq!(sib["observed_now"], json!([]), "a sibling's ask observed another session's grant: {sib}");
+        assert_eq!(sib["claimable"], json!([]), "and the grant stays lapsed for it: {sib}");
+        assert!(shared.lock().await.gate_escalations.get(&id).unwrap().observed_at.is_none());
+
+        // ASKER, first call: the late first observation. Listed, on the observation arm.
+        let first = ask(asker.clone()).await;
+        anchor_is_honest(&first);
+        assert_eq!(first["observed_now"], json!([id]), "{first}");
+        let rows = first["claimable"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "the revived grant must be listed: {first}");
+        let row = &rows[0];
+        assert_eq!(row["escalation_id"], id);
+        assert_eq!(row["pre_migration_horizon_basis"], "observed_at", "{row}");
+        let observed = row["observed_at"].as_u64().expect("observed_at rendered");
+        assert!(observed >= ruled_at + 900, "observed at the ask, not the ruling: {row}");
+        assert_eq!(row["decided_at"], json!(ruled_at));
+        assert_eq!(
+            row["pre_migration_horizon"], json!(observed + W),
+            "the absolute horizon runs from the observation, not the ruling (ruling + W is {}): {row}",
+            ruled_at + W
+        );
+        assert!(row["claim_window_secs_remaining"].as_u64().unwrap() > W - 5, "a full window: {row}");
+
+        // ASKER, second call: repeated observation observes nothing and moves nothing.
+        let second = ask(asker).await;
+        anchor_is_honest(&second);
+        assert_eq!(second["observed_now"], json!([]), "first observation wins: {second}");
+        let row2 = &second["claimable"][0];
+        assert_eq!(row2["escalation_id"], id, "still listed: {second}");
+        assert_eq!(row2["observed_at"], json!(observed), "the observation is one-way: {second}");
+        assert_eq!(row2["pre_migration_horizon"], json!(observed + W), "horizon unchanged: {second}");
+        assert_eq!(row2["pre_migration_horizon_basis"], "observed_at");
+    }
+
     /// THE DERIVATION, with nothing on the wire to derive from.
     ///
     /// The first draft of this change wrote the caller's `host_session_id` argument straight
@@ -15954,6 +18703,45 @@ mod tests {
     /// the weakest evidence the system can hold. RED before this change: every assertion
     /// below passed with the arms reversed (peer decide ALLOWED, corroborate ALLOWED,
     /// `you_may_rule` true).
+    /// One-gate stage C: the pending queue shows the BAR and every marker it was priced over.
+    /// Before this the queue carried the marker alone, so a reader inferred the bar from it —
+    /// the inference the stage-A mispricing made wrong (escalation 9c433571: a mechanism write
+    /// recorded under `plugins/_shared`, single approver).
+    #[tokio::test]
+    async fn the_pending_queue_shows_the_bar_and_the_markers_it_was_priced_over() {
+        let (_dir, shared) = make_shared_state();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "tool_name": "Bash",
+                "marker": "plugins/_shared",
+                "act": "Bash: cp /tmp/x.py plugins/_shared/hestia_gate_mechanism.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let pending = tool_gate_pending_escalations(&shared, &json!({})).await.unwrap();
+        let item = pending["pending"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["escalation_id"] == esc_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(item["bar"], opened["bar"], "the queue shows the opened bar: {item}");
+        assert_eq!(item["bar"], "sovereign_plus_peer", "a mechanism write prices sovereign: {item}");
+        let markers: Vec<&str> = item["matched_markers"]
+            .as_array()
+            .expect("matched_markers is a list")
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect();
+        assert!(markers.contains(&"plugins/_shared") && markers.contains(&"hestia_gate_mechanism.py"),
+                "every marker the act reaches is listed: {item}");
+    }
+
     #[tokio::test]
     async fn an_asserted_asker_collects_no_peer_factor_at_decide_or_corroborate() {
         let (_dir, shared) = make_shared_state();
@@ -17074,7 +19862,7 @@ mod open_appeals_tests {
             );
             ids.push(sid);
         }
-        (dir, std::sync::Arc::new(tokio::sync::Mutex::new(st)), ids)
+        (dir, std::sync::Arc::new(crate::server::state_lock::StateCell::new(st)), ids)
     }
 
     /// A deny on the chain, landed on `plugin_id`, in the shape `tool_appeal` requires.
@@ -17614,6 +20402,415 @@ mod preamble_tests {
 }
 
 #[cfg(test)]
+mod ladder_evidence_tests {
+    use super::*;
+    use super::inbox_tests::{open_state, seeded_home};
+
+    /// Open through the REAL door, not by poking the store.
+    ///
+    /// The first cut of these tests called `EscalationStore::open` directly and every
+    /// chain-derived field came back empty — because the store does not append the chain row;
+    /// the handler does. A bundle assembled from the chain can only be tested against a chain
+    /// that something actually wrote to, which is the standing lesson about running the real
+    /// path at least once.
+    ///
+    /// `reason` is set equal to the act here only because these tests are about other fields.
+    /// Since #1066 the act text is retained from `act` itself, and a reason that DIFFERS from
+    /// the act is pinned by `a_member_rationale_containing_another_copy_is_never_shown_as_the_act`.
+    async fn open_one(state: &SharedState, marker: &str, act: &str) -> String {
+        open_as(state, marker, act, None).await
+    }
+
+    /// With a live session the asker is PROVEN (#128), which is what a peer needs before it
+    /// can rule: NOT-SAME will not clear an asserted name, because it would be grading a
+    /// forgeable operand.
+    async fn open_as(
+        state: &SharedState,
+        marker: &str,
+        act: &str,
+        session: Option<&str>,
+    ) -> String {
+        let mut args = json!({
+            "plugin_id": "claude-code",
+            "role": "role:constellation:member",
+            "tool_name": "Bash",
+            "marker": marker,
+            "act": act,
+            "reason": act,
+        });
+        if let Some(sid) = session {
+            args["session_id"] = json!(sid);
+        }
+        let r = tool_gate_escalation_open(state, &args).await.unwrap();
+        r["escalation_id"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// AN UNKNOWN ID IS ANSWERED, NOT ERRORED, AND NEVER AS AN EMPTY BUNDLE.
+    ///
+    /// "No such escalation" and "an escalation about which nothing is known" are different
+    /// facts, and a reviewer that cannot tell them apart will reason from the wrong one — it
+    /// would read an empty bundle as "nothing of concern here" and concur. That is the same
+    /// shape as a windowed absence read as a never (#610), arriving through a bundle instead
+    /// of through a census.
+    #[tokio::test]
+    async fn an_unknown_escalation_says_so_rather_than_returning_an_empty_case() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let r = tool_escalation_evidence(&state, &json!({"escalation_id": "deadbeefdeadbeef"}))
+            .await
+            .unwrap();
+        assert_eq!(r["found"], json!(false), "{r}");
+        assert!(r["evidence"].is_null(), "an absent case must not render as a case: {r}");
+        assert!(
+            r["note"].as_str().unwrap_or("").contains("reaped"),
+            "and must say that reaped and never-existed are indistinguishable here: {r}"
+        );
+    }
+
+    /// The bundle carries what §3.3 says a decider gets — including the two fields that are
+    /// about the ASK rather than the act.
+    #[tokio::test]
+    async fn the_bundle_carries_the_ask_its_bar_and_the_askers_basis() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let id = open_one(&state, "plugins/_shared", "Bash: cp /tmp/x plugins/_shared/SHIM_LEDGER.md").await;
+
+        let r = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        assert_eq!(r["found"], json!(true), "{r}");
+        let e = &r["evidence"]["escalation"];
+        assert_eq!(e["marker"], json!("plugins/_shared"));
+        // Caller-asserted, and LABELLED as a claim rather than as an identity.
+        assert_eq!(e["claimed_by"], json!("claude-code"));
+        assert!(e.get("claimed_by").is_some() && e.get("member").is_none(),
+                "the unauthenticated name must not be presented as `member`: {e}");
+        // #128: a reviewer must be able to see whether the asker was proven or asserted,
+        // because that is the clause NOT-SAME reads before it will clear anyone.
+        assert_eq!(e["asker_basis"], json!("Asserted"),
+                   "an open() with no session is asserted, and must say so: {e}");
+        assert!(e["bar"].is_string() || e["bar"].is_object(), "the bar in force: {e}");
+        assert!(e.get("bar_met").is_some(), "and whether it is met: {e}");
+        assert!(r["evidence"]["law"]["society_policy_hash"].is_string(), "{r}");
+        // §3.3 + AC-8: no law_hash is minted here, because that composition is per-caller.
+        assert!(r["evidence"]["law"].get("law_hash").is_none(),
+                "a law_hash minted for someone else proves nothing about what the rung read");
+    }
+
+    /// PRIOR DECISIONS ON THE SAME MARKER — §3.3's "the thing a human cannot hold in their
+    /// head" — and the case's OWN rows are not counted as its own precedent.
+    #[tokio::test]
+    async fn prior_escalations_on_the_marker_are_carried_and_the_subject_is_not_its_own_precedent() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        const MARKER: &str = "plugins/*/hooks";
+
+        // Decided through the REAL door. The first cut called `EscalationStore::decide`
+        // directly and `approved` stayed 0 — the store does not append the chain row, the
+        // ruling path does, and this bundle reads the chain. Same shortcut, same lesson, twice
+        // in one test: a surface assembled from the chain can only be tested against a chain
+        // that something actually wrote to.
+        let asker = super::appeal_tests::seat(&state, "claude-code").await;
+        let peer = super::appeal_tests::seat(&state, "codex").await;
+        let first = open_as(&state, MARKER, "Bash: cp /tmp/a plugins/codex/hooks/pre_tool_use.py",
+                            Some(&asker.to_string())).await;
+        tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": first, "approve": true, "session_id": peer.to_string(),
+            "reason": "read the diff; it is a comment correction inside one file",
+        })).await.unwrap();
+        let subject = open_as(&state, MARKER, "Bash: cp /tmp/b plugins/kimi/hooks/pre_tool_use.py",
+                              Some(&asker.to_string())).await;
+
+        let r = tool_escalation_evidence(&state, &json!({"escalation_id": subject})).await.unwrap();
+        let prior = &r["evidence"]["prior_on_this_marker"];
+        assert!(prior["opened"].as_u64().unwrap() >= 1, "the earlier ask is precedent: {prior}");
+        assert_eq!(prior["approved"], json!(1), "and how it was decided: {prior}");
+        // The control that makes the count mean something: the subject's own rows must not
+        // inflate its own history, or every first-time ask would look like a repeat offender.
+        let rows = prior["rows"].as_array().unwrap();
+        assert!(
+            rows.iter().all(|row| row["escalation_id"] != json!(subject)),
+            "the case must not appear in its own precedent: {prior}"
+        );
+        assert_eq!(prior["truncated"], json!(false), "a short history is not truncated: {prior}");
+    }
+
+    /// STAGE A IS RUNNING, NOT MERELY DEFINED: opening an escalation through the real door
+    /// leaves a witnessed advisory verdict on the chain, and changes nothing else.
+    ///
+    /// Both halves matter. Without the row, the agreement measurement has nothing to read and
+    /// the rung sits at stage A forever (§4.3). Without the "changes nothing" half, advisory
+    /// is a word — so this asserts the escalation is still PENDING and still unpermitted after
+    /// the rung has spoken.
+    #[tokio::test]
+    async fn a_minted_escalation_gets_a_witnessed_advisory_verdict_and_stays_pending() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let id = open_one(&state, "plugins/*/hooks",
+                          "Bash: cp /nonexistent/x.py plugins/codex/hooks/pre_tool_use.py").await;
+
+        let s = state.lock().await;
+        let rows = s.recent_chain(20);
+        let v = rows
+            .iter()
+            .find(|e| e.event_type == "ladder_advisory_verdict"
+                  && e.event_data["escalation_id"] == json!(id))
+            .unwrap_or_else(|| panic!("the rung was never asked — stage A is not running: {:?}",
+                                      rows.iter().map(|e| &e.event_type).collect::<Vec<_>>()));
+        assert_eq!(v.event_data["rung"], json!("baseline:v1"));
+        assert_eq!(v.event_data["permits_write"], json!(false),
+                   "the row must disclaim authority on its face");
+        assert!(v.event_data["consulted"].as_array().is_some_and(|a| !a.is_empty()),
+                "and say what it read: {:?}", v.event_data);
+
+        // THE OTHER HALF: the rung spoke and nothing moved.
+        let esc = s.gate_escalations.get(&id).expect("still live");
+        assert_eq!(format!("{:?}", esc.status_at(crate::server::gate_escalation::now_secs())),
+                   "Pending", "an advisory verdict must not decide");
+        assert!(esc.factors.is_empty(), "nor mint a factor nobody filed");
+        assert!(esc.consumed_at.is_none());
+    }
+
+    /// THE RUNG MUST READ THE REAL BUNDLE, NOT A FIXTURE THAT RESEMBLES IT.
+    ///
+    /// `adjudicator`'s own tests hand `BaselineRung` a bundle built by hand, which proves the
+    /// rung's logic and NOTHING about whether it can read what `evidence::bundle` actually
+    /// emits. If a field were renamed on one side, every verdict would quietly become
+    /// `EvidenceInsufficient` — a rung that declines everything looks exactly like a rung
+    /// being careful, and the agreement measurement would report an honest-looking zero
+    /// forever. So the two are joined here, against a real escalation opened through the real
+    /// door.
+    #[tokio::test]
+    async fn the_baseline_rung_can_actually_read_a_bundle_this_daemon_produces() {
+        use crate::server::adjudicator::{Adjudicator, BaselineRung, Decision, Decline};
+        use std::io::Write as _;
+
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let src = dir.path().join("incoming.py");
+        let mut f = std::fs::File::create(&src).unwrap();
+        f.write_all(b"alpha\nbeta\n").unwrap();
+        drop(f);
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        let id = open_one(&state, "plugins/*/hooks", &act).await;
+
+        let bundle = {
+            let s = state.lock().await;
+            crate::server::evidence::bundle(&s, &id).expect("a real bundle")
+        };
+        let v = BaselineRung.adjudicate(&bundle);
+
+        // The load-bearing assertion: it did NOT fall through to "I cannot see the act".
+        assert_ne!(
+            v.declined_because,
+            Some(Decline::EvidenceInsufficient),
+            "the rung could not read the daemon's own bundle — the field names have drifted              apart, and every verdict would silently become an evidence failure: {v:?}"
+        );
+        assert_eq!(v.decision, Decision::Decline, "the baseline still never decides");
+        // And it read real fields, not just the ones that happened to exist in a fixture.
+        for field in ["act_text_source", "write_effect", "escalation.asker_basis"] {
+            assert!(
+                v.consulted.iter().any(|c| c == field),
+                "consulted must name {field}, or the record overstates what was read: {:?}",
+                v.consulted
+            );
+        }
+        // NOT asserted: the diff's numbers.
+        //
+        // `enforcing_copy` resolves the PROCESS home, which in production is the daemon's home
+        // and is correct, but in a test means the bundle diffs against whatever this MACHINE
+        // has installed under ~/.hestia/deploy. The first cut asserted "+2" and passed here for
+        // that accidental reason — it would have gone red on CI, where no such tree exists, and
+        // it DID go red in the full suite the moment `hub.rs` set HOME for its own test.
+        // A rung-reads-the-bundle test must not depend on the host's filesystem.
+        assert!(
+            v.rationale.as_deref().unwrap_or("").starts_with("diff vs the enforcing copy"),
+            "it must report what it read, in the shape the rung composes: {:?}", v.rationale
+        );
+    }
+
+    /// THE HUMAN AND THE RUNG MUST READ ONE OBJECT, NOT TWO RENDERINGS OF ONE IDEA.
+    ///
+    /// This is the load-bearing claim of §3.3 — *"if a rung sees less than the human would, it
+    /// is not a rung, it is a filter"* — and it is a claim about a SURFACE, so it is asserted
+    /// here rather than trusted to the fact that both call the same function today. If the
+    /// card and the tool ever diverge, the ladder's promotion measurement is comparing two
+    /// different questions and the agreement rate it produces is meaningless.
+    #[tokio::test]
+    async fn the_operator_card_and_the_reviewers_bundle_show_the_same_write_effect() {
+        use std::io::Write as _;
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let src = dir.path().join("incoming.py");
+        let mut f = std::fs::File::create(&src).unwrap();
+        f.write_all(b"one\ntwo\nthree\n").unwrap();
+        drop(f);
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        let id = open_one(&state, "plugins/*/hooks", &act).await;
+
+        let via_tool = tool_escalation_evidence(&state, &json!({"escalation_id": id}))
+            .await
+            .unwrap();
+        let bundle_effect = via_tool["evidence"]["write_effect"].clone();
+
+        // The card's value, built the way the dashboard builds it.
+        let card_effect = serde_json::to_value(
+            crate::server::evidence::write_effect_cached(&act),
+        )
+        .unwrap();
+
+        assert!(!bundle_effect.is_null(), "the bundle must carry the effect: {via_tool}");
+        assert_eq!(
+            bundle_effect, card_effect,
+            "the operator's card and the reviewer's bundle must be the SAME object"
+        );
+        assert_eq!(bundle_effect["source_lines"], json!(3), "{bundle_effect}");
+        assert!(bundle_effect["payload_sha256"].is_string(),
+                "and must carry the hash the approval binds: {bundle_effect}");
+    }
+
+    fn write_src(dir: &std::path::Path, name: &str, body: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// GPT's required falsifier on #1064 (#1066). The member door documents `reason` as a
+    /// RATIONALE, distinct from the act. Here the rationale itself contains a DIFFERENT,
+    /// syntactically valid `cp` whose source exists — so a bundle that reads the act out of
+    /// `stated_reason` shows the decider a real, measurable write that is NOT the one the
+    /// approval binds. The act text shown, and the effect derived, must be the bound act's.
+    #[tokio::test]
+    async fn a_member_rationale_containing_another_copy_is_never_shown_as_the_act() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let bound = write_src(dir.path(), "bound.py", b"bound\n");
+        let decoy = write_src(dir.path(), "decoy.py", b"decoy\nwith\nfour\nlines\n");
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", bound.display());
+        let reason = format!("because the old gate is wrong; compare: cp {} plugins/kimi/hooks/pre_tool_use.py",
+                             decoy.display());
+        assert!(crate::server::evidence::write_effect_cached(&reason).is_some(),
+                "precondition: the rationale must itself be a measurable copy, or this proves nothing");
+
+        let r = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Bash",
+            "marker": "plugins/*/hooks", "act": act, "reason": reason,
+        })).await.unwrap();
+        let id = r["escalation_id"].as_str().unwrap().to_string();
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        let ev = &b["evidence"];
+
+        assert_ne!(ev["act_text"], json!(reason), "the rationale was presented as the act: {ev}");
+        assert_eq!(ev["act_text"], json!(act), "the bound act must be what is shown: {ev}");
+        assert_eq!(ev["act_text_source"].as_str().map(|s| s.starts_with("retained")), Some(true),
+                   "and labelled as retained from the act, not inferred: {ev}");
+        let from_reason = serde_json::to_value(crate::server::evidence::write_effect_cached(&reason)).unwrap();
+        let from_act = serde_json::to_value(crate::server::evidence::write_effect_cached(&act)).unwrap();
+        assert_ne!(ev["write_effect"], from_reason, "the effect was derived from the rationale: {ev}");
+        assert_eq!(ev["write_effect"], from_act, "the effect must be the bound act's: {ev}");
+        // The object the approval binds and the object the evidence describes are ONE object.
+        assert_eq!(
+            json!(crate::server::gate_escalation::EscalationStore::act_digest_of(ev["act_text"].as_str().unwrap())),
+            ev["escalation"]["act_digest"],
+            "digest(act_text) must equal the bound act_digest: {ev}"
+        );
+        assert_eq!(ev["escalation"]["opened_via"], json!("open"), "{ev}");
+    }
+
+    /// A row that predates retention carries only a digest. Its `stated_reason` may still hold a
+    /// valid copy (the claim door always put the act there, and a member may put anything
+    /// there) — and nothing proves which. So nothing is inferred: null act, UNAVAILABLE, null
+    /// effect. The legacy half of the same falsifier.
+    #[tokio::test]
+    async fn a_legacy_row_without_retained_act_text_infers_nothing_from_its_reason() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let decoy = write_src(dir.path(), "decoy.py", b"decoy\n");
+        let reason = format!("Bash: cp {} plugins/kimi/hooks/pre_tool_use.py", decoy.display());
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            let entry = crate::storage::chain::ChainEntry {
+                chain_position: 0, hash: String::new(), prev_hash: String::new(),
+                event_type: "gate_escalation_opened".into(),
+                event_data: json!({
+                    "escalation_id": "legacy0000000001", "plugin_id": "claude-code",
+                    "role": "role:constellation:member", "tool_name": "Bash",
+                    "marker": "plugins/*/hooks", "act_digest": "d", "stated_reason": reason,
+                    "opened_via": "claim", "opened_at": now, "expires_at": now + 3600,
+                    "ttl_secs": 3600,
+                }),
+                signer_lct: "test".into(),
+                timestamp: chrono::Utc::now(),
+            };
+            assert_eq!(s.gate_escalations.rehydrate(&[entry], now), 1);
+        }
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": "legacy0000000001"}))
+            .await.unwrap();
+        let ev = &b["evidence"];
+        assert!(ev["act_text"].is_null(), "a legacy reason was promoted to the act: {ev}");
+        assert!(ev["act_text_source"].as_str().unwrap_or("").starts_with("UNAVAILABLE"), "{ev}");
+        assert!(ev["write_effect"].is_null(), "an effect was derived from a legacy reason: {ev}");
+    }
+
+    /// CONTROL — without it the fix could be "never show an act". The gate hook's door takes
+    /// `reason` AS the act when no `act` is sent; that string is what the digest binds, so it
+    /// IS the act, and the bundle must show it and measure it.
+    #[tokio::test]
+    async fn the_claim_door_act_is_retained_shown_and_measured() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let src = write_src(dir.path(), "incoming.py", b"one\ntwo\n");
+        let act = format!("Bash: cp {} plugins/codex/hooks/pre_tool_use.py", src.display());
+        let _ = tool_gate_escalation_claim(&state, &json!({
+            "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Bash",
+            "marker": "plugins/*/hooks", "reason": act,
+        })).await;
+        let id = {
+            let s = state.lock().await;
+            s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_opened")
+                .and_then(|e| e.event_data["escalation_id"].as_str().map(str::to_string))
+                .expect("the claim door opened and witnessed an escalation")
+        };
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        let ev = &b["evidence"];
+        assert_eq!(ev["act_text"], json!(act), "{ev}");
+        assert!(!ev["write_effect"].is_null(), "the bound act is a measurable copy: {ev}");
+        assert_eq!(ev["escalation"]["opened_via"], json!("claim"), "{ev}");
+        assert_eq!(
+            json!(crate::server::gate_escalation::EscalationStore::act_digest_of(&act)),
+            ev["escalation"]["act_digest"], "{ev}"
+        );
+        assert_eq!(ev["act_text_covers"], json!("the command as stated"), "{ev}");
+    }
+
+    /// #1091: for Edit/Write the gate hook's act is the TARGET PATH, so the retained text is
+    /// true and incomplete. The bundle must say it names the destination only — a decider
+    /// reading a path as the content it approved is the failure this field prevents.
+    #[tokio::test]
+    async fn an_edit_act_is_labelled_as_naming_the_destination_not_the_content() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let path = "/repo/deploy/install-members.sh";
+        let _ = tool_gate_escalation_claim(&state, &json!({
+            "plugin_id": "claude-code", "role": "role:constellation:member", "tool_name": "Edit",
+            "marker": "deploy/install-members.sh", "reason": path,
+        })).await;
+        let id = {
+            let s = state.lock().await;
+            s.chain_store.read_recent(60).unwrap().into_iter()
+                .find(|e| e.event_type == "gate_escalation_opened")
+                .and_then(|e| e.event_data["escalation_id"].as_str().map(str::to_string))
+                .expect("opened")
+        };
+        let b = tool_escalation_evidence(&state, &json!({"escalation_id": id})).await.unwrap();
+        let ev = &b["evidence"];
+        assert_eq!(ev["act_text"], json!(path), "{ev}");
+        assert!(ev["act_text_covers"].as_str().unwrap_or("").starts_with("destination only"),
+                "an Edit's act is its target; the bundle must not let it read as content: {ev}");
+    }
+}
+
+#[cfg(test)]
 mod appeal_tests {
     use super::*;
     use super::inbox_tests::{open_state, seeded_home};
@@ -17695,7 +20892,7 @@ mod appeal_tests {
     pub(super) async fn seat_in_wake(state: &SharedState, plugin_id: &str, wake: &str) -> Uuid {
         let sid = seat(state, plugin_id).await;
         let mut s = state.lock().await;
-        if let Some(sess) = s.sessions.get_mut(&sid) {
+        if let Some(mut sess) = s.sessions.get_mut(&sid) {
             sess.host_session_id = Some(wake.to_string());
         }
         sid
@@ -17789,6 +20986,92 @@ mod appeal_tests {
                 "a sovereign ruling is not evidence that {id} is working"
             );
         }
+    }
+
+    /// #990 at the arbiter pool: a RETIRED name holds no arbiter slot, even when
+    /// every other signal would hand it the appeal — a recognised lineage prefix
+    /// (`codex-cli` passes the reasoner check on the `codex` prefix) AND Live on
+    /// its own witnessed acts. This is the exact shape claude-code's #1036 review
+    /// measured: residue passes the prefix check, act-liveness can rank it first,
+    /// and the appeal then goes to a mailbox nobody reads. The control half below
+    /// pins that the test would catch a missing filter: while the name is active,
+    /// it wins.
+    #[tokio::test]
+    async fn a_retired_recognised_prefix_name_is_live_and_still_not_routed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        // The pool reads the registry: seed the residue name and a real peer.
+        {
+            let mut s = state.lock().await;
+            let crate::server::state::ServerState {
+                vault,
+                member_registry,
+                ..
+            } = &mut *s;
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                "codex-cli",
+                false,
+                "sid",
+                "anchor",
+            )
+            .unwrap();
+            crate::member_registry::ensure_member(
+                vault,
+                member_registry,
+                "kimi-code",
+                false,
+                "sid",
+                "anchor",
+            )
+            .unwrap();
+        }
+        // codex-cli is LIVE on its own acts — the review's measured case: the
+        // gate's acts witness under the residue id while the member acts as codex.
+        {
+            let s = state.lock().await;
+            s.append_chain("outcome", json!({
+                "plugin_id": "codex-cli", "role_lct": APPELLANT_ROLE,
+                "session_id": "gate-session", "tool_name": "Bash", "success": true,
+                "target": "cargo test"})).unwrap();
+        }
+        let appellant_sid = seat(&state, "claude-code").await;
+        let deny_hash = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+        let filed = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": appellant_sid.to_string(),
+            "reason": "the preset permits deletes under /tmp",
+        })).await.unwrap();
+        assert_eq!(
+            filed.pointer("/dispatched/arbiter").and_then(Value::as_str),
+            Some("codex-cli"),
+            "CONTROL: Live + recognised + cross-vendor wins the slot while the name is active: {filed}"
+        );
+        // The operator retires the residue name — seeded on the store the one
+        // retire verb (#1100) commits, which is the store the pool now reads.
+        {
+            let mut s = state.lock().await;
+            s.retired_members.retire(crate::server::retirement::RetiredMember {
+                plugin_id: "codex-cli".into(),
+                retired_at: 1,
+                reason: "probe residue".into(),
+                evidence_ref: "test".into(),
+                revoked_paths: vec![],
+                was_active: true,
+                retired_by: "op".into(),
+            });
+        }
+        let deny_hash2 = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+        let filed2 = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash2, "session_id": appellant_sid.to_string(),
+            "reason": "and the deny was over-broad a second time",
+        })).await.unwrap();
+        assert_eq!(
+            filed2.pointer("/dispatched/arbiter").and_then(Value::as_str),
+            Some("kimi-code"),
+            "the retirement excludes the Live residue name; the appeal routes to a \
+             member that can answer: {filed2}"
+        );
     }
 
     /// End to end: file, rule, and check that the CONDUCT SCALE moved. If the emitted shape
@@ -18533,7 +21816,7 @@ mod appeal_tests {
                 decided_at: Some(now),
                 decision_reason: Some("yes, that file".into()),
                 recursive: false,
-                revoked: None,
+                revoked: None, ext: Default::default(),
             });
         }
         let body = read_resource_body(&state, "hestia://scope/scope-test459a")
@@ -19311,6 +22594,24 @@ mod vault_hst001_tests {
                 "the secret value must NEVER be written to the chain");
     }
 
+    /// #1131 class A: a secret whose release cannot be recorded is not released.
+    #[tokio::test]
+    async fn a_read_that_cannot_be_recorded_releases_nothing() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        { state.lock().await.vault.upsert(VaultEntry::new("legacy-cred", "DUMMY-SECRET")).unwrap(); }
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_vget BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'vault_get' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        let anon = seat_session(&state, "some-random-caller").await;
+        let r = get(&state, Some(anon), "legacy-cred").await;
+        assert!(r.get("value").is_none(), "the secret was released unrecorded: {r}");
+        assert!(!r.to_string().contains("DUMMY-SECRET"));
+        assert!(r.to_string().contains("vault_release_unrecorded"), "{r}");
+    }
+
     /// kimi's residual on #76: an ANONYMOUS write must not bind the credential to whoever
     /// connected last. `resolve_caller` falls back to `max_by_key(connected_at)`, so before
     /// this fix an unattributed writer made a bystander the owner of a secret it never
@@ -19576,6 +22877,7 @@ mod authority_attribution_tests {
     async fn witness_decision_threads_caller_rule_id_to_reputation_row() {
         let (dir, _) = seeded_home();
         let state = open_state(&dir);
+        crate::storage::trust::flush_all_for_test();
         let sink = { state.lock().await.reputation_sink() };
         tool_witness_decision(
             &state,
@@ -19590,6 +22892,7 @@ mod authority_attribution_tests {
         )
         .await
         .expect("witness_decision with a rule_id arg");
+        crate::storage::trust::flush_all_for_test();
         let body = std::fs::read_to_string(&sink).expect("a delta row was emitted");
         let last: serde_json::Value =
             serde_json::from_str(body.lines().last().unwrap()).unwrap();
@@ -19863,6 +23166,26 @@ fn resolve_invitation(
                     false
                 }
             })
+            // The two names that can never answer, excluded by TYPE rather than by
+            // rank (#990). A slot on this list is RIVALROUS (top `MAX_INVITED_PEERS`
+            // of a pool that only grew), and every ranking fix left the residue in
+            // place underneath the cap:
+            //   * RETIRED — the operator's administrative remove, recorded in
+            //     `retired_members` by the one retire verb (`POST
+            //     /api/agents/:id/retire`, #1100): witnessed as
+            //     `member_retire_intent`/`member_retired`, and it revokes the id's
+            //     grants in the same act. dp's standing call is that evidence
+            //     (liveness, mailbox rows) may ORDER the pool but never shrink it —
+            //     a legitimate new member has no rows yet — so the shrink is an
+            //     administrative act, and this filter is where it takes effect.
+            //   * FILLER — typed never-a-member at mint (`ensure_filler`): it cannot
+            //     connect, witness, or answer, so a slot spent on it is dead by
+            //     construction. Same defect class as probe residue, one field over.
+            // Both stay in the registry (presence, history) — this is a SELECTION
+            // exclusion, not an erasure; the retirement row and the type mark are
+            // the record.
+            .filter(|id| !s.retired_members.is_retired(id))
+            .filter(|id| !s.member_registry.is_filler(id))
             .map(|id| {
                 let l = actor_liveness(&window, &id);
                 let reachable = has_mailbox_reader(&s.inbox_store, &id);
@@ -20081,7 +23404,6 @@ fn opened_payload(
     inv: &OpenedInvitation,
     asker_is_proven: bool,
     answers_deny: Option<&str>,
-    opened_via: &'static str,
     ttl_secs: u64,
 ) -> Value {
     json!({
@@ -20094,6 +23416,11 @@ fn opened_payload(
         // Explicit null when the opener stated no act, so a census can count that class
         // rather than confuse it with a row that predates the field.
         "act_digest": esc.act_digest,
+        // THE ACT ITSELF (#1066) — the exact text the digest above was computed from. On the
+        // chain because the struct is restored from here: without it a restart would turn
+        // every pending ask back into a digest nobody can read. `rehydrate` restores it only
+        // if it still hashes to `act_digest`.
+        "act_text": esc.act_text,
         // WHICH BYTES this approval is being asked for (#1056), when the act named a source
         // the daemon could read. On the chain for the same reason the act digest is: the
         // binding must survive a restart. Explicit null when nothing was measurable, so a
@@ -20111,8 +23438,9 @@ fn opened_payload(
         // contradicted it.
         "payload_stated_but_not_measured": esc.payload_stated_but_not_measured,
         // WHICH DOOR. See the doc comment: the key-set accident that used to answer this is
-        // gone as of this change, deliberately.
-        "opened_via": opened_via,
+        // gone as of this change, deliberately. Read from the struct (#1066), which each door
+        // records before it witnesses, so the row and the record cannot name different doors.
+        "opened_via": esc.opened_via.as_str(),
         // Clause A: the record commits the evidence it relied on, not just the claim.
         // `session` means the asker was resolved through `resolve_attributed_caller` and
         // equals the session's own member; `asserted` means it is a bare string this
@@ -20135,6 +23463,13 @@ fn opened_payload(
         // unauditable. Stated at open, evaluated at decision. Absent from every claim-path
         // entry until now, which is why 0 of 362 opened payloads could be read for it.
         "bar": esc.bar,
+        // ...and the markers it was computed over (`gate_escalation::price`: the HIGHEST bar
+        // over every marker the act reaches, so a directory marker cannot shadow a sovereign
+        // file). Replay restores both rather than repricing.
+        "matched_markers": esc.matched_markers,
+        // What the act reaches, as the caller sent it (#810) — one of the inputs the bar was
+        // priced from. Explicit null when absent (an old hook, the member door without it).
+        "resolved_targets": esc.resolved_targets,
         // WHO WAS ASKED. The field whose absence made "invited and absent" and "never
         // asked" the same row. Both bars populate it: `single_approver` is satisfied by a
         // NOT-SAME peer acting alone, so it is the bar an invitation helps MOST — reading it
@@ -20396,6 +23731,10 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // states only a why gets `MissingField("act")` from the mint site and a message saying
     // which field to add, rather than an approval that can never be claimed.
     let act = optional_string(args, "act");
+    // THE ACT'S RESOLVED TARGET (#810, recut of #812): the path the act writes, when the
+    // member names it. Optional and caller-asserted; it joins the pricing as one more marker
+    // source, so it can raise this escalation's bar and never lower it (`price`).
+    let resolved_targets = super::gate_escalation::resolved_targets_from_args(args);
     // #128 (release blocker per #224, closed "superseded for coordination" rather than fixed):
     // this surface has always taken its asker as a bare string and accepted no session at all,
     // so `arbiter::eligibility` compares an ASSERTION (`appellant: &esc.plugin_id`) against an
@@ -20464,6 +23803,9 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         .open_or_coalesce_with_payload(&plugin_id, &role, &tool_name, &marker,
               // The act, from its own field. No fallback to `reason` on this door.
               act.as_deref(),
+              // What the act reaches, when the member names it (#810): priced with the marker
+              // and the act, and can only strengthen the bar (`gate_escalation::price`).
+              &resolved_targets,
               stated_reason.as_deref(), stated_detail.as_deref(),
               Some(&binding), now, DEFAULT_TTL_SECS)
     {
@@ -20520,6 +23862,9 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         proven_host_session_id.as_deref(),
         proven_session_id.as_deref(),
     );
+    // THE DOOR (#1066): the member door, where `reason` is a rationale and never the act.
+    s.gate_escalations
+        .record_opened_via(&esc.id, crate::server::gate_escalation::OpenedVia::Open);
     // Re-read AFTER the recording: `open` returned a clone taken before it, and
     // the payload below is built from the struct — the store is the record.
     let esc = s
@@ -20553,10 +23898,10 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             &inv,
             asker_is_proven,
             answers_deny.as_deref(),
-            "open",
             DEFAULT_TTL_SECS,
         ),
     )?;
+    shadow_adjudicate(&mut s, &esc.id);
 
     let invited = inv.invited;
     let invitations = deliver_invitations(&mut s, &esc, &invited, &entry.hash);
@@ -20673,9 +24018,232 @@ mod invitation_note_contract_tests {
 /// **Asking is not receiving.** This returns `pending` and permits nothing. Only the operator
 /// answers, only through the operator-gated HTTP surface, and an unanswered request expires into
 /// a refusal.
-async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
+/// EXISTENCE FIRST (dp, 2026-10-26, hestia#1411): "we should not be doing escalations on
+/// nonexistent paths because there is nothing to escalate - it's just noise". The tools whose
+/// act on a path only READS it: the gate's `READ_ONLY_PATH_TOOLS` plus every tool its
+/// `PATH_TOOL_MODES` maps to exactly `r` (kept in step by `read_tools_match_the_gate`).
+pub(crate) const READ_ONLY_PATH_TOOLS: &[&str] = &[
+    "Glob", "Grep", "LS", "NotebookRead", "Read", "git_read", "glob", "list_directory",
+    "read_file", "read_many_files", "search", "search_file_content",
+];
+
+/// The roots this member's grants and the society floor name: every live and standing grant
+/// root plus every floor root. Where a member's asks are judged to be "about its own space"
+/// (`in_members_space`) and where a did-you-mean candidate may be re-rooted.
+/// Every root the member holds some grant on, WITH its reach: `(root, recursive)`. An exact grant
+/// covers only its own path (part B and C, #1386: the parent is not reach), so a consumer that
+/// asks "is this path under a root" must honour the flag, or an exact grant on a broad directory
+/// would make its whole subtree answerable (nomad on #1415).
+fn member_roots(s: &crate::server::state::ServerState, plugin_id: &str) -> Vec<(String, bool)> {
+    let mut roots: Vec<(String, bool)> = s.live_scope_grants(plugin_id).iter()
+        .map(|r| (r.reach_path().to_string(), r.recursive)).collect();
+    roots.extend(s.live_standing_grants(plugin_id).iter().map(|g| (g.path.clone(), g.recursive)));
+    roots.extend(s.standing_scope.floor.iter().map(|f| (f.path.clone(), f.recursive)));
+    roots
+}
+
+/// The path a nonexistent `target` most likely meant, re-rooted onto `root`: a grant root's
+/// basename found as an INTERIOR segment of `target` re-roots the rest of `target` under that
+/// grant, so the doubled root `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`.
+/// None when `target` does not name the root's basename that way. A `target` that merely ENDS
+/// with the basename (`<elsewhere>/governance`) is not re-rooted: its candidate would be the root
+/// itself, which always exists, so answering it silently would make "does there exist a
+/// `<elsewhere>/governance`" an oracle over the host for every `<elsewhere>` (nomad on #1415).
+fn reroot_onto(root: &str, target: &str) -> Option<String> {
+    let root = root.trim_end_matches('/');
+    let base = root.rsplit('/').next().filter(|b| !b.is_empty())?;
+    let marker = format!("/{base}/");
+    let i = target.find(&marker)?;
+    Some(format!("{root}{}", &target[i + marker.len() - 1..]))
+}
+
+/// The existing, readable path inside the member's own reach that a nonexistent `target` most
+/// likely meant, or None: `target` re-roots onto one of `roots` (`reroot_onto`), the candidate
+/// EXISTS, RESOLVES inside its root (a symlink beneath the root that points outside it exists
+/// but is not the member's to read), and the member is admitted to READ it there by its
+/// effective grants (an exact grant does not reach a child; a floor row may not give this member
+/// read) — the gate's #1412 repair, applied here (Nova, nomad on #1415). This ONE predicate both
+/// draws the hint and bounds the silent decline, so the decline can never be quiet about a path
+/// the hint would not name.
+fn rerooted_in_reach(s: &crate::server::state::ServerState, plugin_id: &str, roots: &[(String, bool)],
+                     target: &str, now: u64) -> Option<String> {
+    roots.iter().find_map(|(root, _recursive)| {
+        let root = root.trim_end_matches('/');
+        let cand = reroot_onto(root, target)?;
+        if cand == target {
+            return None;
+        }
+        let real = std::fs::canonicalize(&cand).ok()?;
+        let root_real = std::fs::canonicalize(root).ok()?;
+        if !(real == root_real || real.starts_with(&root_real)) {
+            return None;
+        }
+        let real_s = real.to_string_lossy().to_string();
+        let read = crate::server::grant_modes::Modes::READ;
+        let admitted = s.has_scope_grant_for(plugin_id, &real_s, read)
+            || s.standing_scope.effective_modes(plugin_id, &real_s, now).is_some_and(|m| m.includes(read));
+        admitted.then_some(cand)
+    })
+}
+
+/// Where an asked path stands relative to the member's own space (nomad and Nova on #1415).
+enum SpaceAnswer {
+    /// UNDER a root the member holds some grant on: the member could learn the path's existence
+    /// by itself, so the existence-first decline may stat it.
+    Under,
+    /// OUTSIDE every root, but a doubled root that re-roots onto something REAL and readable in
+    /// the member's reach (`<ws>/hestia/governance/hestia/gate.py` while holding `<ws>/governance`
+    /// and `governance/hestia/gate.py` exists there). Carries the candidate. The target itself
+    /// is NEVER stat-ed here: a quiet answer that depended on the target's existence would tell
+    /// the member whether `<prefix>` exists for any `<prefix>` on the host (an existing FILE
+    /// there gives ENOTDIR, which reads as present and files; a missing one gives NotFound and
+    /// is quiet) — an existence oracle, whatever bound is put on the candidate. So the answer
+    /// is computed from the candidate alone, and the member that truly means the outside path
+    /// says so once (`confirm: true`) and is filed without any look at the target.
+    Misrooted(String),
+    /// Everywhere else: files as before, so the operator sees the probe.
+    Outside,
+}
+
+/// `path` resolved through its deepest EXISTING ancestor (`canonicalize`), with the missing tail
+/// re-appended; None when no ancestor can be resolved. The target of an existence-first ask is
+/// usually absent, so this is how an escaping symlink beneath a root is seen for what it is
+/// before anything is answered (Nova, nomad on #1415).
+fn resolve_through_existing_ancestor(path: &str) -> Option<std::path::PathBuf> {
+    let mut cur = std::path::Path::new(path);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            let mut out = real;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return Some(out);
+        }
+        // Climb only past a component that is genuinely ABSENT. An entry that exists but did not
+        // canonicalize is a dangling or looping link, or unreadable: treating it as a missing
+        // ordinary component would re-root its name under the parent and make "does the link's
+        // outside target exist" decide Under versus Outside (Nova, nomad on #1415). None here is
+        // "not Under", so the ask files either way.
+        match std::fs::symlink_metadata(cur) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        tail.push(cur.file_name()?.to_os_string());
+        cur = cur.parent()?;
+    }
+}
+
+/// Whether `path` is an existing symlink (dangling or not), without following it.
+fn is_symlink(path: &str) -> bool {
+    std::fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+}
+
+/// Whether the gate's own law lets `plugin_id` READ at `real` (a resolved path): the NEAREST of
+/// the member's own grants covering it decides, by the union of the grants at that depth (#1386,
+/// the rule part C applies at the gate); with no own grant covering it, the floor rows that do.
+/// `effective_modes` unions EVERY covering own grant, which would let a wide `r` admit a read
+/// inside a nearer `w`-only node (Nova on #1415, regression 3); this does not.
+fn read_admitted_nearest(s: &crate::server::state::ServerState, plugin_id: &str, real: &str, now: u64) -> bool {
+    use crate::server::grant_modes::Modes;
+    use crate::server::standing_scope::covers_path;
+    let canon = |root: &str| std::fs::canonicalize(root)
+        .map(|r| r.to_string_lossy().to_string())
+        .unwrap_or_else(|_| root.trim_end_matches('/').to_string());
+    let mut nodes: Vec<(String, bool, Modes)> = s.live_scope_grants(plugin_id).iter()
+        .map(|r| (canon(r.reach_path()), r.recursive, r.ext.modes)).collect();
+    nodes.extend(s.live_standing_grants(plugin_id).iter().map(|g| (canon(&g.path), g.recursive, g.modes)));
+    let covering: Vec<&(String, bool, Modes)> =
+        nodes.iter().filter(|(root, rec, _)| covers_path(root, *rec, real)).collect();
+    if let Some(best) = covering.iter().map(|(root, _, _)| root.matches('/').count()).max() {
+        let held = covering.iter()
+            .filter(|(root, _, _)| root.matches('/').count() == best)
+            .map(|(_, _, m)| *m)
+            .reduce(|a, b| a.union(b))
+            .unwrap_or(Modes::READ);
+        return held.includes(Modes::READ);
+    }
+    let _ = now;
+    s.standing_scope.floor.iter()
+        .filter(|f| covers_path(&canon(&f.path), f.recursive, real))
+        .map(|f| f.modes)
+        .reduce(|a, b| a.union(b))
+        .is_some_and(|m| m.includes(Modes::READ))
+}
+
+fn space_of(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> SpaceAnswer {
+    let p = path.trim_end_matches('/');
+    let roots = member_roots(s, plugin_id);
+    let now = crate::server::gate_escalation::now_secs();
+    // UNDER means "the gate's own law would let this member READ here" (Nova, nomad on #1415),
+    // never "lexically beneath some root": the target is resolved through its deepest existing
+    // ancestor, must sit inside a root's resolved path (an escaping symlink fails), and the member
+    // must be READ-admitted there by the nearest grant (a w-only root, a w-only floor row, or an
+    // r grant shadowed by a nearer w-only node fails). Only then may the target be stat-ed, since
+    // the member could learn its existence itself. An EXACT grant on this very path, the path
+    // itself missing, is Under by the grant's own identity (if the member may read it).
+    let inside = |real: &str| roots.iter().any(|(root, recursive)| {
+        let root = root.trim_end_matches('/');
+        if root.is_empty() {
+            return false;
+        }
+        let root_real = std::fs::canonicalize(root)
+            .map(|r| r.to_string_lossy().to_string())
+            .unwrap_or_else(|_| root.to_string());
+        real == root_real || (*recursive && real.starts_with(&format!("{root_real}/")))
+    });
+    // The exact-identity arm never follows a link either: an exactly granted path that is itself
+    // a (dangling) symlink is not Under by identity, since answering from it would answer for
+    // the link's target (nomad on #1415).
+    let exact_self = !is_symlink(p) && roots.iter().any(|(root, _)| root.trim_end_matches('/') == p);
+    let under = match resolve_through_existing_ancestor(p).map(|r| r.to_string_lossy().to_string()) {
+        Some(real) if inside(&real) => read_admitted_nearest(s, plugin_id, &real, now),
+        _ => exact_self && read_admitted_nearest(s, plugin_id, p, now),
+    };
+    if under {
+        return SpaceAnswer::Under;
+    }
+    match rerooted_in_reach(s, plugin_id, &roots, p, crate::server::gate_escalation::now_secs()) {
+        Some(cand) => SpaceAnswer::Misrooted(cand),
+        None => SpaceAnswer::Outside,
+    }
+}
+
+/// The answer for a misrooted ask: names the in-reach path it most likely meant and the one
+/// way to insist. Depends on the candidate only (see `SpaceAnswer::Misrooted`).
+fn misrooted_detail(path: &str, cand: &str) -> String {
+    format!("{path} lies outside every grant you hold, and it re-roots onto {cand}, which exists \
+             inside one. Did you mean {cand}? It is in your reach now. If you really mean {path}, \
+             ask again with confirm: true and it will be filed")
+}
+
+/// `Path::try_exists` read the way a gate must: an error (an unreadable parent, a dangling or
+/// looping link) is NOT "absent". Only a definite `Ok(false)` is (nomad on #1415, point 2).
+fn definitely_absent(path: &str) -> bool {
+    matches!(std::path::Path::new(path).try_exists(), Ok(false))
+}
+
+/// The refusal text for an ask about a path that does not exist (hestia#1411), naming the
+/// existing path inside one of the member's own grants that it most likely meant
+/// (`rerooted_in_reach`: the doubled root `<ws>/hestia/governance/hestia/x` becomes
+/// `<ws>/governance/hestia/x`, offered only when that exists, resolves inside its root and the
+/// member may READ it there). The hint can never name a path the follow-up read would refuse.
+fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> String {
+    let now = crate::server::gate_escalation::now_secs();
+    let roots = member_roots(s, plugin_id);
+    let target = path.trim_end_matches('/');
+    let hint = rerooted_in_reach(s, plugin_id, &roots, target, now);
+    let mut out = format!("{path} does not exist: there is nothing there to grant, so no request was \
+                           opened (nothing reaches the operator's queue)");
+    if let Some(c) = hint {
+        out.push_str(&format!(". Did you mean {c}? It exists, inside a grant you already hold"));
+    }
+    out
+}
+
+pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
-    use crate::server::state::{normalize_scope_path, ScopeRequest, SCOPE_REQUEST_TTL_SECS};
+    use crate::server::state::{normalize_scope_path, ScopeRequest, ScopeRequestExt, SCOPE_REQUEST_TTL_SECS};
 
     let plugin_id = require_string(args, "plugin_id")?;
     let role = optional_string(args, "role").unwrap_or_default();
@@ -20716,6 +24284,68 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
     let now = now_secs();
     let mut s = state.lock().await;
 
+    // ATTRIBUTION (hestia#1409), the same rule as `hestia_scope_claim`: a resolved session names
+    // the member, and an asserted id that disagrees with it is refused rather than believed.
+    // Without a session the id is asserted (A1) and recorded as such, so no peer can later
+    // treat a name a caller typed as a proven asker.
+    let asker_basis = match resolve_attributed_caller(&s, optional_session_id(args).as_deref()) {
+        Some(who) if who.plugin_id != plugin_id => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_request_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing was filed",
+                Some(json!({ "asserted": plugin_id, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(_) => crate::arbiter::AskerBasis::Session,
+        None => crate::arbiter::AskerBasis::Asserted,
+    };
+
+    // EXISTENCE FIRST (hestia#1411). A request names no mode, so a path that does not exist is
+    // refused unless the member says it is creating it (`create: true`): a new file, even in a
+    // new directory, is a real ask (dp: "how is mkdir or a new file write handled"). Nothing is
+    // filed and nothing is witnessed: there is no decision for anyone to make.
+    let create = args.get("create").and_then(Value::as_bool).unwrap_or(false);
+    // `confirm: true` says "I mean this outside path, not the in-reach one it re-roots onto":
+    // the ask is then filed without any look at the target (it buys an escalation, never a
+    // permission). The target is stat-ed only UNDER a root the member holds (see `SpaceAnswer`).
+    let confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    // A PATH THAT DOES NOT EXIST IS NEVER FILED, WHEREVER IT IS (dp, 2026-10-30: "a nonexistent
+    // path should never escalate to a scope request, it should be flatly denied as not there";
+    // 10-26: "the not visible to you should only come on an existing path that's off limits").
+    // #1415's review had narrowed this to paths under the member's own roots, to keep "does X
+    // exist" from being answered for paths outside its reach. dp's rule takes the other side of
+    // that trade on purpose: the gate already answers `mrh.path.nonexistent` for any missing path
+    // (#1412), and five member-filed asks for missing paths reached the operator on 10-30 under the
+    // narrowed rule. `definitely_absent` still reads an unreadable or dangling entry as present,
+    // so those still file.
+    if !create && definitely_absent(&path) {
+        return Ok(json!({
+            "status": "not_filed",
+            "reason": "nonexistent",
+            "path": path,
+            "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
+            "next": "check the spelling against what you already hold; if you mean to CREATE \
+                     this path, ask again with create: true",
+        }));
+    }
+    if !create {
+        match space_of(&s, &plugin_id, &path) {
+            SpaceAnswer::Misrooted(cand) if !confirm => {
+                return Ok(json!({
+                    "status": "not_filed",
+                    "reason": "likely_misrooted",
+                    "path": path,
+                    "candidate": cand,
+                    "detail": misrooted_detail(&path, &cand),
+                    "next": "read the candidate, which you already hold; or ask again with \
+                             confirm: true if you mean this path and not the candidate",
+                }));
+            }
+            _ => {}
+        }
+    }
+
     // An already-live grant answers the ask without a second act. Told plainly rather than
     // silently deduplicated, so a member never wonders whether its request went nowhere.
     if s.has_scope_grant(&plugin_id, &path) {
@@ -20723,6 +24353,21 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
             "status": "already_granted",
             "path": path,
             "note": "you already hold a live grant for this exact path; no new request was filed",
+        }));
+    }
+
+    // A STANDING REFUSAL covering the path (hestia#1417): the door is closed until the operator
+    // lifts it, so the ask is not filed and the member is told why, in the decider's words.
+    if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+        return Ok(json!({
+            "status": "refused_standing",
+            "path": path,
+            "refused_by": r.refused_by,
+            "refused_at": r.refused_at,
+            "reason": r.reason,
+            "note": "a standing refusal covers this path: nothing was filed and nothing reaches \
+                     the operator's queue. It stands until the operator lifts it; the reason is \
+                     the one recorded when it was refused",
         }));
     }
 
@@ -20755,6 +24400,7 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
         decision_reason: None,
         recursive: false,
         revoked: None,
+        ext: ScopeRequestExt { asker_basis: Some(asker_basis), ..Default::default() },
     };
     s.scope_requests.insert(id.clone(), req);
 
@@ -20795,12 +24441,62 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
 
 /// `hestia_scope_status` — what a member may reach beyond its standing MRH, and what it has asked
 /// for. Read-only and unwitnessed: reading your own permissions is not an act.
+/// Disclose a grant's modes in the operating law when, and only when, they are narrower than all
+/// four (#1345). An all-modes row is left exactly as it was, so `law_hash` does not move for a
+/// society that never narrows a grant, and moves the moment one is narrowed: a member pinning
+/// the hash learns that what it may DO changed, as it already does for what it may reach.
+fn with_modes(mut row: Value, modes: crate::server::grant_modes::Modes) -> Value {
+    if !modes.is_all() {
+        if let Some(o) = row.as_object_mut() {
+            o.insert("modes".into(), json!(modes));
+        }
+    }
+    row
+}
+
+/// How many `hestia_scope_status` reads this daemon served with no session that resolves to the asserted
+/// member (hestia #1450 phase 0, step B). Step C refuses those reads, and is safe only once every
+/// machine's count stays at zero: that is when every caller (the gate's snapshot fetch above all) sends
+/// its session. Served in every response as `unbound_reads_since_start`, a bare number.
+static UNBOUND_SCOPE_STATUS_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
 
     let plugin_id = require_string(args, "plugin_id")?;
     let now = now_secs();
-    let s = state.lock().await;
+    // LOCK-FREE (stage 2): the published policy snapshot, never the state lock.
+    let s = state.published();
+    s.observe();
+
+    // THE CALLER IS WHO ITS SESSION SAYS, NOT WHO IT NAMES (hestia #1450 phase 0, step B). This read
+    // returns a member's grants, floor and request history, and it took `plugin_id` on trust: any
+    // process that could reach the daemon could read another member's territory by naming it, while
+    // hestia_operating_law and hestia_scope_claim already resolved the session. A session that resolves
+    // to a DIFFERENT member is refused here -- that is a lie, and no honest caller sends one. An absent
+    // or unresolvable session is still served, as before, because the gate itself fetched its snapshot
+    // without one until step A: refusing it would deny every governed act on every machine running an
+    // older hook ("no snapshot, no permit"). Those reads are marked and counted; step C refuses them.
+    let caller_bound = match args.get("session_id").and_then(|v| v.as_str()) {
+        Some(sid) => match s.resolve(Some(sid)) {
+            Some(who) if who.plugin_id == plugin_id => true,
+            Some(who) => {
+                return Err(anyhow::anyhow!(
+                    "hestia_scope_status: the session you sent belongs to '{}', not '{}'. This read \
+                     answers for the member whose session asks; send plugin_id '{}' with that session, \
+                     or that member's own session.",
+                    who.plugin_id, plugin_id, who.plugin_id
+                ));
+            }
+            None => false,
+        },
+        None => false,
+    };
+    let unbound_reads = if caller_bound {
+        UNBOUND_SCOPE_STATUS_READS.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        UNBOUND_SCOPE_STATUS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    };
 
     // THE HONOR HORIZON IS BOUNDED BY WHAT IT COVERS (GPT review of #431, blocker 3). A
     // flat now+8h told consumers they could honour a cached snapshot for hours while a
@@ -20848,26 +24544,102 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "revoked_at": r.revoked.as_ref().map(|v| v.at),
                 "revoked_by": r.revoked.as_ref().map(|v| v.by.clone()),
                 "revoke_reason": r.revoked.as_ref().map(|v| v.reason.clone()),
+                // 2026-10-05: a request your GATE opened on a refusal says so, and a one-time
+                // answer says whether it is still yours to spend — re-issue the identical act
+                // (`act`) inside `expires_at` to spend it.
+                "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
+                "once": r.ext.once,
+                "spent_at": r.ext.spent_at,
+                "secs_remaining": r.expires_at.saturating_sub(now),
+                "grant_path": r.reach_path(),
+                "recursive": r.recursive,
+                "modes": r.ext.modes,
             })
         })
         .collect();
 
+    // FAIL CLOSED FOR A MODE-BLIND GATE (#1345). Every gate released before modes existed
+    // turns each row of `live_grants` / `standing_grants` into reach for EVERY act, so a
+    // read-only grant served there would be enforced as rwed: the narrowing the operator chose
+    // would widen silently on the way to enforcement. Those two keys therefore carry only
+    // all-modes grants, exactly what they always meant. Every grant, narrowed or not, is
+    // ALSO served in `grants_by_mode` with its modes; a gate that predates that key ignores it
+    // and refuses, so an older gate reads a narrowed grant as no grant, never as a wider one.
+    // (#1347 makes the same choice for read-only floor entries with `society_floor_read`.)
+    let live_all = s.live_scope_grants(&plugin_id);
+    let standing_all = s.live_standing_grants(&plugin_id);
+    let grants_by_mode: Vec<Value> = live_all
+        .iter()
+        .map(|r| json!({
+            "channel": "live",
+            "path": r.reach_path(),
+            "recursive": r.recursive,
+            "modes": r.ext.modes,
+            "expires_at": r.expires_at,
+            "granted_by": r.decided_by,
+            "request_id": r.id,
+        }))
+        .chain(standing_all.iter().map(|g| json!({
+            "channel": "standing",
+            "path": g.path,
+            "recursive": g.recursive,
+            "modes": g.modes,
+            "expires_at": g.expires_at,
+            "granted_by": g.granted_by,
+            "request_id": g.request_id,
+        })))
+        .collect();
+
+    // THE FLOOR AS THIS MEMBER'S GATE MAY ENFORCE IT (dp, 2026-10-23: "'floor' should not
+    // override the actual grants"). A mode-blind gate unions `society_floor` with the member's
+    // grants, so an all-modes floor entry overlapping one of the member's NARROWED grants is
+    // withheld from it, and named; see StandingScopeStore::floor_for.
+    let narrowed: Vec<(String, bool, crate::server::grant_modes::Modes)> = live_all
+        .iter()
+        .filter(|r| !r.ext.modes.is_all())
+        .map(|r| (r.reach_path().to_string(), r.recursive, r.ext.modes))
+        .chain(standing_all.iter().filter(|g| !g.modes.is_all())
+               .map(|g| (g.path.clone(), g.recursive, g.modes)))
+        .collect();
+    let floor_view = s.standing_scope.floor_for(&narrowed);
+    let floor_row = |f: &crate::server::standing_scope::FloorEntry| json!({
+        "path": f.path,
+        "recursive": f.recursive,
+        "added_at": f.added_at,
+        "added_by": f.added_by,
+        "reason": f.reason,
+    });
+
     Ok(json!({
         "plugin_id": plugin_id,
+        // #1450 phase 0: true when the session sent resolves to `plugin_id`; false for a read served on the
+        // asserted name alone (no session, or one that no longer resolves). Step C refuses those.
+        "caller_bound": caller_bound,
+        "unbound_reads_since_start": unbound_reads,
         "requests": requests,
         // The operative list, separated from the history, because "what may I read right now"
         // and "what have I asked for" are different questions and only one of them is a
         // permission.
-        "live_grants": s.live_scope_grants(&plugin_id)
+        "live_grants": live_all
             .iter()
-            .map(|r| json!({"path": r.path, "expires_at": r.expires_at, "granted_by": r.decided_by,
+            .filter(|r| r.ext.modes.is_all())
+            .map(|r| json!({"path": r.reach_path(), "expires_at": r.expires_at, "granted_by": r.decided_by,
                             "recursive": r.recursive}))
             .collect::<Vec<_>>(),
         // The DURABLE list, additive beside live_grants (Sprint F R1): operator-promoted
         // standing grants from the vault-persisted store. Expired grants are filtered in
         // the store's read, so nothing served here is past its horizon.
-        "standing_grants": s.live_standing_grants(&plugin_id)
+        // STANDING REFUSALS this member is under (hestia#1417): the governed see the closed
+        // door and the deciding seat's reason, instead of re-trying it every window.
+        "refused_standing": s.standing_scope.refusals.iter()
+            .filter(|r| r.member == plugin_id)
+            .map(|r| json!({"path": r.path, "recursive": r.recursive, "refused_at": r.refused_at,
+                            "refused_by": r.refused_by, "reason": r.reason}))
+            .collect::<Vec<_>>(),
+        "standing_grants": standing_all
             .iter()
+            .filter(|g| g.modes.is_all())
             .map(|g| json!({
                 "path": g.path,
                 "granted_at": g.granted_at,
@@ -20881,6 +24653,9 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "recursive": g.recursive,
             }))
             .collect::<Vec<_>>(),
+        // EVERY live and standing grant with what it lets the member DO (#1345). See the
+        // fail-closed note above: the two lists before this one hold only all-modes grants.
+        "grants_by_mode": grants_by_mode,
         // CERTIFICATION, issued by the authority — the two fields the plugin gate's
         // certified-replica logic (AgentPolicy) has demanded since 2026-08-04 with nothing
         // issuing them: WHICH policy this is (the standing store's monotonic generation,
@@ -20896,17 +24671,33 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // applies only to members whose gate remembered to ask — which is per-seat law again,
         // wearing the word "uniform".
         //
-        // Member-independent by construction: this list does not depend on `plugin_id`, so
-        // two members comparing their snapshots see the same floor or the daemon is lying.
-        "society_floor": s.standing_scope.floor
-            .iter()
-            .map(|f| json!({
-                "path": f.path,
-                "added_at": f.added_at,
-                "added_by": f.added_by,
-                "reason": f.reason,
-            }))
+        // ALL-MODES floor entries this member's gate may enforce as reach. The same for every
+        // member except where one of the member's own narrowed grants overlaps an entry:
+        // that entry is withheld from that member (below), because the floor does not
+        // override a member's grant. `floor_by_mode` and `society_floor_digest` stay
+        // member-independent, so two members can still prove they received the same floor.
+        "society_floor": floor_view.reach.iter().map(|f| floor_row(f)).collect::<Vec<_>>(),
+        // NARROWED floor entries that include read, under their own key ON PURPOSE (dp,
+        // 2026-10-19: "the governed see the law"). A gate that predates this key must not see
+        // them as `society_floor` entries: it would map them to all-modes grants. Served
+        // apart, an old gate ignores them and admits nothing, and a gate that knows the key
+        // admits them for read acts only.
+        "society_floor_read": floor_view.read.iter().map(|f| floor_row(f)).collect::<Vec<_>>(),
+        // Floor entries this member's gate is NOT served, each with why: nothing is dropped
+        // silently, and a member that finds a floor path refused can read the reason here.
+        "society_floor_withheld": floor_view.withheld.iter()
+            .map(|w| json!({"path": w.path, "why": w.why}))
             .collect::<Vec<_>>(),
+        // EVERY floor entry with its modes (#1345's `grants_by_mode` for the floor), for the
+        // gate that enforces modes (part B) and for the dashboard.
+        "floor_by_mode": s.standing_scope.floor.iter().map(|f| json!({
+            "path": f.path,
+            "recursive": f.recursive,
+            "modes": f.modes,
+            "added_at": f.added_at,
+            "added_by": f.added_by,
+            "reason": f.reason,
+        })).collect::<Vec<_>>(),
         // Canonical over the path set, not presentation order or provenance. Combined with
         // `generation`, this lets two members prove they received the same society baseline
         // without learning anything about one another's personal expansions.
@@ -20926,6 +24717,7 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
             .map(|a| a.divergence.clone())
             .unwrap_or_default(),
         "snapshot_expires_at": snapshot_expires_at,
+        "publication_version": s.version,
         "lifetime": "live_grants are memory-only — they die with the daemon, and the operator \
                      can also withdraw one early: its request then reads status `revoked`, with \
                      `revoked_by` and `revoke_reason`. standing_grants \
@@ -20933,8 +24725,980 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                      expire or are revoked. society_floor is the society's own list: it is \
                      durable, applies to EVERY member identically, and is not yours to lose — \
                      effective(you) = society_floor ∪ your grants, additive only. None of the \
-                     three is ever written to your identity file.",
+                     three is ever written to your identity file. grants_by_mode lists \
+                     every live and standing grant with its modes (r read, w write, e execute, \
+                     d delete); live_grants and standing_grants hold only the grants that allow \
+                     all four, so a gate that does not know modes never treats a narrower grant \
+                     as a wider one.",
     }))
+}
+
+/// How many GATE-OPENED scope requests one member may hold pending at once. A refusal storm (a
+/// loop re-issuing many distinct outside paths) must not bury the operator's queue; past the cap
+/// the gate still refuses, says so, and names `hestia_request_scope` for the one that matters.
+pub const SCOPE_CLAIM_MAX_PENDING: usize = 32;
+
+/// The scope request key: member and resolved path. The gate computes the same string
+/// (`hestia_gate_mechanism.scope_request_key`) for its deny text; this one decides.
+pub fn scope_request_key(plugin_id: &str, path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(format!("hestia:scope-request-key\u{1f}{plugin_id}\u{1f}{path}").as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// The act binding a ONE-TIME approval is spent against: a sha256 the GATE computes over the
+/// canonical, COMPLETE act — the whole tool input (Write/Edit contents, the unmasked command),
+/// the working directory and the host session — never over the masked display summary (Codex
+/// review of #1232, P1-1: two Writes to one path with different contents, two commands that mask
+/// or truncate alike, collided on the summary digest). The daemon never sees the input in clear;
+/// it stores and compares the digest. Same remedy class as #1229 / #627: an authorisation key
+/// must never be computed from the scrubbed preview a human reads.
+fn valid_act_digest(args: &Value) -> Option<String> {
+    let d = optional_string(args, "act_digest")?;
+    let d = d.trim().to_ascii_lowercase();
+    (d.len() == 64 && d.chars().all(|c| c.is_ascii_hexdigit())).then_some(d)
+}
+
+/// `hestia_scope_claim` — the gate's ONE question after a scope refusal (dp, 2026-10-05:
+/// *"yes on gate gap, let's fix it. escalation should allow standing grants"*).
+///
+/// An `mrh.path` / `mrh.command` refusal used to be a plain deny: nothing reached the operator
+/// unless the member chose to call `hestia_request_scope`. This verb makes the refusal an
+/// ESCALATION in the existing scope-request store (not a new store), with the same re-issue
+/// and claim semantics the governance escalations have:
+///
+///   * a grant already IN FORCE for the path (live or standing) answers `in_force` — the
+///     member's snapshot raced the operator;
+///   * a ONE-TIME approval for exactly this act (its `act_digest`), unspent and inside the
+///     claim window, answers `approved` and is SPENT (unless `spend: false`, a peek);
+///   * a request still PENDING for (member, path) answers `pending` with ITS id — a re-issue
+///     never mints a second ask (legion-being, #956: nine ids for three paths);
+///   * a REFUSED request inside its window answers `refused` — re-issuing does not reopen it;
+///   * otherwise a request is OPENED, carrying the act, the rule, the tool and the session,
+///     and the operator rules it once / for the session / standing, at the breadth they choose.
+///
+/// WHAT IT CANNOT DO, by construction (`no_mcp_tool_can_decide_a_scope_request` and the
+/// behavioural tests below): it never sets `granted`, never touches the standing store, and
+/// spends only a one-time approval an operator made for this member and this act.
+pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+    use crate::server::state::{
+        normalize_scope_path, GateDenyOrigin, ScopeRequest, ScopeRequestExt,
+        SCOPE_REQUEST_TTL_SECS,
+    };
+
+    let asserted = require_string(args, "plugin_id")?;
+    let Some(act_digest) = valid_act_digest(args) else {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_claim_act_digest_required",
+            "act_digest (sha256 hex over the canonical complete act: tool input, cwd, host \
+             session) is required — a one-time approval binds to the whole act, never to its \
+             masked summary; nothing was opened or spent",
+            None,
+        ));
+    };
+    // RESERVE / COMMIT (Codex reviews of #1232, P2): `op` = reserve | commit | release | lookup
+    // over every one-time approval the act needs — all or none, never consumed by a denied act.
+    if args.get("op").is_some() || args.get("paths").is_some() {
+        return scope_claim_spend_all(state, args, &asserted, &act_digest).await;
+    }
+    let raw_path = require_string(args, "path")?;
+    let rule = optional_string(args, "rule").unwrap_or_default();
+    if rule != "mrh.path" && rule != "mrh.command" {
+        return Err(anyhow::anyhow!(
+            "rule must be mrh.path or mrh.command — this verb answers a SCOPE refusal, and a \
+             request opened for any other refusal would ask the operator the wrong question"
+        ));
+    }
+    let tool = optional_string(args, "tool_name").unwrap_or_default();
+    // The act at record depth: capped wide, the cut MARKED (the silent 400-take this replaces
+    // made a cut act indistinguishable from a complete one — the shape #648's scope-path
+    // instance was refused over), then re-masked on receipt — the layer-2 parity
+    // `policy_decision.attempted` already has (see `redact_secrets`).
+    let act_raw = optional_string(args, "act").unwrap_or_default();
+    let act = redact_secrets(&if act_raw.chars().count() > SCOPE_ACT_MAX {
+        act_raw.chars().take(SCOPE_ACT_MAX).collect::<String>() + "…[truncated]"
+    } else {
+        act_raw
+    });
+    let spend = args.get("spend").and_then(Value::as_bool).unwrap_or(true);
+    let role = optional_string(args, "role").unwrap_or_default();
+    let host_session_id = optional_string(args, "host_session_id");
+    let session_id_arg = optional_session_id(args);
+
+    let trimmed = raw_path.trim();
+    // An UNENUMERATED act (dp, 2026-10-10): its "path" is the act-keyed sentinel, kept verbatim —
+    // no filesystem normalisation, never a glob, never in force (no grant can name it).
+    let unpriceable = crate::server::state::unpriceable_scope_path(trimmed);
+    let subtree = unpriceable.is_none() && trimmed.ends_with("/*");
+    let path = match unpriceable.clone() {
+        Some(p) => p,
+        None => normalize_scope_path(if subtree { &trimmed[..trimmed.len() - 2] } else { trimmed }),
+    };
+    let now = now_secs();
+    let mut s = state.lock().await;
+
+    // ATTRIBUTION. A resolved session names the member; an asserted id that disagrees with it
+    // is refused rather than believed. Without a session the id is asserted (A1), exactly as
+    // `hestia_request_scope` takes it — and what an impostor can do with it is bounded: open an
+    // ask in another member's name, or spend that member's one-time approval for that member's
+    // own act string.
+    let (plugin_id, asker_basis) = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+        Some(who) if who.plugin_id != asserted => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_claim_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing was opened or spent",
+                Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(who) => (who.plugin_id, crate::arbiter::AskerBasis::Session),
+        None => (asserted, crate::arbiter::AskerBasis::Asserted),
+    };
+    if unpriceable.is_none() && (!path.starts_with('/') || path == "/") {
+        return Ok(json!({
+            "verdict": "not_opened",
+            "permits": false,
+            "path": path,
+            "detail": "a scope request names one absolute path below the root (or the gate's \
+                       act-keyed unenumerated sentinel); the root itself is not grantable, so no \
+                       request was opened",
+        }));
+    }
+    // EXISTENCE FIRST (hestia#1411): a gate refusal of a READ of a path that does not exist opens
+    // nothing, whichever gate sent it (one that predates the gate-side rule included). A write may
+    // be creating the path, so only read tools are declined here.
+    // Same split as `tool_request_scope` (nomad, Nova on #1415): under a root the target is
+    // stat-ed; a doubled root onto a real, readable in-reach path is answered from that candidate
+    // ALONE, never by looking at the target; anything else opens as before.
+    if unpriceable.is_none() && !subtree && rule == "mrh.path"
+        && READ_ONLY_PATH_TOOLS.contains(&tool.as_str())
+    {
+        // dp, 2026-10-30: a missing path is denied as not there, wherever it is (see
+        // `tool_request_scope`).
+        if definitely_absent(&path) {
+            return Ok(json!({
+                "verdict": "not_opened",
+                "permits": false,
+                "path": path,
+                "reason": "nonexistent",
+                "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
+            }));
+        }
+        match space_of(&s, &plugin_id, &path) {
+            SpaceAnswer::Misrooted(cand) => {
+                return Ok(json!({
+                    "verdict": "not_opened",
+                    "permits": false,
+                    "path": path,
+                    "reason": "likely_misrooted",
+                    "candidate": cand,
+                    "detail": misrooted_detail(&path, &cand),
+                }));
+            }
+            _ => {}
+        }
+    }
+    let key = scope_request_key(&plugin_id, &path);
+    let probe = if subtree { format!("{path}/*") } else { path.clone() };
+
+    // (1) IN FORCE — live or standing (or the society floor) already covers it. Never for an
+    // unenumerated act: no grant names it, so only a one-time approval can answer it.
+    if unpriceable.is_none() && s.has_scope_grant(&plugin_id, &probe) {
+        return Ok(json!({
+            "verdict": "in_force",
+            "permits": true,
+            "path": path,
+            "request_key": key,
+            "detail": "a grant in force already covers this path (your snapshot predates it)",
+        }));
+    }
+
+    // (2) A ONE-TIME approval for exactly this act.
+    let once_id = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.path == path && r.once_spendable(now))
+        .filter(|r| r.ext.gate.as_ref().is_some_and(|g| g.act_digest == act_digest))
+        .min_by_key(|r| r.requested_at)
+        .map(|r| r.id.clone());
+    if let Some(id) = once_id {
+        if !spend {
+            return Ok(json!({
+                "verdict": "approved", "permits": true, "spent": false, "request_id": id,
+                "path": path, "request_key": key,
+                "detail": "a one-time approval for this act stands (peek: not spent)",
+            }));
+        }
+        // ORDER: WITNESS, THEN SPEND. A spend nothing recorded is an act nothing authorised.
+        let decided_by = s.scope_requests.get(&id).and_then(|r| r.decided_by.clone());
+        let entry = s.append_chain(
+            "scope_once_spent",
+            json!({
+                "request_id": id,
+                "plugin_id": plugin_id,
+                "subject_instance_lct": s.member_lct(&plugin_id),
+                "path": path,
+                "act_digest": act_digest,
+                "host_session_id": host_session_id,
+                "decided_by": decided_by,
+            }),
+        )?;
+        if let Some(r) = s.scope_requests.get_mut(&id) {
+            r.ext.spent_at = Some(now);
+        }
+        return Ok(json!({
+            "verdict": "approved", "permits": true, "spent": true, "request_id": id,
+            "path": path, "request_key": key, "witnessEntryHash": entry.hash,
+            "detail": format!("claimed a one-time approval from {} (single use, now spent)",
+                              decided_by.unwrap_or_else(|| "the operator".into())),
+        }));
+    }
+
+    // (3) PENDING for (member, path) — the same id, never a second ask.
+    let pending_id = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.path == path && r.status(now) == "pending")
+        .min_by_key(|r| r.requested_at)
+        .map(|r| r.id.clone());
+    if let Some(id) = pending_id {
+        let mut expires_at = 0;
+        if let Some(r) = s.scope_requests.get_mut(&id) {
+            expires_at = r.expires_at;
+            if let Some(g) = r.ext.gate.as_mut() {
+                g.reissues = g.reissues.saturating_add(1);
+            }
+        }
+        return Ok(json!({
+            "verdict": "pending", "permits": false, "request_id": id, "path": path,
+            "request_key": key, "expires_at": expires_at,
+            "secs_remaining": expires_at.saturating_sub(now),
+            "detail": "the request for this path is still waiting on the operator",
+        }));
+    }
+
+    // (3b) A STANDING REFUSAL (hestia#1417): the operator or a NOT-SAME peer closed this door
+    // durably. Answered from the record, nothing opened, nothing new witnessed: before this a
+    // refusal lasted one window and the next act minted a fresh request and a fresh card.
+    if unpriceable.is_none() {
+        if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+            return Ok(json!({
+                "verdict": "refused", "permits": false, "path": path, "request_key": key,
+                "standing": true, "refused_by": r.refused_by, "refused_at": r.refused_at,
+                "detail": format!("refused, standing (by {}): {}. Re-issuing opens no request; \
+                                   only the operator can lift this",
+                                  r.refused_by, if r.reason.is_empty() { "no reason given" } else { &r.reason }),
+            }));
+        }
+    }
+
+    // (4) REFUSED inside its window — re-issuing does not reopen it.
+    let refused = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.path == path && r.status(now) == "refused"
+                && now < r.expires_at)
+        .max_by_key(|r| r.decided_at.unwrap_or(0))
+        .map(|r| (r.id.clone(), r.decision_reason.clone(), r.expires_at));
+    if let Some((id, why, until)) = refused {
+        return Ok(json!({
+            "verdict": "refused", "permits": false, "request_id": id, "path": path,
+            "request_key": key, "until": until,
+            "detail": why.unwrap_or_else(|| "refused, no reason given".into()),
+        }));
+    }
+
+    // (5) THE CAP.
+    let open_by_gate = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.ext.gate.is_some() && r.status(now) == "pending")
+        .count();
+    if open_by_gate >= SCOPE_CLAIM_MAX_PENDING {
+        return Ok(json!({
+            "verdict": "not_opened", "permits": false, "path": path, "request_key": key,
+            "detail": format!("{open_by_gate} gate-opened requests from you are already pending \
+                               (cap {SCOPE_CLAIM_MAX_PENDING}); none was opened — ask for the \
+                               one that matters with hestia_request_scope"),
+        }));
+    }
+
+    // (6) OPEN. Same id construction as `hestia_request_scope`.
+    let id = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"hestia:scope-request:");
+        h.update(now.to_be_bytes());
+        h.update((s.scope_requests.len() as u64).to_be_bytes());
+        h.update(plugin_id.as_bytes());
+        h.update(path.as_bytes());
+        let hex: String = h.finalize()[..6].iter().map(|b| format!("{b:02x}")).collect();
+        format!("scope-{hex}")
+    };
+    // The record's `reason` says what happened, in the gate's voice — never presented as the
+    // member's rationale, because the member did not choose to ask.
+    let reason = format!(
+        "opened by the gate on a refused {} ({rule}){}; act: {act}",
+        if tool.is_empty() { "act" } else { tool.as_str() },
+        if subtree {
+            " — a glob over this directory: only a recursive grant covers it"
+        } else if unpriceable.is_some() {
+            " — the gate cannot enumerate what this act reaches (an expansion decides it), so \
+             only a one-time approval of this exact act can lift it"
+        } else {
+            ""
+        }
+    );
+    let expires_at = now + SCOPE_REQUEST_TTL_SECS;
+    let origin = GateDenyOrigin {
+        rule: rule.clone(),
+        tool: tool.clone(),
+        act: act.clone(),
+        act_digest: act_digest.clone(),
+        request_key: key.clone(),
+        host_session_id: host_session_id.clone(),
+        subtree,
+        reissues: 0,
+        asker_basis,
+    };
+    // WHO DECIDES (dp, 2026-10-05: "scope escalations should go to peers not to me"): the
+    // NOT-SAME peers, invited exactly as gate escalations invite them. An asserted asker cannot
+    // be peer-cleared (eligibility clause 0), so nobody is invited and the record says the
+    // operator's override is the only route.
+    let invited = if asker_basis == crate::arbiter::AskerBasis::Session {
+        scope_peer_pool(&s, &plugin_id)
+    } else {
+        Vec::new()
+    };
+    let entry = s.append_chain(
+        "scope_requested",
+        json!({
+            "invited_peers": invited,
+            "asker_basis": asker_basis,
+            "decided_by_default": if invited.is_empty() { "operator (no admissible peer)" }
+                                  else { "a NOT-SAME peer (the operator may override)" },
+            "request_id": id,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "role": role,
+            "path": path,
+            "path_as_asked": raw_path,
+            "reason": reason,
+            "expires_at": expires_at,
+            "origin": "gate_deny",
+            "rule": rule,
+            "tool_name": tool,
+            "act": act,
+            "act_digest": act_digest,
+            "request_key": key,
+            "host_session_id": host_session_id,
+            "subtree": subtree,
+            "assurance": "A1 — opened by the plugin gate on a refusal; the member asked nothing. \
+                          Tamper-EVIDENT, not tamper-proof.",
+        }),
+    )?;
+    s.scope_requests.insert(
+        id.clone(),
+        ScopeRequest {
+            id: id.clone(),
+            plugin_id: plugin_id.clone(),
+            role: role.clone(),
+            path: path.clone(),
+            reason,
+            requested_at: now,
+            expires_at,
+            granted: None,
+            decided_by: None,
+            decided_at: None,
+            decision_reason: None,
+            recursive: false,
+            revoked: None,
+            ext: ScopeRequestExt {
+                gate: Some(origin),
+                invited_peers: invited.clone(),
+                ..Default::default()
+            },
+        },
+    );
+    // DELIVER the invitations — a wake, not a vote: the peer reads the request and rules with
+    // `hestia_scope_peer_decide`. A failed queue does not void the invitation; it is recorded.
+    let pointer = format!("hestia://scope/{id}#peer-decide");
+    let mut invitations = Vec::new();
+    for peer in &invited {
+        match s.inbox_store.enqueue_member(peer, &plugin_id, &role, "review_request",
+                                           Some(pointer.as_str()), &entry.hash, None) {
+            Ok(qid) => invitations.push(json!({"peer": peer, "queued_id": qid})),
+            Err(e) => invitations.push(json!({"peer": peer, "queued_id": null,
+                                              "dispatch_error": e.to_string()})),
+        }
+    }
+    Ok(json!({
+        "verdict": "opened",
+        "permits": false,
+        "request_id": id,
+        "path": path,
+        "subtree": subtree,
+        "request_key": key,
+        "expires_at": expires_at,
+        "witnessEntryHash": entry.hash,
+        "invited_peers": invited,
+        "invitations": invitations,
+        "on_timeout": "REFUSED — no answer within the window is a refusal, not a retry",
+        "how_to_decide": scope_how_to_decide(&id, invited.is_empty(), unpriceable.is_some()),
+        "detail": if invited.is_empty() {
+            "refused; a scope request was opened — no NOT-SAME peer can clear it (the asker is \
+             unproven or no admissible peer exists), so the operator decides"
+        } else {
+            "refused; a scope request was opened and NOT-SAME peers were invited to decide it"
+        },
+    }))
+}
+
+/// The recipe a gate-opened scope request names. Peers first (dp, 2026-10-05); the operator is
+/// the override, not the default route.
+fn scope_how_to_decide(id: &str, no_peer: bool, once_only: bool) -> String {
+    if once_only {
+        // An unenumerated act (dp, 2026-10-10): once or refuse, nothing broader exists.
+        return format!(
+            "the gate could not enumerate what this act reaches, so it can be approved ONCE \
+             (this act, exactly) or refused — no session or standing grant can name it: {}",
+            if no_peer {
+                format!("the operator decides {id} (dashboard or the app's Decide page)")
+            } else {
+                format!("a NOT-SAME peer decides: hestia scope decide {id} --as <peer-seat> \
+                         --once|--refuse --reason '...' (or hestia_scope_peer_decide); the \
+                         operator may override")
+            }
+        );
+    }
+    if no_peer {
+        return format!("the operator decides (dashboard Activity → Reach requested, or the app's \
+                        Decide page) — no NOT-SAME peer can clear {id}");
+    }
+    format!(
+        "a NOT-SAME peer decides: hestia scope decide {id} --as <peer-seat> \
+         --once|--session|--standing|--refuse [--grant-path <dir> --recursive] --reason '...' \
+         (or hestia_scope_peer_decide). The asker cannot decide its own request. The operator \
+         may override on the dashboard or the app."
+    )
+}
+
+/// The NOT-SAME peers invited to decide `asker`'s scope request: recorded members other than
+/// the asker (and its aliases), with a declared review door, that `arbiter::eligibility_for`
+/// admits in the GRANTING direction. Ordered as the registry orders them; capped at 3.
+///
+/// The same two names that can never answer are excluded by TYPE here as at
+/// `resolve_invitation` and the appeal pool (#990) — and this pool is the MOST
+/// rivalrous of the three: `take(3)` over an ALPHABETICAL list with no liveness
+/// ranking, so residue sorts in early (claude-code's re-review, measured live:
+/// `claudecode` and `codex-cli` took two of three slots on a real request within
+/// the hour). `is_recognised_reasoner` inside `eligibility_for` is a lineage
+/// PREFIX match and does not stop them; the retirement row and the filler mark
+/// do.
+fn scope_peer_pool(s: &super::state::ServerState, asker: &str) -> Vec<String> {
+    use crate::arbiter::{eligibility_for, AppealParties, AskerBasis, Disposition, Eligibility};
+    s.member_registry
+        .iter_sorted()
+        .into_iter()
+        .map(|(id, _)| id.clone())
+        .filter(|id| !s.retired_members.is_retired(id))
+        .filter(|id| !s.member_registry.is_filler(id))
+        .filter(|id| id != asker && !s.same_entity(asker, id))
+        .filter(|id| review_capability(s, id).is_ok())
+        .filter(|id| matches!(
+            eligibility_for(&AppealParties {
+                appellant: asker,
+                appellant_basis: AskerBasis::Session,
+                deny_adjudicator: None,
+                arbiter: id,
+            }, Disposition::ForAppellant),
+            Eligibility::Eligible { .. }
+        ))
+        .take(3)
+        .collect()
+}
+
+/// `hestia_scope_peer_decide` — a NOT-SAME PEER rules another member's GATE-OPENED scope request
+/// (dp, 2026-10-05: "scope escalations should go to peers not to me").
+///
+/// The same choices the operator has — this act once, for the session, or standing; exact, or
+/// recursive at a directory above the asked path (never the root) — through the SAME decision
+/// function (`http::scope_decide_as`), so the rules cannot drift. What a peer needs that the
+/// operator does not:
+///   * a live session (the arbiter is resolved, never asserted);
+///   * NOT-SAME by `arbiter::eligibility_for`: never the asker (in EITHER direction — dp: "the
+///     asker can never decide its own request"), never an asserted asker's request (clause 0),
+///     a recognised reasoner;
+///   * a reason, in both directions — the asker reads it.
+/// The record names the peer (`peer:<id>`), its channel (`peer_not_same`) and its basis.
+pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::arbiter::{eligibility_for, AppealParties, Disposition, Eligibility};
+    let request_id = require_string(args, "request_id")?;
+    let decision = require_string(args, "decision")?;
+    let reason = require_string(args, "reason")?;
+    if reason.trim().len() < 8 {
+        return Err(anyhow::anyhow!("reason is too thin — the asker reads it"));
+    }
+    let session_id_arg = optional_session_id(args);
+    let (arbiter, asker, basis, req_subtree) = {
+        let s = state.lock().await;
+        let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+            return Err(anyhow::anyhow!(
+                "deciding a scope request requires your own live session_id (from \
+                 hestia_connect): NOT-SAME compares you to the asker, and an asserted name \
+                 proves nothing"
+            ));
+        };
+        let Some(req) = s.scope_requests.get(&request_id) else {
+            return Ok(hestia_error_envelope("hestia.scope_request_unknown",
+                "no such scope request (memory-only: it may have expired or the daemon \
+                 restarted, #908 / #1233)", Some(json!({ "request_id": request_id }))));
+        };
+        // A MEMBER-FILED ask (hestia#1409; dp 2026-10-14: "the human does not need to be in
+        // that loop"): a NOT-SAME peer may REFUSE it, which widens nothing; granting it stays
+        // the operator's (or a delegated seat's `hestia scope arbitrate`). Measured on
+        // cbp-being, 2026-10-26: nine asks for paths already in its grant, or not on disk,
+        // each waiting on the operator because no peer could close them.
+        let asker_basis = match req.ext.gate.as_ref() {
+            Some(gate) => gate.asker_basis,
+            None if decision == "refuse" => req.ext.asker_basis.unwrap_or_default(),
+            None => {
+                return Ok(hestia_error_envelope("hestia.scope_peer_decide_member_filed",
+                    "peers may only REFUSE a member-filed scope request; granting one is the \
+                     operator's (or a delegated seat's `hestia scope arbitrate`)", None));
+            }
+        };
+        if arb.plugin_id == req.plugin_id || s.same_entity(&arb.plugin_id, &req.plugin_id) {
+            return Ok(hestia_error_envelope("hestia.scope_peer_decide_self",
+                "the asker can never decide its own scope request — in either direction",
+                Some(json!({ "asker": req.plugin_id }))));
+        }
+        let disposition = if decision == "refuse" { Disposition::AgainstAppellant }
+                          else { Disposition::ForAppellant };
+        let parties = AppealParties {
+            appellant: &req.plugin_id,
+            appellant_basis: asker_basis,
+            deny_adjudicator: None,
+            arbiter: &arb.plugin_id,
+        };
+        let independence = match eligibility_for(&parties, disposition) {
+            Eligibility::Eligible { independence } => independence,
+            Eligibility::Refused { reason } => {
+                return Ok(hestia_error_envelope("hestia.scope_peer_decide_ineligible", &reason,
+                    Some(json!({ "asker": req.plugin_id, "arbiter": arb.plugin_id }))));
+            }
+            Eligibility::SelfWithdrawal { .. } => {
+                return Ok(hestia_error_envelope("hestia.scope_peer_decide_self",
+                    "the asker can never decide its own scope request", None));
+            }
+        };
+        let basis = json!({
+            "arbiter": arb.plugin_id,
+            "asker": req.plugin_id,
+            "asker_basis": asker_basis,
+            "independence": independence,
+            "origin": if req.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+            "eligibility": "arbiter::eligibility_for (NOT-SAME)",
+        });
+        let req_subtree = req.ext.gate.as_ref().is_some_and(|g| g.subtree);
+        (arb.plugin_id, req.plugin_id.clone(), basis, req_subtree)
+    };
+    let mut body = json!({ "request_id": request_id, "reason": reason });
+    match decision.as_str() {
+        "refuse" => {
+            body["granted"] = json!(false);
+            // A peer may make a refusal STANDING (hestia#1417): it widens nothing. Lifting
+            // one stays the operator's. Its REACH is the request's, never the peer's (Nova on
+            // #1418): a peer refuses the ask presented, exact unless the gate-opened act was
+            // itself a subtree glob, and cannot invent a broader durable prohibition.
+            if args.get("standing").and_then(Value::as_bool).unwrap_or(false) {
+                body["standing"] = json!(true);
+                body["recursive"] = json!(req_subtree);
+            }
+        }
+        "once" => { body["granted"] = json!(true); body["once"] = json!(true); }
+        "session" | "standing" => {
+            body["granted"] = json!(true);
+            body["standing"] = json!(decision == "standing");
+            body["recursive"] = json!(args.get("recursive").and_then(Value::as_bool).unwrap_or(false));
+            // What the grant lets the asker DO (#1345); absent = all four. Validated by the
+            // decide path itself, so a peer and the operator are held to one rule.
+            if let Some(m) = args.get("modes").filter(|v| !v.is_null()) {
+                body["modes"] = m.clone();
+            }
+            if let Some(gp) = optional_string(args, "grant_path") {
+                body["grant_path"] = json!(gp);
+            }
+        }
+        _ => return Err(anyhow::anyhow!("decision must be once, session, standing or refuse")),
+    }
+    let decider = super::http::ScopeDecider {
+        by: format!("peer:{arbiter}"),
+        via: "peer_not_same",
+        basis: Some(basis.clone()),
+    };
+    let (status, axum::Json(out)) = super::http::scope_decide_as(state.clone(), body, decider).await;
+    if !status.is_success() {
+        return Ok(hestia_error_envelope("hestia.scope_peer_decide_refused",
+            out.get("error").and_then(Value::as_str).unwrap_or("the decision was refused"),
+            Some(json!({ "status": status.as_u16(), "asker": asker }))));
+    }
+    let mut out = out;
+    out["decided_by"] = json!(format!("peer:{arbiter}"));
+    out["peer_basis"] = basis;
+    Ok(out)
+}
+
+/// How long a RESERVED one-time approval waits for the gate's commit or release before it lapses
+/// into spent. Longer than any gate deadline (seconds), short enough that a dead gate does not
+/// hold an operator's approval hostage for long.
+pub const SCOPE_RESERVATION_SECS: u64 = 120;
+
+/// `hestia_scope_claim` with `op` — the RESERVE / COMMIT protocol for the one-time approvals an
+/// act needs (Codex reviews of #1232, P2 and re-review P2).
+///
+///   * `reserve` (`paths`, `op_key`): under one lock, every path must be covered by a grant in
+///     force or hold an unspent one-time approval bound to THIS act digest; then all such
+///     approvals are RESERVED for `op_key` with one witnessed `scope_once_reserved` row — or
+///     nothing is reserved and the missing paths are named. Idempotent per `op_key`: a retried
+///     reserve finds its own reservation instead of reserving twice. Opens nothing.
+///   * `commit` (`op_key`): the act was permitted and its final evidence recorded — the reserved
+///     approvals become SPENT (one `scope_once_spent` row).
+///   * `release` (`op_key`): the act was denied after all — the approvals are spendable again
+///     (one `scope_once_released` row).
+///   * `lookup` (`op_key`): what became of an operation whose answer was lost — `reserved`,
+///     `committed`, `released`, `lapsed` (consumed), or `unknown`. Read-only.
+///
+/// A reservation neither committed nor released by `SCOPE_RESERVATION_SECS` LAPSES INTO SPENT: a
+/// gate that went silent may have let the act run, so its approval is never spendable twice.
+async fn scope_claim_spend_all(state: &SharedState, args: &Value, asserted: &str,
+                               act_digest: &str) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+    use crate::server::state::normalize_scope_path;
+
+    let op = optional_string(args, "op").unwrap_or_default();
+    let op_key = optional_string(args, "op_key").unwrap_or_default();
+    if op_key.len() < 16 || op_key.len() > 128 {
+        return Err(anyhow::anyhow!("op_key (16..=128 chars) is required for a batch operation"));
+    }
+    let host_session_id = optional_string(args, "host_session_id");
+    let session_id_arg = optional_session_id(args);
+    let now = now_secs();
+    let mut s = state.lock().await;
+    if matches!(op.as_str(), "commit" | "release" | "lookup") {
+        return scope_claim_settle(&mut s, &op, &op_key, act_digest, asserted,
+                                  session_id_arg.as_deref(), host_session_id, now);
+    }
+    if op != "reserve" {
+        return Err(anyhow::anyhow!("op must be reserve, commit, release or lookup"));
+    }
+    let Some(raw_paths) = args.get("paths").and_then(Value::as_array) else {
+        return Err(anyhow::anyhow!("paths must be an array of absolute paths"));
+    };
+    if raw_paths.is_empty() || raw_paths.len() > 16 {
+        return Err(anyhow::anyhow!("paths must hold 1..=16 entries"));
+    }
+    // IDEMPOTENT: a retried reserve for the same operation reports what it already holds.
+    let held: Vec<String> = s
+        .scope_requests
+        .values()
+        .filter(|r| r.ext.reserved_by.as_deref() == Some(op_key.as_str()) && r.ext.reservation_open()
+                && !r.ext.reservation_lapsed(now))
+        .map(|r| r.id.clone())
+        .collect();
+    if !held.is_empty() {
+        return Ok(json!({
+            "verdict": "reserved", "permits": true, "reserved": held, "op_key": op_key,
+            "detail": "this operation already holds its reservation (retry)",
+        }));
+    }
+    let plugin_id = match resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+        Some(who) if who.plugin_id != asserted => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_claim_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing was spent",
+                Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(who) => who.plugin_id,
+        None => asserted.to_string(),
+    };
+
+    // Plan, without mutating anything.
+    let mut to_spend: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut in_force: Vec<String> = Vec::new();
+    for v in raw_paths {
+        let Some(raw) = v.as_str() else {
+            return Err(anyhow::anyhow!("paths must be strings"));
+        };
+        let t = raw.trim();
+        let unpriceable = crate::server::state::unpriceable_scope_path(t);
+        let subtree = unpriceable.is_none() && t.ends_with("/*");
+        let path = match unpriceable {
+            Some(p) => p,
+            None => normalize_scope_path(if subtree { &t[..t.len() - 2] } else { t }),
+        };
+        let probe = if subtree { format!("{path}/*") } else { path.clone() };
+        if path.starts_with('/') && path != "/" && s.has_scope_grant(&plugin_id, &probe) {
+            in_force.push(path);
+            continue;
+        }
+        let once = s
+            .scope_requests
+            .values()
+            .filter(|r| r.plugin_id == plugin_id && r.path == path && r.once_spendable(now))
+            .filter(|r| r.ext.gate.as_ref().is_some_and(|g| g.act_digest == act_digest))
+            .filter(|r| !to_spend.contains(&r.id))
+            .min_by_key(|r| r.requested_at)
+            .map(|r| r.id.clone());
+        match once {
+            Some(id) => to_spend.push(id),
+            None => missing.push(path),
+        }
+    }
+    if !missing.is_empty() {
+        return Ok(json!({
+            "verdict": "not_all",
+            "permits": false,
+            "reserved": [],
+            "missing": missing,
+            "detail": "not every path is covered by a grant in force or a one-time approval for \
+                       this exact act; NOTHING was reserved",
+        }));
+    }
+    // Witness, then reserve — every approval in one row, so the reservation is one fact.
+    let until = now + SCOPE_RESERVATION_SECS;
+    let mut entry_hash = serde_json::Value::Null;
+    if !to_spend.is_empty() {
+        let entry = s.append_chain(
+            "scope_once_reserved",
+            json!({
+                "request_ids": to_spend,
+                "op_key": op_key,
+                "plugin_id": plugin_id,
+                "subject_instance_lct": s.member_lct(&plugin_id),
+                "act_digest": act_digest,
+                "host_session_id": host_session_id,
+                "in_force_paths": in_force,
+                "reserved_until": until,
+            }),
+        )?;
+        entry_hash = json!(entry.hash);
+        for id in &to_spend {
+            if let Some(r) = s.scope_requests.get_mut(id) {
+                r.ext.reserved_by = Some(op_key.clone());
+                r.ext.reserved_until = Some(until);
+                r.ext.released_at = None;
+            }
+        }
+    }
+    Ok(json!({
+        "verdict": "reserved",
+        "permits": true,
+        "reserved": to_spend,
+        "in_force": in_force,
+        "op_key": op_key,
+        "reserved_until": until,
+        "witnessEntryHash": entry_hash,
+        "detail": "every path is covered; the one-time approvals this act needs are RESERVED — \
+                   commit after the act's evidence is recorded, release if it is denied; \
+                   unreported, they lapse into spent",
+    }))
+}
+
+/// `commit` / `release` / `lookup` of a reservation (see `scope_claim_spend_all`).
+#[allow(clippy::too_many_arguments)]
+fn scope_claim_settle(s: &mut crate::server::state::ServerState, op: &str, op_key: &str,
+                      act_digest: &str, asserted: &str, session_id_arg: Option<&str>,
+                      host_session_id: Option<String>, now: u64) -> ToolResult {
+    let plugin_id = match resolve_attributed_caller(s, session_id_arg) {
+        Some(who) if who.plugin_id != asserted => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_claim_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing changed",
+                Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(who) => who.plugin_id,
+        None => asserted.to_string(),
+    };
+    let mine: Vec<String> = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.ext.reserved_by.as_deref() == Some(op_key))
+        .filter(|r| r.ext.gate.as_ref().is_some_and(|g| g.act_digest == act_digest))
+        .map(|r| r.id.clone())
+        .collect();
+    let state_of = |s: &crate::server::state::ServerState, id: &str| -> &'static str {
+        let r = &s.scope_requests[id];
+        if r.ext.spent_at.is_some() { "committed" }
+        else if r.ext.released_at.is_some() { "released" }
+        else if r.ext.reservation_lapsed(now) { "lapsed" }
+        else { "reserved" }
+    };
+    if op == "lookup" {
+        let states: Vec<&str> = mine.iter().map(|id| state_of(s, id)).collect();
+        let overall = if states.is_empty() {
+            "unknown"
+        } else if states.iter().all(|x| *x == states[0]) {
+            states[0]
+        } else {
+            "mixed"
+        };
+        return Ok(json!({ "verdict": overall, "op_key": op_key, "request_ids": mine,
+                          "consumed": matches!(overall, "committed" | "lapsed") }));
+    }
+    let open: Vec<String> = mine.iter().filter(|id| state_of(s, id) == "reserved").cloned().collect();
+    if open.is_empty() {
+        // Nothing open: report what happened instead of pretending to act.
+        let states: Vec<&str> = mine.iter().map(|id| state_of(s, id)).collect();
+        return Ok(json!({
+            "verdict": if mine.is_empty() { "unknown" } else { "settled" },
+            "op_key": op_key, "states": states, "permits": op == "commit"
+                && !states.is_empty() && states.iter().all(|x| *x == "committed"),
+            "detail": "no open reservation for this operation",
+        }));
+    }
+    let (event, done) = if op == "commit" {
+        ("scope_once_spent", "committed")
+    } else {
+        ("scope_once_released", "released")
+    };
+    let entry = s.append_chain(
+        event,
+        json!({
+            "request_ids": open,
+            "op_key": op_key,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "act_digest": act_digest,
+            "host_session_id": host_session_id,
+        }),
+    )?;
+    for id in &open {
+        if let Some(r) = s.scope_requests.get_mut(id) {
+            if op == "commit" {
+                r.ext.spent_at = Some(now);
+            } else {
+                r.ext.released_at = Some(now);
+            }
+        }
+    }
+    Ok(json!({
+        "verdict": done, "permits": op == "commit", "op_key": op_key, "request_ids": open,
+        "witnessEntryHash": entry.hash,
+    }))
+}
+
+/// The ladder generation the shadow rows carry. The ladder is not yet a stored config (§2.2);
+/// until it is, this constant is the generation, and it moves when the shadow route does.
+const SHADOW_LADDER_GENERATION: u64 = 1;
+
+/// STAGE A, RUNNING (§4.1–4.2): ask the advisory rung about every newly minted escalation and
+/// witness what it said. Computed, recorded, verdict unchanged.
+///
+/// This exists because a routing function nobody calls is a function that exists, not one
+/// that runs — and §4.3 is blunt about what that costs: an advisory rung that is never
+/// measured sits at stage A forever. The measurement needs rows, and rows only accumulate if
+/// the rung is actually asked. Today the rung is `BaselineRung`, the control arm: its
+/// verdicts are weak ON PURPOSE, and the record of them is the denominator any future
+/// reasoner's agreement rate will be read against.
+///
+/// IT CANNOT FAIL THE OPEN. The escalation is already minted and witnessed when this runs;
+/// every error here is swallowed, because a broken advisory path that could refuse or delay a
+/// governance ask would make "advisory" a lie. It cannot DECIDE either: the row says
+/// `permits_write: false` on its face, the route is advisory-only, and the outcome is
+/// discarded — only the trail is kept. Falsifier:
+/// `a_minted_escalation_gets_a_witnessed_advisory_verdict_and_stays_pending`.
+fn shadow_adjudicate(s: &mut crate::server::state::ServerState, escalation_id: &str) {
+    use crate::server::adjudicator::{
+        run_ladder, Adjudicator, BaselineRung, Consequence, RungMode, RungSpec, BASELINE_RUNG_ID,
+    };
+    let Some(bundle) = crate::server::evidence::bundle(s, escalation_id) else {
+        return;
+    };
+    let baseline = BaselineRung;
+    let route: Vec<(RungSpec, &dyn Adjudicator)> = vec![(
+        RungSpec {
+            id: BASELINE_RUNG_ID.to_string(),
+            threshold: 0.0,
+            // Every governance-closure write is treated as High until a stored table says
+            // otherwise — an unclassified surface defaults to high-consequence (CLAUDE.md, S).
+            max_consequence: Consequence::High,
+            mode: RungMode::Advisory,
+        },
+        &baseline,
+    )];
+    let outcome = run_ladder(&route, &bundle, Consequence::High, true);
+    for rec in outcome.trail() {
+        if let Some(v) = &rec.verdict {
+            let _ = s.append_chain(
+                "ladder_advisory_verdict",
+                v.to_row(escalation_id, SHADOW_LADDER_GENERATION),
+            );
+        }
+    }
+}
+
+/// `hestia_gate_escalation_lookup` (#1166): what was done for a request key. READ-ONLY by
+/// construction -- it takes the store by shared reference, so it cannot observe, spend or arm.
+async fn tool_gate_escalation_lookup(state: &SharedState, args: &Value) -> ToolResult {
+    let key = require_string(args, "request_key")?;
+    if !super::gate_escalation::valid_request_key(&key) {
+        return Err(anyhow::anyhow!(
+            "'request_key' must be a sha256 hex digest (64 lowercase hex characters)"
+        ));
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let s = state.lock().await;
+    let store = &s.gate_escalations;
+    let Some(rec) = store.request_key(&key) else {
+        return Ok(json!({
+            "found": false,
+            "request_key": key,
+            "note": "no record for this key on this daemon: either the request never reached it, or the record predates the replay window",
+        }));
+    };
+    let esc = store.get(&rec.escalation_id);
+    Ok(json!({
+        "found": true,
+        "request_key": key,
+        "outcome": rec.outcome,
+        "escalation_id": rec.escalation_id,
+        "at": rec.at,
+        "status": esc.map(|e| e.status_at(now)),
+        "consumed_at": esc.and_then(|e| e.consumed_at),
+        "note": "read-only: this lookup observed nothing and started no claim window",
+    }))
+}
+
+/// The evidence bundle for one escalation — `PRD_ADJUDICATOR_LADDER` §3.3.
+///
+/// READ-ONLY AND NOT WITNESSED, for the same reason `tool_gate_escalation_poll` is not:
+/// reading a case is not acting on it, and witnessing every read would bury the opened and
+/// decided rows under one reviewer's inspection. A rung that must consult the evidence twice
+/// before forming a view should not thereby look twice as busy as one that guessed.
+async fn tool_escalation_evidence(state: &SharedState, args: &Value) -> ToolResult {
+    let escalation_id = require_string(args, "escalation_id")?;
+    let s = state.lock().await;
+    match crate::server::evidence::bundle(&s, &escalation_id) {
+        Some(b) => Ok(json!({"found": true, "evidence": b})),
+        // An unknown id is answered, not errored: the caller's only safe reading of an error
+        // is "try again", while the safe reading of `found: false` is "there is nothing here
+        // to decide". Same discipline as `status_of` answering Expired for an unknown id.
+        None => Ok(json!({
+            "found": false,
+            "escalation_id": escalation_id,
+            "note": "no escalation with that id is live on this daemon. An id that has been \
+                     reaped is indistinguishable here from one that never existed — read the \
+                     chain by id if you need to tell those apart",
+        })),
+    }
 }
 
 async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolResult {
@@ -21052,6 +25816,102 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
 /// runs the tool anyway (kimi-code, PR #114 review — the in-hook wait failed OPEN). So the hook
 /// never waits: it asks this once, and either an approval was already granted and is spent here,
 /// or the write is refused and a human decides out of band.
+/// Grant a reclaim ONLY if its witness is durable (GPT review of #1169, P1-2). The append is
+/// the record that this permit was handed out a second time for one approval; if it cannot be
+/// written, nothing is granted and no reclaimed projection is recorded. `append` is a parameter
+/// so the failure arm is testable without breaking a real chain store (the apply_ratification
+/// pattern).
+#[allow(clippy::too_many_arguments)]
+fn commit_reclaim(
+    s: &mut super::state::ServerState,
+    prev: &super::gate_escalation::RequestKeyRecord,
+    key: &str,
+    tool_name: &str,
+    proven_host_session_id: Option<&str>,
+    invocation_key: Option<&str>,
+    now: u64,
+    append: impl FnOnce(&mut super::state::ServerState, &str, Value)
+        -> anyhow::Result<crate::storage::chain::ChainEntry>,
+) -> ToolResult {
+    let esc = s.gate_escalations.get(&prev.escalation_id).cloned();
+    // THE FENCE (GPT review of 8056dce): this state change grants the permit to a NEW
+    // invocation, so in the same change the ORIGINAL invocation is barred from beginning. All
+    // of this runs under the one state lock the begin handler also takes, so of {the
+    // original's begin, this reclaim} the first ordered wins: if the begin came first,
+    // `reclaimable` already refused ("reached execution"); if this comes first, the begin is
+    // refused (hestia.invocation_superseded). At most one invocation is ever authorized.
+    let Some(original) = prev.invocation_key.clone() else {
+        return Ok(json!({
+            "claimed": false, "permits_write": false, "request_key": key,
+            "escalation_id": prev.escalation_id, "refused": "reclaim_unfenceable",
+            "error": "the claim recorded no invocation, so the superseded one cannot be fenced; nothing is granted",
+        }));
+    };
+    if !s.gate_escalations.fence(&original, &prev.escalation_id, now) {
+        return Ok(json!({
+            "claimed": false, "permits_write": false, "request_key": key,
+            "escalation_id": prev.escalation_id, "refused": "fence_table_full",
+            "error": "every fence is still inside its lifetime, so the superseded invocation cannot be fenced; nothing is granted (fail closed)",
+        }));
+    }
+    let payload = json!({
+        "escalation_id": prev.escalation_id,
+        "plugin_id": prev.plugin_id,
+        "subject_instance_lct": s.member_lct(&prev.plugin_id),
+        "tool_name": tool_name,
+        "marker": prev.marker,
+        "request_key": key,
+        "act_digest": prev.act_digest,
+        "payload_sha256": prev.payload_sha256,
+        "host_session_id": proven_host_session_id,
+        "first_claimed_at": prev.at,
+        "secs_since_first_claim": now.saturating_sub(prev.at),
+        "reclaim_window_secs": super::gate_escalation::RECLAIM_WINDOW_SECS,
+        "original_invocation_key": prev.invocation_key,
+        // The invocation this reclaim bars from begin_action; replay rebuilds the fence from it.
+        "fenced_invocation_key": original,
+        "invocation_key": invocation_key,
+        "evidence": "the claimed invocation never reached begin_action",
+    });
+    let entry = match append(s, "gate_escalation_reclaimed", payload) {
+        Ok(e) => e,
+        Err(e) => {
+            // Nothing granted, so nothing superseded: lift the fence written above. Keeping it
+            // would bar an invocation whose permit was never re-delivered.
+            s.gate_escalations.unfence(&original, &prev.escalation_id);
+            return Ok(json!({
+                "claimed": false,
+                "permits_write": false,
+                "request_key": key,
+                "escalation_id": prev.escalation_id,
+                "refused": "reclaim_not_recorded",
+                "error": format!("the reclaim could not be witnessed ({e}); nothing is granted. \
+The approval stays spent; a new petition is needed."),
+            }));
+        }
+    };
+    // Recorded only now that the witness is durable. The window stays anchored at the first
+    // claim, and the `reclaimed` outcome refuses any further reclaim of it.
+    s.gate_escalations.record_request_key(
+        key,
+        super::gate_escalation::RequestKeyRecord { outcome: "reclaimed".into(), ..prev.clone() },
+    );
+    Ok(json!({
+        "claimed": true,
+        "permits_write": true,
+        "reclaimed": true,
+        "request_key": key,
+        "escalation_id": prev.escalation_id,
+        "decided_by": esc.as_ref().and_then(|e| e.decided_by.clone()),
+        "decided_via": esc.as_ref().and_then(|e| e.decided_via.clone()),
+        "first_claimed_at": prev.at,
+        "single_use": "this is the SAME permit your request already spent, delivered to a new \
+invocation because the first never reached execution. It is not a second approval, and it \
+cannot be reclaimed again.",
+        "witnessEntryHash": entry.hash,
+    }))
+}
+
 async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::{now_secs, APPROVAL_CLAIM_WINDOW_SECS, DEFAULT_TTL_SECS};
 
@@ -21079,6 +25939,13 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // the claim hashed and recorded `reason`. An approval could therefore be correct in the
     // store and permanently unspendable by the member-door caller that created it.
     let attempted_act = act.clone().or_else(|| stated_reason.clone());
+    // THE ACT'S RESOLVED TARGET (#810, recut of #812): the closure verdict's `resource` — the
+    // write-position argument that matched — as the gate hook sends it. Priced with the marker
+    // and the act (`gate_escalation::price`): `attempted_act` is a bounded, self-censoring
+    // summary (220 chars for a shell command; withheld whole when credential-shaped), so the
+    // filename the bar needs can be cut out of it, and this field is where it survives. Old
+    // hooks send nothing and price exactly as before; it can raise the bar, never lower it.
+    let resolved_targets = super::gate_escalation::resolved_targets_from_args(args);
     // The bytes about to be written, when the gate could hash them (#1056). A shim that does
     // not send this claims exactly as before; the binding only engages on approvals that
     // recorded one.
@@ -21092,6 +25959,33 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     );
     let attempted_payload = attempted_binding.sha256.clone();
     let stated_detail = optional_string(args, "detail");
+    // THE REQUEST KEY (#1166, #774). The hook's round trip has a 1.5 s deadline; past it the
+    // outcome is UNKNOWN, not "nothing happened". The key -- stable across identical re-issues
+    // in one session -- is how a retry is answered with what the daemon already did. Refused
+    // by name if malformed: it is written to the chain, so it must be exactly a sha256.
+    let request_key = optional_string(args, "request_key");
+    if let Some(k) = &request_key {
+        if !super::gate_escalation::valid_request_key(k) {
+            return Err(anyhow::anyhow!(
+                "'request_key' must be a sha256 hex digest (64 lowercase hex characters); got {} characters",
+                k.len()
+            ));
+        }
+    }
+    // THE INVOCATION (#1169): the tool call's own correlation key (tool_use_id, kimi's
+    // tool_call_id, gemini's content key) -- what makes a retry distinguishable from a repeat.
+    let invocation_key = optional_string(args, "invocation_key")
+        .filter(|k| super::gate_escalation::valid_correlation_key(k));
+    // THE SEAT'S SUPERSESSION CAPABILITY (GPT review of ca5f394): whether the hook making this
+    // claim stops a superseded invocation in every rollout mode. Recorded on the spend; a spend
+    // whose seat did not declare it is never reclaimed, because the fence would not stop it.
+    let supersession_hard_stop = optional_string(args, "supersession").as_deref()
+        == Some(super::gate_escalation::SUPERSESSION_HARD_STOP);
+    let attempted_act_digest = attempted_act
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(super::gate_escalation::EscalationStore::act_digest_of);
     // The durable per-wake key the daemon's own outcome rows carry — the value that joins a
     // spent approval to the act that consumed it. ACCEPTED HERE ONLY TO BE CHECKED, NEVER TO
     // BE BELIEVED: the row written below carries the value DERIVED from the caller's proven
@@ -21202,11 +26096,33 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // `reason`; the member door carries an explicit `act` plus a distinct rationale. The
     // explicit field wins when both are present, exactly as it does on the open fallback.
     // A caller that states neither cannot claim: an unnamed act matches no approval.
+    //
+    // THE INCOMING PRICE, BEFORE ANY SPEND (Codex review of #1239, P1-1). The act being
+    // attempted is priced by the one rule over what THIS call carries — its marker, its act and
+    // its resolved targets — and an approval is spent (or a lost answer reclaimed) only if it
+    // was granted under at least that bar. The approved row is never repriced: a stronger ask
+    // than the one approved needs its own, sufficient authorization, so it falls through to
+    // the open below and is minted at its own price.
+    let (incoming_bar, _) = super::gate_escalation::price(
+        &marker,
+        attempted_act.as_deref(),
+        &resolved_targets,
+    );
+    // RE-ISSUING IS OBSERVING (#366): the proven asker session re-issuing this exact act has
+    // learned of its ruling, so its matching grant is observed before the spend is tried. A
+    // grant approved while the asker sat idle is then claimed by the re-issue the deny asked
+    // for, instead of lapsing at decided_at + 600 and minting a duplicate petition. The key is
+    // the DERIVED host session above, never the caller's assertion (the precedence block).
+    if let Some(h) = proven_host_session_id.as_deref() {
+        s.gate_escalations
+            .observe_reissue(&plugin_id, h, &marker, attempted_act.as_deref(), now);
+    }
     if let Some(esc) = s.gate_escalations.claim_bound(
         &plugin_id,
         &marker,
         attempted_act.as_deref(),
         attempted_payload.as_deref(),
+        incoming_bar,
         now,
     )
     {
@@ -21277,11 +26193,40 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "decided_at": esc.decided_at,
                 "secs_from_decision_to_use": esc.decided_at.map(|d| now.saturating_sub(d)),
                 "secs_from_open_to_use": now.saturating_sub(esc.opened_at),
+                // #1166/#774: the key this spend answered, and what a retry must match.
+                "request_key": request_key,
+                "act_digest": attempted_act_digest,
+                "payload_sha256": esc.payload_sha256,
+                // #1169: the invocation this permit was delivered to.
+                "invocation_key": invocation_key,
+                // ...and whether its seat hard-stops it if a reclaim supersedes it (replayed).
+                "supersession": supersession_hard_stop
+                    .then_some(super::gate_escalation::SUPERSESSION_HARD_STOP),
             }),
         );
+        // The key record is a projection of the row: written only if the row is durable, so a
+        // restart can never hold a reclaim basis the chain does not (#1169, append audit).
+        if let (Some(k), true) = (&request_key, entry.is_ok()) {
+            s.gate_escalations.record_request_key(
+                k,
+                super::gate_escalation::RequestKeyRecord {
+                    outcome: "claimed".into(),
+                    escalation_id: esc.id.clone(),
+                    at: now,
+                    plugin_id: esc.plugin_id.clone(),
+                    marker: esc.marker.clone(),
+                    act_digest: attempted_act_digest.clone(),
+                    payload_sha256: esc.payload_sha256.clone(),
+                    host_session_id: proven_host_session_id.clone(),
+                    invocation_key: invocation_key.clone(),
+                    supersession_hard_stop,
+                },
+            );
+        }
         return Ok(json!({
             "claimed": true,
             "permits_write": true,
+            "request_key": request_key,
             "escalation_id": esc.id,
             "decided_by": esc.decided_by,
             "decided_via": esc.decided_via,
@@ -21289,6 +26234,35 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
             "single_use": "this approval is now spent; the next write needs a new one",
             "witnessEntryHash": entry.ok().map(|e| e.hash),
         }));
+    }
+
+    // THE SAME REQUEST ALREADY SPENT A GRANT, AND ITS ANSWER WAS LOST (#774, #1169). Recovery
+    // of ONE lost answer, never repeat authority: `reclaimable` requires that the claimed
+    // invocation never reached begin_action (the daemon's own execution evidence), that the
+    // retry is a DIFFERENT invocation, and that the claim has not been reclaimed before. When
+    // it refuses, the reason rides on whatever this call answers next.
+    let mut reclaim_refused: Option<&'static str> = None;
+    if let Some(k) = &request_key {
+        match s.gate_escalations.reclaimable(
+            k,
+            &plugin_id,
+            &marker,
+            attempted_act.as_deref(),
+            attempted_payload.as_deref(),
+            proven_host_session_id.as_deref(),
+            invocation_key.as_deref(),
+            incoming_bar,
+            now,
+        ) {
+            Ok(prev) => {
+                return commit_reclaim(&mut s, &prev, k, &tool_name, proven_host_session_id.as_deref(),
+                                      invocation_key.as_deref(), now,
+                                      |s, kind, payload| s.append_chain(kind, payload));
+            }
+            // "no record" is the ordinary case (a first claim): not worth saying.
+            Err(why) if why != "no record for this request key" => reclaim_refused = Some(why),
+            Err(_) => {}
+        }
     }
 
     // AN APPROVAL EXISTS FOR THIS ACT AND IT BOUND DIFFERENT BYTES (#1056).
@@ -21325,6 +26299,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         return Ok(json!({
             "claimed": false,
             "refused": "payload_drift",
+            "request_key": request_key,
+            "reclaim_refused": reclaim_refused,
             "escalation_id": esc_id,
             "bound_payload_sha256": bound,
             "presented_payload_sha256": presented,
@@ -21336,6 +26312,28 @@ permit for something the approver did not see.",
         }));
     }
 
+    // AN APPROVAL EXISTS FOR THIS ACT, BUT UNDER A LOWER BAR than the act now prices (its
+    // resolved targets reach a stronger one). It is not spent and not repriced; the ask below
+    // is minted at its own price, and the answer says which approval fell short and why.
+    let bar_shortfall = s
+        .gate_escalations
+        .approved_below_bar(
+            &plugin_id,
+            &marker,
+            attempted_act.as_deref(),
+            attempted_payload.as_deref(),
+            incoming_bar,
+            now,
+        )
+        .map(|e| json!({
+            "escalation_id": e.id,
+            "approved_bar": e.bar,
+            "incoming_bar": incoming_bar,
+            "note": "An approval for this exact act exists, but it was granted under a lower bar \
+than this act now prices (its resolved targets reach a stronger one). It is not spent and its \
+record is not repriced; this ask needs its own approval at the stronger bar.",
+        }));
+
     // Nothing to claim, so this write is REFUSED. Opening an escalation is not a maybe — it is
     // the paperwork attached to a refusal that already happened.
     match s
@@ -21344,6 +26342,9 @@ permit for something the approver did not see.",
               // The gate hook composes `reason` AS the act, and has always done so, so it is
               // the act here. `act` still wins if a caller sends both.
               attempted_act.as_deref(),
+              // The closure's write-position argument, when the hook sends it (#810): the act
+              // above is a bounded summary that can cut the filename out; this cannot.
+              &resolved_targets,
               stated_reason.as_deref(), stated_detail.as_deref(),
               Some(&attempted_binding), now, DEFAULT_TTL_SECS)
     {
@@ -21353,13 +26354,37 @@ permit for something the approver did not see.",
         // after the prior ask, each costing the operator a ruling that bought nothing. Fold, witness,
         // and answer with the id that is already waiting.
         Ok(crate::server::gate_escalation::Opened::Coalesced(twin)) => {
-            let payload = coalesced_payload(&s, &twin, "claim", now);
+            let mut payload = coalesced_payload(&s, &twin, "claim", now);
+            payload["request_key"] = json!(request_key);
             let entry = s.append_chain("gate_escalation_coalesced", payload)?;
+            if let Some(k) = &request_key {
+                s.gate_escalations.record_request_key(
+                    k,
+                    super::gate_escalation::RequestKeyRecord {
+                        outcome: "coalesced".into(),
+                        escalation_id: twin.id.clone(),
+                        at: now,
+                        plugin_id: twin.plugin_id.clone(),
+                        marker: twin.marker.clone(),
+                        act_digest: twin.act_digest.clone(),
+                        payload_sha256: twin.payload_sha256.clone(),
+                        host_session_id: proven_host_session_id.clone(),
+                        invocation_key: invocation_key.clone(),
+                        // Only a SPEND's capability is read (by `reclaimable`); the replay of
+                        // this row reads none either, so the projection matches the row.
+                        supersession_hard_stop: false,
+                    },
+                );
+            }
             // Same reason as the member door: a folded ask must not take its disagreement
             // with it. This door is the one the gate hook drives, so it is where a shim that
             // has started asserting hashes would surface first.
             witness_payload_disagreement(&mut s, &twin.id, &attempted_binding, "claim_coalesced")?;
-            Ok(coalesced_response(&twin, &entry.hash, now))
+            let mut resp = coalesced_response(&twin, &entry.hash, now);
+            resp["request_key"] = json!(request_key);
+            resp["reclaim_refused"] = json!(reclaim_refused);
+            resp["bar_shortfall"] = json!(bar_shortfall);
+            Ok(resp)
         }
         Ok(crate::server::gate_escalation::Opened::Minted(esc)) => {
             // THE SEAT KEYS (#542), same write as the member door: the two session
@@ -21377,6 +26402,9 @@ permit for something the approver did not see.",
                     .map(|uuid| uuid.to_string())
                     .as_deref(),
             );
+            // THE DOOR (#1066): claim-or-open, where `reason` may BE the act.
+            s.gate_escalations
+                .record_opened_via(&esc.id, crate::server::gate_escalation::OpenedVia::Claim);
             // Re-read AFTER the recording, same reason as the member door: `open`
             // returned a pre-recording clone and the payload is built from it.
             let esc = s
@@ -21405,7 +26433,6 @@ permit for something the approver did not see.",
                 &inv,
                 asker_is_proven,
                 answers_deny.as_deref(),
-                "claim",
                 DEFAULT_TTL_SECS,
             );
             // WHAT THIS MEMBER CAN ALREADY SPEND, told to the member. `opened_payload` has
@@ -21423,11 +26450,39 @@ permit for something the approver did not see.",
                 .get("decided_awaiting_claim")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
+            let mut payload = payload;
+            payload["request_key"] = json!(request_key);
             let entry = s.append_chain("gate_escalation_opened", payload)?;
+            if let Some(k) = &request_key {
+                s.gate_escalations.record_request_key(
+                    k,
+                    super::gate_escalation::RequestKeyRecord {
+                        outcome: "opened".into(),
+                        escalation_id: esc.id.clone(),
+                        at: now,
+                        plugin_id: esc.plugin_id.clone(),
+                        marker: esc.marker.clone(),
+                        act_digest: esc.act_digest.clone(),
+                        payload_sha256: esc.payload_sha256.clone(),
+                        host_session_id: proven_host_session_id.clone(),
+                        invocation_key: invocation_key.clone(),
+                        // Only a SPEND's capability is read (by `reclaimable`); the replay of
+                        // this row reads none either, so the projection matches the row.
+                        supersession_hard_stop: false,
+                    },
+                );
+            }
+            shadow_adjudicate(&mut s, &esc.id);
             let invitations = deliver_invitations(&mut s, &esc, &inv.invited, &entry.hash);
             Ok(json!({
                 "claimed": false,
                 "permits_write": false,
+                "request_key": request_key,
+                // Why the spent permit this request already holds could not be reused, when it
+                // could not (#1169). Absent on an ordinary first claim.
+                "reclaim_refused": reclaim_refused,
+                // An approval for this act that fell short of its price (P1-1), when one did.
+                "bar_shortfall": bar_shortfall,
                 "escalation_id": esc.id,
                 "expires_at": esc.expires_at,
                 "decide_within_secs": DEFAULT_TTL_SECS,
@@ -21492,6 +26547,7 @@ permit for something the approver did not see.",
             Ok(json!({
                 "claimed": false,
                 "permits_write": false,
+                "request_key": request_key,
                 "escalation_id": Value::Null,
                 "error": e.to_string(),
                 "then": "the write is refused",
@@ -21521,6 +26577,168 @@ permit for something the approver did not see.",
 // What it buys is that something which is not the asker looked, and that the record says how
 // different that something was (cross-vendor beats cross-member). Anyone reading this as a
 // security boundary is reading it wrong, and the `assurance` field says so on every entry.
+
+/// THE ASKER'S HALF of the deny → decide-out-of-band → re-issue loop.
+///
+/// WHY THIS EXISTS. `claimable_for` — the only function that answers "what may I spend right
+/// now" — had exactly ONE production caller before this one: the refusal reply's
+/// `decided_awaiting_claim` field. So the answer reached a member only as a SIDE EFFECT of
+/// being refused again. A member whose grant landed while it sat idle could not ask; it had
+/// to provoke a second refusal to be told about the first approval, and the 600s window ran
+/// the whole time.
+///
+/// The push half already exists and does not arrive: the disposition projector mints a mesh
+/// notice on decision, but delivery is a WAKE, and a LIVE seat is never woken because it is
+/// already running (`claimable_for`'s own doc, #366). Measured 2026-08-23/24 on CBP: four
+/// escalations opened, four approved by the operator, ZERO notifications received, exactly
+/// one claimed — and that one only because dp mentioned it in conversation while the window
+/// happened to still be open. Reproduced 2026-08-25 on `74195558206f22ca`: approved by the
+/// operator, `bar_met: true`, and `claim_window_secs_remaining: 0` by the time its asker
+/// thought to look. The information was never missing. Nothing delivered it, and nothing
+/// could be asked for it.
+///
+/// A PULL surface needs no wake, and the member is by definition talking to this daemon at
+/// the moment it wants to know.
+///
+/// Read-only and deliberately unwitnessed, for the same reason `hestia_scope_status` is:
+/// reading your own permissions is not an act. It lists ONLY what the PROVEN caller may spend
+/// -- see the identity block below for why an earlier draft's `asserted` fallback made that
+/// sentence false, and why "the label was honest" was not a defence.
+/// The ONE statement of today's claim-horizon rule for anything that leaves this process
+/// (the disposition lane and the claimable listing both render it). `decided_horizon()` is the
+/// one definition; this is its prose, kept in one place so the two surfaces cannot drift apart
+/// the way the claimable reply's `"decided_at"` anchor drifted from the code (GPT, #613).
+const PRE_MIGRATION_HORIZON_MODEL: &str =
+    "min(observed_at or decided_at, expires_at) + APPROVAL_CLAIM_WINDOW_SECS; observation is \
+store-only and resets on replay (#850). NOT the canonical delivery-started deadline (#845 R5).";
+
+async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+
+    let session_id_arg = optional_session_id(args);
+    let now = now_secs();
+    let mut s = state.lock().await;
+
+    // Identity, proven where possible. `plugin_id` is caller-supplied across this API at A1,
+    // so accepting it is consistent — but a resolved session OUTRANKS the assertion rather
+    // than merely joining it, and the basis is reported. A member reading its own grants
+    // under `asserted` should know that is what it did.
+    let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
+    // A PROVEN SESSION IS REQUIRED, and the first cut of this got it wrong (GPT/Nova review).
+    //
+    // That version fell back to a caller-supplied `plugin_id` when the session did not resolve
+    // and labelled the result `asker_basis: "asserted"`. The reasoning was that an honest label
+    // makes the evidence honest — and it does. What it does not do is make the SURFACE honest:
+    // the tool advertises "what approvals YOU can spend" and the doc claimed it "lists ONLY what
+    // the caller may spend", while the asserted arm let an unauthenticated caller ENUMERATE
+    // ANOTHER MEMBER'S claimable approvals by naming that member. Labelling a disclosure does
+    // not stop it being one, and the doc's excuse — "discloses nothing a member could not learn
+    // by being refused" — was simply false: your own refusal never tells you what a PEER holds.
+    //
+    // This surface exists precisely BECAUSE the member is already talking to this daemon, so
+    // requiring the live session costs it nothing and removes an identity-laundering seam.
+    // Same null-state discipline as before: unresolved identity is an ERROR, never an empty
+    // list, because "I do not know who you are" and "you hold nothing" are different answers.
+    let plugin_id = match caller.as_ref() {
+        Some(c) => c.plugin_id.clone(),
+        None => {
+            return Err(anyhow::anyhow!(
+                "cannot determine who is asking: this surface reports YOUR OWN claimable \
+                 approvals and therefore requires a PROVEN session_id (from hestia_connect). \
+                 A caller-supplied plugin_id is not accepted here: it would let one member \
+                 enumerate another's grants. Note that an empty list is a real answer and this \
+                 is not it — 'I do not know who you are' is a different fact from 'you hold \
+                 nothing spendable'"
+            ))
+        }
+    };
+    let basis = "session";
+
+    // ASKING IS OBSERVING (2026-09-28). #667 anchors the claim fuse at the asker's observation,
+    // but the only thing that recorded one was an attributed poll. An asker that came here to
+    // ask "what may I spend?" has observed its grants by any reading, and without this a grant
+    // that lapsed unobserved -- the operator approved in seconds, the interactive asker heard
+    // 11 minutes later (#1166's measurements) -- was simply absent from this list, while a
+    // poll would have revived it. Scoped to the escalations THIS proven session asked
+    // (`host_session_id` is the asker's proven session, recorded at open), so a sibling
+    // session on the same seat never starts another session's window (#732).
+    // `mark_observed` keeps its own conjuncts: approved, bar met, unspent, first observation.
+    let asker_host = caller
+        .as_ref()
+        .and_then(|c| c.session_uuid)
+        .and_then(|u| s.sessions.get(&u))
+        .and_then(|sess| sess.host_session_id.clone());
+    let observed_now: Vec<String> = match asker_host.as_deref() {
+        Some(h) => s.gate_escalations.observe_session_grants(&plugin_id, h, now),
+        None => Vec::new(),
+    };
+
+    let items: Vec<Value> = s
+        .gate_escalations
+        .claimable_for(&plugin_id, now)
+        .iter()
+        .map(|c| {
+            json!({
+                "escalation_id": c.id,
+                "marker": c.marker,
+                // WITHOUT THIS THE LIST IS A TRAP. Since #539 `claim()` matches on the act
+                // digest and treats a missing one as no match, so "you hold an approval" is
+                // actionable only alongside "for exactly this act". A member told the former
+                // re-issues a DIFFERENT write, is refused, and reads that refusal as the
+                // approval having lapsed — concluding the window is broken when the binding
+                // is what refused.
+                "act_digest": c.act_digest,
+                "decided_by": c.decided_by,
+                "decided_at": c.decided_at,
+                // The CLAIM clock, never the record clock. Measured 2026-08-08: three
+                // permits reported ~1500s of record life while ~24 minutes past their grant
+                // horizon. That is how a dead permit publishes as live.
+                "claim_window_secs_remaining": c.claim_window_secs_remaining(now),
+                // THE ANCHOR THIS ROW'S WINDOW ACTUALLY RUNS FROM, per row (GPT review of
+                // dd3f1b1). The response used to state one global `claim_window_anchor:
+                // "decided_at"` while this very call can re-anchor a grant on its observation,
+                // so a member following the advertised anchor would compute "expired" for a
+                // grant the call had just made spendable, and discard it. The absolute horizon
+                // travels (a deadline survives the trip; a countdown decays, #795), named as
+                // the pre-migration projection it is, same vocabulary as the disposition lane.
+                "observed_at": c.observed_at,
+                "pre_migration_horizon": c.pre_migration_horizon(),
+                "pre_migration_horizon_basis": if c.observed_at.is_some() { "observed_at" } else { "decided_at" },
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "plugin_id": plugin_id,
+        "asker_basis": basis,
+        "claimable": items,
+        // Which of this session's grants this very call observed (their windows start now).
+        "observed_now": observed_now,
+        // State the RULE, not a countdown from now, and state the rule the code runs. The
+        // first cut said `claim_window_anchor: "decided_at"` -- true only for a grant nobody
+        // observed. `decided_horizon()` is `min(observed_at or decided_at, expires_at) +
+        // window`, and since dd3f1b1 THIS CALL sets `observed_at` for the asking session's own
+        // grants, so the one response that re-anchors a grant was advertising the anchor it
+        // had just moved (GPT review, 2026-09-29). The per-row `pre_migration_horizon_basis`
+        // says which arm each row is on; this is the rule that produces it. Still not a single
+        // number at open time, which is why the open path's `retry_within_secs` is a supremum
+        // presented as a point (`core/tests/claim_horizon_is_never_rendered.rs`, PINs 1/2).
+        "claim_window_secs": crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
+        "claim_window_anchor": "observed_at_else_decided_at",
+        "claim_window_model": PRE_MIGRATION_HORIZON_MODEL,
+        "note": "Re-issue the act named by act_digest VERBATIM to spend an approval; the \
+                 claim is single-use. Each row's window runs claim_window_secs from its \
+                 pre_migration_horizon_basis: your first observation of the ruling if there \
+                 was one, else the ruling itself, and never past the record's expires_at + \
+                 claim_window_secs. This call OBSERVES the approved, unspent, never-observed \
+                 grants this session opened before it lists (observed_now), so a grant whose \
+                 ruling-anchored window had shut can reappear here with a fresh window. An \
+                 empty list means you hold nothing spendable right now, which is not the same \
+                 as never having been approved: a grant past an OBSERVED horizon, or past the \
+                 expires_at cap, is gone and will not reappear, and a sibling session's ask \
+                 never revives yours.",
+    }))
+}
 
 async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> ToolResult {
     use crate::arbiter::{eligibility, AppealParties, Eligibility};
@@ -21579,6 +26797,16 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                 "stated_reason": e.stated_reason,
                 "stated_detail": e.stated_detail,
                 "marker": e.marker,
+                // The criterion this ask must meet, and every marker it was priced over (stage
+                // C: the HIGHEST bar across them). A queue that shows the marker but not the
+                // bar lets a reader infer the bar from the marker — the exact inference the
+                // stage-A mispricing (a mechanism write recorded under `plugins/_shared`,
+                // single approver) made wrong.
+                "bar": e.bar,
+                "matched_markers": e.matched_markers,
+                // What the write reaches (#810), when the asker's hook sent it — the decider's
+                // view names the file, not only the closure element that fired.
+                "resolved_targets": e.resolved_targets,
                 "opened_at": e.opened_at,
                 "secs_remaining": e.secs_remaining(now),
                 "you_may_rule": may_rule,
@@ -21619,6 +26847,11 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                     "requested_at": r.requested_at,
                     "expires_at": r.expires_at,
                     "secs_remaining": r.expires_at.saturating_sub(now),
+                    "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+                    "rule": r.ext.gate.as_ref().map(|g| g.rule.clone()),
+                    "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
+                    "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
+                    "invited_peers": r.ext.invited_peers,
                 })
             })
             .collect()
@@ -22157,7 +27390,7 @@ mod standing_scope_surface_tests {
             decided_at: Some(now),
             decision_reason: None,
             recursive: false,
-            revoked: None,
+            revoked: None, ext: Default::default(),
         }
     }
 
@@ -22171,6 +27404,7 @@ mod standing_scope_surface_tests {
             expires_at,
             request_id: Some("scope-test01".into()),
         recursive: false,
+        modes: crate::server::grant_modes::Modes::ALL,
         }
     }
 
@@ -22178,6 +27412,37 @@ mod standing_scope_surface_tests {
     /// exact pre-existing shape (a consumer keyed on it must not notice this PR), and
     /// `standing_grants` + `generation` + `snapshot_expires_at` arrive beside it.
     /// (d, at the surface) an expired standing grant is not served.
+    /// #1345, FAIL CLOSED: a gate that predates modes reads `live_grants` / `standing_grants` as
+    /// reach for every act, so a narrowed grant must not appear there. It appears only in
+    /// `grants_by_mode`, which such a gate ignores: it reads the grant as no grant.
+    #[tokio::test]
+    async fn a_narrowed_grant_is_withheld_from_the_mode_blind_lists() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            let mut live = live_request("kimi-code", "/w/live-r.md", now);
+            live.ext.modes = crate::server::grant_modes::Modes::READ;
+            s.scope_requests.insert(live.id.clone(), live);
+            s.standing_scope.add(standing("kimi-code", "/w/full", now, None));
+            let mut ro = standing("kimi-code", "/w/gov", now, None);
+            ro.modes = crate::server::grant_modes::Modes::READ;
+            ro.recursive = true;
+            s.standing_scope.add(ro);
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        let paths = |k: &str| -> Vec<String> { out[k].as_array().unwrap().iter()
+            .map(|g| g["path"].as_str().unwrap().to_string()).collect() };
+        assert_eq!(paths("live_grants"), Vec::<String>::new(), "a read-only live grant reached a mode-blind list");
+        assert_eq!(paths("standing_grants"), vec!["/w/full".to_string()]);
+        let by_mode = out["grants_by_mode"].as_array().unwrap();
+        let find = |p: &str| by_mode.iter().find(|g| g["path"] == p).unwrap_or_else(|| panic!("{p} missing: {by_mode:?}"));
+        assert_eq!((find("/w/gov")["modes"].clone(), find("/w/gov")["recursive"].clone(), find("/w/gov")["channel"].clone()),
+                   (json!("r"), json!(true), json!("standing")));
+        assert_eq!(find("/w/live-r.md")["channel"], "live");
+        assert_eq!(find("/w/full")["modes"], "rwed");
+    }
+
     #[tokio::test]
     async fn scope_status_serves_standing_beside_live_additively() {
         let (_d, state) = test_state().await;
@@ -22218,6 +27483,48 @@ mod standing_scope_surface_tests {
         );
     }
 
+    /// hestia #1450 phase 0, step B: the read answers for the member whose session asks. A session that
+    /// resolves to another member is refused; no session, or one that no longer resolves, is served as
+    /// before but marked unbound and counted (the gate fetched its snapshot without one until step A, so
+    /// refusing those would deny every governed act on an older hook).
+    #[tokio::test]
+    async fn scope_status_refuses_another_members_session_and_marks_unbound_reads() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.add(standing("kimi-code", "/w/web4", now, None));
+        }
+        let kimi = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let codex = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        // its own session: served, bound
+        let own = tool_scope_status(&state, &json!({"plugin_id": "kimi-code", "session_id": kimi}))
+            .await.unwrap();
+        assert_eq!(own["caller_bound"], json!(true));
+        assert_eq!(own["standing_grants"][0]["path"], "/w/web4");
+
+        // no session: served exactly as before, marked unbound, counted
+        let before = own["unbound_reads_since_start"].as_u64().unwrap();
+        let bare = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        assert_eq!(bare["caller_bound"], json!(false));
+        assert_eq!(bare["standing_grants"][0]["path"], "/w/web4", "an older hook still gets its snapshot");
+        assert!(bare["unbound_reads_since_start"].as_u64().unwrap() > before);
+
+        // ANOTHER member's session naming kimi-code: refused, and nothing of kimi-code's is returned
+        let err = tool_scope_status(&state, &json!({"plugin_id": "kimi-code", "session_id": codex}))
+            .await.expect_err("a session that belongs to codex cannot read kimi-code's territory");
+        let msg = format!("{err}");
+        assert!(msg.contains("belongs to 'codex'") && !msg.contains("/w/web4"), "{msg}");
+
+        // a session that does not resolve: served unbound (step C tightens this)
+        let stale = tool_scope_status(&state, &json!({"plugin_id": "kimi-code",
+                                                       "session_id": "not-a-session"})).await.unwrap();
+        assert_eq!(stale["caller_bound"], json!(false));
+    }
+
     /// #483 acceptance 5: one non-empty floor is served byte-for-byte identically to
     /// different members, including a member with zero personal grants. The shared
     /// generation/digest identify the same daemon policy revision; personal expansions do
@@ -22233,6 +27540,7 @@ mod standing_scope_surface_tests {
                 added_at: now,
                 added_by: "operator".into(),
                 reason: "public workspace".into(),
+                ..Default::default()
             });
             s.standing_scope
                 .add(standing("kimi-code", "/w/kimi-only", now, None));
@@ -22252,6 +27560,82 @@ mod standing_scope_surface_tests {
         assert_eq!(kimi["standing_grants"].as_array().map(Vec::len), Some(1));
         assert_eq!(kimi["society_floor"][0]["path"], "/w/shared");
         assert_eq!(kimi["society_floor_digest"].as_str().map(str::len), Some(64));
+    }
+
+    /// dp, 2026-10-19 ("the governed see the law"): a READ-ONLY floor entry is served only under
+    /// `society_floor_read`. Under `society_floor` a gate that predates the key would map it to
+    /// an all-modes grant; apart, that gate ignores it and admits nothing. `floor_by_mode`
+    /// carries every entry with its modes.
+    #[tokio::test]
+    async fn a_read_only_floor_entry_is_served_apart_from_reach() {
+        let (_d, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/shared".into(),
+                recursive: true,
+                ..Default::default()
+            });
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/governance/hestia".into(),
+                recursive: true,
+                modes: crate::server::grant_modes::Modes::READ,
+                reason: "the governed see the law".into(),
+                ..Default::default()
+            });
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "cbp-being"}))
+            .await
+            .unwrap();
+        let reach: Vec<&str> = out["society_floor"].as_array().unwrap().iter()
+            .map(|f| f["path"].as_str().unwrap()).collect();
+        let read: Vec<&str> = out["society_floor_read"].as_array().unwrap().iter()
+            .map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(reach, vec!["/w/shared"]);
+        assert_eq!(read, vec!["/w/governance/hestia"]);
+        assert_eq!(out["society_floor"][0]["recursive"], true);
+        assert_eq!(out["society_floor_read"][0]["recursive"], true);
+        let by_mode = out["floor_by_mode"].as_array().unwrap();
+        assert_eq!(by_mode.len(), 2);
+        assert!(by_mode.iter().any(|f| f["path"] == "/w/governance/hestia" && f["modes"] == "r"));
+        assert!(by_mode.iter().any(|f| f["path"] == "/w/shared" && f["modes"] == "rwed"));
+        assert_eq!(out["society_floor_withheld"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// dp, 2026-10-23: "'floor' should not override the actual grants." A member whose own
+    /// grant under a floor path is narrowed is NOT served that all-modes floor entry as reach
+    /// (a mode-blind gate would union it over the narrowing); it is named as withheld. A
+    /// member without such a grant is served the entry as before, and the member-independent
+    /// digest and `floor_by_mode` stay identical for both.
+    #[tokio::test]
+    async fn an_all_modes_floor_entry_is_withheld_from_a_member_whose_own_grant_narrows_it() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/shared".into(),
+                recursive: true,
+                ..Default::default()
+            });
+            let mut g = standing("kimi-code", "/w/shared/law", now, None);
+            g.recursive = true;
+            g.modes = crate::server::grant_modes::Modes::READ;
+            s.standing_scope.add(g);
+        }
+        let kimi = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        let codex = tool_scope_status(&state, &json!({"plugin_id": "codex"})).await.unwrap();
+        assert_eq!(kimi["society_floor"].as_array().map(Vec::len), Some(0));
+        let withheld = kimi["society_floor_withheld"].as_array().unwrap();
+        assert_eq!(withheld.len(), 1);
+        assert_eq!(withheld[0]["path"], "/w/shared");
+        assert!(withheld[0]["why"].as_str().unwrap().contains("/w/shared/law"));
+        assert_eq!(codex["society_floor"][0]["path"], "/w/shared");
+        assert_eq!(kimi["society_floor_digest"], codex["society_floor_digest"]);
+        assert_eq!(kimi["floor_by_mode"], codex["floor_by_mode"]);
+        // kimi's narrowed grant itself stays out of the mode-blind lists (#1370) and in
+        // grants_by_mode, so nothing in kimi's snapshot reads as write reach over /w/shared/law.
+        assert_eq!(kimi["standing_grants"].as_array().map(Vec::len), Some(0));
     }
 
     /// (#407) The operating-law projection carries the scope_grants — live AND standing —
@@ -22363,6 +27747,7 @@ mod standing_scope_surface_tests {
                     added_at: now,
                     added_by: "operator".into(),
                     reason: "society baseline".into(),
+                    ..Default::default()
                 });
             })
             .unwrap();
@@ -22384,7 +27769,7 @@ mod standing_scope_surface_tests {
         assert_eq!(s.standing_scope.grants.len(), 2);
         assert!(s.standing_scope.floor_allows("/w/shared"));
         assert_eq!(
-            s.authority_status,
+            *s.authority_status,
             crate::server::standing_scope::AuthorityStatus::Loaded,
             "a document was present, so this is neither a fresh install nor a migration"
         );
@@ -22491,6 +27876,7 @@ mod standing_scope_surface_tests {
                 added_at: now,
                 added_by: "operator".into(),
                 reason: "baseline".into(),
+                ..Default::default()
             });
             st
         };
@@ -22601,7 +27987,7 @@ mod standing_scope_surface_tests {
 
         let (_dir, fresh) = test_state().await;
         assert_eq!(
-            fresh.lock().await.authority_status,
+            *fresh.lock().await.authority_status,
             AuthorityStatus::Fresh,
             "no document and no history is a fresh install, and empty is correct"
         );
@@ -22622,7 +28008,7 @@ mod standing_scope_surface_tests {
         let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
         let s = state.lock().await;
         assert_eq!(
-            s.authority_status,
+            *s.authority_status,
             AuthorityStatus::MigrationRequired,
             "history plus no standing document is a migration, not an empty society"
         );
@@ -22854,7 +28240,7 @@ mod standing_scope_surface_tests {
         // Reachability, not spelling: every tool that can reach the standing store must be on
         // this list. A name-based check alone is vacuous against a tool named otherwise —
         // which is precisely how `hestia_scope_arbitrate` slipped past it on first writing.
-        const MAY_REACH_STANDING: &[&str] = &["hestia_scope_arbitrate"];
+        const MAY_REACH_STANDING: &[&str] = &["hestia_scope_arbitrate", "hestia_scope_peer_decide"];
         for n in &names {
             let l = n.to_ascii_lowercase();
             if MAY_REACH_STANDING.contains(&n.as_str()) {
@@ -22904,7 +28290,7 @@ mod standing_scope_surface_tests {
         .await
         .unwrap();
         assert_eq!(first["gateCapabilityReportAccepted"], true);
-        assert!(state.lock().await.gate_capabilities["codex"].contains("society-floor:v1"));
+        assert!(state.lock().await.gate_capabilities.get("codex").unwrap().contains("society-floor:v1"));
 
         // A normal non-gate connect says nothing about the installed gate and must not turn
         // a prior positive report into a false negative merely by omitting the field.
@@ -22915,7 +28301,7 @@ mod standing_scope_surface_tests {
         .await
         .unwrap();
         assert_eq!(second["gateCapabilityReportAccepted"], false);
-        assert!(state.lock().await.gate_capabilities["codex"].contains("society-floor:v1"));
+        assert!(state.lock().await.gate_capabilities.get("codex").unwrap().contains("society-floor:v1"));
 
         let refused = tool_connect(
             &state,
@@ -23311,6 +28697,7 @@ mod disposition_durability_tests {
                 revoked: Some(crate::server::state::ScopeRevocation {
                     at: now, by: "lct:web4:review-operator".into(), reason: "done".into(),
                 }),
+                ext: Default::default(),
             });
         }
         let live = read(state.clone()).await;
@@ -24744,6 +30131,7 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
             expires_at: None,
             request_id: Some(request_id.clone()),
             recursive: false,
+            modes: crate::server::grant_modes::Modes::ALL,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
             return Err(anyhow::anyhow!(
@@ -24946,7 +30334,7 @@ mod delegated_scope_arbitration_tests {
                 decided_at: None,
                 decision_reason: None,
                 recursive: false,
-                revoked: None,
+                revoked: None, ext: Default::default(),
             },
         );
         id
@@ -25643,4 +31031,2398 @@ mod transport_binding_tests {
         let anon = tool_transport_binding(&state, &json!({})).await.unwrap();
         assert_eq!(anon["_hestia_error"]["code"], "hestia.transport_binding_unattributed");
     }
+}
+
+// ---------------------------------------------------------------- one decision witness (stage A)
+//
+// The daemon half of one-gate stage A (docs/one-gate-convergence-plan.md): `hestia_witness_decision`
+// takes every final verdict, answers with a receipt that names its inputs, writes ONE row per
+// verdict, and charges `allow` nothing. The Python half (the mechanism's `record_decision`) is
+// pinned against these replies by tools/decision_witness_contract_test.py.
+#[cfg(test)]
+mod decision_witness_tests {
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+
+    // Codex review 19153 on f4c6629: reproduced as failures there; assert the recovery now.
+    fn review_entity_file(state: &super::super::state::ServerState, member: &str) -> std::path::PathBuf {
+        use sha2::{Digest, Sha256};
+        let key = state.trust_entity_key(member, crate::reputation::DEFAULT_CONSTELLATION_ROLE);
+        let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+        state.home.join("trust").join(format!("{}.json", &hash[..16]))
+    }
+
+    #[tokio::test]
+    async fn review_19153_a_lost_entity_under_a_surviving_checkpoint_is_replayed() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let mut args = witness_args("gemini", "deny");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&state, &args)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        let path = {
+            let s = state.lock().await;
+            s.trust_store.persister().flush_blocking();
+            review_entity_file(&s, "gemini")
+        };
+        assert_eq!(grain_actions(&state, "gemini").await, 1);
+        drop(state);
+        // Model an independently lost unsynced cache file with projection.json surviving.
+        // No chain rows are changed; the acknowledged decision remains durable.
+        assert!(dir.path().join("trust/projection.json").exists());
+        std::fs::remove_file(path).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1, "the checkpoint's manifest no longer verifies: replay from the epoch");
+        let retry = tool_witness_decision(&reopened, &args).await.unwrap();
+        assert_eq!(retry["charged"], false, "the charge is on the chain once");
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1);
+    }
+
+    #[tokio::test]
+    async fn review_19153_a_partial_first_batch_is_not_mistaken_for_legacy() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let persister = { state.lock().await.trust_store.persister().clone() };
+        let hold = persister.hold_for_test();
+        for member in ["gemini", "codex"] {
+            let mut args = witness_args(member, "deny");
+            args["action_id"] = json!(Uuid::new_v4().to_string());
+            let (out, durable) = durable_scope(tool_witness_decision(&state, &args)).await;
+            durable.unwrap();
+            assert_eq!(out.unwrap()["charged"], true);
+        }
+        let (keep, lose) = {
+            let s = state.lock().await;
+            (review_entity_file(&s, "gemini"), review_entity_file(&s, "codex"))
+        };
+        drop(hold);
+        persister.flush_blocking();
+        drop(persister);
+        drop(state);
+        // Exact cache shape of a process crash part-way through the FIRST batch: one v2
+        // entity rename completed; the other entity and last-written manifest did not.
+        assert!(keep.exists());
+        std::fs::remove_file(lose).unwrap();
+        std::fs::remove_file(dir.path().join("trust/projection.json")).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1);
+        assert_eq!(grain_actions(&reopened, "codex").await, 1, "a v2 cache is replayed, not adopted at the head");
+        let s = reopened.lock().await;
+        assert_eq!(s.trust_store.projection_since(), Some(0), "the fresh epoch stays 0");
+    }
+
+    /// Codex, #1271 review 19161: the cache must never hold a charge the chain does not. Two
+    /// layers. (1) The barrier: while the chain's fsync is held, no trust file reaches disk, so a
+    /// crash cannot leave the cache ahead of the chain. (2) Recovery: a cache that IS ahead (here,
+    /// the chain restored from an older copy) is set aside and rebuilt, so the retry of the lost
+    /// row counts once. Before the fix the cache advanced under the hold and recovery kept the
+    /// unwitnessed charge (2 against the chain's 1). A retry did NOT count it twice, even with a
+    /// later row landing first (measured: 3 rows, 3 charges) — but with no retry, the cache stays
+    /// one charge above the chain for good.
+    #[tokio::test]
+    async fn review_19161_the_cache_never_holds_a_charge_the_chain_does_not() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let mut first = witness_args("gemini", "deny");
+        first["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&state, &first)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        assert_eq!(grain_actions(&state, "gemini").await, 1);
+        drop(state);
+        let chain_path = dir.path().join("witness.db");
+        let durable_prefix = std::fs::read(&chain_path).unwrap();
+        assert!(!dir.path().join("witness.db-wal").exists(), "closed prefix has no WAL");
+
+        let state = reopen_with_safety(&dir).await;
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let held = durability.hold_flush_for_test();
+        let durable_before = durability.frontier().durable;
+        let mut pending = witness_args("gemini", "deny");
+        pending["action_id"] = json!(Uuid::new_v4().to_string());
+        assert_eq!(tool_witness_decision(&state, &pending).await.unwrap()["charged"], true);
+        assert!(durability.committed() > durable_before);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        {
+            let s = state.lock().await;
+            assert!(s.trust_store.projected_through().is_none_or(|t| t < durable_before),
+                    "(1) no trust file reaches disk while its chain row is not durable");
+        }
+        drop(held);
+        { state.lock().await.trust_store.persister().flush_blocking(); }
+        drop(durability);
+        drop(state);
+        assert!(!dir.path().join("witness.db-wal").exists());
+        // The cache now holds the second charge; restore the chain to the copy without it.
+        std::fs::write(&chain_path, durable_prefix).unwrap();
+        let reopened = reopen_with_safety(&dir).await;
+        let rows = rows_of(&reopened, "policy_decision").await;
+        assert!(!rows.iter().any(|r| r.event_data["action_id"] == pending["action_id"]));
+        assert_eq!(grain_actions(&reopened, "gemini").await, 1,
+                   "(2) a cache ahead of the chain is rebuilt from the chain");
+        let mut later = witness_args("gemini", "deny");
+        later["action_id"] = json!(Uuid::new_v4().to_string());
+        let (out, durable) = durable_scope(tool_witness_decision(&reopened, &later)).await;
+        durable.unwrap();
+        assert_eq!(out.unwrap()["charged"], true);
+        let (retry, durable) = durable_scope(tool_witness_decision(&reopened, &pending)).await;
+        durable.unwrap();
+        assert_eq!(retry.unwrap()["charged"], true, "the lost row is witnessed on retry");
+        assert_eq!(grain_actions(&reopened, "gemini").await, 3,
+                   "three rows on the chain, three charges: the retry counts once");
+    }
+
+    async fn state_with_safety() -> (tempfile::TempDir, SharedState) {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("safety").unwrap().config,
+            );
+        }
+        (dir, state)
+    }
+
+    fn sink_lines(state_sink: &std::path::Path) -> usize {
+        crate::storage::trust::flush_all_for_test();
+        std::fs::read_to_string(state_sink).map(|b| b.lines().count()).unwrap_or(0)
+    }
+
+    fn is_chain_hash(v: &Value) -> bool {
+        v.as_str().is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
+    async fn rows_of(state: &SharedState, event_type: &str) -> Vec<crate::storage::chain::ChainEntry> {
+        let s = state.lock().await;
+        s.recent_chain(200).into_iter().filter(|e| e.event_type == event_type).collect()
+    }
+
+    /// Begin + rule an action for `plugin_id` under the safety preset. Returns (actionId, reply).
+    async fn ruled_action(state: &SharedState, plugin_id: &str, command: &str) -> (String, Value) {
+        let connect = tool_connect(state, &json!({"plugin_id": plugin_id, "host_agent": "test"}))
+            .await
+            .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let begin = tool_begin_action(
+            state,
+            &json!({"tool_name": "Bash", "target": command,
+                    "parameters": {"command": command}, "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        let verdict = tool_query_policy(state, &json!({"action_id": aid})).await.unwrap();
+        (aid, verdict)
+    }
+
+    fn witness_args(plugin_id: &str, decision: &str) -> Value {
+        json!({
+            "plugin_id": plugin_id,
+            "decision": decision,
+            "adjudicator": format!("plugin-gate:{plugin_id}"),
+            "reason": "gate.allow",
+            "rule_id": "gate.allow",
+            "tool_name": "Write",
+            "target": "/tmp/x",
+            "verdict_available": true,
+            "attempted": "Write -> /tmp/x",
+        })
+    }
+
+    #[tokio::test]
+    async fn allow_is_witnessed_as_its_own_event_and_charges_nothing() {
+        let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let decisions_before = rows_of(&state, "policy_decision").await.len();
+        let out = tool_witness_decision(&state, &witness_args("codex", "allow")).await.unwrap();
+        assert!(out.get("_hestia_error").is_none(), "allow must be accepted now: {out}");
+        assert!(is_chain_hash(&out["witnessEntryHash"]), "{out}");
+        assert_eq!(out["eventType"], json!("policy_allow"));
+        assert_eq!(out["decision"], json!("allow"));
+        assert_eq!(out["recorded"], json!("appended"));
+        assert_eq!(out["charged"], json!(false));
+        assert_eq!(out["updatedTrust"], Value::Null);
+        let rows = rows_of(&state, "policy_allow").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hash, out["witnessEntryHash"].as_str().unwrap());
+        assert_eq!(rows[0].event_data["decision"], json!("allow"));
+        assert_eq!(rows[0].event_data["rule_id"], json!("gate.allow"));
+        assert_eq!(rows[0].event_data["verdict_available"], json!(true));
+        assert_eq!(
+            rows_of(&state, "policy_decision").await.len(),
+            decisions_before,
+            "an allow must never be written as a policy_decision (derivation's governance window)"
+        );
+        assert_eq!(sink_lines(&sink), before, "allow must emit no reputation delta");
+    }
+
+    /// A deployed refusal shim sends none of the new keys. Its row and its charge are what they
+    /// were before this change — the property that keeps stage A unwired.
+    #[tokio::test]
+    async fn a_deployed_refusal_call_writes_the_row_it_always_wrote() {
+        let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        for decision in ["deny", "warn"] {
+            let out = tool_witness_decision(&state, &witness_args("kimi-code", decision))
+                .await
+                .unwrap();
+            assert!(is_chain_hash(&out["witnessEntryHash"]), "{out}");
+            assert_eq!(out["decision"], json!(decision));
+            assert_eq!(out["eventType"], json!("policy_decision"));
+            assert_eq!(out["charged"], json!(true));
+            assert!(out["updatedTrust"].is_object(), "the trust reply is kept: {out}");
+        }
+        let rows = rows_of(&state, "policy_decision").await;
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            let obj = r.event_data.as_object().unwrap();
+            for absent in ["action_id", "action_resident", "correlation_key", "core_digest"] {
+                assert!(!obj.contains_key(absent), "{absent} must ride only when sent: {obj:?}");
+            }
+        }
+        assert_eq!(sink_lines(&sink), before + 2, "warn and deny each still charge once");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_verdict_is_refused_before_any_append() {
+        let (_d, state) = state_with_safety().await;
+        let len = { state.lock().await.chain_len() };
+        for bad in ["escalate", "no-verdict", "Allow", ""] {
+            let out = tool_witness_decision(&state, &witness_args("codex", bad)).await.unwrap();
+            assert_eq!(
+                out["_hestia_error"]["code"], json!("hestia.witness_decision_kind"),
+                "{bad:?}: {out}"
+            );
+            assert!(out.get("witnessEntryHash").is_none());
+        }
+        assert_eq!({ state.lock().await.chain_len() }, len, "a refused verdict appends nothing");
+    }
+
+    #[tokio::test]
+    async fn an_unusable_join_key_is_refused_never_dropped() {
+        let (_d, state) = state_with_safety().await;
+        let len = { state.lock().await.chain_len() };
+        let mut bad: Vec<Value> = Vec::new();
+        for (k, v) in [
+            ("action_id", json!("not-a-uuid")),
+            ("action_id", json!(7)),
+            ("correlation_key", json!("has space")),
+            ("correlation_key", json!("x".repeat(201))),
+            ("correlation_key", json!("")),
+        ] {
+            let mut a = witness_args("codex", "allow");
+            a[k] = v;
+            bad.push(a);
+        }
+        for a in bad {
+            let out = tool_witness_decision(&state, &a).await.unwrap();
+            assert_eq!(out["_hestia_error"]["code"], json!("hestia.witness_decision_arg"), "{a}");
+        }
+        assert_eq!({ state.lock().await.chain_len() }, len);
+    }
+
+    #[tokio::test]
+    async fn join_keys_and_core_digest_ride_the_row_and_the_receipt() {
+        let (_d, state) = state_with_safety().await;
+        let aid = Uuid::new_v4().to_string();
+        let mut a = witness_args("gemini", "allow");
+        a["action_id"] = json!(aid);
+        a["correlation_key"] = json!("content-0123abcd");
+        a["core_digest"] = json!("f".repeat(64));
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["actionId"], json!(aid), "the receipt names the action it joined");
+        assert_eq!(out["correlationKey"], json!("content-0123abcd"));
+        let row = rows_of(&state, "policy_allow").await.remove(0);
+        assert_eq!(row.event_data["action_id"], json!(aid));
+        assert_eq!(row.event_data["action_resident"], json!(false), "unknown to this daemon");
+        assert_eq!(row.event_data["correlation_key"], json!("content-0123abcd"));
+        assert_eq!(row.event_data["core_digest"], json!("f".repeat(64)));
+    }
+
+    /// The double-record this closes: the daemon already wrote and charged its own deny for the
+    /// action; the seat then witnessed "the same deny" again and was charged twice.
+    #[tokio::test]
+    async fn one_verdict_one_row_when_the_daemon_already_ruled_the_action() {
+        let (_d, state) = state_with_safety().await;
+        let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        assert_eq!(verdict["decision"], json!("deny"), "precondition: {verdict}");
+        assert!(is_chain_hash(&verdict["decisionEntryHash"]), "query_policy names its row: {verdict}");
+        crate::storage::trust::flush_all_for_test();
+        let sink = { state.lock().await.reputation_sink() };
+        let charged_before = sink_lines(&sink);
+        let rows_before = rows_of(&state, "policy_decision").await.len();
+
+        let mut a = witness_args("codex", "deny");
+        a["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["recorded"], json!("existing"), "{out}");
+        assert_eq!(out["witnessEntryHash"], verdict["decisionEntryHash"]);
+        assert_eq!(out["charged"], json!(false));
+        assert_eq!(out["actionId"], json!(aid));
+        assert_eq!(rows_of(&state, "policy_decision").await.len(), rows_before, "no second row");
+        assert_eq!(sink_lines(&sink), charged_before, "no second charge");
+
+        // A DIFFERENT verdict on the same action is a different decision: its own row, but
+        // the action was already charged, so no second charge.
+        let mut w = witness_args("codex", "warn");
+        w["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_eq!(out["charged"], json!(false), "{out}");
+        assert_eq!(rows_of(&state, "policy_decision").await.len(), rows_before + 1);
+        assert_eq!(sink_lines(&sink), charged_before, "still one charge");
+
+        // And another member is never answered with this member's record.
+        let mut o = witness_args("kimi-code", "deny");
+        o["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &o).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_ne!(out["witnessEntryHash"], verdict["decisionEntryHash"]);
+    }
+
+    /// The allow half of the join: the daemon writes nothing for its own allow, so the gate's
+    /// allow witness is the decision row, and it carries the action id the outcome will close.
+    #[tokio::test]
+    async fn an_allowed_action_is_joined_by_its_allow_row() {
+        let (_d, state) = state_with_safety().await;
+        let (aid, verdict) = ruled_action(&state, "claude-code", "ls -la").await;
+        assert_eq!(verdict["decision"], json!("allow"), "precondition: {verdict}");
+        assert_eq!(verdict["decisionEntryHash"], Value::Null, "the daemon writes no allow row");
+        let mut a = witness_args("claude-code", "allow");
+        a["action_id"] = json!(aid);
+        a["correlation_key"] = json!("toolu_01ABC");
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        let row = rows_of(&state, "policy_allow").await.remove(0);
+        assert_eq!(row.event_data["action_id"], json!(aid));
+        assert_eq!(row.event_data["action_resident"], json!(true));
+        assert_eq!(row.event_data["correlation_key"], json!("toolu_01ABC"));
+    }
+
+    // ------------------------------------------- one charge per (member, action), every order
+
+    /// Make every `policy_decision` insert fail at the SQLite layer. The trust store is a
+    /// different store and keeps working: append fails, trust would succeed.
+    fn fail_decision_appends(dir: &tempfile::TempDir) -> rusqlite::Connection {
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_decision BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'policy_decision' BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Reputation deltas in the sink charged to `plugin_id`'s member LCT for action `aid`.
+    async fn charges_for(state: &SharedState, plugin_id: &str, aid: &str) -> usize {
+        crate::storage::trust::flush_all_for_test();
+        let (sink, lct) = {
+            crate::storage::trust::flush_all_for_test();
+            let s = state.lock().await;
+            (s.reputation_sink(), s.member_lct(plugin_id).expect("a mapped member"))
+        };
+        crate::storage::trust::flush_all_for_test();
+        std::fs::read_to_string(sink)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(aid) && l.contains(lct.as_str()))
+            .count()
+    }
+
+    fn rows_for(rows: &[crate::storage::chain::ChainEntry], aid: &str) -> Vec<Value> {
+        rows.iter()
+            .filter(|e| e.event_data["action_id"] == json!(aid))
+            .map(|e| e.event_data.clone())
+            .collect()
+    }
+
+    /// GPT's arm on #1196, exactly: a deny evaluation; the daemon's own `policy_decision` append
+    /// FAILS while the trust store would succeed; the later common witness finds no row and
+    /// appends one. Before: the daemon's charge had already landed and the witness charged
+    /// again (one row, two charges). Now: no committed row, no daemon charge; one row, one charge.
+    #[tokio::test]
+    async fn append_fails_trust_would_succeed_later_witness_appends_and_charges_once() {
+        let (dir, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let conn = fail_decision_appends(&dir);
+        let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        assert_eq!(verdict["decision"], json!("deny"), "the verdict never depends on the append");
+        assert_eq!(verdict["decisionEntryHash"], Value::Null, "no committed row: {verdict}");
+        assert_eq!(sink_lines(&sink), before, "no committed decision row, no reputation movement");
+        conn.execute_batch("DROP TRIGGER fail_decision;").unwrap();
+
+        let mut a = witness_args("codex", "deny");
+        a["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_eq!(out["charged"], json!(true), "{out}");
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1);
+        assert_eq!(sink_lines(&sink), before + 1, "one row, one charge");
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+    }
+
+    /// The warn-rollout divergence (PR body, Decisions #3), daemon first: the daemon denies and
+    /// charges; the seat then records `warn` for the same action. Two rows (two decisions the
+    /// member experienced), one charge, and the warn row names the row that charged.
+    #[tokio::test]
+    async fn daemon_deny_then_seat_warn_keeps_both_rows_and_one_charge() {
+        let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        let deny_hash = verdict["decisionEntryHash"].clone();
+        assert!(is_chain_hash(&deny_hash), "{verdict}");
+        assert_eq!(sink_lines(&sink), before + 1, "the daemon's own charge");
+
+        let mut w = witness_args("codex", "warn");
+        w["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(out["recorded"], json!("appended"), "{out}");
+        assert_eq!(out["charged"], json!(false), "{out}");
+        assert_eq!(out["chargeHeldBy"], deny_hash, "{out}");
+        assert_eq!(out["updatedTrust"], Value::Null);
+        let rows = rows_for(&rows_of(&state, "policy_decision").await, &aid);
+        assert_eq!(rows.len(), 2, "both decisions are evidence");
+        let warn_row = rows.iter().find(|r| r["decision"] == json!("warn")).unwrap();
+        assert_eq!(warn_row["charge_held_by"], deny_hash);
+        let deny_row = rows.iter().find(|r| r["decision"] == json!("deny")).unwrap();
+        assert!(deny_row.get("charge_held_by").is_none(), "the charging row holds no pointer");
+        assert_eq!(sink_lines(&sink), before + 1, "one charge");
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+    }
+
+    /// The same divergence, seat first: the seat's `warn` names the action before the daemon
+    /// rules it. The seat's row charged (first committed charge wins, at its 0.2 weight); the
+    /// daemon's `deny` row is appended and moves nothing.
+    #[tokio::test]
+    async fn seat_warn_then_daemon_deny_keeps_both_rows_and_one_charge() {
+        let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let connect = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "test"}))
+            .await
+            .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        let cmd = "rm -rf /home/user/data";
+        let begin = tool_begin_action(
+            &state,
+            &json!({"tool_name": "Bash", "target": cmd, "parameters": {"command": cmd},
+                    "session_id": sid}),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+
+        let mut w = witness_args("codex", "warn");
+        w["action_id"] = json!(aid);
+        let warn = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(warn["charged"], json!(true), "{warn}");
+        assert_eq!(sink_lines(&sink), before + 1);
+
+        let verdict = tool_query_policy(&state, &json!({"action_id": aid})).await.unwrap();
+        assert_eq!(verdict["decision"], json!("deny"), "{verdict}");
+        assert!(is_chain_hash(&verdict["decisionEntryHash"]), "the deny row commits: {verdict}");
+        let rows = rows_for(&rows_of(&state, "policy_decision").await, &aid);
+        assert_eq!(rows.len(), 2);
+        let deny_row = rows.iter().find(|r| r["decision"] == json!("deny")).unwrap();
+        assert_eq!(deny_row["charge_held_by"], warn["witnessEntryHash"]);
+        assert_eq!(sink_lines(&sink), before + 1, "the daemon's deny is not a second charge");
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1);
+
+        // The daemon's deny is now a committed row: the seat's deny is answered with it.
+        let mut d = witness_args("codex", "deny");
+        d["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &d).await.unwrap();
+        assert_eq!(out["recorded"], json!("existing"), "{out}");
+        assert_eq!(out["witnessEntryHash"], verdict["decisionEntryHash"]);
+    }
+
+    /// Duplicate deliveries: the same seat witness sent twice (a retry after a lost reply), and
+    /// the daemon asked to rule the same action twice. One row per verdict from the witness,
+    /// and never more than one charge.
+    #[tokio::test]
+    async fn duplicate_deliveries_never_charge_twice() {
+        let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+
+        // A seat-only action id (no daemon row): the retry is answered with the first row.
+        let aid = Uuid::new_v4().to_string();
+        let mut a = witness_args("gemini", "deny");
+        a["action_id"] = json!(aid);
+        let first = tool_witness_decision(&state, &a).await.unwrap();
+        let second = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(first["recorded"], json!("appended"), "{first}");
+        assert_eq!(second["recorded"], json!("existing"), "{second}");
+        assert_eq!(second["witnessEntryHash"], first["witnessEntryHash"]);
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1);
+        assert_eq!(charges_for(&state, "gemini", &aid).await, 1);
+
+        // The daemon asked twice for one action: one verdict, one row — its repeat ruling is
+        // answered with the row it already committed, and charges nothing.
+        let (aid2, v1) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        let v2 = tool_query_policy(&state, &json!({"action_id": aid2})).await.unwrap();
+        assert_eq!(v2["decision"], json!("deny"));
+        assert!(is_chain_hash(&v1["decisionEntryHash"]), "{v1}");
+        assert_eq!(v2["decisionEntryHash"], v1["decisionEntryHash"], "the same committed row");
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid2).len(), 1);
+        assert_eq!(charges_for(&state, "codex", &aid2).await, 1);
+        assert_eq!(sink_lines(&sink), before + 2, "one charge per (member, action)");
+    }
+
+    /// Mismatched verdicts in any interleaving after the daemon's deny: warn, deny, warn again,
+    /// allow, deny again. Still one charge for the member; another member's verdict on the same
+    /// action is its own key.
+    #[tokio::test]
+    async fn mismatched_verdicts_in_any_order_charge_once_per_member() {
+        let (_d, state) = state_with_safety().await;
+        crate::storage::trust::flush_all_for_test();
+        let sink = { state.lock().await.reputation_sink() };
+        let before = sink_lines(&sink);
+        let (aid, _) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        for decision in ["warn", "deny", "warn", "allow", "deny"] {
+            let mut a = witness_args("codex", decision);
+            a["action_id"] = json!(aid);
+            let out = tool_witness_decision(&state, &a).await.unwrap();
+            assert_eq!(out["charged"], json!(false), "{decision}: {out}");
+        }
+        assert_eq!(charges_for(&state, "codex", &aid).await, 1, "one charge, whatever the order");
+        let decision_rows = rows_for(&rows_of(&state, "policy_decision").await, &aid);
+        assert_eq!(decision_rows.len(), 2, "one row per distinct verdict: the deny and one warn");
+        assert_eq!(rows_for(&rows_of(&state, "policy_allow").await, &aid).len(), 1);
+
+        let mut o = witness_args("kimi-code", "warn");
+        o["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &o).await.unwrap();
+        assert_eq!(out["charged"], json!(true), "another member is its own key: {out}");
+        assert_eq!(charges_for(&state, "kimi-code", &aid).await, 1);
+        assert_eq!(sink_lines(&sink), before + 2);
+    }
+
+    // ------------------------------- exactly once: an owed charge is settled, across restarts too
+
+    /// Make the trust store unwritable: its directory goes read-only, so every trust write fails
+    /// while the chain keeps committing (row commits, trust write fails). Reads still work — a
+    /// store that cannot be READ is an error, not an absent entity (#1271 review 19166), so
+    /// swapping the directory for a file no longer models a lost write.
+    fn break_trust(dir: &tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path().join("trust"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+    }
+
+    fn heal_trust(dir: &tempfile::TempDir) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path().join("trust"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+
+    /// Reopen after a restart with the safety preset the decision tests run under.
+    async fn reopen_with_safety(dir: &tempfile::TempDir) -> SharedState {
+        let state = open_state(dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        state
+    }
+
+    /// Action count of a member's execution grain in the member role, as the store holds it.
+    async fn grain_actions(state: &SharedState, plugin_id: &str) -> u64 {
+        let s = state.lock().await;
+        s.trust_for_role(plugin_id, crate::reputation::DEFAULT_CONSTELLATION_ROLE).action_count
+    }
+
+    /// TRUST IS A PROJECTION OF THE CHAIN (#1271). A failing trust-cache write no longer touches
+    /// the decision: the charge is the committed row's, acknowledged with it. A restart over the
+    /// lost cache replays it exactly once, and a retry charges nothing more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_trust_cache_write_is_replayed_exactly_once() {
+        use crate::storage::durability::durable_scope;
+        let (dir, state) = state_with_safety().await;
+        let aid = Uuid::new_v4().to_string();
+        let mut a = witness_args("gemini", "deny");
+        a["action_id"] = json!(aid);
+        break_trust(&dir);
+        let (out, durable) = durable_scope(tool_witness_decision(&state, &a)).await;
+        durable.expect("the act is acknowledged: its fact is the durable chain row");
+        assert_eq!(out.unwrap()["charged"], json!(true));
+        drop(state);
+        heal_trust(&dir);
+
+        let state = reopen_with_safety(&dir).await;
+        assert_eq!(charges_for(&state, "gemini", &aid).await, 1, "replayed once");
+        let retry = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(retry["recorded"], json!("existing"), "{retry}");
+        assert_eq!(retry["charged"], json!(false), "{retry}");
+        assert_eq!(rows_for(&rows_of(&state, "policy_decision").await, &aid).len(), 1, "one row");
+        assert_eq!(charges_for(&state, "gemini", &aid).await, 1, "exactly one charge");
+    }
+
+    /// Codex's P1-1 counterexample on #1271, first half: with the trust write held, a deny and
+    /// then a seat warn on one action (the warn row says `charge_held_by`); the trust batch fails
+    /// and the daemon reopens. Before: replay treated the lost charge as settled (count 0). Now:
+    /// the deny row IS the charge, replay applies it once, and the retry charges nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_p1_lost_charge_behind_a_charge_held_by_row_is_replayed_once() {
+        let (dir, state) = state_with_safety().await;
+        let persister = { state.lock().await.trust_store.persister().clone() };
+        let hold = persister.hold_for_test();
+        let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        assert_eq!(verdict["decision"], json!("deny"), "{verdict}");
+        let mut w = witness_args("codex", "warn");
+        w["action_id"] = json!(aid);
+        let out = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(out["chargeHeldBy"], verdict["decisionEntryHash"], "{out}");
+        persister.discard_for_test(); // the trust batch never lands
+        drop(hold);
+        drop(persister);
+        drop(state);
+
+        let state = reopen_with_safety(&dir).await;
+        assert_eq!(grain_actions(&state, "codex").await, 1, "the deny's charge, once");
+        let retry = tool_witness_decision(&state, &w).await.unwrap();
+        assert_eq!(retry["charged"], json!(false), "{retry}");
+        assert_eq!(grain_actions(&state, "codex").await, 1);
+    }
+
+    /// Codex's P1-1, converse: the trust write lands but the settle record does not (split
+    /// write). Before: reopen + retry charged again (0 → 1 → 2). Now the settle record is not
+    /// authority — the chain is — so the retry charges nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_p1_trust_written_settle_lost_never_double_charges() {
+        let (dir, state) = state_with_safety().await;
+        let (aid, _v) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
+        assert_eq!(grain_actions(&state, "codex").await, 1);
+        crate::storage::trust::flush_all_for_test();
+        drop(state);
+        let _ = std::fs::remove_file(dir.path().join(super::super::decision_witness::SETTLED_FILE));
+
+        let state = reopen_with_safety(&dir).await;
+        assert_eq!(grain_actions(&state, "codex").await, 1);
+        let mut d = witness_args("codex", "deny");
+        d["action_id"] = json!(aid);
+        let retry = tool_witness_decision(&state, &d).await.unwrap();
+        assert_eq!(retry["charged"], json!(false), "{retry}");
+        assert_eq!(grain_actions(&state, "codex").await, 1, "never 2");
+    }
+
+    /// Codex's P1-2: a reader in the observing scope returned trust that a reopen did not have.
+    /// Now what it returns is projected from durable chain rows, so a crash that loses the trust
+    /// cache cannot take it back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_p1_what_a_trust_reader_returns_survives_a_lost_cache() {
+        let (dir, state) = state_with_safety().await;
+        let persister = { state.lock().await.trust_store.persister().clone() };
+        let hold = persister.hold_for_test();
+        let mut a = witness_args("gemini", "deny");
+        a["action_id"] = json!(Uuid::new_v4().to_string());
+        tool_witness_decision(&state, &a).await.unwrap();
+        let st = state.clone();
+        let (body, durable) = crate::storage::durability::durable_scope_observing(async move {
+            read_resource_body(&st, "hestia://society/trust/gemini").await
+        })
+        .await;
+        durable.unwrap();
+        let read: Value = serde_json::from_str(&body.unwrap()).unwrap();
+        let stored: Vec<(String, Value)> = {
+            let s = state.lock().await;
+            s.trust_store.all().unwrap().into_iter().map(|(k, t)| (k, serde_json::to_value(t).unwrap())).collect()
+        };
+        persister.discard_for_test();
+        drop(hold);
+        drop(persister);
+        drop(state);
+
+        let state = reopen_with_safety(&dir).await;
+        let restored: Vec<(String, Value)> = {
+            let s = state.lock().await;
+            s.trust_store.all().unwrap().into_iter().map(|(k, t)| (k, serde_json::to_value(t).unwrap())).collect()
+        };
+        assert_eq!(restored, stored, "the restart did not restore the trust a reader saw");
+        let st = state.clone();
+        let again: Value = serde_json::from_str(
+            &read_resource_body(&st, "hestia://society/trust/gemini").await.unwrap()).unwrap();
+        // `daysSinceLast` is a clock reading at read time, not state.
+        for k in ["actionCount", "successCount", "t3", "v3", "entityId", "level"] {
+            assert_eq!(again[k], read[k], "{k}: a reader returned trust the restart did not have");
+        }
+    }
+
+    /// A settled charge stays settled across restarts: the chain says which row charged.
+    #[tokio::test]
+    async fn a_charge_settles_once_across_restarts() {
+        let (dir, state) = state_with_safety().await;
+        let aid = Uuid::new_v4().to_string();
+        let mut a = witness_args("gemini", "warn");
+        a["action_id"] = json!(aid);
+        let first = tool_witness_decision(&state, &a).await.unwrap();
+        assert_eq!(first["charged"], json!(true), "{first}");
+        drop(state);
+        for _ in 0..2 {
+            let state = open_state(&dir);
+            let out = tool_witness_decision(&state, &a).await.unwrap();
+            assert_eq!(out["recorded"], json!("existing"), "{out}");
+            assert_eq!(out["charged"], json!(false), "settled stays settled: {out}");
+            assert_eq!(charges_for(&state, "gemini", &aid).await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_allow_event_cannot_be_forged_through_request_witness() {
+        let (_d, state) = state_with_safety().await;
+        let out = tool_request_witness(
+            &state,
+            &json!({"event_type": "policy_allow", "event_data": {"decision": "allow"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["_hestia_error"]["code"], json!("hestia.witness_reserved_event"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod concurrency_battery {
+    //! THE CONCURRENCY BATTERY — the invariants every stage of the per-member serialisation plan
+    //! must keep (one-lock → per-member locks, lock-free snapshots, separate escalation store,
+    //! short chain append, society barrier). Written FIRST, green against today's single global
+    //! lock, so each later stage is measured against a battery that already held rather than one
+    //! written to fit the new design.
+    //!
+    //! One burst, many simulated members and sessions at once, through the REAL tool handlers:
+    //! - deny verdicts for one action raced from the daemon (query_policy) and the seat
+    //!   (witness_decision deny + warn): exactly ONE charge per (member, action_id);
+    //! - notices sent while their recipients drain: none lost, none delivered twice;
+    //! - escalations decided by racing peers and an operator: decided at most once, one ruling
+    //!   row; claims raced by the asker: at most one spend, and never a spend of an approval
+    //!   whose bar is not met (the weaker approval);
+    //! and then a RESTART: state rebuilt from the chain (decision ledger, escalation store,
+    //! inbox) must equal the running state the burst left. Sessions are RAM-only by design and
+    //! are not compared.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const MEMBERS: usize = 10;
+    const NOTICES_PER_SENDER: usize = 4;
+    const DENY_CMD: &str = "rm -rf /home/user/data";
+
+    fn member(i: usize) -> String {
+        format!("battery-m{i}")
+    }
+
+    async fn connect(state: &SharedState, plugin_id: &str, hsid: &str) -> String {
+        tool_connect(state, &json!({"plugin_id": plugin_id, "host_agent": "battery",
+                                    "host_session_id": hsid}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn witness(plugin_id: &str, decision: &str, aid: &str) -> Value {
+        json!({
+            "plugin_id": plugin_id, "decision": decision, "action_id": aid,
+            "adjudicator": format!("plugin-gate:{plugin_id}"), "reason": "battery",
+            "rule_id": "battery", "tool_name": "Bash", "target": DENY_CMD,
+            "verdict_available": true, "attempted": DENY_CMD,
+        })
+    }
+
+    /// Reputation deltas charged for `aid` to `plugin_id`'s member LCT.
+    fn charges(sink: &std::path::Path, lct: &str, aid: &str) -> usize {
+        crate::storage::trust::flush_all_for_test();
+        std::fs::read_to_string(sink)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(aid) && l.contains(lct))
+            .count()
+    }
+
+    type EscView = BTreeMap<String, (String, Option<String>, bool, bool)>;
+
+    fn escalation_view(s: &super::super::state::ServerState) -> EscView {
+        s.gate_escalations
+            .rows()
+            .map(|e| {
+                (
+                    e.id.clone(),
+                    (format!("{:?}", e.stored_status()), e.decided_by.clone(),
+                     e.consumed_at.is_some(), e.bar_met()),
+                )
+            })
+            .collect()
+    }
+
+    /// GROUP COMMIT, ordering arm: a vault save that follows an intent row must not reach disk
+    /// while that row is still unsynced. A crash at any instant then leaves neither, the intent
+    /// alone (the case `*_intent` rows exist to record), or both, but never the vault write
+    /// without the chain row that justifies it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_vault_save_never_reaches_disk_ahead_of_the_chain_row_before_it() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let vault_path = dir.path().join("v.enc");
+        let before = std::fs::read(&vault_path).unwrap();
+        let hold = durability.hold_flush_for_test();
+        let st = state.clone();
+        let mut writer = tokio::spawn(async move {
+            let mut s = st.lock().await;
+            let intent = s
+                .append_chain("scope_standing_promote_intent", json!({"battery": "vault-order"}))
+                .unwrap();
+            s.standing_scope_dirty = true;
+            s.persist_standing_scope().expect("the save completes once the chain is durable");
+            intent.chain_position
+        });
+        // A vault save (Argon2 + encrypt + fsync) is slow in a test build; give it ample time.
+        if tokio::time::timeout(std::time::Duration::from_secs(8), &mut writer).await.is_ok() {
+            panic!("the vault save completed while the intent row before it was not durable");
+        }
+        assert_eq!(std::fs::read(&vault_path).unwrap(), before,
+                   "the vault reached disk while the intent row before it was not durable");
+        drop(hold);
+        let pos = writer.await.unwrap();
+        assert!(durability.frontier().durable > pos, "the intent row is durable");
+        assert_ne!(std::fs::read(&vault_path).unwrap(), before, "and then the vault was written");
+    }
+
+    /// GROUP COMMIT, failure arm: an fsync that fails after commit. Decisions acknowledged
+    /// before it survive a restart exactly; the request whose fsync failed is told
+    /// `not durable` (never "recorded"); the running daemon refuses every later append; and the
+    /// restart's ledger, rebuilt from the chain, equals the acknowledged ledger.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_fsync_is_never_acknowledged_and_a_restart_rebuilds_the_acknowledged_state() {
+        use crate::storage::durability::durable_scope;
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        let sid = connect(&state, "battery-fsync", "hs-f").await;
+        let deny = |st: SharedState, sid: String| async move {
+            let b = tool_begin_action(&st, &json!({"tool_name": "Bash", "target": DENY_CMD,
+                "parameters": {"command": DENY_CMD}, "session_id": sid})).await.unwrap();
+            let aid = b["actionId"].as_str().unwrap().to_string();
+            let v = tool_query_policy(&st, &json!({"action_id": aid})).await.unwrap();
+            (aid, v)
+        };
+        let mut acked = Vec::new();
+        for _ in 0..3 {
+            let ((aid, v), res) = durable_scope(deny(state.clone(), sid.clone())).await;
+            res.expect("acknowledged");
+            assert!(v["decisionEntryHash"].is_string(), "{v}");
+            acked.push((aid, v["decisionEntryHash"].as_str().unwrap().to_string()));
+        }
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        durability.inject_sync_failure();
+        let ((_aid, _v), res) = durable_scope(deny(state.clone(), sid.clone())).await;
+        assert!(res.is_err(), "a decision whose fsync failed must not be acknowledged");
+
+        // The running daemon now refuses to witness anything: no reply after the failure can
+        // rest on memory that is ahead of the chain.
+        let len_poisoned = { state.lock().await.chain_len() };
+        let ((_, v_after), res_after) = durable_scope(deny(state.clone(), sid.clone())).await;
+        assert!(v_after["decisionEntryHash"].is_null(), "a poisoned chain witnessed: {v_after}");
+        // Durable reads: a request that observed a poisoned chain is not acknowledged either —
+        // whatever it read may not survive the restart that is coming.
+        assert!(res_after.is_err(), "a poisoned daemon acknowledges nothing, reads included");
+        assert_eq!(state.lock().await.chain_len(), len_poisoned, "no append after poison");
+
+        let acked_ledger: BTreeMap<_, _> = {
+            let s = state.lock().await;
+            s.decision_ledger.canonical().into_iter()
+                .filter(|((_, a), _)| acked.iter().any(|(aid, _)| aid == &a.to_string()))
+                .collect()
+        };
+        assert_eq!(acked_ledger.len(), acked.len());
+        drop(durability);
+        drop(state);
+        let restarted = open_state(&dir);
+        let s = restarted.lock().await;
+        for (_, h) in &acked {
+            assert!(s.chain_store.read_by_hash(h).unwrap().is_some(), "acknowledged row {h} lost");
+        }
+        let rebuilt: BTreeMap<_, _> = s.decision_ledger.canonical().into_iter()
+            .filter(|(k, _)| acked_ledger.contains_key(k))
+            .collect();
+        assert_eq!(rebuilt, acked_ledger, "restart-from-chain != the acknowledged state");
+        assert!(!s.chain_store.durability().poisoned());
+    }
+
+    /// Every trust grain the store holds, as comparable JSON.
+    fn trust_snapshot(s: &super::super::state::ServerState) -> BTreeMap<String, Value> {
+        s.trust_store.all().unwrap().into_iter()
+            .map(|(id, t)| (id, serde_json::to_value(t).unwrap()))
+            .collect()
+    }
+
+    /// One burst over EVERY path that moves trust: outcomes (success and failure), daemon denies
+    /// (Conduct charges), seat witnesses with and without an action id (Unclassified charges, and
+    /// a second verdict that must not charge again), adjudications (V3) and a reversal (judgment
+    /// axis + its validity adjudication) — many members at once.
+    async fn trust_burst(state: &SharedState) {
+        let mut sids = Vec::new();
+        for i in 0..MEMBERS {
+            sids.push(connect(state, &member(i), &format!("hs-t-{i}")).await);
+        }
+        let dev = tool_connect(state, &json!({"plugin_id": "claude-code", "host_agent": "t",
+            "role": "role:constellation:interactive-dev"})).await.unwrap()["sessionId"]
+            .as_str().unwrap().to_string();
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..MEMBERS {
+            let (st, sid, m, dev) = (state.clone(), sids[i].clone(), member(i), dev.clone());
+            tasks.spawn(async move {
+                for k in 0..3 {
+                    let b = tool_begin_action(&st, &json!({"tool_name": "Read", "target": "/tmp/x",
+                        "parameters": {"file_path": "/tmp/x"}, "session_id": sid})).await.unwrap();
+                    tool_record_outcome(&st, &json!({"action_id": b["actionId"],
+                        "success": k != 1, "magnitude": 0.3 + 0.1 * k as f64})).await.unwrap();
+                }
+                let b = tool_begin_action(&st, &json!({"tool_name": "Bash", "target": DENY_CMD,
+                    "parameters": {"command": DENY_CMD}, "session_id": sid})).await.unwrap();
+                let aid = b["actionId"].as_str().unwrap().to_string();
+                tool_query_policy(&st, &json!({"action_id": aid})).await.unwrap();
+                tool_witness_decision(&st, &witness(&m, "warn", &aid)).await.unwrap();
+                let mut no_aid = witness(&m, "deny", "");
+                no_aid.as_object_mut().unwrap().remove("action_id");
+                tool_witness_decision(&st, &no_aid).await.unwrap();
+                let out = tool_witness_adjudication(&st, &json!({"subject_plugin_id": m,
+                    "axis": if i % 2 == 0 { "validity" } else { "valuation" },
+                    "verdict": "upheld", "method": "review", "ref": format!("pr:battery#{i}"),
+                    "session_id": dev})).await.unwrap();
+                assert!(out.get("_hestia_error").is_none(), "adjudication refused: {out}");
+                if i % 3 == 0 {
+                    let out = tool_record_reversal(&st, &json!({"subject_plugin_id": m,
+                        "subject_role": "role:constellation:member", "kind": "override",
+                        "cause": "invalid-result", "reason": "battery", "ref": format!("PR#{i}"),
+                        "magnitude": 0.4, "session_id": dev})).await.unwrap();
+                    assert!(out.get("_hestia_error").is_none(), "reversal refused: {out}");
+                }
+            });
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.expect("a trust burst task panicked");
+        }
+    }
+
+    async fn safety_state(dir: &tempfile::TempDir) -> SharedState {
+        let state = open_state(dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        state
+    }
+
+    /// TRUST IS A PROJECTION OF THE CHAIN (#1271): delete every trust file, restart, and the trust
+    /// rebuilt from the chain equals the running trust exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn trust_rebuilt_from_the_chain_equals_the_running_trust() {
+        let (dir, _) = seeded_home();
+        let state = safety_state(&dir).await;
+        trust_burst(&state).await;
+        let running = { trust_snapshot(&*state.lock().await) };
+        assert!(running.len() >= MEMBERS * 2, "precondition: the burst moved many grains: {}", running.len());
+        drop(state);
+        let trust_dir = dir.path().join("trust");
+        for e in std::fs::read_dir(&trust_dir).unwrap().flatten() {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+        let restarted = open_state(&dir);
+        let rebuilt = { trust_snapshot(&*restarted.lock().await) };
+        assert_eq!(rebuilt.keys().collect::<Vec<_>>(), running.keys().collect::<Vec<_>>(),
+                   "the same grains");
+        for (k, v) in &running {
+            assert_eq!(&rebuilt[k], v, "grain {k} differs after rebuild from the chain");
+        }
+    }
+
+    /// A crash before the cache was written loses nothing: the restart replays the chain from the
+    /// cache's projection point and reaches the running trust.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_crash_before_the_trust_cache_is_written_loses_nothing() {
+        let (dir, _) = seeded_home();
+        let state = safety_state(&dir).await;
+        trust_burst(&state).await; // a first burst, cached normally
+        {
+            let s = state.lock().await;
+            s.trust_store.persister().flush_blocking();
+        }
+        let persister = { state.lock().await.trust_store.persister().clone() };
+        let hold = persister.hold_for_test();
+        trust_burst(&state).await; // the second burst's cache writes never happen
+        let running = { trust_snapshot(&*state.lock().await) };
+        persister.discard_for_test();
+        drop(hold);
+        drop(persister);
+        drop(state);
+        let restarted = open_state(&dir);
+        let rebuilt = { trust_snapshot(&*restarted.lock().await) };
+        assert_eq!(rebuilt, running, "the restart did not reach the running trust");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_concurrent_burst_keeps_every_invariant_and_replays_to_the_running_state() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        let mut sids = Vec::new();
+        for i in 0..MEMBERS {
+            sids.push(connect(&state, &member(i), &format!("hs-{i}")).await);
+        }
+
+        // ---- the burst: every member's three workloads at once -----------------------------
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut aids = Vec::new();
+        let mut esc_ids = Vec::new();
+        for i in 0..MEMBERS {
+            // (1) one denied action, its verdict raced five ways
+            let begin = tool_begin_action(&state, &json!({
+                "tool_name": "Bash", "target": DENY_CMD, "parameters": {"command": DENY_CMD},
+                "session_id": sids[i]})).await.unwrap();
+            let aid = begin["actionId"].as_str().unwrap().to_string();
+            aids.push(aid.clone());
+            for k in 0..5 {
+                let (st, m, aid) = (state.clone(), member(i), aid.clone());
+                tasks.spawn(async move {
+                    match k {
+                        0 | 1 => { tool_query_policy(&st, &json!({"action_id": aid})).await.unwrap(); }
+                        2 | 3 => { tool_witness_decision(&st, &witness(&m, "deny", &aid)).await.unwrap(); }
+                        _ => { tool_witness_decision(&st, &witness(&m, "warn", &aid)).await.unwrap(); }
+                    }
+                });
+            }
+            // (2) notices out to the next members, while those members drain
+            for n in 0..NOTICES_PER_SENDER {
+                let (st, sid) = (state.clone(), sids[i].clone());
+                let to = member((i + 1 + n) % MEMBERS);
+                tasks.spawn(async move {
+                    let r = tool_member_notify(&st, &json!({
+                        "to_plugin_id": to, "kind": "coordination", "session_id": sid,
+                        "pointer_uri": format!("hestia://battery/{i}/{n}")})).await.unwrap();
+                    assert!(r.get("_hestia_error").is_none(), "notify refused: {r}");
+                });
+            }
+            // (3) one escalation per member, through the one-gate claim door (opens on first ask)
+            let key = format!("{:064x}", i + 1);
+            let (m, sid) = (member(i), sids[i].clone());
+            let claim_args = move |inv: String| json!({
+                "plugin_id": m, "session_id": sid, "tool_name": "Bash",
+                "marker": "pre_tool_use.py", "reason": format!("Bash: git apply /tmp/p/{i}.patch"),
+                "request_key": key, "invocation_key": inv, "supersession": "hard_stop"});
+            let opened = tool_gate_escalation_claim(&state, &claim_args(format!("open-{i}"))).await.unwrap();
+            let esc_id = opened["escalation_id"].as_str().unwrap_or_else(|| panic!("{opened}")).to_string();
+            esc_ids.push((i, esc_id.clone(), claim_args));
+        }
+        // drains run concurrently with the sends
+        let received: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>> = Default::default();
+        for i in 0..MEMBERS {
+            for _ in 0..3 {
+                let (st, sid, rec) = (state.clone(), sids[i].clone(), received.clone());
+                tasks.spawn(async move {
+                    let r = tool_member_inbox(&st, &json!({"session_id": sid})).await.unwrap();
+                    for n in r["notices"].as_array().cloned().unwrap_or_default() {
+                        if let Some(p) = n["pointer_uri"].as_str() {
+                            rec.lock().unwrap().push((i, p.to_string()));
+                        }
+                    }
+                });
+            }
+        }
+        // decisions raced on every escalation: two peers (recognised harnesses, so eligible)
+        // and the operator
+        let arbiters = [connect(&state, "codex", "hs-arb-codex").await,
+                        connect(&state, "kimi-code", "hs-arb-kimi").await];
+        for (i, esc_id, _) in &esc_ids {
+            for arb in &arbiters {
+                let (st, id, sid) = (state.clone(), esc_id.clone(), arb.clone());
+                tasks.spawn(async move {
+                    if let Err(e) = tool_gate_arbitrate_escalation(&st, &json!({
+                        "escalation_id": id, "approve": true, "session_id": sid,
+                        "reason": "battery peer"})).await {
+                        eprintln!("battery peer refused: {}", e.to_string().chars().take(200).collect::<String>());
+                    }
+                });
+            }
+            if i % 5 == 4 {
+                continue; // peers only: a peer approval may be the WEAKER approval
+            }
+            let (st, id) = (state.clone(), esc_id.clone());
+            let approve = i % 3 != 0; // some denied, so a deny is in the mix too
+            tasks.spawn(async move {
+                let _ = super::super::http::battery_decide_via_operator_route(
+                    st,
+                    super::super::http::GateEscalationDecision {
+                        id, approve, reason: Some("battery operator".into()),
+                    },
+                )
+                .await;
+            });
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.expect("a burst task panicked");
+        }
+        // claims raced after the decisions: four invocations per escalation
+        // Per escalation: (fresh spends, reclaims, invocation keys handed a write permit). A
+        // reclaim (#1169) legitimately re-delivers an UNDELIVERED permit to a new invocation and
+        // fences the first, so "two replies said claimed" is not the invariant; "at most one
+        // invocation can execute" is, and it is checked below by trying to begin each one.
+        type Spend = (usize, usize, Vec<String>);
+        let spends: std::sync::Arc<std::sync::Mutex<BTreeMap<String, Spend>>> = Default::default();
+        for (i, esc_id, claim_args) in &esc_ids {
+            for k in 0..4 {
+                let inv = format!("claim-{i}-{k}");
+                let (st, id, args, sp) = (state.clone(), esc_id.clone(),
+                                          claim_args(inv.clone()), spends.clone());
+                tasks.spawn(async move {
+                    let r = tool_gate_escalation_claim(&st, &args).await.unwrap();
+                    let mut g = sp.lock().unwrap();
+                    let e = g.entry(id).or_default();
+                    if r["claimed"] == json!(true) {
+                        if r["reclaimed"] == json!(true) { e.1 += 1 } else { e.0 += 1 }
+                    }
+                    if r["permits_write"] == json!(true) {
+                        e.2.push(inv);
+                    }
+                });
+            }
+        }
+        while let Some(r) = tasks.join_next().await {
+            r.expect("a claim task panicked");
+        }
+        // final drain picks up anything sent after the racing drains ran
+        for i in 0..MEMBERS {
+            let r = tool_member_inbox(&state, &json!({"session_id": sids[i]})).await.unwrap();
+            for n in r["notices"].as_array().cloned().unwrap_or_default() {
+                if let Some(p) = n["pointer_uri"].as_str() {
+                    received.lock().unwrap().push((i, p.to_string()));
+                }
+            }
+        }
+
+        // ---- invariant 1: exactly one charge per (member, action) --------------------------
+        let (sink, lcts) = {
+            crate::storage::trust::flush_all_for_test();
+            let s = state.lock().await;
+            (s.reputation_sink(),
+             (0..MEMBERS).map(|i| s.member_lct(&member(i)).expect("mapped member")).collect::<Vec<_>>())
+        };
+        for i in 0..MEMBERS {
+            assert_eq!(charges(&sink, lcts[i].as_str(), &aids[i]), 1,
+                       "member {i}: a raced deny must charge exactly once");
+        }
+
+        // ---- invariant 2: no lost notice, none delivered twice -----------------------------
+        // Only the battery's own notices: the escalations above also (correctly) wake members
+        // with invitations and dispositions, which land in the same inboxes.
+        let got: Vec<(usize, String)> = received.lock().unwrap().iter()
+            .filter(|(_, p)| p.starts_with("hestia://battery/"))
+            .cloned()
+            .collect();
+        let got_set: BTreeSet<(usize, String)> = got.iter().cloned().collect();
+        assert_eq!(got.len(), got_set.len(), "a notice was delivered twice: {got:?}");
+        let mut want = BTreeSet::new();
+        for i in 0..MEMBERS {
+            for n in 0..NOTICES_PER_SENDER {
+                want.insert(((i + 1 + n) % MEMBERS, format!("hestia://battery/{i}/{n}")));
+            }
+        }
+        assert_eq!(got_set, want, "every notice sent is received exactly once");
+
+        // ---- invariant 3: decided at most once; spent at most once; never a weaker approval -
+        let (esc_view, decided_rows) = {
+            let s = state.lock().await;
+            let rows: Vec<_> = s.recent_chain(100_000).into_iter()
+                .filter(|e| e.event_type == "gate_escalation_decided")
+                .collect();
+            (escalation_view(&s), rows)
+        };
+        let spends = spends.lock().unwrap().clone();
+        let mut decided = 0;
+        let mut spent_total = 0;
+        for (_, esc_id, _) in &esc_ids {
+            let (status, by, consumed, bar_met) = esc_view.get(esc_id).cloned().expect("row present");
+            let ruling_rows = decided_rows.iter()
+                .filter(|e| e.event_data["escalation_id"] == json!(esc_id)
+                         || e.event_data["id"] == json!(esc_id))
+                .count();
+            assert!(ruling_rows <= 1, "{esc_id}: decided {ruling_rows} times on the chain");
+            if status != "Pending" {
+                decided += 1;
+                assert!(by.is_some(), "{esc_id}: decided with no decider");
+            }
+            let (fresh, reclaims, permitted) = spends.get(esc_id).cloned().unwrap_or_default();
+            assert!(fresh <= 1, "{esc_id}: one approval spent {fresh} times");
+            assert!(reclaims <= 1, "{esc_id}: reclaimed {reclaims} times (once is the limit)");
+            assert!(reclaims == 0 || fresh == 1, "{esc_id}: a reclaim with no spend to recover");
+            if fresh + reclaims > 0 || !permitted.is_empty() {
+                assert_eq!(status, "Approved", "{esc_id}: a permit from a non-approval");
+                assert!(bar_met, "{esc_id}: a WEAKER approval (bar not met) was spent");
+                assert!(consumed, "{esc_id}: spent but not marked consumed");
+            }
+            // At most ONE permitted invocation may execute: the others were fenced.
+            let mut began = 0;
+            for inv in &permitted {
+                let sid = sids[esc_ids.iter().position(|(_, e, _)| e == esc_id).unwrap()].clone();
+                let b = tool_begin_action(&state, &json!({"tool_name": "Bash", "session_id": sid,
+                                                          "correlation_key": inv})).await.unwrap();
+                if b.get("_hestia_error").is_none() {
+                    began += 1;
+                }
+            }
+            assert!(began <= 1, "{esc_id}: {began} invocations could execute on one approval");
+            if !permitted.is_empty() {
+                assert_eq!(began, 1, "{esc_id}: a permit was handed out and nothing may use it");
+            }
+            spent_total += fresh;
+        }
+        assert!(decided > 0, "precondition: the burst decided something");
+
+        // ---- invariant 4: a restart rebuilt from the chain equals the running state -------
+        let (ledger_before, esc_before, chain_len_before) = {
+            let s = state.lock().await;
+            (s.decision_ledger.canonical(), escalation_view(&s), s.chain_len())
+        };
+        drop(state); // release the vault writer lease, as a real restart does
+        let restarted = open_state(&dir);
+        let s = restarted.lock().await;
+        assert_eq!(s.chain_len(), chain_len_before);
+        assert_eq!(s.decision_ledger.canonical(), ledger_before,
+                   "the decision ledger rebuilt from the chain differs from the running one");
+        assert_eq!(escalation_view(&s), esc_before,
+                   "the escalation store rebuilt from the chain differs from the running one");
+        // Nothing left undelivered was invented or lost by the restart either.
+        drop(s);
+        for i in 0..MEMBERS {
+            let sid = connect(&restarted, &member(i), &format!("hs-r-{i}")).await;
+            let r = tool_member_inbox(&restarted, &json!({"session_id": sid})).await.unwrap();
+            assert_eq!(r["total"], json!(0), "member {i}: a drained notice came back after restart: {r}");
+        }
+        let mut deciders: BTreeMap<String, usize> = BTreeMap::new();
+        for (st, by, _, bar) in esc_before.values() {
+            *deciders.entry(format!("{st}/{}/bar_met={bar}", by.clone().unwrap_or_default()))
+                .or_default() += 1;
+        }
+        eprintln!("battery: {decided} escalations decided, {spent_total} spent, {} notices \
+                   delivered; outcomes {deciders:?}", got.len());
+    }
+}
+
+#[cfg(test)]
+mod published_snapshot_tests {
+    //! Stage 2: the gate's policy snapshot is served from an atomically swapped publication and
+    //! never takes the state lock.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+    use std::time::Duration;
+
+    const DENY_CMD: &str = "rm -rf /home/user/data";
+
+    fn engine_tagged(tag: &str) -> crate::policy::PolicyEngine {
+        let mut cfg = crate::policy::get_preset("safety").unwrap().config;
+        for r in cfg.rules.iter_mut() {
+            r.name = format!("{tag}:{}", r.name);
+        }
+        crate::policy::PolicyEngine::new(cfg)
+    }
+
+    async fn connected(state: &SharedState, member: &str, hs: &str) -> String {
+        tool_connect(state, &json!({"plugin_id": member, "host_agent": "h", "host_session_id": hs}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The property the stage exists for: a writer holding the state lock (as a slow append
+    /// did for seconds) no longer stalls the gate's three snapshot calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_gate_snapshot_is_served_while_the_state_lock_is_held() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = connected(&state, "codex", "hs-1").await;
+        let held = state.lock().await;
+        let calls = async {
+            let c = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "h",
+                                                 "host_session_id": "hs-1",
+                                                 "gate_capabilities": ["society-floor:v1"]}))
+                .await
+                .unwrap();
+            assert_eq!(c["reused"], json!(true), "{c}");
+            assert_eq!(c["sessionId"], json!(sid));
+            let law = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+            assert!(law["law_hash"].is_string(), "{law}");
+            let sc = tool_scope_status(&state, &json!({"plugin_id": "codex"})).await.unwrap();
+            assert!(sc["generation"].is_u64(), "{sc}");
+        };
+        tokio::time::timeout(Duration::from_secs(5), calls)
+            .await
+            .expect("a gate snapshot call waited on the state lock");
+        drop(held);
+        // The lock-free reuse arm's write is visible to lock holders too.
+        let s = state.lock().await;
+        assert!(s.gate_capabilities.get("codex").is_some_and(|c| c.contains("society-floor:v1")));
+    }
+
+    /// A policy change made in ONE critical section (society engine AND the member's role
+    /// overlay, tagged together) is seen whole or not at all by concurrent law readers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reader_sees_a_policy_change_whole_or_not_at_all() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = connected(&state, "codex", "hs-1").await;
+        let role = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap()
+            ["identity"]["role"].as_str().unwrap().to_string();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = tokio::task::JoinSet::new();
+        for _ in 0..3 {
+            let (st, sid, done) = (state.clone(), sid.clone(), done.clone());
+            readers.spawn(async move {
+                let mut reads = 0u32;
+                while !done.load(std::sync::atomic::Ordering::Acquire) || reads == 0 {
+                    let law = tool_operating_law(&st, &json!({"session_id": sid})).await.unwrap();
+                    let mut society = std::collections::BTreeSet::new();
+                    let mut role_tags = std::collections::BTreeSet::new();
+                    let mut role_present = false;
+                    for stmt in law["law"].as_array().unwrap() {
+                        let layer = stmt["layer"].as_str().unwrap_or("");
+                        // "g<k>:<rule>" after a change; any untagged name is the base law.
+                        let name = stmt["rule"].as_str().unwrap_or("");
+                        let tag = match name.split_once(':') {
+                            Some((t, _)) if t.starts_with('g')
+                                && t[1..].parse::<u32>().is_ok() => t.to_string(),
+                            _ => "base".to_string(),
+                        };
+                        if layer == "society" {
+                            society.insert(tag);
+                        } else if layer.starts_with("role:") {
+                            role_present = true;
+                            role_tags.insert(tag);
+                        }
+                    }
+                    assert_eq!(society.len(), 1, "one society law per read: {society:?}");
+                    if role_present {
+                        assert_eq!(society, role_tags,
+                                   "HALF A CHANGE: society {society:?} vs role {role_tags:?}");
+                    } else {
+                        assert_eq!(society.iter().next().unwrap(), "base",
+                                "society changed but its paired role overlay is missing: {society:?}");
+                    }
+                    reads += 1;
+                    tokio::task::yield_now().await;
+                }
+                reads
+            });
+        }
+        for k in 0..150 {
+            let mut s = state.lock().await;
+            *s.policy_engine = engine_tagged(&format!("g{k}"));
+            tokio::task::yield_now().await; // widen the window between the two halves
+            s.role_policy_engines.insert(role.clone(), engine_tagged(&format!("g{k}")));
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let mut total = 0;
+        while let Some(r) = readers.join_next().await {
+            total += r.expect("a reader saw half a change");
+        }
+        assert!(total > 0);
+    }
+
+    /// The law names the publication it was composed from, a decision records the version it was
+    /// evaluated under, and they agree; a policy change moves both (and the hash).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_law_and_the_decision_name_the_same_publication_version() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("safety").unwrap().config);
+        }
+        let sid = connected(&state, "codex", "hs-1").await;
+        let decide = |st: SharedState, sid: String| async move {
+            let b = tool_begin_action(&st, &json!({"tool_name": "Bash", "target": DENY_CMD,
+                "parameters": {"command": DENY_CMD}, "session_id": sid})).await.unwrap();
+            tool_query_policy(&st, &json!({"action_id": b["actionId"]})).await.unwrap()
+        };
+        let law1 = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+        let v1 = law1["publication_version"].as_u64().expect("version");
+        let d1 = decide(state.clone(), sid.clone()).await;
+        assert_eq!(d1["policyVersion"], json!(v1), "{d1}");
+        let row = {
+            let s = state.lock().await;
+            s.recent_chain(20).into_iter().find(|e| e.event_type == "policy_decision").unwrap()
+        };
+        assert_eq!(row.event_data["policy_version"], json!(v1));
+
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = engine_tagged("changed");
+        }
+        let law2 = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+        let v2 = law2["publication_version"].as_u64().unwrap();
+        assert!(v2 > v1);
+        assert_ne!(law2["law_hash"], law1["law_hash"], "the law changed, so must its hash");
+        let d2 = decide(state.clone(), sid.clone()).await;
+        assert_eq!(d2["policyVersion"], json!(v2), "{d2}");
+        let law3 = tool_operating_law(&state, &json!({"session_id": sid})).await.unwrap();
+        assert_eq!(law3["law_hash"], law2["law_hash"], "an unchanged law reads back unchanged");
+    }
+
+    /// Negative control for the debug staleness check: a policy change whose dirty bit is lost
+    /// (the one way a stale publication could arise) panics at the release that made it.
+    #[tokio::test]
+    #[should_panic(expected = "STALE POLICY PUBLICATION")]
+    async fn the_debug_check_catches_a_change_that_escaped_watched() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let mut s = state.lock().await;
+        *s.policy_engine = engine_tagged("escaped");
+        s.forget_policy_dirty_for_test();
+        drop(s);
+    }
+}
+
+#[cfg(test)]
+mod durable_reads_tests {
+    //! DURABLE READS (#1266 review): no reply — read or write — carries a chain fact an OS crash
+    //! could still take back, and nothing outward (inbox, lanes, status, vault, projector) acts
+    //! on one. The commit-to-fsync window is held open with the test flush hold.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+    use crate::storage::durability::durable_scope;
+    use std::time::Duration;
+
+    /// Readers of all three kinds — the published snapshot (`scope_status`), the chain
+    /// (`query_history`) and in-memory state (`hestia://scope/<id>`) — do not return while what
+    /// they would report is still undurable; once it is, they return it, and a restart still
+    /// has every fact they returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_reader_returns_a_fact_an_os_crash_could_take_back() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let hold = durability.hold_flush_for_test();
+
+        // Two writers that touch no other store: a scope request (a published policy input, an
+        // in-memory row and a chain row) and a bare witnessed fact.
+        // The path exists: a request for a nonexistent one is not filed (hestia#1411).
+        let probe_path = dir.path().join("durable-read-probe.txt");
+        std::fs::write(&probe_path, "x").unwrap();
+        let req = tool_request_scope(&state, &json!({"plugin_id": "codex", "session_id": sid,
+            "path": probe_path.to_str().unwrap(), "reason": "durable reads test"})).await.unwrap();
+        let request_id = req["request_id"].as_str().unwrap_or_else(|| panic!("{req}")).to_string();
+        let fact = { state.lock().await.append_chain("battery_fact", json!({"n": 1})).unwrap() };
+
+        let st = state.clone();
+        let r_snapshot = tokio::spawn(async move {
+            durable_scope(async { tool_scope_status(&st, &json!({"plugin_id": "codex"})).await.unwrap() }).await
+        });
+        let st = state.clone();
+        let r_chain = tokio::spawn(async move {
+            durable_scope(async { tool_query_history(&st, &json!({"filter": {"limit": 20}})).await.unwrap() }).await
+        });
+        let st = state.clone();
+        let uri = format!("hestia://scope/{request_id}");
+        let r_memory = tokio::spawn(async move {
+            crate::storage::durability::durable_scope_observing(async {
+                read_resource_body(&st, &uri).await
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!r_snapshot.is_finished(), "the published snapshot was served before its chain row was durable");
+        assert!(!r_chain.is_finished(), "a chain read was served before its rows were durable");
+        assert!(!r_memory.is_finished(), "an in-memory read was served before its chain row was durable");
+
+        drop(hold);
+        let (snap, d1) = r_snapshot.await.unwrap();
+        let (hist, d2) = r_chain.await.unwrap();
+        let (mem, d3) = r_memory.await.unwrap();
+        d1.unwrap(); d2.unwrap(); d3.unwrap();
+        assert!(snap["requests"].as_array().unwrap().iter().any(|r| r["request_id"] == json!(request_id)), "{snap}");
+        assert!(hist["entries"].as_array().unwrap().iter().any(|e| e["hash"] == json!(fact.hash)), "{hist}");
+        assert!(mem.unwrap().contains(&request_id));
+
+        drop(durability);
+        drop(state);
+        let restarted = open_state(&dir);
+        let s = restarted.lock().await;
+        assert!(s.chain_store.read_by_hash(&fact.hash).unwrap().is_some(), "a returned fact was lost");
+        assert!(s.recent_chain(50).iter().any(|e| e.event_data.to_string().contains(&request_id)),
+                "the scope request a reader returned has no chain row after restart");
+    }
+
+    /// #1232 on #1268's rules: the scope verbs answer from rows other requests committed (the
+    /// request, a peer's or the operator's ruling) and the gate lets an act run on `approved`,
+    /// so their replies are durable reads; the gate's begin/query path is not.
+    #[test]
+    fn the_scope_verbs_are_durable_reads() {
+        assert!(reports_shared_state("hestia_scope_claim"));
+        assert!(reports_shared_state("hestia_scope_peer_decide"));
+        assert!(!reports_shared_state("hestia_begin_action"));
+        assert!(!reports_shared_state("hestia_query_policy"));
+    }
+
+    /// A re-issued scope claim answered `pending` from a request ANOTHER call opened does not
+    /// reply while that request's chain row is still inside the commit-to-fsync window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scope_claim_does_not_report_an_undurable_request() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let args = json!({"plugin_id": "codex", "path": "/srv/durable-claim.txt", "rule": "mrh.command",
+                          "tool_name": "Bash", "act": "cat /srv/durable-claim.txt",
+                          "act_digest": "a".repeat(64), "spend": false});
+        let hold = durability.hold_flush_for_test();
+        let first = tool_scope_claim(&state, &args).await.unwrap();
+        assert_eq!(first["verdict"], json!("opened"), "{first}");
+        let st = state.clone();
+        let a2 = args.clone();
+        let reissue = tokio::spawn(async move {
+            crate::storage::durability::durable_scope_observing(async {
+                tool_scope_claim(&st, &a2).await.unwrap()
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!reissue.is_finished(), "a claim reported a request whose row was not yet durable");
+        drop(hold);
+        let (again, durable) = reissue.await.unwrap();
+        durable.unwrap();
+        assert_eq!(again["verdict"], json!("pending"), "{again}");
+        assert_eq!(again["request_id"], first["request_id"]);
+    }
+
+    /// #648: the scope record carries the act at REVIEW depth, not display depth. A NOT-SAME
+    /// peer rules from this record alone (dp 2026-10-05), so a 600-char act is stored whole,
+    /// a cut past SCOPE_ACT_MAX is VISIBLE, and receipt-side masking applies — the silent
+    /// 400-take this replaced made a cut act indistinguishable from a complete one, which is
+    /// what the five scope refusals of 2026-10-13 were declined over.
+    #[tokio::test]
+    async fn the_scope_record_carries_the_act_at_review_depth() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+
+        // 604 chars: whole under the record bound (the old silent take cut this at 400).
+        let long_act = format!("cat {}", "q".repeat(600));
+        let opened = tool_scope_claim(
+            &state,
+            &json!({"plugin_id": "codex", "path": "/srv/depth.txt", "rule": "mrh.command",
+                    "tool_name": "Bash", "act": long_act, "act_digest": "b".repeat(64),
+                    "spend": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened["verdict"], json!("opened"), "{opened}");
+        let rid = opened["request_id"].as_str().unwrap().to_string();
+        let stored = state.lock().await.scope_requests[&rid].reason.clone();
+        assert!(stored.contains(&"q".repeat(600)), "the record carries the act whole: {stored}");
+        assert!(!stored.contains("…[truncated]"), "no cut, no marker: {stored}");
+
+        // Past SCOPE_ACT_MAX: the cut is allowed but must announce itself.
+        let huge = "x".repeat(SCOPE_ACT_MAX + 50);
+        let opened = tool_scope_claim(
+            &state,
+            &json!({"plugin_id": "codex", "path": "/srv/depth2.txt", "rule": "mrh.command",
+                    "tool_name": "Bash", "act": huge, "act_digest": "c".repeat(64),
+                    "spend": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened["verdict"], json!("opened"), "{opened}");
+        let rid = opened["request_id"].as_str().unwrap().to_string();
+        let stored = state.lock().await.scope_requests[&rid].reason.clone();
+        assert!(stored.ends_with("…[truncated]"), "the cut is marked: {stored}");
+        assert!(stored.chars().count() <= SCOPE_ACT_MAX + 200, "the cap holds: {}", stored.len());
+
+        // Receipt-side value-masking fires on this field too (the gate masks first; the
+        // daemon re-masks whatever it is handed).
+        let opened = tool_scope_claim(
+            &state,
+            &json!({"plugin_id": "codex", "path": "/srv/depth3.txt", "rule": "mrh.command",
+                    "tool_name": "Bash", "act": "curl --token sekritexample https://x",
+                    "act_digest": "d".repeat(64), "spend": false}),
+        )
+        .await
+        .unwrap();
+        let rid = opened["request_id"].as_str().unwrap().to_string();
+        let stored = state.lock().await.scope_requests[&rid].reason.clone();
+        assert!(!stored.contains("sekritexample"), "receipt-side masking fires: {stored}");
+        assert!(stored.contains("--token ***"), "the key stays legible: {stored}");
+    }
+
+    /// The gate's hot path is NOT held hostage by other requests' unsynced rows: a begin_action
+    /// and an allowed query_policy reply while another request's row is still in the window.
+    /// (Measured before this split: making every lock release an observation pushed gate-path
+    /// replies behind two slow group fsyncs and past the 8.5 s deadline under disk pressure.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_gate_path_does_not_wait_for_other_requests_rows() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let durability = { state.lock().await.chain_store.durability().clone() };
+        let hold = durability.hold_flush_for_test();
+        let _other = { state.lock().await.append_chain("battery_fact", json!({"other": true})).unwrap() };
+        let st = state.clone();
+        let gate = tokio::spawn(async move {
+            durable_scope(async {
+                let b = tool_begin_action(&st, &json!({"tool_name": "Read", "target": "/tmp/x",
+                    "parameters": {"file_path": "/tmp/x"}, "session_id": sid})).await.unwrap();
+                tool_query_policy(&st, &json!({"action_id": b["actionId"]})).await.unwrap()
+            })
+            .await
+        });
+        let (verdict, res) = tokio::time::timeout(Duration::from_secs(3), gate)
+            .await
+            .expect("the gate path waited on another request's unsynced row")
+            .unwrap();
+        res.unwrap();
+        assert_eq!(verdict["decision"], json!("allow"), "{verdict}");
+        drop(hold);
+    }
+
+    /// No inbox write (dispositions, invitations, notices, egress) reaches disk ahead of the
+    /// chain row it names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_inbox_write_waits_for_the_chain_row_it_names() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let (durability, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.durability().clone(), s.inbox_store.clone())
+        };
+        let hold = durability.hold_flush_for_test();
+        let row = { state.lock().await.append_chain("gate_escalation_decided", json!({"battery": true})).unwrap() };
+        let hash = row.hash.clone();
+        let mut write = tokio::task::spawn_blocking(move || {
+            inbox.ensure_member_disposition("codex", DAEMON_NOTICE_KIND_DISPOSITION,
+                                            "hestia://escalation/battery#decided", &hash)
+        });
+        if tokio::time::timeout(Duration::from_millis(500), &mut write).await.is_ok() {
+            panic!("an inbox row naming an undurable chain row reached the store");
+        }
+        drop(hold);
+        write.await.unwrap().expect("written once the chain is durable");
+        assert!(durability.frontier().durable > row.chain_position);
+    }
+
+    /// Codex review 18933, P1 (admission): the ORDINARY admissions — `enqueue_member` (local
+    /// notices, escalation invitations, appeal dispatch) and `enqueue_egress` (legacy routed
+    /// sends) — take the same barrier as the operation-keyed ones. Store level, with the
+    /// daemon's real barrier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ordinary_notice_or_egress_admission_waits_for_the_chain_row_it_names() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let (durability, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.durability().clone(), s.inbox_store.clone())
+        };
+        let hold = durability.hold_flush_for_test();
+        let row = { state.lock().await.append_chain("member_notice", json!({"battery": true})).unwrap() };
+        let (h1, h2) = (row.hash.clone(), row.hash.clone());
+        let (i1, i2) = (inbox.clone(), inbox.clone());
+        let mut local = tokio::task::spawn_blocking(move || {
+            i1.enqueue_member("reader", "writer", "role:test", "coordination", Some("hestia://t"), &h1, None)
+        });
+        let mut egress = tokio::task::spawn_blocking(move || {
+            i2.enqueue_egress("peer", "reader", "writer", "role:test", "coordination", Some("hestia://t"), &h2)
+        });
+        assert!(tokio::time::timeout(Duration::from_millis(500), &mut local).await.is_err(),
+                "a local notice naming an undurable chain row reached the inbox");
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut egress).await.is_err(),
+                "an egress row naming an undurable chain row reached the queue");
+        drop(hold);
+        local.await.unwrap().expect("queued once the chain is durable");
+        egress.await.unwrap().expect("queued once the chain is durable");
+        assert!(durability.frontier().durable > row.chain_position);
+        assert_eq!(inbox.peek_member("reader").unwrap()[0].chain_hash, row.hash);
+        assert_eq!(inbox.pending_egress(10).unwrap().len(), 1);
+    }
+
+    /// The same, end to end: `hestia_member_notify` WITHOUT an operation_id, to a local member
+    /// and to a routed address, queues nothing while its own witness row is undurable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn member_notify_without_an_operation_id_queues_nothing_before_its_witness_is_durable() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = tool_connect(&state, &json!({"plugin_id": "claude-code", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let _ = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "h"})).await.unwrap();
+        let (durability, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.durability().clone(), s.inbox_store.clone())
+        };
+        let hold = durability.hold_flush_for_test();
+        let mut sends = Vec::new();
+        for to in ["kimi-code", "thor/kimi-code"] {
+            let st = state.clone();
+            let args = json!({"to_plugin_id": to, "kind": "coordination",
+                              "pointer_uri": "shared-context/forum/x.md", "session_id": sid});
+            sends.push(tokio::spawn(async move { tool_member_notify(&st, &args).await }));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(inbox.peek_member("kimi-code").unwrap().is_empty(),
+                "a local notice was queued while its witness row was undurable");
+        assert!(inbox.pending_egress(10).unwrap().is_empty(),
+                "an egress row was queued while its witness row was undurable");
+        drop(hold);
+        for s in sends {
+            let out = s.await.unwrap().unwrap();
+            assert!(out["queued_id"].as_u64().is_some(), "{out}");
+        }
+        assert_eq!(inbox.peek_member("kimi-code").unwrap().len(), 1);
+        assert_eq!(inbox.pending_egress(10).unwrap().len(), 1);
+    }
+
+    /// The disposition projector acts outward on what it reads, so it reads only durable rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_projector_reads_only_durable_rows() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let chain = { state.lock().await.chain_store.clone() };
+        let base = chain.len().unwrap();
+        let hold = chain.durability().hold_flush_for_test();
+        for n in 0..3 {
+            chain.append("battery_fact", json!({"n": n}), "lct:x").unwrap();
+        }
+        assert!(chain.read_from_durable(base, 10).unwrap().is_empty(),
+                "rows inside the commit-to-fsync window were handed to an outward actor");
+        assert_eq!(chain.read_from(base, 10).unwrap().len(), 3, "control: they are committed");
+        drop(hold);
+        chain.durability().flush_committed_blocking().unwrap();
+        assert_eq!(chain.read_from_durable(base, 10).unwrap().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod query_policy_off_lock_tests {
+    //! `hestia_query_policy` evaluates against the published law OUTSIDE the state lock; its
+    //! verdicts must be exactly those of the locked fold on live state.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+
+    const DENY_CMD: &str = "rm -rf /home/user/data";
+
+    async fn verdict(state: &SharedState, sid: &str, tool: &str, cmd: &str) -> (Value, String) {
+        let b = tool_begin_action(state, &json!({"tool_name": tool, "target": cmd,
+            "parameters": {"command": cmd}, "session_id": sid})).await.unwrap();
+        let aid = b["actionId"].as_str().unwrap().to_string();
+        (tool_query_policy(state, &json!({"action_id": aid})).await.unwrap(), aid)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_lock_verdicts_equal_the_locked_fold_on_live_state() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        let sid = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let role = { state.lock().await.sessions.values().next().unwrap().constellation_role.clone() };
+        let cases = [("Bash", DENY_CMD), ("Bash", "ls -la"), ("Read", "/etc/shadow"), ("Read", "/tmp/x")];
+        let check = |label: &'static str| {
+            let state = state.clone();
+            let sid = sid.clone();
+            let role = role.clone();
+            async move {
+                for (tool, cmd) in cases {
+                    let (v, _) = verdict(&state, &sid, tool, cmd).await;
+                    let s = state.lock().await;
+                    let target = Some(cmd);
+                    let pa = crate::policy::PolicyAction {
+                        tool_name: tool,
+                        category: crate::policy::classify(tool),
+                        target,
+                        full_command: if tool == "Bash" { Some(cmd) } else { None },
+                    };
+                    let live = s.evaluate_folded("codex", &role, &pa);
+                    assert_eq!(v["decision"], json!(live.decision.as_str()), "{label} {tool} {cmd}: {v}");
+                    assert_eq!(v["ruleId"], json!(live.rule_id), "{label} {tool} {cmd}");
+                    assert_eq!(v["policyVersion"], json!(s.publication_version), "{label}");
+                }
+            }
+        };
+        check("society").await;
+        // A role overlay that tightens, then an operator grant that substitutes a preset.
+        {
+            let mut s = state.lock().await;
+            s.role_policy_engines.insert(role.clone(), crate::policy::PolicyEngine::new(
+                crate::policy::get_preset("strict").unwrap().config));
+        }
+        check("role overlay").await;
+        {
+            let mut s = state.lock().await;
+            s.instance_grants.insert(("codex".into(), "*".into()), crate::server::state::InstanceGrant {
+                preset: "permissive".into(), granted_by: "operator".into(), granted_at: 0,
+                reason: "test".into(), expires_at: None });
+        }
+        check("operator grant").await;
+    }
+}
+
+#[cfg(test)]
+mod channel_send_tests {
+    //! #1344 slice 1 acceptance: the order is the contract, nothing leaves, the budget is
+    //! derived from outbox rows (so it survives a restart), and a member sees only its own.
+    use super::*;
+    use crate::server::channel::{ChannelBinding, UNANSWERED_LIMIT};
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState, plugin: &str) -> String {
+        let c = tool_connect(state, &json!({"plugin_id": plugin, "host_agent": "t"})).await.unwrap();
+        c["sessionId"].as_str().unwrap().to_string()
+    }
+
+    async fn bind(state: &SharedState, member: &str, channel: &str) {
+        let mut s = state.lock().await;
+        s.commit_channel_bindings(|st| {
+            st.set(ChannelBinding {
+                member: member.into(), channel_id: channel.into(), recipient_class: "operator".into(),
+                adapter: "email".into(), address: "operator@example.invalid".into(),
+                reason: "test".into(), set_by: "operator".into(), set_at: 1, version: 0,
+            })
+        })
+        .unwrap();
+    }
+
+    async fn send(state: &SharedState, sid: &str, channel: &str, content: &str) -> Value {
+        tool_channel_send(state, &json!({"channel_id": channel, "content": content, "session_id": sid}))
+            .await
+            .unwrap()
+    }
+
+    async fn events(state: &SharedState, kind: &str) -> Vec<Value> {
+        let s = state.lock().await;
+        s.recent_chain(500).into_iter().filter(|e| e.event_type == kind).map(|e| e.event_data).collect()
+    }
+
+    async fn outbox_len(state: &SharedState) -> usize {
+        let s = state.lock().await;
+        s.inbox_store.channel_outbox_list(None, 500).unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn a_member_without_a_member_lct_gets_its_own_code_not_the_retryable_one() {
+        // `channel_unattributed` is what a caller reconnects on (SAGE #529); a synthetic member
+        // has no member LCT, a reconnect cannot cure that, so it answers a code of its own.
+        let (_d, state) = test_state().await;
+        let c = tool_connect(&state, &json!({"plugin_id": "fuzz-runner", "host_agent": "t", "synthetic": true}))
+            .await
+            .unwrap();
+        let sid = c["sessionId"].as_str().unwrap().to_string();
+        bind(&state, "fuzz-runner", "dp").await;
+        let out = send(&state, &sid, "dp", "hi").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_no_member_lct", "{out}");
+        assert!(events(&state, "channel_send").await.is_empty());
+        assert_eq!(outbox_len(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unattributed_send_is_refused_and_records_nothing() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let out = tool_channel_send(&state, &json!({"channel_id": "dp", "content": "hi"})).await.unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_unattributed", "{out}");
+        assert!(events(&state, "channel_send").await.is_empty());
+        assert_eq!(outbox_len(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unbound_channel_is_refused_and_names_the_bound_ones() {
+        let (_d, state) = test_state().await;
+        let being = connect(&state, "legion-being").await;
+        let out = send(&state, &being, "dp", "hi").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_unbound", "{out}");
+        bind(&state, "legion-being", "dp").await;
+        let out = send(&state, &being, "elsewhere", "hi").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_unbound");
+        assert_eq!(out["_hestia_error"]["data"]["bound_channels"], json!(["dp"]));
+        assert!(events(&state, "channel_send").await.is_empty());
+        assert_eq!(outbox_len(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_send_is_shadow_witnessed_and_kept_and_nothing_is_sent() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let out = send(&state, &being, "dp", "the board moved on level 2").await;
+        assert_eq!(out["shadow"], true, "{out}");
+        assert_eq!(out["sent"], false);
+        assert_eq!(out["decision"], "would_send");
+        assert_eq!(out["budget"]["unanswered"], 0);
+        let rows = events(&state, "channel_send").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["decision"], "would_send");
+        assert_eq!(rows[0]["shadow"], true);
+        assert_eq!(rows[0]["content_chars"], 26);
+        assert_eq!(rows[0]["content_sha256"].as_str().unwrap().len(), 64);
+        assert!(rows[0].get("content").is_none(), "the chain carries the hash, never the message");
+        let s = state.lock().await;
+        let ob = s.inbox_store.channel_outbox_list(None, 10).unwrap();
+        assert_eq!(ob.len(), 1);
+        assert_eq!(ob[0].content, "the board moved on level 2");
+        assert_eq!(ob[0].chain_hash, out["witnessEntryHash"].as_str().unwrap());
+        assert_eq!(Some(ob[0].member_lct.clone()), s.member_lct("legion-being"));
+    }
+
+    /// #1344 amendment item 3: caller-supplied text never reaches the gate target.
+    #[tokio::test]
+    async fn the_gate_target_is_built_from_the_binding_never_from_caller_text() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let out = tool_channel_send(&state, &json!({
+            "channel_id": "dp", "content": "hello", "session_id": being,
+            "target": "anyone:anything", "recipient_class": "public", "address": "x@example.invalid",
+            "path": "/srv/elsewhere", "url": "mailto:y@example.invalid",
+        })).await.unwrap();
+        assert_eq!(out["recipient_class"], "operator", "{out}");
+        let rows = events(&state, "channel_send").await;
+        assert_eq!(rows[0]["target"], "dp:operator");
+        assert_eq!(rows[0]["recipient_class"], "operator");
+        assert!(crate::policy::extract_target("hestia_channel_send",
+            &json!({"path": "/srv/elsewhere", "target": "x"})).is_none());
+    }
+
+    /// #1344 smaller point: a secret-denied send records the deny and the rule, no content hash.
+    #[tokio::test]
+    async fn a_secret_is_refused_recorded_without_its_hash_and_never_kept() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let tok = format!("{}{}", "/.ss", "h/id_x");   // built at runtime: test data only
+        let out = send(&state, &being, "dp", &format!("copy ~{tok} for me")).await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_secret", "{out}");
+        let rows = events(&state, "channel_send").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["decision"], "deny");
+        assert_eq!(rows[0]["rule"], "egress.secret");
+        assert!(rows[0].get("content_sha256").is_none(), "no hash of a secret-bearing message");
+        assert_eq!(outbox_len(&state).await, 0, "a refused secret is not kept");
+    }
+
+    /// dp's decision c: 3 unanswered in the window, the 4th is would_deny; answer one, and the
+    /// next is not.
+    #[tokio::test]
+    async fn the_fourth_unanswered_send_would_be_refused_until_one_is_answered() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let mut ids = vec![];
+        for i in 0..UNANSWERED_LIMIT {
+            let out = send(&state, &being, "dp", &format!("message {i}")).await;
+            assert_eq!(out["budget"]["would_deny"], false, "{out}");
+            ids.push(out["outbox_id"].as_u64().unwrap());
+        }
+        let fourth = send(&state, &being, "dp", "message 3").await;
+        assert_eq!(fourth["budget"]["would_deny"], true, "{fourth}");
+        assert_eq!(fourth["decision"], "would_deny");
+        assert_eq!(fourth["budget"]["unanswered"], UNANSWERED_LIMIT);
+        assert_eq!(fourth["budget"]["unanswered_ids"], json!(ids));
+        let note = fourth["note"].as_str().unwrap();
+        assert!(note.contains("would NOT go") && note.contains("resets at"), "{note}");
+        let fifth = send(&state, &being, "dp", "message 4").await;
+        assert_eq!(fifth["budget"]["unanswered"], UNANSWERED_LIMIT, "a would-deny row is not counted");
+        {
+            let s = state.lock().await;
+            assert!(s.inbox_store.channel_mark_answered(ids[0], "operator", 1).unwrap());
+            assert!(!s.inbox_store.channel_mark_answered(ids[0], "operator", 2).unwrap(), "answered once");
+        }
+        let next = send(&state, &being, "dp", "message 5").await;
+        assert_eq!(next["budget"]["would_deny"], false, "{next}");
+        assert_eq!(next["budget"]["unanswered"], UNANSWERED_LIMIT - 1);
+    }
+
+    /// The budget is per channel: a full one does not block another.
+    #[tokio::test]
+    async fn the_budget_is_per_channel() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        bind(&state, "legion-being", "ops").await;
+        let being = connect(&state, "legion-being").await;
+        for i in 0..UNANSWERED_LIMIT {
+            send(&state, &being, "dp", &format!("m{i}")).await;
+        }
+        assert_eq!(send(&state, &being, "dp", "x").await["budget"]["would_deny"], true);
+        assert_eq!(send(&state, &being, "ops", "x").await["budget"]["would_deny"], false);
+    }
+
+    /// Amendment item 5 / decision c: the count is derived from outbox rows, so a restart
+    /// forgets nothing.
+    #[tokio::test]
+    async fn the_unanswered_count_survives_a_daemon_restart() {
+        let dir = TempDir::new().unwrap();
+        {
+            let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            bind(&state, "legion-being", "dp").await;
+            let being = connect(&state, "legion-being").await;
+            for i in 0..UNANSWERED_LIMIT {
+                send(&state, &being, "dp", &format!("m{i}")).await;
+            }
+        }
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let being = connect(&state, "legion-being").await;
+        let out = send(&state, &being, "dp", "after the restart").await;
+        assert_eq!(out["budget"]["unanswered"], UNANSWERED_LIMIT, "{out}");
+        assert_eq!(out["budget"]["would_deny"], true);
+    }
+
+    /// Two spellings of one member share ONE budget: the operator's alias record joins them
+    /// (`same_entity`). Keyed on one LCT, each alias would have had its own three (fail-open).
+    #[tokio::test]
+    async fn an_alias_shares_the_members_budget() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        bind(&state, "legion-being-2", "dp").await;
+        {
+            let s = state.lock().await;
+            s.append_chain(crate::derivation::IDENTITY_ALIAS_EVENT,
+                           json!({"alias": "legion-being-2", "alias_of": "legion-being", "ref": "test"}))
+                .unwrap();
+        }
+        let a = connect(&state, "legion-being").await;
+        let b = connect(&state, "legion-being-2").await;
+        send(&state, &a, "dp", "one").await;
+        send(&state, &b, "dp", "two").await;
+        send(&state, &a, "dp", "three").await;
+        let fourth = send(&state, &b, "dp", "four, under the alias").await;
+        assert_eq!(fourth["budget"]["unanswered"], UNANSWERED_LIMIT, "{fourth}");
+        assert_eq!(fourth["budget"]["would_deny"], true, "the alias does not get a fresh budget");
+        // and an unrelated member on the same channel name is not counted
+        bind(&state, "cbp-being", "dp").await;
+        let c = connect(&state, "cbp-being").await;
+        assert_eq!(send(&state, &c, "dp", "mine").await["budget"]["unanswered"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_member_reads_only_its_own_outbox_and_never_an_address() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        bind(&state, "cbp-being", "dp").await;
+        let legion = connect(&state, "legion-being").await;
+        let cbp = connect(&state, "cbp-being").await;
+        send(&state, &legion, "dp", "from legion").await;
+        send(&state, &cbp, "dp", "from cbp").await;
+        let mine = tool_channel_outbox(&state, &json!({"session_id": legion})).await.unwrap();
+        let rows = mine["outbox"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{mine}");
+        assert_eq!(rows[0]["content"], "from legion");
+        assert!(!mine.to_string().contains("example.invalid"), "the recipient address is the operator's");
+        let anon = tool_channel_outbox(&state, &json!({})).await.unwrap();
+        assert_eq!(anon["_hestia_error"]["code"], "hestia.channel_unattributed");
+    }
+
+    #[tokio::test]
+    async fn a_member_cannot_forge_a_channel_send_row() {
+        let (_d, state) = test_state().await;
+        let being = connect(&state, "legion-being").await;
+        let out = tool_request_witness(&state, &json!({"event_type": "channel_send", "data": {},
+                                                       "session_id": being})).await;
+        let refused = match out {
+            Err(_) => true,
+            Ok(v) => v.get("_hestia_error").is_some() || v.get("witnessEntryHash").is_none(),
+        };
+        assert!(refused, "channel_send is daemon-written only");
+        assert!(events(&state, "channel_send").await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod existence_first_tests {
+    //! EXISTENCE FIRST (hestia#1411). dp, 2026-10-26: "we should not be doing escalations on
+    //! nonexistent paths because there is nothing to escalate - it's just noise". Measured on
+    //! cbp-being: nine operator cards for `<ws>/hestia/governance/...`, a doubled root, while the
+    //! member already held `<ws>/governance`.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+
+    async fn session(state: &SharedState) -> String {
+        tool_connect(state, &json!({"plugin_id": "cbp-being", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string()
+    }
+
+    async fn pending(state: &SharedState) -> usize {
+        state.lock().await.scope_requests.len()
+    }
+
+    /// The being's shape: a standing read grant on `<ws>/governance`, so a doubled-root ask under
+    /// `<ws>/hestia/governance/...` lies inside the member's own space (nomad on #1415, option a).
+    async fn grant_governance(state: &SharedState, dir: &tempfile::TempDir) -> String {
+        let root = dir.path().join("governance");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::READ,
+        });
+        root
+    }
+
+    #[tokio::test]
+    async fn a_missing_path_anywhere_is_not_there_and_reaches_no_one() {
+        // dp, 2026-10-30: "a nonexistent path should never escalate to a scope request, it should
+        // be flatly denied as not there". The 10-30 shapes: a tripled workspace root, and a system
+        // directory that does not exist on this host. Neither is under any root the member holds.
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let before = pending(&state).await;
+        for p in [dir.path().join("ai-workspace/ai-workspace/shared-context/forum"),
+                  dir.path().join("var/lib/hestia")] {
+            let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+                "path": p.to_str().unwrap(), "reason": "to read what I think is there"})).await.unwrap();
+            assert_eq!(r["status"], "not_filed", "{}: {r}", p.display());
+            assert_eq!(r["reason"], "nonexistent", "{r}");
+            let c = tool_scope_claim(&state, &json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
+                "path": p.to_str().unwrap(), "rule": "mrh.path", "tool_name": "read_file",
+                "act": "read_file", "act_digest": "e".repeat(64)})).await.unwrap();
+            assert_eq!(c["verdict"], "not_opened", "{c}");
+        }
+        assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
+        // An existing off-limits path is the one that files ("not visible to you").
+        let off = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&off).unwrap();
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": off.to_str().unwrap(), "reason": "to read an existing directory"})).await.unwrap();
+        assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_request_for_a_nonexistent_path_is_not_filed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        grant_governance(&state, &dir).await;
+        // The doubled root (`<ws>/hestia/governance/x.py` for `<ws>/governance/x.py`), the shape
+        // the being's asks took; the real file is in the member's reach, so the ask is about the
+        // member's own space and is answered quietly (nomad on #1415).
+        std::fs::write(dir.path().join("governance/x.py"), "x").unwrap();
+        let missing = dir.path().join("hestia/governance/x.py");
+        let before = pending(&state).await;
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": missing.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "the hint names the real path: {r}");
+        assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
+        // UNDER a root, the target is stat-ed and a missing one is declined as nonexistent.
+        let under = dir.path().join("governance/no-such.py");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": under.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert_eq!(pending(&state).await, before);
+    }
+
+
+
+
+
+
+    #[tokio::test]
+    async fn create_true_keeps_a_new_path_a_real_ask() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let new = dir.path().join("notes/new-dir/new.md");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": new.to_str().unwrap(), "reason": "to write a new note there", "create": true}))
+            .await.unwrap();
+        assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
+    async fn an_existing_path_is_filed_as_before() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let f = dir.path().join("exists.md");
+        std::fs::write(&f, "x").unwrap();
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": f.to_str().unwrap(), "reason": "to read an existing file"})).await.unwrap();
+        assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
+    async fn the_refusal_names_the_path_inside_the_members_own_grant() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("governance/hestia")).unwrap();
+        std::fs::write(ws.join("governance/hestia/gate.py"), "x").unwrap();
+        let root = ws.join("governance").to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::ALL,
+        });
+        let doubled = ws.join("hestia/governance/hestia/gate.py");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": doubled.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        let want = format!("Did you mean {root}/hestia/gate.py?");
+        assert!(r["detail"].as_str().unwrap().contains(&want), "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_gate_claim_for_a_read_of_nothing_opens_nothing_but_a_write_still_does() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        grant_governance(&state, &dir).await;
+        std::fs::write(dir.path().join("governance/x.py"), "x").unwrap(); // the doubled root lands on it
+        let missing = dir.path().join("hestia/governance/x.py");
+        let claim = |tool: &str| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
+            "path": missing.to_str().unwrap(), "rule": "mrh.path", "tool_name": tool,
+            "act": format!("{tool} -> x.py"), "act_digest": "a".repeat(64)});
+        let before = pending(&state).await;
+        let r = tool_scope_claim(&state, &claim("read_file")).await.unwrap();
+        assert_eq!(r["verdict"], "not_opened", "{r}");
+        assert_eq!(r["reason"], "nonexistent", "a missing path is not there: {r}");
+        assert_eq!(pending(&state).await, before, "a read of nothing opens nothing");
+        let w = tool_scope_claim(&state, &claim("Write")).await.unwrap();
+        assert_eq!(w["verdict"], "opened", "a write may be creating it: {w}");
+    }
+
+    /// The daemon's read-tool list must EQUAL the gate's (READ_ONLY_PATH_TOOLS ∪ every
+    /// PATH_TOOL_MODES entry that needs exactly r), parsed from the gate source in the tree
+    /// (nomad/Nova on #1415: a one-directional contains check let a new gate read tool regress).
+    #[test]
+    fn read_tools_match_the_gate() {
+        let core = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/_shared/hestia_gate_core.py"))
+            .expect("gate core in the tree");
+        fn quoted(block: &str) -> std::collections::BTreeSet<String> {
+            let mut out = std::collections::BTreeSet::new();
+            let mut rest = block;
+            while let Some(i) = rest.find('"') {
+                let after = &rest[i + 1..];
+                let Some(j) = after.find('"') else { break };
+                out.insert(after[..j].to_string());
+                rest = &after[j + 1..];
+            }
+            out
+        }
+        let ro_start = core.find("READ_ONLY_PATH_TOOLS = frozenset({").expect("READ_ONLY_PATH_TOOLS");
+        let ro_block = &core[ro_start..core[ro_start..].find("})").map(|k| ro_start + k).unwrap()];
+        let mut gate = quoted(ro_block);
+        let pm_start = core.find("PATH_TOOL_MODES = {").expect("PATH_TOOL_MODES");
+        let pm_block = &core[pm_start..core[pm_start..].find("\n}").map(|k| pm_start + k).unwrap()];
+        // Entries come several to a line (`"search": "r", "git_read": "r",`): split on commas
+        // first, then each `"name": "modes"` pair on its colon.
+        for line in pm_block.lines() {
+            for piece in line.split(',') {
+                let t = piece.trim();
+                if let Some((name, modes)) = t.split_once(':') {
+                    let name = name.trim().trim_matches('"');
+                    let modes = modes.trim().trim_matches('"');
+                    if modes == "r" && !name.is_empty() && !name.contains(' ') && !name.contains('{') {
+                        gate.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        let daemon: std::collections::BTreeSet<String> = READ_ONLY_PATH_TOOLS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(daemon, gate, "daemon READ_ONLY_PATH_TOOLS must equal the gate's read set");
+    }
+
+    #[tokio::test]
+    async fn the_hint_is_withheld_when_the_member_could_not_read_the_candidate() {
+        // Nova/nomad on #1415: the gate's #1412 repair, applied to the daemon's hint.
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("governance/hestia")).unwrap();
+        std::fs::write(ws.join("governance/hestia/gate.py"), "x").unwrap();
+        let root = ws.join("governance").to_str().unwrap().to_string();
+        let grant = |recursive: bool| crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive,
+            modes: crate::server::grant_modes::Modes::READ,
+        };
+        let doubled = ws.join("hestia/governance/hestia/gate.py").to_str().unwrap().to_string();
+        let ask = |state: &SharedState, sid: &str, p: &str| {
+            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p, "reason": "to read the gate scoring model"});
+            let st = state.clone();
+            async move { tool_request_scope(&st, &b).await.unwrap() }
+        };
+        // No hint means no quiet answer either: the one predicate that draws the hint bounds the
+        // decline (nomad on #1415, point 1), so each withheld case FILES and the operator sees it.
+        // 1. an EXACT grant on the root: the child is not readable, so no hint, and it files
+        state.lock().await.standing_scope.grants.push(grant(false));
+        let r = ask(&state, &sid, &doubled).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        // 2. recursive: the hint comes back, quietly
+        state.lock().await.standing_scope.grants.clear();
+        state.lock().await.standing_scope.grants.push(grant(true));
+        let r = ask(&state, &sid, &doubled).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        // 3. a symlink under the root that escapes it: exists, resolves outside, no hint, files
+        std::fs::create_dir_all(ws.join("hestia")).unwrap();
+        std::fs::write(ws.join("hestia/outside.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(ws.join("hestia/outside.txt"), ws.join("governance/hestia/link.txt")).unwrap();
+        let r = ask(&state, &sid, ws.join("hestia/governance/hestia/link.txt").to_str().unwrap()).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        // 4. a floor row that gives this member no read: no hint, files
+        state.lock().await.standing_scope.grants.clear();
+        state.lock().await.standing_scope.floor.push(crate::server::standing_scope::FloorEntry {
+            path: root.clone(), added_at: 0, added_by: "operator".into(), reason: "floor".into(),
+            recursive: true, modes: crate::server::grant_modes::Modes::parse("w").unwrap(),
+        });
+        let r = ask(&state, &sid, &doubled).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+    }
+
+
+
 }

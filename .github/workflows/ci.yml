@@ -46,6 +46,14 @@ on:
   push:
     branches: [main]
 
+# A PR push supersedes the run for that PR's previous head; cancel it. Measured 2026-10-14: a
+# held-patch PR went through four review rounds in an hour, every push left its full run alive,
+# and the current head's `cargo test` queued for about an hour behind its own superseded runs.
+# Runs on main are never cancelled: every merge commit keeps its own result.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: cargo test
@@ -146,11 +154,19 @@ jobs:
           bin="$GITHUB_WORKSPACE/hestia/core/target/debug/hestia"
           "$bin" --home "$home" init --ai
           nohup "$bin" --home "$home" serve --bind 127.0.0.1:7799 >"$home/serve.log" 2>&1 &
-          for _ in $(seq 1 60); do
-            (exec 3<>/dev/tcp/127.0.0.1/7799) 2>/dev/null && exit 0
+          # Ready means an MCP initialize ANSWERS, not that the port is open. The contract step
+          # below also pays its own member's cold path (one warm-up society-safety call) before
+          # it asserts anything.
+          init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-ready","version":"1"}}}'
+          for _ in $(seq 1 120); do
+            if curl -fsS --max-time 10 -H 'Content-Type: application/json' \
+                 -H 'Accept: application/json, text/event-stream' \
+                 -d "$init" http://127.0.0.1:7799/mcp 2>/dev/null | grep -q '"result"'; then
+              exit 0
+            fi
             sleep 1
           done
-          echo "daemon did not come up"; cat "$home/serve.log"; exit 1
+          echo "daemon never answered initialize"; cat "$home/serve.log"; exit 1
 
       - name: TypeScript SDK
         working-directory: hestia/plugin-sdk/typescript
@@ -177,6 +193,39 @@ jobs:
           RUN_CONFORMANCE: "1"
         run: cargo test -- --nocapture
 
+      # One-gate stage A: the decision witness's receipt contract against the daemon built from
+      # THIS commit (allow/warn/deny commit with a receipt; a daemon-ruled warn/deny comes back
+      # as the daemon's own row). The stub-daemon arms of the same file run in plugin-tests.
+      # It is a CORRECTNESS test: it waits for readiness plus a per-member warm-up, then asserts
+      # the receipts under generous ceilings and prints every latency. The hook-budget latency
+      # check is the separate, opt-in HESTIA_DECISION_LATENCY_ASSERT=1 test (debug build here).
+      - name: Decision-witness receipt contract (real daemon)
+        working-directory: hestia
+        env:
+          HESTIA_DECISION_CONTRACT_ENDPOINT: http://127.0.0.1:7799/mcp
+        run: python3 tools/decision_witness_contract_test.py
+
+      # The RECORDED bar of a real escalation: every seat's real gate refuses a write to its own
+      # gate entry (relative, `cd`-qualified, summary-cut spellings), the daemon built from THIS
+      # commit opens the escalation, and the test reads the bar back. The seat-boundary suite
+      # stubs the escalation reply, so only this can see an underpriced approval.
+      - name: Escalation bar from the resolved location (real daemon)
+        working-directory: hestia
+        env:
+          HESTIA_ESCALATION_BAR_ENDPOINT: http://127.0.0.1:7799/mcp
+        run: python3 tools/escalation_bar_real_daemon_test.py
+
+      # One-gate stage B: decide() against the daemon built from THIS commit — a committed
+      # policy_allow, the daemon's own row for its deny, a recorded read, all inside the 3 s
+      # invocation deadline (the first act may meet the cold daemon: an explicit
+      # society.unreachable deny, never a hang). The stub arms and the parity matrix run in
+      # plugin-tests; here only the real-daemon arm is new.
+      - name: decide() contract (real daemon)
+        working-directory: hestia
+        env:
+          HESTIA_DECIDE_CONTRACT_ENDPOINT: http://127.0.0.1:7799/mcp
+        run: python3 tools/one_gate_decide_contract_test.py --only contract
+
       - name: Daemon log (on failure)
         if: failure()
         run: tail -100 "$SBX_HOME/serve.log" || true
@@ -198,6 +247,10 @@ jobs:
         run: |
           npm install --silent --no-audit --no-fund --prefix "$RUNNER_TEMP/lint" eslint@10 globals
           NODE_PATH="$RUNNER_TEMP/lint/node_modules" node tools/dashboard_no_undef.mjs
+      # The update button after a click, with the browser's clock ahead of and behind the
+      # daemon's (#1434): the real renderDeployment and click handler against fake snapshots.
+      - name: Update button holds an accepted click until the snapshot shows it
+        run: node tools/dashboard_deployment_pending_test.mjs
 
   # The app is a separate Rust crate plus a TypeScript frontend. Core green says
   # nothing about either: Sprint A demonstrated the gap when an app-only helper
@@ -252,6 +305,87 @@ jobs:
       - name: Build frontend
         working-directory: hestia/app
         run: npm run build
+
+  # THE APP/DAEMON CONTRACT, from one commit (web4#904 phase 1). The daemon and the app release
+  # in lockstep, so the pairing a release ships is "both built from this commit", and that
+  # pairing had never been run: app/src-tauri/tests/operator_live.rs is #[ignore]d and no
+  # workflow invoked it. Here it runs against a daemon built from THIS commit, with a
+  # throwaway home on :7797 (never :7711), through the app's SHIPPING code paths: the
+  # /api/version handshake (same version, same api_compat), the operator challenge/session
+  # sign-in with the genesis credential that daemon minted, the gated routes, and a bad key's
+  # refusal. A daemon-side change that breaks a route the app parses fails here, not in the
+  # field.
+  app-daemon-contract:
+    name: app-daemon contract (live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hestia
+      - uses: actions/checkout@v4
+        with:
+          repository: dp-web4/web4
+          path: web4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            hestia/core
+            hestia/app/src-tauri -> target
+
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
+
+      - name: Build the daemon
+        working-directory: hestia/core
+        run: cargo build --locked --bin hestia
+
+      - name: Start an isolated daemon on :7797
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d)"
+          echo "SBX_HOME=$home" >> "$GITHUB_ENV"
+          export HESTIA_HOME="$home" HESTIA_PASSPHRASE="ci-$GITHUB_RUN_ID"
+          bin="$GITHUB_WORKSPACE/hestia/core/target/debug/hestia"
+          "$bin" --home "$home" init --ai
+          nohup "$bin" --home "$home" serve --bind 127.0.0.1:7797 >"$home/serve.log" 2>&1 &
+          # Ready means the handshake ANSWERS (and the genesis operator credential exists),
+          # not that the port is open.
+          for _ in $(seq 1 120); do
+            if curl -fsS --max-time 5 http://127.0.0.1:7797/api/version 2>/dev/null | grep -q '"api_compat"' \
+               && [ -s "$home/operator.key" ]; then
+              curl -fsS http://127.0.0.1:7797/api/version; echo
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "daemon never answered /api/version"; cat "$home/serve.log"; exit 1
+
+      # A fresh daemon has no trust grains, and the contract asserts the TrustView fields the
+      # app renders: give it one real witnessed member action so that check has something to read.
+      - name: Seed one witnessed member action
+        working-directory: hestia
+        run: python3 tools/app_contract_seed.py --endpoint http://127.0.0.1:7797/mcp
+
+      - name: Live contract tests (operator_live, incl. the handshake)
+        working-directory: hestia/app/src-tauri
+        env:
+          HESTIA_APP_LIVE_DAEMON: http://127.0.0.1:7797
+        run: |
+          export HESTIA_APP_LIVE_OPERATOR_KEY="$SBX_HOME/operator.key"
+          cargo test --locked --test operator_live -- --ignored --nocapture --test-threads=1
+
+      - name: Daemon log (on failure)
+        if: failure()
+        run: tail -100 "$SBX_HOME/serve.log" || true
 
   # ADDITION, 2026-07-29 (CBP): `cargo test` was the whole gate, and the Rust crate is
   # not the whole repo. Three plugin directories hold real behavioural tests — member-mesh
@@ -517,10 +651,17 @@ jobs:
           # lexical way. Worth saying plainly: this number barely moved (30.0 in-shim -> 29.9),
           # because the meter measures vocabulary in the seat, not where decisions live. What
           # moved is in SHIM_LEDGER: the predicate, exemption and refusal words are the core's.
+          # One-gate stage C (2026-10-04): every seat is the certified template plus data plus
+          # three adapters, and every law-bearing step is the common gate's `decide`. Measured on
+          # the cutover bytes: claude-code 4.6, codex 4.6, gemini 5.3, kimi 4.6 (from 29.9 / 20.6
+          # / 10.3 / 16.8). What remains per seat is the byte-identical bootstrap (projection
+          # loader, authority loader with #747 sys.modules eviction, emergency block, main) and the
+          # adapters, which the meter counts lexically; gemini's extra 0.7 is its lineage
+          # translation and two-channel emit. Pinned at the measured values: the ratchet only falls.
           python3 tools/gate_collapse_meter.py \
             --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=29.9 --max-seat-pct codex=20.6 \
-            --max-seat-pct gemini=10.3 --max-seat-pct kimi=16.8
+            --max-seat-pct claude-code=4.6 --max-seat-pct codex=4.6 \
+            --max-seat-pct gemini=5.3 --max-seat-pct kimi=4.6
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |

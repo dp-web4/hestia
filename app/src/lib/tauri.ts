@@ -44,7 +44,14 @@ export async function ruleScopeRequest(
   requestId: string,
   granted: boolean,
   reason: string | null,
-  opts: { standing?: boolean; recursive?: boolean } = {},
+  opts: {
+    standing?: boolean;
+    recursive?: boolean;
+    once?: boolean;
+    grantPath?: string | null;
+    /** The asked path, so the breadth rule is checked before anything leaves the app. */
+    askedPath?: string;
+  } = {},
 ): Promise<DecideOutcome> {
   return invoke("rule_scope_request", {
     requestId,
@@ -52,6 +59,9 @@ export async function ruleScopeRequest(
     reason,
     standing: opts.standing ?? false,
     recursive: opts.recursive ?? false,
+    once: opts.once ?? false,
+    grantPath: opts.grantPath ?? null,
+    askedPath: opts.askedPath ?? null,
   });
 }
 
@@ -147,8 +157,9 @@ export async function setReach(
   row: ScopeGrantRow,
   recursive: boolean,
   reason: string | null,
+  seen: import("./types").ScopeReachBinding,
 ): Promise<StandingActOutcome> {
-  return invoke("set_reach", { member: row.plugin_id, path: row.path, recursive, reason });
+  return invoke("set_reach", { member: row.plugin_id, path: row.path, recursive, reason, seen });
 }
 
 /** Move one standing grant to another recorded member, bound to the row as shown. */

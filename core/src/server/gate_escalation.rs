@@ -112,6 +112,56 @@ pub const DEFAULT_TTL_SECS: u64 = 3600;
 /// an act name /dev/zero and turn a gate check into an unbounded read.
 pub const MAX_MEASURED_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Why a bounded read returned no bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundedRead {
+    /// Missing, a directory, a FIFO, a device -- anything that is not a regular file. A FIFO or
+    /// `/dev/zero` is exactly the path an unbounded reader never returns from.
+    NotAFile,
+    /// Larger than the cap: the size metadata reported, or -- if the file grew between the
+    /// `stat` and the read -- the number of bytes read before the reader stopped at cap + 1.
+    TooLarge(u64),
+    /// A regular file the daemon could not open or read.
+    Unreadable,
+}
+
+/// Read a regular file of at most `cap` bytes, and NEVER more than `cap + 1` bytes of it.
+///
+/// WHY (GPT hold on #1064, 2026-09-29): the patch path checked `MAX_MEASURED_PAYLOAD_BYTES`
+/// only after `fs::read` had allocated the whole file, so the cap changed a label and bounded
+/// nothing. The size is checked from metadata BEFORE any allocation, and the read itself is
+/// `take(cap + 1)`, so a file swapped or grown between the check and the read still cannot
+/// make this allocate more than the cap plus one byte. Every measurement a decision surface or
+/// an approval binding makes goes through here, so the bytes shown and the bytes bound share
+/// one bound.
+pub fn read_regular_file_bounded(p: &std::path::Path, cap: u64) -> Result<Vec<u8>, BoundedRead> {
+    use std::io::Read;
+    let meta = std::fs::metadata(p).map_err(|_| BoundedRead::NotAFile)?;
+    if !meta.is_file() {
+        return Err(BoundedRead::NotAFile);
+    }
+    if meta.len() > cap {
+        return Err(BoundedRead::TooLarge(meta.len()));
+    }
+    let f = std::fs::File::open(p).map_err(|_| BoundedRead::Unreadable)?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    f.take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|_| BoundedRead::Unreadable)?;
+    if buf.len() as u64 > cap {
+        return Err(BoundedRead::TooLarge(buf.len() as u64));
+    }
+    Ok(buf)
+}
+
+/// Lower-case hex sha256 -- the one spelling of a payload digest used everywhere it is bound
+/// or shown.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
 /// How long an APPROVAL stays claimable after it is granted.
 ///
 /// This exists because the hook cannot wait. `plugin.json` and the live `settings.json` both
@@ -235,7 +285,7 @@ pub enum Channel {
 /// so a met bar is *stated sufficiency*, not proof. What it changes is that a reader can now
 /// see the criterion, the factors present, and whether they met it — the mismatch becomes a
 /// recorded fact instead of an implicit one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Bar {
     /// One decision from a sovereign channel (operator session / operator CLI) OR a NOT-SAME
@@ -245,6 +295,10 @@ pub enum Bar {
     /// silent compromise is the whole model.
     SovereignPlusPeer,
 }
+// The DECLARATION ORDER above is the strength order (SingleApprover < SovereignPlusPeer), and
+// `bar_for_markers` takes the max over it — a reorder is a policy change, not a style edit.
+// Deserialize exists so replay can RESTORE the recorded criterion (`rehydrate`; #812 review
+// hold 2) instead of repricing it under today's policy.
 
 /// The bar a governance file's write must clear. This is POLICY, stated in one place so a
 /// change is a reviewed diff — and copied onto every escalation at open, so the record
@@ -258,6 +312,9 @@ pub enum Bar {
 /// which makes enforcement-path writes wait rather than proceed under a weaker bar. That is
 /// the honest state, and it is visible here rather than implicit. If that is the wrong
 /// trade, this is the one line to change.
+///
+/// WHAT THIS IS FED is stated once, at `price`: every marker the act reaches, never the
+/// closure's first-matched marker alone.
 pub fn bar_for(marker: &str) -> Bar {
     if marker.contains("pre_tool_use.py")
         || marker.contains("post_tool_use.py")
@@ -268,11 +325,488 @@ pub fn bar_for(marker: &str) -> Bar {
         // it" the governance-class declaration named. Live clause: the name is not shadowed in the
         // matcher tuple, so this is the deciding branch for its own marker (governance_class_drift).
         || marker.contains("hestia_gate_mechanism.py")
+        // THE common gate (one-gate stage C): since the thin-shim cutover every seat's shim
+        // delegates its whole decision to it, so it is the enforcement path for all four seats
+        // at once — priced like the gate it replaced (align upward), never single-approver by
+        // omission (the governance-class declaration's "DECIDE before the shims land").
+        || marker.contains("hestia_single_gate.py")
+        // EVERY member's gate entry, wherever its install declaration puts it (align upward):
+        // a seat's enforcement path is priced like every other seat's, whatever its harness
+        // calls the file. Location-qualified, derived from `MEMBER_GATE_ENTRIES` (pinned to the
+        // members' expects.json), so the next member is covered by its declaration and a
+        // same-named file outside every declared location is not promoted.
+        || member_gate_entry_of(marker).is_some()
+        // A seat's REGISTERED gate entry that no declared location covers (a legacy or
+        // hand-placed install the harness registration actually runs): the gate escalates it
+        // under this marker, and it is priced like a declared entry. Caller-asserted like every
+        // marker, so it can only raise the asker's own bar.
+        || marker.trim() == REGISTERED_GATE_ENTRY_MARKER
     {
         Bar::SovereignPlusPeer
     } else {
         Bar::SingleApprover
     }
+}
+
+/// The closure marker the common gate uses for a write to a seat's registered gate entry that
+/// no declared location covers (`hestia_single_gate.REGISTERED_ENTRY_MARKER`).
+pub const REGISTERED_GATE_ENTRY_MARKER: &str = "registered-gate-entry";
+
+/// One member's gate entry as its `plugins/<plugin>/expects.json` `install` block declares it:
+/// `dest` (where the installer puts the hooks) and `gate_probe.entry` (the file the harness
+/// invokes, relative to the plugin dir).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemberGateEntry {
+    pub plugin: &'static str,
+    pub dest: &'static str,
+    pub entry: &'static str,
+}
+
+/// Every member's gate entry — a mirror of the members' install declarations, pinned equal to
+/// them by `member_gate_entries_match_the_install_declarations` (a member added, renamed or
+/// moved without this table is red). The sovereign half of `bar_for` for gate ENTRIES is
+/// derived from it, so a member whose entry is not named like the others' is still priced like
+/// them. `SOVEREIGN_FILES` stays the name-anywhere backstop for the names it already holds.
+pub const MEMBER_GATE_ENTRIES: &[MemberGateEntry] = &[
+    MemberGateEntry { plugin: "claude-code", dest: "~/.claude/hooks/hestia",
+                      entry: "hooks/pre_tool_use.py" },
+    MemberGateEntry { plugin: "codex", dest: "~/.codex/hooks", entry: "hooks/pre_tool_use.py" },
+    MemberGateEntry { plugin: "gemini", dest: "~/.gemini/hestia-plugins/gemini/hooks",
+                      entry: "hooks/before_tool.py" },
+    MemberGateEntry { plugin: "kimi", dest: "~/.kimi-code/hooks", entry: "hooks/pre_tool_use.py" },
+];
+
+/// Path segments, NORMALISED LEXICALLY: repeated slashes collapse, `.` drops, `..` removes the
+/// segment before it (a leading `..` of a relative path is kept: there is nothing to remove),
+/// and a home anchor (`~`, `$HOME`, `${HOME}`) is dropped. So `.x/hooks/sub/../entry.py` is
+/// `.x/hooks/entry.py`, and `.x/hooks/../hooks-old/entry.py` is NOT under `.x/hooks`. Symlinks
+/// are the gate's to resolve (the closure realpaths before it reports a resolved target);
+/// this only makes the string's own `..` mean what the filesystem would make of it.
+fn path_segments(p: &str) -> Vec<&str> {
+    let mut s: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if matches!(s.last(), Some(&last) if last != "..") {
+                    s.pop();
+                } else {
+                    s.push("..");
+                }
+            }
+            x => s.push(x),
+        }
+    }
+    if matches!(s.first(), Some(&"~") | Some(&"$HOME") | Some(&"${HOME}")) {
+        s.remove(0);
+    }
+    s
+}
+
+/// The locations a member's gate entry lives at, as segment runs: installed
+/// (`dest`/<entry basename>), repo source (`plugins/<plugin>/<entry>`) and published ground
+/// truth (`hooks-gt/<plugin>/<entry>`). A `dest` shorter than two segments contributes no
+/// installed location (it would match every same-named dir).
+fn member_entry_locations(e: &MemberGateEntry) -> Vec<Vec<&'static str>> {
+    let entry = path_segments(e.entry);
+    let Some(base) = entry.last().copied() else { return vec![] };
+    let mut out = Vec::new();
+    let dest = path_segments(e.dest);
+    if dest.len() >= 2 {
+        let mut d = dest.clone();
+        d.push(base);
+        out.push(d);
+    }
+    for root in ["plugins", "hooks-gt"] {
+        let mut r = vec![root, e.plugin];
+        r.extend(entry.iter().copied());
+        out.push(r);
+    }
+    out
+}
+
+/// Every declared member gate-entry location `path` reaches: the location itself when `path` ends
+/// (by whole segments, after lexical normalisation) at it, and — #1239's glob rule, applied to
+/// locations — each location whose DIRECTORY `path`'s directory is and whose basename `path`'s
+/// glob basename can expand to (`.x/hooks/*.py`). Decided on the name alone, never the filesystem.
+pub fn member_gate_entries_matching(path: &str) -> Vec<String> {
+    let segs = path_segments(path.trim());
+    let Some((last, dir)) = segs.split_last() else { return Vec::new() };
+    let globby = last.contains(['*', '?', '[']);
+    let mut out = Vec::new();
+    for e in MEMBER_GATE_ENTRIES {
+        for loc in member_entry_locations(e) {
+            let Some((loc_base, loc_dir)) = loc.split_last() else { continue };
+            if loc_dir.len() > dir.len() || dir[dir.len() - loc_dir.len()..] != loc_dir[..] {
+                continue;
+            }
+            if last == loc_base || (globby && glob_match(last, loc_base)) {
+                let l = loc.join("/");
+                if !out.contains(&l) {
+                    out.push(l);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// When `path` ends (by whole segments) at a declared member gate entry location, that location
+/// as a marker string (e.g. `.x/hooks/entry.py`); else None. A file merely NAMED like an entry
+/// elsewhere is not one.
+pub fn member_gate_entry_of(path: &str) -> Option<String> {
+    let segs = path_segments(path.trim());
+    for e in MEMBER_GATE_ENTRIES {
+        for loc in member_entry_locations(e) {
+            if loc.len() <= segs.len() && segs[segs.len() - loc.len()..] == loc[..] {
+                return Some(loc.join("/"));
+            }
+        }
+    }
+    None
+}
+
+/// The files whose silent compromise ends the model, by basename — the sovereign half of
+/// `bar_for`. One list, so `bar_for` and `markers_of` cannot disagree about what is sovereign.
+pub const SOVEREIGN_FILES: &[&str] = &[
+    "pre_tool_use.py",
+    "post_tool_use.py",
+    "witness.py",
+    "hestia_gate_mechanism.py",
+    "hestia_single_gate.py",
+];
+
+/// THE ESCALATION PRICING RULE. This is the one place it is stated. `open` calls it to price a
+/// new ask; the claim door calls it to price the INCOMING act before any approval may be spent
+/// or reclaimed for it; `rehydrate` calls it only for a row that recorded no readable bar.
+///
+/// **An escalation's bar is the HIGHEST bar over every marker the act reaches.** The markers,
+/// in order, deduplicated (`markers_of`):
+///   1. the closure's reported `marker` — always present, always first;
+///   2. for EACH of the act's RESOLVED TARGETS (every governed write-position path the gate's
+///      closure resolved — all of them, not the first), its basename — and, when the target lies
+///      at a member's declared gate-entry location (`member_gate_entries_matching`, after lexical
+///      normalisation; a glob whose directory is the entry's directory counts), that location:
+///      member gate entries are priced by WHERE they are (#1247);
+///   3. every sovereign file (`SOVEREIGN_FILES`, by exact basename) named in the ACT TEXT.
+///
+/// (1) and (2) are names the GATE resolved for this write — the closure element that fired,
+/// and the write-position arguments that resolved into the closure — so each is priced by
+/// `bar_for` as it stands. (3) is free text: it also names sources, flags and look-alikes, so
+/// only an exact sovereign basename counts there (`not_witness.py.bak` is not the witness).
+///
+/// A GLOB prices by what it can EXPAND to: a basename with `*`, `?` or `[...]` — in a resolved
+/// target or in the act text — adds every `SOVEREIGN_FILES` name it matches
+/// (`sovereign_expansions`), so `rm …/hooks/*.py` prices as the gate it removes; a brace
+/// pattern in a target cannot be bounded on the name and is unpriceable (kimi, #1231 Q4).
+///
+/// UNPRICEABLE IS THE HIGHEST BAR, never the lowest. A resolved target that arrives as an
+/// `UNPRICEABLE_PREFIX` sentinel — the gate could not enumerate the whole write set (an
+/// opaque writer, an internal error, more targets than `MAX_RESOLVED_TARGETS`), or a target
+/// path was itself credential-shaped and withheld — is a marker that prices
+/// `SovereignPlusPeer` (`marker_bar`). Missing pricing evidence must not imply the weaker bar
+/// (Codex review of #1239, P1-2/P1-3).
+///
+/// Why each input is there:
+///   - (1) alone was the pre-stage-C rule, and it was unpriceable-strong for exactly the
+///     in-tree paths the strong bar exists for: the closure matches DIRECTORIES first, so a
+///     hook or mechanism write arrived as `plugins/*/hooks` / `plugins/_shared` and priced
+///     one approver (#206 diagnosed it; #810 filed it; 166 strong-named hook writes priced
+///     weak in the 27 days between).
+///   - (3) is one-gate stage C's fix (#1231): read the file out of the act text.
+///   - (2) is #810's repair as #812 built it (kimi-code): the act text is a bounded,
+///     self-censoring SUMMARY (220 chars for a shell command, the whole command withheld if it
+///     is credential-shaped, a multi-target patch cut from the front), so a filename can be
+///     cut out of (3) while the closure still holds it. The resolved targets are those
+///     arguments, sent as their own field, independent of the summary's redaction — and priced
+///     like markers, so a hook-dir file the bar reaches only through `bar_for`'s `contains`
+///     (the society gate) prices as its own name would.
+///
+/// MONOTONIC BY CONSTRUCTION. Every input after (1) can only ADD markers, and the bar is the
+/// max over them, so the targets and the act text may STRENGTHEN the marker-derived bar and
+/// can never weaken it (#812 review hold 1: a first cut that priced from the target alone let
+/// a fabricated `/tmp/ordinary.txt` lower a bar the marker priced two-factor). All are
+/// caller-asserted (A1, HST-005) — the failure direction of a lie in any is a stricter bar on
+/// the liar's own escalation.
+///
+/// FROZEN AT OPEN, ENFORCED AT SPEND. The bar and the markers are copied onto the record and
+/// witnessed on the `gate_escalation_opened` entry; replay RESTORES them rather than repricing
+/// (#812 review hold 2). And an approval is spent (or reclaimed) only for an incoming act whose
+/// price does not exceed the bar it was approved under — the record is never repriced; a
+/// stronger ask needs its own, sufficient authorization (Codex review of #1239, P1-1).
+/// No targets (every row before #810, every old hook) prices exactly as stage C did.
+///
+/// The targets are FULL PATHS here, not basenames, so a location-qualified rule can read them.
+pub fn price(marker: &str, act: Option<&str>, resolved_targets: &[String]) -> (Bar, Vec<String>) {
+    let markers = markers_of(marker, act, resolved_targets);
+    (bar_for_markers(&markers), markers)
+}
+
+/// The markers `price` takes the max over: the closure's reported `marker` first, then the
+/// basename of each resolved target (an `UNPRICEABLE_PREFIX` sentinel is kept whole, as its
+/// own marker), then the basename of every sovereign file named in the act text (deduplicated,
+/// in order). Act text is read the way it is written — whitespace, quotes, `=`, `,`, `;`,
+/// shell punctuation and escaped newlines split it, a `/` separates segments — so a path inside
+/// a command, an Edit target or an apply_patch body is found wherever the closure's directory
+/// marker shadowed it. Reads text only; it can add markers, never remove one.
+pub fn markers_of(marker: &str, act: Option<&str>, resolved_targets: &[String]) -> Vec<String> {
+    let mut out = vec![marker.trim().to_string()];
+    let add = |name: &str, out: &mut Vec<String>| {
+        if !name.is_empty() && !out.iter().any(|m| m == name) {
+            out.push(name.to_string());
+        }
+    };
+    for t in resolved_targets {
+        let t = t.trim();
+        if t.starts_with(UNPRICEABLE_PREFIX) {
+            add(t, &mut out);
+        } else {
+            let t = t.trim_end_matches('/');
+            let base = t.rsplit('/').next().unwrap_or("").trim();
+            add(base, &mut out);
+            // A GLOB prices by what it can expand to (kimi, #1231 review Q4): `*.py` in a
+            // hooks dir reaches the gate. Brace expansion cannot be bounded here, so it is
+            // unpriceable — the highest bar, never the literal's.
+            if base.contains('{') {
+                add(&format!("{UNPRICEABLE_PREFIX}brace-glob"), &mut out);
+            }
+            for s in sovereign_expansions(base) {
+                add(s, &mut out);
+            }
+            // The FULL resolved target, not only its basename (#1247): a member's gate entry is
+            // priced by its declared LOCATION, and the gate resolved this path (cwd-joined,
+            // `..`/symlinks resolved) — so it holds the location even when the act summary is
+            // shortened, withheld, or names the file relatively. A sovereign basename is already
+            // priced above, by name.
+            if !SOVEREIGN_FILES.contains(&base) {
+                for loc in member_gate_entries_matching(t) {
+                    add(&loc, &mut out);
+                }
+            }
+        }
+    }
+    if let Some(text) = act {
+        // Two tokenizations, unioned (markers only add, so the union can only raise the bar):
+        // one splits on `[`/`]` so a bracketed literal (`[/w/hooks/pre_tool_use.py]`) still
+        // names its file; one keeps them so a bracket CLASS (`[pq]re_tool_use.py`) survives
+        // whole to `sovereign_expansions`, pricing like the same pattern as a resolved target
+        // (Codex notice 18784, P2).
+        let split = |c: char| c.is_whitespace() || "\"'`=,;:()<>|&{}[]\\".contains(c);
+        let keep = |c: char| c.is_whitespace() || "\"'`=,;:()<>|&{}\\".contains(c);
+        for tok in text.split(split).chain(text.split(keep)) {
+            let base = tok.rsplit('/').next().unwrap_or("");
+            if SOVEREIGN_FILES.contains(&base) {
+                add(base, &mut out);
+            }
+            // The same glob rule over the act text: `rm hooks-gt/kimi/hooks/*.py` names no
+            // sovereign file literally, and expands to several. Free text is noisier than a
+            // resolved target, so a token counts as a path glob only if it is one: it has a
+            // directory part, or a literal character beside its metacharacters. A bare `***`
+            // (the apply_patch envelope) is punctuation, not a pattern; a bare `*` relative to
+            // a hooks cwd is still priced, from the resolved target the closure reports.
+            let pathlike = tok.contains('/') || base.chars().any(|c| !"*?[]!^-".contains(c));
+            if pathlike {
+                for s in sovereign_expansions(base) {
+                    add(s, &mut out);
+                }
+            }
+        }
+    }
+    // A member's gate entry named in the act text at a declared location, whose basename is
+    // not already a sovereign name (those are found above), joins as its qualified location.
+    // Add-only, like every input here: it can raise the bar, never lower it.
+    if let Some(text) = act {
+        let split = |c: char| c.is_whitespace() || "\"'`=,;:()<>|&{}[]\\".contains(c);
+        for tok in text.split(split) {
+            let base = tok.rsplit('/').next().unwrap_or("");
+            if SOVEREIGN_FILES.contains(&base) {
+                continue;
+            }
+            if let Some(loc) = member_gate_entry_of(tok) {
+                if !out.iter().any(|m| *m == loc) {
+                    out.push(loc);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The sovereign files (`SOVEREIGN_FILES`) a glob basename can expand to — empty for a name
+/// with no glob metacharacter (`*`, `?`, `[`). This is what the pattern CAN reach, decided on
+/// the name alone (no filesystem, so the price never depends on the daemon's cwd or on what
+/// exists at the moment of asking).
+pub fn sovereign_expansions(base: &str) -> Vec<&'static str> {
+    if !base.contains(['*', '?', '[']) {
+        return Vec::new();
+    }
+    SOVEREIGN_FILES.iter().copied().filter(|s| glob_match(base, s)).collect()
+}
+
+/// Shell-style glob match of a whole name: `*` (any run), `?` (one char), `[...]` (a class,
+/// with `!`/`^` negation and `a-z` ranges). An unterminated `[` is a literal, as in the shell.
+pub fn glob_match(pat: &str, name: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // Iterative wildcard match with single-star backtracking.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    // One class at p[i] ('['): Some((matched, len)) or None when it is not a class.
+    let class = |i: usize, c: char| -> Option<(bool, usize)> {
+        let mut j = i + 1;
+        let neg = j < p.len() && (p[j] == '!' || p[j] == '^');
+        if neg {
+            j += 1;
+        }
+        let start = j;
+        let mut hit = false;
+        while j < p.len() && (p[j] != ']' || j == start) {
+            if j + 2 < p.len() && p[j + 1] == '-' && p[j + 2] != ']' {
+                if p[j] <= c && c <= p[j + 2] {
+                    hit = true;
+                }
+                j += 3;
+            } else {
+                if p[j] == c {
+                    hit = true;
+                }
+                j += 1;
+            }
+        }
+        if j >= p.len() {
+            return None; // unterminated: a literal '['
+        }
+        Some((hit != neg, j + 1 - i))
+    };
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+            continue;
+        }
+        let step = if pi < p.len() {
+            match p[pi] {
+                '?' => Some(1),
+                '[' => match class(pi, n[ni]) {
+                    Some((true, len)) => Some(len),
+                    Some((false, _)) => None,
+                    None => (n[ni] == '[').then_some(1),
+                },
+                c => (c == n[ni]).then_some(1),
+            }
+        } else {
+            None
+        };
+        match step {
+            Some(len) => {
+                pi += len;
+                ni += 1;
+            }
+            None => match star {
+                Some(s) => {
+                    pi = s + 1;
+                    mark += 1;
+                    ni = mark;
+                }
+                None => return false,
+            },
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
+/// One marker's bar: `bar_for`, except that an unpriceable-target sentinel is the HIGHEST bar.
+pub fn marker_bar(m: &str) -> Bar {
+    if m.starts_with(UNPRICEABLE_PREFIX) {
+        Bar::SovereignPlusPeer
+    } else {
+        bar_for(m)
+    }
+}
+
+/// The bar an act must clear: the HIGHEST `marker_bar` over every marker it reaches (`Bar`'s
+/// declaration order is its strength order). No markers prices the everyday bar.
+pub fn bar_for_markers(markers: &[String]) -> Bar {
+    markers.iter().map(|m| marker_bar(m)).max().unwrap_or(Bar::SingleApprover)
+}
+
+/// A resolved target the gate could not price, said in-band so it cannot be dropped silently:
+/// `hestia:unpriceable:<why>` (`credential-path`, `unenumerated`, `overflow`, `malformed`).
+/// Shared with the producer (`hestia_gate_mechanism.UNPRICEABLE_PREFIX`).
+pub const UNPRICEABLE_PREFIX: &str = "hestia:unpriceable:";
+
+/// The longest resolved target recorded, in chars. A path's governed filename is at its END,
+/// so an over-long value keeps its tail.
+pub const RESOLVED_TARGET_MAX: usize = 512;
+
+/// The most resolved targets one escalation records. More than this is an `overflow` sentinel,
+/// which prices the highest bar: a write set too large to carry is not a reason to price less.
+pub const MAX_RESOLVED_TARGETS: usize = 16;
+
+/// One resolved target, as recorded: whitespace collapsed, empty is absent, tail-capped.
+pub fn normalize_resolved_target(t: Option<&str>) -> Option<String> {
+    let collapsed = t?.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let n = collapsed.chars().count();
+    Some(if n > RESOLVED_TARGET_MAX {
+        collapsed.chars().skip(n - RESOLVED_TARGET_MAX).collect()
+    } else {
+        collapsed
+    })
+}
+
+/// A caller's resolved targets, as recorded: each normalized, empties dropped, deduplicated in
+/// order, and capped at `MAX_RESOLVED_TARGETS` — the excess replaced by one `overflow`
+/// sentinel rather than discarded.
+pub fn normalize_resolved_targets<'a>(ts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut overflow = false;
+    for t in ts {
+        let Some(n) = normalize_resolved_target(Some(t)) else { continue };
+        if out.contains(&n) {
+            continue;
+        }
+        if out.len() >= MAX_RESOLVED_TARGETS {
+            overflow = true;
+            continue;
+        }
+        out.push(n);
+    }
+    if overflow {
+        out.push(format!("{UNPRICEABLE_PREFIX}overflow"));
+    }
+    out
+}
+
+/// The resolved targets a tool call names, as ONE list of full paths. The canonical key is
+/// `resolved_targets` (an array of strings). Also accepted and joined, in this order, so every
+/// producer spelling prices identically: the single-string `resolved_target`, and
+/// `also_resolved` (an array — the spelling #1247's producer uses for the targets after the
+/// first). Anything present but malformed (a wrong type, a non-string element) is an
+/// `UNPRICEABLE_PREFIX` sentinel, never silently nothing.
+pub fn resolved_targets_from_args(args: &serde_json::Value) -> Vec<String> {
+    let mal = || format!("{UNPRICEABLE_PREFIX}malformed");
+    let mut raw: Vec<String> = Vec::new();
+    let array = |key: &str, raw: &mut Vec<String>| match args.get(key) {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Array(items)) => {
+            for v in items {
+                raw.push(v.as_str().map(str::to_string).unwrap_or_else(mal));
+            }
+        }
+        Some(_) => raw.push(mal()),
+    };
+    array("resolved_targets", &mut raw);
+    match args.get("resolved_target") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(s)) => raw.push(s.clone()),
+        Some(_) => raw.push(mal()),
+    }
+    array("also_resolved", &mut raw);
+    normalize_resolved_targets(raw.iter().map(String::as_str))
 }
 
 /// One piece of evidence present for a decision. The channels ARE the factor types
@@ -338,6 +872,40 @@ impl Channel {
 }
 
 
+/// The door an escalation was opened through. Spelled exactly as the `gate_escalation_opened`
+/// chain row has spelled `opened_via` since the doors' payloads were unified, so the struct and
+/// the chain use one vocabulary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenedVia {
+    /// Not recorded: a row restored from before the field, or a mint whose door said nothing.
+    #[default]
+    Unknown,
+    /// `hestia_gate_escalation_open` — the member door. `reason` is a rationale here.
+    Open,
+    /// `hestia_gate_escalation_claim` — the gate hook's claim-or-open door, which takes
+    /// `reason` as the act when no `act` is sent.
+    Claim,
+}
+
+impl OpenedVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpenedVia::Unknown => "unknown",
+            OpenedVia::Open => "open",
+            OpenedVia::Claim => "claim",
+        }
+    }
+
+    pub fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("open") => OpenedVia::Open,
+            Some("claim") => OpenedVia::Claim,
+            _ => OpenedVia::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Escalation {
     pub id: String,
@@ -400,6 +968,26 @@ pub struct Escalation {
     /// one TTL, and failing closed for that hour is the safe direction for a permit.
     #[serde(default)]
     pub act_digest: Option<String>,
+    /// THE ACT ITSELF — the exact (trimmed) text `act_digest` was computed from (#1066).
+    ///
+    /// Before this field `open` hashed the act and discarded the text, so the only place it
+    /// survived was `stated_reason`, and only on the claim door, which takes `reason` AS the
+    /// act. The evidence bundle read it from there — and on the member door, where `reason` is
+    /// a RATIONALE, a rationale containing some other valid `cp` was shown to the decider as
+    /// the act, with a measured write effect for a write the approval does not bind (GPT,
+    /// review of #1064). Retained at the mint from the same string the digest is computed
+    /// from, so `act_digest_of(act_text) == act_digest` holds by construction: the evidence
+    /// and the permit are about one object. `None` only on rows restored from before this
+    /// field; a reader must render that as unavailable, never recover it from the reason.
+    #[serde(default)]
+    pub act_text: Option<String>,
+    /// WHICH DOOR opened this row, on the struct and not only on the chain row (#1066). The
+    /// door says what `stated_reason` MEANS — a rationale on `open`, possibly the act itself on
+    /// `claim` — so a reader of the struct must not have to guess it from which fields happen
+    /// to be filled. `Unknown` on rows restored from before the chain carried `opened_via`,
+    /// and on any mint whose door did not record itself.
+    #[serde(default)]
+    pub opened_via: OpenedVia,
     /// The sha256 of the BYTES the act would read, when the opener can name them.
     ///
     /// `act_digest` hashes the command TEXT, which for the commonest governed write on this
@@ -466,6 +1054,29 @@ pub struct Escalation {
     pub tool_name: String,
     /// Which governance file the write would reach.
     pub marker: String,
+    /// The act's RESOLVED TARGETS (#810, recut of #812): EVERY governed write-position path the
+    /// gate's closure resolved for this act (`write_verdicts`), full paths, in order — carried
+    /// ALONGSIDE the marker. The marker is WHY (which closure element fired; the claim join
+    /// key); the targets are WHAT the write reaches, and they join the pricing (`price`, input
+    /// 2) because the act text they would otherwise be read from is a bounded summary that can
+    /// cut a filename out. A target the gate could not price arrives as an
+    /// `UNPRICEABLE_PREFIX` sentinel, which prices the highest bar.
+    ///
+    /// CALLER-ASSERTED, like `marker` (A1, HST-005): the hook self-reports them and the daemon
+    /// has nothing to check them against. Each can only ADD a marker, so a fabricated target
+    /// raises the asker's own bar and can never lower it. Empty on every row opened before the
+    /// field existed and on every call from a hook that sends none — those price exactly as
+    /// stage C priced them. (Wire: `resolved_targets`, an array; a single-string
+    /// `resolved_target` is accepted and joined.)
+    pub resolved_targets: Vec<String>,
+    /// EVERY marker the act reaches — the reported `marker` first, then the basename of
+    /// `resolved_target`, then each sovereign file (`SOVEREIGN_FILES`) named in the act text.
+    /// `bar` is the highest over all of them; the rule is stated once, at `price`. The shared
+    /// closure matches directories before filenames, so a write to
+    /// `plugins/_shared/hestia_gate_mechanism.py` arrives with `marker = "plugins/_shared"` —
+    /// escalation 9c433571 (stage A) did exactly that — and `bar_for(marker)` alone priced the
+    /// mechanism single-approver.
+    pub matched_markers: Vec<String>,
     /// WHY the member says it needs this, in its own words. Caller-asserted like everything
     /// else here, and worth exactly what a self-declaration is worth — which is more than
     /// nothing, because it is the only account of intent the decider gets.
@@ -580,9 +1191,10 @@ pub struct Escalation {
     /// that was refused, not a standing permit on the governance surface. Without this, one
     /// approval would license every subsequent edit until the daemon restarted.
     pub consumed_at: Option<u64>,
-    /// The stated bar this escalation must clear — copied from `bar_for(marker)` at open, so
-    /// the record carries the criterion in force at the time. See Bar's doc: this is what
-    /// makes "sufficient for this context" auditable.
+    /// The stated bar this escalation must clear — priced by `price` at open, so the record
+    /// carries the criterion in force at the time. See Bar's doc: this is what makes
+    /// "sufficient for this context" auditable. Replay RESTORES this value from the opened
+    /// entry rather than recomputing it (#812 review hold 2).
     pub bar: Bar,
     /// The evidence present, in arrival order. `decide` always appends the decider's factor;
     /// `corroborate` can add a peer factor while Pending. The bar is evaluated against this
@@ -914,6 +1526,9 @@ impl Escalation {
             "decided_by": self.decided_by,
             "decided_role": self.decided_role,
             "bar": self.bar,
+            // Every marker the act reaches; `bar` is the highest over them (`price`).
+            "matched_markers": self.matched_markers,
+            "resolved_targets": self.resolved_targets,
             "bar_met": bar_met,
             // The same conjunction `is_claimable` enforces — the SAME FOUR, evaluated
             // against the same clock, not two of them re-derived without one.
@@ -1125,6 +1740,15 @@ impl std::fmt::Display for OpenError {
                 "{n} escalations already pending (max {MAX_PENDING}) — refusing rather than \
                  evicting, because evicting the oldest lets a flood erase a pending decision"
             ),
+            OpenError::MissingField(name) if *name == "act" => {
+                write!(
+                    f,
+                    "'act' is required — an unattributable escalation is not actionable. \
+                     Copy it VERBATIM from the deny text that refused the write; the gate derives \
+                     and truncates the act, so retyping it can produce a different digest and an \
+                     approval that cannot be claimed"
+                )
+            }
             OpenError::MissingField(name) => {
                 write!(f, "'{name}' is required — an unattributable escalation is not actionable")
             }
@@ -1239,6 +1863,101 @@ pub struct EscalationStore {
     /// not at all). The chain entry is the durable record; this set only dedups
     /// the append within one daemon lifetime.
     lapse_recorded: std::collections::HashSet<String>,
+    /// What the daemon last did for each `request_key` (#1166, #774).
+    ///
+    /// A gate hook gives initialize + connect + claim one 1.5 s deadline, because the harness
+    /// kills a hook at 5 s and a killed hook fails OPEN. When that deadline passes, the outcome
+    /// is UNKNOWN: the daemon may still open an escalation (whose id the asker never learns,
+    /// #1166) or spend an approval (#774: the grant is consumed, the write never happens, and
+    /// the re-issue mints a new petition). The hook sends a key that is stable across identical
+    /// re-issues in one session; this map is how the daemon answers the retry with what it
+    /// already did instead of with a second, different answer.
+    ///
+    /// A projection of the chain like the rest of the store: every outcome row carries its
+    /// `request_key`, and `rehydrate` rebuilds the map from them. Bounded by
+    /// `REQUEST_KEY_CAP`, oldest evicted first.
+    request_keys: HashMap<String, RequestKeyRecord>,
+    /// Execution evidence for #1166/#774 (GPT review of #1169): the daemon's own record that a
+    /// tool INVOCATION reached `hestia_begin_action` -- which every gate reaches, for a permitted
+    /// write, BEFORE the tool runs. Keyed by the invocation's correlation key
+    /// (hestia_witness_core.correlation_key: tool_use_id / kimi tool_call_id / gemini content
+    /// key), valued by the time it was last seen. MEMORY-ONLY, and `booted_at` makes that safe:
+    /// a claim older than this daemon's start is never reclaimable, because its begin may have
+    /// been seen by a process that no longer exists.
+    begins_seen: HashMap<String, u64>,
+    /// When this store was created (daemon start). See `begins_seen`.
+    booted_at: u64,
+    /// The latest begin time ever evicted from `begins_seen` (GPT review of 8056dce). An
+    /// evicted begin is execution evidence this store no longer holds, so any claim at or
+    /// before this mark is refused a reclaim rather than read as "never executed".
+    begins_evicted_hwm: u64,
+    /// FENCES (GPT review of 8056dce, the claim/begin race): an invocation whose permit was
+    /// re-delivered to another invocation by a reclaim. Written in the SAME state change that
+    /// grants the reclaim, and checked by `hestia_begin_action`, which refuses a fenced key --
+    /// so of {the original's begin, the reclaim} whichever the lock orders first wins, and the
+    /// other is refused. Value: (fenced_at, escalation_id).
+    fenced: HashMap<String, (u64, String)>,
+}
+
+/// How long after a spend the SAME request key may be answered with the same permit
+/// (#774). Long enough to cover a lost response and the member's immediate re-issue; short
+/// enough that a key cannot become a standing permit. It never widens anyone else's window:
+/// a different key, act, payload, member, marker or proven session is refused as before.
+pub const RECLAIM_WINDOW_SECS: u64 = 120;
+/// Upper bound on remembered request keys; the oldest are evicted first.
+pub const REQUEST_KEY_CAP: usize = 4096;
+/// Upper bound on remembered begin keys; the oldest are evicted first, and the eviction
+/// high-water mark (`begins_evicted_hwm`) refuses any reclaim that eviction could affect.
+pub const BEGINS_SEEN_CAP: usize = 8192;
+/// Upper bound on live fences. A fence is only EVICTABLE once it is older than `FENCE_TTL_SECS`;
+/// when the table is full of younger fences, a new reclaim is REFUSED rather than a fence
+/// dropped -- the fail-closed direction: losing a fence would let a superseded invocation run.
+pub const FENCE_CAP: usize = 4096;
+/// How long a fence must live. It only has to outlive the fenced invocation's own hook (the
+/// harness kills a hook at 5 s, and a killed hook never reaches begin_action); twice the reclaim
+/// window is far past that.
+pub const FENCE_TTL_SECS: u64 = 2 * RECLAIM_WINDOW_SECS;
+
+/// A correlation key as the witness core emits it: `[A-Za-z0-9_.-]`, at most 200 bytes.
+pub fn valid_correlation_key(k: &str) -> bool {
+    !k.is_empty() && k.len() <= 200 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+
+/// The daemon's record of one request key's last outcome.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RequestKeyRecord {
+    /// `opened` | `coalesced` | `claimed` | `reclaimed`.
+    pub outcome: String,
+    pub escalation_id: String,
+    pub at: u64,
+    pub plugin_id: String,
+    pub marker: String,
+    /// sha256 of the act the request named, as `act_digest_of` computes it.
+    pub act_digest: Option<String>,
+    /// The payload binding the spent escalation carried, if any.
+    pub payload_sha256: Option<String>,
+    /// The PROVEN host session at the time, if the caller had one.
+    pub host_session_id: Option<String>,
+    /// The tool INVOCATION the claim answered (its correlation key), when the hook sent one.
+    /// A reclaim is only for a DIFFERENT invocation whose predecessor never reached execution.
+    pub invocation_key: Option<String>,
+    /// Whether the claiming seat declared it HARD-STOPS a superseded invocation in every rollout
+    /// mode (`supersession: "hard_stop"` on the claim; GPT review of ca5f394). A reclaim fences
+    /// the ORIGINAL invocation, and the fence is only a cancellation if that invocation's own
+    /// hook refuses to run on it -- a hook that downgrades the refusal to a warning would let it
+    /// run beside its replacement. So a claim that did not declare it is never reclaimed.
+    pub supersession_hard_stop: bool,
+}
+
+/// The claim argument `supersession` value by which a seat declares that its hook stops a
+/// superseded invocation (`hestia.invocation_superseded` at begin_action) regardless of rollout
+/// mode. Declared by the hook that enforces it, so the declaration and the stop ship together.
+pub const SUPERSESSION_HARD_STOP: &str = "hard_stop";
+
+/// A request key is sha256 hex: 64 lowercase hex characters. Anything else is refused by
+/// name rather than stored, so a key can never smuggle an arbitrary string into the chain.
+pub fn valid_request_key(k: &str) -> bool {
+    k.len() == 64 && k.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn now_secs() -> u64 {
@@ -1284,6 +2003,9 @@ impl EscalationStore {
     /// store cannot describe honestly, and inventing a shell for it would put a governance record
     /// in front of an operator that no witnessed act supports.
     pub fn rehydrate(&mut self, entries: &[crate::storage::chain::ChainEntry], now: u64) -> usize {
+        // Everything replayed below happened before this process existed, and so did any
+        // begin_action that answered it: a replayed claim can never be reclaimed (#1169).
+        self.booted_at = self.booted_at.max(now);
         let s = |v: &serde_json::Value, k: &str| {
             v.get(k).and_then(|x| x.as_str()).map(|x| x.to_string())
         };
@@ -1297,6 +2019,53 @@ impl EscalationStore {
             let entry_ts = e.timestamp.timestamp().max(0) as u64;
             let d = &e.event_data;
             let Some(id) = s(d, "escalation_id") else { continue };
+            // FENCES (#1169) are rebuilt from the reclaimed rows that created them, so a restart
+            // cannot let a superseded invocation begin. (A replayed claim is never reclaimable
+            // anyway -- booted_at -- but a fence written just before a restart must survive it.)
+            if e.event_type == "gate_escalation_reclaimed" {
+                if let Some(orig) = s(d, "fenced_invocation_key").filter(|k| valid_correlation_key(k)) {
+                    self.fenced.insert(orig, (entry_ts, id.clone()));
+                }
+            }
+            // THE REQUEST-KEY MAP (#1166) is rebuilt from the same rows: every outcome the
+            // claim door witnesses carries the key it answered, so a restart keeps "what did
+            // I do for this key" exactly as it keeps "what did the operator rule".
+            if let Some(outcome) = match e.event_type.as_str() {
+                "gate_escalation_opened" => Some("opened"),
+                "gate_escalation_coalesced" => Some("coalesced"),
+                "gate_escalation_claimed" => Some("claimed"),
+                "gate_escalation_reclaimed" => Some("reclaimed"),
+                _ => None,
+            } {
+                if let (Some(key), Some(plugin_id), Some(marker)) =
+                    (s(d, "request_key"), s(d, "plugin_id"), s(d, "marker"))
+                {
+                    if valid_request_key(&key) {
+                        self.record_request_key(
+                            &key,
+                            RequestKeyRecord {
+                                outcome: outcome.to_string(),
+                                escalation_id: id.clone(),
+                                // A reclaim never slides the window: it stays anchored at the
+                                // first spend, which its row carries.
+                                at: if outcome == "reclaimed" {
+                                    u(d, "first_claimed_at").unwrap_or(entry_ts)
+                                } else {
+                                    entry_ts
+                                },
+                                plugin_id,
+                                marker,
+                                act_digest: s(d, "act_digest"),
+                                payload_sha256: s(d, "payload_sha256"),
+                                host_session_id: s(d, "host_session_id"),
+                                invocation_key: s(d, "invocation_key"),
+                                supersession_hard_stop: s(d, "supersession").as_deref()
+                                    == Some(SUPERSESSION_HARD_STOP),
+                            },
+                        );
+                    }
+                }
+            }
             match e.event_type.as_str() {
                 "gate_escalation_opened" => {
                     let (Some(plugin_id), Some(marker), Some(expires_at)) =
@@ -1309,6 +2078,37 @@ impl EscalationStore {
                     if expires_at <= now {
                         continue;
                     }
+                    // THE PRICE, RESTORED — NOT REPRICED (#812 review hold 2). The opened
+                    // entry records the bar and the markers it was priced over; replay keeps
+                    // them, so a later change to `price` cannot rewrite the criterion an
+                    // already-open escalation is judged against across a restart. Before this,
+                    // the code claimed criterion-frozen-at-open while replay rebuilt the bar
+                    // from current policy. Only a row that recorded no readable bar (written
+                    // before the claim path emitted one, or an unparseable value) is priced
+                    // here, by the same rule `open` uses, from what the row itself carries.
+                    // The array the opened entry records; a single-string `resolved_target`
+                    // (an entry written by the first cut of this change) is read the same way.
+                    let resolved_targets = resolved_targets_from_args(d);
+                    // The row's act text, verified or not, exactly as stage C read it here: an
+                    // unverified text can only ADD markers, so it can only raise the fallback.
+                    let (fallback_bar, fallback_markers) = price(
+                        &marker,
+                        s(d, "act_text").as_deref(),
+                        &resolved_targets,
+                    );
+                    let recorded_bar = d
+                        .get("bar")
+                        .and_then(|v| serde_json::from_value::<Bar>(v.clone()).ok());
+                    let recorded_markers = d
+                        .get("matched_markers")
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                        .filter(|m| !m.is_empty());
+                    // A row that recorded a bar but no markers predates stage C, when the bar
+                    // was priced over the closure marker alone — so that is what it lists.
+                    let (bar, matched_markers) = match recorded_bar {
+                        Some(b) => (b, recorded_markers.unwrap_or_else(|| vec![marker.trim().to_string()])),
+                        None => (fallback_bar, fallback_markers),
+                    };
                     self.by_id.insert(
                         id.clone(),
                         Escalation {
@@ -1395,6 +2195,16 @@ impl EscalationStore {
                             // Restored from the entry, so a restart keeps the binding.
                             // Absent on legacy rows opened before #539 -> None -> unspendable.
                             act_digest: s(d, "act_digest"),
+                            // The act text (#1066), restored ONLY if it hashes to the row's
+                            // own digest. A text that does not is evidence about some other
+                            // object, and the one property this field exists for is that
+                            // what a decider reads is what the permit binds. Rows written
+                            // before the field restore None -> rendered UNAVAILABLE.
+                            act_text: s(d, "act_text").filter(|t| {
+                                s(d, "act_digest").as_deref()
+                                    == Some(Self::act_digest_of(t).as_str())
+                            }),
+                            opened_via: OpenedVia::parse(s(d, "opened_via").as_deref()),
                             stated_reason: s(d, "stated_reason"),
                             stated_detail: s(d, "stated_detail"),
                             // The seat keys (#542), restored from the entry when present.
@@ -1404,7 +2214,11 @@ impl EscalationStore {
                             gate_path: s(d, "gate_path"),
                             host_session_id: s(d, "host_session_id"),
                             session_id: s(d, "session_id"),
-                            bar: bar_for(&marker),
+                            // Restored as recorded; priced by `price` only when unrecorded
+                            // (see above).
+                            bar,
+                            matched_markers,
+                            resolved_targets,
                             marker,
                             // The open time is the ENTRY's time, not the restart's. The
                             // payload carries it as of this change; rows written before
@@ -1568,7 +2382,7 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Escalation, OpenError> {
-        self.open_with_payload(plugin_id, role, tool_name, marker, act, stated_reason,
+        self.open_with_payload(plugin_id, role, tool_name, marker, act, &[], stated_reason,
                                stated_detail, None, now, ttl_secs)
     }
 
@@ -1581,6 +2395,7 @@ impl EscalationStore {
         tool_name: &str,
         marker: &str,
         act: Option<&str>,
+        resolved_targets: &[String],
         stated_reason: Option<&str>,
         stated_detail: Option<&str>,
         binding: Option<&PayloadBinding>,
@@ -1648,6 +2463,9 @@ impl EscalationStore {
         h.update(marker.as_bytes());
         let id: String = h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
 
+        let resolved_targets = normalize_resolved_targets(resolved_targets.iter().map(String::as_str));
+        let (bar, matched_markers) = price(marker, act, &resolved_targets);
+
         let esc = Escalation {
             id: id.clone(),
             invited_peers: Vec::new(),
@@ -1655,6 +2473,10 @@ impl EscalationStore {
             // Bound at OPEN, from the same text every decision surface renders (#539).
             // From `act`, never from `stated_reason` — see the note on this fn.
             act_digest: act.map(Self::act_digest_of),
+            // The same string, kept (#1066). Not re-derived anywhere: one source for both.
+            act_text: act.map(str::to_string),
+            // The door records itself via `record_opened_via`; `open` takes no view of it.
+            opened_via: OpenedVia::Unknown,
             payload_sha256: binding.and_then(|b| b.sha256.clone()),
             payload_basis: binding.map(|b| b.basis.to_string()),
             payload_stated_but_not_measured: binding
@@ -1687,10 +2509,14 @@ impl EscalationStore {
             independence: None,
             observed_at: None,
             consumed_at: None,
-            // The bar is stated AT OPEN and copied from policy, so the record carries the
-            // criterion in force at the time — a later tightening of `bar_for` must not
-            // rewrite what this escalation was judged against.
-            bar: bar_for(marker),
+            // The bar is stated AT OPEN, priced by THE rule (`price`), and copied onto the
+            // record, so it carries the criterion in force at the time — a later change to the
+            // rule must not rewrite what this escalation was judged against (and replay
+            // restores it rather than repricing). Monotonic: the act text and the resolved
+            // target can only add markers to the closure's, so they strengthen, never weaken.
+            bar,
+            matched_markers,
+            resolved_targets,
             factors: Vec::new(),
         };
         self.by_id.insert(id, esc.clone());
@@ -1715,7 +2541,7 @@ impl EscalationStore {
         act_digest: &str,
         now: u64,
     ) -> Option<&Escalation> {
-        self.pending_twin_bound(plugin_id, marker, act_digest, None, now)
+        self.pending_twin_bound(plugin_id, marker, act_digest, None, now, Bar::SingleApprover)
     }
 
     /// `pending_twin` where the PAYLOAD is part of the identity (#1056).
@@ -1726,6 +2552,9 @@ impl EscalationStore {
         act_digest: &str,
         payload_sha256: Option<&str>,
         now: u64,
+        // The price the new ask carries. A twin priced BELOW it is not the same ask: folding
+        // into it would drop the stronger bar (see `open_or_coalesce_with_payload`).
+        at_least: Bar,
     ) -> Option<&Escalation> {
         let want_payload = Self::normalize_payload(payload_sha256);
         self.by_id
@@ -1740,6 +2569,7 @@ impl EscalationStore {
                     // authorise the second — the exact substitution the field exists to stop,
                     // arriving through the de-duplicator instead of through the claim.
                     && e.payload_sha256 == want_payload
+                    && e.bar >= at_least
                     && e.status_at(now) == Status::Pending
             })
             .min_by(|a, b| a.opened_at.cmp(&b.opened_at).then_with(|| a.id.cmp(&b.id)))
@@ -1771,7 +2601,7 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Opened, OpenError> {
-        self.open_or_coalesce_with_payload(plugin_id, role, tool_name, marker, act,
+        self.open_or_coalesce_with_payload(plugin_id, role, tool_name, marker, act, &[],
                                            stated_reason, stated_detail, None, now, ttl_secs)
     }
 
@@ -1783,6 +2613,7 @@ impl EscalationStore {
         tool_name: &str,
         marker: &str,
         act: Option<&str>,
+        resolved_targets: &[String],
         stated_reason: Option<&str>,
         stated_detail: Option<&str>,
         binding: Option<&PayloadBinding>,
@@ -1791,15 +2622,22 @@ impl EscalationStore {
     ) -> Result<Opened, OpenError> {
         if let Some(a) = act.map(str::trim).filter(|v| !v.is_empty()) {
             let digest = Self::act_digest_of(a);
+            // A FOLD MUST NOT LOWER THE PRICE. The twin was priced from what ITS ask carried; an
+            // ask for the same act that prices HIGHER (a resolved target the first ask lacked —
+            // an old hook then a new one, across an upgrade) is not folded into the weaker row,
+            // or coalescing would be the one path on which the target could not strengthen.
+            let (asked_bar, _) = price(
+                marker.trim(), Some(a),
+                &normalize_resolved_targets(resolved_targets.iter().map(String::as_str)));
             if let Some(twin) = self.pending_twin_bound(
                 plugin_id.trim(), marker.trim(), &digest,
-                binding.and_then(|b| b.sha256.as_deref()), now)
+                binding.and_then(|b| b.sha256.as_deref()), now, asked_bar)
             {
                 return Ok(Opened::Coalesced(twin.clone()));
             }
         }
-        self.open_with_payload(plugin_id, role, tool_name, marker, act, stated_reason,
-                               stated_detail, binding, now, ttl_secs)
+        self.open_with_payload(plugin_id, role, tool_name, marker, act, resolved_targets,
+                               stated_reason, stated_detail, binding, now, ttl_secs)
             .map(Opened::Minted)
     }
 
@@ -1940,6 +2778,71 @@ impl EscalationStore {
         }
     }
 
+    /// ASKING IS OBSERVING: the proven asker session's OWN approved grants are observed when it
+    /// asks what it may spend (`hestia_gate_escalation_claimable`). Only escalations whose
+    /// recorded asker session (`host_session_id`, set from the proven session at open) is this
+    /// one, so a sibling session on the same seat never starts another's window (#732); each
+    /// passes through `mark_observed`'s own conjuncts (approved, bar met, unspent, first
+    /// observation). Returns the ids this call observed.
+    pub fn observe_session_grants(&mut self, plugin_id: &str, host_session_id: &str, now: u64) -> Vec<String> {
+        if host_session_id.trim().is_empty() {
+            return Vec::new();
+        }
+        let mine: Vec<String> = self
+            .by_id
+            .values()
+            .filter(|e| e.plugin_id == plugin_id && e.host_session_id.as_deref() == Some(host_session_id))
+            .map(|e| e.id.clone())
+            .collect();
+        mine.into_iter().filter(|id| self.mark_observed(id, plugin_id, now)).collect()
+    }
+
+    /// RE-ISSUING IS OBSERVING (#366). The asker that re-issues the very act it was refused has
+    /// learned of the ruling by any reading — that re-issue is what the deny told it to do. Yet
+    /// only a poll or a `claimable` call recorded an observation, so a grant approved while the
+    /// asker sat idle died at `decided_at + 600` and its exact re-issue minted a duplicate
+    /// petition for the operator to rule again (cf54d46850bcdfe0 → d9b167e12a7283b8,
+    /// 2026-10-21; the #366 census: 26 of 103 approvals lapsed in a week). A poll from the
+    /// same session would have revived it, so this adds no authority the asker lacked — it
+    /// removes a step only a seat that already knew the trick would take.
+    ///
+    /// Narrower than `observe_session_grants`: only rows of this proven asker session whose
+    /// marker AND act digest equal the incoming act's, so re-issuing one act never starts the
+    /// fuse of another. Each passes `mark_observed`'s own conjuncts (approved, bar met, unspent,
+    /// first observation), and `decided_horizon` keeps its outer cap at `expires_at + 600`.
+    pub fn observe_reissue(
+        &mut self,
+        plugin_id: &str,
+        host_session_id: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        now: u64,
+    ) -> Vec<String> {
+        let (plugin_id, marker) = (plugin_id.trim(), marker.trim());
+        if host_session_id.trim().is_empty() || plugin_id.is_empty() || marker.is_empty() {
+            return Vec::new();
+        }
+        let Some(want) = attempted_act
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(Self::act_digest_of)
+        else {
+            return Vec::new();
+        };
+        let mine: Vec<String> = self
+            .by_id
+            .values()
+            .filter(|e| {
+                e.plugin_id == plugin_id
+                    && e.marker == marker
+                    && e.host_session_id.as_deref() == Some(host_session_id)
+                    && e.act_digest.as_deref() == Some(want.as_str())
+            })
+            .map(|e| e.id.clone())
+            .collect();
+        mine.into_iter().filter(|id| self.mark_observed(id, plugin_id, now)).collect()
+    }
+
     pub fn claimable_for(&self, plugin_id: &str, now: u64) -> Vec<&Escalation> {
         let mut out: Vec<&Escalation> = self
             .by_id
@@ -2006,6 +2909,20 @@ impl EscalationStore {
     /// registry, and `open`'s existing callers — every one a test with no session to prove
     /// anything by — keep the fail-closed default without a signature change. Returns false
     /// only for an unknown id, which cannot happen from the handler's own flow.
+    /// Record which door opened this escalation (#1066). Separate from `open` for the same
+    /// reason `record_asker_basis` is: `open` is the pure mint and every test that pins it
+    /// still pins it. Each production door calls this before it witnesses the open, so the
+    /// chain row is built from the struct and cannot disagree with it.
+    pub fn record_opened_via(&mut self, id: &str, via: OpenedVia) -> bool {
+        match self.by_id.get_mut(id) {
+            Some(e) => {
+                e.opened_via = via;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn record_asker_basis(&mut self, id: &str, basis: crate::arbiter::AskerBasis) -> bool {
         match self.by_id.get_mut(id) {
             Some(e) => {
@@ -2135,6 +3052,14 @@ impl EscalationStore {
     /// closes that, and this is not that change. What it removes is the four-and-a-half
     /// minutes an operator's approval spent pointing at mutable bytes.
     pub fn measured_payload_for_act(act: &str) -> Option<String> {
+        // A PATCH-APPLICATION act installs the bytes of its patch file, so those are what it
+        // binds (#648, 2026-09-28: codex could not bind an endorsement to `git apply <scratch>/
+        // witness-…` because four sibling patches shared the truncated prefix, and the approval
+        // bound nothing at all). Checked first: `git -C <dir> apply <patch>` would otherwise
+        // read `<dir>` as the copy source, find a directory, and measure nothing.
+        if let Some(patch) = Self::patch_file_of_act(act) {
+            return Self::sha256_of_regular_file(&patch);
+        }
         let toks: Vec<&str> = act.split_whitespace().collect();
         // The destination is what the act WRITES; hashing it would bind the thing being
         // overwritten rather than the thing being installed, which is the opposite record.
@@ -2143,15 +3068,100 @@ impl EscalationStore {
             .iter()
             .find(|t| t.starts_with('/') && !t.contains(".."))
             .map(std::path::Path::new)?;
-        let meta = std::fs::metadata(src).ok()?;
-        if !meta.is_file() || meta.len() > MAX_MEASURED_PAYLOAD_BYTES {
+        Self::sha256_of_regular_file(src)
+    }
+
+/// sha256 of a regular file no larger than `MAX_MEASURED_PAYLOAD_BYTES`, else `None`.
+fn sha256_of_regular_file(p: &std::path::Path) -> Option<String> {
+    read_regular_file_bounded(p, MAX_MEASURED_PAYLOAD_BYTES)
+        .ok()
+        .map(|b| sha256_hex(&b))
+}
+
+/// The patch file a patch-APPLICATION act installs, when the act names exactly one.
+///
+/// Recognised, conservatively (a guess here would bind an approval to the wrong bytes):
+/// - `git [-C <dir>|-c k=v|--opt]… apply|am [--opt]… <patch>`: exactly one non-option operand;
+/// - `patch [--opt]… (-i <patch> | --input=<patch> | < <patch> | <<patch>)`.
+/// The act text may carry the gate's `<Tool>: ` prefix, which is skipped. The patch path must
+/// be ABSOLUTE with no `..` (the daemon does not share the member's working directory), and an
+/// act containing a shell separator (`&&`, `||`, `;`, `|`) is not read at all: which command
+/// the patch belongs to would be a guess. Read-only forms (`--check`, `--stat`, `--numstat`,
+/// `--summary`) are not applications and yield `None`.
+pub fn patch_file_of_act(act: &str) -> Option<std::path::PathBuf> {
+    let mut toks: Vec<&str> = act.split_whitespace().collect();
+    if toks.first().map(|t| t.ends_with(':')).unwrap_or(false) {
+        toks.remove(0);
+    }
+    if toks.iter().any(|t| matches!(*t, "&&" | "||" | ";" | "|") || t.ends_with(';')) {
+        return None;
+    }
+    let abs = |t: &str| -> Option<std::path::PathBuf> {
+        (t.starts_with('/') && !t.contains("..")).then(|| std::path::PathBuf::from(t))
+    };
+    let first = *toks.first()?;
+    if first == "git" {
+        let mut i = 1;
+        // global options before the subcommand; -C and -c take a value
+        while i < toks.len() && toks[i].starts_with('-') {
+            i += if matches!(toks[i], "-C" | "-c") { 2 } else { 1 };
+        }
+        let sub = *toks.get(i)?;
+        if sub != "apply" && sub != "am" {
             return None;
         }
-        let bytes = std::fs::read(src).ok()?;
-        let mut h = Sha256::new();
-        h.update(&bytes);
-        Some(format!("{:x}", h.finalize()))
+        let rest = &toks[i + 1..];
+        if rest.iter().any(|t| matches!(*t, "--check" | "--stat" | "--numstat" | "--summary")) {
+            return None;
+        }
+        // Options that take their value as the NEXT token (`-p 2`, `--directory d`): that
+        // value is not a patch operand. Without this, `git apply -p 2 /p/x.patch` read as two
+        // operands and measured nothing.
+        let mut operands: Vec<&str> = Vec::new();
+        let mut k = 0;
+        while k < rest.len() {
+            let t = rest[k];
+            if matches!(t, "-p" | "--directory" | "--include" | "--exclude") {
+                k += 2;
+                continue;
+            }
+            if !t.starts_with('-') {
+                operands.push(t);
+            }
+            k += 1;
+        }
+        return match operands.as_slice() {
+            [one] => abs(one),
+            _ => None,
+        };
     }
+    if first == "patch" {
+        let mut found: Option<&str> = None;
+        let mut j = 1;
+        while j < toks.len() {
+            let t = toks[j];
+            let v = if t == "-i" || t == "<" {
+                j += 1;
+                toks.get(j).copied()
+            } else if let Some(v) = t.strip_prefix("--input=") {
+                Some(v)
+            } else if let Some(v) = t.strip_prefix('<') {
+                Some(v)
+            } else {
+                None
+            };
+            if let Some(v) = v {
+                if found.is_some() {
+                    return None; // two inputs named: not one patch
+                }
+                found = Some(v);
+            }
+            j += 1;
+        }
+        return abs(found?);
+    }
+    None
+}
 
 /// THE RULE, IN ONE PLACE: measurement is authoritative wherever it is possible.
 ///
@@ -2205,7 +3215,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         attempted_act: Option<&str>,
         now: u64,
     ) -> Option<Escalation> {
-        self.claim_bound(plugin_id, marker, attempted_act, None, now)
+        self.claim_bound(plugin_id, marker, attempted_act, None, Bar::SingleApprover, now)
     }
 
     /// `claim` with the PAYLOAD the caller is about to write, so an approval rendered for one
@@ -2216,12 +3226,19 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
     /// escalation that bound one demands a match. So the field ships inert, every existing row
     /// keeps its behaviour, and the binding switches on per-seat as shims begin to send it —
     /// instead of a flag day where every un-wired seat loses its approvals at once.
+    ///
+    /// `at_least` is the price of the INCOMING act (`price` over its marker, act and resolved
+    /// targets). An approval granted under a LOWER bar is not spent for it: the record keeps
+    /// its historical bar (it is never repriced), and a stronger ask needs its own, sufficient
+    /// authorization (Codex review of #1239, P1-1: a weak approval for an act whose summary cut
+    /// the sovereign filename out must not be spendable once the target names it).
     pub fn claim_bound(
         &mut self,
         plugin_id: &str,
         marker: &str,
         attempted_act: Option<&str>,
         attempted_payload: Option<&str>,
+        at_least: Bar,
         now: u64,
     ) -> Option<Escalation> {
         let plugin_id = plugin_id.trim();
@@ -2265,6 +3282,8 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                         (Some(_), None) => false,
                         (None, _) => true,
                     }
+                    // The incoming act's price must not exceed the bar this approval met.
+                    && e.bar >= at_least
                     && e.is_claimable(now)
             })
             .map(|e| (e.opened_at, e.id.clone()))
@@ -2274,6 +3293,40 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         let esc = self.by_id.get_mut(&id)?;
         esc.consumed_at = Some(now);
         Some(esc.clone())
+    }
+
+    /// A claimable approval for THIS act (same member, marker, act digest, payload rule) that was
+    /// granted under a bar BELOW the incoming act's price — so `claim_bound` refused to spend it.
+    /// Named so the refusal can say why, instead of reading as "no approval found".
+    pub fn approved_below_bar(
+        &self,
+        plugin_id: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        attempted_payload: Option<&str>,
+        at_least: Bar,
+        now: u64,
+    ) -> Option<&Escalation> {
+        let want_digest = attempted_act
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(Self::act_digest_of)?;
+        let want_payload = Self::normalize_payload(attempted_payload);
+        self.by_id
+            .values()
+            .filter(|e| {
+                e.plugin_id == plugin_id.trim()
+                    && e.marker == marker.trim()
+                    && e.act_digest.as_deref() == Some(want_digest.as_str())
+                    && match (&e.payload_sha256, &want_payload) {
+                        (Some(bound), Some(asked)) => bound == asked,
+                        (Some(_), None) => false,
+                        (None, _) => true,
+                    }
+                    && e.bar < at_least
+                    && e.is_claimable(now)
+            })
+            .min_by(|a, b| a.opened_at.cmp(&b.opened_at).then_with(|| a.id.cmp(&b.id)))
     }
 
     /// A claimable approval for THIS act whose bound payload is not the one being presented.
@@ -2323,6 +3376,187 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             .get(id)
             .map(|e| e.status_at(now))
             .unwrap_or(Status::Expired)
+    }
+
+    /// Remember what was done for a request key (#1166). Last write wins; the oldest key is
+    /// evicted once the map passes `REQUEST_KEY_CAP`.
+    pub fn record_request_key(&mut self, key: &str, rec: RequestKeyRecord) {
+        if !valid_request_key(key) {
+            return;
+        }
+        self.request_keys.insert(key.to_string(), rec);
+        if self.request_keys.len() > REQUEST_KEY_CAP {
+            if let Some(oldest) = self
+                .request_keys
+                .iter()
+                .min_by_key(|(_, r)| r.at)
+                .map(|(k, _)| k.clone())
+            {
+                self.request_keys.remove(&oldest);
+            }
+        }
+    }
+
+    /// The last outcome recorded for a key. READ-ONLY: never observes, never arms a fuse.
+    pub fn request_key(&self, key: &str) -> Option<&RequestKeyRecord> {
+        self.request_keys.get(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clone_for_test(&self) -> EscalationStore {
+        EscalationStore {
+            request_keys: self.request_keys.clone(),
+            begins_seen: self.begins_seen.clone(),
+            booted_at: self.booted_at,
+            begins_evicted_hwm: self.begins_evicted_hwm,
+            fenced: self.fenced.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Record that a tool invocation reached `hestia_begin_action` (execution evidence).
+    pub fn record_begin(&mut self, correlation_key: &str, now: u64) {
+        if !valid_correlation_key(correlation_key) {
+            return;
+        }
+        self.begins_seen.insert(correlation_key.to_string(), now);
+        if self.begins_seen.len() > BEGINS_SEEN_CAP {
+            if let Some((oldest, t)) = self.begins_seen.iter().min_by_key(|(_, t)| **t)
+                .map(|(k, t)| (k.clone(), *t))
+            {
+                self.begins_seen.remove(&oldest);
+                self.begins_evicted_hwm = self.begins_evicted_hwm.max(t);
+            }
+        }
+    }
+
+    /// Has this invocation reached begin_action at or after `since`?
+    pub fn begin_seen_since(&self, correlation_key: &str, since: u64) -> bool {
+        self.begins_seen.get(correlation_key).is_some_and(|t| *t >= since)
+    }
+
+    /// The reclaim that superseded this invocation, if any: (fenced_at, escalation_id).
+    pub fn fenced_by(&self, correlation_key: &str) -> Option<&(u64, String)> {
+        self.fenced.get(correlation_key)
+    }
+
+    /// Lift a fence this reclaim wrote, only if it is still that reclaim's (append failed).
+    pub fn unfence(&mut self, correlation_key: &str, escalation_id: &str) {
+        if self.fenced.get(correlation_key).is_some_and(|(_, e)| e == escalation_id) {
+            self.fenced.remove(correlation_key);
+        }
+    }
+
+    /// Fence a superseded invocation. Returns false -- and fences nothing -- when the table is
+    /// full of fences still inside their TTL: the caller must then REFUSE the reclaim, because
+    /// granting it without a fence is exactly the race the fence exists to close.
+    pub fn fence(&mut self, correlation_key: &str, escalation_id: &str, now: u64) -> bool {
+        if !valid_correlation_key(correlation_key) {
+            return false;
+        }
+        if self.fenced.len() >= FENCE_CAP && !self.fenced.contains_key(correlation_key) {
+            let expired: Option<String> = self.fenced.iter()
+                .filter(|(_, (t, _))| now.saturating_sub(*t) > FENCE_TTL_SECS)
+                .min_by_key(|(_, (t, _))| *t)
+                .map(|(k, _)| k.clone());
+            match expired {
+                Some(k) => { self.fenced.remove(&k); }
+                None => return false,
+            }
+        }
+        self.fenced.insert(correlation_key.to_string(), (now, escalation_id.to_string()));
+        true
+    }
+
+    /// May THIS retry be answered with the permit its request already spent? (#774, #1169)
+    ///
+    /// A reclaim is recovery of ONE lost answer, never repeat authority. Command equality
+    /// cannot prove a transport failure (GPT review of #1169): an identical command after a
+    /// delivered, executed permit must NOT inherit it. So the evidence is the daemon's own --
+    /// whether the claimed invocation ever reached `hestia_begin_action`, which every gate
+    /// reaches for a permitted write before the tool runs -- and never anything the agent
+    /// asserts. Every conjunct must hold; the error names the first that fails:
+    ///   - the key's record is a spend (`claimed`), not an open, and not already reclaimed;
+    ///   - the claim happened in THIS daemon's lifetime (its begin evidence is held here);
+    ///   - within `RECLAIM_WINDOW_SECS` of that claim;
+    ///   - same member, marker, act digest, bound payload, and proven host session;
+    ///   - the claim recorded its invocation, and the retry names a DIFFERENT invocation;
+    ///   - the claimed invocation has NO begin_action since the claim (it never executed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn reclaimable(
+        &self,
+        key: &str,
+        plugin_id: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        attempted_payload: Option<&str>,
+        proven_host_session_id: Option<&str>,
+        invocation_key: Option<&str>,
+        // The INCOMING act's price (see `claim_bound`): a lost answer is recovered only for an
+        // act that prices no higher than the approval the first claim spent.
+        at_least: Bar,
+        now: u64,
+    ) -> Result<RequestKeyRecord, &'static str> {
+        let rec = self.request_keys.get(key).ok_or("no record for this request key")?;
+        match rec.outcome.as_str() {
+            "claimed" => {}
+            "reclaimed" => return Err("this claim was already reclaimed once"),
+            _ => return Err("this request key's last outcome was not a spend"),
+        }
+        if rec.at < self.booted_at {
+            return Err("the daemon restarted since that claim, so its execution evidence is not held here");
+        }
+        if self.begins_evicted_hwm >= rec.at {
+            return Err("begin evidence at or after that claim was evicted under pressure, so execution cannot be ruled out");
+        }
+        if now.saturating_sub(rec.at) > RECLAIM_WINDOW_SECS {
+            return Err("past the reclaim window of the first claim");
+        }
+        if rec.plugin_id != plugin_id.trim() || rec.marker != marker.trim() {
+            return Err("different member or marker");
+        }
+        let asked = attempted_act
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(Self::act_digest_of)
+            .ok_or("the retry names no act")?;
+        if rec.act_digest.as_deref() != Some(asked.as_str()) {
+            return Err("different act");
+        }
+        if let Some(bound) = &rec.payload_sha256 {
+            if Self::normalize_payload(attempted_payload).as_deref() != Some(bound.as_str()) {
+                return Err("different or absent payload");
+            }
+        }
+        if let Some(sess) = &rec.host_session_id {
+            if proven_host_session_id != Some(sess.as_str()) {
+                return Err("different or unproven host session");
+            }
+        }
+        let original = rec.invocation_key.as_deref().ok_or("the claim recorded no invocation")?;
+        let retry = invocation_key.ok_or("the retry names no invocation")?;
+        if retry == original {
+            return Err("the same invocation retried: its permit was already delivered to it");
+        }
+        if !rec.supersession_hard_stop {
+            return Err("the claimed invocation's seat did not declare that it hard-stops a superseded invocation (supersession: hard_stop), so a fence could not be relied on to stop it");
+        }
+        if self.fenced.contains_key(retry) {
+            return Err("the retrying invocation is itself fenced by an earlier reclaim");
+        }
+        if self.begin_seen_since(original, rec.at) {
+            return Err("the claimed invocation reached execution (begin_action seen): its permit was delivered");
+        }
+        // Fail closed when the spent row is gone: its bar cannot be read, so it can be shown to
+        // cover only the everyday bar every approval meets, never a stronger ask.
+        let covers = match self.by_id.get(&rec.escalation_id) {
+            Some(e) => e.bar >= at_least,
+            None => at_least == Bar::SingleApprover,
+        };
+        if !covers {
+            return Err("the retry prices above the bar the spent approval was granted under (its resolved targets reach a stronger bar): a stronger ask needs its own approval");
+        }
+        Ok(rec.clone())
     }
 
     pub fn get(&self, id: &str) -> Option<&Escalation> {
@@ -2600,6 +3834,254 @@ mod tests {
     use super::*;
 
     const T0: u64 = 1_800_000_000;
+
+    /// One-gate stage C: the common gate every seat delegates to is priced like the enforcement
+    /// path it replaced, wherever its marker names it (the installed copy's marker is its
+    /// basename). Control: the law renderer stays single-approver.
+    #[test]
+    fn the_common_gate_is_priced_like_the_enforcement_path() {
+        assert_eq!(bar_for("hestia_single_gate.py"), Bar::SovereignPlusPeer);
+        assert_eq!(bar_for("pre_tool_use.py"), Bar::SovereignPlusPeer);
+        assert_eq!(bar_for("law_inject.py"), Bar::SingleApprover);
+        // One list: every sovereign file is priced sovereign by `bar_for` itself.
+        for f in SOVEREIGN_FILES {
+            assert_eq!(bar_for(f), Bar::SovereignPlusPeer, "{f}");
+        }
+    }
+
+    fn open_act(marker: &str, act: &str) -> Escalation {
+        let mut s = EscalationStore::default();
+        s.open("codex", "role:constellation:member", "Edit", marker, Some(act), None, None, T0, 120)
+            .expect("open")
+    }
+
+    /// One-gate stage C governance fix. The shared closure matches DIRECTORIES before filenames,
+    /// so a write to the mechanism under plugins/_shared reaches the bar as marker
+    /// "plugins/_shared" (stage A's escalation 9c433571 recorded exactly that) and was priced
+    /// single-approver. The bar is now the highest over every marker the act reaches.
+    #[test]
+    fn a_mechanism_write_via_a_shared_path_prices_sovereign() {
+        let e = open_act("plugins/_shared",
+                         "/w/hestia/plugins/_shared/hestia_gate_mechanism.py");
+        assert_eq!(e.bar, Bar::SovereignPlusPeer);
+        assert_eq!(e.matched_markers, vec!["plugins/_shared".to_string(),
+                                           "hestia_gate_mechanism.py".to_string()]);
+        // The same through every act shape the gate sends: a shell command, an apply_patch
+        // body (JSON-escaped newlines), and the common gate's installed copy.
+        for act in [
+            "sed -i s/a/b/ plugins/_shared/hestia_gate_mechanism.py",
+            r#"{"input": "*** Begin Patch\n*** Update File: /w/plugins/_shared/hestia_single_gate.py\n+x"}"#,
+            "cp /tmp/p/x.py \"/w/plugins/kimi/hooks/pre_tool_use.py\"",
+        ] {
+            let e = open_act("plugins/_shared", act);
+            assert_eq!(e.bar, Bar::SovereignPlusPeer, "{act}");
+            assert!(e.matched_markers.len() == 2, "{act}: {:?}", e.matched_markers);
+        }
+    }
+
+    #[test]
+    fn a_non_sovereign_shared_file_stays_single_approver() {
+        let e = open_act("plugins/_shared", "/w/hestia/plugins/_shared/hestia_gate_core.py");
+        assert_eq!(e.bar, Bar::SingleApprover);
+        assert_eq!(e.matched_markers, vec!["plugins/_shared".to_string()]);
+        // A name that merely CONTAINS a sovereign basename is not one.
+        let e = open_act("plugins/_shared", "/w/plugins/_shared/not_witness.py.bak");
+        assert_eq!(e.bar, Bar::SingleApprover);
+        // And a directory marker for hooks prices by the file it names.
+        let e = open_act("plugins/*/hooks", "/w/plugins/claude-code/hooks/law_inject.py");
+        assert_eq!(e.bar, Bar::SingleApprover);
+    }
+
+    /// Align upward: every member's gate entry is priced like every other's, wherever its install
+    /// declaration puts it and whatever its harness names it. Tested through `open`, with the
+    /// marker the closure actually reports (the installed hooks dir, or the repo hooks pattern).
+    #[test]
+    fn every_member_gate_entry_prices_sovereign_at_its_declared_locations() {
+        for e in MEMBER_GATE_ENTRIES {
+            let base = e.entry.rsplit('/').next().unwrap();
+            let dest = e.dest.trim_start_matches("~/");
+            for (marker, act) in [
+                (dest.to_string(), format!("/home/u/{dest}/{base}")),
+                (dest.to_string(), format!("touch /home/u/{dest}/{base}")),
+                (dest.to_string(), format!("echo x > ~/{dest}/{base}")),
+                ("plugins/*/hooks".to_string(), format!("/w/hestia/plugins/{}/{}", e.plugin, e.entry)),
+                (base.to_string(), format!("/w/hestia/hooks-gt/{}/{}", e.plugin, e.entry)),
+            ] {
+                let opened = open_act(&marker, &act);
+                assert_eq!(opened.bar, Bar::SovereignPlusPeer, "{}: {marker} / {act}", e.plugin);
+            }
+        }
+        // The member whose entry is not in SOVEREIGN_FILES, by its qualified marker.
+        let e = open_act(".gemini/hestia-plugins/gemini/hooks",
+                         "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py");
+        assert_eq!(e.matched_markers, vec![
+            ".gemini/hestia-plugins/gemini/hooks".to_string(),
+            ".gemini/hestia-plugins/gemini/hooks/before_tool.py".to_string()]);
+    }
+
+    /// A registered gate entry no declaration covers (a legacy install the harness actually runs)
+    /// escalates under the registered-entry marker and is priced two-factor, whatever its
+    /// directory marker or act text say. Control: the same act under the directory marker alone.
+    #[test]
+    fn a_registered_gate_entry_prices_sovereign_like_a_declared_one() {
+        assert_eq!(bar_for(REGISTERED_GATE_ENTRY_MARKER), Bar::SovereignPlusPeer);
+        assert_eq!(bar_for(&format!(" {REGISTERED_GATE_ENTRY_MARKER} ")), Bar::SovereignPlusPeer);
+        let act = "/home/u/.hestia/members/gemini/entry_gate.py";
+        assert_eq!(open_act(REGISTERED_GATE_ENTRY_MARKER, act).bar, Bar::SovereignPlusPeer);
+        assert_eq!(open_act("home/u/.hestia/members/gemini", act).bar, Bar::SingleApprover);
+        // Not a prefix or substring rule: a look-alike marker is not promoted.
+        assert_eq!(bar_for("registered-gate-entry-not"), Bar::SingleApprover);
+        assert_eq!(bar_for("x/registered-gate-entry"), Bar::SingleApprover);
+    }
+
+    /// The derivation is location-qualified: a file merely NAMED like a member's entry, outside
+    /// every declared location, is not promoted — neither as the closure's marker nor in the act
+    /// text (the exact-name act-text rule covers `SOVEREIGN_FILES` only). Pre-existing names
+    /// keep their name-anywhere pricing (the backstop is unchanged).
+    #[test]
+    fn an_entry_named_file_outside_every_declared_location_is_not_promoted() {
+        let base = "before_tool.py";
+        assert_eq!(bar_for(base), Bar::SingleApprover);
+        for act in [
+            "/srv/proj/hooks/before_tool.py",
+            "touch /home/u/.gemini/before_tool.py",
+            "/w/plugins/gemini/before_tool.py",           // not under the declared entry path
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py.bak",
+        ] {
+            let e = open_act(base, act);
+            assert_eq!(e.bar, Bar::SingleApprover, "{act}");
+            assert_eq!(e.matched_markers, vec![base.to_string()], "{act}");
+        }
+        // Backstop unchanged: a SOVEREIGN_FILES name is still priced by name anywhere, and is
+        // not double-listed as a qualified location.
+        let e = open_act("plugins/*/hooks", "/w/plugins/kimi/hooks/pre_tool_use.py");
+        assert_eq!(e.bar, Bar::SovereignPlusPeer);
+        assert_eq!(e.matched_markers.len(), 2, "{:?}", e.matched_markers);
+    }
+
+    /// Covered by construction: the table `bar_for` derives entry pricing from must equal what
+    /// the members' expects.json install blocks declare — a member added, renamed or moved
+    /// without it is red here.
+    #[test]
+    fn member_gate_entries_match_the_install_declarations() {
+        let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("plugins");
+        let Ok(dir) = std::fs::read_dir(&plugins) else {
+            // A source tarball without the plugins tree: nothing to bind against.
+            eprintln!("no plugins dir at {}; declarations not checked", plugins.display());
+            return;
+        };
+        let mut declared: Vec<(String, String, String)> = Vec::new();
+        for ent in dir.flatten() {
+            let p = ent.path().join("expects.json");
+            let Ok(text) = std::fs::read_to_string(&p) else { continue };
+            let v: serde_json::Value = serde_json::from_str(&text).expect("expects.json parses");
+            let inst = &v["install"];
+            let (Some(dest), Some(entry)) = (inst["dest"].as_str(), inst["gate_probe"]["entry"].as_str())
+            else { continue };
+            declared.push((ent.file_name().to_string_lossy().into_owned(), dest.into(), entry.into()));
+        }
+        declared.sort();
+        let mut table: Vec<(String, String, String)> = MEMBER_GATE_ENTRIES.iter()
+            .map(|e| (e.plugin.into(), e.dest.into(), e.entry.into())).collect();
+        table.sort();
+        assert!(declared.len() >= 4, "found {declared:?}");
+        assert_eq!(table, declared, "MEMBER_GATE_ENTRIES drifted from plugins/*/expects.json");
+    }
+
+    /// #774/#1169: a reclaim is recovery of one lost answer. Every conjunct is exercised on its
+    /// own, and the positive arm is the control.
+    #[test]
+    fn a_reclaim_requires_every_conjunct_and_never_outlives_its_window() {
+        let key = "c".repeat(64);
+        let mut st = EscalationStore::default();
+        let act = "Bash: git apply /tmp/p/fix.patch";
+        let pay = "ab".repeat(32);
+        let rec = RequestKeyRecord {
+            outcome: "claimed".into(),
+            escalation_id: "E1".into(),
+            at: T0,
+            plugin_id: "codex".into(),
+            marker: "pre_tool_use.py".into(),
+            act_digest: Some(EscalationStore::act_digest_of(act)),
+            payload_sha256: Some(pay.clone()),
+            host_session_id: Some("hs-1".into()),
+            invocation_key: Some("toolu_A".into()),
+            supersession_hard_stop: true,
+        };
+        st.record_request_key(&key, rec.clone());
+        #[allow(clippy::too_many_arguments)]
+        fn why(st: &EscalationStore, k: &str, pl: &str, mk: &str, a: &str, p: Option<&str>,
+               hs: Option<&str>, inv: Option<&str>, now: u64) -> Result<(), &'static str> {
+            st.reclaimable(k, pl, mk, Some(a), p, hs, inv, Bar::SingleApprover, now).map(|_| ())
+        }
+        let base = |st: &EscalationStore, now| why(st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), now);
+        assert_eq!(base(&st, T0 + 5), Ok(()), "control");
+        assert_eq!(base(&st, T0 + RECLAIM_WINDOW_SECS), Ok(()), "the window's last second still holds");
+        assert!(base(&st, T0 + RECLAIM_WINDOW_SECS + 1).unwrap_err().contains("window"));
+        assert!(why(&st, &"d".repeat(64), "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).is_err(), "other key");
+        assert!(why(&st, &key, "kimi-code", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("member"));
+        assert!(why(&st, &key, "codex", "other.py", act, Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("marker"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", "Bash: rm x", Some(&pay), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("act"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&"ff".repeat(32)), Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("payload"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, None, Some("hs-1"), Some("toolu_B"), T0 + 5).unwrap_err().contains("payload"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-2"), Some("toolu_B"), T0 + 5).unwrap_err().contains("session"));
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), None, Some("toolu_B"), T0 + 5).unwrap_err().contains("session"));
+        // THE INVOCATION CONJUNCTS (#1169).
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), Some("toolu_A"), T0 + 5)
+                    .unwrap_err().contains("same invocation"), "the same invocation retried");
+        assert!(why(&st, &key, "codex", "pre_tool_use.py", act, Some(&pay), Some("hs-1"), None, T0 + 5)
+                    .unwrap_err().contains("no invocation"), "a retry that names no invocation");
+        let mut no_inv = st.clone_for_test();
+        no_inv.record_request_key(&key, RequestKeyRecord { invocation_key: None, ..rec.clone() });
+        assert!(base(&no_inv, T0 + 5).unwrap_err().contains("recorded no invocation"));
+        // GPT review of ca5f394: the ORIGINAL seat must hard-stop a superseded invocation, or
+        // the fence is not a cancellation.
+        let mut soft = st.clone_for_test();
+        soft.record_request_key(&key, RequestKeyRecord { supersession_hard_stop: false, ..rec.clone() });
+        assert!(base(&soft, T0 + 5).unwrap_err().contains("hard-stops"));
+        // Execution evidence: a begin for the CLAIMED invocation at/after the claim refuses.
+        let mut ran = st.clone_for_test();
+        ran.record_begin("toolu_A", T0 + 1);
+        assert!(base(&ran, T0 + 5).unwrap_err().contains("reached execution"));
+        // ...but a begin from BEFORE the claim is not evidence about this permit.
+        let mut before = st.clone_for_test();
+        before.record_begin("toolu_A", T0 - 1);
+        assert_eq!(base(&before, T0 + 5), Ok(()));
+        // Once reclaimed, never again.
+        let mut once = st.clone_for_test();
+        once.record_request_key(&key, RequestKeyRecord { outcome: "reclaimed".into(), ..rec.clone() });
+        assert!(base(&once, T0 + 5).unwrap_err().contains("already reclaimed"));
+        // An open is not a spend.
+        let mut opened = st.clone_for_test();
+        opened.record_request_key(&key, RequestKeyRecord { outcome: "opened".into(), ..rec.clone() });
+        assert!(base(&opened, T0 + 5).unwrap_err().contains("not a spend"));
+        // A claim older than this daemon (replayed) holds no execution evidence here.
+        let mut restarted = st.clone_for_test();
+        restarted.booted_at = T0 + 1;
+        assert!(base(&restarted, T0 + 5).unwrap_err().contains("restarted"));
+        // Malformed keys are never stored.
+        st.record_request_key("nope", rec.clone());
+        assert!(st.request_key("nope").is_none());
+        assert!(!valid_request_key(&"A".repeat(64)) && valid_request_key(&"0".repeat(64)));
+        assert!(valid_correlation_key("toolu_01ABC") && !valid_correlation_key("a/b") && !valid_correlation_key(""));
+    }
+
+    /// The key map is bounded: the oldest record goes first.
+    #[test]
+    fn the_request_key_map_is_bounded_oldest_first() {
+        let mut st = EscalationStore::default();
+        let rec = |at| RequestKeyRecord {
+            outcome: "opened".into(), escalation_id: "E".into(), at,
+            plugin_id: "p".into(), marker: "m".into(), act_digest: None,
+            payload_sha256: None, host_session_id: None, invocation_key: None,
+            supersession_hard_stop: false,
+        };
+        for i in 0..=REQUEST_KEY_CAP {
+            st.record_request_key(&format!("{:064x}", i), rec(T0 + i as u64));
+        }
+        assert!(st.request_key(&format!("{:064x}", 0)).is_none(), "the oldest was evicted");
+        assert!(st.request_key(&format!("{:064x}", REQUEST_KEY_CAP)).is_some());
+    }
 
     fn chain_entry(event_type: &str, data: serde_json::Value) -> crate::storage::chain::ChainEntry {
         crate::storage::chain::ChainEntry {
@@ -3406,7 +4888,7 @@ mod tests {
 
         let mut s = EscalationStore::default();
         let e = s
-            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT),
+            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT), &[],
                                Some(ACT), None, Some(&stated(APPROVED_BYTES)), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -3417,11 +4899,11 @@ mod tests {
         // digest cannot be what refuses — exactly the isolation #539's test uses one axis up.
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT),
-                          Some(SUBSTITUTED_BYTES), T0 + 10).is_none(),
+                          Some(SUBSTITUTED_BYTES), Bar::SingleApprover, T0 + 10).is_none(),
             "an approval rendered for one payload must not be spendable on another"
         );
         assert!(
-            s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT), None, T0 + 11)
+            s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT), None, Bar::SingleApprover, T0 + 11)
                 .is_none(),
             "nor by a caller that simply stops naming the bytes — silence must not be a \
              skeleton key for a permit that bound a payload"
@@ -3429,12 +4911,12 @@ mod tests {
         // POSITIVE CONTROL. Without it a store that refused every bound claim would pass.
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT),
-                          Some(APPROVED_BYTES), T0 + 12).is_some(),
+                          Some(APPROVED_BYTES), Bar::SingleApprover, T0 + 12).is_some(),
             "the bytes it was granted for still claim it"
         );
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(ACT),
-                          Some(APPROVED_BYTES), T0 + 13).is_none(),
+                          Some(APPROVED_BYTES), Bar::SingleApprover, T0 + 13).is_none(),
             "and only once — binding the payload does not make a permit reusable"
         );
     }
@@ -3534,7 +5016,7 @@ mod tests {
                    "and the disagreement must be observable — the whole point");
 
         let mut s = EscalationStore::default();
-        let e = s.open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(&act),
+        let e = s.open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(&act), &[],
                                     Some(&act), None, Some(&b1), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -3548,7 +5030,7 @@ mod tests {
         let b2 = EscalationStore::bind_payload(Some(&act), Some(LIE));
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(&act), b2.sha256.as_deref(),
-                          T0 + 10).is_none(),
+                          Bar::SingleApprover, T0 + 10).is_none(),
             "repeating a caller assertion satisfied a measured permit — the bytes moved and \
              the permit spent anyway"
         );
@@ -3566,7 +5048,7 @@ mod tests {
         assert_eq!(honest.basis, "measured");
         assert!(
             s.claim_bound("claude-code", "pre_tool_use.py", Some(&act), honest.sha256.as_deref(),
-                          T0 + 11).is_some(),
+                          Bar::SingleApprover, T0 + 11).is_some(),
             "the approved bytes still claim the permit"
         );
 
@@ -3603,7 +5085,7 @@ mod tests {
         // approval demanded nothing, so presenting more than nothing cannot be a mismatch.
         assert!(
             s.claim_bound("kimi-code", "pre_tool_use.py", Some(ACT), Some("cccc3333"),
-                          T0 + 10).is_some(),
+                          Bar::SingleApprover, T0 + 10).is_some(),
             "an unbound approval is claimed by any payload, including a named one"
         );
     }
@@ -3622,17 +5104,17 @@ mod tests {
         let mut s = EscalationStore::default();
         let first = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), Some(ACT), None, Some(&stated("aaaa1111")),
+                                           Some(ACT), &[], Some(ACT), None, Some(&stated("aaaa1111")),
                                            T0, DEFAULT_TTL_SECS)
             .unwrap();
         let same = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), Some(ACT), None, Some(&stated("aaaa1111")),
+                                           Some(ACT), &[], Some(ACT), None, Some(&stated("aaaa1111")),
                                            T0 + 9, DEFAULT_TTL_SECS)
             .unwrap();
         let moved = s
             .open_or_coalesce_with_payload("claude-code", "r", "Bash", "pre_tool_use.py",
-                                           Some(ACT), Some(ACT), None, Some(&stated("bbbb2222")),
+                                           Some(ACT), &[], Some(ACT), None, Some(&stated("bbbb2222")),
                                            T0 + 18, DEFAULT_TTL_SECS)
             .unwrap();
         // CONTROL FIRST: identical bytes still coalesce, or this test would pass on a store
@@ -3666,7 +5148,7 @@ mod tests {
         const OTHER_ACT: &str = "Bash -> cp /tmp/other.txt plugins/kimi/hooks/pre_tool_use.py";
         let mut s = EscalationStore::default();
         let e = s
-            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT),
+            .open_with_payload("claude-code", "r", "Bash", "pre_tool_use.py", Some(ACT), &[],
                                Some(ACT), None, Some(&stated("aaaa1111")), T0, DEFAULT_TTL_SECS)
             .unwrap();
         s.decide(&e.id, true, "operator", "role:constellation:sovereign",
@@ -3718,6 +5200,9 @@ mod tests {
             err, OpenError::MissingField("act"),
             "an approval bound to a rationale can never be claimed, so it must not be minted"
         );
+        let refusal = err.to_string();
+        assert!(refusal.contains("VERBATIM"), "the refusal must say not to reconstruct the act: {refusal}");
+        assert!(refusal.contains("deny text"), "the refusal must say where the canonical act comes from: {refusal}");
         assert_eq!(s.len(), 0, "and nothing was minted — no MAX_PENDING burn, no loop");
 
         // With the act stated, the same open succeeds and the permit is spendable.
@@ -4206,6 +5691,59 @@ mod tests {
                  not one predicate at all (offset {offset})"
             );
         }
+    }
+
+    /// #366: the asker's exact re-issue observes its own grant, and only that grant. A grant
+    /// ruled at T0+5 and never observed is lapsed at T0+1200 (decided_at + 600); before this,
+    /// its byte-identical re-issue found nothing claimable and minted a duplicate petition.
+    /// Arms: another session, another act, another marker observe nothing; the asker's
+    /// re-issue observes exactly the matching row and leaves a sibling grant of the same
+    /// session unarmed; and the outer cap (`expires_at + 600`) still holds after observation.
+    #[test]
+    fn a_reissue_observes_only_its_own_matching_grant() {
+        let mut s = EscalationStore::default();
+        let open = |s: &mut EscalationStore, marker: &str, act: &str, host: &str| {
+            let id = s
+                .open("claude-code", "r", "Bash", marker, Some(act), None, None, T0, DEFAULT_TTL_SECS)
+                .unwrap()
+                .id;
+            assert!(s.record_seat_keys(&id, None, Some(host), None));
+            s.decide(&id, true, "operator", "role:constellation:sovereign",
+                     Channel::OperatorSession, None, Some("k"), T0 + 5)
+                .unwrap();
+            id
+        };
+        let id = open(&mut s, "pre_tool_use.py", TEST_ACT, "hs-asker");
+        let other_act = open(&mut s, "pre_tool_use.py", "Edit -> /repo/other.rs", "hs-asker");
+        let late = T0 + 1200;
+        assert!(!s.get(&id).unwrap().is_claimable(late), "precondition: lapsed unobserved");
+
+        assert!(s.observe_reissue("claude-code", "hs-sibling", "pre_tool_use.py", Some(TEST_ACT), late).is_empty(),
+                "a sibling session's identical re-issue observes nothing");
+        assert!(s.observe_reissue("claude-code", "hs-asker", "pre_tool_use.py", Some("Bash: rm -rf /"), late).is_empty(),
+                "a different act observes nothing");
+        assert!(s.observe_reissue("claude-code", "hs-asker", "other.py", Some(TEST_ACT), late).is_empty(),
+                "a different marker observes nothing");
+        assert!(s.observe_reissue("codex", "hs-asker", "pre_tool_use.py", Some(TEST_ACT), late).is_empty(),
+                "another member observes nothing");
+        assert!(s.observe_reissue("claude-code", "hs-asker", "pre_tool_use.py", None, late).is_empty(),
+                "an unnamed act observes nothing");
+        assert_eq!(s.get(&id).unwrap().observed_at, None);
+
+        assert_eq!(s.observe_reissue("claude-code", "hs-asker", "pre_tool_use.py", Some(TEST_ACT), late),
+                   vec![id.clone()]);
+        assert!(s.get(&id).unwrap().is_claimable(late), "observed at the re-issue: claimable again");
+        assert_eq!(s.get(&other_act).unwrap().observed_at, None,
+                   "re-issuing one act never starts the fuse of another");
+        let claimed = s.claim("claude-code", "pre_tool_use.py", Some(TEST_ACT), late).expect("claims");
+        assert_eq!(claimed.id, id);
+
+        // Outer cap: observation never stretches a grant past expires_at + 600.
+        let capped = open(&mut s, "cap.py", TEST_ACT, "hs-asker");
+        let past = s.get(&capped).unwrap().expires_at + APPROVAL_CLAIM_WINDOW_SECS + 1;
+        assert_eq!(s.observe_reissue("claude-code", "hs-asker", "cap.py", Some(TEST_ACT), past),
+                   vec![capped.clone()], "observed (mark_observed does not read the clock)…");
+        assert!(!s.get(&capped).unwrap().is_claimable(past), "…but not claimable past the cap");
     }
 
     /// Observation must not re-arm a SPENT permit. `mark_observed` read four conjuncts and
@@ -5270,6 +6808,40 @@ mod bar_factor_tests {
             .expect_err("expired is expired");
         assert_eq!(err, DecideError::Expired);
     }
+
+    #[test]
+    fn a_ruled_escalation_still_takes_evidence_long_after_its_record_horizon() {
+        let (mut s, id) = open_with("law_inject.py");
+        s.decide(
+            &id,
+            true,
+            "dp",
+            "role:constellation:sovereign",
+            Channel::OperatorSession,
+            None,
+            Some("ruled inside the window"),
+            T0 + 5,
+        )
+        .expect("decided while pending");
+
+        let late = T0 + 12_000;
+        assert_eq!(s.status_of(&id, late), Status::Approved, "a ruling does not lapse");
+
+        let after = s
+            .corroborate(
+                &id,
+                "codex",
+                "role:constellation:member",
+                None,
+                true,
+                Some("late review remains evidence, not a new ruling"),
+                late,
+            )
+            .expect("a decided record keeps accepting evidence after the pending horizon");
+
+        assert_eq!(after.peer_participation().dissented, 1, "the late dissent is on the record");
+        assert_eq!(after.stored_status(), Status::Approved, "late evidence does not rewrite the ruling");
+    }
 }
 
 #[cfg(test)]
@@ -5431,5 +7003,515 @@ mod coalesce_tests {
         let _ = open2(&mut s, ACT, "m", T0);
         let r = s.open_or_coalesce("claude-code", "r", "Bash", "m", None, None, None, T0 + 1, 3600);
         assert!(matches!(r, Err(OpenError::MissingField("act"))));
+    }
+}
+
+#[cfg(test)]
+mod resolved_target_tests {
+    //! #810, as #812 built it (kimi-code), recut onto one-gate stage C (#1231). The bar is ONE
+    //! rule (`price`): the highest bar over the closure marker, every resolved target, and every
+    //! sovereign file the act text names. These pin what the targets add beyond stage C, the
+    //! monotonicity #812's review demanded, replay restoring the recorded price, and Codex's
+    //! three P1s on #1239: the incoming price is enforced before a spend or reclaim; EVERY
+    //! target is priced, not the first; an unpriceable target is the highest bar, not none.
+    use super::*;
+
+    const T0: u64 = 1_800_000_000;
+    /// The marker the closure emits for any in-tree hook path: a directory, no filename.
+    const HOOKS: &str = "plugins/*/hooks";
+    const TARGET: &str = "/wt/plugins/kimi/hooks/pre_tool_use.py";
+
+    fn v(ts: &[&str]) -> Vec<String> {
+        ts.iter().map(|t| t.to_string()).collect()
+    }
+
+    /// The act as the common gate actually summarises a long shell command: 220 chars of it,
+    /// then ` …` (mechanism `attempted_summary`, ATTEMPTED_MAX). The scratch path is long, so
+    /// the governed filename at the END of the command is exactly what the cut removes.
+    fn truncated_shell_act() -> String {
+        let full = format!(
+            "cd /w/hestia && cp /tmp/claude-1000/scratchpad/{}/staged/new_gate.py {}",
+            "s".repeat(160), TARGET);
+        let cut: String = full.chars().take(220).collect();
+        assert!(!cut.contains("pre_tool_use.py"), "the fixture must cut the filename out");
+        format!("Bash: {cut} …")
+    }
+
+    fn open_t(marker: &str, act: &str, targets: &[&str]) -> Escalation {
+        let mut s = EscalationStore::default();
+        s.open_with_payload("kimi-code", "role:constellation:member", "Bash", marker, Some(act),
+                            &v(targets), None, None, None, T0, 3600)
+            .expect("open")
+    }
+
+    // ── a member's gate entry is priced from the RESOLVED location, never the summary ──────
+    /// The marker the closure reports for a write into a member's installed hooks dir: the dir.
+    const ENTRY_DIR: &str = ".gemini/hestia-plugins/gemini/hooks";
+    const ENTRY: &str = "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py";
+    const ENTRY_LOC: &str = ".gemini/hestia-plugins/gemini/hooks/before_tool.py";
+
+    /// Pricing must not depend on display text. Whatever the summary carries (nothing, a
+    /// withheld credential-shaped command, a shortened command, a relative name), the gate's
+    /// resolved target holds the location and the bar is two-factor. Each arm's control is the
+    /// same act with no target: one approver — the summary alone cannot see it.
+    #[test]
+    fn a_member_entry_prices_from_the_resolved_target_whatever_the_summary_says() {
+        let shortened = format!("Bash: cp /tmp/{}/staged/x.py /home/u/.gemini/hest …", "s".repeat(190));
+        for act in [
+            "Bash: …",                                            // omitted (no path at all)
+            "Bash: [command withheld: credential-shaped]",       // withheld
+            shortened.as_str(),                                   // shortened
+            "Bash: touch before_tool.py",                         // relative (cd'd into the dir)
+            "Write -> ./before_tool.py",                          // relative Write
+        ] {
+            let control = open_t(ENTRY_DIR, act, &[]);
+            assert_eq!(control.bar, Bar::SingleApprover, "control, no target: {act:?}");
+            let e = open_t(ENTRY_DIR, act, &[ENTRY]);
+            assert_eq!(e.bar, Bar::SovereignPlusPeer, "{act:?}");
+            assert!(e.matched_markers.iter().any(|m| m == ENTRY_LOC), "{act:?}: {:?}", e.matched_markers);
+        }
+        // The repo source and the published copy, by resolved target behind the hooks pattern.
+        for t in ["/w/hestia/plugins/gemini/hooks/before_tool.py",
+                  "/w/hestia/hooks-gt/gemini/hooks/before_tool.py"] {
+            assert_eq!(open_t(HOOKS, "Bash: …", &[t]).bar, Bar::SovereignPlusPeer, "{t}");
+        }
+    }
+
+    /// The resolved target is matched after LEXICAL normalisation: collapsed slashes, `.`, and a
+    /// `..` that lands inside the entry location all price two-factor. A path that only LOOKS
+    /// like the location by string prefix but resolves outside it does not.
+    #[test]
+    fn a_normalised_target_inside_the_location_is_sovereign_and_a_lookalike_is_not() {
+        for t in [
+            "/home/u/.gemini//hestia-plugins/./gemini/hooks/before_tool.py",
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/sub/../before_tool.py",
+            "/home/u/.gemini/hestia-plugins/gemini/other/../hooks/before_tool.py",
+            "~/.gemini/hestia-plugins/gemini/hooks/before_tool.py",
+        ] {
+            assert_eq!(open_t(ENTRY_DIR, "Bash: …", &[t]).bar, Bar::SovereignPlusPeer, "{t}");
+        }
+        for t in [
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/../hooks-old/before_tool.py",
+            "/home/u/.gemini/hestia-plugins/gemini/hooks-old/before_tool.py",
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py/../x.py",
+            "/home/u/.gemini/hestia-plugins/gemini/hooks/before_tool.py.bak",
+        ] {
+            assert_eq!(open_t(ENTRY_DIR, "Bash: …", &[t]).bar, Bar::SingleApprover, "{t}");
+        }
+    }
+
+    /// Outside every declared location, a file named like an entry is not promoted by its
+    /// resolved target either; a sovereign basename keeps its stage C markers (no location
+    /// is double-listed for it).
+    #[test]
+    fn an_entry_named_target_outside_every_location_stays_single() {
+        for t in ["/srv/proj/hooks/before_tool.py", "/home/u/.gemini/before_tool.py",
+                  "/w/plugins/gemini/before_tool.py", "before_tool.py"] {
+            let e = open_t("before_tool.py", "Bash: …", &[t]);
+            assert_eq!(e.bar, Bar::SingleApprover, "{t}");
+            assert_eq!(e.matched_markers, vec!["before_tool.py".to_string()], "{t}");
+        }
+        let e = open_t(HOOKS, "Bash: …", &[TARGET]);
+        assert_eq!(e.matched_markers, vec![HOOKS.to_string(), "pre_tool_use.py".to_string()]);
+    }
+
+    /// #1239's glob rule, applied to member gate-entry LOCATIONS: a glob whose directory is an
+    /// entry's directory and which can expand to the entry's name prices two-factor; the same glob
+    /// one directory over, or one that cannot match the name, does not.
+    #[test]
+    fn a_glob_in_an_entry_directory_prices_the_entry() {
+        for t in ["/home/u/.gemini/hestia-plugins/gemini/hooks/*.py",
+                  "/home/u/.gemini/hestia-plugins/gemini/hooks/before_*",
+                  "/w/hestia/plugins/gemini/hooks/?efore_tool.py"] {
+            let e = open_t(ENTRY_DIR, "Bash: rm …", &[t]);
+            assert_eq!(e.bar, Bar::SovereignPlusPeer, "{t}");
+            assert!(e.matched_markers.iter().any(|m| m.ends_with("gemini/hooks/before_tool.py")),
+                    "{t}: {:?}", e.matched_markers);
+        }
+        // Controls use patterns no SOVEREIGN_FILES name can match (#1239 prices a bare `*.py`
+        // anywhere two-factor, since it can expand to the gate), so they test the location rule.
+        for t in ["/home/u/.gemini/hestia-plugins/gemini/hooks-old/before_*",
+                  "/home/u/.gemini/hestia-plugins/gemini/hooks/*.sh",
+                  "/home/u/.gemini/hestia-plugins/gemini/before_*"] {
+            assert_eq!(open_t(ENTRY_DIR, "Bash: rm …", &[t]).bar, Bar::SingleApprover, "{t}");
+        }
+    }
+
+    /// The gate says a write reaches a REGISTERED gate entry (one no declaration covers) by
+    /// carrying the registered-entry token among its resolved targets — so it is priced even
+    /// when that entry is not the target the closure reported first.
+    #[test]
+    fn a_registered_entry_token_among_the_targets_prices_two_factor() {
+        let e = open_t("plugins/_shared", "Bash: cp …",
+                       &["/w/hestia/plugins/_shared/notes.md", REGISTERED_GATE_ENTRY_MARKER]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer, "{:?}", e.matched_markers);
+        assert_eq!(open_t("plugins/_shared", "Bash: cp …", &["/w/hestia/plugins/_shared/notes.md"]).bar,
+                   Bar::SingleApprover, "control");
+    }
+
+    /// What #812 adds beyond stage C. Stage C reads the file out of the act TEXT; when the
+    /// text is a summary that cut the filename, the directory marker prices one approver. The
+    /// resolved target still names the file. RED on the stage C rule (the control arm).
+    #[test]
+    fn a_target_the_act_summary_cut_out_still_prices_the_strong_bar() {
+        let act = truncated_shell_act();
+        assert_eq!(open_t(HOOKS, &act, &[]).bar, Bar::SingleApprover,
+                   "control: stage C alone cannot see it");
+        let e = open_t(HOOKS, &act, &[TARGET]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer, "the target carries the filename the summary lost");
+        assert_eq!(e.matched_markers, v(&[HOOKS, "pre_tool_use.py"]));
+        assert_eq!(e.marker, HOOKS, "the marker stays the claim join key");
+        assert_eq!(e.resolved_targets, v(&[TARGET]), "the full path is recorded, not the basename");
+    }
+
+    /// Codex P1-2 on #1239: a multi-target act whose SECOND target is sovereign and lies beyond
+    /// the summary's bound. The first target (what `classify` reports) is ordinary; every
+    /// target is priced, so the act prices two-factor whatever the order.
+    #[test]
+    fn a_later_sovereign_target_beyond_the_summary_prices_the_strong_bar() {
+        let first = "/w/hestia/plugins/_shared/ordinary.txt";
+        let sovereign = "/w/hestia/plugins/_shared/hestia_single_gate.py";
+        let pad: Vec<String> = (0..25).map(|i| format!("/w/x/pad{i}.txt")).collect();
+        let full = format!("touch {first} {} {sovereign}", pad.join(" "));
+        let cut: String = full.chars().take(220).collect();
+        assert!(!cut.contains("hestia_single_gate.py"), "the summary must lose the sovereign target");
+        let act = format!("Bash: {cut} …");
+        assert_eq!(open_t("plugins/_shared", &act, &[first]).bar, Bar::SingleApprover,
+                   "control: the first target alone (the pre-fix producer) prices weak");
+        for order in [[first, sovereign], [sovereign, first]] {
+            let e = open_t("plugins/_shared", &act, &order);
+            assert_eq!(e.bar, Bar::SovereignPlusPeer, "{order:?}");
+            assert_eq!(e.resolved_targets, v(&order));
+        }
+    }
+
+    /// Codex P1-3 on #1239: a credential-shaped command reaches the daemon with its summary
+    /// withheld whole, and the producer no longer drops the target with it — the target is a
+    /// path the gate resolved, carried independently. And when the target path ITSELF is
+    /// credential-shaped, the producer sends the `credential-path` sentinel instead: missing
+    /// pricing evidence is the HIGHEST bar, never the lowest.
+    #[test]
+    fn a_redacted_summary_or_a_redacted_target_still_prices_the_strong_bar() {
+        let redacted = "Bash [REDACTED — names a credential-shaped token; 312 chars withheld \
+                        rather than copied into the record]";
+        assert_eq!(open_t(HOOKS, redacted, &[]).bar, Bar::SingleApprover, "control");
+        assert_eq!(open_t(HOOKS, redacted, &[TARGET]).bar, Bar::SovereignPlusPeer);
+        let sentinel = format!("{UNPRICEABLE_PREFIX}credential-path");
+        let e = open_t(HOOKS, redacted, &[&sentinel]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer, "an unpriceable target is the highest bar");
+        assert_eq!(e.matched_markers, v(&[HOOKS, &sentinel]), "and the record says why");
+        for why in ["unenumerated", "overflow", "malformed"] {
+            let s = format!("{UNPRICEABLE_PREFIX}{why}");
+            assert_eq!(open_t(HOOKS, "Edit -> act", &[&s]).bar, Bar::SovereignPlusPeer, "{why}");
+        }
+    }
+
+    /// Codex P1-1 on #1239, store half: an approved SingleApprover escalation (opened from a
+    /// summary that cut the filename out) is NOT spent for an incoming act whose resolved
+    /// target prices two-factor — nor reclaimed for one. The approval's record keeps its bar.
+    #[test]
+    fn an_approved_weak_escalation_is_not_spent_for_a_stronger_incoming_act() {
+        let act = truncated_shell_act();
+        let mut s = EscalationStore::default();
+        let e = s.open_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act), &[], None, None,
+                                    None, T0, 3600).unwrap();
+        assert_eq!(e.bar, Bar::SingleApprover);
+        s.decide(&e.id, true, "operator", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("ok"), T0 + 5).unwrap();
+        let (incoming, _) = price(HOOKS, Some(&act), &v(&[TARGET]));
+        assert_eq!(incoming, Bar::SovereignPlusPeer);
+        let found = s.approved_below_bar("kimi-code", HOOKS, Some(&act), None, incoming, T0 + 6)
+            .map(|e| e.id.clone());
+        assert_eq!(found.as_deref(), Some(e.id.as_str()), "the shortfall is nameable");
+        assert!(s.claim_bound("kimi-code", HOOKS, Some(&act), None, incoming, T0 + 6).is_none(),
+                "a weak approval must not be spent for a stronger act");
+        assert_eq!(s.get(&e.id).unwrap().consumed_at, None, "and it is not consumed");
+        assert_eq!(s.get(&e.id).unwrap().bar, Bar::SingleApprover, "nor repriced");
+
+        // Reclaim: the first claim (a targetless re-issue) spent it; the retry carries the
+        // target. Recovery of a lost answer never covers a stronger act.
+        let spent = s.claim_bound("kimi-code", HOOKS, Some(&act), None, Bar::SingleApprover, T0 + 7)
+            .expect("control: the same act at its own price spends it");
+        let key = "e".repeat(64);
+        s.record_request_key(&key, RequestKeyRecord {
+            outcome: "claimed".into(), escalation_id: spent.id.clone(), at: T0 + 7,
+            plugin_id: "kimi-code".into(), marker: HOOKS.into(),
+            act_digest: spent.act_digest.clone(), payload_sha256: None,
+            host_session_id: Some("hs".into()), invocation_key: Some("inv-1".into()),
+            supersession_hard_stop: true,
+        });
+        let retry = |b: Bar| s.reclaimable(&key, "kimi-code", HOOKS, Some(&act), None, Some("hs"),
+                                           Some("inv-2"), b, T0 + 8);
+        assert!(retry(Bar::SingleApprover).is_ok(), "control: a same-priced retry reclaims");
+        assert!(retry(incoming).unwrap_err().contains("prices above"),
+                "a retry that prices higher is not a lost answer to recover");
+    }
+
+    /// #812 review hold 1, all four arms: the targets may STRENGTHEN the marker-derived bar,
+    /// never weaken it. (The arm that was wrong in #812's first cut is the second.)
+    #[test]
+    fn the_resolved_target_can_strengthen_but_never_weaken_the_bar() {
+        let act = "Edit -> act";
+        assert_eq!(open_t(HOOKS, act, &[TARGET]).bar, Bar::SovereignPlusPeer);
+        assert_eq!(open_t("pre_tool_use.py", act, &["/tmp/ordinary.txt"]).bar,
+                   Bar::SovereignPlusPeer,
+                   "a fabricated or ordinary target must never LOWER the marker-derived bar");
+        assert_eq!(open_t(HOOKS, "Edit -> /w/plugins/_shared/hestia_gate_mechanism.py",
+                          &["/tmp/ordinary.txt"]).bar,
+                   Bar::SovereignPlusPeer);
+        assert_eq!(open_t(HOOKS, act, &["/tmp/ordinary.txt"]).bar, Bar::SingleApprover);
+        assert_eq!(open_t(HOOKS, act, &[]).bar, Bar::SingleApprover);
+        let blank = open_t("pre_tool_use.py", act, &["   "]);
+        assert_eq!(blank.bar, Bar::SovereignPlusPeer);
+        assert!(blank.resolved_targets.is_empty(), "an empty target is no target");
+    }
+
+    /// #812's negative arms, carried forward: a target naming no file the bar prices two-factor
+    /// changes nothing about the bar.
+    #[test]
+    fn a_target_naming_no_sovereign_file_changes_nothing() {
+        let act = "Edit -> act";
+        for (t, base) in [("/wt/plugins/kimi/hooks/README.md", "README.md"),
+                          ("/wt/plugins/claude-code/hooks/law_inject.py", "law_inject.py"),
+                          ("/wt/plugins/_shared/hestia_gate_core.py", "hestia_gate_core.py"),
+                          ("/tmp/ordinary.txt", "ordinary.txt")] {
+            let e = open_t(HOOKS, act, &[t]);
+            assert_eq!(e.bar, Bar::SingleApprover, "{t}");
+            assert_eq!(e.matched_markers, v(&[HOOKS, base]), "{t}");
+        }
+    }
+
+    /// The reconciliation: a resolved target is priced like the closure marker (`bar_for`, as
+    /// #812 priced it); the act text keeps stage C's exact-basename rule.
+    #[test]
+    fn the_target_is_priced_like_a_marker_and_the_act_text_like_stage_c() {
+        let society = "/wt/plugins/kimi/hooks/society_pre_tool_use.py";
+        assert_eq!(open_t(HOOKS, "Edit -> act", &[society]).bar, Bar::SovereignPlusPeer,
+                   "#812 priced this from the target; the recut keeps it");
+        assert_eq!(open_t(HOOKS, &format!("Edit -> {society}"), &[]).bar, Bar::SingleApprover,
+                   "stage C's act-text rule is unchanged: no target, no change");
+        assert_eq!(open_t("plugins/_shared", "cp a /w/plugins/_shared/not_witness.py.bak", &[]).bar,
+                   Bar::SingleApprover, "a look-alike in the act text is not the witness");
+        assert_eq!(open_t(HOOKS, "Edit -> act", &["/wt/plugins/kimi/hooks/"]).matched_markers,
+                   v(&[HOOKS, "hooks"]));
+    }
+
+    /// ONE rule: `price` is what `open` records, for every combination of the inputs. No
+    /// targets is bit-for-bit the stage C rule.
+    #[test]
+    fn open_records_exactly_what_the_one_rule_prices() {
+        let acts = ["Edit -> act", "sed -i s/a/b/ plugins/_shared/hestia_single_gate.py"];
+        let targets: [&[&str]; 4] = [&[], &[TARGET], &["/tmp/ordinary.txt"],
+                                     &["/tmp/ordinary.txt", TARGET]];
+        for marker in [HOOKS, "plugins/_shared", "witness.py"] {
+            for act in acts {
+                for t in targets {
+                    let e = open_t(marker, act, t);
+                    let (bar, markers) = price(marker, Some(act), &v(t));
+                    assert_eq!((e.bar, &e.matched_markers), (bar, &markers), "{marker} {act} {t:?}");
+                    assert!(e.bar >= bar_for(marker));
+                    assert!(e.bar >= price(marker, Some(act), &[]).0);
+                }
+                assert_eq!(price(marker, Some(act), &[]).1, markers_of(marker, Some(act), &[]));
+            }
+        }
+    }
+
+    /// Bounds: an over-long target keeps its TAIL (the filename); more than
+    /// `MAX_RESOLVED_TARGETS` is an `overflow` sentinel — the highest bar — never a silent cut.
+    #[test]
+    fn bounds_keep_the_filename_and_fail_closed_on_overflow() {
+        let long = format!("/{}/plugins/kimi/hooks/pre_tool_use.py", "d".repeat(2000));
+        let n = normalize_resolved_target(Some(&long)).unwrap();
+        assert_eq!(n.chars().count(), RESOLVED_TARGET_MAX);
+        assert!(n.ends_with("/pre_tool_use.py"));
+        assert_eq!(open_t(HOOKS, "Edit -> act", &[&long]).bar, Bar::SovereignPlusPeer);
+        assert_eq!(normalize_resolved_target(Some(" a \n b ")).as_deref(), Some("a b"));
+        assert_eq!(normalize_resolved_target(Some(" \t ")), None);
+
+        let many: Vec<String> = (0..MAX_RESOLVED_TARGETS + 3)
+            .map(|i| format!("/wt/plugins/kimi/hooks/f{i}.txt")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let e = open_t(HOOKS, "Edit -> act", &refs);
+        assert_eq!(e.resolved_targets.len(), MAX_RESOLVED_TARGETS + 1);
+        assert_eq!(e.resolved_targets.last().unwrap(), &format!("{UNPRICEABLE_PREFIX}overflow"));
+        assert_eq!(e.bar, Bar::SovereignPlusPeer, "a write set too large to carry prices highest");
+    }
+
+    /// The wire: `resolved_targets` (array) and the single-string `resolved_target` are joined;
+    /// anything malformed is a sentinel, never silently nothing.
+    #[test]
+    fn the_wire_accepts_both_spellings_and_never_drops_a_malformed_one() {
+        let j = serde_json::json!({"resolved_targets": ["/a/x.py", "/a/y.py"], "resolved_target": "/a/z.py"});
+        assert_eq!(resolved_targets_from_args(&j), v(&["/a/x.py", "/a/y.py", "/a/z.py"]));
+        assert!(resolved_targets_from_args(&serde_json::json!({})).is_empty());
+        let mal = format!("{UNPRICEABLE_PREFIX}malformed");
+        assert_eq!(resolved_targets_from_args(&serde_json::json!({"resolved_targets": "/a/x.py"})),
+                   v(&[&mal]));
+        assert_eq!(resolved_targets_from_args(&serde_json::json!({"resolved_targets": ["/a", 3]})),
+                   v(&["/a", &mal]));
+        assert_eq!(resolved_targets_from_args(&serde_json::json!({"resolved_target": 7})), v(&[&mal]));
+        // #1247's producer spelling (`resolved_target` + `also_resolved`) prices as the same
+        // list, so both branches' producers agree with this daemon.
+        let j = serde_json::json!({"resolved_target": "/a/x.py", "also_resolved": ["/a/y.py", "/a/x.py"]});
+        assert_eq!(resolved_targets_from_args(&j), v(&["/a/x.py", "/a/y.py"]));
+        let order = serde_json::json!({"resolved_target": "/w/plugins/_shared/ordinary.txt",
+                                       "also_resolved": ["/w/plugins/_shared/hestia_single_gate.py"]});
+        assert_eq!(price("plugins/_shared", Some("Bash: …"), &resolved_targets_from_args(&order)).0,
+                   Bar::SovereignPlusPeer);
+    }
+
+    fn opened(id: &str, marker: &str, extra: serde_json::Value) -> crate::storage::chain::ChainEntry {
+        let mut data = serde_json::json!({
+            "escalation_id": id, "plugin_id": "kimi-code",
+            "role": "role:constellation:member", "tool_name": "Edit",
+            "marker": marker, "opened_at": T0, "expires_at": T0 + 3600,
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            data[k] = v.clone();
+        }
+        crate::storage::chain::ChainEntry {
+            chain_position: 0,
+            hash: String::new(),
+            prev_hash: String::new(),
+            event_type: "gate_escalation_opened".into(),
+            event_data: data,
+            signer_lct: "test".into(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// #812 review hold 2: replay RESTORES the recorded bar; it does not reprice history.
+    #[test]
+    fn replay_restores_the_recorded_bar_not_todays_policy() {
+        let mut s = EscalationStore::default();
+        assert_eq!(s.rehydrate(&[opened("rec1", "pre_tool_use.py",
+                                        serde_json::json!({"bar": "single_approver",
+                                                           "matched_markers": ["pre_tool_use.py"]}))],
+                               T0 + 20), 1);
+        assert_eq!(s.get("rec1").unwrap().bar, Bar::SingleApprover,
+                   "the record carries the criterion in force at the time");
+        assert_eq!(s.rehydrate(&[opened("rec2", HOOKS,
+                                        serde_json::json!({"bar": "sovereign_plus_peer",
+                                                           "resolved_targets": [TARGET],
+                                                           "matched_markers": [HOOKS, "pre_tool_use.py"]}))],
+                               T0 + 20), 1);
+        let r2 = s.get("rec2").unwrap();
+        assert_eq!(r2.bar, Bar::SovereignPlusPeer);
+        assert_eq!(r2.resolved_targets, v(&[TARGET]));
+        assert_eq!(r2.matched_markers, v(&[HOOKS, "pre_tool_use.py"]));
+    }
+
+    /// The fallback, for rows that recorded no readable bar: priced by THE rule, from what the
+    /// row carries. A legacy row prices exactly as stage C priced it; an unparseable bar is no
+    /// bar; the first cut's single-string `resolved_target` is read too.
+    #[test]
+    fn a_row_with_no_readable_bar_is_priced_by_the_one_rule() {
+        let mut s = EscalationStore::default();
+        s.rehydrate(&[
+            opened("leg1", HOOKS, serde_json::json!({})),
+            opened("leg2", HOOKS, serde_json::json!({"act_text": "Edit -> /w/plugins/x/hooks/witness.py"})),
+            opened("tgt1", HOOKS, serde_json::json!({"resolved_targets": ["/x/a.txt", TARGET]})),
+            opened("tgt2", HOOKS, serde_json::json!({"resolved_target": TARGET})),
+            opened("bad1", HOOKS, serde_json::json!({"bar": "two_humans_and_a_dog",
+                                                     "resolved_targets": [TARGET]})),
+            opened("pre1", HOOKS, serde_json::json!({"bar": "single_approver",
+                                                     "act_text": "Edit -> /w/plugins/x/hooks/witness.py"})),
+        ], T0 + 20);
+        let g = |id: &str| s.get(id).unwrap().clone();
+        assert_eq!(g("leg1").bar, Bar::SingleApprover);
+        assert!(g("leg1").resolved_targets.is_empty(), "absent restores absent, never fails");
+        assert_eq!(g("leg2").bar, Bar::SovereignPlusPeer, "stage C's act-text fallback, unchanged");
+        assert_eq!(g("tgt1").bar, Bar::SovereignPlusPeer, "every target, not the first");
+        assert_eq!(g("tgt2").bar, Bar::SovereignPlusPeer);
+        assert_eq!(g("bad1").bar, Bar::SovereignPlusPeer, "an unreadable criterion is recomputed");
+        assert_eq!(g("pre1").bar, Bar::SingleApprover, "recorded, so restored — not repriced");
+        assert_eq!(g("pre1").matched_markers, v(&[HOOKS]));
+    }
+
+    /// Coalescing (#668) must not be the one path on which a target cannot strengthen.
+    #[test]
+    fn a_fold_never_lowers_the_price() {
+        let act = truncated_shell_act();
+        let mut s = EscalationStore::default();
+        let weak = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
+                                                   &[], None, None, None, T0, 3600).unwrap();
+        assert_eq!(weak.escalation().bar, Bar::SingleApprover);
+        let strong = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
+                                                     &v(&[TARGET]), None, None, None, T0 + 5, 3600)
+            .unwrap();
+        assert!(!strong.coalesced(), "a stronger ask is not folded into a weaker twin");
+        assert_eq!(strong.escalation().bar, Bar::SovereignPlusPeer);
+        let again = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
+                                                    &v(&[TARGET]), None, None, None, T0 + 9, 3600)
+            .unwrap();
+        assert!(again.coalesced());
+        assert_eq!(again.escalation().id, strong.escalation().id);
+        let old_hook = s.open_or_coalesce_with_payload("kimi-code", "r", "Bash", HOOKS, Some(&act),
+                                                       &[], None, None, None, T0 + 12, 3600)
+            .unwrap();
+        assert!(old_hook.coalesced());
+    }
+
+    /// The glob row (kimi, #1231 review Q4; carried on #1239 2026-10-07): a glob prices by
+    /// what it can EXPAND to, in the act text and in a resolved target alike — whichever form
+    /// the producer sends (the glob text, as the closure resolves it today, or an expansion).
+    #[test]
+    fn a_glob_prices_by_what_it_can_expand_to() {
+        let hooks_glob = "/w/hooks-gt/kimi/hooks/*.py";
+        // Act text alone (no targets): `rm hooks-gt/kimi/hooks/*.py`.
+        let e = open_t(HOOKS, "Bash: rm hooks-gt/kimi/hooks/*.py", &[]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer, "act-text glob: {:?}", e.matched_markers);
+        assert!(e.matched_markers.contains(&"pre_tool_use.py".to_string()));
+        // A resolved target that IS the glob.
+        let e = open_t(HOOKS, "Edit -> act", &[hooks_glob]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer);
+        // The expansion form, for a producer that expands: same price.
+        assert_eq!(open_t(HOOKS, "Edit -> act", &["/w/hooks-gt/kimi/hooks/pre_tool_use.py"]).bar,
+                   Bar::SovereignPlusPeer);
+        // Narrower globs, both ways.
+        for (pat, strong) in [("pre_*.py", true), ("*gate.py", true), ("p?e_tool_use.py", true),
+                              ("[pq]re_tool_use.py", true), ("[!p]re_tool_use.py", false),
+                              ("*.txt", false), ("law_*.py", false), ("*.md", false),
+                              ("witness.p[a-z]", true), ("README*", false)] {
+            let e = open_t(HOOKS, "Edit -> act", &[&format!("/w/plugins/kimi/hooks/{pat}")]);
+            let want = if strong { Bar::SovereignPlusPeer } else { Bar::SingleApprover };
+            assert_eq!(e.bar, want, "{pat}: {:?}", e.matched_markers);
+        }
+        // Free-text noise is not a pattern: the apply_patch envelope's `***` prices nothing,
+        // while a pathlike glob in the act text still does.
+        assert_eq!(open_t("plugins/_shared", "*** Begin Patch\n*** Update File: /w/x.txt", &[]).bar,
+                   Bar::SingleApprover);
+        assert_eq!(open_t("plugins/_shared", "Bash: rm /w/plugins/kimi/hooks/*", &[]).bar,
+                   Bar::SovereignPlusPeer);
+        // Codex notice 18784, P2: a bracket CLASS in the act text prices like the same pattern
+        // as a resolved target; a bracketed literal still names its file; a class that cannot
+        // reach a sovereign name adds nothing.
+        assert_eq!(open_t("plugins/_shared", "Bash: rm /w/plugins/kimi/hooks/[pq]re_tool_use.py", &[]).bar,
+                   Bar::SovereignPlusPeer);
+        assert_eq!(open_t("plugins/_shared", "Edit -> act", &["/w/plugins/kimi/hooks/[pq]re_tool_use.py"]).bar,
+                   Bar::SovereignPlusPeer);
+        assert_eq!(open_t("plugins/_shared", "Bash: ls [/w/plugins/kimi/hooks/pre_tool_use.py]", &[]).bar,
+                   Bar::SovereignPlusPeer);
+        assert_eq!(open_t("plugins/_shared", "Bash: rm /w/plugins/kimi/hooks/[xy]re_tool_use.py", &[]).bar,
+                   Bar::SingleApprover);
+        // Brace expansion cannot be bounded on the name: unpriceable, the highest bar.
+        let e = open_t(HOOKS, "Edit -> act", &["/w/plugins/kimi/hooks/{a,b}.py"]);
+        assert_eq!(e.bar, Bar::SovereignPlusPeer);
+        // A literal name with no metacharacter is unchanged by the rule.
+        assert!(sovereign_expansions("notes.txt").is_empty());
+        assert_eq!(open_t(HOOKS, "Edit -> act", &["/w/plugins/kimi/hooks/notes.txt"]).bar,
+                   Bar::SingleApprover);
+    }
+
+    #[test]
+    fn glob_match_is_the_shell_rule() {
+        for (p, n, want) in [("*", "x", true), ("*", "", true), ("a*b", "ab", true),
+                             ("a*b", "axxb", true), ("a*b", "axxc", false), ("?", "", false),
+                             ("[abc]", "b", true), ("[a-c]x", "bx", true), ("[!a]", "a", false),
+                             ("[^a]", "b", true), ("[", "[", true), ("*.py", "x.py", true),
+                             ("*.py", "x.pyc", false), ("**y", "xy", true)] {
+            assert_eq!(glob_match(p, n), want, "{p} vs {n}");
+        }
     }
 }

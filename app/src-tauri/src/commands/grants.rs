@@ -94,6 +94,7 @@ fn replaced_key(row: &serde_json::Value) -> serde_json::Value {
         "granted_by": row.get("granted_by"),
         "expires_at": row.get("expires_at"),
         "request_id": row.get("request_id"),
+        "modes": row.get("modes").and_then(|v| v.as_str()).unwrap_or("rwed"),
     })
 }
 
@@ -334,18 +335,29 @@ pub async fn set_reach(
     path: String,
     recursive: bool,
     reason: Option<String>,
+    seen: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let reason = check_reason(recursive, reason.as_deref()).map_err(|e| {
         if recursive { "making a grant reach its whole subtree requires a reason: it widens one path into a tree".to_string() } else { e }
     })?;
     let mut body = serde_json::json!({
         "plugin_id": member.trim(), "path": normalize_scope_path(&path), "recursive": recursive,
+        "expected_generation": seen.get("generation"),
+        "expected_standing": seen.get("standing"),
+        "expected_live": seen.get("live"),
     });
+    if seen.get("generation").and_then(|v| v.as_u64()).is_none()
+        || seen.get("standing").is_none() || seen.get("live").is_none() {
+        return Err("the complete reach snapshot is required; refresh before changing reach".into());
+    }
     if let Some(r) = reason {
         body["reason"] = serde_json::Value::String(r);
     }
     let (status, value) =
-        daemon::request_status(&state, reqwest::Method::POST, "/api/scope/standing/recursive", Some(body)).await?;
+        daemon::request_status(&state, reqwest::Method::POST, "/api/scope/standing/recursive-if-unchanged", Some(body)).await?;
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err("this daemon does not support bound reach changes; update it before trying again".into());
+    }
     standing_act_outcome("reach", status, value)
 }
 
@@ -403,6 +415,16 @@ mod tests {
                  "granted_by": "operator", "recursive": true, "expires_at": null, "request_id": null},
             ],
         })
+    }
+
+    #[test]
+    fn the_rendered_binding_includes_modes() {
+        let narrow = serde_json::json!({"reason": "r", "recursive": false, "granted_by": "operator",
+            "expires_at": null, "request_id": null, "modes": "r"});
+        let mut wide = narrow.clone();
+        wide["modes"] = serde_json::json!("rwed");
+        assert_ne!(replaced_key(&narrow), replaced_key(&wide), "a mode change must invalidate the shown row");
+        assert_eq!(replaced_key(&narrow)["modes"], "r");
     }
 
     #[test]

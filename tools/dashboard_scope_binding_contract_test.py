@@ -68,16 +68,24 @@ def source_contract():
     check("a moved reassign is reported as such", "o && o.moved" in move)
 
     reach = between("const rch = e.target.closest('[data-reach-member]')", "// REASSIGN")
-    check("reach sends no binding: it only flips exact/subtree, and the daemon refuses a no-op",
-          "expected_existing" not in reach)
+    check("reach captures the full binding before prompting",
+          reach.index("scopeReachBinding(shown, member, p)") < reach.index("prompt("))
+    check("reach uses the bound endpoint and sends both lifetimes",
+          "/api/scope/standing/recursive-if-unchanged" in reach
+          and "expected_generation: binding.generation" in reach
+          and "expected_standing: seenStanding" in reach and "expected_live: seenLive" in reach)
+    check("reach tells the operator the affected channels", "out.applied_to" in reach)
 
 
 def behaviour():
-    prog = (fn("normScopePath") + fn("standingBinding") + fn("scopeMovedMessage") +
+    prog = (fn("normScopePath") + fn("standingBinding") + fn("scopeMovedMessage") + fn("scopeReachBinding") +
             "\nconst A = JSON.parse(process.argv[1]);"
             "process.stdout.write(JSON.stringify(A.calls.map(c => c[0] === 'bind'"
-            " ? standingBinding(A.data, c[1], c[2]) : scopeMovedMessage(c[1]))));")
-    data = {"scope_grants": [
+            " ? standingBinding(A.data, c[1], c[2]) : c[0] === 'reach'"
+            " ? scopeReachBinding(c[1], c[2], c[3]) : scopeMovedMessage(c[1]))));")
+    data = {"standing_generation": 7, "scope_reach_live": [
+        {"plugin_id": "hub-being", "path": "/w/home", "id": "hidden", "recursive": False,
+         "modes": "r", "expires_at": 2000000000}], "scope_grants": [
         {"lifetime": "live", "plugin_id": "hub-being", "path": "/w/notes", "reason": "asked",
          "request_id": "r1", "recursive": False, "secs_remaining": 60},
         {"lifetime": "standing", "plugin_id": "hub-being", "path": "/w/home", "reason": "its home",
@@ -90,21 +98,30 @@ def behaviour():
         ["bind", "claude-code", "/w/home"],         # another member's path
         ["moved", {"moved": True, "current": {"reason": "edited elsewhere", "recursive": False}}],
         ["moved", {"moved": True, "current": None}],
+        ["reach", data, "hub-being", "/w/home"],
+        ["reach", {"standing_generation": 7, "scope_grants": []}, "hub-being", "/w/home"],
+        ["reach", {**data, "scope_reach_live": data["scope_reach_live"] * 2}, "hub-being", "/w/home"],
     ]
+    # The mode set is part of the binding, not a cosmetic column.
+    data["scope_grants"][1]["modes"] = "r"
     r = subprocess.run(["node", "-e", prog, json.dumps({"data": data, "calls": calls})],
                        capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         FAILS.append(f"node failed: {r.stderr.strip()[:300]}")
         return
     got = json.loads(r.stdout)
-    # exactly the five fields the daemon compares (grant_binding_of) — clock fields excluded
-    check("the binding is the five fields the daemon compares, from the standing row",
+    # All fields the daemon compares, including modes; clock fields excluded.
+    check("the binding includes the mode set the daemon compares",
           got[0] == {"reason": "its home", "recursive": True, "granted_by": "operator",
-                     "expires_at": None, "request_id": None})
+                     "expires_at": None, "request_id": None, "modes": "r"})
     check("a live row binds as none", got[1] is None)
     check("another member's row binds as none", got[2] is None)
     check("the moved message names what it now reads", "edited elsewhere" in got[3] and "nothing was done" in got[3])
     check("and says when the row is gone", "it is gone" in got[4])
+    check("reach includes a hidden live twin", got[5] == {"generation": 7, "standing": True,
+          "live": {"id": "hidden", "recursive": False, "modes": "r", "expires_at": 2000000000}})
+    check("missing live projection fails closed", got[6] is None)
+    check("multiple live twins fail closed", got[7] is None)
 
 
 def main() -> int:

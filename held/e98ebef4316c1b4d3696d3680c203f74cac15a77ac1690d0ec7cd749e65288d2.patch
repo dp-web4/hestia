@@ -1,0 +1,392 @@
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 4ffb1fe401ed9671ee767adf272ccf1b902c75241e370bf01dc4f7e17618c786  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -220,6 +220,23 @@
+         "hand you a file. If you believe the deny itself was wrong, that is the appeal, and it "
+         "is a separate act.",
+         ("hestia_request_scope", "hestia_scope_status", "hestia_appeal"),
++    ),
++    # AN UNENUMERABLE REACH (dp's ruling, 2026-10-14, hestia#1313: option (b) of three). The act's
++    # reach depends on an expansion the gate does not model, so no path exists for a grant to
++    # name. Until this ruling the refusal also opened a once-only peer scope request for the act;
++    # measured on claude-code's own 50,091 recorded commands, 9,178 (18%) were such requests and
++    # most lapsed or were refused as noise. Now it is its own rule, NOT a scope-escalating one
++    # (mechanism.SCOPE_ESCALATING_RULES), so the single gate asks the daemon nothing, and the
++    # remedy names the two rewrites that work. The rewrite is the asked-for act, not a recast.
++    "mrh.command.unenumerated": Remedy(
++        "Rewrite the act so the gate can see what it reaches. That rewrite is what this refusal "
++        "asks for; it is not a recast. Either spell every path out literally (if a value comes "
++        "from a command, run that command on its own first and use what it printed), or put "
++        "the expansion in a script file and run the script by its literal path. No scope "
++        "request was opened: no grant can name a path the gate cannot see. If the spelled-out "
++        "command then reaches outside your scope, its own refusal opens a request for that "
++        "path.",
++        ("hestia_request_scope",),
+     ),
+     "mrh.command": Remedy(
+         "Scope the command to a granted path. If the path is genuinely needed: when this "
+@@ -2933,10 +2950,14 @@
+                         f"could not be judged completely, and an incompletely judged command is "
+                         f"refused — split it, or the act can be approved once as written")
+             elif offending and offending.startswith(_UNMODELLED_PREFIX):
+-                what = (f"the gate cannot enumerate what it reaches "
+-                        f"({offending[len(_UNMODELLED_PREFIX):-1]}): nothing an expansion produces is "
+-                        f"modelled, so this act can only be approved ONCE, as written — or rewritten "
+-                        f"with every path spelled out literally")
++                # hestia#1313: its own rule, so nothing escalates (see REMEDIES).
++                return _deny(
++                    "mrh.command.unenumerated",
++                    f"'{event.tool}' command: the gate cannot enumerate what it reaches "
++                    f"({offending[len(_UNMODELLED_PREFIX):-1]}). Nothing an expansion produces is "
++                    f"modelled, so no grant can cover it as written",
++                    target=refused or "",
++                )
+             elif outside:
+                 what = f"'{offending}' is outside the workspace and no grant reaches it"
+             else:
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "4ffb1fe401ed9671ee767adf272ccf1b902c75241e370bf01dc4f7e17618c786",
++      "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "f6933afe101b4da6ee6f05d103b8d2389ec9b81fe94f976f3a8afadca7c450ae"
++  "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "f6933afe101b4da6ee6f05d103b8d2389ec9b81fe94f976f3a8afadca7c450ae",
++    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4ffb1fe401ed9671ee767adf272ccf1b902c75241e370bf01dc4f7e17618c786"
++        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "eefe6029a8748d39eeadb9c25a1c2868d6f84a2fe461e9f9d251c35e2828de90"
++  "gt_version": "f59762b4e42ac450427412ef251889b8f5edca7ef587fe6ff95f3a8973684431"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "f6933afe101b4da6ee6f05d103b8d2389ec9b81fe94f976f3a8afadca7c450ae",
++    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4ffb1fe401ed9671ee767adf272ccf1b902c75241e370bf01dc4f7e17618c786"
++        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "1697cd42cce0da133573e244fbf6263311d589136571d8b084baa34baed602c3"
++  "gt_version": "d4571479d33aad6d4b67a745b9c23b1d815cadbcb8963e412eb6af53b10dbcec"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "f6933afe101b4da6ee6f05d103b8d2389ec9b81fe94f976f3a8afadca7c450ae",
++    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4ffb1fe401ed9671ee767adf272ccf1b902c75241e370bf01dc4f7e17618c786"
++        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "860745b7046f680747854f1699aaf5d9141933901afc607d387cb2a97be1b656"
++  "gt_version": "00068fc9ec4a345487b9b1567deb156cfc21dcc6890692e20fd2eb4345ecd29f"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "f6933afe101b4da6ee6f05d103b8d2389ec9b81fe94f976f3a8afadca7c450ae",
++    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "4ffb1fe401ed9671ee767adf272ccf1b902c75241e370bf01dc4f7e17618c786"
++        "sha256": "f3b065100b674f5d6accb07230c7f6888d65017f475bb8e0f9503e2e80ff547e"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "fcf095dad098ffa5b7f69aaf6fcf3c902f4078b13a01e3cf095c9f543870bad0"
++  "gt_version": "6fa3feda4cf14ab1c5348a7c57a625a63e35924d27cfdf7a3780687ab1174016"
+ }
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -219,6 +219,23 @@
+         "hand you a file. If you believe the deny itself was wrong, that is the appeal, and it "
+         "is a separate act.",
+         ("hestia_request_scope", "hestia_scope_status", "hestia_appeal"),
++    ),
++    # AN UNENUMERABLE REACH (dp's ruling, 2026-10-14, hestia#1313: option (b) of three). The act's
++    # reach depends on an expansion the gate does not model, so no path exists for a grant to
++    # name. Until this ruling the refusal also opened a once-only peer scope request for the act;
++    # measured on claude-code's own 50,091 recorded commands, 9,178 (18%) were such requests and
++    # most lapsed or were refused as noise. Now it is its own rule, NOT a scope-escalating one
++    # (mechanism.SCOPE_ESCALATING_RULES), so the single gate asks the daemon nothing, and the
++    # remedy names the two rewrites that work. The rewrite is the asked-for act, not a recast.
++    "mrh.command.unenumerated": Remedy(
++        "Rewrite the act so the gate can see what it reaches. That rewrite is what this refusal "
++        "asks for; it is not a recast. Either spell every path out literally (if a value comes "
++        "from a command, run that command on its own first and use what it printed), or put "
++        "the expansion in a script file and run the script by its literal path. No scope "
++        "request was opened: no grant can name a path the gate cannot see. If the spelled-out "
++        "command then reaches outside your scope, its own refusal opens a request for that "
++        "path.",
++        ("hestia_request_scope",),
+     ),
+     "mrh.command": Remedy(
+         "Scope the command to a granted path. If the path is genuinely needed: when this "
+@@ -2932,10 +2949,14 @@
+                         f"could not be judged completely, and an incompletely judged command is "
+                         f"refused — split it, or the act can be approved once as written")
+             elif offending and offending.startswith(_UNMODELLED_PREFIX):
+-                what = (f"the gate cannot enumerate what it reaches "
+-                        f"({offending[len(_UNMODELLED_PREFIX):-1]}): nothing an expansion produces is "
+-                        f"modelled, so this act can only be approved ONCE, as written — or rewritten "
+-                        f"with every path spelled out literally")
++                # hestia#1313: its own rule, so nothing escalates (see REMEDIES).
++                return _deny(
++                    "mrh.command.unenumerated",
++                    f"'{event.tool}' command: the gate cannot enumerate what it reaches "
++                    f"({offending[len(_UNMODELLED_PREFIX):-1]}). Nothing an expansion produces is "
++                    f"modelled, so no grant can cover it as written",
++                    target=refused or "",
++                )
+             elif outside:
+                 what = f"'{offending}' is outside the workspace and no grant reaches it"
+             else:
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -1041,58 +1041,51 @@
+         stub.close()
+ 
+ 
+-def test_an_unenumerated_reach_is_a_once_only_request(m, g, wc, home):
+-    """dp, 2026-10-10 ("narrow and land"): nothing an expansion produces is modelled. A command
+-    whose reach depends on one is refused with the UNENUMERATED target, and the refusal is a scope
+-    REQUEST for the act — keyed on the act's complete digest, decidable only as "this act once" —
+-    never a silent allow (Codex 17054 P1-output-model: `cat "$(date +/x)"` was allowed)."""
++def test_an_unenumerated_reach_is_refused_with_rewrite_guidance(m, g, wc, home):
++    """dp, 2026-10-10 ("narrow and land"): nothing an expansion produces is modelled. dp, 2026-10-14
++    (hestia#1313, option b): a command whose reach depends on one is refused under its OWN rule,
++    `mrh.command.unenumerated`, which is not a scope-escalating rule. So the gate asks the daemon
++    nothing (no peer scope request is opened, for the act or for any concrete path beside it),
++    and the remedy names the rewrite that works. Never a silent allow (Codex 17054
++    P1-output-model: `cat "$(date +/x)"` was allowed)."""
+     unenum = g.core.UNENUMERATED_TARGET
+-    act = 'cat "$(date +/etc/hostname)"'
++    rule = "mrh.command.unenumerated"
+     stub = Stub(Policy())
+     try:
+         with _Env(m, stub.url, home):
+-            d, _ = _decide(g, "codex", "Bash", {"command": act}, home)
+-        claims = [a for a, _ in stub.named("hestia_scope_claim")]
+-        c = claims[0] if claims else {}
+-        dg = c.get("act_digest") or ""
+-        check("unenum-17054-date-format-is-refused", d.decision == "deny" and d.rule == "mrh.command", d)
+-        check("unenum-opens-one-request", len(claims) == 1 and c.get("spend") is False, claims)
+-        check("unenum-request-keyed-on-the-act",
+-              len(dg) == 64 and c.get("path") == f"{unenum}#{dg[:16]}", c)
+-        check("unenum-deny-names-the-request", d.escalation_id and d.escalation_id in d.reason, d)
+-        check("unenum-deny-says-once-only", "only ONCE" in d.reason and "no session" in d.reason, d.reason)
+-        with _Env(m, stub.url, home):
+-            d2, _ = _decide(g, "codex", "Bash", {"command": 'cat "$(date +/etc/os-release)"'}, home)
+-        claims = [a for a, _ in stub.named("hestia_scope_claim")]
+-        check("unenum-two-acts-two-requests",
+-              d2.decision == "deny" and len({a.get("path") for a in claims}) == 2, claims)
+-    finally:
+-        stub.close()
+-    # A one-time approval of the act lifts it: reserved after society, committed after evidence,
+-    # under the same act-keyed path.
+-    stub = Stub(Policy(scope_claim=lambda p: "approved" if p.startswith(unenum) else "opened"))
++            d, _ = _decide(g, "codex", "Bash", {"command": 'cat "$(date +/etc/hostname)"'}, home)
++        claims = stub.named("hestia_scope_claim")
++        check("unenum-17054-date-format-is-refused", d.decision == "deny" and d.rule == rule, d)
++        check("unenum-opens-no-request", claims == [] and not d.escalation_id, (claims, d))
++        check("unenum-remedy-names-the-rewrite", "spell every path out literally" in d.remedy
++              and "script file" in d.remedy and "not a recast" in d.remedy, d.remedy)
++        check("unenum-says-no-request", "No scope request was opened" in d.remedy, d.remedy)
++        check("unenum-no-once-only-promise", "only ONCE" not in d.reason + d.remedy, d)
++        check("unenum-names-the-expansion", "a command substitution" in d.reason, d.reason)
++    finally:
++        stub.close()
++    # Even a daemon that WOULD approve is never asked: there is no approval route as written.
++    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+     try:
+         with _Env(m, stub.url, home):
+             d, _ = _decide(g, "codex", "Bash", {"command": "cat /tmp/run-$(date +%s)/../x"}, home)
+-        calls = [a for a, _ in stub.named("hestia_scope_claim")]
+-        ops = [a.get("op") for a in calls if "op" in a]
+-        reserve = [a for a in calls if a.get("op") == "reserve"]
+-        check("unenum-once-approval-lifts", d.decision == "allow", d)
+-        check("unenum-once-reserve-then-commit", ops == ["reserve", "commit"]
+-              and reserve and all(p.startswith(unenum + "#") for p in reserve[0]["paths"]), calls)
+-    finally:
+-        stub.close()
+-    # A concrete refusal in the same act is collected too, and is its own request.
++        check("unenum-never-lifted", d.decision == "deny" and d.rule == rule, d)
++        check("unenum-daemon-never-asked", stub.named("hestia_scope_claim") == [], stub.named("hestia_scope_claim"))
++    finally:
++        stub.close()
++    # A concrete refusal in the same act is not escalated either: the act cannot pass as written.
+     stub = Stub(Policy(scope_claim=lambda p: "approved"))
+     try:
+         with _Env(m, stub.url, home):
+-            # `$D` alone would now resolve (dp, 2026-10-11: one literal binds); `$E` does not.
++            # `$D` alone would resolve (dp, 2026-10-11: one literal binds); `$E` does not.
+             d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D $E"}, home)
+-        peeks = [a.get("path") for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
+-        check("unenum-mixed-collects-both", d.decision == "allow" and len(peeks) == 2
+-              and "/etc/hostname" in peeks and any(p.startswith(unenum + "#") for p in peeks), (d, peeks))
+-    finally:
+-        stub.close()
++        check("unenum-mixed-is-refused-unescalated", d.decision == "deny" and d.rule == rule
++              and stub.named("hestia_scope_claim") == [], (d, stub.named("hestia_scope_claim")))
++    finally:
++        stub.close()
++    # The once-only lift still exists in the core (a trial scope carrying the sentinel), but no
++    # path in the gate builds that scope any more; pinned so a later change notices.
++    check("unenum-core-target-unchanged", unenum == "hestia:unpriceable:unenumerated", unenum)
+     # Codex 17054 P1-quote-context, through decide(): the live substitution is found and judged.
+     stub = Stub(Policy())
+     try:
+@@ -1124,18 +1117,18 @@
+                 check(f"1287-{seat}-prose-reason-allowed", d.decision == "allow", d)
+                 check(f"1287-{seat}-prose-reason-asks-society", len(stub.named("hestia_begin_action")) == 1)
+                 d, _ = _decide(g, seat, "Bash", {"command": 'F="a*"; cat $F'}, home)
+-                check(f"1287-{seat}-glob-var-path-is-a-request", d.decision == "deny"
+-                      and d.rule == "mrh.command" and "only ONCE" in d.reason, d)
++                check(f"1287-{seat}-glob-var-path-is-refused", d.decision == "deny"
++                      and d.rule == "mrh.command.unenumerated", d)
+                 d, _ = _decide(g, seat, "Bash", {"command": 'R="/tmp/review-probe/*"; hestia gate deny X --reason $R'}, home)
+-                check(f"1287-{seat}-unquoted-glob-reason-is-a-request", d.decision == "deny"
+-                      and d.rule == "mrh.command", d)
++                check(f"1287-{seat}-unquoted-glob-reason-is-refused", d.decision == "deny"
++                      and d.rule == "mrh.command.unenumerated", d)
+                 # Codex HOLD 21675: unquoted, the value splits and `--body-file` becomes gh's argument.
+                 d, _ = _decide(g, seat, "Bash", {"command": 'R="hi --body-file /etc/hostname"; gh pr create --title $R'}, home)
+-                check(f"1289-{seat}-unquoted-split-title-is-a-request", d.decision == "deny"
+-                      and d.rule == "mrh.command" and "only ONCE" in d.reason, d)
+-            claims = [a for a, _ in stub.named("hestia_scope_claim") if "op" not in a]
+-            check(f"1287-{seat}-requests-are-unenumerated",
+-                  claims and all(str(c.get("path", "")).startswith(unenum) for c in claims), claims)
++                check(f"1289-{seat}-unquoted-split-title-is-refused", d.decision == "deny"
++                      and d.rule == "mrh.command.unenumerated", d)
++            # hestia#1313: none of these opens a scope request any more.
++            check(f"1313-{seat}-no-requests-opened", stub.named("hestia_scope_claim") == [],
++                  stub.named("hestia_scope_claim"))
+         finally:
+             stub.close()
+ 
+@@ -1564,7 +1557,7 @@
+     test_superseded_is_denied_in_every_mode,
+     test_daemon_verdicts_and_the_warn_rollout,
+     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
+-    test_an_unenumerated_reach_is_a_once_only_request,
++    test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
+     test_prose_in_a_message_position_is_data_on_every_seat,
+     test_degraded_posture,
+     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
+@@ -2055,16 +2048,14 @@
+         check("real-scope-reissue-finds-the-same-request", again.escalation_id == d.escalation_id,
+               (d.escalation_id, again.escalation_id))
+         check("real-scope-reissue-says-pending", "still pending" in again.reason, again.reason)
+-        # dp, 2026-10-10 (narrowed): an act whose reach an expansion decides is a request for THE
+-        # ACT against the real handler too — the daemon accepts the act-keyed sentinel, and a
+-        # re-issue of the identical act finds the same request.
++        # dp, 2026-10-14 (hestia#1313): an act whose reach an expansion decides is refused under
++        # its own rule against the real handler too, and opens no request, on a re-issue either.
+         u = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 7)
+-        check("real-unenumerated-is-mrh-command", u.decision == "deny" and u.rule == "mrh.command", u)
+-        check("real-unenumerated-opens-a-request", bool(u.escalation_id)
+-              and str(u.escalation_id).startswith("scope-") and "only ONCE" in u.reason, u)
++        check("real-unenumerated-own-rule", u.decision == "deny"
++              and u.rule == "mrh.command.unenumerated", u)
++        check("real-unenumerated-opens-no-request", not u.escalation_id, u)
+         u2 = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 8)
+-        check("real-unenumerated-reissue-finds-it", u2.escalation_id == u.escalation_id,
+-              (u.escalation_id, u2.escalation_id))
++        check("real-unenumerated-reissue-opens-none", not u2.escalation_id, u2)
+ 
+ 
+ def teardown_module(module=None):
+diff --git a/tools/shell_scope_reach_battery_test.py b/tools/shell_scope_reach_battery_test.py
+--- a/tools/shell_scope_reach_battery_test.py
++++ b/tools/shell_scope_reach_battery_test.py
+@@ -962,12 +962,16 @@
+         # there — the verdict a seat acts on, not only the helper.
+         for name, cmd in deny:
+             ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
+-            check(f"evaluate-denies:{name}", ve.blocks and ve.rule in ("mrh.command", "egress.secret"),
++            check(f"evaluate-denies:{name}", ve.blocks and ve.rule in (
++                      "mrh.command", "mrh.command.unenumerated", "egress.secret"),
+                   f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}")
++        # hestia#1313 (dp, 2026-10-14): an unenumerable reach is refused under its own rule, which
++        # does not escalate (no scope request is opened). The target still names the sentinel.
++        unenum_rule = "mrh.command.unenumerated" if "mrh.command.unenumerated" in G.REMEDIES else "mrh.command"
+         for name, cmd in request:
+             ve = G.evaluate(G.NormalizedEvent(tool="Bash", command=cmd, cwd=fx.cwd), prof, ws, policy=pol)
+             check(f"evaluate-requests:{name}",
+-                  ve.blocks and ve.rule == "mrh.command" and getattr(ve, "target", "") == UNENUM,
++                  ve.blocks and ve.rule == unenum_rule and getattr(ve, "target", "") == UNENUM,
+                   f"{cmd[:100]!r} -> {ve.decision}/{ve.rule}/{getattr(ve, 'target', None)}")
+         # Parity on the deny side: every absolute deny target is also refused to Read.
+         for name, cmd in deny:

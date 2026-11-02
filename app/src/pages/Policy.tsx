@@ -12,6 +12,9 @@ export function Policy() {
     try {
       const result = (await getPolicy()) as Record<string, unknown>;
       setPolicy(result);
+      // The highlight follows what the DAEMON says is active, not the last button this page
+      // pressed: before this, nothing was highlighted on load, whatever the preset was.
+      setActivePreset(String(result.active_preset ?? ""));
       setError(null);
     } catch (e) {
       setError(String(e));

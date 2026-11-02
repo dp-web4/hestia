@@ -7,12 +7,12 @@
   "files": [
     {
       "path": "hooks/before_tool.py",
-      "sha256": "245cc79187ec995903278c04f7fd27b97162aa8067eaa1aac586d1c94d150a07",
+      "sha256": "110da755b501530206efc965d3dd11042fd643961f9c9c0d3eb7ba2dcd97e898",
       "source": "plugins/gemini/hooks/before_tool.py"
     },
     {
       "path": "hooks/hooks.json",
-      "sha256": "9d8260aeb44f6cc59f1d981bc9c1f15c970ebb252a7fd8d0f65ccbc8152ec3a2",
+      "sha256": "efd3e850e35bcefe116626b04cdc0f2b6770f2e3fed41a0870acfb9963639791",
       "source": "plugins/gemini/hooks/hooks.json"
     },
     {
@@ -33,23 +33,27 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "3b3e685ba1f21092e4ddfbd48a6aeb11c92ada32409d9c66fdd8de664e7c649f",
+    "gt_version": "7d630395ef33d82fb7efde8c4c7b91d4a934330172e09b347c69ccc1aab9009d",
     "files": [
       {
         "path": "hestia_gate_core.py",
-        "sha256": "4d0807d35482e36b4e107e572f44a92a4864fc9357348baf6313ac734d105301"
+        "sha256": "2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930"
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "5bb44382c00720fb06439695ad5a0b47fe635601f9cd19e576d203b94b2bed65"
+        "sha256": "2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf"
       },
       {
         "path": "hestia_governance_closure.py",
-        "sha256": "9c9a00843a8956a3220917eef39dc3dd85f25412ba5d2fdabe04fe4fdce32d5a"
+        "sha256": "1f9a167c9793a1a416307b346b1013b343b421135675a5302a8b9deb60615e94"
       },
       {
         "path": "hestia_shell_classifier.py",
         "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      },
+      {
+        "path": "hestia_single_gate.py",
+        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
       },
       {
         "path": "hestia_witness_core.py",
@@ -57,12 +61,6 @@
       }
     ]
   },
-  "requires": [
-    {
-      "unit": "claude-code",
-      "path": "hooks/pre_tool_use.py",
-      "sha256": "c162fa9845ebea07c50aeed3e113bb9612258f9ef8ea5922dd623b8870e48f74"
-    }
-  ],
-  "gt_version": "c5015c27e14231aac8f43f66bd3503765d1453b7e3e2b2715247f1e697c84d01"
+  "requires": [],
+  "gt_version": "10c062c83c93cde56f31216b13cb096d2469a34077025eedf0f5b6e22ea81ddd"
 }

@@ -1,5 +1,10 @@
 # 13 handlers can change governed state with no record of it
 
+> **Status 2026-09-29: fixed.** `orchestrator_connect` in PR 1164; the other 12 (and a sibling the
+> `let _` sweep missed, `policy_instance_grant`, which kept a failed append as an empty hash) in the
+> class-A PR, each with an injected-failure test. `tools/discarded_chain_records_test.py` is the
+> ratchet. Classes B–D are unchanged, deliberately (see below).
+
 **Found:** 2026-09-27, by hub-claude, building the app's gate-integrity surface on
 `POST /api/gates/ratify` and then checking whether the defect found there was local.
 **Related:** the ratify fix (PR `hub/gate-integrity-surface`, `apply_ratification`), the RWOA
