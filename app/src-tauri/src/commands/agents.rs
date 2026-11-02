@@ -98,6 +98,13 @@ fn retire_outcome(status: reqwest::StatusCode, body: serde_json::Value) -> Resul
 
 fn reinstate_outcome(status: reqwest::StatusCode, body: serde_json::Value) -> Result<serde_json::Value, String> {
     if status.is_success() {
+        // Older daemons report a committed reinstatement as 200 even when its
+        // terminal witness append failed; the explicit null preserves that evidence.
+        if body.get("intentEntryHash").is_some()
+            && body.get("witnessEntryHash").is_some_and(|v| v.is_null())
+        {
+            return Ok(serde_json::json!({ "outcome": "reinstated_unrecorded", "result": body }));
+        }
         return Ok(serde_json::json!({ "outcome": "reinstated", "result": body }));
     }
     if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
@@ -297,6 +304,26 @@ mod tests {
         assert_eq!(out["outcome"], "already_reinstated");
         let out = reinstate_outcome(StatusCode::OK, json!({"ok": true, "grants_not_restored": ["/w"]})).unwrap();
         assert_eq!(out["result"]["grants_not_restored"], json!(["/w"]));
+    }
+
+    #[test]
+    fn old_daemon_reinstatement_with_null_witness_is_unrecorded() {
+        let legacy = json!({
+            "ok": true, "plugin_id": "member", "retired": false, "generation": 3,
+            "intentEntryHash": "intent", "witnessEntryHash": null,
+            "grants_not_restored": ["/w/a"]
+        });
+        let out = reinstate_outcome(StatusCode::OK, legacy.clone()).unwrap();
+        assert_eq!(out["outcome"], "reinstated_unrecorded");
+        assert_eq!(out["result"], legacy);
+
+        let recorded = reinstate_outcome(StatusCode::OK, json!({
+            "intentEntryHash": "intent", "witnessEntryHash": "terminal"
+        })).unwrap();
+        assert_eq!(recorded["outcome"], "reinstated");
+        // Missing is not the older daemon's explicit failure signal.
+        let missing = reinstate_outcome(StatusCode::OK, json!({"ok": true})).unwrap();
+        assert_eq!(missing["outcome"], "reinstated");
     }
 
     /// Last edit wins in the engine; the app must not overwrite a retirement it did not see.
