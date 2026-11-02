@@ -1040,7 +1040,7 @@
   "unsurfaced": [
     {
       "route": "POST /api/scope/standing/recursive",
-      "why": "Legacy unbound route kept for compatibility. Operator surfaces use the separate snapshot-bound endpoint; other legacy clients remain unbound."
+      "why": "Legacy unbound route kept for compatibility. Operator surfaces use the separate snapshot-bound endpoint; legacy clients remain unbound and are refused when live and standing grants share the path and either would change."
     },
     {
       "route": "GET /",

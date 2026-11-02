@@ -6480,7 +6480,7 @@ async fn scope_standing_recursive_impl(
     if !require_binding && standing_now.is_some() && live.is_some() && (standing_changes || live_changes) {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
             "error": "live and standing grants share this path; use a client that shows and binds both",
-            "moved": true})));
+            "unbound_twin": true})));
     }
     if !standing_changes && !live_changes {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
@@ -11543,6 +11543,10 @@ mod disposition_tests {
             "recursive": true, "reason":"needed"});
         let response = scope_standing_recursive(State(state.clone()), Json(body)).await.into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(response_body["unbound_twin"], true);
+        assert!(response_body.get("moved").is_none());
         let s = state.lock().await;
         assert_eq!(s.standing_scope.generation, generation);
         assert_eq!(s.recent_chain(50).len(), chain_len);

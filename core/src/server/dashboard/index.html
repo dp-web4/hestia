@@ -6670,7 +6670,7 @@
         } catch (e2) { err.textContent = `make standing failed: ${e2.message}`; err.hidden = false; pro.disabled = false; }
         return;
       }
-      // make recursive / make exact — POST /api/scope/standing/recursive
+      // make recursive / make exact — POST /api/scope/standing/recursive-if-unchanged
       const rch = e.target.closest('[data-reach-member]');
       if (rch) {
         const member = rch.dataset.reachMember, p = rch.dataset.reachPath;
