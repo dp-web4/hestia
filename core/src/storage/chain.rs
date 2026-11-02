@@ -2544,6 +2544,17 @@ mod tests {
     }
 
     #[test]
+    fn online_backup_never_creates_a_missing_source() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("missing.db");
+        let snapshot_path = dir.path().join("snapshot.db");
+
+        let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY);
+        assert!(!source_path.exists(), "a read-only snapshot must not create its source");
+        assert!(result.is_err(), "a missing source must not produce an empty snapshot");
+    }
+
+    #[test]
     fn online_backup_includes_wal_frames_and_stays_encrypted() {
         let dir = TempDir::new().unwrap();
         let source_path = dir.path().join("live.db");
