@@ -265,6 +265,10 @@ pub fn load_members(vault: &crate::vault::Vault) -> MemberRegistry {
 /// An authority-sensitive caller must not treat an unreadable or ambiguous
 /// identity map as a known-empty registry.
 pub fn load_members_checked(vault: &crate::vault::Vault) -> anyhow::Result<MemberRegistry> {
+    Ok(registry_from_persisted(load_persisted_members_checked(vault)?))
+}
+
+fn load_persisted_members_checked(vault: &crate::vault::Vault) -> anyhow::Result<Vec<PersistedMember>> {
     let persisted: Vec<PersistedMember> = crate::vault::load_doc_checked(
         vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE,
     )?;
@@ -276,7 +280,7 @@ pub fn load_members_checked(vault: &crate::vault::Vault) -> anyhow::Result<Membe
         anyhow::ensure!(ids.insert(member.plugin_id.clone()), "member registry contains a duplicate member id");
         anyhow::ensure!(identities.insert(member.lct.lct_id()), "member registry contains a duplicate member identity");
     }
-    Ok(registry_from_persisted(persisted))
+    Ok(persisted)
 }
 
 fn registry_from_persisted(persisted: Vec<PersistedMember>) -> MemberRegistry {
@@ -504,6 +508,21 @@ fn mint_once(
         return Some(lct.lct_id()); // hot path: already present
     }
 
+    // Never turn unreadable or ambiguous identity authority into a fresh roster.
+    // A persisted member absent from the in-memory map is also a stale-state
+    // conflict, not permission to mint it a replacement identity.
+    let mut persisted = match load_persisted_members_checked(vault) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("[members] REFUSED: member registry is unreadable or ambiguous ({e:#})");
+            return None;
+        }
+    };
+    if persisted.iter().any(|member| member.plugin_id == id) {
+        eprintln!("[members] REFUSED: persisted member is absent from the current registry; reconcile first");
+        return None;
+    }
+
     // First sight: mint an AiSoftware LCT with a custodial keypair.
     let (mut lct, keypair) = Lct::new(EntityType::AiSoftware, None);
     lct.sign_binding(&keypair); // self-issued §3.2 bootstrap, custodial key proves the binding
@@ -517,9 +536,6 @@ fn mint_once(
     }
 
     // Persist: reload the doc, append, save (append-only; other members untouched).
-    let mut persisted: Vec<PersistedMember> =
-        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
-            .unwrap_or_default();
     persisted.push(PersistedMember {
         plugin_id: id.to_string(),
         lct: lct.clone(),
@@ -639,6 +655,18 @@ mod tests {
                     "unreadable registry was overwritten or advertised; sealed={sealed}, created={}, file_changed={}",
                     created.is_some(), before != after);
         }
+    }
+
+    #[test]
+    fn member_mint_must_not_replace_a_persisted_identity_missing_from_memory() {
+        let (dir, mut vault) = fresh_vault();
+        let mut original = MemberRegistry::default();
+        let existing = ensure_member(&mut vault, &mut original, "test-seat", false, "", "anchor").unwrap();
+        let before = std::fs::read(dir.path().join("v.enc")).unwrap();
+        let mut stale = MemberRegistry::default();
+        assert!(ensure_member(&mut vault, &mut stale, "test-seat", false, "", "anchor").is_none());
+        assert_eq!(std::fs::read(dir.path().join("v.enc")).unwrap(), before);
+        assert_eq!(load_members_checked(&vault).unwrap().get("test-seat").unwrap().lct_id(), existing);
     }
 
     #[test]
