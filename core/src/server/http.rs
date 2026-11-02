@@ -10603,6 +10603,9 @@ mod disposition_tests {
         };
         let error = response.0["error"].as_str().unwrap_or("");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(persisted.as_deref(), Some("enforce"), "fault must occur after the rename");
+        assert_eq!(snapshot, crate::server::delegation_gate::GateMode::Record);
+        assert_eq!(chain_len, 0, "this probe has not appended a mode witness");
         assert!(error.contains("outcome is unknown") && !error.contains("nothing changed"),
                 "false no-change response: {error}; reopened={persisted:?}, snapshot={snapshot:?}, chain_len={chain_len}");
     }
