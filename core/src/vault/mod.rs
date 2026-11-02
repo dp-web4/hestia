@@ -801,6 +801,26 @@ mod tests {
     }
 
     #[test]
+    fn rejected_expectations_cannot_ride_on_later_save() {
+        let (_dir, path) = temp_path();
+        let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
+        let mut expectations = gate_integrity::GateExpectations::new();
+        expectations.insert("fixture".into(), gate_integrity::GateExpectation {
+            sha256: "fixture-digest".into(), plugin_id: "fixture".into(),
+            ratified_at: chrono::Utc::now(), note: "synthetic".into(),
+        });
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+        assert!(vault.set_gate_expectations(expectations).is_err());
+        let rejected_in_memory = !vault.gate_expectations().is_empty();
+        assert!(Vault::open(path.clone(), "p".into()).unwrap().gate_expectations().is_empty());
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        vault.put_document("unrelated", "record", b"new".to_vec()).unwrap();
+        let reopened = Vault::open(path, "p".into()).unwrap();
+        assert!(!rejected_in_memory && reopened.gate_expectations().is_empty(),
+                "rejected expectations remained staged");
+    }
+
+    #[test]
     fn init_and_open_round_trip() {
         let (_dir, path) = temp_path();
         let _v = Vault::init(path.clone(), "passphrase".into()).unwrap();
