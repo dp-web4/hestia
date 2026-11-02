@@ -69,17 +69,13 @@ fn retire_outcome(status: reqwest::StatusCode, body: serde_json::Value) -> Resul
         return Ok(serde_json::json!({ "outcome": "retired", "result": body }));
     }
     let why = body.get("error").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    // A failed terminal receipt can follow a committed retirement. Preserve the
-    // daemon's recovery evidence instead of flattening the 500 to its error alone.
+    // A failed terminal receipt can follow a committed retirement. Give the UI
+    // a distinct, evidence-bearing outcome so it can refresh without saying success.
     if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
         && body.get("retired").and_then(|v| v.as_bool()) == Some(true)
         && body.get("recorded").and_then(|v| v.as_bool()) == Some(false)
     {
-        let intent = body.get("intentEntryHash").and_then(|v| v.as_str()).unwrap_or("unknown");
-        return Err(format!("{why} Intent: {intent}. Applied revocations: standing {}, live {}, delegations {}.",
-            body.get("revoked_standing_paths").unwrap_or(&serde_json::Value::Null),
-            body.get("revoked_live_paths").unwrap_or(&serde_json::Value::Null),
-            body.get("revoked_delegations").unwrap_or(&serde_json::Value::Null)));
+        return Ok(serde_json::json!({ "outcome": "retired_unrecorded", "result": body }));
     }
     if status == reqwest::StatusCode::CONFLICT && body.get("code").and_then(|v| v.as_str()) == Some("already_retired") {
         return Ok(serde_json::json!({ "outcome": "already_retired", "detail": why }));
@@ -274,9 +270,11 @@ mod tests {
             "retired": true, "recorded": false, "error": "retirement committed; inspect before retrying",
             "intentEntryHash": "intent-hash", "revoked_standing_paths": ["/w/a"],
             "revoked_live_paths": [], "revoked_delegations": ["delegation-id"]
-        })).unwrap_err();
-        assert!(partial.contains("committed") && partial.contains("intent-hash")
-            && partial.contains("/w/a") && partial.contains("delegation-id"));
+        })).unwrap();
+        assert_eq!(partial["outcome"], "retired_unrecorded");
+        assert_eq!(partial["result"]["intentEntryHash"], "intent-hash");
+        assert_eq!(partial["result"]["revoked_standing_paths"], json!(["/w/a"]));
+        assert_eq!(partial["result"]["revoked_delegations"], json!(["delegation-id"]));
         assert!(reinstate_outcome(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "still retired: disk"})).is_err());
     }
 

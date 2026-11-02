@@ -121,11 +121,13 @@ function MemberLifecycle({
   inventoryFresh,
   inventoryGeneration,
   onActed,
+  onUnrecorded,
 }: {
   m: UnaccountedMember;
   inventoryFresh: boolean;
   inventoryGeneration: number;
   onActed: () => void;
+  onUnrecorded: (member: string, result: Record<string, unknown>) => void;
 }) {
   const [reason, setReason] = useState("");
   const [ref, setRef] = useState("");
@@ -147,6 +149,9 @@ function MemberLifecycle({
       if (out.outcome === "needs_confirmation") {
         setAnswer({ generation: inventoryGeneration, question: out });
         setConfirm(false);
+      } else if (out.outcome === "retired_unrecorded") {
+        onUnrecorded(m.id, out.result);
+        onActed();
       } else if (out.outcome === "already_retired" || out.outcome === "already_reinstated") {
         setMsg(out.detail);
         onActed();
@@ -211,6 +216,7 @@ export function Agents() {
   const [confirming, setConfirming] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [actError, setActError] = useState<string | null>(null);
+  const [unrecorded, setUnrecorded] = useState<{ member: string; result: Record<string, unknown> }[]>([]);
   const refreshGeneration = useRef(0);
 
   const refresh = useCallback(async () => {
@@ -306,6 +312,13 @@ export function Agents() {
       )}
 
       {error && <div className="error-banner">could not read the inventory: {error}</div>}
+
+      {unrecorded.map((item, index) => (
+        <div role="alert" className="error-banner" key={index}>
+          Retirement for {item.member} committed, but its terminal witness failed. Inspect before retrying.
+          <pre>{JSON.stringify(item.result, null, 2)}</pre>
+        </div>
+      ))}
 
       {inv?.status === "UNKNOWN" && (
         <div className="error-banner">
@@ -453,7 +466,8 @@ export function Agents() {
                   {m.retired ? " · retired on this seat" : ""}
                 </span>
               </h3>
-              <MemberLifecycle m={m} inventoryFresh={inventoryFresh} inventoryGeneration={inventoryGeneration} onActed={refresh} />
+              <MemberLifecycle m={m} inventoryFresh={inventoryFresh} inventoryGeneration={inventoryGeneration} onActed={refresh}
+                onUnrecorded={(member, result) => setUnrecorded((items) => [...items, { member, result }])} />
             </article>
           ))}
         </section>

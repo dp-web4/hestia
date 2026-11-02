@@ -548,6 +548,7 @@ export interface AgentInventory {
 /** What a retire/reinstate came back as. Conflicts are outcomes, not errors (PRD §1a). */
 export type MemberActOutcome =
   | { outcome: "retired" | "reinstated"; result: Record<string, unknown> }
+  | { outcome: "retired_unrecorded"; result: Record<string, unknown> }
   | { outcome: "already_retired" | "already_reinstated"; detail: string }
   | {
       outcome: "needs_confirmation";

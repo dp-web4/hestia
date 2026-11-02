@@ -294,6 +294,30 @@ describe("Agents", () => {
       expect(screen.queryByRole("button", { name: /connect/i })).toBeNull();
     });
 
+    it("keeps committed-but-unrecorded retirement evidence visible after refreshing away the row", async () => {
+      operatorStatus.mockResolvedValue(signedIn);
+      agentsInventory.mockResolvedValue(inventory([claude]));
+      getDashboard.mockResolvedValueOnce({ retired: [], members: ["caude-code"], trust: [] })
+        .mockResolvedValue({ retired: [], members: [], trust: [] });
+      retireAgent.mockResolvedValue({ outcome: "retired_unrecorded", result: {
+        retired: true, recorded: false, intentEntryHash: "intent-123", revoked_standing_paths: ["/w/a"],
+        revoked_live_paths: [], revoked_delegations: ["delegation-456"],
+      }});
+      render(<Agents />);
+      await screen.findByText("caude-code");
+      const [reason, ref] = screen.getAllByRole("textbox");
+      fireEvent.change(reason, { target: { value: "typo" } });
+      fireEvent.change(ref, { target: { value: "ruling" } });
+      fireEvent.click(screen.getByRole("button", { name: "Retire" }));
+      const warning = await screen.findByRole("alert");
+      expect(warning.textContent).toContain("committed, but its terminal witness failed");
+      expect(warning.textContent).toContain("intent-123");
+      expect(warning.textContent).toContain("/w/a");
+      expect(warning.textContent).toContain("delegation-456");
+      await waitFor(() => expect(screen.queryByRole("button", { name: "Retire" })).toBeNull());
+      expect(screen.getByRole("alert").textContent).toContain("intent-123");
+    });
+
     it("the live-member refusal is a question with its evidence, confirmed only by the operator", async () => {
       operatorStatus.mockResolvedValue(signedIn);
       agentsInventory.mockResolvedValue(inventory([claude]));
