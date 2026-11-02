@@ -670,6 +670,19 @@ mod tests {
     }
 
     #[test]
+    fn failed_witness_vouch_must_not_change_published_member_identity() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let before = serde_json::to_vec(registry.get("test-seat").unwrap()).unwrap();
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+        let key = web4_core::crypto::KeyPair::generate();
+        assert!(!vouch_witnessing_key(&mut vault, &mut registry, "test-seat", key.verifying_key()));
+        let after = serde_json::to_vec(registry.get("test-seat").unwrap()).unwrap();
+        assert!(before == after, "a failed vouch must not publish the new key in memory");
+    }
+
+    #[test]
     fn ensure_member_mints_persists_and_is_idempotent() {
         let (_dir, mut vault) = fresh_vault();
         let mut reg = MemberRegistry::default();
