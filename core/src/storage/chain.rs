@@ -2572,6 +2572,18 @@ mod tests {
     }
 
     #[test]
+    fn missing_backup_source_does_not_remove_existing_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("missing.db");
+        let snapshot_path = dir.path().join("existing.db");
+        std::fs::write(&snapshot_path, b"keep existing destination").unwrap();
+        let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY);
+        assert!(result.is_err());
+        assert!(!source_path.exists());
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination");
+    }
+
+    #[test]
     fn snapshot_source_removed_after_check_is_not_recreated() {
         let dir = TempDir::new().unwrap();
         let source_path = dir.path().join("source.db");
