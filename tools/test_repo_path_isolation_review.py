@@ -1,4 +1,5 @@
 """Synthetic regression: local path reach must not imply foreign remote reach."""
+import os
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +23,21 @@ class RepoIsolation(unittest.TestCase):
             prof, pol = g._policy(g._snapshot(ws, standing=[{"path": ws + "/project", "recursive": True}]))
             self.assertFalse(g._verdict(prof, pol, ws, "Read", inside).blocks)
             self.assertTrue(g._verdict(prof, pol, ws, "Read", outside).blocks)
+
+    def test_simulated_path_projection_does_not_follow_a_link_outside_the_grant(self):
+        def path_only(path, recursive=False):
+            return "path:" + path.strip().rstrip("/") + ("/**" if recursive else "")
+
+        with g._Workspace() as ws, patch.object(g.m, "_scope_entry_for_grant", path_only):
+            outside = ws + "/other/file"
+            g._materialize(outside)
+            g._materialize(ws + "/project/inside/file")
+            os.makedirs(ws + "/project", exist_ok=True)
+            os.symlink(ws + "/other", ws + "/project/link")
+            os.symlink(ws + "/project/inside", ws + "/project/inside-link")
+            prof, pol = g._policy(g._snapshot(ws, standing=[{"path": ws + "/project", "recursive": True}]))
+            self.assertTrue(g._verdict(prof, pol, ws, "Read", ws + "/project/link/file", materialize=False).blocks)
+            self.assertFalse(g._verdict(prof, pol, ws, "Read", ws + "/project/inside-link/file", materialize=False).blocks)
 
     def test_recursive_path_does_not_grant_foreign_remote(self):
         with g._Workspace() as ws:
