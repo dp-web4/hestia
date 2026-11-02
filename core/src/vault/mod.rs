@@ -632,6 +632,22 @@ mod tests {
     }
 
     #[test]
+    fn failed_policy_save_cannot_ride_on_later_document_save() {
+        let (_dir, path) = temp_path();
+        let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
+        assert_eq!(vault.policy().active_preset, "safety");
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+        assert!(vault.set_active_preset("permissive").is_err());
+        assert_eq!(Vault::open(path.clone(), "p".into()).unwrap().policy().active_preset, "safety");
+
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        vault.put_document("unrelated", "record", b"new".to_vec()).unwrap();
+        let reopened = Vault::open(path, "p".into()).unwrap();
+        assert_eq!(reopened.get_document("unrelated", "record").unwrap(), b"new");
+        assert_eq!(reopened.policy().active_preset, "safety");
+    }
+
+    #[test]
     fn init_and_open_round_trip() {
         let (_dir, path) = temp_path();
         let _v = Vault::init(path.clone(), "passphrase".into()).unwrap();
