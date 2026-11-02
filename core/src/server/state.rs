@@ -660,6 +660,9 @@ pub struct ServerState {
     pub standing_projection_audit: crate::server::published::Watched<Option<crate::server::standing_scope::ProjectionAudit>>,
     /// Process-local identity used to discard superseded off-lock audit results.
     standing_projection_attempt: Option<Arc<()>>,
+    /// One blocking durable reader per state instance, held until the worker
+    /// actually exits even if its asynchronous waiter is canceled.
+    standing_projection_reader_slot: Arc<tokio::sync::Semaphore>,
     /// TRUE while the in-memory standing store is TIGHTER than the persisted vault copy —
     /// set when a revoke's vault write fails after the row was already removed from memory
     /// (memory keeps the tighter state on purpose). While set, the revoke surface accepts a
@@ -1177,6 +1180,7 @@ impl ServerState {
             // make the freshness timestamp lie from the first second.
             standing_projection_audit: crate::server::published::Watched::new(None),
             standing_projection_attempt: None,
+            standing_projection_reader_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
             #[cfg(test)]
@@ -2612,9 +2616,15 @@ where
         -> anyhow::Result<(u64, u64, crate::server::standing_scope::StandingScopeStore)> + Send + 'static,
 {
     use crate::server::standing_scope::ProjectionAudit;
-    let (attempt, instance, generation, revision, runtime, reader) = {
+    let (attempt, instance, generation, revision, runtime, reader, permit) = {
         let mut s = state.lock().await;
-        // Supersede any in-flight attempt even if this one cannot start.
+        let Ok(permit) = s.standing_projection_reader_slot.clone().try_acquire_owned() else {
+            // The existing worker may still finish (or its waiter may have
+            // been canceled). Do not start another or present an old match.
+            *s.standing_projection_audit = None;
+            return false;
+        };
+        // Supersede an earlier attempt even if this one lacks a usable revision.
         let attempt = Arc::new(());
         s.standing_projection_attempt = Some(attempt.clone());
         let Some(revision) = s.standing_scope.revision() else {
@@ -2624,9 +2634,12 @@ where
         // An old successful result is not evidence while a new read is in flight.
         *s.standing_projection_audit = None;
         (attempt, s.vault.instance_identity(), s.vault.generation(), revision,
-         (*s.standing_scope).clone(), s.vault.detached_reader())
+         (*s.standing_scope).clone(), s.vault.detached_reader(), permit)
     };
-    let result = tokio::task::spawn_blocking(move || read(reader)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read(reader)
+    }).await;
     let observed_at = crate::server::gate_escalation::now_secs();
     let mut s = state.lock().await;
     // A later attempt owns the published slot; an older result must not replace it.
@@ -2766,15 +2779,64 @@ mod tests {
         release_tx.send(()).unwrap();
         assert!(!second_started.load(Ordering::SeqCst),
                 "canceling the waiter must not release the reader's capacity");
-        let s = state.lock().await;
-        assert!(s.standing_projection_audit.as_ref().map_or(true, |a| !a.matches),
-                "a busy or canceled read must never publish a successful audit");
+        let slot = {
+            let s = state.lock().await;
+            assert!(s.standing_projection_audit.as_ref().map_or(true, |a| !a.matches),
+                    "a busy or canceled read must never publish a successful audit");
+            s.standing_projection_reader_slot.clone()
+        };
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(2), slot.acquire())
+            .await.expect("released worker must return capacity").unwrap();
+        drop(permit);
+        let (generation, runtime) = {
+            let s = state.lock().await;
+            (s.vault.generation(), (*s.standing_scope).clone())
+        };
+        assert!(!verify_standing_projection_with(&state, move |_| Ok((generation, 123, runtime))).await);
+        assert!(state.lock().await.standing_projection_audit.as_ref().unwrap().matches,
+                "a later valid read can publish after the prior worker exits");
+    }
+
+    #[tokio::test]
+    async fn detached_busy_audit_does_not_supersede_the_reader_already_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_dir, raw) = make_state();
+        let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        let (generation, runtime) = {
+            let s = state.lock().await;
+            (s.vault.generation(), (*s.standing_scope).clone())
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task_state = state.clone();
+        let first = tokio::spawn(async move {
+            verify_standing_projection_with(&task_state, move |_| {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                Ok((generation, 123, runtime))
+            }).await
+        });
+        started_rx.await.unwrap();
+        let second_started = Arc::new(AtomicBool::new(false));
+        let seen = second_started.clone();
+        assert!(!verify_standing_projection_with(&state, move |_| {
+            seen.store(true, Ordering::SeqCst);
+            Err(anyhow::anyhow!("must not start"))
+        }).await);
+        assert!(state.lock().await.standing_projection_audit.is_none());
+        release_tx.send(()).unwrap();
+        assert!(!first.await.unwrap());
+        assert!(!second_started.load(Ordering::SeqCst));
+        assert!(state.lock().await.standing_projection_audit.as_ref().unwrap().matches);
     }
 
     #[tokio::test]
     async fn an_older_detached_audit_cannot_replace_a_newer_attempt() {
         let (_dir, raw) = make_state();
         let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        // Exercise the existing supersession check independently of the
+        // normal one-reader limit, including future configuration changes.
+        state.lock().await.standing_projection_reader_slot = Arc::new(tokio::sync::Semaphore::new(2));
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let task_state = state.clone();
