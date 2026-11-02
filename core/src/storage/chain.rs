@@ -25,7 +25,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -542,6 +542,21 @@ impl SqliteChainStore {
             })?;
         }
         refuse_snapshot_alias(source_path, destination_path)?;
+        // The alias check and open are separate operations. Do not recreate a
+        // source removed between them, and do not replace a destination if
+        // the source cannot be opened.
+        let key_hex = hex::encode(key);
+        let source = Connection::open_with_flags(
+            source_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ).with_context(|| format!("opening chain snapshot source {}", source_path.display()))?;
+        source
+            .pragma_update(None, "key", &key_hex)
+            .with_context(|| "keying chain snapshot source")?;
+        source
+            .pragma_update(None, "query_only", true)
+            .with_context(|| "making chain snapshot source query-only")?;
+
         if destination_path.exists() {
             std::fs::remove_file(destination_path).with_context(|| {
                 format!(
@@ -550,16 +565,6 @@ impl SqliteChainStore {
                 )
             })?;
         }
-
-        let key_hex = hex::encode(key);
-        let source = Connection::open(source_path)
-            .with_context(|| format!("opening chain snapshot source {}", source_path.display()))?;
-        source
-            .pragma_update(None, "key", &key_hex)
-            .with_context(|| "keying chain snapshot source")?;
-        source
-            .pragma_update(None, "query_only", true)
-            .with_context(|| "making chain snapshot source query-only")?;
 
         let mut destination = Connection::open(destination_path).with_context(|| {
             format!(
@@ -2552,6 +2557,18 @@ mod tests {
         let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY);
         assert!(!source_path.exists(), "a read-only snapshot must not create its source");
         assert!(result.is_err(), "a missing source must not produce an empty snapshot");
+    }
+
+    #[test]
+    fn missing_backup_source_does_not_remove_existing_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("missing.db");
+        let snapshot_path = dir.path().join("existing.db");
+        std::fs::write(&snapshot_path, b"keep existing destination").unwrap();
+        let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY);
+        assert!(result.is_err());
+        assert!(!source_path.exists());
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination");
     }
 
     #[test]
