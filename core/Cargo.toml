@@ -39,6 +39,7 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # System
 dirs = "5"
+# Private, exclusively created scratch dirs (chain verification and request snapshots).
 tempfile = "3"
 
 # Errors

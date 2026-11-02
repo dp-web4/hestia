@@ -135,6 +135,29 @@ form should send it too** (spec rule `bound-to-rendered-evidence` now lists `sco
 
 ---
 
+### 4c as built (2026-09-29): Delegations
+
+The placeholder page, which read a `delegations` field off the snapshot and labelled empty
+roles "all", is replaced by the three routes it stood in for:
+- **Pick a member** from the registry. Its delegation key is derived by the daemon; the app sends
+  no identity field, and the daemon refuses one (#1067).
+- **The listing** shows each delegation's status (active / expired / revoked). Revoked ones stay
+  listed.
+- **Grant:** roles are checkboxes from the daemon's closed list, and actions are one per line.
+  The page refuses a grant naming nothing (it would be full authority) and one with no reason.
+  After a grant, the daemon's `unvalidated_actions` is shown in full, not as a bare "delegated".
+- **Revoke:** an already-revoked answer is an outcome.
+- **Retired member:** its history is readable and the grant form is absent.
+- **Signed out:** nothing is read, and the page says so.
+
+**Raised, not changed: revoke requires a reason.** `agent_delegation_revoke` answers 400 without
+one, pinned by its own test and by `delegation_panel_contract_test.py` ("revoke asks for a
+reason"). That inverts the asymmetry kept on every other surface (scope revoke, decide, refuse),
+where narrowing never costs more than widening. The app follows the daemon and labels the field
+"the daemon requires one to revoke". The owner's call is whether to relax it.
+
+Spec: `delegations` app -> required.
+
 ## What is deliberately not scheduled
 
 - **S4 Evidence** (chain/trust views) — deferred in the PRD; the dashboard serves it.
