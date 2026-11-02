@@ -1,4 +1,4 @@
-import sys, subprocess, pathlib, glob
+import os, sys, subprocess, pathlib, glob
 sys.path.insert(0, "/tmp/s1314e")
 from apply_lib import split, apply
 S = pathlib.Path("/tmp/s1314e")
@@ -8,7 +8,7 @@ want = {"plugins/_shared/hestia_gate_core.py": "core_rev.py",
         "tools/shell_scope_reach_battery_test.py": "battery_rev.py",
         "tools/one_gate_decide_contract_test.py": "contract_held.py"}
 for f, lines in files.items():
-    base = subprocess.run(["git", "-C", "/home/dp/ai-workspace/hestia", "show", f"2d79644f:{f}"],
+    base = subprocess.run(["git", "-C", os.environ["HESTIA_1314_REPO"], "show", f"2d79644f:{f}"],
                           capture_output=True, text=True, check=True).stdout
     got = apply(base, lines)
     if f in want:

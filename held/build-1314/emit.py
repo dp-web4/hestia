@@ -1,6 +1,12 @@
-import sys, pathlib, difflib, hashlib, subprocess
-WT = pathlib.Path("/home/dp/ai-workspace/hestia/scratchpad/s1314e-base")
+import os, sys, pathlib, difflib, hashlib, subprocess
+WT = pathlib.Path(os.environ["HESTIA_1314_BASE"]).resolve()
 S = pathlib.Path("/tmp/s1314e")
+def git(*args):
+    return subprocess.check_output(["git", "-C", str(WT), *args], text=True).strip()
+if git("rev-parse", "HEAD") != git("rev-parse", "2d79644f^{commit}"):
+    raise RuntimeError("historical base checkout is at the wrong commit")
+if git("status", "--porcelain", "--untracked-files=normal"):
+    raise RuntimeError("historical base checkout must be clean")
 sys.path.insert(0, str(WT / "tools"))
 SERVE = {str(WT / "plugins/_shared/hestia_gate_core.py"): S / "core_rev.py"}
 _orig = pathlib.Path.read_bytes

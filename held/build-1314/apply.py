@@ -1,5 +1,5 @@
-import re, subprocess, sys, pathlib
-REPO = "/home/dp/ai-workspace/hestia"
+import os, re, subprocess, sys, pathlib
+REPO = os.environ["HESTIA_1314_REPO"]
 BASE = "2d79644f"
 OUT = pathlib.Path("/tmp/s1314e")
 

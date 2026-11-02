@@ -1,7 +1,4 @@
-import re, subprocess, sys, pathlib
-REPO = "/home/dp/ai-workspace/hestia"
-BASE = "2d79644f"
-OUT = pathlib.Path("/tmp/s1314e")
+import re
 
 def split(patch):
     files = {}

@@ -2,6 +2,14 @@
 
 These scripts are kept here because the scratch copies of earlier rounds were wiped. All of them work in `/tmp/s1314e`.
 
+The scripts no longer name an installation-specific repository. `HESTIA_1314_REPO` must name a
+repository containing the historical base, and `HESTIA_1314_BASE` must name a separate, clean
+checkout at `2d79644f` for the contract and emission steps. Those two steps refuse a different or
+dirty checkout. The build scripts still use the fixed scratch directory `/tmp/s1314e`: they can
+overwrite files there and do not yet provide a safe, unique scratch-directory protocol. Do not run
+them without first reviewing their effects and arranging an explicitly disposable scratch area.
+Editing these scripts is not approval to apply any held patch or change an installed gate.
+
 1. `apply.py`: extracts the previous held patch (saved as `held.txt`) and applies it in memory to `2d79644f` text, writing `core_held.py`, `battery_held.py`, `contract_held.py` and the `*_main.py` copies.
 2. `edit_core.py` and `edit_battery.py`: this round's edits, as exact-once replaces on the held copies, producing `core_rev.py` and `battery_rev.py`.
 3. `sep.sh`: runs the revised battery against the rev, held and main cores, using `HESTIA_SCOPE_BATTERY_CORE`.
