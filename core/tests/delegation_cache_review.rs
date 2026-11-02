@@ -40,11 +40,14 @@ fn equal_size_and_mtime_key_replacement_must_refresh_the_verifier() {
                             vec!["act:command".into()], Some(1), &old_signer);
     let mut evidence = Snapshot::default();
     evidence.mode = Some(GateMode::Enforce);
-    evidence.operator_key = Some(current.clone());
+    evidence.operator_key = Some(KeyPair::from_secret_bytes(&[2; 32]).verifying_key());
     evidence.store = Some(store);
     evidence.member_lcts.insert("synthetic".into(), member_lct.into());
     let action = Act { plugin_id: "synthetic", role: "role:test", tool_name: "Bash",
                        category: "command", target: Some("synthetic") };
+    assert_eq!(assess(&evidence, &action, chrono::Utc::now()).status, Status::InvalidSignature,
+               "control: the replacement verifier rejects the old signature");
+    evidence.operator_key = Some(current.clone());
     let finding = assess(&evidence, &action, chrono::Utc::now());
     assert_eq!(finding.status, Status::InvalidSignature,
                "a delegation signed by the replaced key must not still match");
