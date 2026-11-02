@@ -172,7 +172,7 @@ jobs:
           # builds on windows (vendored OpenSSL), so the remaining work is cfg-gating
           # the Unix file-mode calls — filed as #342. Linux + macOS cover the fleet.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
     steps:
       # Two repos as SIBLING subdirs of the workspace — the pattern ci.yml proved
       # green. hestia/core has path deps into ../../web4/..., so the release must
@@ -270,7 +270,7 @@ jobs:
             os: ubuntu-22.04
             bundles: appimage,deb
           - platform: aarch64-macos
-            os: macos-14
+            os: macos-15
             bundles: app,dmg
     steps:
       # app/src-tauri path-depends on ../../../web4/web4-core: the same sibling layout and the
@@ -411,6 +411,8 @@ jobs:
     with:
       ref: ${{ needs.version.outputs.ref }}
       label: ${{ needs.version.outputs.label }}
+    # The four ANDROID_* keystore values (app-android.yml). Absent: debug-keystore signed.
+    secrets: inherit
 
   # ── one release ───────────────────────────────────────────────────────────────────────────────
   # Created as a DRAFT before any asset exists, so there is never a published release that is
@@ -453,6 +455,11 @@ jobs:
     needs: [version, build, desktop, android]
     if: ${{ !cancelled() && needs.version.result == 'success' }}
     runs-on: ubuntu-latest
+    # id-token + attestations: the keyless provenance step below (release runs only).
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       LABEL: ${{ needs.version.outputs.label }}
     steps:
@@ -492,6 +499,20 @@ jobs:
           python3 ../hestia/tools/release_publish.py check-dir . "$LABEL" || ok=1
           test "$bad" -eq 0 && test "$ok" -eq 0
 
+      # PROVENANCE FOR EVERY ASSET (dp, 2026-10-14, web4#904 signing option b): a keyless Sigstore
+      # attestation, signed through this workflow's GitHub OIDC identity, so anyone can check that
+      # an asset was built by this repository's release workflow at this tag:
+      #   gh attestation verify <asset> --repo dp-web4/hestia
+      # No key to hold or lose. Release runs only (a dry run publishes nothing to attest), and only
+      # over a verified, complete set (the step above failing skips it).
+      - name: Attest build provenance
+        if: needs.version.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/hestia-*
+            dist/SHA256SUMS
+
       # Uploaded even when verification failed, so `publish` can attach what exists to the draft
       # (it will not publish) and a human can see exactly what was built.
       - name: Upload the assembled set
@@ -506,11 +527,12 @@ jobs:
 
   publish:
     name: attach assets and publish
-    needs: [version, draft, assemble]
+    needs: [version, draft, assemble, android]
     if: ${{ !cancelled() && needs.draft.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write   # dispatch install smoke at the end (see the last step)
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -555,6 +577,7 @@ jobs:
         env:
           WEB4: ${{ steps.web4pin.outputs.rev }}
           KIND: ${{ needs.version.outputs.kind }}
+          APK_SIGNING: ${{ needs.android.outputs.signing == 'release' && 'signed with the release key' || 'signed with the debug keystore, so a later release-key APK cannot upgrade it in place' }}
         run: |
           set -euo pipefail
           U="https://github.com/$GH_REPO/releases/download/$TAG"
@@ -579,9 +602,13 @@ jobs:
           \`\`\`
           The dashboard HTML is baked into the daemon binary; nothing else is required to run.
 
-          **The desktop and Android apps are unsigned** (macOS: ad-hoc signed, not notarized;
-          Android: debug keystore). See "Installing the desktop app" in the README for the
-          Gatekeeper and AppImage steps. No Windows build: the daemon has no Windows target yet (#342).
+          **Provenance:** every asset carries a Sigstore build attestation from this repository's
+          release workflow. Check one with \`gh attestation verify <asset> --repo $GH_REPO\`.
+
+          **Platform signing:** the Android APK is $APK_SIGNING. The macOS app is ad-hoc signed,
+          not notarized, and the Linux bundles are unsigned. See "Installing the desktop app" in
+          the README for the Gatekeeper and AppImage steps. No Windows build: the daemon has no
+          Windows target yet (#342).
 
           Build provenance: hestia \`$TAG\`, Web4 \`$WEB4\` (web4.pin).
           EOF
@@ -607,3 +634,16 @@ jobs:
             --assemble "$ASSEMBLE" --kind "$KIND" --notes notes.md
           gh api "repos/$GH_REPO/releases/${{ steps.rel.outputs.id }}" \
             --jq '{html_url, draft, prerelease, assets: (.assets | length)}'
+
+      # A release this job publishes with GITHUB_TOKEN does NOT fire install-smoke's
+      # `release: published` trigger (GitHub suppresses events from GITHUB_TOKEN, except
+      # workflow_dispatch), so until v0.3.0-rc.5 no published release had ever been
+      # fresh-installed by CI. When it finally was, it caught a curl | sh install that had
+      # died at the systemd unit since July (#1458). Dispatch it explicitly, at the tag, so
+      # the smoke is the one that shipped with this release.
+      - name: Dispatch install smoke for this release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run install-smoke.yml --repo "$GH_REPO" --ref "$TAG" -f tag="$TAG"
+          echo "install smoke dispatched for $TAG: gh run list --workflow install-smoke.yml --repo $GH_REPO"

@@ -129,6 +129,8 @@ impl ServerHandler for HestiaServer {
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
             "hestia_egress_pending" => tool_egress_pending(&self.state, &args).await,
             "hestia_transport_binding" => tool_transport_binding(&self.state, &args).await,
+            "hestia_channel_send" => tool_channel_send(&self.state, &args).await,
+            "hestia_channel_outbox" => tool_channel_outbox(&self.state, &args).await,
             "hestia_member_unanswered" => tool_member_unanswered(&self.state, &args).await,
             "hestia_inbox" => tool_inbox(&self.state, &args).await,
             "hestia_pair_inbox" => tool_pair_inbox(&self.state, &args).await,
@@ -295,6 +297,7 @@ pub(crate) fn reports_shared_state(name: &str) -> bool {
     matches!(
         name,
         "hestia_gate_escalation_poll"
+            | "hestia_channel_outbox"
             | "hestia_gate_escalation_lookup"
             | "hestia_gate_escalation_claimable"
             | "hestia_gate_pending_escalations"
@@ -407,7 +410,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_scope_peer_decide",
-            "Rule ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05: scope escalations go to peers, the operator is the override). Pass your own live session_id, the request_id, decision = once | session | standing | refuse, a reason (the asker reads it), and for session/standing optionally grant_path (the asked path or a directory above it, never the root) with recursive=true. Refused by name when: you are the asker (in either direction — the asker can never decide its own request); the asker was never proven against a session (NOT-SAME cannot peer-clear an asserted name, eligibility clause 0); you are not a recognised reasoner; the request was filed by the member rather than opened by the gate. The record names you (granted_by peer:<you>), the channel (peer_not_same) and your NOT-SAME basis",
+            "Rule ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05: scope escalations go to peers, the operator is the override). Pass your own live session_id, the request_id, decision = once | session | standing | refuse, a reason (the asker reads it), and for session/standing optionally grant_path (the asked path or a directory above it, never the root) with recursive=true, and modes (a string of r read, w write, e execute, d delete; default all four, #1345). Refused by name when: you are the asker (in either direction — the asker can never decide its own request); the asker was never proven against a session (NOT-SAME cannot peer-clear an asserted name, eligibility clause 0); you are not a recognised reasoner; the request was filed by the member rather than opened by the gate. The record names you (granted_by peer:<you>), the channel (peer_not_same) and your NOT-SAME basis",
         ),
         t(
             "hestia_scope_claim",
@@ -649,6 +652,36 @@ fn hestia_tools() -> Vec<Tool> {
                         "type": "string",
                         "description": "Your own live session_id from hestia_connect. Attribution is never inherited: an unattributable sender cannot notify another member."
                     }
+                }
+            }),
+        ),
+        t_args(
+            "hestia_channel_send",
+            "SHADOW (#1344): ask to send a message to a channel the operator bound for you (e.g. \
+             'dp'). Nothing leaves this machine yet: the send is judged, witnessed and kept in your \
+             outbox, and the reply says what would have happened. The recipient is the operator's \
+             binding, never yours to choose. A message naming a credential or secret path is \
+             refused. At most 3 unanswered messages per channel per clock hour; the reply names \
+             them and when the count resets.",
+            json!({
+                "type": "object",
+                "required": ["channel_id", "content"],
+                "properties": {
+                    "channel_id": {"type": "string", "description": "REQUIRED. The bound channel's name, e.g. dp. hestia_channel_outbox lists yours."},
+                    "content": {"type": "string", "minLength": 1, "maxLength": 8000, "description": "REQUIRED. The message, plain text."},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."}
+                }
+            }),
+        ),
+        t_args(
+            "hestia_channel_outbox",
+            "Your own channel sends (#1344), newest first, with whether each was answered, and the \
+             channels bound for you. You see only your own messages.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."}
                 }
             }),
         ),
@@ -1390,13 +1423,13 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // pins the hash learns its reach changed instead of discovering it by trying.
         "scope_grants": p.live_scope_grants(&who.plugin_id)
             .iter()
-            .map(|r| json!({
+            .map(|r| with_modes(json!({
                 "path": r.reach_path(),
                 "granted_by": r.decided_by,
                 "requested_because": r.reason,
                 "decision_reason": r.decision_reason,
                 "expires_at": r.expires_at,
-            }))
+            }), r.ext.modes))
             .collect::<Vec<_>>(),
         // STANDING grants, disclosed beside the live ones and inside the same hashed body
         // (Sprint F R1): the durable widening is the one a member most needs to see, because
@@ -1404,13 +1437,13 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         // or being revoked MOVES law_hash.
         "standing_grants": p.live_standing_grants(&who.plugin_id)
             .iter()
-            .map(|g| json!({
+            .map(|g| with_modes(json!({
                 "path": g.path,
                 "granted_by": g.granted_by,
                 "reason": g.reason,
                 "granted_at": g.granted_at,
                 "expires_at": g.expires_at,
-            }))
+            }), g.modes))
             .collect::<Vec<_>>(),
         "law": statements,
     });
@@ -2459,6 +2492,11 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "reversal",
     "appeal",
     "adjudication",
+    // #1344: daemon-written only; a member must not forge a send or its failure record.
+    "channel_send",
+    "channel_send_unrecorded",
+    "channel_answer",
+    "channel_binding_set",
 ];
 
 /// Reversal kinds — the operational shape of a reversal, distinct from the
@@ -6911,6 +6949,189 @@ async fn tool_transport_binding(state: &SharedState, args: &Value) -> ToolResult
     Ok(out)
 }
 
+/// `hestia_channel_send` (#1344, slice 1, SHADOW): a member's message to a channel the operator
+/// bound for it. Judged and recorded exactly as it would be enforced; NOTHING LEAVES THE MACHINE.
+/// The order is the contract (`server::channel`): attribute, binding, gate on the binding's
+/// target, innate secret sweep, unanswered budget, record (chain row, then outbox row).
+async fn tool_channel_send(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::channel::{forbidden_token, window, MAX_CONTENT_CHARS, UNANSWERED_LIMIT};
+    let channel_id = require_string(args, "channel_id")?.trim().to_string();
+    let content = require_string(args, "content")?;
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unattributed",
+            "hestia_channel_send requires your own live session_id (from hestia_connect): a message \
+             is sent as the member who asked, so the member must be known",
+            None,
+        ));
+    };
+    // A DIFFERENT CODE FROM AN UNKNOWN SESSION (SAGE #529 review): a caller reconnects once on
+    // `channel_unattributed`, which cures a stale session and nothing else. A member with no
+    // member LCT stays one after a reconnect, so it must not share the code a retry keys on.
+    let Some(member_lct) = s.member_lct(&who.plugin_id) else {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_no_member_lct",
+            "this member has no member LCT, so its sends cannot be counted against it; nothing \
+             was recorded, and reconnecting will not change that",
+            None,
+        ));
+    };
+    // 2. THE BINDING. The recipient is the operator's choice, never the member's.
+    let Some(binding) = s.channel_bindings.get(&who.plugin_id, &channel_id).cloned() else {
+        let bound: Vec<String> =
+            s.channel_bindings.for_member(&who.plugin_id).iter().map(|b| b.channel_id.clone()).collect();
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unbound",
+            &if bound.is_empty() {
+                format!("no channel '{channel_id}' is bound for you, and you have no bound channels \
+                         yet. A channel is bound by the operator; nothing was sent or recorded.")
+            } else {
+                format!("no channel '{channel_id}' is bound for you. Your bound channels: {}. \
+                         Nothing was sent or recorded.", bound.join(", "))
+            },
+            Some(json!({"bound_channels": bound})),
+        ));
+    };
+    // 3. THE GATE, on the target built from the binding alone.
+    let target = binding.target();
+    if let Some(denied) = gate_direct_tool(&mut s, &who, "hestia_channel_send", "channel_egress", &target) {
+        return Ok(denied);
+    }
+    let chars = content.chars().count();
+    if chars == 0 || chars > MAX_CONTENT_CHARS {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_content_size",
+            &format!("a message is 1 to {MAX_CONTENT_CHARS} characters; this one is {chars}. Nothing \
+                      was sent or recorded."),
+            None,
+        ));
+    }
+    let base = json!({
+        "member": who.plugin_id, "member_lct": member_lct, "role_lct": who.role_lct,
+        "session_id": who.session_uuid, "channel_id": binding.channel_id,
+        "recipient_class": binding.recipient_class, "target": target,
+        "binding_version": binding.version, "shadow": true,
+    });
+    // 4. THE INNATE SECRET SWEEP. The deny and its rule are recorded; the content is not, and
+    // neither is its hash (#1344 amendment: no content_sha256 on a secret-denied row).
+    if let Some(tok) = forbidden_token(&content) {
+        let mut row = base.clone();
+        row["decision"] = json!("deny");
+        row["rule"] = json!("egress.secret");
+        row["innate"] = json!(true);
+        let entry = s.append_chain("channel_send", row)?;
+        return Ok(hestia_error_envelope(
+            "hestia.channel_secret",
+            &format!("not sent: the message names '{tok}', a credential or secret path, and that \
+                      never leaves this machine. The refusal is recorded; the message is not."),
+            Some(json!({"rule": "egress.secret", "witnessEntryHash": entry.hash})),
+        ));
+    }
+    // 5. THE UNANSWERED BUDGET, counted from the outbox rows of the current clock hour.
+    let now = crate::server::gate_escalation::now_secs();
+    let (start, resets_at) = window(now);
+    // THE SENDER AND ITS ALIASES SHARE ONE BUDGET: a count keyed on one spelling of the member
+    // would give each alias its own three (a name-gate failing open; see member_presence_census).
+    let unanswered: Vec<_> = s
+        .inbox_store
+        .channel_unanswered_on_channel(&binding.channel_id, start)?
+        .into_iter()
+        .filter(|r| r.member == who.plugin_id || s.same_entity(&r.member, &who.plugin_id))
+        .collect();
+    let would_deny = unanswered.len() as u32 >= UNANSWERED_LIMIT;
+    let budget = json!({
+        "limit": UNANSWERED_LIMIT, "window": "1h", "unanswered": unanswered.len(),
+        "would_deny": would_deny, "window_resets_at": resets_at,
+        "unanswered_ids": unanswered.iter().map(|r| r.id).collect::<Vec<_>>(),
+    });
+    let sha = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(content.as_bytes()))
+    };
+    // 6. RECORD: the chain row first (the outbox row names it), then the outbox row.
+    let mut row = base.clone();
+    row["decision"] = json!(if would_deny { "would_deny" } else { "would_send" });
+    row["rule"] = json!(if would_deny { "channel.unanswered_budget" } else { "" });
+    row["content_sha256"] = json!(sha);
+    row["content_chars"] = json!(chars);
+    row["budget"] = budget.clone();
+    row["arrived_at"] = json!(now);
+    let entry = s.append_chain("channel_send", row)?;
+    let outbox_id = match s.inbox_store.channel_outbox_insert(&crate::storage::inbox::NewChannelOutbox {
+        member: &who.plugin_id, member_lct: &member_lct, channel_id: &binding.channel_id,
+        recipient_class: &binding.recipient_class, binding_version: binding.version,
+        content: &content, content_sha256: &sha, created: now, would_deny, chain_hash: &entry.hash,
+    }) {
+        Ok(id) => id,
+        Err(e) => {
+            let _ = s.append_chain("channel_send_unrecorded", json!({
+                "channel_send": entry.hash, "member": who.plugin_id, "error": e.to_string(),
+            }));
+            return Ok(hestia_error_envelope(
+                "hestia.channel_unrecorded",
+                "the send was witnessed but its outbox row could not be written, so it is not \
+                 counted and would not be delivered. The failure is recorded; this is the \
+                 operator's to repair, not yours.",
+                Some(json!({"witnessEntryHash": entry.hash})),
+            ));
+        }
+    };
+    let at = |t: u64| {
+        chrono::DateTime::from_timestamp(t as i64, 0)
+            .map(|d| d.format("%H:%M UTC").to_string())
+            .unwrap_or_else(|| t.to_string())
+    };
+    let note = if would_deny {
+        format!(
+            "Shadow: nothing left this machine. Once sends are enforced this one would NOT go: you \
+             have {} unanswered messages on '{}' this hour ({}), and the limit is {UNANSWERED_LIMIT}. \
+             It is kept in your outbox as outbox #{outbox_id}. The count resets at {}, or as soon as \
+             one of them is answered.",
+            unanswered.len(), binding.channel_id,
+            unanswered.iter().map(|r| format!("#{} at {}", r.id, at(r.created))).collect::<Vec<_>>().join(", "),
+            at(resets_at),
+        )
+    } else {
+        format!(
+            "Shadow: nothing left this machine. Once sends are enforced this would go to '{}' ({}). \
+             It is in your outbox as #{outbox_id}. Unanswered on this channel this hour, counting \
+             it: {} of {UNANSWERED_LIMIT}.",
+            binding.channel_id, binding.recipient_class, unanswered.len() + 1,
+        )
+    };
+    Ok(json!({
+        "shadow": true, "sent": false, "outbox_id": outbox_id,
+        "channel_id": binding.channel_id, "recipient_class": binding.recipient_class,
+        "decision": if would_deny { "would_deny" } else { "would_send" },
+        "budget": budget, "witnessEntryHash": entry.hash, "note": note,
+    }))
+}
+
+/// `hestia_channel_outbox` (#1344): the caller's OWN outbox rows, newest first, and its bound
+/// channels (without their addresses: who a message reaches is the operator's). A member reads
+/// its own rows only.
+async fn tool_channel_outbox(state: &SharedState, args: &Value) -> ToolResult {
+    let s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, optional_session_id(args).as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.channel_unattributed",
+            "hestia_channel_outbox requires your own live session_id (from hestia_connect): it \
+             shows the asking member's own messages, so the member must be known",
+            None,
+        ));
+    };
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20).min(100) as u32;
+    let rows = s.inbox_store.channel_outbox_list(Some(&who.plugin_id), limit)?;
+    let channels: Vec<Value> = s
+        .channel_bindings
+        .for_member(&who.plugin_id)
+        .iter()
+        .map(|b| json!({"channel_id": b.channel_id, "recipient_class": b.recipient_class, "adapter": b.adapter}))
+        .collect();
+    Ok(json!({"member": who.plugin_id, "channels": channels, "outbox": rows, "shadow": true}))
+}
+
 /// Retire an egress row that has exhausted its attempts, and pay what it owes.
 ///
 /// Named in three comments across two files since 2026-07-26, always in the present
@@ -8069,10 +8290,10 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
 ///
 /// Two properties this surface must keep, both learned the hard way:
 ///
-/// 1. It is **unanswered**, not undelivered. A notice read and deliberately
-///    not answered is forensically identical here to one nobody ever picked
-///    up (`drained_at` separates those two, and only those two). Named
-///    "undelivered" it would re-create absence-read-as-pass with better
+/// 1. It is **unanswered**, not undelivered. `drained_at` is a drain mark, not
+///    a per-notice read receipt: peeks leave it null, and the local drain may
+///    mark expired ordinary notices that its SELECT did not return.
+///    Named "undelivered" it would re-create absence-read-as-pass with better
 ///    tooling.
 /// 2. It closes the loop for RESPONSIVENESS, not for ACTION. The INERT
 ///    signature — woke, ran, did nothing — is still not representable. The
@@ -8127,22 +8348,66 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
     let (mine, theirs): (Vec<_>, Vec<_>) = rows
         .into_iter()
         .partition(|n| n.to_plugin == who.plugin_id);
+    // #1354: a transient ask dies with its target. A `review_request` row whose
+    // pointer names a scope request that is TERMINAL (ruled, revoked, or past its
+    // window) is moot: it stops counting as debt and moves to `*_moot`. Derivation
+    // is read-time against the live request map — no sweep — so a request the map
+    // no longer holds (a restart; scope requests are memory-only) reads UNKNOWN,
+    // and unknown is NOT moot: the row stays owed and fails toward visibility, the
+    // pointer resolver's "UNKNOWN, not refused" principle one level up. That also
+    // makes mootness NON-MONOTONIC across an eviction/restart (moot -> owed), which
+    // is intentional: the durable fix (event-driven `mooted_at` evidence at the
+    // terminal transition) is #1354's named follow-up, not this slice.
+    //
+    // KIND-RESTRICTED (nova's P1 on #1357): only a transient ASK dies with its
+    // target. A durable `reply` carrying a terminal scope pointer is CONTENT the
+    // recipient is still owed — mooting it would silently erase debt. The match is
+    // by kind ROOT, because the send gate admits dotted specializations
+    // (review_request.pr) and the ledger's own kind matching is by prefix; the two
+    // must agree here too.
+    //
+    // In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness —
+    // the misroute is sender-actionable, mootness is not.
+    let now = super::gate_escalation::now_secs();
+    let scope_moot = |kind: &str, pointer_uri: &Option<String>| -> bool {
+        if kind.split('.').next() != Some("review_request") {
+            return false;
+        }
+        let Some(p) = pointer_uri.as_deref() else {
+            return false;
+        };
+        let Some(rest) = p.strip_prefix("hestia://scope/") else {
+            return false;
+        };
+        let id = rest.split('#').next().unwrap_or(rest);
+        match s.scope_requests.get(id) {
+            Some(req) => {
+                req.granted.is_some() || req.revoked.is_some() || now >= req.expires_at
+            }
+            None => false,
+        }
+    };
+    let (mine, mine_moot): (Vec<_>, Vec<_>) =
+        mine.into_iter().partition(|n| !scope_moot(&n.kind, &n.pointer_uri));
     // Arm the strong asker (the fire primer) with the distinction that matters
     // on THIS side of the ledger: "live and unanswered" is a member choosing
     // not to reply; "never seen locally" is a misroute, and the two want
     // opposite responses from the sender. Carried on `owed_to_me` only — on
     // `i_owe` the recipient is the caller, who just proved its own liveness by
     // asking, so the field would be a constant.
-    let theirs: Vec<Value> = theirs
+    let (theirs, theirs_moot): (Vec<(bool, Value)>, Vec<(bool, Value)>) = theirs
         .into_iter()
         .map(|n| {
+            let moot = scope_moot(&n.kind, &n.pointer_uri);
             let (liveness, evidence) = recipient_liveness(&s.inbox_store, &n.to_plugin);
             let mut row = serde_json::to_value(&n).unwrap_or_else(|_| json!({}));
             row["recipient_liveness"] = json!(liveness);
             row["recipient_liveness_evidence"] = evidence;
-            row
+            (moot && liveness != "unknown", row)
         })
-        .collect();
+        .partition(|(mooted, _)| !mooted);
+    let theirs_moot: Vec<Value> = theirs_moot.into_iter().map(|(_, row)| row).collect();
+    let theirs: Vec<Value> = theirs.into_iter().map(|(_, row)| row).collect();
     Ok(json!({
         "plugin_id": who.plugin_id,
         "older_than_secs": older_than_secs,
@@ -8151,13 +8416,29 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "i_owe": mine,
         // Notices I sent that nobody answered: did my wake land?
         "owed_to_me": theirs,
+        // Transient rows whose target is terminal: answered by time, not by a
+        // member. Counted nowhere; visible here so a late wake can still bind a
+        // disposition to one (binding is unchanged by mootness).
+        "i_owe_moot": mine_moot,
+        "owed_to_me_moot": theirs_moot,
+        "moot_scope": "moot = a review_request row (the transient ASK kind — a durable \
+                       reply never moots) whose pointer names a scope request that is \
+                       TERMINAL (ruled, revoked, or past its window), derived at read \
+                       time against the live request map — no sweep (#1354). A request \
+                       the memory-only map no longer holds reads UNKNOWN, and unknown \
+                       stays owed: absence of evidence is not mootness. Eviction or \
+                       restart therefore reverts moot -> owed; that non-monotonicity is \
+                       intentional until durable mooted_at evidence lands (the #1354 \
+                       follow-up). In owed_to_me a misroute (recipient_liveness unknown) \
+                       outranks mootness — the misroute is sender-actionable.",
         "scope": "unanswered = no notice binds in_reply_to to it; \
-                  drained_at:null additionally means it was never picked up; \
+                  drained_at:null means the drain mark is absent; a peek may still \
+                  have seen it. A mark does not prove it was returned or read; \
                   each row carries its OWN in_reply_to - group by that, not by \
                   pointer_uri, or distinct dispositions anchored at one section \
                   read as duplicates",
-        "recipient_liveness_scope": "liveness measures the DELIVERY PATH (did that member \
-                                     read its mailbox), not the member's ability to act — a \
+        "recipient_liveness_scope": "liveness measures mailbox touches under that seat, \
+                                     not an interactive member's ability to act — a \
                                      watcher polling for a broken CLI reads as live. \
                                      'unknown' means never seen on THIS mesh, which is the \
                                      dead-letter class and usually a misroute",
@@ -12341,9 +12622,9 @@ mod member_mesh_tests {
     }
 
     /// The row is only useful where the question gets asked. `owed_to_me` is
-    /// what the fire primer renders, so that is where "live and unanswered"
-    /// (a member choosing not to reply) must separate from "never seen here"
-    /// (a misroute) — they want opposite responses from the sender.
+    /// what the fire primer renders, so mailbox liveness must separate from
+    /// "never seen here" without claiming that an interactive member read a
+    /// particular notice or deliberately chose not to answer.
     #[tokio::test]
     async fn unanswered_owed_to_me_carries_recipient_liveness() {
         let (_dir, state) = test_state().await;
@@ -12376,9 +12657,14 @@ mod member_mesh_tests {
         };
         assert_eq!(by_to("thor"), json!("unknown"), "{rows}");
         assert_eq!(by_to("kimi-code"), json!("live"), "{rows}");
-        // Liveness is about the delivery path, not about acting — say so in
-        // the payload, where a reader cannot skip past it.
-        assert!(rows["recipient_liveness_scope"].is_string(), "{rows}");
+        // Mailbox touch and drain are not interactive-session read receipts.
+        let liveness_scope = rows["recipient_liveness_scope"].as_str().unwrap();
+        assert!(liveness_scope.contains("mailbox touches"), "{rows}");
+        assert!(liveness_scope.contains("watcher"), "{rows}");
+        let scope = rows["scope"].as_str().unwrap();
+        assert!(scope.contains("drain mark is absent"), "{rows}");
+        assert!(scope.contains("a peek"), "{rows}");
+        assert!(scope.contains("does not prove it was returned or read"), "{rows}");
     }
 
     /// **The site the fractal change could have broken silently, and the reason it is
@@ -12569,6 +12855,199 @@ mod member_mesh_tests {
             scope.contains("group by"),
             "scope must tell the reader HOW to group: {scope}"
         );
+    }
+
+    /// #1354: a transient ask dies with its target. A `review_request` row pointing at a
+    /// scope request that is TERMINAL (ruled, revoked, or past its window) leaves the debt
+    /// fold for `i_owe_moot`; a pending request, an UNKNOWN id (the map is memory-only —
+    /// post-restart every id is unknown, and unknown fails toward owed), a durable
+    /// pointer (no `hestia://scope/` referent), and any DURABLE kind (a `reply` carrying
+    /// a terminal scope pointer is content, still owed — nova's P1) all stay owed. A
+    /// dotted specialization of the ask kind moots exactly like its root. Evicting the
+    /// request from the map moves the row BACK to owed (moot -> owed): read-time
+    /// derivation is deliberately non-monotonic until durable mooted_at evidence lands.
+    /// In `owed_to_me` a misroute (recipient_liveness "unknown") outranks mootness,
+    /// because the misroute is the sender-actionable signal. Binding to a mooted row
+    /// still works: mootness reclassifies the debt, it does not close the row.
+    #[tokio::test]
+    async fn unanswered_moots_rows_whose_scope_target_is_terminal() {
+        let (_dir, state) = test_state().await;
+        let kimi = connect(&state, "kimi-code").await;
+        let claude = connect(&state, "claude-code").await;
+        let now = crate::server::gate_escalation::now_secs();
+        use crate::server::state::ScopeRequest;
+
+        // claude -> kimi, one ask per target state.
+        for ptr in [
+            "hestia://scope/scope-moot-decided#peer-decide",
+            "hestia://scope/scope-moot-expired#peer-decide",
+            "hestia://scope/scope-moot-pending#peer-decide",
+            "hestia://scope/scope-never-heard#peer-decide",
+            "pr/1354",
+        ] {
+            tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                        "pointer_uri": ptr, "session_id": claude}),
+            )
+            .await
+            .unwrap();
+        }
+        // nova's P1 on #1357: a durable `reply` carrying a TERMINAL scope pointer is
+        // content the recipient is still owed — it must NEVER moot. And a dotted
+        // specialization of the ask kind (review_request.pr — the send gate admits it,
+        // the ledger matches it by prefix) MUST moot: the three surfaces agree or the
+        // kind restriction is a lie.
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "reply",
+                    "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide;reply-content-still-owed",
+                    "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request.pr",
+                    "pointer_uri": "hestia://scope/scope-moot-expired#peer-decide",
+                    "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        // kimi -> claude: a scope ask whose request is decided (mootable), and the same
+        // shape to a never-seen recipient (misroute: must NOT moot).
+        let mut decided_ask_id = None;
+        for to in ["claude-code", "ghost-member"] {
+            let out = tool_member_notify(
+                &state,
+                &json!({"to_plugin_id": to, "kind": "review_request",
+                        "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide",
+                        "session_id": kimi}),
+            )
+            .await
+            .unwrap();
+            if to == "claude-code" {
+                decided_ask_id = Some(out["queued_id"].as_u64().unwrap());
+            }
+        }
+        // claude is a live recipient (reads its mailbox); ghost-member never has.
+        tool_member_inbox(&state, &json!({"session_id": claude})).await.unwrap();
+
+        {
+            let mut s = state.lock().await;
+            let req = |id: &str, granted: Option<bool>, expires_at: u64| ScopeRequest {
+                id: id.into(),
+                plugin_id: "cbp-being".into(),
+                role: String::new(),
+                path: "/w/x".into(),
+                reason: "a scope ask whose state pins a mootness arm".into(),
+                requested_at: now,
+                expires_at,
+                granted,
+                decided_by: granted.map(|_| "operator".to_string()),
+                decided_at: granted.map(|_| now),
+                decision_reason: None,
+                recursive: false,
+                revoked: None,
+                ext: Default::default(),
+            };
+            s.scope_requests
+                .insert("scope-moot-decided".into(), req("scope-moot-decided", Some(true), now + 3600));
+            s.scope_requests
+                .insert("scope-moot-expired".into(), req("scope-moot-expired", None, now - 3600));
+            s.scope_requests
+                .insert("scope-moot-pending".into(), req("scope-moot-pending", None, now + 3600));
+        }
+
+        let rows = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let ptrs = |key: &str| -> Vec<String> {
+            rows[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} missing: {rows}"))
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r["to_plugin"].as_str().unwrap_or("?"),
+                        r["pointer_uri"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        };
+        let i_owe = ptrs("i_owe");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-moot-pending#peer-decide".to_string()), "{rows}");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-never-heard#peer-decide".to_string()),
+                "unknown id stays owed — absence of evidence is not mootness: {rows}");
+        assert!(i_owe.contains(&"kimi-code|pr/1354".to_string()),
+                "a durable pointer never moots: {rows}");
+        assert!(i_owe.contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide;reply-content-still-owed".to_string()),
+                "a durable reply never moots, even on a terminal scope pointer: {rows}");
+        let i_moot = ptrs("i_owe_moot");
+        assert!(i_moot.contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
+        assert_eq!(
+            i_moot.iter().filter(|p| *p == "kimi-code|hestia://scope/scope-moot-expired#peer-decide").count(),
+            2,
+            "the expired ask moots under BOTH the bare kind and its dotted specialization: {rows}"
+        );
+        assert_eq!(i_moot.len(), 3, "exactly the terminal review_request rows moot: {rows}");
+
+        let owed = ptrs("owed_to_me");
+        assert!(owed.contains(&"ghost-member|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "misroute outranks mootness: {rows}");
+        let owed_moot = ptrs("owed_to_me_moot");
+        assert!(owed_moot.contains(&"claude-code|hestia://scope/scope-moot-decided#peer-decide".to_string()), "{rows}");
+        assert_eq!(owed_moot.len(), 1, "{rows}");
+
+        // Eviction/restart regression (dp-web4 review of #1357): the request map is
+        // memory-only, so losing the request must move the row BACK to owed. Mootness
+        // is a read-time property of available evidence, not a row state — the
+        // non-monotonicity is intentional until durable `mooted_at` evidence lands
+        // (the #1354 follow-up), and this transition is the proof it fails toward
+        // visibility rather than silently staying moot.
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.remove("scope-moot-decided");
+        }
+        let rows2 = tool_member_unanswered(
+            &state,
+            &json!({"session_id": kimi, "older_than_secs": 0}),
+        )
+        .await
+        .unwrap();
+        let ptrs2 = |key: &str| -> Vec<String> {
+            rows2[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} missing: {rows2}"))
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}|{}",
+                        r["to_plugin"].as_str().unwrap_or("?"),
+                        r["pointer_uri"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect()
+        };
+        assert!(ptrs2("i_owe").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "evicted request: moot -> owed, the row fails back toward visibility: {rows2}");
+        assert!(!ptrs2("i_owe_moot").contains(&"kimi-code|hestia://scope/scope-moot-decided#peer-decide".to_string()),
+                "nothing stays moot on absent evidence: {rows2}");
+
+        // Mootness reclassifies; it does not close. The ASKED member can still bind late.
+        let late = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "reply",
+                    "pointer_uri": "hestia://scope/scope-moot-decided#peer-decide;window-missed;via=claude-code",
+                    "in_reply_to": decided_ask_id.unwrap(), "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        assert!(late["queued_id"].is_u64(), "binding to a mooted row stays legal: {late}");
     }
 
     /// Kimi review Finding 3: a pointer NAMES a location. Multi-line /
@@ -17647,6 +18126,89 @@ mod tests {
             shared.lock().await.gate_escalations.get(&id).unwrap().observed_at.is_some(),
             "and the record keeps the instant it was observed"
         );
+    }
+
+    /// #366 through the REAL claim handler: a grant approved 900 s ago and never observed
+    /// (lapsed) is claimed by the asker session's byte-identical re-issue, instead of minting a
+    /// duplicate petition (cf54d46850bcdfe0 → d9b167e12a7283b8, 2026-10-21). A sibling session
+    /// on the same seat re-issuing the same act does not claim it, and neither does the asker
+    /// re-issuing a different act; the grant stays lapsed and unobserved for both.
+    #[tokio::test]
+    async fn the_askers_exact_reissue_claims_a_grant_ruled_while_it_was_idle() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+        let (_dir, shared) = make_shared_state();
+        let connect = |hs: &'static str| {
+            let shared = shared.clone();
+            async move {
+                tool_connect(
+                    &shared,
+                    &json!({ "plugin_id": "claude-code", "host_agent": "h", "host_session_id": hs }),
+                )
+                .await
+                .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let asker = connect("hs-asker").await;
+        let sibling = connect("hs-sibling").await;
+        const ACT: &str = "Bash: git -C /tmp/wt apply /tmp/gt.patch";
+        let claim = |sid: &str, act: &str, inv: &str| json!({
+            "plugin_id": "claude-code", "session_id": sid, "tool_name": "Bash",
+            "marker": "hestia_governance_closure.py", "reason": act, "invocation_key": inv,
+        });
+
+        let opened = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-open")).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(&id, true, "operator", "role:constellation:sovereign",
+                        Channel::OperatorSession, None, Some("k"), now_secs() - 900)
+                .expect("the sovereign channel approves");
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert_eq!(e.host_session_id.as_deref(), Some("hs-asker"), "fixture: asker recorded");
+            assert!(e.observed_at.is_none() && !e.is_claimable(now_secs()), "precondition: lapsed unobserved");
+        }
+
+        let sib = tool_gate_escalation_claim(&shared, &claim(&sibling, ACT, "inv-sib")).await.unwrap();
+        assert_ne!(sib["claimed"], json!(true), "a sibling session's re-issue claimed the asker's grant: {sib}");
+        let other = tool_gate_escalation_claim(&shared, &claim(&asker, "Bash: git apply /tmp/other.patch", "inv-other"))
+            .await.unwrap();
+        assert_ne!(other["claimed"], json!(true), "a different act claimed the grant: {other}");
+        {
+            let s = shared.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert!(e.observed_at.is_none() && e.consumed_at.is_none(), "untouched by both: {e:?}");
+        }
+
+        // Nova's review of #1363: observation only AFTER the authenticated session binding.
+        // (a) No session at all: an unattributed caller naming the asker's member and exact act
+        //     has no proven host session, so nothing is observed and nothing is claimed.
+        let anon = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "claude-code", "tool_name": "Bash", "marker": "hestia_governance_closure.py",
+            "reason": ACT, "invocation_key": "inv-anon",
+        })).await;
+        if let Ok(v) = &anon {
+            assert_ne!(v["claimed"], json!(true), "an unattributed re-issue claimed the asker's grant: {v}");
+        }
+        // (b) The asker's own session, but ASSERTING another host session: the precedence block
+        //     refuses the call before observation, so the grant stays unobserved.
+        let mut forged = claim(&asker, ACT, "inv-forged");
+        forged["host_session_id"] = json!("hs-sibling");
+        let refused = tool_gate_escalation_claim(&shared, &forged).await;
+        assert!(refused.is_err(), "a mismatched host_session_id must be refused: {refused:?}");
+        {
+            let s = shared.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            assert!(e.observed_at.is_none() && e.consumed_at.is_none(),
+                    "neither the unattributed nor the forged call may observe or spend: {e:?}");
+        }
+
+        let mine = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-reissue")).await.unwrap();
+        assert_eq!(mine["claimed"], json!(true), "the asker's exact re-issue must claim its lapsed grant: {mine}");
+        assert_eq!(mine["escalation_id"], json!(id), "{mine}");
     }
 
     /// THE CLAIMABLE REPLY STATES THE ANCHOR ITS OWN CALL USES (GPT review of #613 @ dd3f1b1).
@@ -23456,9 +24018,232 @@ mod invitation_note_contract_tests {
 /// **Asking is not receiving.** This returns `pending` and permits nothing. Only the operator
 /// answers, only through the operator-gated HTTP surface, and an unanswered request expires into
 /// a refusal.
-async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
+/// EXISTENCE FIRST (dp, 2026-10-26, hestia#1411): "we should not be doing escalations on
+/// nonexistent paths because there is nothing to escalate - it's just noise". The tools whose
+/// act on a path only READS it: the gate's `READ_ONLY_PATH_TOOLS` plus every tool its
+/// `PATH_TOOL_MODES` maps to exactly `r` (kept in step by `read_tools_match_the_gate`).
+pub(crate) const READ_ONLY_PATH_TOOLS: &[&str] = &[
+    "Glob", "Grep", "LS", "NotebookRead", "Read", "git_read", "glob", "list_directory",
+    "read_file", "read_many_files", "search", "search_file_content",
+];
+
+/// The roots this member's grants and the society floor name: every live and standing grant
+/// root plus every floor root. Where a member's asks are judged to be "about its own space"
+/// (`in_members_space`) and where a did-you-mean candidate may be re-rooted.
+/// Every root the member holds some grant on, WITH its reach: `(root, recursive)`. An exact grant
+/// covers only its own path (part B and C, #1386: the parent is not reach), so a consumer that
+/// asks "is this path under a root" must honour the flag, or an exact grant on a broad directory
+/// would make its whole subtree answerable (nomad on #1415).
+fn member_roots(s: &crate::server::state::ServerState, plugin_id: &str) -> Vec<(String, bool)> {
+    let mut roots: Vec<(String, bool)> = s.live_scope_grants(plugin_id).iter()
+        .map(|r| (r.reach_path().to_string(), r.recursive)).collect();
+    roots.extend(s.live_standing_grants(plugin_id).iter().map(|g| (g.path.clone(), g.recursive)));
+    roots.extend(s.standing_scope.floor.iter().map(|f| (f.path.clone(), f.recursive)));
+    roots
+}
+
+/// The path a nonexistent `target` most likely meant, re-rooted onto `root`: a grant root's
+/// basename found as an INTERIOR segment of `target` re-roots the rest of `target` under that
+/// grant, so the doubled root `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`.
+/// None when `target` does not name the root's basename that way. A `target` that merely ENDS
+/// with the basename (`<elsewhere>/governance`) is not re-rooted: its candidate would be the root
+/// itself, which always exists, so answering it silently would make "does there exist a
+/// `<elsewhere>/governance`" an oracle over the host for every `<elsewhere>` (nomad on #1415).
+fn reroot_onto(root: &str, target: &str) -> Option<String> {
+    let root = root.trim_end_matches('/');
+    let base = root.rsplit('/').next().filter(|b| !b.is_empty())?;
+    let marker = format!("/{base}/");
+    let i = target.find(&marker)?;
+    Some(format!("{root}{}", &target[i + marker.len() - 1..]))
+}
+
+/// The existing, readable path inside the member's own reach that a nonexistent `target` most
+/// likely meant, or None: `target` re-roots onto one of `roots` (`reroot_onto`), the candidate
+/// EXISTS, RESOLVES inside its root (a symlink beneath the root that points outside it exists
+/// but is not the member's to read), and the member is admitted to READ it there by its
+/// effective grants (an exact grant does not reach a child; a floor row may not give this member
+/// read) — the gate's #1412 repair, applied here (Nova, nomad on #1415). This ONE predicate both
+/// draws the hint and bounds the silent decline, so the decline can never be quiet about a path
+/// the hint would not name.
+fn rerooted_in_reach(s: &crate::server::state::ServerState, plugin_id: &str, roots: &[(String, bool)],
+                     target: &str, now: u64) -> Option<String> {
+    roots.iter().find_map(|(root, _recursive)| {
+        let root = root.trim_end_matches('/');
+        let cand = reroot_onto(root, target)?;
+        if cand == target {
+            return None;
+        }
+        let real = std::fs::canonicalize(&cand).ok()?;
+        let root_real = std::fs::canonicalize(root).ok()?;
+        if !(real == root_real || real.starts_with(&root_real)) {
+            return None;
+        }
+        let real_s = real.to_string_lossy().to_string();
+        let read = crate::server::grant_modes::Modes::READ;
+        let admitted = s.has_scope_grant_for(plugin_id, &real_s, read)
+            || s.standing_scope.effective_modes(plugin_id, &real_s, now).is_some_and(|m| m.includes(read));
+        admitted.then_some(cand)
+    })
+}
+
+/// Where an asked path stands relative to the member's own space (nomad and Nova on #1415).
+enum SpaceAnswer {
+    /// UNDER a root the member holds some grant on: the member could learn the path's existence
+    /// by itself, so the existence-first decline may stat it.
+    Under,
+    /// OUTSIDE every root, but a doubled root that re-roots onto something REAL and readable in
+    /// the member's reach (`<ws>/hestia/governance/hestia/gate.py` while holding `<ws>/governance`
+    /// and `governance/hestia/gate.py` exists there). Carries the candidate. The target itself
+    /// is NEVER stat-ed here: a quiet answer that depended on the target's existence would tell
+    /// the member whether `<prefix>` exists for any `<prefix>` on the host (an existing FILE
+    /// there gives ENOTDIR, which reads as present and files; a missing one gives NotFound and
+    /// is quiet) — an existence oracle, whatever bound is put on the candidate. So the answer
+    /// is computed from the candidate alone, and the member that truly means the outside path
+    /// says so once (`confirm: true`) and is filed without any look at the target.
+    Misrooted(String),
+    /// Everywhere else: files as before, so the operator sees the probe.
+    Outside,
+}
+
+/// `path` resolved through its deepest EXISTING ancestor (`canonicalize`), with the missing tail
+/// re-appended; None when no ancestor can be resolved. The target of an existence-first ask is
+/// usually absent, so this is how an escaping symlink beneath a root is seen for what it is
+/// before anything is answered (Nova, nomad on #1415).
+fn resolve_through_existing_ancestor(path: &str) -> Option<std::path::PathBuf> {
+    let mut cur = std::path::Path::new(path);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            let mut out = real;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return Some(out);
+        }
+        // Climb only past a component that is genuinely ABSENT. An entry that exists but did not
+        // canonicalize is a dangling or looping link, or unreadable: treating it as a missing
+        // ordinary component would re-root its name under the parent and make "does the link's
+        // outside target exist" decide Under versus Outside (Nova, nomad on #1415). None here is
+        // "not Under", so the ask files either way.
+        match std::fs::symlink_metadata(cur) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return None,
+        }
+        tail.push(cur.file_name()?.to_os_string());
+        cur = cur.parent()?;
+    }
+}
+
+/// Whether `path` is an existing symlink (dangling or not), without following it.
+fn is_symlink(path: &str) -> bool {
+    std::fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false)
+}
+
+/// Whether the gate's own law lets `plugin_id` READ at `real` (a resolved path): the NEAREST of
+/// the member's own grants covering it decides, by the union of the grants at that depth (#1386,
+/// the rule part C applies at the gate); with no own grant covering it, the floor rows that do.
+/// `effective_modes` unions EVERY covering own grant, which would let a wide `r` admit a read
+/// inside a nearer `w`-only node (Nova on #1415, regression 3); this does not.
+fn read_admitted_nearest(s: &crate::server::state::ServerState, plugin_id: &str, real: &str, now: u64) -> bool {
+    use crate::server::grant_modes::Modes;
+    use crate::server::standing_scope::covers_path;
+    let canon = |root: &str| std::fs::canonicalize(root)
+        .map(|r| r.to_string_lossy().to_string())
+        .unwrap_or_else(|_| root.trim_end_matches('/').to_string());
+    let mut nodes: Vec<(String, bool, Modes)> = s.live_scope_grants(plugin_id).iter()
+        .map(|r| (canon(r.reach_path()), r.recursive, r.ext.modes)).collect();
+    nodes.extend(s.live_standing_grants(plugin_id).iter().map(|g| (canon(&g.path), g.recursive, g.modes)));
+    let covering: Vec<&(String, bool, Modes)> =
+        nodes.iter().filter(|(root, rec, _)| covers_path(root, *rec, real)).collect();
+    if let Some(best) = covering.iter().map(|(root, _, _)| root.matches('/').count()).max() {
+        let held = covering.iter()
+            .filter(|(root, _, _)| root.matches('/').count() == best)
+            .map(|(_, _, m)| *m)
+            .reduce(|a, b| a.union(b))
+            .unwrap_or(Modes::READ);
+        return held.includes(Modes::READ);
+    }
+    let _ = now;
+    s.standing_scope.floor.iter()
+        .filter(|f| covers_path(&canon(&f.path), f.recursive, real))
+        .map(|f| f.modes)
+        .reduce(|a, b| a.union(b))
+        .is_some_and(|m| m.includes(Modes::READ))
+}
+
+fn space_of(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> SpaceAnswer {
+    let p = path.trim_end_matches('/');
+    let roots = member_roots(s, plugin_id);
+    let now = crate::server::gate_escalation::now_secs();
+    // UNDER means "the gate's own law would let this member READ here" (Nova, nomad on #1415),
+    // never "lexically beneath some root": the target is resolved through its deepest existing
+    // ancestor, must sit inside a root's resolved path (an escaping symlink fails), and the member
+    // must be READ-admitted there by the nearest grant (a w-only root, a w-only floor row, or an
+    // r grant shadowed by a nearer w-only node fails). Only then may the target be stat-ed, since
+    // the member could learn its existence itself. An EXACT grant on this very path, the path
+    // itself missing, is Under by the grant's own identity (if the member may read it).
+    let inside = |real: &str| roots.iter().any(|(root, recursive)| {
+        let root = root.trim_end_matches('/');
+        if root.is_empty() {
+            return false;
+        }
+        let root_real = std::fs::canonicalize(root)
+            .map(|r| r.to_string_lossy().to_string())
+            .unwrap_or_else(|_| root.to_string());
+        real == root_real || (*recursive && real.starts_with(&format!("{root_real}/")))
+    });
+    // The exact-identity arm never follows a link either: an exactly granted path that is itself
+    // a (dangling) symlink is not Under by identity, since answering from it would answer for
+    // the link's target (nomad on #1415).
+    let exact_self = !is_symlink(p) && roots.iter().any(|(root, _)| root.trim_end_matches('/') == p);
+    let under = match resolve_through_existing_ancestor(p).map(|r| r.to_string_lossy().to_string()) {
+        Some(real) if inside(&real) => read_admitted_nearest(s, plugin_id, &real, now),
+        _ => exact_self && read_admitted_nearest(s, plugin_id, p, now),
+    };
+    if under {
+        return SpaceAnswer::Under;
+    }
+    match rerooted_in_reach(s, plugin_id, &roots, p, crate::server::gate_escalation::now_secs()) {
+        Some(cand) => SpaceAnswer::Misrooted(cand),
+        None => SpaceAnswer::Outside,
+    }
+}
+
+/// The answer for a misrooted ask: names the in-reach path it most likely meant and the one
+/// way to insist. Depends on the candidate only (see `SpaceAnswer::Misrooted`).
+fn misrooted_detail(path: &str, cand: &str) -> String {
+    format!("{path} lies outside every grant you hold, and it re-roots onto {cand}, which exists \
+             inside one. Did you mean {cand}? It is in your reach now. If you really mean {path}, \
+             ask again with confirm: true and it will be filed")
+}
+
+/// `Path::try_exists` read the way a gate must: an error (an unreadable parent, a dangling or
+/// looping link) is NOT "absent". Only a definite `Ok(false)` is (nomad on #1415, point 2).
+fn definitely_absent(path: &str) -> bool {
+    matches!(std::path::Path::new(path).try_exists(), Ok(false))
+}
+
+/// The refusal text for an ask about a path that does not exist (hestia#1411), naming the
+/// existing path inside one of the member's own grants that it most likely meant
+/// (`rerooted_in_reach`: the doubled root `<ws>/hestia/governance/hestia/x` becomes
+/// `<ws>/governance/hestia/x`, offered only when that exists, resolves inside its root and the
+/// member may READ it there). The hint can never name a path the follow-up read would refuse.
+fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &str, path: &str) -> String {
+    let now = crate::server::gate_escalation::now_secs();
+    let roots = member_roots(s, plugin_id);
+    let target = path.trim_end_matches('/');
+    let hint = rerooted_in_reach(s, plugin_id, &roots, target, now);
+    let mut out = format!("{path} does not exist: there is nothing there to grant, so no request was \
+                           opened (nothing reaches the operator's queue)");
+    if let Some(c) = hint {
+        out.push_str(&format!(". Did you mean {c}? It exists, inside a grant you already hold"));
+    }
+    out
+}
+
+pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
-    use crate::server::state::{normalize_scope_path, ScopeRequest, SCOPE_REQUEST_TTL_SECS};
+    use crate::server::state::{normalize_scope_path, ScopeRequest, ScopeRequestExt, SCOPE_REQUEST_TTL_SECS};
 
     let plugin_id = require_string(args, "plugin_id")?;
     let role = optional_string(args, "role").unwrap_or_default();
@@ -23499,6 +24284,68 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
     let now = now_secs();
     let mut s = state.lock().await;
 
+    // ATTRIBUTION (hestia#1409), the same rule as `hestia_scope_claim`: a resolved session names
+    // the member, and an asserted id that disagrees with it is refused rather than believed.
+    // Without a session the id is asserted (A1) and recorded as such, so no peer can later
+    // treat a name a caller typed as a proven asker.
+    let asker_basis = match resolve_attributed_caller(&s, optional_session_id(args).as_deref()) {
+        Some(who) if who.plugin_id != plugin_id => {
+            return Ok(hestia_error_envelope(
+                "hestia.scope_request_asker_mismatch",
+                "the session you presented belongs to a different member than the plugin_id \
+                 you asserted; nothing was filed",
+                Some(json!({ "asserted": plugin_id, "session_member": who.plugin_id })),
+            ));
+        }
+        Some(_) => crate::arbiter::AskerBasis::Session,
+        None => crate::arbiter::AskerBasis::Asserted,
+    };
+
+    // EXISTENCE FIRST (hestia#1411). A request names no mode, so a path that does not exist is
+    // refused unless the member says it is creating it (`create: true`): a new file, even in a
+    // new directory, is a real ask (dp: "how is mkdir or a new file write handled"). Nothing is
+    // filed and nothing is witnessed: there is no decision for anyone to make.
+    let create = args.get("create").and_then(Value::as_bool).unwrap_or(false);
+    // `confirm: true` says "I mean this outside path, not the in-reach one it re-roots onto":
+    // the ask is then filed without any look at the target (it buys an escalation, never a
+    // permission). The target is stat-ed only UNDER a root the member holds (see `SpaceAnswer`).
+    let confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    // A PATH THAT DOES NOT EXIST IS NEVER FILED, WHEREVER IT IS (dp, 2026-10-30: "a nonexistent
+    // path should never escalate to a scope request, it should be flatly denied as not there";
+    // 10-26: "the not visible to you should only come on an existing path that's off limits").
+    // #1415's review had narrowed this to paths under the member's own roots, to keep "does X
+    // exist" from being answered for paths outside its reach. dp's rule takes the other side of
+    // that trade on purpose: the gate already answers `mrh.path.nonexistent` for any missing path
+    // (#1412), and five member-filed asks for missing paths reached the operator on 10-30 under the
+    // narrowed rule. `definitely_absent` still reads an unreadable or dangling entry as present,
+    // so those still file.
+    if !create && definitely_absent(&path) {
+        return Ok(json!({
+            "status": "not_filed",
+            "reason": "nonexistent",
+            "path": path,
+            "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
+            "next": "check the spelling against what you already hold; if you mean to CREATE \
+                     this path, ask again with create: true",
+        }));
+    }
+    if !create {
+        match space_of(&s, &plugin_id, &path) {
+            SpaceAnswer::Misrooted(cand) if !confirm => {
+                return Ok(json!({
+                    "status": "not_filed",
+                    "reason": "likely_misrooted",
+                    "path": path,
+                    "candidate": cand,
+                    "detail": misrooted_detail(&path, &cand),
+                    "next": "read the candidate, which you already hold; or ask again with \
+                             confirm: true if you mean this path and not the candidate",
+                }));
+            }
+            _ => {}
+        }
+    }
+
     // An already-live grant answers the ask without a second act. Told plainly rather than
     // silently deduplicated, so a member never wonders whether its request went nowhere.
     if s.has_scope_grant(&plugin_id, &path) {
@@ -23506,6 +24353,21 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
             "status": "already_granted",
             "path": path,
             "note": "you already hold a live grant for this exact path; no new request was filed",
+        }));
+    }
+
+    // A STANDING REFUSAL covering the path (hestia#1417): the door is closed until the operator
+    // lifts it, so the ask is not filed and the member is told why, in the decider's words.
+    if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+        return Ok(json!({
+            "status": "refused_standing",
+            "path": path,
+            "refused_by": r.refused_by,
+            "refused_at": r.refused_at,
+            "reason": r.reason,
+            "note": "a standing refusal covers this path: nothing was filed and nothing reaches \
+                     the operator's queue. It stands until the operator lifts it; the reason is \
+                     the one recorded when it was refused",
         }));
     }
 
@@ -23537,7 +24399,8 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
         decided_at: None,
         decision_reason: None,
         recursive: false,
-        revoked: None, ext: Default::default(),
+        revoked: None,
+        ext: ScopeRequestExt { asker_basis: Some(asker_basis), ..Default::default() },
     };
     s.scope_requests.insert(id.clone(), req);
 
@@ -23578,6 +24441,25 @@ async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
 
 /// `hestia_scope_status` — what a member may reach beyond its standing MRH, and what it has asked
 /// for. Read-only and unwitnessed: reading your own permissions is not an act.
+/// Disclose a grant's modes in the operating law when, and only when, they are narrower than all
+/// four (#1345). An all-modes row is left exactly as it was, so `law_hash` does not move for a
+/// society that never narrows a grant, and moves the moment one is narrowed: a member pinning
+/// the hash learns that what it may DO changed, as it already does for what it may reach.
+fn with_modes(mut row: Value, modes: crate::server::grant_modes::Modes) -> Value {
+    if !modes.is_all() {
+        if let Some(o) = row.as_object_mut() {
+            o.insert("modes".into(), json!(modes));
+        }
+    }
+    row
+}
+
+/// How many `hestia_scope_status` reads this daemon served with no session that resolves to the asserted
+/// member (hestia #1450 phase 0, step B). Step C refuses those reads, and is safe only once every
+/// machine's count stays at zero: that is when every caller (the gate's snapshot fetch above all) sends
+/// its session. Served in every response as `unbound_reads_since_start`, a bare number.
+static UNBOUND_SCOPE_STATUS_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
 
@@ -23586,6 +24468,35 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     // LOCK-FREE (stage 2): the published policy snapshot, never the state lock.
     let s = state.published();
     s.observe();
+
+    // THE CALLER IS WHO ITS SESSION SAYS, NOT WHO IT NAMES (hestia #1450 phase 0, step B). This read
+    // returns a member's grants, floor and request history, and it took `plugin_id` on trust: any
+    // process that could reach the daemon could read another member's territory by naming it, while
+    // hestia_operating_law and hestia_scope_claim already resolved the session. A session that resolves
+    // to a DIFFERENT member is refused here -- that is a lie, and no honest caller sends one. An absent
+    // or unresolvable session is still served, as before, because the gate itself fetched its snapshot
+    // without one until step A: refusing it would deny every governed act on every machine running an
+    // older hook ("no snapshot, no permit"). Those reads are marked and counted; step C refuses them.
+    let caller_bound = match args.get("session_id").and_then(|v| v.as_str()) {
+        Some(sid) => match s.resolve(Some(sid)) {
+            Some(who) if who.plugin_id == plugin_id => true,
+            Some(who) => {
+                return Err(anyhow::anyhow!(
+                    "hestia_scope_status: the session you sent belongs to '{}', not '{}'. This read \
+                     answers for the member whose session asks; send plugin_id '{}' with that session, \
+                     or that member's own session.",
+                    who.plugin_id, plugin_id, who.plugin_id
+                ));
+            }
+            None => false,
+        },
+        None => false,
+    };
+    let unbound_reads = if caller_bound {
+        UNBOUND_SCOPE_STATUS_READS.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        UNBOUND_SCOPE_STATUS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    };
 
     // THE HONOR HORIZON IS BOUNDED BY WHAT IT COVERS (GPT review of #431, blocker 3). A
     // flat now+8h told consumers they could honour a cached snapshot for hours while a
@@ -23643,26 +24554,92 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "secs_remaining": r.expires_at.saturating_sub(now),
                 "grant_path": r.reach_path(),
                 "recursive": r.recursive,
+                "modes": r.ext.modes,
             })
         })
         .collect();
 
+    // FAIL CLOSED FOR A MODE-BLIND GATE (#1345). Every gate released before modes existed
+    // turns each row of `live_grants` / `standing_grants` into reach for EVERY act, so a
+    // read-only grant served there would be enforced as rwed: the narrowing the operator chose
+    // would widen silently on the way to enforcement. Those two keys therefore carry only
+    // all-modes grants, exactly what they always meant. Every grant, narrowed or not, is
+    // ALSO served in `grants_by_mode` with its modes; a gate that predates that key ignores it
+    // and refuses, so an older gate reads a narrowed grant as no grant, never as a wider one.
+    // (#1347 makes the same choice for read-only floor entries with `society_floor_read`.)
+    let live_all = s.live_scope_grants(&plugin_id);
+    let standing_all = s.live_standing_grants(&plugin_id);
+    let grants_by_mode: Vec<Value> = live_all
+        .iter()
+        .map(|r| json!({
+            "channel": "live",
+            "path": r.reach_path(),
+            "recursive": r.recursive,
+            "modes": r.ext.modes,
+            "expires_at": r.expires_at,
+            "granted_by": r.decided_by,
+            "request_id": r.id,
+        }))
+        .chain(standing_all.iter().map(|g| json!({
+            "channel": "standing",
+            "path": g.path,
+            "recursive": g.recursive,
+            "modes": g.modes,
+            "expires_at": g.expires_at,
+            "granted_by": g.granted_by,
+            "request_id": g.request_id,
+        })))
+        .collect();
+
+    // THE FLOOR AS THIS MEMBER'S GATE MAY ENFORCE IT (dp, 2026-10-23: "'floor' should not
+    // override the actual grants"). A mode-blind gate unions `society_floor` with the member's
+    // grants, so an all-modes floor entry overlapping one of the member's NARROWED grants is
+    // withheld from it, and named; see StandingScopeStore::floor_for.
+    let narrowed: Vec<(String, bool, crate::server::grant_modes::Modes)> = live_all
+        .iter()
+        .filter(|r| !r.ext.modes.is_all())
+        .map(|r| (r.reach_path().to_string(), r.recursive, r.ext.modes))
+        .chain(standing_all.iter().filter(|g| !g.modes.is_all())
+               .map(|g| (g.path.clone(), g.recursive, g.modes)))
+        .collect();
+    let floor_view = s.standing_scope.floor_for(&narrowed);
+    let floor_row = |f: &crate::server::standing_scope::FloorEntry| json!({
+        "path": f.path,
+        "recursive": f.recursive,
+        "added_at": f.added_at,
+        "added_by": f.added_by,
+        "reason": f.reason,
+    });
+
     Ok(json!({
         "plugin_id": plugin_id,
+        // #1450 phase 0: true when the session sent resolves to `plugin_id`; false for a read served on the
+        // asserted name alone (no session, or one that no longer resolves). Step C refuses those.
+        "caller_bound": caller_bound,
+        "unbound_reads_since_start": unbound_reads,
         "requests": requests,
         // The operative list, separated from the history, because "what may I read right now"
         // and "what have I asked for" are different questions and only one of them is a
         // permission.
-        "live_grants": s.live_scope_grants(&plugin_id)
+        "live_grants": live_all
             .iter()
+            .filter(|r| r.ext.modes.is_all())
             .map(|r| json!({"path": r.reach_path(), "expires_at": r.expires_at, "granted_by": r.decided_by,
                             "recursive": r.recursive}))
             .collect::<Vec<_>>(),
         // The DURABLE list, additive beside live_grants (Sprint F R1): operator-promoted
         // standing grants from the vault-persisted store. Expired grants are filtered in
         // the store's read, so nothing served here is past its horizon.
-        "standing_grants": s.live_standing_grants(&plugin_id)
+        // STANDING REFUSALS this member is under (hestia#1417): the governed see the closed
+        // door and the deciding seat's reason, instead of re-trying it every window.
+        "refused_standing": s.standing_scope.refusals.iter()
+            .filter(|r| r.member == plugin_id)
+            .map(|r| json!({"path": r.path, "recursive": r.recursive, "refused_at": r.refused_at,
+                            "refused_by": r.refused_by, "reason": r.reason}))
+            .collect::<Vec<_>>(),
+        "standing_grants": standing_all
             .iter()
+            .filter(|g| g.modes.is_all())
             .map(|g| json!({
                 "path": g.path,
                 "granted_at": g.granted_at,
@@ -23676,6 +24653,9 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                 "recursive": g.recursive,
             }))
             .collect::<Vec<_>>(),
+        // EVERY live and standing grant with what it lets the member DO (#1345). See the
+        // fail-closed note above: the two lists before this one hold only all-modes grants.
+        "grants_by_mode": grants_by_mode,
         // CERTIFICATION, issued by the authority — the two fields the plugin gate's
         // certified-replica logic (AgentPolicy) has demanded since 2026-08-04 with nothing
         // issuing them: WHICH policy this is (the standing store's monotonic generation,
@@ -23691,17 +24671,33 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         // applies only to members whose gate remembered to ask — which is per-seat law again,
         // wearing the word "uniform".
         //
-        // Member-independent by construction: this list does not depend on `plugin_id`, so
-        // two members comparing their snapshots see the same floor or the daemon is lying.
-        "society_floor": s.standing_scope.floor
-            .iter()
-            .map(|f| json!({
-                "path": f.path,
-                "added_at": f.added_at,
-                "added_by": f.added_by,
-                "reason": f.reason,
-            }))
+        // ALL-MODES floor entries this member's gate may enforce as reach. The same for every
+        // member except where one of the member's own narrowed grants overlaps an entry:
+        // that entry is withheld from that member (below), because the floor does not
+        // override a member's grant. `floor_by_mode` and `society_floor_digest` stay
+        // member-independent, so two members can still prove they received the same floor.
+        "society_floor": floor_view.reach.iter().map(|f| floor_row(f)).collect::<Vec<_>>(),
+        // NARROWED floor entries that include read, under their own key ON PURPOSE (dp,
+        // 2026-10-19: "the governed see the law"). A gate that predates this key must not see
+        // them as `society_floor` entries: it would map them to all-modes grants. Served
+        // apart, an old gate ignores them and admits nothing, and a gate that knows the key
+        // admits them for read acts only.
+        "society_floor_read": floor_view.read.iter().map(|f| floor_row(f)).collect::<Vec<_>>(),
+        // Floor entries this member's gate is NOT served, each with why: nothing is dropped
+        // silently, and a member that finds a floor path refused can read the reason here.
+        "society_floor_withheld": floor_view.withheld.iter()
+            .map(|w| json!({"path": w.path, "why": w.why}))
             .collect::<Vec<_>>(),
+        // EVERY floor entry with its modes (#1345's `grants_by_mode` for the floor), for the
+        // gate that enforces modes (part B) and for the dashboard.
+        "floor_by_mode": s.standing_scope.floor.iter().map(|f| json!({
+            "path": f.path,
+            "recursive": f.recursive,
+            "modes": f.modes,
+            "added_at": f.added_at,
+            "added_by": f.added_by,
+            "reason": f.reason,
+        })).collect::<Vec<_>>(),
         // Canonical over the path set, not presentation order or provenance. Combined with
         // `generation`, this lets two members prove they received the same society baseline
         // without learning anything about one another's personal expansions.
@@ -23729,7 +24725,11 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
                      expire or are revoked. society_floor is the society's own list: it is \
                      durable, applies to EVERY member identically, and is not yours to lose — \
                      effective(you) = society_floor ∪ your grants, additive only. None of the \
-                     three is ever written to your identity file.",
+                     three is ever written to your identity file. grants_by_mode lists \
+                     every live and standing grant with its modes (r read, w write, e execute, \
+                     d delete); live_grants and standing_grants hold only the grants that allow \
+                     all four, so a gate that does not know modes never treats a narrower grant \
+                     as a wider one.",
     }))
 }
 
@@ -23866,6 +24866,40 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
                        request was opened",
         }));
     }
+    // EXISTENCE FIRST (hestia#1411): a gate refusal of a READ of a path that does not exist opens
+    // nothing, whichever gate sent it (one that predates the gate-side rule included). A write may
+    // be creating the path, so only read tools are declined here.
+    // Same split as `tool_request_scope` (nomad, Nova on #1415): under a root the target is
+    // stat-ed; a doubled root onto a real, readable in-reach path is answered from that candidate
+    // ALONE, never by looking at the target; anything else opens as before.
+    if unpriceable.is_none() && !subtree && rule == "mrh.path"
+        && READ_ONLY_PATH_TOOLS.contains(&tool.as_str())
+    {
+        // dp, 2026-10-30: a missing path is denied as not there, wherever it is (see
+        // `tool_request_scope`).
+        if definitely_absent(&path) {
+            return Ok(json!({
+                "verdict": "not_opened",
+                "permits": false,
+                "path": path,
+                "reason": "nonexistent",
+                "detail": nonexistent_scope_detail(&s, &plugin_id, &path),
+            }));
+        }
+        match space_of(&s, &plugin_id, &path) {
+            SpaceAnswer::Misrooted(cand) => {
+                return Ok(json!({
+                    "verdict": "not_opened",
+                    "permits": false,
+                    "path": path,
+                    "reason": "likely_misrooted",
+                    "candidate": cand,
+                    "detail": misrooted_detail(&path, &cand),
+                }));
+            }
+            _ => {}
+        }
+    }
     let key = scope_request_key(&plugin_id, &path);
     let probe = if subtree { format!("{path}/*") } else { path.clone() };
 
@@ -23943,6 +24977,21 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
             "secs_remaining": expires_at.saturating_sub(now),
             "detail": "the request for this path is still waiting on the operator",
         }));
+    }
+
+    // (3b) A STANDING REFUSAL (hestia#1417): the operator or a NOT-SAME peer closed this door
+    // durably. Answered from the record, nothing opened, nothing new witnessed: before this a
+    // refusal lasted one window and the next act minted a fresh request and a fresh card.
+    if unpriceable.is_none() {
+        if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+            return Ok(json!({
+                "verdict": "refused", "permits": false, "path": path, "request_key": key,
+                "standing": true, "refused_by": r.refused_by, "refused_at": r.refused_at,
+                "detail": format!("refused, standing (by {}): {}. Re-issuing opens no request; \
+                                   only the operator can lift this",
+                                  r.refused_by, if r.reason.is_empty() { "no reason given" } else { &r.reason }),
+            }));
+        }
     }
 
     // (4) REFUSED inside its window — re-issuing does not reopen it.
@@ -24193,7 +25242,7 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
         return Err(anyhow::anyhow!("reason is too thin — the asker reads it"));
     }
     let session_id_arg = optional_session_id(args);
-    let (arbiter, asker, basis) = {
+    let (arbiter, asker, basis, req_subtree) = {
         let s = state.lock().await;
         let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
             return Err(anyhow::anyhow!(
@@ -24207,10 +25256,19 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
                 "no such scope request (memory-only: it may have expired or the daemon \
                  restarted, #908 / #1233)", Some(json!({ "request_id": request_id }))));
         };
-        let Some(gate) = req.ext.gate.as_ref() else {
-            return Ok(hestia_error_envelope("hestia.scope_peer_decide_member_filed",
-                "peers decide GATE-OPENED scope requests; a member-filed ask is the operator's \
-                 (or a delegated seat's `hestia scope arbitrate`)", None));
+        // A MEMBER-FILED ask (hestia#1409; dp 2026-10-14: "the human does not need to be in
+        // that loop"): a NOT-SAME peer may REFUSE it, which widens nothing; granting it stays
+        // the operator's (or a delegated seat's `hestia scope arbitrate`). Measured on
+        // cbp-being, 2026-10-26: nine asks for paths already in its grant, or not on disk,
+        // each waiting on the operator because no peer could close them.
+        let asker_basis = match req.ext.gate.as_ref() {
+            Some(gate) => gate.asker_basis,
+            None if decision == "refuse" => req.ext.asker_basis.unwrap_or_default(),
+            None => {
+                return Ok(hestia_error_envelope("hestia.scope_peer_decide_member_filed",
+                    "peers may only REFUSE a member-filed scope request; granting one is the \
+                     operator's (or a delegated seat's `hestia scope arbitrate`)", None));
+            }
         };
         if arb.plugin_id == req.plugin_id || s.same_entity(&arb.plugin_id, &req.plugin_id) {
             return Ok(hestia_error_envelope("hestia.scope_peer_decide_self",
@@ -24221,7 +25279,7 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
                           else { Disposition::ForAppellant };
         let parties = AppealParties {
             appellant: &req.plugin_id,
-            appellant_basis: gate.asker_basis,
+            appellant_basis: asker_basis,
             deny_adjudicator: None,
             arbiter: &arb.plugin_id,
         };
@@ -24239,20 +25297,37 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
         let basis = json!({
             "arbiter": arb.plugin_id,
             "asker": req.plugin_id,
-            "asker_basis": gate.asker_basis,
+            "asker_basis": asker_basis,
             "independence": independence,
+            "origin": if req.ext.gate.is_some() { "gate_deny" } else { "member_request" },
             "eligibility": "arbiter::eligibility_for (NOT-SAME)",
         });
-        (arb.plugin_id, req.plugin_id.clone(), basis)
+        let req_subtree = req.ext.gate.as_ref().is_some_and(|g| g.subtree);
+        (arb.plugin_id, req.plugin_id.clone(), basis, req_subtree)
     };
     let mut body = json!({ "request_id": request_id, "reason": reason });
     match decision.as_str() {
-        "refuse" => { body["granted"] = json!(false); }
+        "refuse" => {
+            body["granted"] = json!(false);
+            // A peer may make a refusal STANDING (hestia#1417): it widens nothing. Lifting
+            // one stays the operator's. Its REACH is the request's, never the peer's (Nova on
+            // #1418): a peer refuses the ask presented, exact unless the gate-opened act was
+            // itself a subtree glob, and cannot invent a broader durable prohibition.
+            if args.get("standing").and_then(Value::as_bool).unwrap_or(false) {
+                body["standing"] = json!(true);
+                body["recursive"] = json!(req_subtree);
+            }
+        }
         "once" => { body["granted"] = json!(true); body["once"] = json!(true); }
         "session" | "standing" => {
             body["granted"] = json!(true);
             body["standing"] = json!(decision == "standing");
             body["recursive"] = json!(args.get("recursive").and_then(Value::as_bool).unwrap_or(false));
+            // What the grant lets the asker DO (#1345); absent = all four. Validated by the
+            // decide path itself, so a peer and the operator are held to one rule.
+            if let Some(m) = args.get("modes").filter(|v| !v.is_null()) {
+                body["modes"] = m.clone();
+            }
             if let Some(gp) = optional_string(args, "grant_path") {
                 body["grant_path"] = json!(gp);
             }
@@ -25033,6 +26108,15 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         attempted_act.as_deref(),
         &resolved_targets,
     );
+    // RE-ISSUING IS OBSERVING (#366): the proven asker session re-issuing this exact act has
+    // learned of its ruling, so its matching grant is observed before the spend is tried. A
+    // grant approved while the asker sat idle is then claimed by the re-issue the deny asked
+    // for, instead of lapsing at decided_at + 600 and minting a duplicate petition. The key is
+    // the DERIVED host session above, never the caller's assertion (the precedence block).
+    if let Some(h) = proven_host_session_id.as_deref() {
+        s.gate_escalations
+            .observe_reissue(&plugin_id, h, &marker, attempted_act.as_deref(), now);
+    }
     if let Some(esc) = s.gate_escalations.claim_bound(
         &plugin_id,
         &marker,
@@ -26320,6 +27404,7 @@ mod standing_scope_surface_tests {
             expires_at,
             request_id: Some("scope-test01".into()),
         recursive: false,
+        modes: crate::server::grant_modes::Modes::ALL,
         }
     }
 
@@ -26327,6 +27412,37 @@ mod standing_scope_surface_tests {
     /// exact pre-existing shape (a consumer keyed on it must not notice this PR), and
     /// `standing_grants` + `generation` + `snapshot_expires_at` arrive beside it.
     /// (d, at the surface) an expired standing grant is not served.
+    /// #1345, FAIL CLOSED: a gate that predates modes reads `live_grants` / `standing_grants` as
+    /// reach for every act, so a narrowed grant must not appear there. It appears only in
+    /// `grants_by_mode`, which such a gate ignores: it reads the grant as no grant.
+    #[tokio::test]
+    async fn a_narrowed_grant_is_withheld_from_the_mode_blind_lists() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            let mut live = live_request("kimi-code", "/w/live-r.md", now);
+            live.ext.modes = crate::server::grant_modes::Modes::READ;
+            s.scope_requests.insert(live.id.clone(), live);
+            s.standing_scope.add(standing("kimi-code", "/w/full", now, None));
+            let mut ro = standing("kimi-code", "/w/gov", now, None);
+            ro.modes = crate::server::grant_modes::Modes::READ;
+            ro.recursive = true;
+            s.standing_scope.add(ro);
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        let paths = |k: &str| -> Vec<String> { out[k].as_array().unwrap().iter()
+            .map(|g| g["path"].as_str().unwrap().to_string()).collect() };
+        assert_eq!(paths("live_grants"), Vec::<String>::new(), "a read-only live grant reached a mode-blind list");
+        assert_eq!(paths("standing_grants"), vec!["/w/full".to_string()]);
+        let by_mode = out["grants_by_mode"].as_array().unwrap();
+        let find = |p: &str| by_mode.iter().find(|g| g["path"] == p).unwrap_or_else(|| panic!("{p} missing: {by_mode:?}"));
+        assert_eq!((find("/w/gov")["modes"].clone(), find("/w/gov")["recursive"].clone(), find("/w/gov")["channel"].clone()),
+                   (json!("r"), json!(true), json!("standing")));
+        assert_eq!(find("/w/live-r.md")["channel"], "live");
+        assert_eq!(find("/w/full")["modes"], "rwed");
+    }
+
     #[tokio::test]
     async fn scope_status_serves_standing_beside_live_additively() {
         let (_d, state) = test_state().await;
@@ -26367,6 +27483,48 @@ mod standing_scope_surface_tests {
         );
     }
 
+    /// hestia #1450 phase 0, step B: the read answers for the member whose session asks. A session that
+    /// resolves to another member is refused; no session, or one that no longer resolves, is served as
+    /// before but marked unbound and counted (the gate fetched its snapshot without one until step A, so
+    /// refusing those would deny every governed act on an older hook).
+    #[tokio::test]
+    async fn scope_status_refuses_another_members_session_and_marks_unbound_reads() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.add(standing("kimi-code", "/w/web4", now, None));
+        }
+        let kimi = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let codex = tool_connect(&state, &json!({"plugin_id": "codex", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        // its own session: served, bound
+        let own = tool_scope_status(&state, &json!({"plugin_id": "kimi-code", "session_id": kimi}))
+            .await.unwrap();
+        assert_eq!(own["caller_bound"], json!(true));
+        assert_eq!(own["standing_grants"][0]["path"], "/w/web4");
+
+        // no session: served exactly as before, marked unbound, counted
+        let before = own["unbound_reads_since_start"].as_u64().unwrap();
+        let bare = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        assert_eq!(bare["caller_bound"], json!(false));
+        assert_eq!(bare["standing_grants"][0]["path"], "/w/web4", "an older hook still gets its snapshot");
+        assert!(bare["unbound_reads_since_start"].as_u64().unwrap() > before);
+
+        // ANOTHER member's session naming kimi-code: refused, and nothing of kimi-code's is returned
+        let err = tool_scope_status(&state, &json!({"plugin_id": "kimi-code", "session_id": codex}))
+            .await.expect_err("a session that belongs to codex cannot read kimi-code's territory");
+        let msg = format!("{err}");
+        assert!(msg.contains("belongs to 'codex'") && !msg.contains("/w/web4"), "{msg}");
+
+        // a session that does not resolve: served unbound (step C tightens this)
+        let stale = tool_scope_status(&state, &json!({"plugin_id": "kimi-code",
+                                                       "session_id": "not-a-session"})).await.unwrap();
+        assert_eq!(stale["caller_bound"], json!(false));
+    }
+
     /// #483 acceptance 5: one non-empty floor is served byte-for-byte identically to
     /// different members, including a member with zero personal grants. The shared
     /// generation/digest identify the same daemon policy revision; personal expansions do
@@ -26382,6 +27540,7 @@ mod standing_scope_surface_tests {
                 added_at: now,
                 added_by: "operator".into(),
                 reason: "public workspace".into(),
+                ..Default::default()
             });
             s.standing_scope
                 .add(standing("kimi-code", "/w/kimi-only", now, None));
@@ -26401,6 +27560,82 @@ mod standing_scope_surface_tests {
         assert_eq!(kimi["standing_grants"].as_array().map(Vec::len), Some(1));
         assert_eq!(kimi["society_floor"][0]["path"], "/w/shared");
         assert_eq!(kimi["society_floor_digest"].as_str().map(str::len), Some(64));
+    }
+
+    /// dp, 2026-10-19 ("the governed see the law"): a READ-ONLY floor entry is served only under
+    /// `society_floor_read`. Under `society_floor` a gate that predates the key would map it to
+    /// an all-modes grant; apart, that gate ignores it and admits nothing. `floor_by_mode`
+    /// carries every entry with its modes.
+    #[tokio::test]
+    async fn a_read_only_floor_entry_is_served_apart_from_reach() {
+        let (_d, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/shared".into(),
+                recursive: true,
+                ..Default::default()
+            });
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/governance/hestia".into(),
+                recursive: true,
+                modes: crate::server::grant_modes::Modes::READ,
+                reason: "the governed see the law".into(),
+                ..Default::default()
+            });
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "cbp-being"}))
+            .await
+            .unwrap();
+        let reach: Vec<&str> = out["society_floor"].as_array().unwrap().iter()
+            .map(|f| f["path"].as_str().unwrap()).collect();
+        let read: Vec<&str> = out["society_floor_read"].as_array().unwrap().iter()
+            .map(|f| f["path"].as_str().unwrap()).collect();
+        assert_eq!(reach, vec!["/w/shared"]);
+        assert_eq!(read, vec!["/w/governance/hestia"]);
+        assert_eq!(out["society_floor"][0]["recursive"], true);
+        assert_eq!(out["society_floor_read"][0]["recursive"], true);
+        let by_mode = out["floor_by_mode"].as_array().unwrap();
+        assert_eq!(by_mode.len(), 2);
+        assert!(by_mode.iter().any(|f| f["path"] == "/w/governance/hestia" && f["modes"] == "r"));
+        assert!(by_mode.iter().any(|f| f["path"] == "/w/shared" && f["modes"] == "rwed"));
+        assert_eq!(out["society_floor_withheld"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// dp, 2026-10-23: "'floor' should not override the actual grants." A member whose own
+    /// grant under a floor path is narrowed is NOT served that all-modes floor entry as reach
+    /// (a mode-blind gate would union it over the narrowing); it is named as withheld. A
+    /// member without such a grant is served the entry as before, and the member-independent
+    /// digest and `floor_by_mode` stay identical for both.
+    #[tokio::test]
+    async fn an_all_modes_floor_entry_is_withheld_from_a_member_whose_own_grant_narrows_it() {
+        let (_d, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: "/w/shared".into(),
+                recursive: true,
+                ..Default::default()
+            });
+            let mut g = standing("kimi-code", "/w/shared/law", now, None);
+            g.recursive = true;
+            g.modes = crate::server::grant_modes::Modes::READ;
+            s.standing_scope.add(g);
+        }
+        let kimi = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        let codex = tool_scope_status(&state, &json!({"plugin_id": "codex"})).await.unwrap();
+        assert_eq!(kimi["society_floor"].as_array().map(Vec::len), Some(0));
+        let withheld = kimi["society_floor_withheld"].as_array().unwrap();
+        assert_eq!(withheld.len(), 1);
+        assert_eq!(withheld[0]["path"], "/w/shared");
+        assert!(withheld[0]["why"].as_str().unwrap().contains("/w/shared/law"));
+        assert_eq!(codex["society_floor"][0]["path"], "/w/shared");
+        assert_eq!(kimi["society_floor_digest"], codex["society_floor_digest"]);
+        assert_eq!(kimi["floor_by_mode"], codex["floor_by_mode"]);
+        // kimi's narrowed grant itself stays out of the mode-blind lists (#1370) and in
+        // grants_by_mode, so nothing in kimi's snapshot reads as write reach over /w/shared/law.
+        assert_eq!(kimi["standing_grants"].as_array().map(Vec::len), Some(0));
     }
 
     /// (#407) The operating-law projection carries the scope_grants — live AND standing —
@@ -26512,6 +27747,7 @@ mod standing_scope_surface_tests {
                     added_at: now,
                     added_by: "operator".into(),
                     reason: "society baseline".into(),
+                    ..Default::default()
                 });
             })
             .unwrap();
@@ -26640,6 +27876,7 @@ mod standing_scope_surface_tests {
                 added_at: now,
                 added_by: "operator".into(),
                 reason: "baseline".into(),
+                ..Default::default()
             });
             st
         };
@@ -28894,6 +30131,7 @@ async fn tool_scope_arbitrate(state: &SharedState, args: &Value) -> ToolResult {
             expires_at: None,
             request_id: Some(request_id.clone()),
             recursive: false,
+            modes: crate::server::grant_modes::Modes::ALL,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
             return Err(anyhow::anyhow!(
@@ -31295,8 +32533,11 @@ mod durable_reads_tests {
 
         // Two writers that touch no other store: a scope request (a published policy input, an
         // in-memory row and a chain row) and a bare witnessed fact.
+        // The path exists: a request for a nonexistent one is not filed (hestia#1411).
+        let probe_path = dir.path().join("durable-read-probe.txt");
+        std::fs::write(&probe_path, "x").unwrap();
         let req = tool_request_scope(&state, &json!({"plugin_id": "codex", "session_id": sid,
-            "path": "/tmp/durable-read-probe.txt", "reason": "durable reads test"})).await.unwrap();
+            "path": probe_path.to_str().unwrap(), "reason": "durable reads test"})).await.unwrap();
         let request_id = req["request_id"].as_str().unwrap_or_else(|| panic!("{req}")).to_string();
         let fact = { state.lock().await.append_chain("battery_fact", json!({"n": 1})).unwrap() };
 
@@ -31650,4 +32891,538 @@ mod query_policy_off_lock_tests {
         }
         check("operator grant").await;
     }
+}
+
+#[cfg(test)]
+mod channel_send_tests {
+    //! #1344 slice 1 acceptance: the order is the contract, nothing leaves, the budget is
+    //! derived from outbox rows (so it survives a restart), and a member sees only its own.
+    use super::*;
+    use crate::server::channel::{ChannelBinding, UNANSWERED_LIMIT};
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState, plugin: &str) -> String {
+        let c = tool_connect(state, &json!({"plugin_id": plugin, "host_agent": "t"})).await.unwrap();
+        c["sessionId"].as_str().unwrap().to_string()
+    }
+
+    async fn bind(state: &SharedState, member: &str, channel: &str) {
+        let mut s = state.lock().await;
+        s.commit_channel_bindings(|st| {
+            st.set(ChannelBinding {
+                member: member.into(), channel_id: channel.into(), recipient_class: "operator".into(),
+                adapter: "email".into(), address: "operator@example.invalid".into(),
+                reason: "test".into(), set_by: "operator".into(), set_at: 1, version: 0,
+            })
+        })
+        .unwrap();
+    }
+
+    async fn send(state: &SharedState, sid: &str, channel: &str, content: &str) -> Value {
+        tool_channel_send(state, &json!({"channel_id": channel, "content": content, "session_id": sid}))
+            .await
+            .unwrap()
+    }
+
+    async fn events(state: &SharedState, kind: &str) -> Vec<Value> {
+        let s = state.lock().await;
+        s.recent_chain(500).into_iter().filter(|e| e.event_type == kind).map(|e| e.event_data).collect()
+    }
+
+    async fn outbox_len(state: &SharedState) -> usize {
+        let s = state.lock().await;
+        s.inbox_store.channel_outbox_list(None, 500).unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn a_member_without_a_member_lct_gets_its_own_code_not_the_retryable_one() {
+        // `channel_unattributed` is what a caller reconnects on (SAGE #529); a synthetic member
+        // has no member LCT, a reconnect cannot cure that, so it answers a code of its own.
+        let (_d, state) = test_state().await;
+        let c = tool_connect(&state, &json!({"plugin_id": "fuzz-runner", "host_agent": "t", "synthetic": true}))
+            .await
+            .unwrap();
+        let sid = c["sessionId"].as_str().unwrap().to_string();
+        bind(&state, "fuzz-runner", "dp").await;
+        let out = send(&state, &sid, "dp", "hi").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_no_member_lct", "{out}");
+        assert!(events(&state, "channel_send").await.is_empty());
+        assert_eq!(outbox_len(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unattributed_send_is_refused_and_records_nothing() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let out = tool_channel_send(&state, &json!({"channel_id": "dp", "content": "hi"})).await.unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_unattributed", "{out}");
+        assert!(events(&state, "channel_send").await.is_empty());
+        assert_eq!(outbox_len(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unbound_channel_is_refused_and_names_the_bound_ones() {
+        let (_d, state) = test_state().await;
+        let being = connect(&state, "legion-being").await;
+        let out = send(&state, &being, "dp", "hi").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_unbound", "{out}");
+        bind(&state, "legion-being", "dp").await;
+        let out = send(&state, &being, "elsewhere", "hi").await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_unbound");
+        assert_eq!(out["_hestia_error"]["data"]["bound_channels"], json!(["dp"]));
+        assert!(events(&state, "channel_send").await.is_empty());
+        assert_eq!(outbox_len(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_send_is_shadow_witnessed_and_kept_and_nothing_is_sent() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let out = send(&state, &being, "dp", "the board moved on level 2").await;
+        assert_eq!(out["shadow"], true, "{out}");
+        assert_eq!(out["sent"], false);
+        assert_eq!(out["decision"], "would_send");
+        assert_eq!(out["budget"]["unanswered"], 0);
+        let rows = events(&state, "channel_send").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["decision"], "would_send");
+        assert_eq!(rows[0]["shadow"], true);
+        assert_eq!(rows[0]["content_chars"], 26);
+        assert_eq!(rows[0]["content_sha256"].as_str().unwrap().len(), 64);
+        assert!(rows[0].get("content").is_none(), "the chain carries the hash, never the message");
+        let s = state.lock().await;
+        let ob = s.inbox_store.channel_outbox_list(None, 10).unwrap();
+        assert_eq!(ob.len(), 1);
+        assert_eq!(ob[0].content, "the board moved on level 2");
+        assert_eq!(ob[0].chain_hash, out["witnessEntryHash"].as_str().unwrap());
+        assert_eq!(Some(ob[0].member_lct.clone()), s.member_lct("legion-being"));
+    }
+
+    /// #1344 amendment item 3: caller-supplied text never reaches the gate target.
+    #[tokio::test]
+    async fn the_gate_target_is_built_from_the_binding_never_from_caller_text() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let out = tool_channel_send(&state, &json!({
+            "channel_id": "dp", "content": "hello", "session_id": being,
+            "target": "anyone:anything", "recipient_class": "public", "address": "x@example.invalid",
+            "path": "/srv/elsewhere", "url": "mailto:y@example.invalid",
+        })).await.unwrap();
+        assert_eq!(out["recipient_class"], "operator", "{out}");
+        let rows = events(&state, "channel_send").await;
+        assert_eq!(rows[0]["target"], "dp:operator");
+        assert_eq!(rows[0]["recipient_class"], "operator");
+        assert!(crate::policy::extract_target("hestia_channel_send",
+            &json!({"path": "/srv/elsewhere", "target": "x"})).is_none());
+    }
+
+    /// #1344 smaller point: a secret-denied send records the deny and the rule, no content hash.
+    #[tokio::test]
+    async fn a_secret_is_refused_recorded_without_its_hash_and_never_kept() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let tok = format!("{}{}", "/.ss", "h/id_x");   // built at runtime: test data only
+        let out = send(&state, &being, "dp", &format!("copy ~{tok} for me")).await;
+        assert_eq!(out["_hestia_error"]["code"], "hestia.channel_secret", "{out}");
+        let rows = events(&state, "channel_send").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["decision"], "deny");
+        assert_eq!(rows[0]["rule"], "egress.secret");
+        assert!(rows[0].get("content_sha256").is_none(), "no hash of a secret-bearing message");
+        assert_eq!(outbox_len(&state).await, 0, "a refused secret is not kept");
+    }
+
+    /// dp's decision c: 3 unanswered in the window, the 4th is would_deny; answer one, and the
+    /// next is not.
+    #[tokio::test]
+    async fn the_fourth_unanswered_send_would_be_refused_until_one_is_answered() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        let being = connect(&state, "legion-being").await;
+        let mut ids = vec![];
+        for i in 0..UNANSWERED_LIMIT {
+            let out = send(&state, &being, "dp", &format!("message {i}")).await;
+            assert_eq!(out["budget"]["would_deny"], false, "{out}");
+            ids.push(out["outbox_id"].as_u64().unwrap());
+        }
+        let fourth = send(&state, &being, "dp", "message 3").await;
+        assert_eq!(fourth["budget"]["would_deny"], true, "{fourth}");
+        assert_eq!(fourth["decision"], "would_deny");
+        assert_eq!(fourth["budget"]["unanswered"], UNANSWERED_LIMIT);
+        assert_eq!(fourth["budget"]["unanswered_ids"], json!(ids));
+        let note = fourth["note"].as_str().unwrap();
+        assert!(note.contains("would NOT go") && note.contains("resets at"), "{note}");
+        let fifth = send(&state, &being, "dp", "message 4").await;
+        assert_eq!(fifth["budget"]["unanswered"], UNANSWERED_LIMIT, "a would-deny row is not counted");
+        {
+            let s = state.lock().await;
+            assert!(s.inbox_store.channel_mark_answered(ids[0], "operator", 1).unwrap());
+            assert!(!s.inbox_store.channel_mark_answered(ids[0], "operator", 2).unwrap(), "answered once");
+        }
+        let next = send(&state, &being, "dp", "message 5").await;
+        assert_eq!(next["budget"]["would_deny"], false, "{next}");
+        assert_eq!(next["budget"]["unanswered"], UNANSWERED_LIMIT - 1);
+    }
+
+    /// The budget is per channel: a full one does not block another.
+    #[tokio::test]
+    async fn the_budget_is_per_channel() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        bind(&state, "legion-being", "ops").await;
+        let being = connect(&state, "legion-being").await;
+        for i in 0..UNANSWERED_LIMIT {
+            send(&state, &being, "dp", &format!("m{i}")).await;
+        }
+        assert_eq!(send(&state, &being, "dp", "x").await["budget"]["would_deny"], true);
+        assert_eq!(send(&state, &being, "ops", "x").await["budget"]["would_deny"], false);
+    }
+
+    /// Amendment item 5 / decision c: the count is derived from outbox rows, so a restart
+    /// forgets nothing.
+    #[tokio::test]
+    async fn the_unanswered_count_survives_a_daemon_restart() {
+        let dir = TempDir::new().unwrap();
+        {
+            let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+            let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+            bind(&state, "legion-being", "dp").await;
+            let being = connect(&state, "legion-being").await;
+            for i in 0..UNANSWERED_LIMIT {
+                send(&state, &being, "dp", &format!("m{i}")).await;
+            }
+        }
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let being = connect(&state, "legion-being").await;
+        let out = send(&state, &being, "dp", "after the restart").await;
+        assert_eq!(out["budget"]["unanswered"], UNANSWERED_LIMIT, "{out}");
+        assert_eq!(out["budget"]["would_deny"], true);
+    }
+
+    /// Two spellings of one member share ONE budget: the operator's alias record joins them
+    /// (`same_entity`). Keyed on one LCT, each alias would have had its own three (fail-open).
+    #[tokio::test]
+    async fn an_alias_shares_the_members_budget() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        bind(&state, "legion-being-2", "dp").await;
+        {
+            let s = state.lock().await;
+            s.append_chain(crate::derivation::IDENTITY_ALIAS_EVENT,
+                           json!({"alias": "legion-being-2", "alias_of": "legion-being", "ref": "test"}))
+                .unwrap();
+        }
+        let a = connect(&state, "legion-being").await;
+        let b = connect(&state, "legion-being-2").await;
+        send(&state, &a, "dp", "one").await;
+        send(&state, &b, "dp", "two").await;
+        send(&state, &a, "dp", "three").await;
+        let fourth = send(&state, &b, "dp", "four, under the alias").await;
+        assert_eq!(fourth["budget"]["unanswered"], UNANSWERED_LIMIT, "{fourth}");
+        assert_eq!(fourth["budget"]["would_deny"], true, "the alias does not get a fresh budget");
+        // and an unrelated member on the same channel name is not counted
+        bind(&state, "cbp-being", "dp").await;
+        let c = connect(&state, "cbp-being").await;
+        assert_eq!(send(&state, &c, "dp", "mine").await["budget"]["unanswered"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_member_reads_only_its_own_outbox_and_never_an_address() {
+        let (_d, state) = test_state().await;
+        bind(&state, "legion-being", "dp").await;
+        bind(&state, "cbp-being", "dp").await;
+        let legion = connect(&state, "legion-being").await;
+        let cbp = connect(&state, "cbp-being").await;
+        send(&state, &legion, "dp", "from legion").await;
+        send(&state, &cbp, "dp", "from cbp").await;
+        let mine = tool_channel_outbox(&state, &json!({"session_id": legion})).await.unwrap();
+        let rows = mine["outbox"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{mine}");
+        assert_eq!(rows[0]["content"], "from legion");
+        assert!(!mine.to_string().contains("example.invalid"), "the recipient address is the operator's");
+        let anon = tool_channel_outbox(&state, &json!({})).await.unwrap();
+        assert_eq!(anon["_hestia_error"]["code"], "hestia.channel_unattributed");
+    }
+
+    #[tokio::test]
+    async fn a_member_cannot_forge_a_channel_send_row() {
+        let (_d, state) = test_state().await;
+        let being = connect(&state, "legion-being").await;
+        let out = tool_request_witness(&state, &json!({"event_type": "channel_send", "data": {},
+                                                       "session_id": being})).await;
+        let refused = match out {
+            Err(_) => true,
+            Ok(v) => v.get("_hestia_error").is_some() || v.get("witnessEntryHash").is_none(),
+        };
+        assert!(refused, "channel_send is daemon-written only");
+        assert!(events(&state, "channel_send").await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod existence_first_tests {
+    //! EXISTENCE FIRST (hestia#1411). dp, 2026-10-26: "we should not be doing escalations on
+    //! nonexistent paths because there is nothing to escalate - it's just noise". Measured on
+    //! cbp-being: nine operator cards for `<ws>/hestia/governance/...`, a doubled root, while the
+    //! member already held `<ws>/governance`.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+
+    async fn session(state: &SharedState) -> String {
+        tool_connect(state, &json!({"plugin_id": "cbp-being", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string()
+    }
+
+    async fn pending(state: &SharedState) -> usize {
+        state.lock().await.scope_requests.len()
+    }
+
+    /// The being's shape: a standing read grant on `<ws>/governance`, so a doubled-root ask under
+    /// `<ws>/hestia/governance/...` lies inside the member's own space (nomad on #1415, option a).
+    async fn grant_governance(state: &SharedState, dir: &tempfile::TempDir) -> String {
+        let root = dir.path().join("governance");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::READ,
+        });
+        root
+    }
+
+    #[tokio::test]
+    async fn a_missing_path_anywhere_is_not_there_and_reaches_no_one() {
+        // dp, 2026-10-30: "a nonexistent path should never escalate to a scope request, it should
+        // be flatly denied as not there". The 10-30 shapes: a tripled workspace root, and a system
+        // directory that does not exist on this host. Neither is under any root the member holds.
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let before = pending(&state).await;
+        for p in [dir.path().join("ai-workspace/ai-workspace/shared-context/forum"),
+                  dir.path().join("var/lib/hestia")] {
+            let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+                "path": p.to_str().unwrap(), "reason": "to read what I think is there"})).await.unwrap();
+            assert_eq!(r["status"], "not_filed", "{}: {r}", p.display());
+            assert_eq!(r["reason"], "nonexistent", "{r}");
+            let c = tool_scope_claim(&state, &json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
+                "path": p.to_str().unwrap(), "rule": "mrh.path", "tool_name": "read_file",
+                "act": "read_file", "act_digest": "e".repeat(64)})).await.unwrap();
+            assert_eq!(c["verdict"], "not_opened", "{c}");
+        }
+        assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
+        // An existing off-limits path is the one that files ("not visible to you").
+        let off = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&off).unwrap();
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": off.to_str().unwrap(), "reason": "to read an existing directory"})).await.unwrap();
+        assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_request_for_a_nonexistent_path_is_not_filed() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        grant_governance(&state, &dir).await;
+        // The doubled root (`<ws>/hestia/governance/x.py` for `<ws>/governance/x.py`), the shape
+        // the being's asks took; the real file is in the member's reach, so the ask is about the
+        // member's own space and is answered quietly (nomad on #1415).
+        std::fs::write(dir.path().join("governance/x.py"), "x").unwrap();
+        let missing = dir.path().join("hestia/governance/x.py");
+        let before = pending(&state).await;
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": missing.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "the hint names the real path: {r}");
+        assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
+        // UNDER a root, the target is stat-ed and a missing one is declined as nonexistent.
+        let under = dir.path().join("governance/no-such.py");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": under.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert_eq!(r["reason"], "nonexistent", "{r}");
+        assert_eq!(pending(&state).await, before);
+    }
+
+
+
+
+
+
+    #[tokio::test]
+    async fn create_true_keeps_a_new_path_a_real_ask() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let new = dir.path().join("notes/new-dir/new.md");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": new.to_str().unwrap(), "reason": "to write a new note there", "create": true}))
+            .await.unwrap();
+        assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
+    async fn an_existing_path_is_filed_as_before() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let f = dir.path().join("exists.md");
+        std::fs::write(&f, "x").unwrap();
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": f.to_str().unwrap(), "reason": "to read an existing file"})).await.unwrap();
+        assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
+    async fn the_refusal_names_the_path_inside_the_members_own_grant() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("governance/hestia")).unwrap();
+        std::fs::write(ws.join("governance/hestia/gate.py"), "x").unwrap();
+        let root = ws.join("governance").to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::ALL,
+        });
+        let doubled = ws.join("hestia/governance/hestia/gate.py");
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": doubled.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        let want = format!("Did you mean {root}/hestia/gate.py?");
+        assert!(r["detail"].as_str().unwrap().contains(&want), "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_gate_claim_for_a_read_of_nothing_opens_nothing_but_a_write_still_does() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        grant_governance(&state, &dir).await;
+        std::fs::write(dir.path().join("governance/x.py"), "x").unwrap(); // the doubled root lands on it
+        let missing = dir.path().join("hestia/governance/x.py");
+        let claim = |tool: &str| json!({"plugin_id": "cbp-being", "session_id": sid.clone(),
+            "path": missing.to_str().unwrap(), "rule": "mrh.path", "tool_name": tool,
+            "act": format!("{tool} -> x.py"), "act_digest": "a".repeat(64)});
+        let before = pending(&state).await;
+        let r = tool_scope_claim(&state, &claim("read_file")).await.unwrap();
+        assert_eq!(r["verdict"], "not_opened", "{r}");
+        assert_eq!(r["reason"], "nonexistent", "a missing path is not there: {r}");
+        assert_eq!(pending(&state).await, before, "a read of nothing opens nothing");
+        let w = tool_scope_claim(&state, &claim("Write")).await.unwrap();
+        assert_eq!(w["verdict"], "opened", "a write may be creating it: {w}");
+    }
+
+    /// The daemon's read-tool list must EQUAL the gate's (READ_ONLY_PATH_TOOLS ∪ every
+    /// PATH_TOOL_MODES entry that needs exactly r), parsed from the gate source in the tree
+    /// (nomad/Nova on #1415: a one-directional contains check let a new gate read tool regress).
+    #[test]
+    fn read_tools_match_the_gate() {
+        let core = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/_shared/hestia_gate_core.py"))
+            .expect("gate core in the tree");
+        fn quoted(block: &str) -> std::collections::BTreeSet<String> {
+            let mut out = std::collections::BTreeSet::new();
+            let mut rest = block;
+            while let Some(i) = rest.find('"') {
+                let after = &rest[i + 1..];
+                let Some(j) = after.find('"') else { break };
+                out.insert(after[..j].to_string());
+                rest = &after[j + 1..];
+            }
+            out
+        }
+        let ro_start = core.find("READ_ONLY_PATH_TOOLS = frozenset({").expect("READ_ONLY_PATH_TOOLS");
+        let ro_block = &core[ro_start..core[ro_start..].find("})").map(|k| ro_start + k).unwrap()];
+        let mut gate = quoted(ro_block);
+        let pm_start = core.find("PATH_TOOL_MODES = {").expect("PATH_TOOL_MODES");
+        let pm_block = &core[pm_start..core[pm_start..].find("\n}").map(|k| pm_start + k).unwrap()];
+        // Entries come several to a line (`"search": "r", "git_read": "r",`): split on commas
+        // first, then each `"name": "modes"` pair on its colon.
+        for line in pm_block.lines() {
+            for piece in line.split(',') {
+                let t = piece.trim();
+                if let Some((name, modes)) = t.split_once(':') {
+                    let name = name.trim().trim_matches('"');
+                    let modes = modes.trim().trim_matches('"');
+                    if modes == "r" && !name.is_empty() && !name.contains(' ') && !name.contains('{') {
+                        gate.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        let daemon: std::collections::BTreeSet<String> = READ_ONLY_PATH_TOOLS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(daemon, gate, "daemon READ_ONLY_PATH_TOOLS must equal the gate's read set");
+    }
+
+    #[tokio::test]
+    async fn the_hint_is_withheld_when_the_member_could_not_read_the_candidate() {
+        // Nova/nomad on #1415: the gate's #1412 repair, applied to the daemon's hint.
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("governance/hestia")).unwrap();
+        std::fs::write(ws.join("governance/hestia/gate.py"), "x").unwrap();
+        let root = ws.join("governance").to_str().unwrap().to_string();
+        let grant = |recursive: bool| crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive,
+            modes: crate::server::grant_modes::Modes::READ,
+        };
+        let doubled = ws.join("hestia/governance/hestia/gate.py").to_str().unwrap().to_string();
+        let ask = |state: &SharedState, sid: &str, p: &str| {
+            let b = json!({"plugin_id": "cbp-being", "session_id": sid, "path": p, "reason": "to read the gate scoring model"});
+            let st = state.clone();
+            async move { tool_request_scope(&st, &b).await.unwrap() }
+        };
+        // No hint means no quiet answer either: the one predicate that draws the hint bounds the
+        // decline (nomad on #1415, point 1), so each withheld case FILES and the operator sees it.
+        // 1. an EXACT grant on the root: the child is not readable, so no hint, and it files
+        state.lock().await.standing_scope.grants.push(grant(false));
+        let r = ask(&state, &sid, &doubled).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        // 2. recursive: the hint comes back, quietly
+        state.lock().await.standing_scope.grants.clear();
+        state.lock().await.standing_scope.grants.push(grant(true));
+        let r = ask(&state, &sid, &doubled).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        // 3. a symlink under the root that escapes it: exists, resolves outside, no hint, files
+        std::fs::create_dir_all(ws.join("hestia")).unwrap();
+        std::fs::write(ws.join("hestia/outside.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(ws.join("hestia/outside.txt"), ws.join("governance/hestia/link.txt")).unwrap();
+        let r = ask(&state, &sid, ws.join("hestia/governance/hestia/link.txt").to_str().unwrap()).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+        // 4. a floor row that gives this member no read: no hint, files
+        state.lock().await.standing_scope.grants.clear();
+        state.lock().await.standing_scope.floor.push(crate::server::standing_scope::FloorEntry {
+            path: root.clone(), added_at: 0, added_by: "operator".into(), reason: "floor".into(),
+            recursive: true, modes: crate::server::grant_modes::Modes::parse("w").unwrap(),
+        });
+        let r = ask(&state, &sid, &doubled).await;
+        assert_eq!(r["status"], "not_filed", "{r}");
+        assert!(!r["detail"].as_str().unwrap().contains("Did you mean"), "{r}");
+    }
+
+
+
 }

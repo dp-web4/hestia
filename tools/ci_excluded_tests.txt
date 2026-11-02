@@ -48,3 +48,8 @@ plugin-sdk/python/tests/conformance/test_conformance.py
 # upgrade-path.yml, which builds the daemon and checks out with fetch-depth 0. Its plumbing is
 # pinned hermetically by tools/upgrade_path_plumbing_test.py, which plugin-tests does run.
 tools/upgrade_path_test.py
+
+
+# Held with #1345 part B (grant modes at the gate): it tests a gate core that is not applied yet,
+# so it fails against the tree until the governed apply. It moves to tools/ at the apply and this
+# line goes, as floor_read_only_test.py did for #1347.

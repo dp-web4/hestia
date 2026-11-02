@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 4ffb1fe401ed9671ee767adf272ccf1b902c75241e370bf01dc4f7e17618c786  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -221,6 +221,50 @@ REMEDIES: dict[str, Remedy] = {
         "is a separate act.",
         ("hestia_request_scope", "hestia_scope_status", "hestia_appeal"),
     ),
+    # AN UNENUMERABLE REACH (dp's ruling, 2026-10-14, hestia#1313: option (b) of three). The act's
+    # reach depends on an expansion the gate does not model, so no path exists for a grant to
+    # name. Until this ruling the refusal also opened a once-only peer scope request for the act;
+    # measured on claude-code's own 50,091 recorded commands, 9,178 (18%) were such requests and
+    # most lapsed or were refused as noise. Now it is its own rule, NOT a scope-escalating one
+    # (mechanism.SCOPE_ESCALATING_RULES), so the single gate asks the daemon nothing, and the
+    # remedy names the two rewrites that work. The rewrite is the asked-for act, not a recast.
+    "mrh.command.unenumerated": Remedy(
+        "Rewrite the act so the gate can see what it reaches. That rewrite is what this refusal "
+        "asks for; it is not a recast. Either spell every path out literally (if a value comes "
+        "from a command, run that command on its own first and use what it printed), or put "
+        "the expansion in a script file and run the script by its literal path. No scope "
+        "request was opened: no grant can name a path the gate cannot see. If the spelled-out "
+        "command then reaches outside your scope, its own refusal opens a request for that "
+        "path.",
+        ("hestia_request_scope",),
+    ),
+    # A PHANTOM REACH (hestia#1327, the #1313 pattern). A relative `cd` is composed under every
+    # earlier directory base, so `cd /ws && cd a && cd ../b` is also judged at `<cwd>/../b`, and
+    # every later relative word under that. When neither the refused path nor its parent exists,
+    # it names nothing a grant could be about, so it is NOT a scope-escalating rule: refused as
+    # before (the over-approximation is the safe direction), but no peer request is opened.
+    # EXISTENCE FIRST (dp, 2026-10-26, hestia#1411: "we should not be doing escalations on
+    # nonexistent paths because there is nothing to escalate - it's just noise"; "we should be
+    # checking existence first"). A path tool that READS a path that does not exist, or acts on
+    # one whose parent does not exist either, names nothing a grant could be about. Measured on
+    # cbp-being: nine operator cards for `<ws>/hestia/governance/...`, a doubled root carried in
+    # its own journal, while the refusal said "'hestia' is not granted" and never "not there".
+    # Not a scope-escalating rule, so the single gate opens nothing.
+    "mrh.path.nonexistent": Remedy(
+        "The path does not exist, so there is nothing to grant and no scope request was opened. "
+        "Check the spelling against what you already hold: if the refusal names a path inside "
+        "one of your grants, that is the one you meant. (Only reads are refused this way: "
+        "creating a path is judged as an ordinary write.)",
+        ("hestia_scope_status",),
+    ),
+    "mrh.command.nonexistent": Remedy(
+        "The refused path does not exist, and neither does its parent directory: most often a "
+        "relative cd composed under a directory the command never runs in. Spell the cd target "
+        "absolutely (or use git -C / an absolute path) and re-issue. No scope request was opened: "
+        "a grant cannot be about a path that names nothing. If the path is genuinely needed (the "
+        "command creates it), ask with hestia_request_scope (one path, with a reason).",
+        ("hestia_request_scope",),
+    ),
     "mrh.command": Remedy(
         "Scope the command to a granted path. If the path is genuinely needed: when this "
         "refusal names a scope request id, the gate already opened it for you — a NOT-SAME "
@@ -237,11 +281,13 @@ REMEDIES: dict[str, Remedy] = {
     # member is not sent asking for "a path" it never named. Added Sprint D (§6.D): before
     # this, that call site authored its own sentence, naming the request_scope phantom.
     "mrh.repo": Remedy(
-        "Adjust to work within scope. If the repository is genuinely needed, ask for it with "
-        "hestia_request_scope (one repo, with a reason) — a human decides, the grant is "
-        "memory-only and expires. An appeal cannot deliver a repo — hestia_appeal disputes "
+        "Adjust to work within scope. If the repository is genuinely needed, the OPERATOR must "
+        "grant it as a qualified entry `repo:<owner>/<name>` (the deny names it); a path grant, "
+        "even recursive, never reaches a remote repository. A scope request cannot yet carry a "
+        "repository (the scope store holds paths; #1392 follow-up), so ask the operator rather "
+        "than filing one. An appeal cannot deliver a repo — hestia_appeal disputes "
         "whether the deny was right, which is a different question.",
-        ("hestia_request_scope", "hestia_appeal"),
+        ("hestia_appeal",),
     ),
     # ── egress ───────────────────────────────────────────────────────────────────────────
     #
@@ -426,6 +472,15 @@ class AgentPolicy:
     member_id: str
     #: Repo names and `path:` grants. `["*"]` = deliberately unscoped, and must be declared.
     scope: tuple = ()
+    #: Roots this member may READ and nothing more: the read-only society floor (dp,
+    #: 2026-10-19, "the governed see the law" — every member reads the governance snapshot).
+    #: Consulted by evaluate() only for an act that is a read; never widens a write.
+    read_scope: tuple = ()
+    #: Grants NARROWED to fewer than all four modes (hestia #1345 part B), as
+    #: ``((entry, modes), ...)`` with `entry` parsed like `scope` and `modes` a subset of
+    #: "rwed". Consulted by evaluate() only for an act whose mode it can name, and only when
+    #: every mode that act needs is in the grant's. A full-mode grant stays in `scope`.
+    mode_scope: tuple = ()
     #: Where this policy was resolved from, carried so a reader never has to guess which store
     #: won. A policy that cannot say where it came from is not auditable.
     source: str = "unresolved"
@@ -472,9 +527,552 @@ class NormalizedEvent:
     #: (the 2026-07-26 false-deny class). Sprint F: this moved the last shim-side scope
     #: decision (codex's mcp_repo check) into the one law.
     repos: list = field(default_factory=list)
+    #: The FULL remote identity (`owner/name`) of each entry in `repos`, index-aligned ("" when the call carried
+    #: no owner). #1392: a name alone cannot be bound to a checkout -- `other-owner/hestia` and `dp-web4/hestia`
+    #: both reduce to `hestia` -- so the recursive-grant admission binds on this, never on the bare name.
+    repo_full: list = field(default_factory=list)
     command: Optional[str] = None               # shell command, if any
     cwd: Optional[str] = None
     raw: dict = field(default_factory=dict)     # kept for witnessing, never for deciding
+    #: Text that LEAVES THE MACHINE: a web query, a url, a prompt or context handed to a remote
+    #: model (#1201). Gate 1a sweeps it with the same innate `egress.secret` rule as paths, repos
+    #: and the command. Gate 1b NEVER reads it: natural language is not a path, and scoping its
+    #: words is the false-deny SAGE #335 measured ("'models' is not granted"). The field can
+    #: only ADD a deny. Default empty: an event that declares no egress is judged as before.
+    egress: list = field(default_factory=list)
+
+
+def egress_items(value: object) -> Optional[list]:
+    """Declared egress as the strings Gate 1a sweeps, or None when it cannot be swept.
+
+    A string is ONE blob. `list("~/.ssh/id_rsa")` is fourteen one-character blobs that match no
+    token, which is how a bare string slipped past the first #1201 patch (NOVA HOLD at 7a6e410b).
+    A list or tuple contributes its strings, flattened through nested lists/tuples, and None
+    entries are skipped. Anything else (a dict, bytes, a number, a set, a generator) is not text
+    this gate can read whole, so it returns None and the caller fails closed."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, (list, tuple)):
+        return None
+    out: list = []
+    for x in value:
+        if x is None:
+            continue
+        sub = egress_items(x)
+        if sub is None:
+            return None
+        out.extend(sub)
+    return out
+
+
+def egress_unsweepable(event: "NormalizedEvent") -> str:
+    """The type name of declared egress that `egress_items` cannot sweep; "" when it can."""
+    raw = getattr(event, "egress", None)
+    return type(raw).__name__ if egress_items(raw) is None else ""
+
+
+def egress_unsweepable_deny(event: "NormalizedEvent") -> Optional["Verdict"]:
+    """Gate 1a's fail-closed half: egress the gate cannot read whole is denied, never passed
+    unread. Both Gate 1a sites call it before the token sweep, so the degraded mode does too."""
+    bad = egress_unsweepable(event)
+    if not bad:
+        return None
+    return _deny("egress.secret",
+                 f"'{event.tool}' declares egress the gate cannot sweep ({bad}): egress must be "
+                 f"a string or a list of strings, so it is denied rather than sent unread",
+                 innate=True)
+
+
+def egress_blobs(event: "NormalizedEvent") -> list:
+    """Every string Gate 1a sweeps for the innate forbidden tokens: paths, repos, declared
+    egress text, and the command. `getattr`, not attribute access: a caller's own event
+    shape (SAGE's test fakes) may predate the `egress` field, and that must read as none.
+    Unsweepable egress contributes nothing here; `egress_unsweepable_deny` has refused it."""
+    return (list(event.paths) + list(event.repos)
+            + (egress_items(getattr(event, "egress", None)) or [])
+            + ([egress_command_text(event.command)] if event.command else [])
+            + link_targets(event))
+
+
+#: How far Gate 1a follows an act's REACH to the links in it (hestia #1331 follow-ups). Past either bound the act is
+#: refused under mrh.command.unenumerated rather than judged in part (egress_unsweepable_deny). All are STRICT work
+#: bounds (Nova's #1435 review): directory entries are read one at a time and counted as they are read, so nothing
+#: lists more entries, or collects more matches, than its bound before it stops. Two entry budgets, because the two
+#: risks differ (nomad's #1435 review): a glob is a caller-written pattern, so its scan stays small; a walk's size is
+#: the tree's own, so its budget is set from the measured cost of real trees. Measured 2026-10-30, no-follow scandir,
+#: warm: Legion SAGE 82,943 entries / 48 ms, web4 46,983 / 20 ms, hestia 14,369 / 19 ms (0.4-1.3 us per entry);
+#: Nomad SAGE 70,237 / 43 ms. 200,000 is about 120 ms warm, clears every repo, and still refuses a whole workspace
+#: (Legion's ai-workspace: 705,755 entries).
+LINK_GLOB_LIMIT = 2048         # paths a glob or brace may expand to, per act (each a realpath: a few ms in all)
+LINK_GLOB_SCAN_LIMIT = 10000   # directory entries a glob may read while expanding, per act
+LINK_WALK_LIMIT = 200000       # directory entries the act's link-following walks may read, per act
+
+
+class _TooWide(Exception):
+    """A reach past its bound, or a directory it reaches that cannot be read: refused, never judged in part."""
+
+
+def _entries(d: str, budget: list):
+    """The entries of directory `d`, read lazily and each counted against `budget[0]` as it is read. `budget` is
+    [remaining, bound, what]: `what` names the reader in the refusal."""
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                budget[0] -= 1
+                if budget[0] < 0:
+                    raise _TooWide(f"{budget[2]} would read more than {budget[1]} directory entries")
+                yield e
+    except OSError as exc:
+        raise _TooWide(f"a directory it reaches cannot be read ({type(exc).__name__})")
+
+
+def _bounded_glob(pattern: str, budget: list, matches: list) -> list:
+    """The paths an absolute glob `pattern` matches, one component at a time, reading only the directories a
+    wildcard component needs, through `_entries`. `matches[0]` counts down LINK_GLOB_LIMIT across the act. Hidden
+    names match only a component that starts with a dot, as glob does."""
+    parts = [p for p in pattern.split(os.sep) if p]
+    cur = [os.sep]
+    for i, comp in enumerate(parts):
+        last = i == len(parts) - 1
+        nxt = []
+        for c in cur:
+            if not _GLOB_CHARS.search(comp):
+                p = os.path.join(c, comp)
+                if os.path.lexists(p) if last else os.path.isdir(p):
+                    nxt.append(p)
+                continue
+            if not os.path.isdir(c):
+                continue
+            for e in _entries(c, budget):
+                if e.name.startswith(".") and not comp.startswith("."):
+                    continue
+                if _fnmatch.fnmatchcase(e.name, comp) and (last or os.path.isdir(e.path)):
+                    nxt.append(e.path)
+                    if last:
+                        matches[0] -= 1
+                        if matches[0] < 0:
+                            raise _TooWide(f"a pattern reaches more than {LINK_GLOB_LIMIT} paths")
+        cur = nxt
+    return cur
+
+
+def _bounded_walk(root: str, budget: list):
+    """Every path under `root`, depth-first, without following links, read through `_entries`."""
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        for e in _entries(d, budget):
+            yield e.path
+            if e.is_dir(follow_symlinks=False):
+                stack.append(e.path)
+#: Readers that FOLLOW links while walking a directory, and the options that make them do it. A short cluster
+#: counts (`cp -rL`, `tar -chf`), except for find, whose options are whole words. Read from each tool's --help.
+_FOLLOW_FLAGS = {
+    "grep": frozenset({"-R", "--dereference-recursive"}),
+    "rg": frozenset({"-L", "--follow"}),
+    "find": frozenset({"-L", "-H", "-follow"}),
+    "cp": frozenset({"-L", "--dereference"}),
+    "tar": frozenset({"-h", "--dereference"}),
+    "bsdtar": frozenset({"-L", "-h", "--dereference"}),
+    "rsync": frozenset({"-L", "--copy-links", "-k", "--copy-dirlinks"}),
+    "cpio": frozenset({"-L", "--dereference"}),
+}
+#: Archivers that follow links BY DEFAULT, and the options that make them store the link instead (nomad's #1435
+#: review). `7z` follows only when adding (`7z a`).
+_FOLLOW_UNLESS = {
+    "zip": frozenset({"-y", "--symlinks"}),
+    "7z": frozenset({"-snl"}),
+}
+#: find walks without following links but LISTS them; an -exec reader then opens each listed path, and readers follow
+#: a link on open (nomad's #1435 review). So a find that execs is a link-following reader with or without -L.
+_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+#: Programs that change the working directory of what they run, and the option that names it: like an in-line cd.
+_CHDIR_OPTS = {"env": ("-C", "--chdir"), "sudo": ("-D", "--chdir")}
+_CD = frozenset({"cd", "pushd"})
+
+
+def _reach_segments(command: str) -> list:
+    """The command's words as (word, quoted), split at the shell's segment breaks. `quoted` is whether the word was
+    written in quotes, so a pattern the shell will not expand is not expanded here either (nomad's #1435 review:
+    `find clean -name '*.txt'` was expanded against the cwd). When the quoting cannot be read word-for-word, every
+    word counts as unquoted, which only ever adds refusals. The raw words, unquoted, when it cannot be tokenized."""
+    def lex(posix):
+        lx = shlex.shlex(command, posix=posix, punctuation_chars=True)
+        lx.whitespace_split = True
+        return list(lx)
+    try:
+        words = lex(True)
+    except ValueError:
+        return [[(w, False) for w in command.split()]]
+    try:
+        raw = lex(False)
+    except ValueError:
+        raw = []
+    quoted = ([("'" in r or '"' in r) for r in raw] if len(raw) == len(words) else [False] * len(words))
+    segs = [[]]
+    for w, q in zip(words, quoted):
+        if w in _SEGMENT_BREAKS:
+            segs.append([])
+        else:
+            segs[-1].append((w, q))
+    return [s for s in segs if s]
+
+
+def _braces(word: str, limit: int = LINK_GLOB_LIMIT) -> list:
+    """`a{b,c}d` -> [abd, acd], recursively; a word with no complete `{x,y}` group is itself."""
+    i = word.find("{")
+    while i >= 0:
+        depth, j = 0, i
+        for j in range(i, len(word)):
+            depth += word[j] == "{"
+            depth -= word[j] == "}"
+            if depth == 0:
+                break
+        inner = word[i + 1:j]
+        if depth == 0 and "," in inner:
+            parts, d, cur = [], 0, ""
+            for ch in inner:
+                if ch == "," and d == 0:
+                    parts.append(cur)
+                    cur = ""
+                    continue
+                d += ch == "{"
+                d -= ch == "}"
+                cur += ch
+            parts.append(cur)
+            out = []
+            for p in parts:
+                out.extend(_braces(word[:i] + p + word[j + 1:], limit))
+                if len(out) > limit:
+                    return out
+            return out
+        i = word.find("{", i + 1)
+    return [word]
+
+
+def _has_flag(prog: str, flags: frozenset, words: list) -> bool:
+    """A word of the segment is one of `flags`; a short cluster counts (`-rL`), except for find's whole-word options."""
+    for w in words:
+        if w in flags:
+            return True
+        if prog != "find" and w.startswith("-") and not w.startswith("--") and len(w) > 2:
+            if any(f"-{c}" in flags for c in w[1:]):
+                return True
+    return False
+
+
+def _follows_links(prog: str, words: list) -> bool:
+    """Whether this segment's program reads through the links in the directories it walks."""
+    if prog in _FOLLOW_FLAGS and _has_flag(prog, _FOLLOW_FLAGS[prog], words):
+        return True
+    if prog == "find" and any(w in _FIND_EXEC for w in words):
+        return True
+    if prog in _FOLLOW_UNLESS and not _has_flag(prog, _FOLLOW_UNLESS[prog], words):
+        return prog != "7z" or (bool(words) and words[0] == "a")
+    return False
+
+
+def _chdirs(seg: list) -> list:
+    """The directories a segment makes the cwd of what it runs: `cd D`, `pushd D`, `env -C D`, `env --chdir=D`,
+    `sudo -D D`. Unresolved; the caller resolves them against the cwd."""
+    prog = os.path.basename(seg[0][0])
+    words = [w for w, _ in seg[1:]]
+    if prog in _CD:
+        ops = [w for w in words if not w.startswith("-")]
+        return ops[:1]
+    opts = _CHDIR_OPTS.get(prog)
+    if not opts:
+        return []
+    out = []
+    for i, w in enumerate(words):
+        if w in opts and i + 1 < len(words):
+            out.append(words[i + 1])
+        for o in opts:
+            if o.startswith("--") and w.startswith(o + "="):
+                out.append(w.split("=", 1)[1])
+    return out
+
+
+def link_reach(event: "NormalizedEvent", within: Optional[tuple] = None) -> tuple:
+    """(targets, too_wide). `targets`: the resolved targets of the links an act names OR reaches, where they differ
+    from the path as written (hestia #1331). #1433 judged only the links an act NAMES; measured on its applied core
+    2026-10-28, every unnamed shape still reached a secret-named target. So:
+    - an UNQUOTED glob or brace word is expanded and each match judged (a quoted pattern is the program's, not the
+      shell's, and is judged as written);
+    - every relative word is judged against the cwd AND every directory the line makes a cwd: `cd`/`pushd`,
+      `env -C`/`--chdir`, `sudo -D`;
+    - a reader that reads through links while walking has its directories walked (the walk itself follows none) and
+      every link inside judged: the -L/-h/--dereference readers, a find that -execs (find lists links and the exec
+      reader opens them), and zip/7z, which follow unless told to store links.
+    `too_wide`: '' or why the act is refused unjudged (a bound passed). Over-approximates by design: cd directories
+    apply to every word, so it can only ADD refusals, and only where a link really points at a secret-named target.
+    Not the Grep/Glob tools: whether they read through links is the host's, unmeasured. Never raises.
+    `within` (granted roots, absolute): when given, only reach rooted inside the grants is expanded or walked; the
+    overflow check passes it, so a pattern outside the grants is left to the scope pass and its escalation."""
+    cwd = getattr(event, "cwd", None)
+    # getattr, as egress_blobs does: an event shape without command/paths (the single gate's GateEvent) must
+    # contribute nothing, never raise into gate.internal_error.
+    command = getattr(event, "command", None)
+    segs = _reach_segments(command) if command else []
+    words = [(w, False) for w in (getattr(event, "paths", None) or ()) if isinstance(w, str) and w]
+    for s in segs:
+        words += s
+    bases = [cwd] if cwd else []
+    for s in segs:
+        for d in _chdirs(s):
+            d = os.path.expanduser(d)
+            if not os.path.isabs(d) and cwd:
+                d = os.path.join(cwd, d)
+            if os.path.isabs(d) and os.path.isdir(d) and d not in bases:
+                bases.append(d)
+
+    def resolve(cand):
+        base = os.path.expanduser(cand)
+        if os.path.isabs(base):
+            return [base]
+        return [os.path.join(b, base) for b in bases]
+
+    out, seen, matches = [], set(), [LINK_GLOB_LIMIT]
+    scan = [LINK_GLOB_SCAN_LIMIT, LINK_GLOB_SCAN_LIMIT, "a pattern"]
+    walk = [LINK_WALK_LIMIT, LINK_WALK_LIMIT, "a reader that follows links"]
+
+    roots_in = None if within is None else tuple(os.path.realpath(r).rstrip("/") for r in within)
+
+    def counts(p):
+        """Whether reach rooted at `p` is inside the grants (always, with no `within`)."""
+        if roots_in is None:
+            return True
+        rp = os.path.realpath(p).rstrip("/") or "/"
+        return any(rp == r or rp.startswith(r + "/") or r.startswith(rp.rstrip("/") + "/") for r in roots_in)
+
+    def judge(p):
+        try:
+            if p in seen or not os.path.lexists(p):
+                return
+            seen.add(p)
+            real = os.path.realpath(p)
+            if real != os.path.normpath(p):
+                out.append(real)
+        except (OSError, ValueError):
+            pass
+
+    try:
+        _reach_words(words, resolve=resolve, judge=judge, budget=scan, matches=matches, counts=counts)
+        _reach_walks(segs, resolve=resolve, bases=bases, judge=judge, budget=walk, counts=counts)
+    except _TooWide as why:
+        return out, str(why)
+    return out, ""
+
+
+def _reach_words(words, *, resolve, judge, budget, matches, counts=lambda p: True) -> None:
+    """Judge every path the act's words name or, as unquoted globs and braces, expand to (bounded)."""
+    for w, quoted in words:
+        if w.startswith("-"):
+            if "=" not in w:
+                continue                    # a bare flag names no path; `--input=x` names x
+            cands = [w.split("=", 1)[1]]
+        else:
+            cands = [w, w.split("=", 1)[1]] if "=" in w else [w]
+        for cand in cands:
+            expand = not quoted
+            pats = _braces(cand) if expand else [cand]
+            if len(pats) > LINK_GLOB_LIMIT:
+                raise _TooWide(f"a pattern reaches more than {LINK_GLOB_LIMIT} paths")
+            for pat in pats:
+                for full in resolve(pat):
+                    if expand and _GLOB_CHARS.search(pat):
+                        absf = os.path.abspath(full)
+                        fixed = absf.split("/")
+                        cut = next((i for i, c in enumerate(fixed) if _GLOB_CHARS.search(c)), len(fixed))
+                        if not counts("/".join(fixed[:cut]) or "/"):
+                            continue        # a pattern outside the grants: the scope pass's, not ours
+                        for h in _bounded_glob(absf, budget, matches):
+                            judge(h)
+                    else:
+                        judge(full)
+
+
+def _reach_walks(segs, *, resolve, bases, judge, budget, counts=lambda p: True) -> None:
+    """Judge every link under the directories a link-following reader in the act walks (bounded)."""
+    for s in segs:
+        prog = os.path.basename(s[0][0])
+        rest = [w for w, _ in s[1:]]
+        if not _follows_links(prog, rest):
+            continue
+        roots = []
+        for w in rest:
+            if w.startswith("-") or w in ("(", "!"):
+                if prog == "find":
+                    break                   # find's start dirs come before its first expression word
+                continue
+            for full in resolve(w):
+                if os.path.isdir(full) and not os.path.islink(full):
+                    roots.append(full)
+        if not roots:
+            roots = bases[:1]
+        for root in roots:
+            if not counts(root):
+                continue                    # a walk outside the grants: the scope pass's, not ours
+            for p in _bounded_walk(root, budget):
+                judge(p)
+
+
+def link_reach_too_wide(event: "NormalizedEvent", within: Optional[tuple] = None) -> Optional["Verdict"]:
+    """hestia #1331: an act whose glob or link-following walk passes its bound is refused unjudged, under the rule
+    for a reach the gate cannot enumerate (the scope pass refuses past SCOPE_JUDGE_BUDGET the same way). Called
+    before EVERY allow (Nova's #1435 review): evaluate's final allow (with `within`), its unscoped early allow and
+    degraded_verdict's read allows (with none: no scope layer there to defer to). Outside the grant the scope pass
+    refuses or escalates first, and an
+    out-of-scope glob must keep its escalation (one_gate_decide_contract phantom-glob-still-escalates). `within`
+    is the granted roots: a pattern or walk rooted outside them is not counted (None = an unscoped policy)."""
+    too_wide = link_reach(event, within)[1]
+    if not too_wide:
+        return None
+    return _deny("mrh.command.unenumerated",
+                 f"'{event.tool}': {too_wide}, so the gate cannot judge every link it reaches and it is "
+                 f"refused rather than judged in part: name the paths it needs",
+                 target=UNENUMERATED_TARGET)
+
+
+def link_targets(event: "NormalizedEvent") -> list:
+    """The resolved targets of the links an act names or reaches, where a link makes them DIFFER from the path as
+    written (hestia #1331): what Gate 1a sweeps beside the paths and command. See `link_reach`."""
+    return link_reach(event)[0]
+
+
+#: A value a command's own contract makes TEXT, never a path it opens (hestia #1330). Keyed on the
+#: PARSED COMMAND, not the program (Nova's exact-head review of #1427): `git checkout -m` is --merge,
+#: `gh pr checkout -b` names a branch, `gh pr review -c` is a boolean. Each entry is (prose flags,
+#: the options of that command that take no value). A prose flag counts only when the word before
+#: it cannot be an option waiting for its value (see `_prose_flag_counts`), so `git commit --author
+#: -m .ssh/x`, where git reads `-m` as the author and `.ssh/x` as a pathspec, is swept whole. Every
+#: other word, including an interpreter's `-c`/`-e` code and a quoted path, is swept as before.
+#: Flags read from `gh <cmd> --help` (gh 2.x) and `git <cmd> -h` on Legion, 2026-10-28.
+_GH_TITLE_BODY = frozenset({"--title", "-t", "--body", "-b"})
+_GH_BODY = frozenset({"--body", "-b"})
+_GH_CLOSE_COMMENT = frozenset({"--comment", "-c"})
+_GH_COMMENT_BOOLS = frozenset({"--web", "-w", "--editor", "-e", "--edit-last", "--delete-last",
+                               "--create-if-none", "--yes"})
+_GIT_MESSAGE = frozenset({"-m", "--message"})
+_PROSE_FLAGS = {
+    ("gh", "issue", "create"): (_GH_TITLE_BODY, frozenset({"--web", "-w", "--editor", "-e"})),
+    ("gh", "issue", "edit"): (_GH_TITLE_BODY, frozenset({"--remove-milestone"})),
+    ("gh", "issue", "comment"): (_GH_BODY, _GH_COMMENT_BOOLS),
+    ("gh", "issue", "close"): (_GH_CLOSE_COMMENT, frozenset()),
+    ("gh", "pr", "create"): (_GH_TITLE_BODY, frozenset({
+        "--draft", "-d", "--dry-run", "--editor", "-e", "--fill", "-f", "--fill-first",
+        "--fill-verbose", "--no-maintainer-edit", "--web", "-w"})),
+    ("gh", "pr", "edit"): (_GH_TITLE_BODY, frozenset({"--remove-milestone"})),
+    ("gh", "pr", "comment"): (_GH_BODY, _GH_COMMENT_BOOLS),
+    ("gh", "pr", "review"): (_GH_BODY, frozenset({
+        "--approve", "-a", "--comment", "-c", "--request-changes", "-r"})),
+    ("gh", "pr", "close"): (_GH_CLOSE_COMMENT, frozenset({"--delete-branch", "-d"})),
+    ("git", "commit"): (_GIT_MESSAGE, frozenset({
+        "-q", "--quiet", "-v", "--verbose", "-s", "--signoff", "--no-signoff", "-e", "--edit",
+        "--no-edit", "-a", "--all", "-i", "--include", "-o", "--only", "-n", "--no-verify",
+        "--verify", "--amend", "--no-amend", "--reset-author", "--allow-empty",
+        "--allow-empty-message", "--dry-run", "--status", "--no-status", "-p", "--patch",
+        "--short", "--branch", "--porcelain", "--long", "-z", "--null", "-S", "--gpg-sign",
+        "--no-gpg-sign", "-u", "--untracked-files", "--no-post-rewrite", "--post-rewrite"})),
+    ("git", "tag"): (_GIT_MESSAGE, frozenset({
+        "-a", "--annotate", "-s", "--sign", "--no-sign", "-f", "--force", "-e", "--edit",
+        "--no-edit", "--create-reflog"})),
+}
+#: git's own options BEFORE the subcommand: these take a value; these do not. Any other option there
+#: leaves the command unresolved, so nothing in the segment is exempt.
+_GIT_GLOBAL_WITH_VALUE = frozenset({"-C", "-c"})
+_GIT_GLOBAL_BOOLS = frozenset({"--no-pager", "-P", "--no-optional-locks"})
+_SEGMENT_BREAKS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
+
+
+def _literal(word: str) -> bool:
+    """No `$` and no backtick: the value is the bytes written, not something that expands."""
+    return "$" not in word and "`" not in word
+
+
+def _prose_flag_counts(prev: str, bools: frozenset) -> bool:
+    """A prose flag is the flag only if the word before it is not an option waiting for its value:
+    a non-option word (the program, a subcommand, a positional, or the value of an earlier option),
+    a `--x=y` word, or an option this command's contract lists as taking none. Anything else may
+    consume the prose flag as its value, so the segment is swept as written."""
+    return not prev.startswith("-") or "=" in prev or prev in bools
+
+
+def egress_command_text(command: str) -> str:
+    """The command as Gate 1a sweeps it: every word, except a LITERAL prose value of a flag in
+    `_PROSE_FLAGS` under the command that defines it (hestia #1330). Measured on Legion
+    2026-10-15/10-27: `gh issue create --body "...the workspace credentials file..."` was refused
+    `egress.secret` on a word in the issue's text, so every security write-up went through
+    `--body-file`, the pattern the law discourages elsewhere. A value holding `$` or a backtick is
+    not literal (it could expand to a secret's contents) and stays swept; so does the whole raw
+    command when it cannot be tokenized. Each segment (`_SEGMENT_BREAKS`) is resolved on its own:
+    the program, then its subcommand words (git's own leading options allowed), then the flags.
+    `--` ends the exemptions for the rest of its segment: after it every word is an operand."""
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return command
+    kept = []
+    prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
+    for w in words:
+        if w in _SEGMENT_BREAKS:
+            prog, sub, entry, prev, skip_next, git_value, done = None, [], None, "", False, False, False
+            kept.append(w)
+            continue
+        if skip_next:
+            skip_next = False
+            prev = w
+            if _literal(w):
+                continue                    # the literal prose value: not a path, not swept
+            kept.append(w)
+            continue
+        kept.append(w)
+        if prog is None:
+            if "=" in w and not w.startswith("-") and w.split("=", 1)[0].isidentifier():
+                continue                    # an env assignment before the program: still swept
+            prog, prev = os.path.basename(w), w
+            if not any(key[0] == prog for key in _PROSE_FLAGS):
+                done = True
+            continue
+        if done:
+            continue
+        if entry is None:                   # resolving the subcommand
+            if git_value:
+                git_value, prev = False, w
+                continue
+            if prog == "git" and not sub and w in _GIT_GLOBAL_WITH_VALUE:
+                git_value, prev = True, w
+                continue
+            if prog == "git" and not sub and w in _GIT_GLOBAL_BOOLS:
+                prev = w
+                continue
+            if w.startswith("-"):
+                done = True                 # an option the resolver does not know: nothing exempt
+                continue
+            sub.append(w)
+            key = (prog, *sub)
+            if key in _PROSE_FLAGS:
+                entry = _PROSE_FLAGS[key]
+            elif not any(k[:len(key)] == key for k in _PROSE_FLAGS):
+                done = True
+            prev = w
+            continue
+        flags, bools = entry
+        if w == "--":
+            done = True                     # every later word is an operand (a pathspec): swept
+            continue
+        name, eq, val = w.partition("=")
+        if w in flags and _prose_flag_counts(prev, bools):
+            skip_next = True
+        elif (eq and name in flags and name.startswith("--") and _literal(val)
+              and _prose_flag_counts(prev, bools)):
+            kept[-1] = name + "="
+        prev = w
+    return " ".join(kept)
 
 
 @dataclass(frozen=True)
@@ -664,6 +1262,40 @@ def _parse_scope_entries(entries) -> tuple:
     return tuple(s for s in out if s.strip("."))
 
 
+#: The four grant modes (hestia #1345), in their canonical order.
+GRANT_MODES = "rwed"
+
+
+def _parse_mode_scope(raw) -> tuple:
+    """`[{"entry": "path:/x/**", "modes": "r"}, ...]` -> `(("path:/x/**", "r"), ...)`.
+
+    Each entry is parsed exactly as an `in_scope` entry is (one entry, one parse), and its
+    modes are reduced to letters of "rwed" in canonical order. Anything malformed is dropped,
+    whole: bad data here reads as NO narrowed grant, never as a traceback and never as reach.
+    An entry whose modes are empty, or carry a letter outside "rwed", is dropped rather than
+    trimmed: a mode set nobody wrote must not be repaired into one that admits something.
+    A bare `*` is never honoured here: a narrowed grant names a place."""
+    if not isinstance(raw, list):
+        return ()
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        entry, modes = item.get("entry"), item.get("modes")
+        if not isinstance(entry, str) or not isinstance(modes, str) or not modes:
+            continue
+        if any(m not in GRANT_MODES for m in modes):
+            continue
+        try:
+            parsed = _parse_scope_entries([entry])
+        except Exception:
+            continue
+        if len(parsed) != 1 or parsed[0] == AgentPolicy.UNSCOPED:
+            continue
+        out.append((parsed[0], "".join(m for m in GRANT_MODES if m in modes)))
+    return tuple(out)
+
+
 #: A `path:` grant that ends in this reaches its whole subtree; a bare one reaches exactly
 #: its path (dp, 2026-09-08: "the exact path is useful, and is preferred as default.
 #: recursive should be an option"). Spelled in the entry so an older consumer fails closed.
@@ -737,6 +1369,39 @@ def _within_path_grant(path: str, scopes, workspace: str) -> bool:
                for root, recursive in _scope_roots_with_reach(scopes, workspace))
 
 
+_PLAIN_REPO_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _qualified_repo(s) -> Optional[tuple]:
+    """``(owner, name)`` lower-cased when ``s`` is exactly `owner/name` of plain segments (neither `.` nor `..`),
+    else None. A `path:` entry is never a repository."""
+    if not isinstance(s, str) or s.startswith("path:") or s.count("/") != 1:
+        return None
+    owner, name = s.split("/")
+    for seg in (owner, name):
+        if seg in (".", "..") or not _PLAIN_REPO_SEGMENT.match(seg):
+            return None
+    return (owner.lower(), name.lower())
+
+
+def _qualified_repo_granted(full: str, scopes) -> bool:
+    """#1392 v3: whether remote repository ``full`` (`owner/name`) is granted by a QUALIFIED repository entry.
+
+    The grant boundary spells a repository grant `repo:<owner>/<name>`; `_parse_scope_entries` strips the `repo:`
+    prefix, so the entry reaches here as `owner/name`. It is compared by owner AND name, case-insensitively,
+    against the call's own full identity.
+
+    Nothing local stands in for a remote repository. v1 joined the owner-stripped name onto the workspace (it
+    admitted `unrelated-owner/hestia`). v2 read the checkout's `origin` from `.git/config` when each call was
+    judged; that file is member-writable under the very recursive grant that triggered the binding, so a checkout
+    created or re-pointed after the grant minted remote authority (Nova's HOLD on PR #1393, the #1281 class).
+    Remote identity now comes only from an operator/peer-governed grant: a recursive `path:` grant reaches local
+    files, never a remote repository. The legacy bare-name grant keeps its owner-agnostic meaning at the call
+    site (a compatibility exception, flagged for its own review)."""
+    want = _qualified_repo(full)
+    return bool(want) and any(_qualified_repo(s) == want for s in scopes)
+
+
 def _exact_grant_hint(path: str, scopes, workspace: str) -> str:
     """The sentence a scope deny owes when the refused path lies BENEATH an exact grant.
 
@@ -762,6 +1427,48 @@ def _exact_grant_hint(path: str, scopes, workspace: str) -> str:
     return (f"; note: your grant path:{root} is EXACT — it reaches that path itself and nothing "
             f"beneath it. A recursive grant (path:{root}{RECURSIVE_SUFFIX}) would reach this; "
             f"only an operator can make it so")
+
+
+def _did_you_mean(path: str, scopes, workspace: str, admits=None) -> str:
+    """The existing path, inside one of the member's own grants, that a nonexistent `path` most
+    likely meant (hestia#1411), as a clause; "" when there is none. A grant root's basename found
+    as a segment of `path` re-roots the rest of `path` under that grant: the doubled root
+    `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when that
+    candidate exists AND `admits(candidate)` says the read it suggests would pass (codex/kimi on
+    #1412): under an EXACT grant a child is not reachable, so naming it sends the member to a
+    second refusal; a symlink under a recursive grant that resolves outside it exists but is not
+    readable, so naming it would confirm a path beyond the grant. `admits` is the read path's own
+    admission, so the hint and the read cannot disagree."""
+    target = os.path.normpath(os.path.expanduser(path)).replace("\\", "/").rstrip("/")
+    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+    # `path:` grants resolve as everywhere else; a bare entry (`governance`) is a workspace dir
+    roots = [r for r, _rec in _scope_roots_with_reach(scopes, workspace)]
+    roots += [f"{ws}/{s.strip('/')}" for s in scopes
+              if isinstance(s, str) and s and ":" not in s and not os.path.isabs(s)]
+    for root in roots:
+        base = os.path.basename(root)
+        if not base:
+            continue
+        marker = "/" + base + "/"
+        i = target.find(marker)
+        if i >= 0:
+            cand = root + target[i + len(marker) - 1:]
+        elif target.endswith("/" + base):
+            cand = root
+        else:
+            continue
+        if cand == target or not os.path.lexists(cand):
+            continue
+        # The candidate must RESOLVE inside the grant root as well as exist: a symlink under the
+        # root that points outside it lexists, and a bare repo-name entry is judged lexically by
+        # the read path, so the hint checks containment itself and stays stricter than the read.
+        real = os.path.realpath(cand).replace("\\", "/")
+        root_real = os.path.realpath(root).replace("\\", "/").rstrip("/")
+        if not (real == root_real or real.startswith(root_real + "/")):
+            continue
+        if admits is None or admits(cand):
+            return f"; did you mean '{cand}'? It exists, inside your grant path:{root}"
+    return ""
 
 
 def resolve_agent_policy(profile: HarnessProfile,
@@ -821,9 +1528,19 @@ def resolve_agent_policy(profile: HarnessProfile,
                         return AgentPolicy(member_id=profile.member_id, scope=(),
                                            source="vault-expired", stale=True,
                                            generation=gen, expires_at=exp)
+                    # Read-only roots, parsed inside the same guard: bad data here reads
+                    # as no read-only roots, never as a traceback and never as reach.
+                    read_raw = got.get("in_scope_read")
+                    try:
+                        read_parsed = (_parse_scope_entries(read_raw)
+                                       if isinstance(read_raw, list) else ())
+                    except Exception:
+                        read_parsed = ()
                     return AgentPolicy(
                         member_id=profile.member_id, scope=parsed, source="vault",
                         generation=gen, expires_at=exp,
+                        read_scope=tuple(read_parsed or ()),
+                        mode_scope=_parse_mode_scope(got.get("in_scope_modes")),
                     )
 
     # 2. Local replica — fail-closed fallback, marked stale.
@@ -1534,6 +2251,12 @@ _GREP_SPEC = {"pattern_first": True, "pattern_opts": {"-e", "--regexp"}, "file_o
               "value_opts": {"-A", "-B", "-C", "-m", "--max-count", "--include", "--exclude",
                              "--exclude-dir", "--context", "--after-context", "--before-context",
                              "-d", "--directories", "-D", "--devices", "--label"}}
+#: `git grep` (after the subcommand): grep's grammar. Its `-C` is context, not git's directory.
+_GIT_GREP_SPEC = dict(_GREP_SPEC)
+#: Heads whose PATTERN operands the in-workspace passes of `command_scope_reach` do not read as
+#: reaches (#1241 recut, SAGE #368): the tool matches the text against what it reads and never
+#: opens it. Recorded by value in `_Found.patterns`, LITERAL words only (an expansion stays live).
+_PATTERN_HEADS = frozenset(("grep", "egrep", "fgrep", "rg", "git-grep"))
 _CMD_SPECS = {
     "tr": {"positional": "strings"},
     "echo": {"positional": "strings_noglob"},
@@ -1815,6 +2538,7 @@ class _Found:
         self.dirs = []              # literal directories relative paths may resolve under
         self.dirs_unknown = None    # why a directory change cannot be followed
         self.known = {}             # names bound to ONE literal so far (`_literal_names`)
+        self.patterns = []          # literal grep-family PATTERN values (`_PATTERN_HEADS`, #1241)
 
 
 #: THE SINGLE-LITERAL-ASSIGNMENT RULE (dp's ruling, 2026-10-11, measured on #1232 first: ~45% of
@@ -1961,6 +2685,21 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
         out.extend(_outside_candidates(_strip_data_heredocs(
             text.replace(_DQ_REF, "").replace(_BRACE, "").replace(_LIT_DOLLAR, "$")
             .replace(_LIT_TICK, "`")), pwd, depth + 1, found))
+
+    def pattern(word, judge=True):
+        """A grep-family PATTERN operand: data like any other (`data`), and, when it is one LITERAL
+        word, its value is recorded so the workspace passes do not judge text the tool only matches
+        against (#1241 recut). A word holding any expansion is not recorded: what it expands to is
+        not known, and a substitution inside it was already lifted out and is judged."""
+        if state["head"] in _PATTERN_HEADS and _LIT_DOLLAR not in word and _LIT_TICK not in word:
+            try:
+                literal = not _expansion_spans(word)
+            except _Unmodelled:
+                literal = False
+            if literal and "$" not in word and "`" not in word and word:
+                found.patterns.append(word)
+        if judge:
+            data(word)
 
     def in_force():
         cut = body_origin
@@ -2196,7 +2935,9 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                     or opt in _string_opts(head, spec, state["subs"])) and not uglob:
                 if opt in spec.get("pattern_opts", ()):
                     state["pattern_given"] = True
-                data(w)
+                    pattern(w)
+                else:
+                    data(w)
                 continue
             if opt == "-c" and _HEREDOC_SHELL.match(head):
                 code(w)
@@ -2238,6 +2979,8 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                                  or name in spec.get("pattern_opts", ())
                                  or name in strs):
                     emit(val, uglob)
+                elif name in spec.get("pattern_opts", ()):
+                    pattern(val)
                 else:
                     data(val)
                 continue
@@ -2267,12 +3010,18 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                                  or w[:2] in spec.get("pattern_opts", ())
                                  or w[:2] in spec.get("string_opts", ())):
                     emit(w[2:], uglob)
+                elif w[:2] in spec.get("pattern_opts", ()):
+                    pattern(w[2:], judge=False)            # as before, plus its value recorded
                 continue
             m = _ATTACHED_OPT.match(w)
             if m:
                 emit(m.group(1), uglob)                    # `-I/usr/include`, `-C/elsewhere`
             continue
         state["positional"] += 1
+        if head == "git" and state["positional"] == 1 and w == "grep":
+            # `git [opts] grep …`: from here the arguments are grep's (#1241 recut).
+            state.update(head="git-grep", spec=_GIT_GREP_SPEC, positional=0, opts_done=False)
+            continue
         if len(state["subs"]) < 3:
             state["subs"].append(w)
         if state["positional"] == 1 and _HEREDOC_INTERPRETER.match(head) and not state["code_opt"]:
@@ -2314,7 +3063,7 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
             continue
         if spec.get("pattern_first") and state["positional"] == 1 and not state["pattern_given"] \
                 and not uglob:
-            data(w)
+            pattern(w)
             continue
         name, eq, val = w.partition("=")
         if eq and name.isidentifier():                     # `dd if=/x`, `make DESTDIR=/x`
@@ -2359,6 +3108,19 @@ def _is_reach(path: str) -> bool:
             return False
         p = parent
     return False
+
+
+def _names_nothing(path: str) -> bool:
+    """Whether a refused reach is a PHANTOM (hestia#1327): neither it nor its parent directory
+    exists, so it names no object a grant could be about. `_dir_bases` composes a relative `cd`
+    under every earlier base, so `cd /ws && cd a && cd ../b` also judges `<cwd>/../b` and every
+    later relative word under it; each such spelling opened a peer request for nothing. The
+    parent rule keeps a NEW file in an existing directory (`echo x > /out/new.txt`) a real ask.
+    A glob probe (`dir/*`) is judged as its directory; a device path is never a phantom."""
+    p = path[:-2] if path.endswith("/*") else path
+    if p == "/dev" or p.startswith("/dev/"):
+        return False
+    return not os.path.lexists(p) and not os.path.lexists(os.path.dirname(p) or "/")
 
 
 def _glob_probe(path: str) -> str:
@@ -2505,6 +3267,25 @@ def _literal_for_body_uncertain(body: str, var: str, item: str) -> bool:
     return False
 
 
+def _grammar_patterns(cmd: str, cwd: Optional[str]) -> tuple:
+    """(patterns, judged) from the shell grammar: the literal grep-family PATTERN values it
+    recognised (`_PATTERN_HEADS`), and every word it judges as a path. ((), ()) when it cannot
+    read the line, so nothing is skipped (pass 3 then refuses the line as unenumerated)."""
+    found = _Found()
+    try:
+        cands = _outside_candidates(_strip_data_heredocs(cmd), cwd or "", found=found)
+    except _Unmodelled:
+        return (), ()
+    return tuple(found.patterns), tuple(c[0] for c in cands)
+
+
+def _only_pattern_text(text: str, patterns, judged) -> bool:
+    """A mention the in-workspace passes do not judge (#1241 recut): it lies inside a recognised
+    grep-family PATTERN and inside no word the grammar judges as a path. `grep '<ws>/x' <ws>/x`
+    still judges `<ws>/x`, because the operand names it too."""
+    return bool(text) and any(text in p_ for p_ in patterns) and not any(text in j for j in judged)
+
+
 def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
                         forbidden=None, home_markers=None):
     """Returns (ok, offending_token, resolved_path). See `_command_scope_reach_one`; a command
@@ -2572,12 +3353,27 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     # Pass 0 — the shell's home spellings, expanded before anything reads the text, so a
     # workspace path spelled `~/…` or `$HOME/…` meets pass 1 like its literal spelling does.
     cmd = _expand_home_words(cmd)
+    # A grep-family PATTERN INSIDE THE WORKSPACE IS NOT A REACH (#1241 recut, SAGE #368): the tool
+    # matches against it and never opens it (a being's own `-e '<ws>[^ ]*ft09'` was refused
+    # "'[^' is not granted"). Patterns are recognised by the shell GRAMMAR (`_CMD_SPECS`), never by
+    # rewriting the text, so a live substitution inside one is still lifted out and judged, and
+    # pass 3 is not touched. A TOOLCHAIN (the being's interpreter, its sandbox's `--ro-bind`) is
+    # NOT exempted here: it is reached through an operator's recursive `path:<root>/**` grant,
+    # which lives in the member's vault-held scope, is witnessed and revocable, and is matched on
+    # the REALPATH. #1377 first shipped an environment variable for it (HESTIA_TOOL_ROOTS); Nova's
+    # review asked who can set it, and a symlink under the declared root read an ungranted repo
+    # (`cat <root>/lib/link/x`), because the exemption was lexical. A caller-controlled
+    # environment must not become authority.
+    patterns, judged_words = _grammar_patterns(cmd, cwd)
     for after in cmd.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
         # resolving into an ungranted repo — path_in_scope's B5 one function over. A command's
         # text is member-controlled end to end, so this one needs no harness to cooperate.
         tok = re.split(r"""[\s"'`);&|<>]""", after.lstrip("/"), 1)[0]
+        if patterns and _only_pattern_text(workspace + after[:len(after) - len(after.lstrip("/"))] + tok,
+                                           patterns, judged_words):
+            continue
         resolved = os.path.normpath(f"{ws}/{tok}").replace("\\", "/")
         if resolved != ws and not resolved.startswith(ws + "/"):
             # Traversed out of the workspace: judged WHERE IT LANDS, by the outside rule (pass 3),
@@ -2622,6 +3418,8 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
                 continue
             if "/" not in tok and tok in MEMBER_ADDRESSES:
                 continue
+            if patterns and _only_pattern_text(tok, patterns, judged_words):
+                continue                      # text inside a grep-family pattern (#1241 recut)
             if tok in seen2:
                 continue                      # a repeated spelling is judged once
             seen2.add(tok)
@@ -2812,6 +3610,153 @@ def forbidden_tokens(profile: HarnessProfile) -> tuple:
 
 
 # ── The decision ─────────────────────────────────────────────────────────────────────────
+#: Tools whose path is only READ. The read-only floor admits these and nothing else. Each is
+#: also a reader in the governance closure (`_READ_PATH_TOOLS`), which
+#: tools/closure_read_tool_names_test.py pins: a tool the scope layer lets read a root must
+#: not be one the closure treats as writing it.
+READ_ONLY_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead",
+                                  "read_file", "read_many_files", "glob",
+                                  "search_file_content", "list_directory"})
+
+
+#: Shell verbs that only read: no option and no operand of theirs names a file they write.
+#: Deliberately tiny. The degraded mode's read grammar is NOT reused here: it admits verbs that
+#: write through an option or an operand (`uniq IN OUT`, `sort -oFILE`, `git diff
+#: --output=FILE`; Codex HOLD 28057 on this change, and the closure's copy of the hole is #1348).
+#: Excluded on purpose: sed (its `w` command writes), awk, find (-fprint, -delete), sort, uniq,
+#: git, tee, xargs, and every interpreter.
+READ_ONLY_ROOT_VERBS = frozenset({"cat", "head", "tail", "grep", "wc", "ls", "stat"})
+
+
+def _read_only_root_command(command: str) -> bool:
+    """True iff every simple command in the line is a bare READ_ONLY_ROOT_VERBS verb, joined
+    only by pipes or && / || / ;. Any redirect, substitution, heredoc, newline, background `&`,
+    environment prefix or path-qualified verb makes it False: a miss refuses, never leaks."""
+    if any(tok in command for tok in (">", "<", "$(", "`", "\n", "\r")):
+        return False
+    if "&" in command.replace("&&", ""):
+        return False
+    for chunk_or in command.split("||"):
+        for chunk_and in chunk_or.split("&&"):
+            for chunk_semi in chunk_and.split(";"):
+                for seg in chunk_semi.split("|"):
+                    words = seg.strip().split()
+                    if not words:
+                        continue
+                    if words[0] not in READ_ONLY_ROOT_VERBS:
+                        return False
+    return True
+
+
+def _read_only_admits(event: NormalizedEvent, p: str, read_scopes: list, ws: str,
+                      profile: HarnessProfile) -> bool:
+    """Does the read-only floor admit this path for this act? Only a reader tool, only
+    inside a read-only root. No read-only roots means no."""
+    return (bool(read_scopes) and event.tool in READ_ONLY_PATH_TOOLS
+            and path_in_scope(p, read_scopes, ws, profile, event.cwd))
+
+
+#: What the PATH of each tool's act needs, in grant modes (hestia #1345 part B). A narrowed
+#: grant admits an act only when every mode listed here is in the grant's modes; a tool NOT
+#: listed has no nameable mode and is admitted by full (rwed) grants alone, so an unknown or
+#: new tool fails narrow. Deliberately per tool, not per argument:
+#:   - every READ_ONLY_PATH_TOOLS reader needs r; so do a being's composed reads, whose `path`
+#:     is their read target (the governance closure reads them the same way, _COMPOSED_READ_TOOLS);
+#:   - Write / write_file create or replace and need w;
+#:   - Edit-family tools read the old text to replace it, and answer with it, so they need rw;
+#:   - write_note is a being's append, edit and retire alike (one gate tool for three verbs):
+#:     w, since an append must work on a write-only grant; its edit receipt quotes the being's
+#:     own old text back, never more of the file;
+#:   - a being's git_restore rewrites a file from history (w); git_clean deletes one (d);
+#:   - a being's run reads its script (to stage a copy) and executes it: re. Its event carries
+#:     the script path only; what the run can reach inside its sandbox is mounted from the
+#:     being's grants by their own modes on SAGE's side (SAGE #521), never by this table.
+#: Shell commands are NOT classified here: see _command_mode_need.
+PATH_TOOL_MODES = {
+    **{t: "r" for t in READ_ONLY_PATH_TOOLS},
+    "search": "r", "git_read": "r",
+    "Write": "w", "write_file": "w",
+    "Edit": "rw", "MultiEdit": "rw", "NotebookEdit": "rw", "replace": "rw",
+    "write_note": "w",
+    "git_restore": "w", "git_clean": "d",
+    "run": "re",
+}
+
+
+def act_path_modes(event: NormalizedEvent) -> str:
+    """The modes this act needs on each path it names, or "" when none can be named (then
+    only a full grant admits it)."""
+    return PATH_TOOL_MODES.get(event.tool, "")
+
+
+def _command_mode_need(command: str) -> str:
+    """The modes a shell command needs on every path it reaches: "r" for a command made only
+    of READ_ONLY_ROOT_VERBS (the same strict allowlist the read-only floor uses), "" for every
+    other command. Write, delete and execute positions inside a shell line are not attributed
+    per path yet, so a command that does more than read is admitted by full grants alone: a
+    narrowed grant never widens a command it cannot fully classify."""
+    return "r" if _read_only_root_command(command) else ""
+
+
+def _mode_entries(mode_scopes, need: str) -> list:
+    """The narrowed grants whose modes include every mode in `need` ([] for an empty need)."""
+    if not need:
+        return []
+    return [entry for entry, modes in mode_scopes if all(m in modes for m in need)]
+
+
+def _mode_admits(event: NormalizedEvent, p: str, mode_scopes, ws: str,
+                 profile: HarnessProfile) -> bool:
+    """Does a narrowed grant admit this path for this act's modes?"""
+    entries = _mode_entries(mode_scopes, act_path_modes(event))
+    return bool(entries) and path_in_scope(p, entries, ws, profile, event.cwd)
+
+
+def _mode_hint(p: str, need: str, mode_scopes, ws: str, profile: HarnessProfile,
+               cwd: Optional[str]) -> str:
+    """When a narrowed grant DOES reach the path but lacks a mode the act needs, say which:
+    "granted r, this act needs w" (the refusal #1345 asks for). Empty otherwise."""
+    held = "".join(sorted({m for entry, modes in mode_scopes
+                           if path_in_scope(p, [entry], ws, profile, cwd) for m in modes},
+                          key=GRANT_MODES.index))
+    if not held:
+        return ""
+    wants = need or GRANT_MODES
+    missing = "".join(m for m in wants if m not in held)
+    what = (f"needs {wants}" if need else
+            "has no mode the gate can name, so only a grant of all four modes (rwed) admits it")
+    return (f" Your grant here is narrowed to {held}; this act {what}"
+            + (f" (missing {missing})." if need else "."))
+
+
+def scope_roots_with_modes(policy: AgentPolicy, workspace: str) -> tuple:
+    """``((root, recursive, modes), ...)`` for every `path:` grant the policy holds: full
+    grants as "rwed", narrowed ones with their modes (#1345 part B). For a consumer that
+    confines an act itself after the gate (a dispatcher, a sandbox), so it honours the same
+    modes the gate does.
+
+    A NARROWED grant on a workspace-direct root arrives as a bare repo NAME
+    (`_scope_entry_for_grant` maps a recursive grant on `<ws>/<name>` that way), and it is
+    listed here as the recursive root `<ws>/<name>` with its modes. Leaving it out made the
+    gate admit it while every consumer of this list refused it: cbp-being's `governance/**`
+    is exactly that shape (nomad review of #1383, point 2). Every `mode_scope` entry comes
+    from the daemon's grant rows, so a name here is always a grant. A FULL repo-name entry in
+    `policy.scope` is still not listed: that list also carries declarative repo scope, and a
+    consumer resolves granted names itself (SAGE `_repo_name_roots`)."""
+    out = [(r, rec, GRANT_MODES) for r, rec in _scope_roots_with_reach(list(policy.scope), workspace)]
+    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+    for entry, modes in getattr(policy, "mode_scope", ()) or ():
+        if entry.startswith("path:"):
+            out += [(r, rec, modes) for r, rec in _scope_roots_with_reach([entry], workspace)]
+        elif entry and "/" not in entry and "\\" not in entry and entry not in (".", "..", "*"):
+            # Resolved like a `path:` root (realpath), so a repo that is a symlink on some
+            # machine confines to the same place the gate's path check resolves.
+            root = os.path.realpath(os.path.join(ws, entry)).replace("\\", "/").rstrip("/")
+            if root:
+                out.append((root, True, modes))
+    return tuple(out)
+
+
 def evaluate(event: NormalizedEvent, profile: HarnessProfile,
              workspace: Optional[str] = None,
              policy: Optional[AgentPolicy] = None) -> Verdict:
@@ -2830,12 +3775,18 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     # ONE object rather than three stores and an absence.
     pol = policy if policy is not None else resolve_agent_policy(profile)
     scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
+    read_scopes = list(getattr(pol, "read_scope", ()) or ())
+    mode_scopes = list(getattr(pol, "mode_scope", ()) or ())
     forbidden = forbidden_tokens(profile)
 
     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
-    # Repo names are scanned too: an MCP call naming a forbidden token is still egress.
-    for blob in (list(event.paths) + list(event.repos)
-                 + ([event.command] if event.command else [])):
+    # Repo names are scanned too: an MCP call naming a forbidden token is still egress. So is
+    # declared egress text (#1201), which Gate 1b below never scopes; egress it cannot read
+    # whole is refused first, never passed unread.
+    unswept = egress_unsweepable_deny(event)
+    if unswept is not None:
+        return unswept
+    for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
             if f in low:
@@ -2876,7 +3827,9 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     # down daemon from bricking every member — but it can never widen to everything.
     if pol.is_unscoped():
         if not pol.stale:
-            return ALLOW
+            # Gate 1a swept only what link_reach reached; past its bound the rest is unchecked, so an
+            # unscoped allow still refuses it (Nova's #1435 review: innate checks are never relaxed by scope).
+            return link_reach_too_wide(event) or ALLOW
         # Stale + unscoped: drop the wildcard so it cannot match downstream, and evaluate the
         # remaining standing scope normally. Fails narrow, which is the direction a replica may
         # move in.
@@ -2886,15 +3839,23 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     # `paths` are repo-relative and must not be re-scoped — egress above already saw
     # them); file paths use path-scope; shell commands use command-scope.
     if event.repos:
-        for rname in event.repos:
-            if rname not in scopes:
+        fulls = list(getattr(event, "repo_full", None) or [])
+        for i, rname in enumerate(event.repos):
+            full = fulls[i] if i < len(fulls) and isinstance(fulls[i], str) else ""
+            # #1392 v3: the legacy literal name keeps its (owner-agnostic) meaning; otherwise only a QUALIFIED
+            # `repo:<owner>/<name>` grant reaches a remote repository. No local state stands in for it.
+            if rname not in scopes and not _qualified_repo_granted(full, scopes):
+                need = f"repo:{full}" if _qualified_repo(full) else f"repo:<owner>/{rname}"
                 return _deny(
                     "mrh.repo",
-                    f"'{event.tool}' targets repository '{rname}' outside your granted "
-                    f"scope (granted: {'+'.join(scopes)})",
+                    f"'{event.tool}' targets repository '{full or rname}' outside your granted "
+                    f"scope (granted: {'+'.join(scopes)}); a repository is reached only by a qualified "
+                    f"grant '{need}' (a path grant, even recursive, does not reach a remote repository)",
                 )
     for p in ([] if event.repos else event.paths):
-        if not path_in_scope(p, scopes, ws, profile, event.cwd):
+        if (not path_in_scope(p, scopes, ws, profile, event.cwd)
+                and not _read_only_admits(event, p, read_scopes, ws, profile)
+                and not _mode_admits(event, p, mode_scopes, ws, profile)):
             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
             # on any long path truncates away the very component that tripped the gate — the
             # member is handed a string that does not contain its own reason. That is the
@@ -2903,13 +3864,34 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             # `deny_names_the_offending_target` once the test workspace moved off /tmp and
             # the paths got long enough to truncate.
             seg = _offending_segment(p, ws, event.cwd)
-            where = f"'{seg}' is not granted" if seg else "it is outside the workspace"
             # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
             absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
-            hint = _exact_grant_hint(absolute, scopes, ws)
+            # EXISTENCE FIRST (hestia#1411): a READ of nothing is refused as such, with no scope
+            # request (see REMEDIES). Only reads: an act that writes may be creating the path, and
+            # a new file in a new directory is a real ask (dp, 2026-10-26: "how is mkdir or a new
+            # file write handled"), so it keeps the ordinary refusal and its request.
+            norm = os.path.normpath(os.path.expanduser(absolute)).replace("\\", "/")
+            if act_path_modes(event) == "r" and not os.path.lexists(norm):
+                return _deny(
+                    "mrh.path.nonexistent",
+                    f"'{event.tool}' targets '{_elide(p)}', which does not exist: there is nothing "
+                    f"there to grant, so no scope request was opened "
+                    f"(granted: {'+'.join(scopes)})"
+                    # every grant the member holds, narrowed and read-floor ones included: the
+                    # being's snapshot grant is a narrowed `r` grant, absent from `scopes`
+                    f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws, admits=lambda c: path_in_scope(c, scopes, ws, profile, event.cwd) or _read_only_admits(event, c, read_scopes, ws, profile) or _mode_admits(event, c, mode_scopes, ws, profile))}",
+                    target=norm,
+                )
+            mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
+            # A narrowed grant that REACHES the path is a grant: the refusal must not open by
+            # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
+            where = ("a grant reaches it, but not in the mode this act needs" if mode_hint
+                     else f"'{seg}' is not granted" if seg else "it is outside the workspace")
+            hint = _exact_grant_hint(absolute, scopes, ws) + mode_hint
+            lead = "beyond your grant's modes" if mode_hint else "outside your granted scope"
             return _deny(
                 "mrh.path",
-                f"'{event.tool}' targets '{_elide(p)}' outside your granted scope: {where} "
+                f"'{event.tool}' targets '{_elide(p)}' {lead}: {where} "
                 f"(granted: {'+'.join(scopes)}){hint}",
                 target=os.path.normpath(os.path.expanduser(absolute)).replace("\\", "/"),
             )
@@ -2917,6 +3899,19 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
         ok, offending, refused = command_scope_reach(event.command, scopes, ws, event.cwd,
                                                      forbidden=forbidden,
                                                      home_markers=profile.home_markers)
+        # A command that only READS may also reach the read-only roots, by a strict verb
+        # allowlist (READ_ONLY_ROOT_VERBS): anything outside it refuses rather than leaks.
+        # And the narrowed grants that hold every mode the command needs (#1345 part B): for
+        # now that is r for the same strict read-only allowlist, and nothing for any other
+        # command. One retry over all of them, so a read crossing the floor and a narrowed
+        # grant is judged as one act.
+        cmd_need = _command_mode_need(event.command)
+        extra = ((read_scopes if cmd_need == "r" else [])
+                 + _mode_entries(mode_scopes, cmd_need))
+        if not ok and extra:
+            ok, offending, refused = command_scope_reach(
+                event.command, scopes + extra, ws, event.cwd,
+                forbidden=forbidden, home_markers=profile.home_markers)
         if not ok:
             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
             # debugging blind (Codex live session, 2026-07-23). The exact-grant hint is
@@ -2924,7 +3919,9 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             # not rebuilt from the display token, which has the right repo and the wrong
             # depth (GPT review of #1003).
             unpriceable = bool(refused) and refused.startswith(UNPRICEABLE_PREFIX)
-            hint = _exact_grant_hint(refused, scopes, ws) if refused and not unpriceable else ""
+            hint = (_exact_grant_hint(refused, scopes, ws)
+                    + _mode_hint(refused, cmd_need, mode_scopes, ws, profile, event.cwd)
+                    if refused and not unpriceable else "")
             wsn = ws.replace("\\", "/").rstrip("/")
             outside = bool(refused) and not unpriceable and not (refused == wsn or
                                                                   refused.startswith(wsn + "/"))
@@ -2933,10 +3930,23 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                         f"could not be judged completely, and an incompletely judged command is "
                         f"refused — split it, or the act can be approved once as written")
             elif offending and offending.startswith(_UNMODELLED_PREFIX):
-                what = (f"the gate cannot enumerate what it reaches "
-                        f"({offending[len(_UNMODELLED_PREFIX):-1]}): nothing an expansion produces is "
-                        f"modelled, so this act can only be approved ONCE, as written — or rewritten "
-                        f"with every path spelled out literally")
+                # hestia#1313: its own rule, so nothing escalates (see REMEDIES).
+                return _deny(
+                    "mrh.command.unenumerated",
+                    f"'{event.tool}' command: the gate cannot enumerate what it reaches "
+                    f"({offending[len(_UNMODELLED_PREFIX):-1]}). Nothing an expansion produces is "
+                    f"modelled, so no grant can cover it as written",
+                    target=refused or "",
+                )
+            elif outside and _names_nothing(refused):
+                # hestia#1327: its own rule, so nothing escalates (see REMEDIES).
+                return _deny(
+                    "mrh.command.nonexistent",
+                    f"'{event.tool}' command reaches outside your granted scope: '{offending}' "
+                    f"names nothing on disk (neither it nor its parent directory exists), so no "
+                    f"grant could be about it (granted: {'+'.join(scopes)}){hint}",
+                    target=refused,
+                )
             elif outside:
                 what = f"'{offending}' is outside the workspace and no grant reaches it"
             else:
@@ -2948,7 +3958,10 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
                 target=refused or "",
             )
 
-    return ALLOW
+    _repos, _roots = _scope_parts(scopes, ws)
+    _wsr = os.path.realpath(os.path.expanduser(ws)).rstrip("/")
+    within = tuple(_roots) + tuple(os.path.join(_wsr, r) for r in _repos if r and r != AgentPolicy.UNSCOPED)
+    return link_reach_too_wide(event, within) or ALLOW
 
 
 # ── The ratified degraded mode (Sprint F — PRD §7.1 criterion 9) ────────────────────────
@@ -3067,8 +4080,10 @@ def degraded_verdict(event: NormalizedEvent,
     read-allows are recorded on the gate-availability telemetry instead (they are an infra
     series, not refusals, and the deny log's readers expect denies)."""
     forbidden = forbidden_tokens(profile) if profile is not None else FORBIDDEN_DEFAULT
-    for blob in (list(event.paths) + list(event.repos)
-                 + ([event.command] if event.command else [])):
+    unswept = egress_unsweepable_deny(event)
+    if unswept is not None:
+        return unswept
+    for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
             if f in low:
@@ -3078,8 +4093,10 @@ def degraded_verdict(event: NormalizedEvent,
                     f"out-of-MRH private repo): '{f}'",
                     innate=True,
                 )
+    # Degraded mode allows reads, but never one whose links Gate 1a checked only in part (Nova's #1435 review).
+    too_wide = link_reach_too_wide(event)
     if event.tool in READ_CLASS:
-        return ALLOW
+        return too_wide or ALLOW
     if event.tool.lower() in ("bash", "shell") and event.command \
             and _degraded_command_is_read(event.command):
         # The ratified posture is deny-writes-allow-READS, and a read-only shell command
@@ -3088,7 +4105,7 @@ def degraded_verdict(event: NormalizedEvent,
         # `git rev-list --count` refused while single reads passed). The grammar below is
         # deliberately conservative: every segment's verb must be on the read allowlist,
         # any write-redirect/substitution/unknown verb keeps the deny.
-        return ALLOW
+        return too_wide or ALLOW
     return _deny(
         "gate.degraded",
         f"'{event.tool}' is write/exec-class and the policy daemon is unreachable — the "

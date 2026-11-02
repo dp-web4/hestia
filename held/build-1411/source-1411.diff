@@ -1,0 +1,120 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -242,6 +242,20 @@
+     # every later relative word under that. When neither the refused path nor its parent exists,
+     # it names nothing a grant could be about, so it is NOT a scope-escalating rule: refused as
+     # before (the over-approximation is the safe direction), but no peer request is opened.
++    # EXISTENCE FIRST (dp, 2026-10-26, hestia#1411: "we should not be doing escalations on
++    # nonexistent paths because there is nothing to escalate - it's just noise"; "we should be
++    # checking existence first"). A path tool that READS a path that does not exist, or acts on
++    # one whose parent does not exist either, names nothing a grant could be about. Measured on
++    # cbp-being: nine operator cards for `<ws>/hestia/governance/...`, a doubled root carried in
++    # its own journal, while the refusal said "'hestia' is not granted" and never "not there".
++    # Not a scope-escalating rule, so the single gate opens nothing.
++    "mrh.path.nonexistent": Remedy(
++        "The path does not exist, so there is nothing to grant and no scope request was opened. "
++        "Check the spelling against what you already hold: if the refusal names a path inside "
++        "one of your grants, that is the one you meant. (Only reads are refused this way: "
++        "creating a path is judged as an ordinary write.)",
++        ("hestia_scope_status",),
++    ),
+     "mrh.command.nonexistent": Remedy(
+         "The refused path does not exist, and neither does its parent directory: most often a "
+         "relative cd composed under a directory the command never runs in. Spell the cd target "
+@@ -934,6 +948,35 @@
+             f"only an operator can make it so")
+ 
+ 
++def _did_you_mean(path: str, scopes, workspace: str) -> str:
++    """The existing path, inside one of the member's own grants, that a nonexistent `path` most
++    likely meant (hestia#1411), as a clause; "" when there is none. A grant root's basename found
++    as a segment of `path` re-roots the rest of `path` under that grant: the doubled root
++    `<ws>/hestia/governance/hestia/x` becomes `<ws>/governance/hestia/x`. Offered only when that
++    candidate exists, so the hint never names another path that is not there."""
++    target = os.path.normpath(os.path.expanduser(path)).replace("\\", "/").rstrip("/")
++    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++    # `path:` grants resolve as everywhere else; a bare entry (`governance`) is a workspace dir
++    roots = [r for r, _rec in _scope_roots_with_reach(scopes, workspace)]
++    roots += [f"{ws}/{s.strip('/')}" for s in scopes
++              if isinstance(s, str) and s and ":" not in s and not os.path.isabs(s)]
++    for root in roots:
++        base = os.path.basename(root)
++        if not base:
++            continue
++        marker = "/" + base + "/"
++        i = target.find(marker)
++        if i >= 0:
++            cand = root + target[i + len(marker) - 1:]
++        elif target.endswith("/" + base):
++            cand = root
++        else:
++            continue
++        if cand != target and os.path.lexists(cand):
++            return f"; did you mean '{cand}'? It exists, inside your grant path:{root}"
++    return ""
++
++
+ def resolve_agent_policy(profile: HarnessProfile,
+                          vault_reader=None) -> AgentPolicy:
+     """Resolve the per-agent layer, naming the store it came from.
+@@ -3327,6 +3370,22 @@
+             seg = _offending_segment(p, ws, event.cwd)
+             # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
+             absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
++            # EXISTENCE FIRST (hestia#1411): a READ of nothing is refused as such, with no scope
++            # request (see REMEDIES). Only reads: an act that writes may be creating the path, and
++            # a new file in a new directory is a real ask (dp, 2026-10-26: "how is mkdir or a new
++            # file write handled"), so it keeps the ordinary refusal and its request.
++            norm = os.path.normpath(os.path.expanduser(absolute)).replace("\\", "/")
++            if act_path_modes(event) == "r" and not os.path.lexists(norm):
++                return _deny(
++                    "mrh.path.nonexistent",
++                    f"'{event.tool}' targets '{_elide(p)}', which does not exist: there is nothing "
++                    f"there to grant, so no scope request was opened "
++                    f"(granted: {'+'.join(scopes)})"
++                    # every grant the member holds, narrowed and read-floor ones included: the
++                    # being's snapshot grant is a narrowed `r` grant, absent from `scopes`
++                    f"{_did_you_mean(norm, list(scopes) + list(read_scopes) + [e for e, _m in mode_scopes], ws)}",
++                    target=norm,
++                )
+             mode_hint = _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd)
+             # A narrowed grant that REACHES the path is a grant: the refusal must not open by
+             # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
+diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.py
+--- a/plugins/_shared/test_gate_core.py
++++ b/plugins/_shared/test_gate_core.py
+@@ -300,6 +300,7 @@
+     ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/granted/a.md"], cwd=ws)
+     check("in_scope_path_allows", G.evaluate(ev, prof, ws).decision == "allow")
+ 
++    open(f"{ws}/notgranted/a.md", "w").close()  # exists: an off-limits path, not a missing one (hestia #1411)
+     ev = G.NormalizedEvent(tool="Read", paths=[f"{ws}/notgranted/a.md"], cwd=ws)
+     v = G.evaluate(ev, prof, ws)
+     check("out_of_scope_path_denies", v.blocks and v.rule == "mrh.path")
+@@ -360,6 +361,8 @@
+           repr(G._parse_scope_entries([root_entry])))
+     # exact root grant: reaches the root, not what is under it
+     root_exact = _profile(ws, [root_entry])
++    os.makedirs(deep, exist_ok=True)
++    open(os.path.join(deep, "note.md"), "a").close()  # exists: an off-limits path, not a missing one (hestia #1411)
+     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "note.md")], cwd=ws)
+     check("workspace_root_exact_grant_does_not_admit_descendant",
+           G.evaluate(ev, root_exact, ws).blocks)
+@@ -387,6 +390,7 @@
+     ev = G.NormalizedEvent(tool="Read", paths=[deep], cwd=ws)
+     check("deep_directory_exact_grant_admits_itself",
+           G.evaluate(ev, exact, ws).decision == "allow")
++    open(os.path.join(deep, "child.txt"), "a").close()  # exists: an off-limits path, not a missing one (hestia #1411)
+     ev = G.NormalizedEvent(tool="Read", paths=[os.path.join(deep, "child.txt")], cwd=ws)
+     check("deep_directory_exact_grant_does_not_admit_child",
+           G.evaluate(ev, exact, ws).blocks)
+@@ -731,6 +735,8 @@
+         os.makedirs(os.path.join(ws, r), exist_ok=True)
+     prof = _profile(ws, ["repo:granted"])
+     escape = f"{ws}/granted/../notgranted/secret"
++    os.makedirs(f"{ws}/notgranted", exist_ok=True)
++    open(f"{ws}/notgranted/secret", "a").close()  # exists: an off-limits path, not a missing one (hestia #1411)
+ 
+     # Positive controls FIRST: the grant must still work, or a deny-everything regression
+     # would green every assertion below for the wrong reason.

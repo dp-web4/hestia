@@ -153,6 +153,21 @@ enum Command {
         key: PathBuf,
     },
 
+    /// Channel sends (#1344, shadow): bind a member's channel, list the outbox, and mark a
+    /// send answered. Operator-signed, like `member`.
+    Channel {
+        #[command(subcommand)]
+        cmd: ChannelCmd,
+
+        /// Daemon URL
+        #[arg(long, default_value = "http://127.0.0.1:7711", global = true)]
+        endpoint: String,
+
+        /// Operator credential file (JSON `{lct_id, secret_key_hex}`), as for `member`.
+        #[arg(long, global = true, env = "HESTIA_OPERATOR_KEY")]
+        key: PathBuf,
+    },
+
     /// Governance-surface escalations — the remedy every gate deny already names.
     ///
     /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
@@ -249,6 +264,40 @@ enum GateCmd {
         /// evidence)
         #[arg(long)]
         argument: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ChannelCmd {
+    /// Mark one outbox row answered: the bound recipient replied, so it no longer counts
+    /// against the member's unanswered budget (#1344 decision c). Once only.
+    Answer {
+        /// The outbox id (from `hestia channel outbox` or the dashboard)
+        outbox_id: u64,
+    },
+    /// Bind (or rebind) where a member's sends to a channel go.
+    Bind {
+        /// The member (plugin id), e.g. legion-being
+        member: String,
+        /// The channel name the member asks for, e.g. dp
+        channel_id: String,
+        /// The recipient class the gate rules on, e.g. operator
+        #[arg(long)]
+        recipient_class: String,
+        /// Where the adapter delivers (never shown to the member)
+        #[arg(long)]
+        address: String,
+        /// The adapter that will carry it
+        #[arg(long, default_value = "email")]
+        adapter: String,
+        /// WHY: required, it is on the witnessed record
+        #[arg(long)]
+        reason: String,
+    },
+    /// List the outbox, newest first.
+    Outbox {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
     },
 }
 
@@ -964,6 +1013,10 @@ enum ScopeCmd {
         /// Include everything below the granted path
         #[arg(long)]
         recursive: bool,
+        /// What the grant lets the asker do: letters of r (read), w (write), e (execute),
+        /// d (delete), e.g. `--mode r`. Default: all four (#1345)
+        #[arg(long = "mode")]
+        modes: Option<String>,
         /// Why — the asker reads it. Required in both directions.
         #[arg(long)]
         reason: String,
@@ -1120,7 +1173,7 @@ pub fn run() -> AnyResult<()> {
             cmd_scope_arbitrate(&home, &endpoint, &request_id, grant, reason, &as_member, &target)
         }
         Command::Scope(ScopeCmd::Decide { request_id, once, session, standing, refuse, grant_path,
-                                          recursive, reason, as_member, endpoint }) => {
+                                          recursive, modes, reason, as_member, endpoint }) => {
             let decision = match (once, session, standing, refuse) {
                 (true, false, false, false) => "once",
                 (false, true, false, false) => "session",
@@ -1128,8 +1181,11 @@ pub fn run() -> AnyResult<()> {
                 (false, false, false, true) => "refuse",
                 _ => anyhow::bail!("say exactly one of --once, --session, --standing or --refuse"),
             };
+            if let Some(m) = &modes {
+                hestia::server::grant_modes::Modes::parse(m).map_err(|e| anyhow::anyhow!("--mode: {e}"))?;
+            }
             hestia::gate_cli::scope_peer_decide(&endpoint, &as_member, &request_id, decision,
-                                                grant_path, recursive, &reason)
+                                                grant_path, recursive, modes, &reason)
         }
         Command::Scope(ScopeCmd::Pending { json, as_member, endpoint }) => {
             hestia::gate_cli::scope_pending(&endpoint, as_member, "role:constellation:member", json)
@@ -1159,6 +1215,14 @@ pub fn run() -> AnyResult<()> {
                 }
             }
         }
+        Command::Channel { cmd, endpoint, key } => match cmd {
+            ChannelCmd::Answer { outbox_id } => hestia::member_cli::channel_answer(&endpoint, &key, outbox_id),
+            ChannelCmd::Bind { member, channel_id, recipient_class, address, adapter, reason } => {
+                hestia::member_cli::channel_bind(&endpoint, &key, &member, &channel_id, &recipient_class,
+                                                 &adapter, &address, &reason)
+            }
+            ChannelCmd::Outbox { limit } => hestia::member_cli::channel_outbox(&endpoint, &key, limit),
+        },
         Command::Member { cmd, endpoint, key } => match cmd {
             MemberCmd::Retire { plugin_id, reason, r#ref, confirm_active } => {
                 hestia::member_cli::retire(&endpoint, &key, &plugin_id, &reason, &r#ref, confirm_active)
@@ -1860,6 +1924,12 @@ fn cmd_witness_attest(
     out: Option<String>,
 ) -> AnyResult<()> {
     use hestia::hub::MemberKeySource;
+    // R6, BEFORE the vault: an unattended session gets the reason, not the tty-only passphrase
+    // prompt, and a signature over a subject that is not a key-derived id is never made (it is
+    // well-formed, signed, and can never verify, reported far away as "quorum not met").
+    if let Err(why) = hestia::witness::canonical_subject_id(subject_lct_id) {
+        anyhow::bail!("not attesting: {why}");
+    }
     let vault = open_vault(home)?;
     let store = HubStore::load(&vault)?;
     // Resolve which connection's pinned key witnesses (the operational key the

@@ -23,7 +23,7 @@
 //!
 //! Where the gate is: the inventory's own `hook_targets` for the member — `is_gate` and
 //! `owned_by_hestia`, with the `config` file that registers it — the same discovered truth the
-//! Gates pane and `discovered_gate_paths` use. No per-harness config reader is written here.
+//! Gates pane and `discovered_gate_paths_off_lock` use. No per-harness config reader is written here.
 //!
 //! Durable: the record of what was swapped lives in `$HESTIA_HOME/bypass/<member>.json`, so a
 //! restore after a daemon restart is exact. Refusals: a second bypass while one is active; a

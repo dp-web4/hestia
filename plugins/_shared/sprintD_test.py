@@ -201,10 +201,12 @@ def main():
     check("core_has_mrh_repo_rule", "mrh.repo" in core.REMEDIES)
     if "mrh.repo" in core.REMEDIES:
         r = core.REMEDIES["mrh.repo"]
-        check("mrh_repo_declares_its_tools",
-              set(r.tools) == {"hestia_request_scope", "hestia_appeal"})
+        # #1392 v3 (Nova, PR #1393): the scope store holds paths, so request_scope cannot carry a repository;
+        # the truthful remedy names the operator's qualified `repo:<owner>/<name>` grant, and appeal stays.
+        check("mrh_repo_declares_its_tools", set(r.tools) == {"hestia_appeal"})
         v = core._deny("mrh.repo", "probe")
-        check("mrh_repo_deny_renders_remedy", v.blocks and "hestia_request_scope" in v.remedy)
+        check("mrh_repo_deny_renders_remedy",
+              v.blocks and "OPERATOR must grant" in v.remedy and "repo:<owner>/<name>" in v.remedy)
     # The authenticated path still grants nothing on absent data (the semantics the shims
     # now stand on — a regression here would silently widen both shims).
     pol = core.resolve_agent_policy(

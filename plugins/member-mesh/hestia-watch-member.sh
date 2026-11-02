@@ -1098,6 +1098,12 @@ PY
 }
 
 drain() { mesh_rpc hestia_member_inbox; }
+# #1389 A: PRINT-ONLY MUST NOT CONSUME. With no fire command there is no wake to hand a drained list to, and the
+# drained primer sits outside every seat's MRH; the member's live session reaches its mail only through its own hooks
+# (session-mesh-inbox.sh, prompt-disposition-watch.sh), which PEEK. Draining here emptied the inbox they read (Thor,
+# 2026-10-24: peek {"total": 0} while this journal showed the notices). So print-only peeks, and peek-new.py keeps
+# only notices not reported before (seen ids in $STATE, per member): each is journalled once and stays queued.
+peek_new() { mesh_rpc hestia_member_inbox '{"peek": true}' | python3 "$WATCH_DIR/peek-new.py" "$STATE/peeked-$PLUGIN.ids"; }
 unanswered() { mesh_rpc hestia_member_unanswered "{\"older_than_secs\": $STALE_AFTER}"; }
 # The journal wants the 6h floor; `primer_spent` asks for a floor of ZERO so the fold it
 # reads is the complete debt rather than the stale tail. Asked-for-and-zero, not absent:
@@ -1135,12 +1141,23 @@ retry_stale_primers
 announce_unanswered() {
   local OUT; OUT=$(unanswered 2>/dev/null) || return 0
   printf '%s' "$OUT" | python3 -c '
-import json,sys
+import datetime,json,re,sys
 try: d=json.load(sys.stdin)
 except Exception: raise SystemExit(0)
+def mark_status(n):
+    if "drained_at" not in n:
+        return "drain mark unknown; read status unknown"
+    mark = n["drained_at"]
+    if mark is None:
+        return "drain mark absent; read status unknown"
+    if not isinstance(mark, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:[0-5]\d)", mark):
+        return "drain mark unknown; read status unknown"
+    try: datetime.datetime.fromisoformat(mark.replace("Z", "+00:00"))
+    except ValueError: return "drain mark unknown; read status unknown"
+    return "drain mark present; read status unknown"
 for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me")):
     for n in d.get(key,[]) or []:
-        seen = "delivered, unanswered" if n.get("drained_at") else "NEVER PICKED UP"
+        seen = mark_status(n)
         live = n.get("recipient_liveness")
         if live and live != "live": seen += f", recipient {live}"
         # Single quotes inside the expressions, deliberately: this block is
@@ -1953,7 +1970,11 @@ while true; do
     retire_discharged_primers
     LAST_SWEEP=$NOW
   fi
-  OUT=$(drain || echo '{"total":0}')
+  if [ -n "$FIRE" ]; then
+    OUT=$(drain || echo '{"total":0}')
+  else
+    OUT=$(peek_new || echo '{"total":0}')  # #1389 A: print-only never consumes
+  fi
   N=$(echo "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
   if [ "$N" -gt 0 ]; then
     PRIMER=$(mktemp "$PRIMERS/notice-XXXXXX.json")
@@ -2053,7 +2074,9 @@ json.dump(d,sys.stdout)
         fi
       fi
     else
-      python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  {n['kind']} from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"
+      # #1389 C: the journal line is the only trace a print-only seat can read, so it carries the notice id (and the
+      # id it answers) — without it a reply cannot be bound. `from <sender>:` stays adjacent for line readers.
+      python3 -c "import json;d=json.load(open('$PRIMER'));[print(f\"  id={n.get('id','?')} {n['kind']}\"+(f\" re={n['in_reply_to']}\" if n.get('in_reply_to') else '')+f\" from {n['from_plugin']}: {n.get('pointer_uri','')}\") for n in d['notices']]"
     fi
   elif [ -n "$FIRE" ]; then
     # No fresh mail this tick: spend it on ONE retained list, if any is due. The inbox

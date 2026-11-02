@@ -60,3 +60,8 @@ cbp-being
 # (notify map `mcnugget-claude: claude-code`, dp 2026-10-06), so its notices must not be
 # withheld here.
 mcnugget-being
+
+# A being on Sprout (Jetson). Sends review_request/coordination to claude-code on this
+# mesh; allowlisted nowhere, so 73 of its notices (ids 203-285, ten review_requests on
+# its own appeals and scope requests) were withheld before a fired seat noticed, 2026-10-14.
+sprout-being

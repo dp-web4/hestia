@@ -1,0 +1,14 @@
+[Unit]
+Description=hestia update check every 4h (reports only; installing is hestia-deploy.timer's job)
+
+[Timer]
+# Two hours off the deploy timer's marks (00/4:17), so the two never contend for the deploy
+# lock: 02:17, 06:17, 10:17, 14:17, 18:17, 22:17 local. On whether this box INSTALLS updates on
+# a schedule, see hestia-deploy.timer (the dashboard's auto-update toggle); this one never does.
+OnCalendar=*-*-* 02/4:17:00
+OnBootSec=15min
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

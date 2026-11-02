@@ -831,7 +831,9 @@ delegated seat's signed `hestia scope arbitrate`.
 **What this does not fix, said here so it is not rediscovered:** pending requests are still
 memory-only and die with the daemon (#908); the 8 h request window is still shorter than the
 mesh's delivery latency (#956); the member still cannot ask for recursion itself (#1022's member
-half); grants carry reach, not mode (#1098 §2); and a shell path the parser cannot see (code
+half); grants now RECORD a mode (r/w/e/d, #1345 part A) but the gate does not yet enforce it, so a
+grant narrower than rwed is withheld from the gate entirely (fail closed) until #1345 part B; and a
+shell path the parser cannot see (code
 inside `python -c`, a variable set earlier in the same command, `cd` followed by relative paths)
 is still judged only where it is spelled.
 
@@ -1161,6 +1163,12 @@ Each names the arm that must be able to fail.
 - **AC-1 — union, never subtraction.** `effective(m) == society ∪ member(m)` for every member,
   property-tested over random lists. And the contraction API returns 409 with the
   overlays-pointer text (§2.3), asserted on the response body, not on a comment.
+  **Amended 2026-10-23, once grants and floor entries carry modes (#1345, #1347):** where a
+  member's own grant reaches a path, its modes decide; the floor applies only where none of the
+  member's grants reaches (`StandingScopeStore::effective_modes`). dp: *"'floor' should not
+  override the actual grants."* For all-modes grants and entries this is the union above. A
+  mode-blind gate is served, per member, only the floor entries that cannot undo that member's
+  narrowed grants; the rest are named in `society_floor_withheld` (`floor_for`).
 - **AC-2 — innate dominates.** §2.4's three tests, including the positive control.
 - **AC-3 — no member can widen itself.** `no_mcp_tool_can_mutate_allowlist`, plus an assertion
   that no `/api/allowlist/*` route is reachable without a valid operator session token.

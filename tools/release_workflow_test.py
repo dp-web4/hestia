@@ -123,6 +123,14 @@ def main() -> int:
     check("3 publish passes the kind to the script",
           "KIND: ${{ needs.version.outputs.kind }}" in pub and '--kind "$KIND"' in pub)
 
+    # 4. a published release is fresh-installed: GITHUB_TOKEN fires no `release: published`,
+    # so publish dispatches install smoke itself, after the publish step, at the tag.
+    disp = pub.find("gh workflow run install-smoke.yml")
+    check("4 publish dispatches install smoke for the tag",
+          disp != -1 and '--ref "$TAG" -f tag="$TAG"' in pub[disp:disp + 120])
+    check("4 the dispatch runs after the publish step", disp > pub.find("release_publish.py publish"))
+    check("4 publish may dispatch a workflow", "actions: write" in pub)
+
     for f in FAILS:
         print("FAIL", f)
     print(f"release_workflow: {'FAILED' if FAILS else 'PASS'} ({len(FAILS)} failure(s))")

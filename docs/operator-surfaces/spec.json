@@ -301,14 +301,15 @@
     },
     {
       "id": "scope-standing",
-      "title": "Make a grant standing / recursive / reassign it",
+      "title": "Make a grant standing / recursive / reassign it, or edit its path, reach and modes",
       "place": "activity",
       "kind": "write",
       "risk": "high",
       "routes": [
         "POST /api/scope/standing/promote",
         "POST /api/scope/standing/recursive",
-        "POST /api/scope/standing/reassign"
+        "POST /api/scope/standing/reassign",
+        "POST /api/scope/standing/edit"
       ],
       "rules": [
         "reason-to-permit",
@@ -323,6 +324,36 @@
           "why": "Sprint 4b (promote / recursive / reassign), after 4a's grant and revoke"
         }
       }
+    },
+    {
+      "id": "society-floor",
+      "title": "Edit the society floor: what every member may do where none of its own grants reaches",
+      "place": "activity",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/scope/floor",
+        "POST /api/scope/floor/remove"
+      ],
+      "rules": [
+        "reason-to-permit",
+        "signed-in-only"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "after the dashboard's floor Edit row (hestia #1347)"
+        }
+      },
+      "obligations": [
+        "each floor entry is one row with the same r/w/e/d boxes and recursive (/**) control a grant has, DISABLED outside Edit; Edit stages the change and nothing is sent until Save, Cancel discards it (dp, 2026-10-23: 'we want granularity and edit'; Nova on #1347)",
+        "Save says in words what changes and whether it WIDENS (any added mode, or exact made recursive), asks for a reason every time because the change binds every member, and sends expected_generation so a store that moved since the edit was staged is refused (409) with nothing written",
+        "the surface says that a member's own grant decides wherever it reaches and the floor applies only where none does (PRD_ALLOWLISTS AC-1 as amended 2026-10-23: 'floor should not override the actual grants')",
+        "removing an entry narrows every member at once and asks for a reason"
+      ]
     },
     {
       "id": "scope-revoke",
@@ -770,6 +801,58 @@
       }
     },
     {
+      "id": "deployment-check",
+      "title": "Check whether a hestia update is available (installs nothing)",
+      "place": "me",
+      "kind": "write",
+      "risk": "low",
+      "routes": [
+        "POST /api/operator/deployment/check"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "obligations": [
+        "starts only the check unit (hestia-deploy --check): it syncs the deploy checkout and records a verdict; it never builds, installs or restarts",
+        "shown as \"check for updates\" only where the check unit is installed (deployment.check_capable); the header names when the last check ran"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
+      "id": "deployment-auto-update",
+      "title": "Switch scheduled deploys (the hestia-deploy timer) on or off",
+      "place": "me",
+      "kind": "write",
+      "risk": "high",
+      "routes": [
+        "POST /api/operator/deployment/auto-update"
+      ],
+      "rules": [
+        "signed-in-only"
+      ],
+      "obligations": [
+        "shown only where the timer unit is installed and the platform has a toggle (deployment.auto_update is on or off); absent or unavailable hides it",
+        "turning it on asks for confirmation first: the timer is Persistent=true, so a missed fire time can start a deploy at once"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "app parity is sequenced in PRD_APP_GOVERNING_SURFACES.md / SPRINTS_APP_SURFACES.md; not yet built"
+        }
+      }
+    },
+    {
       "id": "vault",
       "title": "Vault: list names and policy, add, delete",
       "place": "me",
@@ -914,6 +997,32 @@
         }
       },
       "notes": "Enrollment is probed per hub (GET /v1/hubs/{hub}/members/{me}/pubkey): only 200/404 set it; unreachable or any other answer is UNKNOWN, rendered amber, never 'not a member'. Withdraw is the member's own exit (web4#804); 'remove from list' only forgets a URL locally. Apply reuses POST /api/hub/join + PUT /api/hub/urls/active (hub-act, hub-urls)."
+    },
+    {
+      "id": "channel-sends",
+      "title": "Channel sends (#1344, shadow): the outbox, and marking a send answered",
+      "place": "activity",
+      "kind": "write",
+      "risk": "medium",
+      "routes": [
+        "GET /api/channel/outbox",
+        "POST /api/channel/outbox/:id/answer",
+        "GET /api/channel/binding"
+      ],
+      "rules": [
+        "signed-in-only",
+        "already-decided-409"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "planned",
+          "why": "slice 1 of #1344 is shadow and operator-only; the app view follows with the delivery slice"
+        }
+      },
+      "notes": "Marking answered is an attestation (the bound recipient replied), not a permit: it frees the member's unanswered budget and is witnessed once (409 after). Nothing in the outbox has left the machine in this slice."
     }
   ],
   "unsurfaced": [
@@ -926,16 +1035,12 @@
       "why": "hardened for #1131 (a reason is required; the intent is recorded before any hook is touched; a failed terminal record is reported, not hidden). Still unsurfaced by choice: removing a gate is the one act no view offers until the owner decides it should"
     },
     {
-      "route": "POST /api/scope/floor",
-      "why": "the society floor: the widest escalation there is; CLI/operator-only until a surface is designed for it. A read-only view is wanted"
-    },
-    {
-      "route": "POST /api/scope/floor/remove",
-      "why": "as scope/floor"
-    },
-    {
       "route": "POST /api/scope/reroot",
       "why": "rewrites the whole scope set; deliberately no UI"
+    },
+    {
+      "route": "POST /api/scope/standing/refusal/lift",
+      "why": "standing refusals (#1417): the operator's lift of a refusal that stands; no view offers it yet. The dashboard's scope pane should show refused_standing rows with a lift button (an additive follow-up to #1418)"
     },
     {
       "route": "GET /api/transport/binding",
@@ -976,6 +1081,10 @@
     {
       "route": "GET /.well-known/openid-credential-issuer",
       "why": "wallet-facing metadata"
+    },
+    {
+      "route": "POST /api/channel/binding",
+      "why": "channel bindings (#1344): set with `hestia channel bind` (operator-signed, reason required); the dashboard shows bindings read-only"
     }
   ],
   "known_gaps": []

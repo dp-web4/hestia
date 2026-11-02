@@ -1,0 +1,665 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -459,6 +459,11 @@
+     #: 2026-10-19, "the governed see the law" — every member reads the governance snapshot).
+     #: Consulted by evaluate() only for an act that is a read; never widens a write.
+     read_scope: tuple = ()
++    #: Grants NARROWED to fewer than all four modes (hestia #1345 part B), as
++    #: ``((entry, modes), ...)`` with `entry` parsed like `scope` and `modes` a subset of
++    #: "rwed". Consulted by evaluate() only for an act whose mode it can name, and only when
++    #: every mode that act needs is in the grant's. A full-mode grant stays in `scope`.
++    mode_scope: tuple = ()
+     #: Where this policy was resolved from, carried so a reader never has to guess which store
+     #: won. A policy that cannot say where it came from is not auditable.
+     source: str = "unresolved"
+@@ -754,6 +759,40 @@
+     # `ssh:/etc` was inert, `ssh:etc` granted). Dropped here too, so the guarantee does not
+     # depend on the caller of the day. No live policy carries one; all are bare repo names.
+     return tuple(s for s in out if s.strip("."))
++
++
++#: The four grant modes (hestia #1345), in their canonical order.
++GRANT_MODES = "rwed"
++
++
++def _parse_mode_scope(raw) -> tuple:
++    """`[{"entry": "path:/x/**", "modes": "r"}, ...]` -> `(("path:/x/**", "r"), ...)`.
++
++    Each entry is parsed exactly as an `in_scope` entry is (one entry, one parse), and its
++    modes are reduced to letters of "rwed" in canonical order. Anything malformed is dropped,
++    whole: bad data here reads as NO narrowed grant, never as a traceback and never as reach.
++    An entry whose modes are empty, or carry a letter outside "rwed", is dropped rather than
++    trimmed: a mode set nobody wrote must not be repaired into one that admits something.
++    A bare `*` is never honoured here: a narrowed grant names a place."""
++    if not isinstance(raw, list):
++        return ()
++    out = []
++    for item in raw:
++        if not isinstance(item, dict):
++            continue
++        entry, modes = item.get("entry"), item.get("modes")
++        if not isinstance(entry, str) or not isinstance(modes, str) or not modes:
++            continue
++        if any(m not in GRANT_MODES for m in modes):
++            continue
++        try:
++            parsed = _parse_scope_entries([entry])
++        except Exception:
++            continue
++        if len(parsed) != 1 or parsed[0] == AgentPolicy.UNSCOPED:
++            continue
++        out.append((parsed[0], "".join(m for m in GRANT_MODES if m in modes)))
++    return tuple(out)
+ 
+ 
+ #: A `path:` grant that ends in this reaches its whole subtree; a bare one reaches exactly
+@@ -925,6 +964,7 @@
+                         member_id=profile.member_id, scope=parsed, source="vault",
+                         generation=gen, expires_at=exp,
+                         read_scope=tuple(read_parsed or ()),
++                        mode_scope=_parse_mode_scope(got.get("in_scope_modes")),
+                     )
+ 
+     # 2. Local replica — fail-closed fallback, marked stale.
+@@ -3040,6 +3080,90 @@
+             and path_in_scope(p, read_scopes, ws, profile, event.cwd))
+ 
+ 
++#: What the PATH of each tool's act needs, in grant modes (hestia #1345 part B). A narrowed
++#: grant admits an act only when every mode listed here is in the grant's modes; a tool NOT
++#: listed has no nameable mode and is admitted by full (rwed) grants alone, so an unknown or
++#: new tool fails narrow. Deliberately per tool, not per argument:
++#:   - every READ_ONLY_PATH_TOOLS reader needs r; so do a being's composed reads, whose `path`
++#:     is their read target (the governance closure reads them the same way, _COMPOSED_READ_TOOLS);
++#:   - Write / write_file create or replace and need w;
++#:   - Edit-family tools read the old text to replace it, and answer with it, so they need rw;
++#:   - write_note is a being's append, edit and retire alike (one gate tool for three verbs):
++#:     w, since an append must work on a write-only grant; its edit receipt quotes the being's
++#:     own old text back, never more of the file;
++#:   - a being's git_restore rewrites a file from history (w); git_clean deletes one (d);
++#:   - a being's run reads its script (to stage a copy) and executes it: re. Its event carries
++#:     the script path only; what the run can reach inside its sandbox is mounted from the
++#:     being's grants by their own modes on SAGE's side (SAGE #521), never by this table.
++#: Shell commands are NOT classified here: see _command_mode_need.
++PATH_TOOL_MODES = {
++    **{t: "r" for t in READ_ONLY_PATH_TOOLS},
++    "search": "r", "git_read": "r",
++    "Write": "w", "write_file": "w",
++    "Edit": "rw", "MultiEdit": "rw", "NotebookEdit": "rw", "replace": "rw",
++    "write_note": "w",
++    "git_restore": "w", "git_clean": "d",
++    "run": "re",
++}
++
++
++def act_path_modes(event: NormalizedEvent) -> str:
++    """The modes this act needs on each path it names, or "" when none can be named (then
++    only a full grant admits it)."""
++    return PATH_TOOL_MODES.get(event.tool, "")
++
++
++def _command_mode_need(command: str) -> str:
++    """The modes a shell command needs on every path it reaches: "r" for a command made only
++    of READ_ONLY_ROOT_VERBS (the same strict allowlist the read-only floor uses), "" for every
++    other command. Write, delete and execute positions inside a shell line are not attributed
++    per path yet, so a command that does more than read is admitted by full grants alone: a
++    narrowed grant never widens a command it cannot fully classify."""
++    return "r" if _read_only_root_command(command) else ""
++
++
++def _mode_entries(mode_scopes, need: str) -> list:
++    """The narrowed grants whose modes include every mode in `need` ([] for an empty need)."""
++    if not need:
++        return []
++    return [entry for entry, modes in mode_scopes if all(m in modes for m in need)]
++
++
++def _mode_admits(event: NormalizedEvent, p: str, mode_scopes, ws: str,
++                 profile: HarnessProfile) -> bool:
++    """Does a narrowed grant admit this path for this act's modes?"""
++    entries = _mode_entries(mode_scopes, act_path_modes(event))
++    return bool(entries) and path_in_scope(p, entries, ws, profile, event.cwd)
++
++
++def _mode_hint(p: str, need: str, mode_scopes, ws: str, profile: HarnessProfile,
++               cwd: Optional[str]) -> str:
++    """When a narrowed grant DOES reach the path but lacks a mode the act needs, say which:
++    "granted r, this act needs w" (the refusal #1345 asks for). Empty otherwise."""
++    held = "".join(sorted({m for entry, modes in mode_scopes
++                           if path_in_scope(p, [entry], ws, profile, cwd) for m in modes},
++                          key=GRANT_MODES.index))
++    if not held:
++        return ""
++    wants = need or GRANT_MODES
++    missing = "".join(m for m in wants if m not in held)
++    what = (f"needs {wants}" if need else
++            "has no mode the gate can name, so only a grant of all four modes (rwed) admits it")
++    return (f" Your grant here is narrowed to {held}; this act {what}"
++            + (f" (missing {missing})." if need else "."))
++
++
++def scope_roots_with_modes(policy: AgentPolicy, workspace: str) -> tuple:
++    """``((root, recursive, modes), ...)`` for every `path:` grant the policy holds: full
++    grants as "rwed", narrowed ones with their modes (#1345 part B). For a consumer that
++    confines an act itself after the gate (a dispatcher, a sandbox), so it honours the same
++    modes the gate does. Repo-name grants are not path roots and are not listed."""
++    out = [(r, rec, GRANT_MODES) for r, rec in _scope_roots_with_reach(list(policy.scope), workspace)]
++    for entry, modes in getattr(policy, "mode_scope", ()) or ():
++        out += [(r, rec, modes) for r, rec in _scope_roots_with_reach([entry], workspace)]
++    return tuple(out)
++
++
+ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
+              workspace: Optional[str] = None,
+              policy: Optional[AgentPolicy] = None) -> Verdict:
+@@ -3059,6 +3183,7 @@
+     pol = policy if policy is not None else resolve_agent_policy(profile)
+     scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
+     read_scopes = list(getattr(pol, "read_scope", ()) or ())
++    mode_scopes = list(getattr(pol, "mode_scope", ()) or ())
+     forbidden = forbidden_tokens(profile)
+ 
+     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
+@@ -3128,7 +3253,8 @@
+                 )
+     for p in ([] if event.repos else event.paths):
+         if (not path_in_scope(p, scopes, ws, profile, event.cwd)
+-                and not _read_only_admits(event, p, read_scopes, ws, profile)):
++                and not _read_only_admits(event, p, read_scopes, ws, profile)
++                and not _mode_admits(event, p, mode_scopes, ws, profile)):
+             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
+             # on any long path truncates away the very component that tripped the gate — the
+             # member is handed a string that does not contain its own reason. That is the
+@@ -3140,7 +3266,8 @@
+             where = f"'{seg}' is not granted" if seg else "it is outside the workspace"
+             # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
+             absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
+-            hint = _exact_grant_hint(absolute, scopes, ws)
++            hint = (_exact_grant_hint(absolute, scopes, ws)
++                    + _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd))
+             return _deny(
+                 "mrh.path",
+                 f"'{event.tool}' targets '{_elide(p)}' outside your granted scope: {where} "
+@@ -3153,9 +3280,16 @@
+                                                      home_markers=profile.home_markers)
+         # A command that only READS may also reach the read-only roots, by a strict verb
+         # allowlist (READ_ONLY_ROOT_VERBS): anything outside it refuses rather than leaks.
+-        if not ok and read_scopes and _read_only_root_command(event.command):
++        # And the narrowed grants that hold every mode the command needs (#1345 part B): for
++        # now that is r for the same strict read-only allowlist, and nothing for any other
++        # command. One retry over all of them, so a read crossing the floor and a narrowed
++        # grant is judged as one act.
++        cmd_need = _command_mode_need(event.command)
++        extra = ((read_scopes if cmd_need == "r" else [])
++                 + _mode_entries(mode_scopes, cmd_need))
++        if not ok and extra:
+             ok, offending, refused = command_scope_reach(
+-                event.command, scopes + read_scopes, ws, event.cwd,
++                event.command, scopes + extra, ws, event.cwd,
+                 forbidden=forbidden, home_markers=profile.home_markers)
+         if not ok:
+             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
+@@ -3164,7 +3298,9 @@
+             # not rebuilt from the display token, which has the right repo and the wrong
+             # depth (GPT review of #1003).
+             unpriceable = bool(refused) and refused.startswith(UNPRICEABLE_PREFIX)
+-            hint = _exact_grant_hint(refused, scopes, ws) if refused and not unpriceable else ""
++            hint = (_exact_grant_hint(refused, scopes, ws)
++                    + _mode_hint(refused, cmd_need, mode_scopes, ws, profile, event.cwd)
++                    if refused and not unpriceable else "")
+             wsn = ws.replace("\\", "/").rstrip("/")
+             outside = bool(refused) and not unpriceable and not (refused == wsn or
+                                                                   refused.startswith(wsn + "/"))
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+--- a/plugins/_shared/hestia_gate_mechanism.py
++++ b/plugins/_shared/hestia_gate_mechanism.py
+@@ -1214,6 +1214,11 @@
+             # an entry here admits READ acts only, and only in a core that knows the key.
+             "society_floor_read": [],
+             "in_scope_read": [],
++            # Grants NARROWED below all four modes (hestia #1345 part B), as
++            # {"entry": <in_scope spelling>, "modes": "r"|"rw"|...}. Apart from `in_scope` for
++            # the same reason as `in_scope_read`: a core that predates this key ignores it and
++            # admits nothing for them, so narrowing never widens on an older gate.
++            "in_scope_modes": [],
+             "generation": None,
+             "expires_at": None,
+         }
+@@ -1266,6 +1271,26 @@
+                         })
+                         snap["scope_grants"].append(p.strip())
+                         snap["in_scope"].append(_scope_entry_for_grant(p, rec))
++            # NARROWED grants (hestia #1345 part B). Since #1370 the two lists above carry only
++            # full-mode grants, and `grants_by_mode` carries every grant with its modes. Only
++            # the narrowed rows are taken from it (a full-mode row is already in `in_scope`),
++            # through the same `_scope_entry_for_grant` mapping. Absent on an older daemon:
++            # a no-op. A row whose modes are not a non-empty subset of "rwed" is skipped, so
++            # malformed data reads as no grant.
++            by_mode = scope.get("grants_by_mode")
++            if isinstance(by_mode, list):
++                for g in by_mode:
++                    if not isinstance(g, dict):
++                        continue
++                    p, modes = g.get("path"), g.get("modes")
++                    if not (isinstance(p, str) and p.strip() and isinstance(modes, str)):
++                        continue
++                    if not modes or modes == "rwed" or any(m not in "rwed" for m in modes):
++                        continue
++                    snap["in_scope_modes"].append({
++                        "entry": _scope_entry_for_grant(p, bool(g.get("recursive"))),
++                        "modes": "".join(m for m in "rwed" if m in modes),
++                    })
+             # CERTIFICATION, issued by the authority (Sprint F R1): the standing store's
+             # monotonic generation ("WHICH policy is this copy") and the daemon's honor
+             # horizon for it. Booleans are excluded deliberately — isinstance(True, int)
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 3b188d32aef61de48696d7b2e9ebe475730f0fcf2effb946d905503f163225e5  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -460,6 +460,11 @@
+     #: 2026-10-19, "the governed see the law" — every member reads the governance snapshot).
+     #: Consulted by evaluate() only for an act that is a read; never widens a write.
+     read_scope: tuple = ()
++    #: Grants NARROWED to fewer than all four modes (hestia #1345 part B), as
++    #: ``((entry, modes), ...)`` with `entry` parsed like `scope` and `modes` a subset of
++    #: "rwed". Consulted by evaluate() only for an act whose mode it can name, and only when
++    #: every mode that act needs is in the grant's. A full-mode grant stays in `scope`.
++    mode_scope: tuple = ()
+     #: Where this policy was resolved from, carried so a reader never has to guess which store
+     #: won. A policy that cannot say where it came from is not auditable.
+     source: str = "unresolved"
+@@ -755,6 +760,40 @@
+     # `ssh:/etc` was inert, `ssh:etc` granted). Dropped here too, so the guarantee does not
+     # depend on the caller of the day. No live policy carries one; all are bare repo names.
+     return tuple(s for s in out if s.strip("."))
++
++
++#: The four grant modes (hestia #1345), in their canonical order.
++GRANT_MODES = "rwed"
++
++
++def _parse_mode_scope(raw) -> tuple:
++    """`[{"entry": "path:/x/**", "modes": "r"}, ...]` -> `(("path:/x/**", "r"), ...)`.
++
++    Each entry is parsed exactly as an `in_scope` entry is (one entry, one parse), and its
++    modes are reduced to letters of "rwed" in canonical order. Anything malformed is dropped,
++    whole: bad data here reads as NO narrowed grant, never as a traceback and never as reach.
++    An entry whose modes are empty, or carry a letter outside "rwed", is dropped rather than
++    trimmed: a mode set nobody wrote must not be repaired into one that admits something.
++    A bare `*` is never honoured here: a narrowed grant names a place."""
++    if not isinstance(raw, list):
++        return ()
++    out = []
++    for item in raw:
++        if not isinstance(item, dict):
++            continue
++        entry, modes = item.get("entry"), item.get("modes")
++        if not isinstance(entry, str) or not isinstance(modes, str) or not modes:
++            continue
++        if any(m not in GRANT_MODES for m in modes):
++            continue
++        try:
++            parsed = _parse_scope_entries([entry])
++        except Exception:
++            continue
++        if len(parsed) != 1 or parsed[0] == AgentPolicy.UNSCOPED:
++            continue
++        out.append((parsed[0], "".join(m for m in GRANT_MODES if m in modes)))
++    return tuple(out)
+ 
+ 
+ #: A `path:` grant that ends in this reaches its whole subtree; a bare one reaches exactly
+@@ -926,6 +965,7 @@
+                         member_id=profile.member_id, scope=parsed, source="vault",
+                         generation=gen, expires_at=exp,
+                         read_scope=tuple(read_parsed or ()),
++                        mode_scope=_parse_mode_scope(got.get("in_scope_modes")),
+                     )
+ 
+     # 2. Local replica — fail-closed fallback, marked stale.
+@@ -3041,6 +3081,90 @@
+             and path_in_scope(p, read_scopes, ws, profile, event.cwd))
+ 
+ 
++#: What the PATH of each tool's act needs, in grant modes (hestia #1345 part B). A narrowed
++#: grant admits an act only when every mode listed here is in the grant's modes; a tool NOT
++#: listed has no nameable mode and is admitted by full (rwed) grants alone, so an unknown or
++#: new tool fails narrow. Deliberately per tool, not per argument:
++#:   - every READ_ONLY_PATH_TOOLS reader needs r; so do a being's composed reads, whose `path`
++#:     is their read target (the governance closure reads them the same way, _COMPOSED_READ_TOOLS);
++#:   - Write / write_file create or replace and need w;
++#:   - Edit-family tools read the old text to replace it, and answer with it, so they need rw;
++#:   - write_note is a being's append, edit and retire alike (one gate tool for three verbs):
++#:     w, since an append must work on a write-only grant; its edit receipt quotes the being's
++#:     own old text back, never more of the file;
++#:   - a being's git_restore rewrites a file from history (w); git_clean deletes one (d);
++#:   - a being's run reads its script (to stage a copy) and executes it: re. Its event carries
++#:     the script path only; what the run can reach inside its sandbox is mounted from the
++#:     being's grants by their own modes on SAGE's side (SAGE #521), never by this table.
++#: Shell commands are NOT classified here: see _command_mode_need.
++PATH_TOOL_MODES = {
++    **{t: "r" for t in READ_ONLY_PATH_TOOLS},
++    "search": "r", "git_read": "r",
++    "Write": "w", "write_file": "w",
++    "Edit": "rw", "MultiEdit": "rw", "NotebookEdit": "rw", "replace": "rw",
++    "write_note": "w",
++    "git_restore": "w", "git_clean": "d",
++    "run": "re",
++}
++
++
++def act_path_modes(event: NormalizedEvent) -> str:
++    """The modes this act needs on each path it names, or "" when none can be named (then
++    only a full grant admits it)."""
++    return PATH_TOOL_MODES.get(event.tool, "")
++
++
++def _command_mode_need(command: str) -> str:
++    """The modes a shell command needs on every path it reaches: "r" for a command made only
++    of READ_ONLY_ROOT_VERBS (the same strict allowlist the read-only floor uses), "" for every
++    other command. Write, delete and execute positions inside a shell line are not attributed
++    per path yet, so a command that does more than read is admitted by full grants alone: a
++    narrowed grant never widens a command it cannot fully classify."""
++    return "r" if _read_only_root_command(command) else ""
++
++
++def _mode_entries(mode_scopes, need: str) -> list:
++    """The narrowed grants whose modes include every mode in `need` ([] for an empty need)."""
++    if not need:
++        return []
++    return [entry for entry, modes in mode_scopes if all(m in modes for m in need)]
++
++
++def _mode_admits(event: NormalizedEvent, p: str, mode_scopes, ws: str,
++                 profile: HarnessProfile) -> bool:
++    """Does a narrowed grant admit this path for this act's modes?"""
++    entries = _mode_entries(mode_scopes, act_path_modes(event))
++    return bool(entries) and path_in_scope(p, entries, ws, profile, event.cwd)
++
++
++def _mode_hint(p: str, need: str, mode_scopes, ws: str, profile: HarnessProfile,
++               cwd: Optional[str]) -> str:
++    """When a narrowed grant DOES reach the path but lacks a mode the act needs, say which:
++    "granted r, this act needs w" (the refusal #1345 asks for). Empty otherwise."""
++    held = "".join(sorted({m for entry, modes in mode_scopes
++                           if path_in_scope(p, [entry], ws, profile, cwd) for m in modes},
++                          key=GRANT_MODES.index))
++    if not held:
++        return ""
++    wants = need or GRANT_MODES
++    missing = "".join(m for m in wants if m not in held)
++    what = (f"needs {wants}" if need else
++            "has no mode the gate can name, so only a grant of all four modes (rwed) admits it")
++    return (f" Your grant here is narrowed to {held}; this act {what}"
++            + (f" (missing {missing})." if need else "."))
++
++
++def scope_roots_with_modes(policy: AgentPolicy, workspace: str) -> tuple:
++    """``((root, recursive, modes), ...)`` for every `path:` grant the policy holds: full
++    grants as "rwed", narrowed ones with their modes (#1345 part B). For a consumer that
++    confines an act itself after the gate (a dispatcher, a sandbox), so it honours the same
++    modes the gate does. Repo-name grants are not path roots and are not listed."""
++    out = [(r, rec, GRANT_MODES) for r, rec in _scope_roots_with_reach(list(policy.scope), workspace)]
++    for entry, modes in getattr(policy, "mode_scope", ()) or ():
++        out += [(r, rec, modes) for r, rec in _scope_roots_with_reach([entry], workspace)]
++    return tuple(out)
++
++
+ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
+              workspace: Optional[str] = None,
+              policy: Optional[AgentPolicy] = None) -> Verdict:
+@@ -3060,6 +3184,7 @@
+     pol = policy if policy is not None else resolve_agent_policy(profile)
+     scopes = list(pol.scope) + launch_cwd_repo(profile, ws)
+     read_scopes = list(getattr(pol, "read_scope", ()) or ())
++    mode_scopes = list(getattr(pol, "mode_scope", ()) or ())
+     forbidden = forbidden_tokens(profile)
+ 
+     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
+@@ -3129,7 +3254,8 @@
+                 )
+     for p in ([] if event.repos else event.paths):
+         if (not path_in_scope(p, scopes, ws, profile, event.cwd)
+-                and not _read_only_admits(event, p, read_scopes, ws, profile)):
++                and not _read_only_admits(event, p, read_scopes, ws, profile)
++                and not _mode_admits(event, p, mode_scopes, ws, profile)):
+             # NAME THE SEGMENT, not just the path. The inherited hooks wrote `p[:60]`, which
+             # on any long path truncates away the very component that tripped the gate — the
+             # member is handed a string that does not contain its own reason. That is the
+@@ -3141,7 +3267,8 @@
+             where = f"'{seg}' is not granted" if seg else "it is outside the workspace"
+             # SAY WHY when the cause is the grant's shape, not its absence (2026-09-08).
+             absolute = p if os.path.isabs(p) else os.path.join(event.cwd or ws, p)
+-            hint = _exact_grant_hint(absolute, scopes, ws)
++            hint = (_exact_grant_hint(absolute, scopes, ws)
++                    + _mode_hint(p, act_path_modes(event), mode_scopes, ws, profile, event.cwd))
+             return _deny(
+                 "mrh.path",
+                 f"'{event.tool}' targets '{_elide(p)}' outside your granted scope: {where} "
+@@ -3154,9 +3281,16 @@
+                                                      home_markers=profile.home_markers)
+         # A command that only READS may also reach the read-only roots, by a strict verb
+         # allowlist (READ_ONLY_ROOT_VERBS): anything outside it refuses rather than leaks.
+-        if not ok and read_scopes and _read_only_root_command(event.command):
++        # And the narrowed grants that hold every mode the command needs (#1345 part B): for
++        # now that is r for the same strict read-only allowlist, and nothing for any other
++        # command. One retry over all of them, so a read crossing the floor and a narrowed
++        # grant is judged as one act.
++        cmd_need = _command_mode_need(event.command)
++        extra = ((read_scopes if cmd_need == "r" else [])
++                 + _mode_entries(mode_scopes, cmd_need))
++        if not ok and extra:
+             ok, offending, refused = command_scope_reach(
+-                event.command, scopes + read_scopes, ws, event.cwd,
++                event.command, scopes + extra, ws, event.cwd,
+                 forbidden=forbidden, home_markers=profile.home_markers)
+         if not ok:
+             # Name WHAT tripped the gate — a deny that hides its trigger sends the agent
+@@ -3165,7 +3299,9 @@
+             # not rebuilt from the display token, which has the right repo and the wrong
+             # depth (GPT review of #1003).
+             unpriceable = bool(refused) and refused.startswith(UNPRICEABLE_PREFIX)
+-            hint = _exact_grant_hint(refused, scopes, ws) if refused and not unpriceable else ""
++            hint = (_exact_grant_hint(refused, scopes, ws)
++                    + _mode_hint(refused, cmd_need, mode_scopes, ws, profile, event.cwd)
++                    if refused and not unpriceable else "")
+             wsn = ws.replace("\\", "/").rstrip("/")
+             outside = bool(refused) and not unpriceable and not (refused == wsn or
+                                                                   refused.startswith(wsn + "/"))
+diff --git a/hooks-gt/_shared/hestia_gate_mechanism.py b/hooks-gt/_shared/hestia_gate_mechanism.py
+--- a/hooks-gt/_shared/hestia_gate_mechanism.py
++++ b/hooks-gt/_shared/hestia_gate_mechanism.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681  (published ground truth; manifest: hooks-gt)
+ """Shared in-process daemon-query mechanism — the society-safety verdict path.
+ 
+ PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
+@@ -1215,6 +1215,11 @@
+             # an entry here admits READ acts only, and only in a core that knows the key.
+             "society_floor_read": [],
+             "in_scope_read": [],
++            # Grants NARROWED below all four modes (hestia #1345 part B), as
++            # {"entry": <in_scope spelling>, "modes": "r"|"rw"|...}. Apart from `in_scope` for
++            # the same reason as `in_scope_read`: a core that predates this key ignores it and
++            # admits nothing for them, so narrowing never widens on an older gate.
++            "in_scope_modes": [],
+             "generation": None,
+             "expires_at": None,
+         }
+@@ -1267,6 +1272,26 @@
+                         })
+                         snap["scope_grants"].append(p.strip())
+                         snap["in_scope"].append(_scope_entry_for_grant(p, rec))
++            # NARROWED grants (hestia #1345 part B). Since #1370 the two lists above carry only
++            # full-mode grants, and `grants_by_mode` carries every grant with its modes. Only
++            # the narrowed rows are taken from it (a full-mode row is already in `in_scope`),
++            # through the same `_scope_entry_for_grant` mapping. Absent on an older daemon:
++            # a no-op. A row whose modes are not a non-empty subset of "rwed" is skipped, so
++            # malformed data reads as no grant.
++            by_mode = scope.get("grants_by_mode")
++            if isinstance(by_mode, list):
++                for g in by_mode:
++                    if not isinstance(g, dict):
++                        continue
++                    p, modes = g.get("path"), g.get("modes")
++                    if not (isinstance(p, str) and p.strip() and isinstance(modes, str)):
++                        continue
++                    if not modes or modes == "rwed" or any(m not in "rwed" for m in modes):
++                        continue
++                    snap["in_scope_modes"].append({
++                        "entry": _scope_entry_for_grant(p, bool(g.get("recursive"))),
++                        "modes": "".join(m for m in "rwed" if m in modes),
++                    })
+             # CERTIFICATION, issued by the authority (Sprint F R1): the standing store's
+             # monotonic generation ("WHICH policy is this copy") and the daemon's honor
+             # horizon for it. Booleans are excluded deliberately — isinstance(True, int)
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,12 +7,12 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc",
++      "sha256": "3b188d32aef61de48696d7b2e9ebe475730f0fcf2effb946d905503f163225e5",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+       "path": "hestia_gate_mechanism.py",
+-      "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903",
++      "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681",
+       "source": "plugins/_shared/hestia_gate_mechanism.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "28debcf4a9a9e475edf147ad645d63829ac428d0b09d98babcab55dd9ad3aacd"
++  "gt_version": "386ca07475e89fe38580ef1232ce93d59c7512abcf2c3218d9b8696d977c6516"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "28debcf4a9a9e475edf147ad645d63829ac428d0b09d98babcab55dd9ad3aacd",
++    "gt_version": "386ca07475e89fe38580ef1232ce93d59c7512abcf2c3218d9b8696d977c6516",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc"
++        "sha256": "3b188d32aef61de48696d7b2e9ebe475730f0fcf2effb946d905503f163225e5"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903"
++        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "b16766ebf639077dd80cfb0961263448229077a664a458f008b4e26ae1e5415d"
++  "gt_version": "c3d8f069a430a314fca1780e4b6be08aa5e3c8db7dde098672d5c94a042441fb"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "28debcf4a9a9e475edf147ad645d63829ac428d0b09d98babcab55dd9ad3aacd",
++    "gt_version": "386ca07475e89fe38580ef1232ce93d59c7512abcf2c3218d9b8696d977c6516",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc"
++        "sha256": "3b188d32aef61de48696d7b2e9ebe475730f0fcf2effb946d905503f163225e5"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903"
++        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "bbe01c0355ac67f3fe2c7121f849fce25f970b32cd96c3141c406b6abcf3506e"
++  "gt_version": "f0c808ba665bd8445ff7d53ab8958f7549fce2c3e59cef213a810c64b6be0d74"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "28debcf4a9a9e475edf147ad645d63829ac428d0b09d98babcab55dd9ad3aacd",
++    "gt_version": "386ca07475e89fe38580ef1232ce93d59c7512abcf2c3218d9b8696d977c6516",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc"
++        "sha256": "3b188d32aef61de48696d7b2e9ebe475730f0fcf2effb946d905503f163225e5"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903"
++        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "ed593e796917e5f3cbbcc11457ecfeaf8eec652952998caf2d80deb5fa45b9c0"
++  "gt_version": "4dba20665ec09f996535b4a62a8d4914f258c86ea54b67dac1696b14d511b919"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,15 +33,15 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "28debcf4a9a9e475edf147ad645d63829ac428d0b09d98babcab55dd9ad3aacd",
++    "gt_version": "386ca07475e89fe38580ef1232ce93d59c7512abcf2c3218d9b8696d977c6516",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "82576707a1942b25056603f7b8f7fc00fe2a8b7294e1367fbf1ad6bf1dd7c4bc"
++        "sha256": "3b188d32aef61de48696d7b2e9ebe475730f0fcf2effb946d905503f163225e5"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "73d81b8e7efb2346c6c315f1bacbbf39af99d225db34c8ee8d947d97b93d0903"
++        "sha256": "5a3a633dbae94283722e4214f87ae1c6457bf414ca12c7eab4d31e200fd5e681"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "c8ee4bb0931e356422140fad973a44c661b6682b18e24f6bcbf32ce662363223"
++  "gt_version": "f6c585d0243f97b213a1a557c42a0de35e94067e97f37a4108b179e714ec3d5b"
+ }

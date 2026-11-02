@@ -1,0 +1,241 @@
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: 7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -99,6 +99,12 @@
+ #: enforces on this process. A harness invocation is bounded by its registration; when both are
+ #: known the smaller wins, so this can only shorten a registered bound.
+ HOOK_TIMEOUT_ENV = "HESTIA_HOOK_TIMEOUT_S"
++#: The declaration a NON-harness invoker (the deploy preflight) makes that its event is a PROBE,
++#: not an act: a scope refusal is returned as a plain refusal and the daemon is asked nothing, so
++#: no peer scope request is opened for an act nobody will re-issue (dp, 2026-10-14: every deploy
++#: cycle's hold probe opened one per member). It can only withhold a request, never lift one:
++#: exactly "1" withholds, anything else is today's behaviour.
++NO_ESCALATE_ENV = "HESTIA_GATE_NO_ESCALATE"
+ 
+ #: The rollout knob. ONE name for every seat, projected per seat by the vault as
+ #: `<SEAT_TOKEN>__HESTIA_GATE_MODE` (the per-seat HESTIA_<SEAT>_GATE_MODE names are retired).
+@@ -1224,6 +1230,12 @@
+        them added, passes. The one-time approvals are recorded on `inv.scope_spend` and spent in
+        ONE atomic call after society law permits the act — a denied act consumes nothing."""
+     import dataclasses
++    if os.environ.get(NO_ESCALATE_ENV) == "1":
++        # A declared probe: refuse as the law judged it and ask the daemon nothing.
++        return _verdict_deny(core._deny(
++            v.rule, v.reason + f" Not escalated: the invoker declared {NO_ESCALATE_ENV}=1 (a probe, "
++            "not an act), so no scope request was opened.",
++            innate=bool(v.innate), target=v.target))
+     ws = core.detect_workspace(cprofile)
+     targets, cur = [], v
+     while cur.blocks and cur.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(cur, "target", ""):
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1",
++      "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8"
++  "gt_version": "ea2c1940ee93d38f0ab0e81cde8905efd819c514b83dee09d30c1729651bbdd1"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "ea2c1940ee93d38f0ab0e81cde8905efd819c514b83dee09d30c1729651bbdd1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1"
++        "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "f59762b4e42ac450427412ef251889b8f5edca7ef587fe6ff95f3a8973684431"
++  "gt_version": "2b6a0f9d780d013f90a92ef79317599d08c48d075f2fd577d89efc4df234cacd"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "ea2c1940ee93d38f0ab0e81cde8905efd819c514b83dee09d30c1729651bbdd1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1"
++        "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "d4571479d33aad6d4b67a745b9c23b1d815cadbcb8963e412eb6af53b10dbcec"
++  "gt_version": "d74976fbe9507f3c7ab4637f4af2ca6e4cadbae64d8279fff41110da0311b543"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "ea2c1940ee93d38f0ab0e81cde8905efd819c514b83dee09d30c1729651bbdd1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1"
++        "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "00068fc9ec4a345487b9b1567deb156cfc21dcc6890692e20fd2eb4345ecd29f"
++  "gt_version": "5cc4d2196667c811e4fe655cf3f7be2e177c0342af36f151f9b43d0eac26a6d3"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "6816e3687ea26beeba0f822a10c9a1bbbe5bcfa42cb4b45e1f15a69e19d128f8",
++    "gt_version": "ea2c1940ee93d38f0ab0e81cde8905efd819c514b83dee09d30c1729651bbdd1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1"
++        "sha256": "f6a1f47c14f3a07edbc451c96e4f04439a1033b0944e7a75d7a9c254ae383ec2"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "6fa3feda4cf14ab1c5348a7c57a625a63e35924d27cfdf7a3780687ab1174016"
++  "gt_version": "e236b1b01d390244e41715154ad679b5e1cfe95038a6ca05ad72d50cc45dd726"
+ }
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -98,6 +98,12 @@
+ #: enforces on this process. A harness invocation is bounded by its registration; when both are
+ #: known the smaller wins, so this can only shorten a registered bound.
+ HOOK_TIMEOUT_ENV = "HESTIA_HOOK_TIMEOUT_S"
++#: The declaration a NON-harness invoker (the deploy preflight) makes that its event is a PROBE,
++#: not an act: a scope refusal is returned as a plain refusal and the daemon is asked nothing, so
++#: no peer scope request is opened for an act nobody will re-issue (dp, 2026-10-14: every deploy
++#: cycle's hold probe opened one per member). It can only withhold a request, never lift one:
++#: exactly "1" withholds, anything else is today's behaviour.
++NO_ESCALATE_ENV = "HESTIA_GATE_NO_ESCALATE"
+ 
+ #: The rollout knob. ONE name for every seat, projected per seat by the vault as
+ #: `<SEAT_TOKEN>__HESTIA_GATE_MODE` (the per-seat HESTIA_<SEAT>_GATE_MODE names are retired).
+@@ -1223,6 +1229,12 @@
+        them added, passes. The one-time approvals are recorded on `inv.scope_spend` and spent in
+        ONE atomic call after society law permits the act — a denied act consumes nothing."""
+     import dataclasses
++    if os.environ.get(NO_ESCALATE_ENV) == "1":
++        # A declared probe: refuse as the law judged it and ask the daemon nothing.
++        return _verdict_deny(core._deny(
++            v.rule, v.reason + f" Not escalated: the invoker declared {NO_ESCALATE_ENV}=1 (a probe, "
++            "not an act), so no scope request was opened.",
++            innate=bool(v.innate), target=v.target))
+     ws = core.detect_workspace(cprofile)
+     targets, cur = [], v
+     while cur.blocks and cur.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(cur, "target", ""):
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -823,6 +823,34 @@
+     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+ 
+ 
++def test_a_declared_probe_opens_no_scope_request(m, g, wc, home):
++    """dp, 2026-10-14 ("needless frictions are bad"): the deploy preflight's hold probe opened a
++    peer scope request per member every cycle. A non-harness invoker that declares
++    HESTIA_GATE_NO_ESCALATE=1 gets the refusal the law gives and the daemon is asked nothing;
++    any other value keeps today's escalation."""
++    stub = Stub(Policy())
++    saved = os.environ.get("HESTIA_GATE_NO_ESCALATE")
++    try:
++        os.environ["HESTIA_GATE_NO_ESCALATE"] = "1"
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "kimi", "Bash", {"command": "touch /etc/hostname"}, home)
++        check("probe-refused-as-law-judged", d.decision == "deny" and d.rule == "mrh.command", d)
++        check("probe-asks-no-scope-claim", not stub.named("hestia_scope_claim"), stub.calls[-3:])
++        check("probe-carries-no-escalation-id", not getattr(d, "escalation_id", None), d)
++        check("probe-says-why", "HESTIA_GATE_NO_ESCALATE" in (d.reason or ""), d.reason)
++        os.environ["HESTIA_GATE_NO_ESCALATE"] = "0"
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "kimi", "Bash", {"command": "touch /etc/hostname"}, home)
++        check("probe-flag-other-value-still-escalates", len(stub.named("hestia_scope_claim")) == 1,
++              stub.calls[-3:])
++    finally:
++        if saved is None:
++            os.environ.pop("HESTIA_GATE_NO_ESCALATE", None)
++        else:
++            os.environ["HESTIA_GATE_NO_ESCALATE"] = saved
++        stub.close()
++
++
+ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home):
+     """dp, 2026-10-05: "escalation should allow standing grants". An `mrh.path` / `mrh.command`
+     refusal asks the daemon ONCE (`hestia_scope_claim`): a request is opened (or re-found) on the
+@@ -1556,6 +1584,7 @@
+     test_reads_meet_the_same_local_law_on_every_seat,
+     test_superseded_is_denied_in_every_mode,
+     test_daemon_verdicts_and_the_warn_rollout,
++    test_a_declared_probe_opens_no_scope_request,
+     test_a_scope_refusal_is_an_escalation_with_a_standing_option,
+     test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
+     test_prose_in_a_message_position_is_data_on_every_seat,

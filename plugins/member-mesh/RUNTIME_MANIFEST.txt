@@ -1,0 +1,11 @@
+# The member-mesh runtime a mesh member's hooks dir carries (#1373). One bare filename per line; `#` lines and blank
+# lines are ignored. deploy/install-members.sh installs each listed file into the directory the member's harness runs
+# its mesh hooks from (derived from the registration, never assumed), for every member whose expects.json declares
+# install.mesh_member. tools/hooks_gt.py publishes this set as the `member-mesh` ground-truth unit, the way
+# plugins/_shared/RUNTIME_MANIFEST.txt is published as `_shared`.
+#
+# A name here must be a bare filename (letters, digits, `.`, `_`, `-`; no leading dot, no `/`): the installer refuses
+# anything else before it writes, and refuses a source that is a symlink or resolves outside plugins/member-mesh.
+session-mesh-inbox.sh
+prompt-disposition-watch.sh
+hestia-mesh.py
