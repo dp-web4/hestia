@@ -756,6 +756,32 @@ mod tests {
     }
 
     #[test]
+    fn rejected_sealed_and_removed_documents_cannot_ride_on_later_save() {
+        let mut leaked = Vec::new();
+        for op in ["seal", "remove"] {
+            let (_dir, path) = temp_path();
+            let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
+            vault.put_document("fixture", "existing", b"old".to_vec()).unwrap();
+            vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+            let failed = match op {
+                "seal" => vault.seal_document("fixture", "existing", b"new", "p").is_err(),
+                _ => vault.remove_document("fixture", "existing").is_err(),
+            };
+            assert!(failed);
+            let memory_old = vault.get_document("fixture", "existing") == Some(b"old".as_slice());
+            let before = Vault::open(path.clone(), "p".into()).unwrap();
+            assert_eq!(before.get_document("fixture", "existing"), Some(b"old".as_slice()));
+            vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+            vault.put_document("unrelated", "record", b"new".to_vec()).unwrap();
+            let after = Vault::open(path, "p".into()).unwrap();
+            if !memory_old || after.get_document("fixture", "existing") != Some(b"old".as_slice()) {
+                leaked.push(op);
+            }
+        }
+        assert!(leaked.is_empty(), "rejected document changes remained staged: {leaked:?}");
+    }
+
+    #[test]
     fn init_and_open_round_trip() {
         let (_dir, path) = temp_path();
         let _v = Vault::init(path.clone(), "passphrase".into()).unwrap();
