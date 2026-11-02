@@ -107,7 +107,7 @@ function DelegationCard({
             reason <span className="muted">(the daemon requires one to revoke)</span>
             <input type="text" value={reason} maxLength={512} onChange={(e) => setReason(e.target.value)} />
           </label>
-          <button disabled={busy} onClick={revoke}>
+          <button disabled={busy || !reason.trim()} onClick={revoke}>
             Revoke
           </button>
           <button disabled={busy} onClick={() => setOpen(false)}>

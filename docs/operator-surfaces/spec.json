@@ -662,7 +662,7 @@
           "status": "required"
         }
       },
-      "notes": "The app shows delegations read-only from the snapshot."
+      "notes": "The app lists, grants, and revokes delegations through the daemon's member routes."
     },
     {
       "id": "member-aliases",

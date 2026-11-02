@@ -202,7 +202,15 @@ describe("Delegations", () => {
     await pick("kimi-code");
     fireEvent.click(await screen.findByText("Revoke…"));
     const card = document.querySelector(`[data-delegation="${row().id}"]`) as HTMLElement;
-    fireEvent.change(card.querySelector("input[type=text]") as HTMLInputElement, { target: { value: "done" } });
+    const reason = card.querySelector("input[type=text]") as HTMLInputElement;
+    const revoke = screen.getByRole("button", { name: "Revoke" }) as HTMLButtonElement;
+    expect(revoke.disabled).toBe(true);
+    fireEvent.change(reason, { target: { value: "   " } });
+    expect(revoke.disabled).toBe(true);
+    fireEvent.click(revoke);
+    expect(delegationRevoke).not.toHaveBeenCalled();
+    fireEvent.change(reason, { target: { value: "done" } });
+    expect(revoke.disabled).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
     await waitFor(() => expect(delegationRevoke).toHaveBeenCalledWith("kimi-code", row().id, "done"));
     expect(await screen.findByText(/already revoked elsewhere/)).toBeTruthy();
