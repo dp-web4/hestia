@@ -384,6 +384,17 @@ def arm_review_timing_is_evidence_not_an_assumption() -> None:
     check("unknown rows excluded from negative count", result["unreviewed"] == 1
           and result["timing_unknown"] == 5, str(result))
 
+    # One known negative plus three unknowns: the known rate is 100%, while
+    # the all-row uncertainty interval is 25–100%, never a silent 25% rate.
+    denominator = census([cases[1], cases[3], cases[4], cases[5]], 200, {})
+    check("unknowns excluded from known denominator", denominator["timing_known"] == 1
+          and denominator["unreviewed_pct"] == 100.0, str(denominator))
+    check("uncertainty bounds include unknown rows", denominator["unreviewed_pct_lower"] == 25.0
+          and denominator["unreviewed_pct_upper"] == 100.0, str(denominator))
+    check("class uncertainty is explicit", denominator["findings_timing_unknown"] == 3, str(denominator))
+    none_known = census([cases[3]], 200, {})
+    check("no known denominator is not zero percent", none_known["unreviewed_pct"] is None, str(none_known))
+
 
 def main() -> int:
     print("merge_review_census arms")

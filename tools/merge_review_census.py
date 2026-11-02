@@ -378,13 +378,17 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
     for r in seated:
         by_seat[r["performed_by_seat"]] = by_seat.get(r["performed_by_seat"], 0) + 1
     gaps = sorted(abs(r["seat_gap_s"]) for r in seated)
+    known = n - len(unknown)
     return {
         "n": n,
         "review_proxy_limitations": "Long pre-merge discussion does not prove independent review or head coverage; unknown timing is separate.",
         "performer_proxy_limitations": "Temporal association can be false positive or false negative; not a strict lower bound.",
         "unreviewed": len(unrev),
         "timing_unknown": len(unknown),
-        "unreviewed_pct": round(100 * len(unrev) / n, 1) if n else 0.0,
+        "timing_known": known,
+        "unreviewed_pct": round(100 * len(unrev) / known, 1) if known else None,
+        "unreviewed_pct_lower": round(100 * len(unrev) / n, 1) if n else None,
+        "unreviewed_pct_upper": round(100 * (len(unrev) + len(unknown)) / n, 1) if n else None,
         "github_review_objects": sum(r["github_reviews"] for r in rows),
         # The channel split is reported, not just pooled, because the pooling is
         # what hid the defect: `review_only` is exactly the set v1/v2 published
@@ -397,8 +401,10 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
                              if r["reviewed_via_review"] and r["reviewed_via_comment"]),
         "findings_class": len(fnd),
         "findings_unreviewed": sum(1 for r in fnd if r["reviewed"] is False),
+        "findings_timing_unknown": sum(1 for r in fnd if r["reviewed"] is None),
         "code_class": len(code),
         "code_unreviewed": sum(1 for r in code if r["reviewed"] is False),
+        "code_timing_unknown": sum(1 for r in code if r["reviewed"] is None),
         "distinct_mergedBy": sorted({r["mergedBy"] for r in rows if r["mergedBy"]}),
         # The headline the credential cannot show: how many of these one GitHub
         # identity's merges were actually performed by a seat.
@@ -452,18 +458,22 @@ def main() -> int:
         return 0
 
     print(f"merged PRs examined: {out['n']}")
+    known_rate = f"{out['unreviewed_pct']}%" if out['unreviewed_pct'] is not None else "n/a"
+    lower = out['unreviewed_pct_lower']
+    upper = out['unreviewed_pct_upper']
+    bounds = f"{lower}–{upper}%" if lower is not None else "n/a"
     print(f"  no qualifying pre-merge discussion in either channel "
           f"(non-bot body > {args.min_body} chars; proxy, not proof of review): "
-          f"{out['unreviewed']} ({out['unreviewed_pct']}%)")
+          f"{out['unreviewed']} of {out['timing_known']} known ({known_rate}); bounds {bounds}")
     print(f"  qualifying discussion with timing unknown: {out['timing_unknown']}")
     print(f"  GitHub review objects, all PRs pooled: {out['github_review_objects']}")
     print(f"    read via comment only {out['reviewed_comment_only']}, "
           f"via review object only {out['reviewed_review_only']} "
           f"(v1/v2 published these as unread), both {out['reviewed_both']}")
-    print(f"  findings-class: {out['findings_class']}, of which unreviewed "
-          f"{out['findings_unreviewed']}")
-    print(f"  code-class:     {out['code_class']}, of which unreviewed "
-          f"{out['code_unreviewed']}")
+    print(f"  findings-class: {out['findings_class']}, no discussion {out['findings_unreviewed']}, "
+          f"timing unknown {out['findings_timing_unknown']}")
+    print(f"  code-class:     {out['code_class']}, no discussion {out['code_unreviewed']}, "
+          f"timing unknown {out['code_timing_unknown']}")
     print(f"  distinct mergedBy identities: {out['distinct_mergedBy']}")
     print(f"  temporally associated seat-merge candidates: {out['seat_performed']} "
           f"({out['seat_performed_pct']}%) {out['seat_performed_by']}")
