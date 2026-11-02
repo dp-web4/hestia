@@ -32,6 +32,17 @@ const MAGIC: &[u8; 4] = b"HSTV";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 4 + 1 + 16 + 12; // = 33
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only one-shot failure at the boundary after the file is replaced.
+#[cfg(test)]
+pub(crate) fn fail_next_save_after_rename() {
+    FAIL_AFTER_RENAME.with(|flag| flag.set(true));
+}
+
 /// The cleartext contents of the vault — serialized to JSON, then encrypted on disk.
 ///
 /// **Schema versions**
@@ -267,6 +278,11 @@ pub fn save(path: &Path, passphrase: &str, data: &VaultData) -> Result<()> {
         tmp.sync_all().map_err(|e| CoreError::io(&tmp_path, e))?;
     }
     fs::rename(&tmp_path, path).map_err(|e| CoreError::io(path, e))?;
+
+    #[cfg(test)]
+    if FAIL_AFTER_RENAME.with(|flag| flag.replace(false)) {
+        return Err(CoreError::io(path, std::io::Error::other("synthetic post-rename failure")));
+    }
 
     // Tighten permissions on Unix (rwx for owner only)
     #[cfg(unix)]
