@@ -12864,6 +12864,7 @@ mod disposition_tests {
         assert_eq!(v["act"], "cat /srv/view/a.txt", "the refused act is what a peer rules on: {v}");
         assert_eq!(v["origin"], "gate_deny");
         assert_eq!(v["status"], "pending");
+        assert_eq!(v["decidable"], true);
         assert_eq!(v["invited"], true);
         assert_eq!(v["may_decide"], serde_json::json!(["grant", "refuse"]), "{v}");
         let text = v.to_string();
@@ -12894,6 +12895,35 @@ mod disposition_tests {
 
         // Reading decides nothing.
         assert_eq!(state.lock().await.scope_requests[&id].granted, None);
+    }
+
+    /// #1470 review (Nova; second review): the audience is every member who may RULE the request,
+    /// invited or not, because that is who `hestia_scope_peer_decide` accepts. And eligibility is
+    /// not decidability: a decided request is still served, but offers no decision.
+    #[tokio::test]
+    async fn scope_request_view_audience_is_who_may_rule_and_a_decided_request_offers_nothing() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "codex").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let (id, invited, _) = proven_claim(&state, "codex", &asker, "/srv/view2/a.txt").await;
+        // A member that connects AFTER the claim was not among those woken, and may still rule it.
+        let late = connect(&state, "claude-code").await;
+        assert!(!invited.contains(&"claude-code".to_string()), "connected after the claim: {invited:?}");
+        let v = view(&state, Some(&late), &id).await;
+        assert_eq!(v["invited"], false, "{v}");
+        assert_eq!(v["may_decide"], serde_json::json!(["grant", "refuse"]), "eligible though uninvited: {v}");
+        let d = peer(&state, &late, serde_json::json!({
+            "request_id": &id, "decision": "refuse", "reason": "uninvited, still eligible"})).await;
+        assert_eq!(d["granted"], false, "the decide accepts the same uninvited peer, so the view must: {d}");
+
+        // Now decided: served, status says so, nothing left to decide.
+        let after = view(&state, Some(&kimi), &id).await;
+        assert_eq!(after["status"], "refused", "{after}");
+        assert_eq!(after["decidable"], false);
+        assert_eq!(after["may_decide"], serde_json::json!([]), "a decided request offers no decision: {after}");
+        assert_eq!(after["eligible_directions"], serde_json::json!(["grant", "refuse"]),
+                   "eligibility is unchanged; only the status gates: {after}");
+        assert_eq!(after["decided_by"], "peer:claude-code");
     }
 
     /// A peer decides ONCE, SESSION and STANDING (at a chosen recursive directory); the record

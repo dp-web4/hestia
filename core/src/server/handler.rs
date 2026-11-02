@@ -415,7 +415,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_scope_request_view",
-            "Read ONE scope request you may rule, before you rule it: the asker, the path, the refused act, its reason and status, and which decisions are yours to make (may_decide). Pass your own live session_id and the request_id from the review_request notice (hestia://scope/<id>#peer-decide). Served only to a member hestia_scope_peer_decide would let rule it: never the asker (read your own requests with hestia_scope_status), never an ineligible member. It returns the one request, never the asker's grants or other requests. Read-only and unwitnessed",
+            "Read ONE scope request you may rule, before you rule it: the asker, the path, the refused act, its reason and status, and which decisions are yours to make now (may_decide: empty unless the request is still pending; eligible_directions: what your eligibility allows). Pass your own live session_id and the request_id from the review_request notice (hestia://scope/<id>#peer-decide). Served to every member hestia_scope_peer_decide would let rule it, invited or not: never the asker (read your own requests with hestia_scope_status), never an ineligible member. It returns the one request, never the asker's grants or other requests. Read-only and unwitnessed",
         ),
         t(
             "hestia_scope_claim",
@@ -25369,6 +25369,11 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
 /// session — still works and counts against step C, so the only working read pushed the
 /// tightening further away.
 ///
+/// AUDIENCE: every member who may RULE the request, invited or not, because that is who
+/// `tool_scope_peer_decide` accepts (an invitation is a wake-up to three peers, never the
+/// boundary: the decide does not check it). Reading what you may rule is the same boundary as
+/// ruling it; `invited` says whether this caller was one of the three woken.
+///
 /// This serves the one request, never the asker's territory (no grants, no floor, no other
 /// requests), and only to a caller `tool_scope_peer_decide` would let rule it: a live session,
 /// never the asker or its aliases, and admitted by `arbiter::eligibility_for` in at least one
@@ -25428,6 +25433,11 @@ pub(crate) async fn tool_scope_request_view(state: &SharedState, args: &Value) -
                          "viewer": viewer.plugin_id }))));
     }
     let gate = req.ext.gate.as_ref();
+    // Eligibility is WHO may rule; whether anything is left to rule is the request's status.
+    // A decided, lapsed, spent or revoked request is served (the reader may want to know what
+    // happened) but offers no decision (Nova and the second review on #1470).
+    let status = req.status(now);
+    let decidable = status == "pending";
     Ok(json!({
         "request_id": req.id,
         "asker": req.plugin_id,
@@ -25439,7 +25449,8 @@ pub(crate) async fn tool_scope_request_view(state: &SharedState, args: &Value) -
         "rule": gate.map(|g| g.rule.clone()),
         "tool": gate.map(|g| g.tool.clone()),
         "subtree": gate.is_some_and(|g| g.subtree),
-        "status": req.status(now),
+        "status": status,
+        "decidable": decidable,
         "requested_at": req.requested_at,
         "expires_at": req.expires_at,
         "secs_remaining": req.expires_at.saturating_sub(now),
@@ -25447,7 +25458,8 @@ pub(crate) async fn tool_scope_request_view(state: &SharedState, args: &Value) -
         "decided_at": req.decided_at,
         "decision_reason": req.decision_reason,
         "invited": req.ext.invited_peers.contains(&viewer.plugin_id),
-        "may_decide": may_decide,
+        "eligible_directions": may_decide,
+        "may_decide": if decidable { may_decide } else { Vec::new() },
         "how_to_decide": "hestia_scope_peer_decide with your session_id, this request_id, a \
                           decision and a reason (the asker reads it)",
     }))
