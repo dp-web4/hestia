@@ -217,6 +217,18 @@ impl Vault {
         Ok(())
     }
 
+    /// Keep a rejected policy edit out of later saves. A save error can still
+    /// have an unknown disk outcome if storage failed after its rename.
+    fn edit_policy<T>(&mut self, edit: impl FnOnce(&mut VaultPolicyState) -> T) -> Result<T> {
+        let before = self.data.policy.clone();
+        let value = edit(&mut self.data.policy);
+        if let Err(error) = self.save() {
+            self.data.policy = before;
+            return Err(error);
+        }
+        Ok(value)
+    }
+
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
@@ -263,8 +275,7 @@ impl Vault {
 
     /// Replace the vault's policy state and persist.
     pub fn set_policy(&mut self, policy: VaultPolicyState) -> Result<()> {
-        self.data.policy = policy;
-        self.save()
+        self.edit_policy(|current| *current = policy)
     }
 
     /// Convenience: change just the active preset, keeping overrides + custom rules.
@@ -273,22 +284,19 @@ impl Vault {
         if !crate::policy::is_preset_name(preset_name) {
             return Err(CoreError::InvalidPreset(preset_name.to_string()));
         }
-        self.data.policy.active_preset = preset_name.to_string();
-        self.save()
+        self.edit_policy(|policy| policy.active_preset = preset_name.to_string())
     }
 
     /// Set (or replace) a per-rule override on a *preset* rule — change its
     /// decision and/or enable/disable it. This is the "edit specifically" path
     /// for the rules that ship with a preset. Sealed on success.
     pub fn set_policy_override(&mut self, rule_id: &str, ov: PolicyOverride) -> Result<()> {
-        self.data.policy.overrides.insert(rule_id.to_string(), ov);
-        self.save()
+        self.edit_policy(|policy| { policy.overrides.insert(rule_id.to_string(), ov); })
     }
 
     /// Remove a per-rule override (revert that preset rule to its default).
     pub fn clear_policy_override(&mut self, rule_id: &str) -> Result<()> {
-        self.data.policy.overrides.remove(rule_id);
-        self.save()
+        self.edit_policy(|policy| { policy.overrides.remove(rule_id); })
     }
 
     /// Set (replace) the per-`(instance, role)` policy overlay for one
@@ -302,65 +310,60 @@ impl Vault {
         role: &str,
         rules: Vec<crate::policy::PolicyRule>,
     ) -> Result<()> {
-        self.data
-            .policy
-            .set_instance_overlay(plugin_id, role, rules);
-        self.save()
+        self.edit_policy(|policy| { policy.set_instance_overlay(plugin_id, role, rules); })
     }
 
     /// Add or replace (by `id`) a custom rule layered on top of the preset.
     /// The "edit by category or specifically" path — the rule's `match` may be a
     /// category match or a tool/pattern match. Sealed on success.
     pub fn upsert_custom_rule(&mut self, rule: crate::policy::PolicyRule) -> Result<()> {
-        let rules = &mut self.data.policy.custom_rules;
-        match rules.iter_mut().find(|r| r.id == rule.id) {
-            Some(slot) => *slot = rule,
-            None => rules.push(rule),
-        }
-        self.save()
+        self.edit_policy(|policy| {
+            let rules = &mut policy.custom_rules;
+            match rules.iter_mut().find(|r| r.id == rule.id) {
+                Some(slot) => *slot = rule,
+                None => rules.push(rule),
+            }
+        })
     }
 
     /// Remove a custom rule by id. Returns whether one was removed.
     pub fn remove_custom_rule(&mut self, rule_id: &str) -> Result<bool> {
-        let before = self.data.policy.custom_rules.len();
-        self.data.policy.custom_rules.retain(|r| r.id != rule_id);
-        let removed = self.data.policy.custom_rules.len() != before;
-        self.save()?;
-        Ok(removed)
+        self.edit_policy(|policy| {
+            let before = policy.custom_rules.len();
+            policy.custom_rules.retain(|r| r.id != rule_id);
+            policy.custom_rules.len() != before
+        })
     }
 
     /// Add or replace (by `id`) a rule in a constellation-role overlay (#403
     /// role-scoped law). Overlay rules are folded into the base by strictest
     /// verdict at query time, so they can only tighten. Sealed on success.
     pub fn upsert_role_rule(&mut self, role: &str, rule: crate::policy::PolicyRule) -> Result<()> {
-        let rules = self
-            .data
-            .policy
-            .role_overlays
-            .entry(role.to_string())
-            .or_default();
-        match rules.iter_mut().find(|r| r.id == rule.id) {
-            Some(slot) => *slot = rule,
-            None => rules.push(rule),
-        }
-        self.save()
+        self.edit_policy(|policy| {
+            let rules = policy.role_overlays.entry(role.to_string()).or_default();
+            match rules.iter_mut().find(|r| r.id == rule.id) {
+                Some(slot) => *slot = rule,
+                None => rules.push(rule),
+            }
+        })
     }
 
     /// Remove a rule from a role overlay by id; drops the overlay entry when it
     /// empties (so `role_configs` builds no engine for it). Returns whether a
     /// rule was removed.
     pub fn remove_role_rule(&mut self, role: &str, rule_id: &str) -> Result<bool> {
-        let mut removed = false;
-        if let Some(rules) = self.data.policy.role_overlays.get_mut(role) {
-            let before = rules.len();
-            rules.retain(|r| r.id != rule_id);
-            removed = rules.len() != before;
-            if rules.is_empty() {
-                self.data.policy.role_overlays.remove(role);
+        self.edit_policy(|policy| {
+            let mut removed = false;
+            if let Some(rules) = policy.role_overlays.get_mut(role) {
+                let before = rules.len();
+                rules.retain(|r| r.id != rule_id);
+                removed = rules.len() != before;
+                if rules.is_empty() {
+                    policy.role_overlays.remove(role);
+                }
             }
-        }
-        self.save()?;
-        Ok(removed)
+            removed
+        })
     }
 
     // ---- Documents: config / metadata / state, enclosed in the vault ----
@@ -645,6 +648,37 @@ mod tests {
         let reopened = Vault::open(path, "p".into()).unwrap();
         assert_eq!(reopened.get_document("unrelated", "record").unwrap(), b"new");
         assert_eq!(reopened.policy().active_preset, "safety");
+    }
+
+    #[test]
+    fn rejected_policy_insert_remove_and_overlay_leave_no_staged_changes() {
+        use crate::policy::{PolicyDecision, PolicyMatch, PolicyRule};
+        let (_dir, path) = temp_path();
+        let mut vault = Vault::init(path.clone(), "p".into()).unwrap();
+        let rule = PolicyRule {
+            id: "synthetic-rule".into(), name: "synthetic".into(), priority: 5,
+            decision: PolicyDecision::Deny, reason: None, r#match: PolicyMatch::default(),
+        };
+        vault.upsert_custom_rule(rule.clone()).unwrap();
+        vault.set_policy_override("warn-network", PolicyOverride {
+            decision: Some(PolicyDecision::Deny), enabled: None,
+        }).unwrap();
+        let before = serde_json::to_value(vault.policy()).unwrap();
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+
+        assert!(vault.clear_policy_override("warn-network").is_err());
+        assert_eq!(serde_json::to_value(vault.policy()).unwrap(), before);
+        assert!(vault.remove_custom_rule("synthetic-rule").is_err());
+        assert_eq!(serde_json::to_value(vault.policy()).unwrap(), before);
+        assert!(vault.set_instance_overlay("synthetic", "role", vec![rule.clone()]).is_err());
+        assert_eq!(serde_json::to_value(vault.policy()).unwrap(), before);
+        assert!(vault.upsert_role_rule("role", rule).is_err());
+        assert_eq!(serde_json::to_value(vault.policy()).unwrap(), before);
+
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        vault.put_document("unrelated", "record", b"new".to_vec()).unwrap();
+        let reopened = Vault::open(path, "p".into()).unwrap();
+        assert_eq!(serde_json::to_value(reopened.policy()).unwrap(), before);
     }
 
     #[test]
