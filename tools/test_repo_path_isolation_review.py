@@ -7,6 +7,22 @@ import hestia_single_gate as single
 
 
 class RepoIsolation(unittest.TestCase):
+    def test_local_projection_control_really_requires_a_grant(self):
+        def path_only(path, recursive=False):
+            return "path:" + path.strip().rstrip("/") + ("/**" if recursive else "")
+
+        # _Workspace disables the gate's temp-root exemption in this test process.
+        # Materialize both paths so a missing-file rule cannot supply the denial.
+        with g._Workspace() as ws, patch.object(g.m, "_scope_entry_for_grant", path_only):
+            inside, outside = ws + "/project/file", ws + "/other/file"
+            g._materialize(inside)
+            g._materialize(outside)
+            empty_prof, empty_pol = g._policy(g._snapshot(ws, standing=[]))
+            self.assertTrue(g._verdict(empty_prof, empty_pol, ws, "Read", inside).blocks)
+            prof, pol = g._policy(g._snapshot(ws, standing=[{"path": ws + "/project", "recursive": True}]))
+            self.assertFalse(g._verdict(prof, pol, ws, "Read", inside).blocks)
+            self.assertTrue(g._verdict(prof, pol, ws, "Read", outside).blocks)
+
     def test_recursive_path_does_not_grant_foreign_remote(self):
         with g._Workspace() as ws:
             for standing, should_block in (
