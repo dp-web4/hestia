@@ -242,9 +242,16 @@ def _before_merge(items, min_body: int, merged_at: str, time_key: str):
 
     Equal timestamps are ambiguous at GitHub's timestamp precision. An edited
     body can have changed after merge even if its creation time was earlier.
+    This includes a body now below the length threshold: an edit could have
+    shortened previously qualifying text, so it is not a known negative.
     """
     prior, unknown = [], []
-    for item in _substantive(items, min_body):
+    for item in items or []:
+        if ((item.get("author") or {}).get("login")) in BOT_LOGINS:
+            continue
+        substantive = len(item.get("body") or "") > min_body
+        if not substantive and not item.get("includesCreatedEdit"):
+            continue
         stamp = item.get(time_key)
         try:
             instant = datetime.fromisoformat(stamp.replace("Z", "+00:00"))

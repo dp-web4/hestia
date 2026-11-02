@@ -396,6 +396,32 @@ def arm_review_timing_is_evidence_not_an_assumption() -> None:
     check("no known denominator is not zero percent", none_known["unreviewed_pct"] is None, str(none_known))
 
 
+def arm_shortened_edited_discussion_is_unknown() -> None:
+    """A later edit can hide a formerly qualifying pre-merge body."""
+    merge = "2026-09-01T12:00:00Z"
+    items = []
+    for number, field, stamp_key, stamp, edited in [
+        (910, "comments", "createdAt", "2026-09-01T11:59:59Z", True),
+        (911, "reviews", "submittedAt", "2026-09-01T11:59:59Z", True),
+        (912, "comments", "createdAt", "2026-09-01T12:00:01Z", True),
+        (913, "comments", "createdAt", "2026-09-01T11:59:59Z", False),
+        (914, "comments", "createdAt", None, True),
+        (915, "comments", "createdAt", "2026-09-01T12:00:00Z", True),
+    ]:
+        item = pr(number, "findings: edited short", merge)
+        item[field] = [{"author": {"login": "reviewer"}, "body": "short",
+                        stamp_key: stamp, "includesCreatedEdit": edited}]
+        items.append(item)
+    states = [row["reviewed"] for row in census(items, 200, {})["rows"]]
+    check("short edited prior bodies are unknown, not absent",
+          states == [None, None, False, False, None, None], str(states))
+
+    items[0]["reviews"] = [{"author": {"login": "reviewer"}, "body": "x" * 300,
+                            "submittedAt": "2026-09-01T11:59:59Z"}]
+    check("known qualifying discussion beats shortened edited body",
+          census([items[0]], 200, {})["rows"][0]["reviewed"] is True)
+
+
 def main() -> int:
     print("merge_review_census arms")
     for name, fn in sorted(globals().items()):
