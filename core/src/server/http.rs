@@ -12832,6 +12832,70 @@ mod disposition_tests {
         assert_eq!(state.lock().await.scope_requests[&id].granted, None, "nothing decided");
     }
 
+    async fn view(state: &SharedState, sid: Option<&str>, id: &str) -> serde_json::Value {
+        let mut b = serde_json::json!({ "request_id": id });
+        if let Some(sid) = sid {
+            b["session_id"] = serde_json::json!(sid);
+        }
+        match crate::server::handler::tool_scope_request_view(state, &b).await {
+            Ok(v) => v,
+            Err(e) => serde_json::json!({ "_err": e.to_string() }),
+        }
+    }
+
+    /// #1450 phase 0 follow-up (cbp's claude-code, 2026-11-02): once `hestia_scope_status` refused
+    /// another member's session, an invited peer had no way to read the request it was asked to
+    /// rule. `hestia_scope_request_view` serves the ONE request to a member that may rule it, and
+    /// to nobody else: not the asker, not an asserted name, not an ineligible member.
+    #[tokio::test]
+    async fn scope_request_view_serves_one_request_to_an_eligible_peer() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "codex").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let (id, invited, _) = proven_claim(&state, "codex", &asker, "/srv/view/a.txt").await;
+        // A second request by the same asker, which the view must not disclose.
+        let (other, _, _) = proven_claim(&state, "codex", &asker, "/srv/view/secret.txt").await;
+        assert!(invited.contains(&"kimi-code".to_string()), "{invited:?}");
+
+        let v = view(&state, Some(&kimi), &id).await;
+        assert_eq!(v["request_id"], id.as_str(), "{v}");
+        assert_eq!(v["asker"], "codex");
+        assert_eq!(v["path"], "/srv/view/a.txt");
+        assert_eq!(v["act"], "cat /srv/view/a.txt", "the refused act is what a peer rules on: {v}");
+        assert_eq!(v["origin"], "gate_deny");
+        assert_eq!(v["status"], "pending");
+        assert_eq!(v["invited"], true);
+        assert_eq!(v["may_decide"], serde_json::json!(["grant", "refuse"]), "{v}");
+        let text = v.to_string();
+        assert!(!text.contains(&other) && !text.contains("secret.txt"),
+                "one request, never the asker's others: {v}");
+        assert!(v.get("live_grants").is_none() && v.get("society_floor").is_none(),
+                "never the asker's territory: {v}");
+
+        // The asker reads its own requests through scope_status, not here.
+        let own = view(&state, Some(&asker), &id).await;
+        assert_eq!(own["_hestia_error"]["code"], "hestia.scope_request_view_self", "{own}");
+        // No session, or an unresolvable one: refused, nothing served.
+        for sid in [None, Some("not-a-session")] {
+            let anon = view(&state, sid, &id).await;
+            assert!(anon["_err"].as_str().unwrap_or("").contains("live session_id"), "{sid:?}: {anon}");
+        }
+        // Unknown id.
+        let unknown = view(&state, Some(&kimi), "scope-nope").await;
+        assert_eq!(unknown["_hestia_error"]["code"], "hestia.scope_request_unknown", "{unknown}");
+
+        // An ASSERTED asker's request: no peer may clear it in the granting direction, and a
+        // gate-opened ask from an asserted asker is not peer-refusable either, so it is not served.
+        let r = claim(&state, "codex", "/srv/view/asserted.txt", "cat /srv/view/asserted.txt", false).await;
+        let asserted = r["request_id"].as_str().unwrap().to_string();
+        let inel = view(&state, Some(&kimi), &asserted).await;
+        assert_eq!(inel["_hestia_error"]["code"], "hestia.scope_request_view_ineligible",
+                   "no peer may rule an asserted asker's gate-opened ask, so none may read it: {inel}");
+
+        // Reading decides nothing.
+        assert_eq!(state.lock().await.scope_requests[&id].granted, None);
+    }
+
     /// A peer decides ONCE, SESSION and STANDING (at a chosen recursive directory); the record
     /// names the peer and its NOT-SAME basis, on the request and on the standing grant.
     #[tokio::test]

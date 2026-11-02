@@ -105,6 +105,7 @@ impl ServerHandler for HestiaServer {
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
             "hestia_scope_claim" => tool_scope_claim(&self.state, &args).await,
             "hestia_scope_peer_decide" => tool_scope_peer_decide(&self.state, &args).await,
+            "hestia_scope_request_view" => tool_scope_request_view(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
             "hestia_gate_escalation_poll" => tool_gate_escalation_poll(&self.state, &args).await,
             "hestia_escalation_evidence" => tool_escalation_evidence(&self.state, &args).await,
@@ -411,6 +412,10 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_scope_peer_decide",
             "Rule ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05: scope escalations go to peers, the operator is the override). Pass your own live session_id, the request_id, decision = once | session | standing | refuse, a reason (the asker reads it), and for session/standing optionally grant_path (the asked path or a directory above it, never the root) with recursive=true, and modes (a string of r read, w write, e execute, d delete; default all four, #1345). Refused by name when: you are the asker (in either direction — the asker can never decide its own request); the asker was never proven against a session (NOT-SAME cannot peer-clear an asserted name, eligibility clause 0); you are not a recognised reasoner; the request was filed by the member rather than opened by the gate. The record names you (granted_by peer:<you>), the channel (peer_not_same) and your NOT-SAME basis",
+        ),
+        t(
+            "hestia_scope_request_view",
+            "Read ONE scope request you may rule, before you rule it: the asker, the path, the refused act, its reason and status, and which decisions are yours to make (may_decide). Pass your own live session_id and the request_id from the review_request notice (hestia://scope/<id>#peer-decide). Served only to a member hestia_scope_peer_decide would let rule it: never the asker (read your own requests with hestia_scope_status), never an ineligible member. It returns the one request, never the asker's grants or other requests. Read-only and unwitnessed",
         ),
         t(
             "hestia_scope_claim",
@@ -13627,7 +13632,10 @@ mod tests {
                     // dp 2026-10-05: gate-opened scope requests go to NOT-SAME peers. Held by
                     // the behavioural tests `scope_peer_decide_*` (self refused in both
                     // directions, asserted asker refused, record names peer and basis).
-                    || l == "hestia_scope_peer_decide",
+                    || l == "hestia_scope_peer_decide"
+                    // #1450 phase 0 follow-up: READS one request, for a member that may rule it;
+                    // decides nothing. Held by `scope_request_view_serves_one_request_to_an_eligible_peer`.
+                    || l == "hestia_scope_request_view",
                 "MCP tool `{n}` reaches the scope surface. Member-callable doors are ASKING \
                  (hestia_request_scope), READING (hestia_scope_status), and ruling ANOTHER \
                  member's request under an operator delegation (hestia_scope_arbitrate). \
@@ -25180,8 +25188,9 @@ fn scope_how_to_decide(id: &str, no_peer: bool, once_only: bool) -> String {
     format!(
         "a NOT-SAME peer decides: hestia scope decide {id} --as <peer-seat> \
          --once|--session|--standing|--refuse [--grant-path <dir> --recursive] --reason '...' \
-         (or hestia_scope_peer_decide). The asker cannot decide its own request. The operator \
-         may override on the dashboard or the app."
+         (or hestia_scope_peer_decide). Read the request first with hestia_scope_request_view. \
+         The asker cannot decide its own request. The operator may override on the dashboard \
+         or the app."
     )
 }
 
@@ -25349,6 +25358,99 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
     out["decided_by"] = json!(format!("peer:{arbiter}"));
     out["peer_basis"] = basis;
     Ok(out)
+}
+
+/// `hestia_scope_request_view` — ONE scope request, read by a member who may RULE it.
+///
+/// Phase 0 of #1450 (#1460) bound `hestia_scope_status` to its caller: a session that resolves
+/// to another member is refused. That read was also, until then, the only way an invited peer
+/// could see what it was asked to decide (cbp's claude-code on #1450, 2026-11-02: it declined
+/// codex's `scope-1ec95b7805ea` rather than rule blind). The other route left — sending no
+/// session — still works and counts against step C, so the only working read pushed the
+/// tightening further away.
+///
+/// This serves the one request, never the asker's territory (no grants, no floor, no other
+/// requests), and only to a caller `tool_scope_peer_decide` would let rule it: a live session,
+/// never the asker or its aliases, and admitted by `arbiter::eligibility_for` in at least one
+/// direction it could rule. `may_decide` names those directions, so the reader learns what it
+/// may do in the same read. Read-only and unwitnessed, like `hestia_scope_status`.
+pub(crate) async fn tool_scope_request_view(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::arbiter::{eligibility_for, AppealParties, Disposition, Eligibility};
+    use crate::server::gate_escalation::now_secs;
+    let request_id = require_string(args, "request_id")?;
+    let session_id_arg = optional_session_id(args);
+    let now = now_secs();
+    let s = state.lock().await;
+    let Some(viewer) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Err(anyhow::anyhow!(
+            "reading a scope request requires your own live session_id (from hestia_connect): \
+             it is served to a member who may rule it, and an asserted name proves nothing"
+        ));
+    };
+    let Some(req) = s.scope_requests.get(&request_id) else {
+        return Ok(hestia_error_envelope("hestia.scope_request_unknown",
+            "no such scope request (memory-only: it may have expired or the daemon restarted, \
+             #908 / #1233)", Some(json!({ "request_id": request_id }))));
+    };
+    if viewer.plugin_id == req.plugin_id || s.same_entity(&viewer.plugin_id, &req.plugin_id) {
+        return Ok(hestia_error_envelope("hestia.scope_request_view_self",
+            "this is your own request: read it, with everything else you have asked for, through \
+             hestia_scope_status",
+            Some(json!({ "request_id": request_id }))));
+    }
+    // The directions `tool_scope_peer_decide` would let this caller rule, by the same rules: a
+    // gate-opened ask carries its asker basis and may be granted or refused; a member-filed ask
+    // may only be refused by a peer.
+    let (asker_basis, directions): (_, &[(&str, Disposition)]) = match req.ext.gate.as_ref() {
+        Some(gate) => (gate.asker_basis,
+                       &[("grant", Disposition::ForAppellant), ("refuse", Disposition::AgainstAppellant)]),
+        None => (req.ext.asker_basis.unwrap_or_default(), &[("refuse", Disposition::AgainstAppellant)]),
+    };
+    let parties = AppealParties {
+        appellant: &req.plugin_id,
+        appellant_basis: asker_basis,
+        deny_adjudicator: None,
+        arbiter: &viewer.plugin_id,
+    };
+    let mut may_decide = Vec::new();
+    let mut refused_because = None;
+    for (name, disposition) in directions {
+        match eligibility_for(&parties, *disposition) {
+            Eligibility::Eligible { .. } => may_decide.push(*name),
+            Eligibility::Refused { reason } => { refused_because.get_or_insert(reason); }
+            Eligibility::SelfWithdrawal { .. } => {}
+        }
+    }
+    if may_decide.is_empty() {
+        return Ok(hestia_error_envelope("hestia.scope_request_view_ineligible",
+            &refused_because.unwrap_or_else(|| "you may not rule this request".to_string()),
+            Some(json!({ "request_id": request_id, "asker": req.plugin_id,
+                         "viewer": viewer.plugin_id }))));
+    }
+    let gate = req.ext.gate.as_ref();
+    Ok(json!({
+        "request_id": req.id,
+        "asker": req.plugin_id,
+        "asker_basis": asker_basis,
+        "path": req.path,
+        "reason": req.reason,
+        "origin": if gate.is_some() { "gate_deny" } else { "member_request" },
+        "act": gate.map(|g| g.act.clone()),
+        "rule": gate.map(|g| g.rule.clone()),
+        "tool": gate.map(|g| g.tool.clone()),
+        "subtree": gate.is_some_and(|g| g.subtree),
+        "status": req.status(now),
+        "requested_at": req.requested_at,
+        "expires_at": req.expires_at,
+        "secs_remaining": req.expires_at.saturating_sub(now),
+        "decided_by": req.decided_by,
+        "decided_at": req.decided_at,
+        "decision_reason": req.decision_reason,
+        "invited": req.ext.invited_peers.contains(&viewer.plugin_id),
+        "may_decide": may_decide,
+        "how_to_decide": "hestia_scope_peer_decide with your session_id, this request_id, a \
+                          decision and a reason (the asker reads it)",
+    }))
 }
 
 /// How long a RESERVED one-time approval waits for the gate's commit or release before it lapses
