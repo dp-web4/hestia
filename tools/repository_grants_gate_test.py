@@ -117,6 +117,21 @@ class RepositoryGrants(unittest.TestCase):
                 self.assertTrue(verdict.blocks,
                                 f"local path must not grant foreign remote: {verdict}; scope={pol.scope}")
 
+    def test_simulated_typed_path_projection_composes_with_repository_modes(self):
+        # Test-process-only hypothesis; this does not edit or install a gate.
+        def path_only(path, recursive=False):
+            return "path:" + path.strip().rstrip("/") + ("/**" if recursive else "")
+
+        self.scope["live_grants"] = [{"path": self.ws + "/project", "recursive": True}]
+        with patch.object(g.m, "_scope_entry_for_grant", path_only):
+            policy = self.policy()
+            self.assertFalse(self.verdict(repo="owner/project", policy=policy).blocks)
+            self.assertTrue(self.verdict(repo="foreign/project", policy=policy).blocks)
+            self.assertTrue(self.verdict(tool="mcp__github__delete_file",
+                                         repo="owner/project", policy=policy).blocks)
+            event = g.core.NormalizedEvent(tool="Read", paths=[self.ws + "/project/file"])
+            self.assertFalse(g.core.evaluate(event, policy[0], self.ws, policy=policy[1]).blocks)
+
     def test_certification_and_expiry(self):
         for key, values in {
             "generation": [None, True, "7"],
