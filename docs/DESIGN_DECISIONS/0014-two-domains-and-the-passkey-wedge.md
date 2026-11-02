@@ -292,6 +292,16 @@ there is no column to hold one. The primitive is correct (N marks verify against
 > onto a witnessed entry. This document stays architectural: read the sections below as the design
 > the implementation now instantiates, not as a claim that nothing is built.
 
+> **Freshness, B2 / `#339` (2026-10-14, PR pending).** The chain now has the place for a witness
+> signature: an additive `chain_signatures` table, written in the same transaction as each row,
+> over `hestia:chain-entry-signature:v1` (chain id, position, row hash, `signer_lct`, witness
+> LCT, witness public key, policy generation). **This implements the chain-witness half of §6.1
+> but not the "archive and sign from entry zero" plan above.** Following #339, the current chain
+> is *not* archived: legacy rows stay as they are and report `legacy_unsigned`, and a
+> `signed_from_position` boundary is recorded, which is the coexistence this section ruled
+> unnecessary. On a fresh chain the same code signs from entry zero with no boundary to explain.
+> Whether to archive the live chain or keep the boundary is still open for dp to rule on.
+
 > **The app should be the first signer.** It is a new surface with no legacy, its acts are
 > consequential (they fill the sovereign role), and it already depends on `ed25519-dalek`. Making the
 > app's acts signed from its first release produces the reference implementation the harness gates
