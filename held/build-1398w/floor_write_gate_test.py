@@ -143,6 +143,39 @@ def test_an_act_that_reaches_below_answers_to_the_own_narrowed_child():
         check("bash_recursive_read_capped_by_the_child", v.blocks, str(v))
 
 
+def test_recursive_read_does_not_cross_a_write_only_floor_child():
+    """The named ancestor is not the only path reached by a recursive reader."""
+    with fr._Workspace() as ws:
+        parent, child = _forum(ws), _forum(ws) + "/sub"
+        os.makedirs(child, exist_ok=True)
+        snap = _snapshot(ws, floor_by_mode=[_rw(parent),
+                          {"path": child, "recursive": True, "modes": "w"}])
+        prof, pol = fr._policy(snap)
+        # Direct nearest-node control, plus an unrelated read and allowed child write.
+        check("child_read_refused", fr._verdict(prof, pol, ws, "Read", path=child + "/x").blocks)
+        check("parent_file_read_allowed", not fr._verdict(prof, pol, ws, "Read", path=parent + "/x").blocks)
+        check("child_write_allowed", not fr._verdict(prof, pol, ws, "Write", path=child + "/x").blocks)
+        for tool in ("Grep", "search"):
+            v = fr._verdict(prof, pol, ws, tool, path=parent, materialize=False)
+            check(f"{tool}_cannot_traverse_child", v.blocks, str(v))
+        v = fr._verdict(prof, pol, ws, "Bash", command=f"grep -rn x {parent}")
+        check("recursive_shell_read_cannot_traverse_child", v.blocks, str(v))
+
+
+def test_recursive_write_does_not_cross_a_read_only_floor_child():
+    with fr._Workspace() as ws:
+        parent, child = _forum(ws), _forum(ws) + "/sub"
+        os.makedirs(child, exist_ok=True)
+        snap = _snapshot(ws, floor_by_mode=[_rw(parent),
+                          {"path": child, "recursive": True, "modes": "r"}])
+        prof, pol = fr._policy(snap)
+        check("child_write_refused", fr._verdict(prof, pol, ws, "Write", path=child + "/x").blocks)
+        check("child_read_allowed", not fr._verdict(prof, pol, ws, "Read", path=child + "/x").blocks)
+        check("parent_file_write_allowed", not fr._verdict(prof, pol, ws, "Write", path=parent + "/x").blocks)
+        v = fr._verdict(prof, pol, ws, "git_restore", path=parent, materialize=False)
+        check("recursive_restore_cannot_traverse_child", v.blocks, str(v))
+
+
 def test_an_exact_floor_entry_does_not_reach_its_children():
     with fr._Workspace() as ws:
         snap = _snapshot(ws, floor_by_mode=[_rw(_forum(ws), recursive=False)])
@@ -199,6 +232,8 @@ ALL = [
     test_the_floor_fills_only_where_no_own_grant_reaches,
     test_an_own_grant_above_the_floor_entry_is_not_widened_by_it,
     test_an_act_that_reaches_below_answers_to_the_own_narrowed_child,
+    test_recursive_read_does_not_cross_a_write_only_floor_child,
+    test_recursive_write_does_not_cross_a_read_only_floor_child,
     test_an_exact_floor_entry_does_not_reach_its_children,
     test_malformed_and_all_mode_rows_admit_nothing,
     test_an_older_daemon_admits_nothing_extra,
