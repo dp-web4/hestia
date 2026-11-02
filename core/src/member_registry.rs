@@ -352,12 +352,28 @@ pub fn vouch_witnessing_key(
     plugin_id: &str,
     operational_pubkey: web4_core::PublicKey,
 ) -> bool {
-    let mut persisted: Vec<PersistedMember> =
-        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
-            .unwrap_or_default();
+    let mut persisted = match load_persisted_members_checked(vault) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("[members] REFUSED: member registry is unreadable or ambiguous ({e:#})");
+            return false;
+        }
+    };
     let Some(p) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) else {
         return false;
     };
+    let Some(current) = registry.members.get(plugin_id) else {
+        eprintln!("[members] REFUSED: member is absent from the current registry; reconcile first");
+        return false;
+    };
+    let same = match (serde_json::to_value(current), serde_json::to_value(&p.lct)) {
+        (Ok(current), Ok(saved)) => current == saved,
+        _ => false,
+    };
+    if !same {
+        eprintln!("[members] REFUSED: in-memory and saved member identities disagree; reconcile first");
+        return false;
+    }
     // A FILLER IS NEVER A WITNESS. Three minted fillers conferring the plane's own being
     // is the lean path's refusal one altitude up (cbp, 2026-09-03): a filler's key is the
     // plane's key, so its attestation is the plane witnessing itself under another name —
@@ -390,9 +406,7 @@ pub fn vouch_witnessing_key(
     }
     p.lct
         .authorize_operational_key(web4_core::WITNESS_PURPOSE, operational_pubkey, &binding_kp);
-    if let Some(lct) = registry.members.get_mut(plugin_id) {
-        *lct = p.lct.clone();
-    }
+    let updated = p.lct.clone();
     if let Err(e) = crate::vault::save_doc(
         vault,
         MEMBERS_NAMESPACE,
@@ -405,6 +419,7 @@ pub fn vouch_witnessing_key(
         );
         return false;
     }
+    registry.members.insert(plugin_id.to_string(), updated);
     true
 }
 
