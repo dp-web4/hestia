@@ -279,6 +279,14 @@ fn load_persisted_members_checked(vault: &crate::vault::Vault) -> anyhow::Result
                         "member registry contains an empty or noncanonical member id");
         anyhow::ensure!(ids.insert(member.plugin_id.clone()), "member registry contains a duplicate member id");
         anyhow::ensure!(identities.insert(member.lct.lct_id()), "member registry contains a duplicate member identity");
+        anyhow::ensure!(member.lct.verify_binding(), "member registry contains an invalid identity binding");
+        let decoded = zeroize::Zeroizing::new(hex::decode(&member.keypair_secret_hex)
+            .map_err(|_| anyhow::anyhow!("member registry contains an invalid custodial key"))?);
+        let secret = zeroize::Zeroizing::new(<[u8; 32]>::try_from(decoded.as_slice())
+            .map_err(|_| anyhow::anyhow!("member registry contains an invalid custodial key"))?);
+        let keypair = web4_core::crypto::KeyPair::from_secret_bytes(&secret);
+        anyhow::ensure!(keypair.verifying_key() == member.lct.public_key,
+                        "member registry contains a custodial key that does not bind its identity");
     }
     Ok(persisted)
 }
