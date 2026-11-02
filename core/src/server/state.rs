@@ -1900,7 +1900,7 @@ impl ServerState {
             }
             if !standing.is_empty() {
                 crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &scope)
-                    .context("NOTHING changed: the standing-scope document did not persist")?;
+                    .context("standing-scope save outcome is unknown; inspect and reconcile vault, in-memory authority and witness before retrying")?;
                 *self.standing_scope = scope;
                 self.standing_scope_dirty = false;
             }
@@ -1930,22 +1930,15 @@ impl ServerState {
                 }
                 if !delegations.is_empty() {
                     store.save(&mut self.vault).context(
-                        "NOT RETIRED: the standing grants are revoked, but the delegation store \
-                         did not persist, so this id's delegations are still in force -- nothing \
-                         was marked retired; retry")?;
+                        "delegation save outcome is unknown; inspect and reconcile vault, in-memory \
+                         authority and witness before retrying")?;
                 }
             }
         }
         crate::server::retirement::save(&mut self.vault, &retired).with_context(|| {
-            if standing.is_empty() && delegations.is_empty() {
-                "NOTHING changed: the retirement did not persist".to_string()
-            } else {
-                // Names ONLY what landed. The live grants are revoked further down and have not
-                // been reached from here (cbp, #1106, finding 3).
-                format!("HALF landed: {} standing grant(s) and {} delegation(s) are revoked, and \
-                         nothing else -- the retirement did not persist, and this id's live grants \
-                         are untouched; retry", standing.len(), delegations.len())
-            }
+            format!("retirement save outcome is unknown; prior successful save steps included \
+                     {} standing grant(s) and {} delegation(s); inspect and reconcile vault, in-memory \
+                     authority and witness before retrying", standing.len(), delegations.len())
         })?;
         self.retired_members = retired;
         let mut live: Vec<String> = Vec::new();

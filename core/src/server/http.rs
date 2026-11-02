@@ -8248,7 +8248,8 @@ async fn agent_reinstate(
     };
     if let Err(e) = s.commit_retirement(&reason, |st| { st.reinstate(&plugin_id); None }) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("still retired: {e}"), "intentEntryHash": intent.hash })));
+            "error": format!("reinstatement outcome is unknown; inspect and reconcile vault, in-memory authority and witness before retrying: {e:#}"),
+            "intentEntryHash": intent.hash })));
     }
     let mut done = record;
     if let Some(m) = done.as_object_mut() {
