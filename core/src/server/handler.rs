@@ -30373,7 +30373,7 @@ mod delegated_scope_arbitration_tests {
                 member_registry,
                 plugin,
                 kp.verifying_key()
-            ),
+            ).unwrap(),
             "the test arbiter must be a registered member whose binding key can vouch"
         );
         (sid, kp)

@@ -2154,7 +2154,7 @@ fn cmd_witness_onboard(home: &std::path::Path, plugin_id: &str, target: &str) ->
              Nothing to onboard."
         );
     }
-    if hestia::member_registry::vouch_witnessing_key(&mut vault, &mut reg, plugin_id, op_kp.verifying_key()) {
+    if hestia::member_registry::vouch_witnessing_key(&mut vault, &mut reg, plugin_id, op_kp.verifying_key())? {
         let id = reg.get(plugin_id).map(|l| l.lct_id()).unwrap_or_default();
         println!("Vouched operational witnessing key for '{plugin_id}'.");
         println!("  witness LCT id: {id}");

@@ -344,27 +344,22 @@ pub fn attach_citizenship(
 ///
 /// A one-time, vault-attended act (the sealed binding key signs once); thereafter
 /// the member witnesses autonomously with the operational key. Located by
-/// `plugin_id`; re-persists. Returns `false` if the member is unknown or its
-/// sealed binding secret can't be recovered (fail-closed — never a forged vouch).
+/// `plugin_id`; re-persists. `Ok(false)` is a pre-save refusal. `Err` may mean
+/// that a save took effect even though its acknowledgment failed: callers must
+/// inspect and reconcile before retrying, not interpret it as no effect.
 pub fn vouch_witnessing_key(
     vault: &mut crate::vault::Vault,
     registry: &mut MemberRegistry,
     plugin_id: &str,
     operational_pubkey: web4_core::PublicKey,
-) -> bool {
-    let mut persisted = match load_persisted_members_checked(vault) {
-        Ok(rows) => rows,
-        Err(e) => {
-            eprintln!("[members] REFUSED: member registry is unreadable or ambiguous ({e:#})");
-            return false;
-        }
-    };
+) -> anyhow::Result<bool> {
+    let mut persisted = load_persisted_members_checked(vault)?;
     let Some(p) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) else {
-        return false;
+        return Ok(false);
     };
     let Some(current) = registry.members.get(plugin_id) else {
         eprintln!("[members] REFUSED: member is absent from the current registry; reconcile first");
-        return false;
+        return Ok(false);
     };
     let same = match (serde_json::to_value(current), serde_json::to_value(&p.lct)) {
         (Ok(current), Ok(saved)) => current == saved,
@@ -372,7 +367,7 @@ pub fn vouch_witnessing_key(
     };
     if !same {
         eprintln!("[members] REFUSED: in-memory and saved member identities disagree; reconcile first");
-        return false;
+        return Ok(false);
     }
     // A FILLER IS NEVER A WITNESS. Three minted fillers conferring the plane's own being
     // is the lean path's refusal one altitude up (cbp, 2026-09-03): a filler's key is the
@@ -385,7 +380,7 @@ pub fn vouch_witnessing_key(
             "[members] REFUSED: '{plugin_id}' is a filler (an invoked role occupant signed \
              custodially by this plane), and a filler is never a witness — vouch refused"
         );
-        return false;
+        return Ok(false);
     }
     // Recover the custodial binding keypair (sealed in the vault) to sign the vouch.
     let Some(binding_kp) = hex::decode(&p.keypair_secret_hex)
@@ -396,13 +391,13 @@ pub fn vouch_witnessing_key(
         eprintln!(
             "[members] WARNING: cannot recover binding key for '{plugin_id}' — vouch refused"
         );
-        return false;
+        return Ok(false);
     };
     if binding_kp.verifying_key() != p.lct.public_key {
         eprintln!(
             "[members] WARNING: sealed key for '{plugin_id}' does not bind its LCT — vouch refused"
         );
-        return false;
+        return Ok(false);
     }
     p.lct
         .authorize_operational_key(web4_core::WITNESS_PURPOSE, operational_pubkey, &binding_kp);
@@ -413,15 +408,13 @@ pub fn vouch_witnessing_key(
     let bytes = match serde_json::to_vec_pretty(&persisted) {
         Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!("[members] WARNING: serializing witnessing-key vouch failed ({e})");
-            return false;
+            return Err(e.into());
         }
     };
     if let Err(e) = vault.put_documents(MEMBERS_NAMESPACE, &[(MEMBERS_DOC.to_string(), bytes)]) {
-        eprintln!(
-            "[members] WARNING: witnessing-key vouch outcome is unknown for '{plugin_id}' ({e}); reconcile before retry"
-        );
-        return false;
+        return Err(anyhow::anyhow!(
+            "witnessing-key vouch outcome is unknown for '{plugin_id}' ({e}); inspect and reconcile before retry"
+        ));
     }
     // Match the existing save_doc migration behavior on successful persistence.
     if let Some(legacy) = vault.home_dir().map(|home| home.join(MEMBERS_LEGACY_FILE)) {
@@ -430,7 +423,7 @@ pub fn vouch_witnessing_key(
         }
     }
     registry.members.insert(plugin_id.to_string(), updated);
-    true
+    Ok(true)
 }
 
 /// Build the verifiable legacy alias tying a member LCT to its pre-LCT label.
@@ -702,7 +695,7 @@ mod tests {
         let before = serde_json::to_vec(registry.get("test-seat").unwrap()).unwrap();
         vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
         let key = web4_core::crypto::KeyPair::generate();
-        assert!(!vouch_witnessing_key(&mut vault, &mut registry, "test-seat", key.verifying_key()));
+        assert!(vouch_witnessing_key(&mut vault, &mut registry, "test-seat", key.verifying_key()).is_err());
         let after = serde_json::to_vec(registry.get("test-seat").unwrap()).unwrap();
         assert!(before == after, "a failed vouch must not publish the new key in memory");
     }
@@ -715,7 +708,7 @@ mod tests {
         let key = web4_core::crypto::KeyPair::generate();
         let pubkey = key.verifying_key();
         vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
-        assert!(!vouch_witnessing_key(&mut vault, &mut registry, "test-seat", pubkey.clone()));
+        assert!(vouch_witnessing_key(&mut vault, &mut registry, "test-seat", pubkey.clone()).is_err());
         let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
         assert!(load_members_checked(&reopened).unwrap().get("test-seat").unwrap()
                     .operational_key_for(web4_core::WITNESS_PURPOSE) != Some(pubkey.clone()),
@@ -739,7 +732,7 @@ mod tests {
         std::fs::write(&legacy, bytes).unwrap();
         let key = web4_core::crypto::KeyPair::generate();
         let pubkey = key.verifying_key();
-        assert!(vouch_witnessing_key(&mut vault, &mut registry, "test-seat", pubkey.clone()));
+        assert!(vouch_witnessing_key(&mut vault, &mut registry, "test-seat", pubkey.clone()).unwrap());
         assert!(!legacy.exists(), "successful migration should remove the legacy sidecar");
         let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
         assert_eq!(load_members_checked(&reopened).unwrap().get("test-seat").unwrap()
@@ -754,17 +747,15 @@ mod tests {
         let key = web4_core::crypto::KeyPair::generate();
         let pubkey = key.verifying_key();
         crate::vault::storage::fail_next_save_after_rename();
-        let ok = vouch_witnessing_key(&mut vault, &mut registry, "test-seat", pubkey.clone());
+        let result = vouch_witnessing_key(&mut vault, &mut registry, "test-seat", pubkey.clone());
         let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
         let disk_has_key = load_members_checked(&reopened).unwrap().get("test-seat").unwrap()
             .operational_key_for(web4_core::WITNESS_PURPOSE) == Some(pubkey.clone());
         let memory_has_key = registry.get("test-seat").unwrap()
             .operational_key_for(web4_core::WITNESS_PURPOSE) == Some(pubkey);
-        assert!(!ok && disk_has_key && !memory_has_key,
+        assert!(result.is_err() && disk_has_key && !memory_has_key,
                 "fault must reproduce an ambiguous saved effect, not a pre-commit failure");
-        // The current bool return cannot represent this third state. This
-        // expectation remains red until callers can handle unknown outcomes.
-        assert!(ok || !disk_has_key, "false cannot be interpreted as proof of no durable effect");
+        assert!(format!("{:#}", result.unwrap_err()).contains("outcome is unknown"));
     }
 
     #[test]
@@ -856,7 +847,7 @@ mod tests {
                 &mut reg,
                 "ollama:qwen3:2b@sha256:8f1c",
                 op.verifying_key()
-            ),
+            ).unwrap(),
             "a filler is never a witness"
         );
         assert_eq!(
@@ -880,7 +871,7 @@ mod tests {
             &mut reg,
             "claude-code",
             op.verifying_key()
-        ));
+        ).unwrap());
         assert_eq!(
             reg.get("claude-code")
                 .unwrap()
@@ -984,7 +975,7 @@ mod tests {
             &mut reg,
             "legion-witness",
             operational.verifying_key()
-        ));
+        ).unwrap());
         // resolvable from the member LCT, no roster
         let lct = reg.get("legion-witness").unwrap();
         assert_eq!(
@@ -1006,7 +997,7 @@ mod tests {
             &mut reg,
             "ghost",
             operational.verifying_key()
-        ));
+        ).unwrap());
     }
 
     #[test]
