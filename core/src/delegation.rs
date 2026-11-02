@@ -423,7 +423,22 @@ pub fn parse_role(s: &str) -> Result<SocietyRole> {
 /// did not have. The delegator id is the UUIDv5 of the signing key's derived LCT id, so a
 /// reader can recompute who signed from the key alone.
 pub fn operator_delegator(vault: &crate::vault::Vault, home: &std::path::Path) -> Result<(Uuid, KeyPair)> {
-    let secret_hex: String = match std::fs::read_to_string(home.join("operator.key")) {
+    operator_delegator_from(vault, &std::fs::read_to_string(home.join("operator.key")))
+}
+
+/// [`operator_delegator`] over an `operator.key` read the caller already made, so a caller that
+/// caches the verifier (the delegation gate) parses the key from the SAME bytes it fingerprinted.
+/// Only `NotFound` falls back to the vault's `ai_identity_secret`: any other read error (a
+/// permission change, a transient I/O fault) is reported, never silently answered with a
+/// different key.
+pub fn operator_delegator_from(
+    vault: &crate::vault::Vault,
+    read: &std::io::Result<String>,
+) -> Result<(Uuid, KeyPair)> {
+    let secret_hex: String = match read {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            anyhow::bail!("operator.key exists but could not be read ({e}); refusing to fall back to another key")
+        }
         Ok(text) => {
             let v: serde_json::Value = serde_json::from_str(&text).context("operator.key is not JSON")?;
             v.get("secret_key_hex")
@@ -695,5 +710,29 @@ mod tests {
         let recovered: DelegationStore = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered.delegations.len(), 1);
         assert!(recovered.delegations[0].is_active());
+    }
+
+    /// #1323 review: only a MISSING operator.key may fall back to the vault key. An unreadable
+    /// one (permission, I/O fault) is an error, never an answer from a different key; and a
+    /// readable one is parsed from the bytes handed in, not re-read.
+    #[test]
+    fn only_a_missing_operator_key_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = crate::vault::Vault::init(dir.path().join("v"), "test-passphrase".into()).unwrap();
+        let denied: std::io::Result<String> =
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let Err(err) = operator_delegator_from(&vault, &denied) else {
+            panic!("an unreadable operator.key must not resolve to any key")
+        };
+        assert!(format!("{err:#}").contains("refusing to fall back"), "{err:#}");
+        let missing: std::io::Result<String> = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        // A fresh vault has no ai_identity_secret, so the fallback is taken and finds nothing.
+        let Err(err) = operator_delegator_from(&vault, &missing) else {
+            panic!("a fresh vault has no identity key to fall back to")
+        };
+        assert!(format!("{err:#}").contains("no operator key on this box"), "{err:#}");
+        let text = serde_json::json!({"secret_key_hex": hex::encode([7u8; 32])}).to_string();
+        let (_, kp) = operator_delegator_from(&vault, &Ok(text)).unwrap();
+        assert_eq!(kp.verifying_key(), KeyPair::from_secret_bytes(&[7u8; 32]).verifying_key());
     }
 }

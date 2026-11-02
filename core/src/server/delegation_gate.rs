@@ -273,6 +273,18 @@ impl Snapshot {
         members: &crate::member_registry::MemberRegistry,
         roles: &web4_core::RoleRegistry,
     ) -> Self {
+        Self::build_with_key(vault, &std::fs::read_to_string(home.join("operator.key")), members, roles)
+    }
+
+    /// [`Snapshot::build`] with the `operator.key` read already made, so the verifier is parsed
+    /// from exactly the bytes the cache fingerprinted (#1323 review: a size+mtime fingerprint
+    /// kept a replaced key trusted).
+    pub fn build_with_key(
+        vault: &crate::vault::Vault,
+        operator_key_read: &std::io::Result<String>,
+        members: &crate::member_registry::MemberRegistry,
+        roles: &web4_core::RoleRegistry,
+    ) -> Self {
         let mut s = Snapshot { loaded_at: Some(Utc::now()), ..Default::default() };
         match load_mode(vault) {
             Ok(Some(doc)) => {
@@ -286,7 +298,7 @@ impl Snapshot {
             Ok(st) => s.store = Some(st),
             Err(e) => s.store_error = Some(format!("{e:#}")),
         }
-        match crate::delegation::operator_delegator(vault, home) {
+        match crate::delegation::operator_delegator_from(vault, operator_key_read) {
             Ok((_, kp)) => s.operator_key = Some(kp.verifying_key()),
             Err(e) => s.operator_key_error = Some(format!("{e:#}")),
         }
@@ -308,13 +320,16 @@ impl Snapshot {
 
 /// What identifies the inputs, so the snapshot is rebuilt only when one changed: the vault's
 /// save generation (moves on every save), the member and role counts (a member minted on
-/// connect), and `operator.key` on disk (the verification key; written outside the vault).
+/// connect), and the CONTENT of `operator.key` (the verification key; written outside the
+/// vault). Content, not size+mtime: equal metadata is not evidence of equal bytes, and a key
+/// replaced under a preserved mtime must not stay trusted. A read error is fingerprinted by its
+/// kind, so a key becoming unreadable also rebuilds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Fingerprint {
     vault_generation: u64,
     members: usize,
     roles: usize,
-    operator_key: Option<(std::time::SystemTime, u64)>,
+    operator_key: Result<String, std::io::ErrorKind>,
 }
 
 /// The daemon's handle: the cached snapshot, refreshed at every state-lock release whose
@@ -339,20 +354,21 @@ impl DelegationGate {
     }
 
     /// Rebuild the snapshot if an input changed. Called with the state lock held (at release and
-    /// at open), so it sees one consistent state. Cost when nothing changed: one `stat`.
+    /// at open), so it sees one consistent state. Cost when nothing changed: one read of a
+    /// ~80-byte file.
     pub fn refresh(
         &self,
         vault: &crate::vault::Vault,
         members: &crate::member_registry::MemberRegistry,
         roles: &web4_core::RoleRegistry,
     ) {
+        // ONE read: the fingerprint and the verifier come from the same bytes.
+        let key_read = std::fs::read_to_string(self.home.join("operator.key"));
         let fp = Fingerprint {
             vault_generation: vault.generation(),
             members: members.iter_sorted().len(),
             roles: roles.len(),
-            operator_key: std::fs::metadata(self.home.join("operator.key"))
-                .ok()
-                .and_then(|m| Some((m.modified().ok()?, m.len()))),
+            operator_key: key_read.as_ref().map(Clone::clone).map_err(|e| e.kind()),
         };
         {
             let r = self.cache.read().unwrap_or_else(|p| p.into_inner());
@@ -360,7 +376,7 @@ impl DelegationGate {
                 return;
             }
         }
-        let snap = Arc::new(Snapshot::build(vault, &self.home, members, roles));
+        let snap = Arc::new(Snapshot::build_with_key(vault, &key_read, members, roles));
         *self.cache.write().unwrap_or_else(|p| p.into_inner()) = Some((fp, snap));
     }
 
