@@ -506,6 +506,8 @@ export interface AgentRow {
   launchers?: BeingLauncher[];
   /** The MEMBER id (agent-inventory `member`); `plugin` is the older fallback. */
   member?: string;
+  /** Multiple governance ids explicitly found in launchers, when present. */
+  members?: string[];
   /** Each registered hook target, qualified: a hestia gate is `is_gate && owned_by_hestia`. */
   hook_targets?: HookTarget[];
 }

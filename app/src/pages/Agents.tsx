@@ -95,8 +95,13 @@ export function unaccountedMembers(
   const accounted = new Set<string>();
   for (const r of inv?.detail ?? []) {
     if (r.plugin) accounted.add(r.plugin);
+    if (r.member) accounted.add(r.member);
+    for (const member of r.members ?? []) if (member) accounted.add(member);
     if (r.kind === "being" && machine) accounted.add(`${machine}-being`);
-    for (const l of r.launchers ?? []) if (l.member) accounted.add(l.member);
+    for (const l of r.launchers ?? []) {
+      if (l.member) accounted.add(l.member);
+      for (const member of l.members_in_unit ?? []) if (member) accounted.add(member);
+    }
   }
   const acts = new Map<string, number>();
   for (const t of snap.trust ?? []) {

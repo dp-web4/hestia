@@ -273,6 +273,15 @@ describe("Agents", () => {
       ]);
     });
 
+    it("does not offer retirement for governance member ids that differ from the plugin", () => {
+      const inv = inventory([{ ...claude, plugin: "adapter-name", member: "actual-member",
+                               members: ["second-member"],
+                               launchers: [{ unit: "test", member: null, members_in_unit: ["third-member"],
+                                             sets_hestia_env: true, enabled_on_disk: true }] }]);
+      expect(unaccountedMembers(inv, { members: ["adapter-name", "actual-member", "second-member", "third-member", "orphan"],
+                                       trust: [], retired: [] })).toEqual([{ id: "orphan", actions: 0, retired: false }]);
+    });
+
     it("offers retire on a phantom id, and on no installed agent's row", async () => {
       operatorStatus.mockResolvedValue(signedIn);
       agentsInventory.mockResolvedValue(inventory([claude, codex]));
