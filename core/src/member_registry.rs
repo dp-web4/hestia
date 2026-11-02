@@ -295,12 +295,26 @@ fn registry_from_persisted(persisted: Vec<PersistedMember>) -> MemberRegistry {
     MemberRegistry { members, fillers }
 }
 
+/// Write a whole validated roster without retaining a failed pre-save mutation
+/// in the vault's in-memory document index. Errors after replacement remain
+/// ambiguous and require caller-side reconciliation.
+fn save_persisted_members(vault: &mut crate::vault::Vault, rows: &[PersistedMember]) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(rows)?;
+    vault.put_documents(MEMBERS_NAMESPACE, &[(MEMBERS_DOC.to_string(), bytes)])?;
+    if let Some(legacy) = vault.home_dir().map(|home| home.join(MEMBERS_LEGACY_FILE)) {
+        if legacy.exists() {
+            let _ = std::fs::remove_file(legacy);
+        }
+    }
+    Ok(())
+}
+
 /// Attach a citizenship reference to a member's LCT and re-persist, so the member
 /// now *carries* proof-of-citizenship (a tamper-evident pointer to the ledger
 /// record — the authoritative home stays the ledger). Located by `plugin_id`, not
 /// by lct_id, since that's the durable member key. Idempotent: a reference already
-/// present (same society + entry) is not duplicated. Returns `true` if the member
-/// exists and the reference is now attached (added or already present).
+/// present (same society + entry) is not duplicated. `Ok(false)` is a pre-save
+/// refusal. `Err` can mean the save took effect and requires reconciliation.
 ///
 /// The subject's `citizenships` is plural (one per society), so this appends —
 /// it never overwrites another society's citizenship (the plurality reshape).
@@ -309,31 +323,25 @@ pub fn attach_citizenship(
     registry: &mut MemberRegistry,
     plugin_id: &str,
     citizenship: web4_core::BirthCertificateRef,
-) -> bool {
-    let Some(lct) = registry.members.get_mut(plugin_id) else {
-        return false;
-    };
-    if !lct.citizenships.contains(&citizenship) {
-        lct.citizenships.push(citizenship);
+) -> anyhow::Result<bool> {
+    let Some(current) = registry.members.get(plugin_id) else { return Ok(false); };
+    let mut persisted = load_persisted_members_checked(vault)?;
+    let Some(saved) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) else { return Ok(false); };
+    if serde_json::to_value(current)? != serde_json::to_value(&saved.lct)? {
+        return Ok(false);
     }
-    // Re-persist the whole roster (the member's keypair secret is reloaded from
-    // the existing doc so the persisted record stays complete).
-    let mut persisted: Vec<PersistedMember> =
-        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
-            .unwrap_or_default();
-    if let Some(p) = persisted.iter_mut().find(|p| p.plugin_id == plugin_id) {
-        p.lct = lct.clone();
-        if let Err(e) = crate::vault::save_doc(
-            vault,
-            MEMBERS_NAMESPACE,
-            MEMBERS_DOC,
-            MEMBERS_LEGACY_FILE,
-            &persisted,
-        ) {
-            eprintln!("[members] WARNING: persisting citizenship for '{plugin_id}' failed ({e})");
-        }
+    let mut updated = current.clone();
+    if !updated.citizenships.contains(&citizenship) {
+        updated.citizenships.push(citizenship);
     }
-    true
+    saved.lct = updated.clone();
+    if let Err(e) = save_persisted_members(vault, &persisted) {
+        return Err(anyhow::anyhow!(
+            "citizenship attachment outcome is unknown for '{plugin_id}' ({e}); inspect and reconcile before retry"
+        ));
+    }
+    registry.members.insert(plugin_id.to_string(), updated);
+    Ok(true)
 }
 
 /// Vouch a member's **operational witnessing key** on its LCT (concord ruling (B),
@@ -402,25 +410,10 @@ pub fn vouch_witnessing_key(
     p.lct
         .authorize_operational_key(web4_core::WITNESS_PURPOSE, operational_pubkey, &binding_kp);
     let updated = p.lct.clone();
-    // Use the vault's batch document path so a pre-save failure restores the
-    // in-memory document index; a generic error can still be post-rename and
-    // therefore does not establish that the file was unchanged.
-    let bytes = match serde_json::to_vec_pretty(&persisted) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return Err(e.into());
-        }
-    };
-    if let Err(e) = vault.put_documents(MEMBERS_NAMESPACE, &[(MEMBERS_DOC.to_string(), bytes)]) {
+    if let Err(e) = save_persisted_members(vault, &persisted) {
         return Err(anyhow::anyhow!(
             "witnessing-key vouch outcome is unknown for '{plugin_id}' ({e}); inspect and reconcile before retry"
         ));
-    }
-    // Match the existing save_doc migration behavior on successful persistence.
-    if let Some(legacy) = vault.home_dir().map(|home| home.join(MEMBERS_LEGACY_FILE)) {
-        if legacy.exists() {
-            let _ = std::fs::remove_file(legacy);
-        }
     }
     registry.members.insert(plugin_id.to_string(), updated);
     Ok(true)
@@ -710,10 +703,65 @@ mod tests {
         let reference = web4_core::BirthCertificateRef {
             issuing_society: "synthetic-society".into(), entry_id: "1".into(), entry_hash: "test".into(),
         };
-        let success = attach_citizenship(&mut vault, &mut registry, "test-seat", reference);
+        let result = attach_citizenship(&mut vault, &mut registry, "test-seat", reference);
         let after = serde_json::to_vec(registry.get("test-seat").unwrap()).unwrap();
-        assert!(!success && before == after,
+        assert!(result.is_err() && before == after,
                 "unreadable registry must not report or publish a citizenship attachment");
+    }
+
+    #[test]
+    fn citizenship_attach_pre_save_failure_does_not_leak_to_later_save() {
+        let (dir, mut vault) = fresh_vault();
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let reference = web4_core::BirthCertificateRef {
+            issuing_society: "synthetic-society".into(), entry_id: "1".into(), entry_hash: "test".into(),
+        };
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+        let result = attach_citizenship(&mut vault, &mut registry, "test-seat", reference.clone());
+        assert!(format!("{:#}", result.unwrap_err()).contains("outcome is unknown"));
+        assert!(!registry.get("test-seat").unwrap().citizenships.contains(&reference));
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        vault.put_document("fixture", "unrelated", b"synthetic".to_vec()).unwrap();
+        let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        assert!(!load_members_checked(&reopened).unwrap().get("test-seat").unwrap().citizenships.contains(&reference));
+    }
+
+    #[test]
+    fn citizenship_attach_post_rename_reports_unknown_effect() {
+        let (dir, mut vault) = fresh_vault();
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let reference = web4_core::BirthCertificateRef {
+            issuing_society: "synthetic-society".into(), entry_id: "1".into(), entry_hash: "test".into(),
+        };
+        crate::vault::storage::fail_next_save_after_rename();
+        let result = attach_citizenship(&mut vault, &mut registry, "test-seat", reference.clone());
+        assert!(format!("{:#}", result.unwrap_err()).contains("outcome is unknown"));
+        assert!(!registry.get("test-seat").unwrap().citizenships.contains(&reference));
+        let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        assert!(load_members_checked(&reopened).unwrap().get("test-seat").unwrap().citizenships.contains(&reference),
+                "the fault must happen after replacement and leave the effect ambiguous");
+    }
+
+    #[test]
+    fn citizenship_attach_idempotent_call_migrates_legacy_registry() {
+        let (dir, mut vault) = fresh_vault();
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let reference = web4_core::BirthCertificateRef {
+            issuing_society: "synthetic-society".into(), entry_id: "1".into(), entry_hash: "test".into(),
+        };
+        assert!(attach_citizenship(&mut vault, &mut registry, "test-seat", reference.clone()).unwrap());
+        let bytes = vault.get_document(MEMBERS_NAMESPACE, MEMBERS_DOC).unwrap().to_vec();
+        vault.remove_document(MEMBERS_NAMESPACE, MEMBERS_DOC).unwrap();
+        let legacy = dir.path().join(MEMBERS_LEGACY_FILE);
+        std::fs::write(&legacy, bytes).unwrap();
+        assert!(attach_citizenship(&mut vault, &mut registry, "test-seat", reference.clone()).unwrap());
+        assert!(!legacy.exists());
+        let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        assert_eq!(load_members_checked(&reopened).unwrap().get("test-seat").unwrap().citizenships,
+                   vec![reference]);
     }
 
     #[test]
@@ -947,13 +995,13 @@ mod tests {
             &mut reg,
             "claude-code",
             cref.clone()
-        ));
+        ).unwrap());
         assert_eq!(
             reg.get("claude-code").unwrap().citizenships,
             vec![cref.clone()]
         );
         // idempotent: attaching the same ref again does not duplicate
-        attach_citizenship(&mut vault, &mut reg, "claude-code", cref.clone());
+        assert!(attach_citizenship(&mut vault, &mut reg, "claude-code", cref.clone()).unwrap());
         assert_eq!(reg.get("claude-code").unwrap().citizenships.len(), 1);
         // a SECOND society's citizenship appends (plurality), never overwrites
         let cref2 = web4_core::BirthCertificateRef {
@@ -961,13 +1009,13 @@ mod tests {
             entry_id: "7".into(),
             entry_hash: "cafe".into(),
         };
-        attach_citizenship(&mut vault, &mut reg, "claude-code", cref2.clone());
+        assert!(attach_citizenship(&mut vault, &mut reg, "claude-code", cref2.clone()).unwrap());
         assert_eq!(reg.get("claude-code").unwrap().citizenships.len(), 2);
         // persisted: a reload sees both citizenships
         let reloaded = load_members(&vault);
         assert_eq!(reloaded.get("claude-code").unwrap().citizenships.len(), 2);
         // an unknown member → false, no panic
-        assert!(!attach_citizenship(&mut vault, &mut reg, "ghost", cref));
+        assert!(!attach_citizenship(&mut vault, &mut reg, "ghost", cref).unwrap());
     }
 
     #[test]
