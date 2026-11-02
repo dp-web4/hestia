@@ -29,20 +29,23 @@ def func(name):
 
 
 PRELUDE = "\n".join(line for line in SCRIPT.splitlines()
-                    if line.startswith(("REPO=", "FALLBACK_VERSION=")))
-PRELUDE += "\n" + "\n".join(func(n) for n in ("c_warn", "c_err", "resolve_version", "version_newer",
+                    if line.startswith(("REPO=",)))
+PRELUDE += "\n" + "\n".join(func(n) for n in ("c_warn", "c_err", "c_dim", "resolve_version", "version_newer",
                                        "downgrade_opted_in", "guard_downgrade"))
 
 
-def run(*, api_json=None, installed=None, pin="", allow="", raw_version=None):
+def run(*, api_json=None, installed=None, pin="", allow="", raw_version=None, redirect=None):
+    """api_json: the API's reply (None = unreachable). redirect: the releases/latest redirect
+    target the second lookup sees (None = unreachable). #1444: no floor literal any more."""
     with tempfile.TemporaryDirectory() as d:
         d = pathlib.Path(d)
         stub = d / "curl"
-        if api_json is None:
-            stub.write_text("#!/bin/sh\nexit 22\n")
-        else:
+        api = "exit 22"
+        if api_json is not None:
             (d / "api.json").write_text(api_json)
-            stub.write_text(f"#!/bin/sh\ncat '{d / 'api.json'}'\n")
+            api = f"cat '{d / 'api.json'}'"
+        red = "exit 22" if redirect is None else f"printf '%s' '{redirect}'"
+        stub.write_text(f'#!/bin/sh\ncase "$*" in *redirect_url*) {red} ;; *) {api} ;; esac\n')
         stub.chmod(0o755)
         (d / "sort").write_text("#!/bin/sh\necho 'sort must not be called (no GNU sort -V on macOS)' >&2\nexit 99\n")
         (d / "sort").chmod(0o755)
@@ -69,10 +72,16 @@ LATEST = '{\n  "url": "x",\n  "tag_name": "v0.3.0",\n  "name": "v0.3.0"\n}\n'
 rc, out = run(api_json=LATEST)
 check("no pin: resolves GitHub's latest release", rc == 0 and "VERSION=v0.3.0" in out, out)
 rc, out = run(api_json=None)
-check("API unreachable: falls back to the floor, and says so",
-      rc == 0 and "VERSION=v0.0.4" in out and "could not resolve" in out, out)
+check("API and redirect unreachable: stops, names the remedy, installs nothing (#1444: no floor)",
+      rc != 0 and "VERSION=" not in out and "could not resolve" in out and "HESTIA_VERSION" in out, out)
 rc, out = run(api_json='{"message": "API rate limit exceeded"}')
-check("API answers without a tag: falls back", rc == 0 and "VERSION=v0.0.4" in out, out)
+check("API answers without a tag, no redirect: stops", rc != 0 and "VERSION=" not in out, out)
+rc, out = run(api_json='{"message": "API rate limit exceeded"}',
+              redirect="https://github.com/dp-web4/hestia/releases/tag/v0.3.0")
+check("API rate-limited: the releases/latest redirect resolves the tag",
+      rc == 0 and "VERSION=v0.3.0" in out, out)
+rc, out = run(api_json=None, redirect="https://github.com/dp-web4/hestia/releases")
+check("a redirect that names no tag is not a version", rc != 0 and "VERSION=" not in out, out)
 rc, out = run(api_json=LATEST, pin="v0.0.4")
 check("an explicit HESTIA_VERSION wins over latest", rc == 0 and "VERSION=v0.0.4" in out, out)
 rc, out = run(api_json=LATEST, installed="0.3.0")

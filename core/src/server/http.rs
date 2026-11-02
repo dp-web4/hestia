@@ -869,13 +869,24 @@ async fn operator_deployment_update(
         }
     };
 
-    if super::dashboard::same_deployed_build(&authority_build, authority_head_sha.as_deref(), env!("HESTIA_GIT_VERSION")) {
+    // A box that is current against its OWN manifest can still be behind origin/main: the
+    // daemon never fetches, so only the supervisor knows. With the timer off, this request is
+    // the box's only way to find out, so it is not short-circuited here ("check for updates").
+    // The supervisor syncs, compares, and logs CURRENT without building when nothing moved.
+    let locally_current = super::dashboard::same_deployed_build(
+        &authority_build,
+        authority_head_sha.as_deref(),
+        env!("HESTIA_GIT_VERSION"),
+    );
+
+    // Refuse before witnessing or publishing anything when there is no supervisor to start:
+    // the trigger could only fail, and the old failure text named no remedy (#791).
+    if !super::dashboard::deploy_supervisor_installed() {
         return (
-            StatusCode::OK,
+            StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "status": "current",
-                "message": "deployment is already current",
-                "running_build": env!("HESTIA_GIT_VERSION"),
+                "status": "update_unavailable",
+                "error": super::dashboard::DEPLOY_SUPERVISOR_MISSING,
             })),
         );
     }
@@ -943,6 +954,7 @@ async fn operator_deployment_update(
                 "authority_build": authority_build,
                 "platform": std::env::consts::OS,
                 "mechanism": "registered-deployment-supervisor",
+                "locally_current": locally_current,
             }),
             provenance.as_ref(),
         );
@@ -1085,6 +1097,380 @@ async fn operator_deployment_update(
     }
 }
 
+/// Fixed check trigger: start the check-only unit, never the deploy. Linux user systemd only;
+/// elsewhere there is no check unit, so the dashboard has only the update button.
+fn deployment_check_trigger_for(os: &str) -> Option<DeploymentUpdateTrigger> {
+    (os == "linux").then(|| DeploymentUpdateTrigger {
+        program: "systemctl",
+        // --no-block: answer the browser now; the dashboard poll shows the verdict.
+        args: vec![
+            "--user".into(),
+            "--no-block".into(),
+            "start".into(),
+            "hestia-deploy-check.service".into(),
+        ],
+    })
+}
+
+/// Whether a deploy-check.tsv line is a check still in flight (requested or checking, recent).
+fn deployment_check_in_flight(raw: &str) -> bool {
+    super::dashboard::deploy_check_in(raw, env!("HESTIA_GIT_VERSION"), chrono::Utc::now())
+        .is_some_and(|c| c.state == "requested" || c.state == "checking")
+}
+
+/// `POST /api/operator/deployment/check` - ask whether an update is available, and nothing
+/// else (operator, tl-dell 2026-10-21: "check for update means ONLY to check").
+///
+/// Starts hestia-deploy-check.service (`hestia-deploy --check`): sync the deploy checkout,
+/// compare it with the running build, write the verdict to deploy-check.tsv. No build, no
+/// install, no restart; installing stays with `/deployment/update`. The browser sends no body.
+async fn operator_deployment_check(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let now = super::state::unix_now();
+    let (operator, provenance) = {
+        let s = state.lock().await;
+        current_operator_context(&s, &headers, now)
+    };
+    let home = match deployment_update_authority() {
+        Ok((home, _, _)) => home,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "check_unavailable", "error": error })),
+            );
+        }
+    };
+    // Refuse before witnessing or writing anything when there is no check unit to start.
+    let Some(trigger) = deployment_check_trigger_for(std::env::consts::OS)
+        .filter(|_| super::dashboard::deploy_check_installed())
+    else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "check_unavailable",
+                "error": "the update-check unit (hestia-deploy-check) is not installed on this box; \
+                          the next update installs it, or re-run deploy/fleet/install.sh",
+            })),
+        );
+    };
+    let result_path = home.join("deploy-check.tsv");
+    if std::fs::read_to_string(&result_path).is_ok_and(|raw| deployment_check_in_flight(&raw)) {
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "status": "checking", "message": "a check is already running" })),
+        );
+    }
+
+    // Witnessed before the side effect, as the update request is: no record, no check.
+    {
+        let mut s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "running_build": env!("HESTIA_GIT_VERSION"),
+                "platform": std::env::consts::OS,
+                "mechanism": "hestia-deploy --check (no build, no install, no restart)",
+            }),
+            provenance.as_ref(),
+        );
+        if let Err(error) = s.append_chain("deployment_check_requested", record) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "failed",
+                    "error": format!("cannot witness the update check request: {error}"),
+                })),
+            );
+        }
+    }
+
+    // "requested" first, so the dashboard shows "checking…" on its next poll instead of the
+    // previous verdict; the supervisor overwrites it with its own.
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let _ = write_deployment_update_file(
+        &result_path,
+        &format!("requested\t{stamp}\t{}\t\n", env!("HESTIA_GIT_VERSION")),
+    );
+    let trigger_for_run = trigger.clone();
+    let outcome = match tokio::task::spawn_blocking(move || deployment_trigger_output(&trigger_for_run)).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("update check trigger task failed: {error}")),
+    };
+    let mut s = state.lock().await;
+    match outcome {
+        Ok(()) => {
+            let witnessed = s
+                .append_chain(
+                    "deployment_check_triggered",
+                    super::operator_auth::attach_operator_provenance(
+                        serde_json::json!({
+                            "operator": operator,
+                            "trigger_program": trigger.program,
+                            "trigger_args": trigger.args,
+                            "outcome": "requested",
+                        }),
+                        provenance.as_ref(),
+                    ),
+                )
+                .is_ok();
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "requested",
+                    "witnessed": witnessed,
+                    "message": "checking origin/main for an update; nothing will be installed",
+                })),
+            )
+        }
+        Err(error) => {
+            let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let _ = write_deployment_update_file(
+                &result_path,
+                &format!("failed\t{stamp}\t{}\t\n", env!("HESTIA_GIT_VERSION")),
+            );
+            let witnessed = s
+                .append_chain(
+                    "deployment_check_trigger_failed",
+                    super::operator_auth::attach_operator_provenance(
+                        serde_json::json!({ "operator": operator, "outcome": "trigger-failed", "error": error }),
+                        provenance.as_ref(),
+                    ),
+                )
+                .is_ok();
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "failed", "witnessed": witnessed, "error": error })),
+            )
+        }
+    }
+}
+
+/// Body of `POST /api/operator/deployment/auto-update`: on or off, nothing else. No unit,
+/// path or schedule is taken from the browser.
+#[derive(serde::Deserialize)]
+struct AutoUpdateToggle {
+    enabled: bool,
+}
+
+/// Fixed timer toggle. `--now` makes enabled and active move together, so what the dashboard
+/// reads from the unit files (`auto_update_state`) is also what is scheduled.
+fn auto_update_trigger_for(os: &str, enabled: bool) -> Option<DeploymentUpdateTrigger> {
+    match os {
+        "linux" => Some(DeploymentUpdateTrigger {
+            program: "systemctl",
+            args: vec![
+                "--user".into(),
+                if enabled { "enable" } else { "disable" }.into(),
+                "--now".into(),
+                "hestia-deploy.timer".into(),
+            ],
+        }),
+        _ => None,
+    }
+}
+
+/// `POST /api/operator/deployment/auto-update` - switch scheduled deploys (hestia-deploy.timer)
+/// on or off. The update button is unaffected: with the timer off the box still updates, but
+/// only when the operator asks.
+///
+/// Turning it ON can start a deploy straight away: the timer is `Persistent=true`, so a missed
+/// fire time runs as soon as it is armed. The dashboard says so before it asks.
+async fn operator_deployment_auto_update(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(toggle): Json<AutoUpdateToggle>,
+) -> impl IntoResponse {
+    let now = super::state::unix_now();
+    let (operator, provenance) = {
+        let s = state.lock().await;
+        current_operator_context(&s, &headers, now)
+    };
+    let Some(unit_dir) = super::dashboard::auto_update_unit_dir() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "unavailable",
+                "error": format!("no auto-update toggle for {}", std::env::consts::OS),
+            })),
+        );
+    };
+    let Some(trigger) = auto_update_trigger_for(std::env::consts::OS, toggle.enabled) else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "status": "unavailable",
+                "error": format!("no auto-update toggle for {}", std::env::consts::OS),
+            })),
+        );
+    };
+    let (code, body) = toggle_auto_update(
+        &state,
+        operator,
+        provenance,
+        toggle.enabled,
+        &unit_dir,
+        trigger,
+        deployment_trigger_output,
+    )
+    .await;
+    (code, Json(body))
+}
+
+/// One auto-update change at a time. Two opposing clicks (two tabs, a double click) would
+/// otherwise both read the same `before`, both witness an intent against it and race their
+/// systemctl calls, leaving a chain whose before/after pairs describe no real sequence.
+static AUTO_UPDATE_TOGGLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The toggle itself, with the unit directory and the systemctl runner passed in so tests can
+/// drive it without a real user systemd. Holds [`AUTO_UPDATE_TOGGLE`] from the first read of the
+/// timer state to the outcome record.
+async fn toggle_auto_update<F>(
+    state: &SharedState,
+    operator: Option<String>,
+    provenance: Option<super::operator_auth::OperatorProvenance>,
+    enabled: bool,
+    unit_dir: &std::path::Path,
+    trigger: DeploymentUpdateTrigger,
+    run: F,
+) -> (StatusCode, serde_json::Value)
+where
+    F: FnOnce(&DeploymentUpdateTrigger) -> std::result::Result<(), String> + Send + 'static,
+{
+    let _one_at_a_time = AUTO_UPDATE_TOGGLE.lock().await;
+    let before = super::dashboard::auto_update_state_in(unit_dir);
+    let wanted = if enabled { "on" } else { "off" };
+    if before == "absent" {
+        return (
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "status": "absent",
+                "error": "hestia-deploy.timer is not installed on this box; see deploy/from-main/README.md",
+            }),
+        );
+    }
+    if before == wanted {
+        return (
+            StatusCode::OK,
+            serde_json::json!({ "status": wanted, "message": format!("auto-update is already {wanted}") }),
+        );
+    }
+
+    // SELF-WITNESS BEFORE SIDE EFFECT, as for the update request: no chain record, no toggle.
+    {
+        let s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "before": before,
+                "requested": wanted,
+                "platform": std::env::consts::OS,
+                "trigger_program": trigger.program,
+                "trigger_args": trigger.args,
+            }),
+            provenance.as_ref(),
+        );
+        if let Err(error) = s.append_chain("deployment_auto_update_intent", record) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "status": "failed",
+                    "error": format!("cannot witness auto-update change: {error}"),
+                }),
+            );
+        }
+    }
+
+    let trigger_for_run = trigger.clone();
+    let trigger_result = match tokio::task::spawn_blocking(move || run(&trigger_for_run)).await {
+        Ok(result) => result,
+        Err(error) => Err(format!("auto-update toggle task failed: {error}")),
+    };
+    let after = super::dashboard::auto_update_state_in(unit_dir);
+    let outcome = auto_update_outcome(wanted, after, &trigger_result);
+    let witness = {
+        let s = state.lock().await;
+        let record = super::operator_auth::attach_operator_provenance(
+            serde_json::json!({
+                "operator": operator,
+                "before": before,
+                "requested": wanted,
+                "after": after,
+                "outcome": outcome,
+                "error": trigger_result.as_ref().err(),
+            }),
+            provenance.as_ref(),
+        );
+        s.append_chain("deployment_auto_update_changed", record)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
+    auto_update_reply(wanted, after, outcome, &trigger_result, witness)
+}
+
+/// How a toggle ended, judged by the unit files afterwards, not by systemctl's exit alone:
+/// `changed` (asked for and now in force), `not-applied` (systemctl said yes but the timer
+/// still reads otherwise) or `trigger-failed`.
+fn auto_update_outcome(
+    wanted: &str,
+    after: &str,
+    trigger: &std::result::Result<(), String>,
+) -> &'static str {
+    match trigger {
+        Err(_) => "trigger-failed",
+        Ok(()) if after == wanted => "changed",
+        Ok(()) => "not-applied",
+    }
+}
+
+/// The caller's answer. A change that took effect but whose outcome record did not land is
+/// still an error, and it says the change happened: the operator must not retry a toggle that
+/// already took, and must know the chain is one record short.
+fn auto_update_reply(
+    wanted: &str,
+    after: &str,
+    outcome: &str,
+    trigger: &std::result::Result<(), String>,
+    witness: std::result::Result<(), String>,
+) -> (StatusCode, serde_json::Value) {
+    let witness_error = witness.err().map(|e| format!("the outcome record was not written: {e}"));
+    let (code, error) = match (outcome, trigger) {
+        ("changed", _) => match &witness_error {
+            None => (StatusCode::OK, None),
+            Some(w) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some(format!("auto-update is now {after}, but {w}")),
+            ),
+        },
+        ("not-applied", _) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(format!(
+                "systemctl reported success but the timer reads {after}, not {wanted}{}",
+                witness_error.as_ref().map(|w| format!("; {w}")).unwrap_or_default()
+            )),
+        ),
+        (_, Err(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some(format!(
+                "{e}{}",
+                witness_error.as_ref().map(|w| format!("; {w}")).unwrap_or_default()
+            )),
+        ),
+        (_, Ok(())) => (StatusCode::INTERNAL_SERVER_ERROR, Some(format!("unexpected outcome {outcome}"))),
+    };
+    let mut body = serde_json::json!({
+        "status": after,
+        "requested": wanted,
+        "outcome": outcome,
+        "witnessed": witness_error.is_none(),
+    });
+    if let Some(e) = error {
+        body["error"] = e.into();
+    }
+    (code, body)
+}
+
 #[cfg(test)]
 mod deployment_update_tests {
     use super::*;
@@ -1097,6 +1483,166 @@ mod deployment_update_tests {
             trigger.args,
             ["--user", "--no-block", "start", "hestia-deploy.service"]
         );
+    }
+
+    #[test]
+    fn auto_update_toggle_is_fixed_on_linux_and_absent_elsewhere() {
+        let on = auto_update_trigger_for("linux", true).unwrap();
+        assert_eq!(on.program, "systemctl");
+        assert_eq!(on.args, ["--user", "enable", "--now", "hestia-deploy.timer"]);
+        let off = auto_update_trigger_for("linux", false).unwrap();
+        assert_eq!(off.args, ["--user", "disable", "--now", "hestia-deploy.timer"]);
+        assert!(auto_update_trigger_for("macos", true).is_none());
+        assert!(auto_update_trigger_for("windows", false).is_none());
+    }
+
+    #[test]
+    fn deployment_check_starts_the_check_unit_and_never_the_deploy() {
+        let t = deployment_check_trigger_for("linux").unwrap();
+        assert_eq!(t.program, "systemctl");
+        assert_eq!(t.args, ["--user", "--no-block", "start", "hestia-deploy-check.service"]);
+        assert!(!t.args.iter().any(|a| a == "hestia-deploy.service"));
+        assert!(deployment_check_trigger_for("macos").is_none());
+        assert!(deployment_check_trigger_for("windows").is_none());
+    }
+
+    #[test]
+    fn deployment_check_in_flight_only_while_requested_or_checking() {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert!(deployment_check_in_flight(&format!("requested\t{now}\t\t\n")));
+        assert!(deployment_check_in_flight(&format!("checking\t{now}\t\t\n")));
+        assert!(!deployment_check_in_flight(&format!("available\t{now}\t\tv9\n")));
+        assert!(!deployment_check_in_flight(&format!("failed\t{now}\t\t\n")));
+        assert!(!deployment_check_in_flight("checking\t2020-01-01T00:00:00Z\t\t\n"));
+    }
+
+    #[test]
+    fn auto_update_reply_reports_what_happened_not_what_was_asked() {
+        let ok: std::result::Result<(), String> = Ok(());
+        let failed: std::result::Result<(), String> = Err("systemctl exited 1".into());
+        // Asked, done, witnessed.
+        let (code, body) = auto_update_reply("on", "on", auto_update_outcome("on", "on", &ok), &ok, Ok(()));
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!((body["outcome"].as_str(), body["witnessed"].as_bool()), (Some("changed"), Some(true)));
+        assert!(body.get("error").is_none());
+        // Done but the outcome record failed: an error that says the change took.
+        let (code, body) = auto_update_reply("on", "on", "changed", &ok, Err("chain poisoned".into()));
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["witnessed"], false);
+        let e = body["error"].as_str().unwrap();
+        assert!(e.contains("auto-update is now on") && e.contains("chain poisoned"), "{e}");
+        // systemctl exit 0, timer unchanged: not reported as success.
+        assert_eq!(auto_update_outcome("off", "on", &ok), "not-applied");
+        let (code, body) = auto_update_reply("off", "on", "not-applied", &ok, Ok(()));
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["status"], "on");
+        assert!(body["error"].as_str().unwrap().contains("reads on, not off"));
+        // Trigger failed, and the record of that failed too: both named.
+        let (code, body) = auto_update_reply("on", "off", "trigger-failed", &failed, Err("disk full".into()));
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        let e = body["error"].as_str().unwrap();
+        assert!(e.contains("systemctl exited 1") && e.contains("disk full"), "{e}");
+    }
+
+    async fn toggle_test_state() -> (tempfile::TempDir, SharedState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    /// A stand-in for `systemctl --user enable|disable --now`: moves the timers.target.wants
+    /// link the dashboard reads, after a pause so concurrent toggles would overlap.
+    fn fake_systemctl(
+        unit_dir: std::path::PathBuf,
+        apply: bool,
+    ) -> impl FnOnce(&DeploymentUpdateTrigger) -> std::result::Result<(), String> + Send + 'static {
+        move |t| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if apply {
+                let wants = unit_dir.join("timers.target.wants");
+                std::fs::create_dir_all(&wants).unwrap();
+                let link = wants.join("hestia-deploy.timer");
+                if t.args.iter().any(|a| a == "enable") {
+                    std::fs::write(&link, "").unwrap();
+                } else {
+                    let _ = std::fs::remove_file(&link);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_update_toggle_reports_a_change_systemctl_did_not_make() {
+        let (dir, state) = toggle_test_state().await;
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(units.join("hestia-deploy.timer"), "[Timer]\n").unwrap();
+        let trigger = auto_update_trigger_for("linux", true).unwrap();
+        let (code, body) = toggle_auto_update(
+            &state, Some("op".into()), None, true, &units, trigger, fake_systemctl(units.clone(), false),
+        )
+        .await;
+        assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body["outcome"], "not-applied");
+        let s = state.lock().await;
+        let changed = s
+            .recent_chain(50)
+            .into_iter()
+            .find(|e| e.event_type == "deployment_auto_update_changed")
+            .expect("outcome record");
+        assert_eq!(changed.event_data["outcome"], "not-applied");
+        assert_eq!(changed.event_data["after"], "off");
+    }
+
+    #[tokio::test]
+    async fn opposing_auto_update_toggles_are_serialized() {
+        let (dir, state) = toggle_test_state().await;
+        let units = dir.path().join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        std::fs::write(units.join("hestia-deploy.timer"), "[Timer]\n").unwrap();
+        let on = {
+            let (state, units) = (state.clone(), units.clone());
+            tokio::spawn(async move {
+                let t = auto_update_trigger_for("linux", true).unwrap();
+                toggle_auto_update(&state, Some("a".into()), None, true, &units, t, fake_systemctl(units.clone(), true)).await
+            })
+        };
+        let off = {
+            let (state, units) = (state.clone(), units.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let t = auto_update_trigger_for("linux", false).unwrap();
+                toggle_auto_update(&state, Some("b".into()), None, false, &units, t, fake_systemctl(units.clone(), true)).await
+            })
+        };
+        let (on, off) = (on.await.unwrap(), off.await.unwrap());
+        assert_eq!(on.0, StatusCode::OK, "{}", on.1);
+        assert_eq!(off.0, StatusCode::OK, "{}", off.1);
+        assert_eq!(super::super::dashboard::auto_update_state_in(&units), "off");
+        // Chain order: each intent is followed by its own outcome, and the second toggle's
+        // `before` is the first one's `after`.
+        let s = state.lock().await;
+        let mut recs: Vec<_> = s
+            .recent_chain(200)
+            .into_iter()
+            .filter(|e| e.event_type.starts_with("deployment_auto_update_"))
+            .collect();
+        recs.sort_by_key(|e| e.chain_position);
+        let kinds: Vec<_> = recs.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "deployment_auto_update_intent",
+                "deployment_auto_update_changed",
+                "deployment_auto_update_intent",
+                "deployment_auto_update_changed"
+            ]
+        );
+        assert_eq!(recs[1].event_data["after"], "on");
+        assert_eq!(recs[2].event_data["before"], "on");
+        assert_eq!(recs[3].event_data["after"], "off");
     }
 
     #[test]
@@ -1212,6 +1758,14 @@ pub async fn serve_with_callback(
             post(operator_deployment_update),
         )
         .route(
+            "/api/operator/deployment/auto-update",
+            post(operator_deployment_auto_update),
+        )
+        .route(
+            "/api/operator/deployment/check",
+            post(operator_deployment_check),
+        )
+        .route(
             "/api/operator/gate-escalation",
             post(operator_gate_escalation),
         )
@@ -1240,6 +1794,7 @@ pub async fn serve_with_callback(
         // member that could revoke — or, worse, could NOT be revoked — would hold the
         // control.
         .route("/api/scope/standing/revoke", post(scope_standing_revoke))
+        .route("/api/scope/standing/refusal/lift", post(scope_refusal_lift))
         // The LIVE half (dp, 2026-09-15). Memory-only like the grant it withdraws, so there
         // is no vault step: witness, then withdraw, then tell the member.
         .route("/api/scope/revoke", post(scope_live_revoke))
@@ -1248,6 +1803,9 @@ pub async fn serve_with_callback(
         .route("/api/scope/standing/promote", post(scope_standing_promote))
         .route("/api/scope/standing/recursive", post(scope_standing_recursive))
         .route("/api/scope/standing/reassign", post(scope_standing_reassign))
+        // dp's Edit row (2026-10-22, #1345): path, reach and modes of ONE standing grant,
+        // changed together, bound to the generation the operator saw.
+        .route("/api/scope/standing/edit", post(scope_standing_edit))
         .route("/api/scope/reroot", post(scope_reroot))
         // THE GRANT HALF NOW HAS A ROUTE, REVERSING A DELIBERATE DECISION RECORDED HERE.
         //
@@ -1306,6 +1864,9 @@ pub async fn serve_with_callback(
             get(transport_binding_list).post(transport_binding_set),
         )
         .route("/api/transport/binding/remove", post(transport_binding_remove))
+        .route("/api/channel/binding", get(channel_binding_list).post(channel_binding_set))
+        .route("/api/channel/outbox", get(channel_outbox_list))
+        .route("/api/channel/outbox/:id/answer", post(channel_outbox_answer))
         .route("/api/policy/preset", put(policy_set_preset))
         .route("/api/policy/override", put(policy_set_override))
         .route(
@@ -1430,6 +1991,9 @@ pub async fn serve_with_callback(
         loop {
             tick.tick().await;
             let now = super::gate_escalation::now_secs();
+            // The gate set, discovered BEFORE the lock below: the inventory child takes about a
+            // second, and under the lock that second was a stall for every member (#1183).
+            let discovered = discovered_gate_paths_off_lock().await;
             // DURABLE READS: the pass runs in a durability scope (its outward writes also flush
             // the chain first: inbox barrier, lane, status file, vault barrier).
             let (lapsed, durable) = crate::storage::durability::durable_scope(async {
@@ -1454,7 +2018,7 @@ pub async fn serve_with_callback(
                 // Gate bytes on the same cadence, and at startup (an interval's first tick is
                 // immediate). Before this the daemon checked its gates only when an operator
                 // asked (#1085); dp, 2026-09-21: the daemon verifies, the installer reads.
-                let gates = super::gate_watch::check(&mut s);
+                let gates = super::gate_watch::check(&mut s, discovered);
                 if gates["status"] != "VERIFIED" {
                     tracing::warn!(status = %gates["status"], "gate integrity: not verified");
                 }
@@ -2598,10 +3162,19 @@ async fn policy_set_instance_grant(
         );
     }
     let now = crate::server::gate_escalation::now_secs();
-    let expires_at = body
-        .get("expires_in_secs")
-        .and_then(|v| v.as_u64())
-        .map(|s| now + s);
+    let expires_in = body.get("expires_in_secs").and_then(|v| v.as_u64());
+    // checked (nomad on #1430): `now + s` panicked in debug and wrapped in release on a huge `s`,
+    // making a grant already expired while the reply said it was kept until its expiry
+    let expires_at = match expires_in.map(|s| now.checked_add(s)) {
+        None => None,
+        Some(Some(e)) => Some(e),
+        Some(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "expires_in_secs is out of range"})),
+            );
+        }
+    };
 
     let mut s = state.lock().await;
 
@@ -2612,12 +3185,29 @@ async fn policy_set_instance_grant(
     //                 with everything else, which is exactly what a restriction should do. A
     //                 member restricted for cause must not be freed by a reboot.
     //   LOOSENING  -> in-memory grant. Substitutes the local baseline and dies with the daemon,
-    //                 so a permission nobody remembers to revoke expires on its own.
+    //                 so a permission nobody remembers to revoke expires on its own. ONE amendment
+    //                 (dp, 2026-10-28, #1306 option 2): a loosening WITH an expiry is also kept in
+    //                 the vault until that expiry, because a deploy's restart was revoking it hours
+    //                 early. Its end is still the operator's own bound, never inattention.
     //
     // Sending a tightening through the memory path would have made restrictions evaporate on
     // restart; sending a loosening through the vault would have made permissions permanent and
     // written to disk. Same control, opposite correct answers.
     let loosening = s.is_loosening(&preset);
+    // the durable kind is bounded (nomad's HOLD on #1430): a loosening that survives restarts may
+    // not outlast MAX_EXPIRING_LOOSENING_SECS. Refused, not clamped, so the operator knows.
+    let ceiling = crate::server::state::MAX_EXPIRING_LOOSENING_SECS;
+    if loosening && expires_in.is_some_and(|s| s > ceiling) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("a loosening that survives restarts may last at most {ceiling} s ({} days); \
+                                  ask for that or less, or make it a standing grant on the standing surface",
+                                 ceiling / 86400),
+                "max_expires_in_secs": ceiling,
+            })),
+        );
+    }
     // What this grant replaces, for the undo below if it cannot be recorded (#1131 class A, the
     // sibling the `let _` sweep missed: this route kept a failed append as an empty hash).
     let key = (plugin_id.clone(), role.clone());
@@ -2634,7 +3224,26 @@ async fn policy_set_instance_grant(
                 expires_at,
             },
         );
-        "memory-only — a daemon restart revokes it"
+        // #1306 (dp, 2026-10-28, option 2): a loosening WITH an expiry is kept in the vault too, so a
+        // deploy's restart does not revoke it before the operator's own bound; one without stays
+        // memory-only. Rewritten on every loosening, so a grant replaced by one without an expiry
+        // leaves the document as well. A write that fails undoes the grant: nothing half-durable.
+        let rows = s.expiring_grant_rows(None);
+        if let Err(e) = s.save_expiring_grants(&rows) {
+            match previous_grant.clone() {
+                Some(g) => { s.instance_grants.insert(key.clone(), g); }
+                None => { s.instance_grants.remove(&key); }
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("vault write failed ({e}); the grant is undone and nothing changed")})),
+            );
+        }
+        if expires_at.is_some() {
+            "vault until its expiry — a daemon restart does not revoke it; it lapses at expires_at"
+        } else {
+            "memory-only — a daemon restart revokes it (set an expiry to keep it across restarts)"
+        }
     } else {
         // A tightening is expressed as the preset's own rules laid over this member, so it
         // composes with society law by the ordinary fold rather than replacing it.
@@ -2676,11 +3285,13 @@ async fn policy_set_instance_grant(
                     Some(g) => { s.instance_grants.insert(key, g); }
                     None => { s.instance_grants.remove(&key); }
                 }
-                Ok(())
+                // and the vault back to what memory now holds (#1306)
+                let rows = s.expiring_grant_rows(None);
+                s.save_expiring_grants(&rows).map_err(|e| e.to_string())
             } else {
                 let r = s.vault.set_policy(previous_policy);
                 s.reload_policy();
-                r
+                r.map_err(|e| e.to_string())
             };
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "error": match undone {
@@ -2716,9 +3327,18 @@ async fn policy_revoke_instance_grant(
     let key = (plugin_id.clone(), role.clone());
     let had = s.instance_grants.contains_key(&key);
     if had {
-        // Witness FIRST, then remove — removing from memory cannot fail, so the order is exact,
-        // and a revoke that cannot be recorded is refused (the scope revoke's rule), never left
-        // unwitnessed (#1131 class A).
+        // #1306: the vault FIRST, without this grant. A revoke whose vault write failed would come
+        // back at the next restart, so it is refused before anything is recorded or removed.
+        let prior_rows = s.expiring_grant_rows(None);
+        let rows = s.expiring_grant_rows(Some(&key));
+        if let Err(e) = s.save_expiring_grants(&rows) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("the revoke could not be written to the vault ({e}); the grant is still in force — retry"),
+            })));
+        }
+        // Witness, then remove — removing from memory cannot fail, so the order is exact, and a
+        // revoke that cannot be recorded is refused (the scope revoke's rule), never left
+        // unwitnessed (#1131 class A); the vault is put back to what is still in force.
         if let Err(e) = s.append_chain(
             "policy_instance_grant_revoked",
             serde_json::json!({
@@ -2728,6 +3348,11 @@ async fn policy_revoke_instance_grant(
                 "via": "operator_session",
             }),
         ) {
+            if let Err(e2) = s.save_expiring_grants(&prior_rows) {
+                // the safe direction (the grant is lost at the next restart, not kept), but said
+                tracing::warn!("revoke unrecorded and the vault could not be restored ({e2:#}): \
+                                the grant stays in force until the next restart only");
+            }
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                 "error": format!("the revoke could not be recorded ({e}); the grant is still in force — retry"),
             })));
@@ -2832,6 +3457,21 @@ impl ScopeDecider {
     }
 }
 
+/// Read an optional `modes` field (#1345): absent = all four, today's meaning; present must be a
+/// non-empty subset of `r w e d`. A malformed value is a 400, never a guess, because guessing
+/// either way would put a grant in the store nobody chose.
+fn modes_arg(body: &serde_json::Value)
+    -> Result<crate::server::grant_modes::Modes, (StatusCode, Json<serde_json::Value>)> {
+    match body.get("modes") {
+        None | Some(serde_json::Value::Null) => Ok(crate::server::grant_modes::Modes::ALL),
+        Some(serde_json::Value::String(m)) => crate::server::grant_modes::Modes::parse(m)
+            .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))),
+        Some(_) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": "modes must be a string of r, w, e, d (e.g. \"r\" or \"rw\")"
+        })))),
+    }
+}
+
 pub(crate) async fn scope_decide_as(
     state: SharedState,
     body: serde_json::Value,
@@ -2852,6 +3492,11 @@ pub(crate) async fn scope_decide_as(
     // gate refused, once, inside the claim window. Not a grant of reach — never served as
     // policy; only `hestia_scope_claim` spends it, and only for that act.
     let once = body.get("once").and_then(|v| v.as_bool()).unwrap_or(false);
+    // WHAT THE GRANT LETS THE MEMBER DO (#1345), the decider's choice like `recursive`.
+    let modes = match modes_arg(&body) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
     // BREADTH (2026-10-05, #1022's operator half): the path the grant reaches from — the asked
     // path, or an ANCESTOR of it the operator chose (then necessarily recursive: an exact grant
     // on an ancestor does not reach the asked path). Absent = exactly the asked path.
@@ -2889,24 +3534,28 @@ pub(crate) async fn scope_decide_as(
             })),
         );
     }
-    // A standing REFUSAL is not a thing: refusing is already durable in effect (nothing was
-    // granted, and a re-ask files a new record). Guessing what the caller meant would put a
-    // durable ruling in the store nobody made.
-    if standing && !granted {
+    // A STANDING REFUSAL is a thing (hestia#1417; this block used to refuse it as "already
+    // durable in effect"). It was not durable: a refusal lived only as long as its request's
+    // window, and a re-ask filed a new record and a new operator card every 8 h. Measured on one
+    // member and one path, 2026-10-24..27: 87 refused acts, 17 request ids. With `standing`, the
+    // refusal is written to the vault beside the standing grants, the gate answers from it and
+    // opens nothing, and only the operator can lift it. It needs a reason: the member reads it
+    // on every re-ask, and "refused, no reason given" is what taught the member to re-ask.
+    if standing && !granted && reason.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "standing:true is only meaningful with granted:true — a refusal \
-                          grants nothing and needs no durability"
+                "error": "reason is required to make a refusal standing — the member reads it \
+                          on every re-ask, and it is the one thing that can end the re-asking"
             })),
         );
     }
-    if once && (!granted || standing || recursive || grant_path_arg.is_some()) {
+    if once && (!granted || standing || recursive || grant_path_arg.is_some() || !modes.is_all()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "once:true approves ONE act exactly as it was refused — it is a grant, \
-                          never standing, never recursive, and has no breadth to choose"
+                          never standing, never recursive, and has no breadth or modes to choose"
             })),
         );
     }
@@ -3078,6 +3727,7 @@ pub(crate) async fn scope_decide_as(
             "standing": standing,
             "standing_expires_at": standing_expires_at,
             "recursive": recursive,
+            "modes": modes,
             // 2026-10-05: the duration and breadth the operator chose, and what was asked.
             "once": once,
             "grant_path": reach_path,
@@ -3136,7 +3786,47 @@ pub(crate) async fn scope_decide_as(
     // an auditor it is the worse one, because a false `scope_granted` is a phantom widening
     // nothing contradicts. The first record is now an INTENT and the success is appended
     // after the commit, so neither direction can lie.
-    if standing {
+    // THE STANDING REFUSAL (hestia#1417), applied after its `scope_refused` record committed,
+    // the same order rule as the grant below. Nothing widens, so a failed vault write leaves
+    // the member exactly where a window-bound refusal would: refused for this request, and
+    // free to re-ask after it, which the response says.
+    if standing && !granted {
+        // What the ask was FOR: a read when the gate opened it for a read-only tool, else every
+        // mode (a member-filed ask names no tool; the conservative side). A later standing grant
+        // lifts the refusal only when its modes include these (Nova on #1418).
+        let asked = match gate_origin.as_ref() {
+            Some(g) if crate::server::handler::READ_ONLY_PATH_TOOLS.contains(&g.tool.as_str()) =>
+                crate::server::grant_modes::Modes::READ,
+            _ => crate::server::grant_modes::Modes::ALL,
+        };
+        let refusal = crate::server::standing_scope::StandingRefusal {
+            member: plugin_id.clone(),
+            path: path.clone(),
+            recursive,
+            refused_at: now,
+            refused_by: decider.by.clone(),
+            reason: reason.clone(),
+            request_id: Some(request_id.clone()),
+            modes: Some(asked),
+        };
+        if let Err(e) = s.commit_standing_scope(|st| {
+            st.refusals.retain(|r| !(r.member == refusal.member && r.path == refusal.path));
+            st.refusals.push(refusal);
+            st.generation += 1;
+        }) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("the refusal was recorded for this request, but could NOT be \
+                                      made standing — vault write failed ({e}); re-decide a later \
+                                      ask with standing:true to retry"),
+                    "witnessEntryHash": entry.hash,
+                })),
+            );
+        }
+    }
+
+    if standing && granted {
         // Snapshot for rollback (revised #480 review, blocker 3): the SUCCESS
         // witness below is part of the grant's finality. If it fails after the
         // commit landed, the grant must NOT stay live — permission in force,
@@ -3157,6 +3847,7 @@ pub(crate) async fn scope_decide_as(
             expires_at: standing_expires_at,
             request_id: Some(request_id.clone()),
             recursive,
+            modes,
         };
         if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
             return (
@@ -3252,6 +3943,7 @@ pub(crate) async fn scope_decide_as(
         };
         req.expires_at = expires_at;
         req.recursive = recursive;
+        req.ext.modes = modes;
         req.ext.once = granted && once;
         req.ext.granted_path = (granted && reach_path != path).then(|| reach_path.clone());
     }
@@ -4071,6 +4763,9 @@ fn standing_grant_binding(
             serde_json::json!({
                 "reason": g.reason, "recursive": g.recursive, "granted_by": g.granted_by,
                 "expires_at": g.expires_at, "request_id": g.request_id,
+                // #1345: what the operator was shown includes what the grant lets the member
+                // do, so a row narrowed or widened since the read is refused as moved.
+                "modes": g.modes.as_letters(),
             })
         })
         .unwrap_or(serde_json::Value::Null)
@@ -4083,9 +4778,20 @@ fn grant_binding_of(v: &serde_json::Value) -> serde_json::Value {
         return serde_json::Value::Null;
     }
     let f = |k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    // A row from a surface that predates #1345 carries no `modes`: every grant it could have
+    // been shown was all-modes, so that is what it saw. Any other spelling is canonicalised, so
+    // "wr" and "rw" bind alike; an unparseable one is kept verbatim and can never match.
+    let modes = match v.get("modes") {
+        None | Some(serde_json::Value::Null) => serde_json::json!("rwed"),
+        Some(serde_json::Value::String(m)) => match crate::server::grant_modes::Modes::parse(m) {
+            Ok(m) => serde_json::json!(m.as_letters()),
+            Err(_) => serde_json::json!(m),
+        },
+        Some(other) => other.clone(),
+    };
     serde_json::json!({
         "reason": f("reason"), "recursive": f("recursive"), "granted_by": f("granted_by"),
-        "expires_at": f("expires_at"), "request_id": f("request_id"),
+        "expires_at": f("expires_at"), "request_id": f("request_id"), "modes": modes,
     })
 }
 
@@ -4147,6 +4853,11 @@ async fn scope_grant(
         .map(|w| now + w);
     // Exact by default; the operator opts into the subtree (dp, 2026-09-08).
     let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    // All four by default, today's meaning; the operator narrows explicitly (#1345).
+    let modes = match modes_arg(&body) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
 
     let mut s = state.lock().await;
     // A GRANT TO A MEMBER NOBODY HAS SEEN IS ALMOST ALWAYS A TYPO, and it fails silently:
@@ -4253,6 +4964,7 @@ async fn scope_grant(
         "request_id": serde_json::Value::Null,
         "origin": "operator_initiated",
         "recursive": recursive,
+        "modes": modes,
         "plugin_id": plugin_id,
         "subject_instance_lct": s.member_lct(&plugin_id),
         "path": path,
@@ -4281,6 +4993,7 @@ async fn scope_grant(
         // None, for the same reason `request_id` is null in the record above.
         request_id: None,
         recursive,
+        modes,
     };
     let (intent_hash, entry_hash) = match s.witness_and_commit_standing_grant(grant, record) {
         Ok(pair) => pair,
@@ -4357,7 +5070,11 @@ async fn scope_grant(
     )
 }
 
-/// `POST /api/scope/floor` {path, reason} — add a path to THE SOCIETY FLOOR.
+/// `POST /api/scope/floor` {path, reason, recursive?, modes?, expected_generation?} — add a path
+/// to THE SOCIETY FLOOR, or replace its entry (keyed by path). `modes` is r/w/e/d as on a grant
+/// (#1345), all four when absent; `expected_generation` makes it the dashboard's Edit Save:
+/// a store that moved since is refused (409), and so is a Save that changes nothing. The
+/// witness records the entry before and after and whether the change widens.
 ///
 /// dp, 2026-08-16: *"law has to be applied uniformly to ALL. that is the only way the law is
 /// trusted."* This is the surface that makes that structural rather than aspirational: one
@@ -4372,6 +5089,166 @@ async fn scope_grant(
 /// the same list — produces N copies that drift the moment one member is granted something the
 /// others are not, and then the law differs per seat while looking identical. Uniformity has
 /// to be structural or it decays. One list cannot drift.
+// ---- #1344: channel bindings and the channel outbox (operator-gated) -------------------------
+
+/// Every channel binding, addresses included: this is the operator's own view.
+async fn channel_binding_list(State(state): State<SharedState>) -> impl IntoResponse {
+    let s = state.lock().await;
+    Json(serde_json::json!({
+        "bindings": s.channel_bindings.bindings,
+        "generation": s.channel_bindings.generation,
+    }))
+}
+
+fn channel_operator(gate: &Option<axum::Extension<super::operator_auth::GateWitness>>) -> String {
+    gate.as_ref().and_then(|g| g.0.operator.clone()).unwrap_or_else(|| "operator".to_string())
+}
+
+/// Bind (insert or replace) a member's channel. The chain row names the recipient by the hash of
+/// its address, never the address: chain rows are readable by members, and who a message
+/// reaches is the operator's. Persist first, then witness; if the witness fails, the store is
+/// rolled back, so no binding is in force without its record.
+async fn channel_binding_set(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::channel::{validate, ChannelBinding};
+    let field = |k: &str| {
+        body.get(k).and_then(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    };
+    let operator = channel_operator(&gate);
+    let binding = ChannelBinding {
+        member: field("member").unwrap_or_default(),
+        channel_id: field("channel_id").unwrap_or_default(),
+        recipient_class: field("recipient_class").unwrap_or_default(),
+        adapter: field("adapter").unwrap_or_else(|| "email".to_string()),
+        address: field("address").unwrap_or_default(),
+        reason: field("reason").unwrap_or_default(),
+        set_by: operator.clone(),
+        set_at: crate::server::gate_escalation::now_secs(),
+        version: 0,
+    };
+    if let Err(msg) = validate(&binding) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": msg})));
+    }
+    let address_sha256 = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(binding.address.as_bytes()))
+    };
+    let mut s = state.lock().await;
+    let prior = s.channel_bindings.clone();
+    let version = match s.commit_channel_bindings(|st| st.set(binding.clone())) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("binding NOT changed: vault write failed ({e})")})),
+            );
+        }
+    };
+    match s.append_chain(
+        "channel_binding_set",
+        serde_json::json!({
+            "member": binding.member, "channel_id": binding.channel_id,
+            "recipient_class": binding.recipient_class, "adapter": binding.adapter,
+            "address_sha256": address_sha256, "reason": binding.reason, "set_by": operator,
+            "version": version, "operator_gate": gate.as_ref().and_then(|g| g.0.gate_entry_hash.clone()),
+        }),
+    ) {
+        Ok(entry) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true, "member": binding.member, "channel_id": binding.channel_id,
+                "target": binding.target(), "version": version, "witnessEntryHash": entry.hash,
+            })),
+        ),
+        Err(e) => {
+            let restored = s.commit_channel_bindings(|st| *st = prior);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("the channel_binding_set append failed ({e}); rollback: {}",
+                        match restored {
+                            Ok(()) => "prior bindings restored, the binding is NOT in force".to_string(),
+                            Err(rb) => format!("FAILED ({rb}): the binding is live without its record"),
+                        }),
+                })),
+            )
+        }
+    }
+}
+
+/// The whole outbox, newest first (`?limit=`, default 100): the operator's view, content included.
+async fn channel_outbox_list(
+    State(state): State<SharedState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = q.get("limit").and_then(|v| v.parse::<u32>().ok()).unwrap_or(100);
+    let s = state.lock().await;
+    match s.inbox_store.channel_outbox_list(None, limit) {
+        Ok(rows) => (StatusCode::OK, Json(serde_json::json!({"outbox": rows, "shadow": true}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+/// Mark one outbox row answered (#1344 decision c: in this slice there is no email ingress, so
+/// the operator says when the bound recipient replied). Once only: an answer is never moved.
+async fn channel_outbox_answer(
+    State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    let operator = channel_operator(&gate);
+    let s = state.lock().await;
+    let row = match s.inbox_store.channel_outbox_get(id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("no outbox row #{id}")})));
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    };
+    if row.answered_at.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("outbox #{id} was already answered"), "row": row})),
+        );
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    let entry = match s.append_chain(
+        "channel_answer",
+        serde_json::json!({
+            "outbox_id": id, "member": row.member, "member_lct": row.member_lct,
+            "channel_id": row.channel_id, "channel_send": row.chain_hash, "answered_by": operator,
+            "via": "operator", "operator_gate": gate.as_ref().and_then(|g| g.0.gate_entry_hash.clone()),
+        }),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("witness append failed, NOT marked answered: {e}")})),
+            );
+        }
+    };
+    match s.inbox_store.channel_mark_answered(id, &operator, now) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "outbox_id": id, "answered_at": now, "witnessEntryHash": entry.hash})),
+        ),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("outbox #{id} was answered concurrently"),
+                                    "witnessEntryHash": entry.hash})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("witnessed but NOT marked answered: {e}"),
+                                    "witnessEntryHash": entry.hash})),
+        ),
+    }
+}
+
 async fn transport_binding_list(State(state): State<SharedState>) -> impl IntoResponse {
     let s = state.lock().await;
     Json(serde_json::json!({
@@ -4590,6 +5467,22 @@ async fn scope_floor_add(
 ) -> impl IntoResponse {
     let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    // Both default to the pre-existing meaning (exact, all), so a caller that sends neither
+    // gets exactly the entry it got before these fields existed.
+    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    // The same r/w/e/d modes a grant carries (#1345); all four when absent.
+    let modes = match body.get("modes").and_then(|v| v.as_str()) {
+        None => crate::server::grant_modes::Modes::ALL,
+        Some(raw) => match crate::server::grant_modes::Modes::parse(raw) {
+            Ok(m) => m,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})));
+            }
+        },
+    };
+    // An EDIT from the dashboard names the generation it was staged against; a store that has
+    // moved since gets 409 and nothing is written, as /api/scope/standing/edit does (#1370).
+    let expected_generation = body.get("expected_generation").and_then(|v| v.as_u64());
     if raw_path.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -4618,7 +5511,36 @@ async fn scope_floor_add(
     let now = crate::server::gate_escalation::now_secs();
 
     let mut s = state.lock().await;
-    let replaces = s.standing_scope.floor_allows(&path);
+    if let Some(g) = expected_generation {
+        if g != s.standing_scope.generation {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("the scope store moved since this edit was staged (generation \
+                                      {g}, now {}); nothing was written. Reload and stage it again",
+                                     s.standing_scope.generation),
+                })),
+            );
+        }
+    }
+    let before = s.standing_scope.floor.iter().find(|f| f.path == path).cloned();
+    let replaces = before.is_some();
+    // What this change adds: a mode, or exact made recursive. A new entry widens by definition.
+    let widens = match &before {
+        None => true,
+        Some(b) => modes.widens(b.modes) || (recursive && !b.recursive),
+    };
+    // Save with nothing changed is not a mutation (an Edit only; a plain re-add still replaces).
+    if expected_generation.is_some()
+        && before.as_ref().is_some_and(|b| b.modes == modes && b.recursive == recursive) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "that floor entry already has exactly this reach and these modes; \
+                          nothing was written",
+            })),
+        );
+    }
     let members_affected = s.member_registry.len();
 
     // ORDER: WITNESS, THEN WIDEN — and the intent/success split, for the same reason the
@@ -4629,13 +5551,21 @@ async fn scope_floor_add(
         serde_json::json!({
             "path": path,
             "path_as_asked": raw_path,
+            "recursive": recursive,
+            "modes": modes,
+            "before": before.as_ref().map(|b| serde_json::json!({
+                "recursive": b.recursive, "modes": b.modes, "reason": b.reason,
+            })),
+            "widens": widens,
             "reason": reason,
             "added_by": "operator",
             "via": "operator_session",
             "replaces_existing": replaces,
             "members_in_registry": members_affected,
             "scope": "SOCIETY — every member of this society, present and future",
-            "semantics": "additive only: effective(m) = society_floor ∪ member(m)",
+            "semantics": "a member's own grant decides where it reaches; the floor applies \
+                          where none of the member's grants does (PRD_ALLOWLISTS AC-1, amended \
+                          2026-10-23)",
         }),
     ) {
         Ok(e) => e,
@@ -4655,6 +5585,8 @@ async fn scope_floor_add(
         added_at: now,
         added_by: "operator".to_string(),
         reason: reason.clone(),
+        recursive,
+        modes,
     };
     // The terminal success witness is part of finality. Preserve the exact prior store so
     // a failed terminal append can restore both memory and vault, including a predecessor
@@ -4676,6 +5608,7 @@ async fn scope_floor_add(
         "society_floor_added",
         serde_json::json!({
             "path": path, "reason": reason, "added_by": "operator",
+            "recursive": recursive, "modes": modes, "widens": widens,
             "intent": entry.hash, "standing_generation": generation,
         }),
     ) {
@@ -4714,8 +5647,10 @@ async fn scope_floor_add(
             "generation": generation,
             "replaced_existing": replaces,
             "applies_to": "every member of this society, including any that connect later",
-            "note": "additive only — a member's own grants can widen beyond this, never narrow \
-                     below it",
+            "modes": modes,
+            "widens": widens,
+            "note": "a member's own grant decides wherever it reaches; this entry applies only \
+                     where none of a member's grants does",
             // The terminal fact, not the intent. This is the record that says the floor is
             // durably in force and is the only correct pointer for downstream consumers.
             "witnessEntryHash": success.hash,
@@ -4978,6 +5913,120 @@ async fn scope_live_revoke(
     )
 }
 
+/// `POST /api/scope/standing/refusal/lift {plugin_id, path, reason}` — the operator lifts a
+/// standing refusal (hestia#1417). Operator-gated with the rest of /api/*; a peer may add a
+/// standing refusal through `hestia_scope_peer_decide` but never lift one. Witnessed as
+/// `scope_refusal_lifted` BEFORE the store changes; the next act on the path opens a request
+/// again, as it did before the refusal stood.
+async fn scope_refusal_lift(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let plugin_id = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if plugin_id.is_empty() || raw_path.is_empty() {
+        return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "plugin_id and path are required"})));
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let mut s = state.lock().await;
+    let Some(row) = s.standing_scope.refusals.iter()
+        .find(|r| r.member == plugin_id && r.path == path).cloned() else {
+        return (StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "no standing refusal of record for that (plugin_id, path)"})));
+    };
+    // TWO-PHASE (Nova on #1418): the first row is an INTENT, not a success. A `lifted` row
+    // written before the vault commit would, on a failed commit, leave the chain asserting a
+    // lift that never happened while the refusal still stood. The success row is appended only
+    // after the commit landed, carrying the intent's hash.
+    let record = serde_json::json!({
+        "plugin_id": plugin_id,
+        "subject_instance_lct": s.member_lct(&plugin_id),
+        "path": path,
+        "recursive": row.recursive,
+        "reason": reason,
+        "lifted_by": "operator",
+        "via": "operator_session",
+        "refused_by": row.refused_by,
+        "refused_at": row.refused_at,
+        "standing_generation": s.standing_scope.generation + 1,
+    });
+    let intent = match s.append_chain("scope_refusal_lift_intent", record.clone()) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+                          Json(serde_json::json!({"error": format!("witness append failed, nothing lifted: {e}")}))),
+    };
+    if let Err(e) = s.commit_standing_scope(|st| {
+        st.refusals.retain(|r| !(r.member == plugin_id && r.path == path));
+        st.generation += 1;
+    }) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("vault write failed, the refusal still stands: {e}"),
+                                        "state": "the chain holds the INTENT and no scope_refusal_lifted",
+                                        "intentEntryHash": intent.hash})));
+    }
+    let mut success = record;
+    success["intent"] = serde_json::json!(intent.hash);
+    let entry = match s.append_chain("scope_refusal_lifted", success) {
+        Ok(e) => e,
+        Err(e) => {
+            // The lift is live but its success is unrecorded: the chain holds an intent and no
+            // `lifted`, which every reader takes as "not lifted", so the store must say the same.
+            // Restore the refusal MEMORY-FIRST (the tighter state, which cannot fail and is what
+            // the gate answers from), then persist. Nova on #1418: never claim a restoration the
+            // vault did not take. A failed persist is reported as what it is: memory tighter than
+            // the vault, the `standing_scope_dirty` window a failed revoke-persist uses, which a
+            // restart would reopen (the vault copy wins) and the next successful persist closes.
+            s.standing_scope.refusals.push(row.clone());
+            s.standing_scope.generation += 1;
+            match s.persist_standing_scope() {
+                Ok(()) => {
+                    s.standing_scope_dirty = false;
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("lift committed but its success could not be witnessed ({e}); \
+                                                  the refusal was restored, in memory and in the vault"),
+                                "state": "restored",
+                                "intentEntryHash": intent.hash})));
+                }
+                Err(e2) => {
+                    s.standing_scope_dirty = true;
+                    tracing::error!(plugin_id = %plugin_id, path = %path, intent = %intent.hash,
+                        "scope refusal lift: success unwitnessed ({e}) AND rollback persist failed ({e2}): \
+                         the refusal stands in memory, the vault holds the lift, repair required");
+                    return (StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("lift committed but its success could not be witnessed ({e}), \
+                                                  and restoring the refusal to the vault failed ({e2})"),
+                                "state": "UNKNOWN_REPAIR_REQUIRED",
+                                "detail": "the refusal stands in MEMORY and the gate answers from it; the VAULT \
+                                           still holds the lift and the chain holds only the intent, so a \
+                                           restart would reopen the door. Repair: once the vault is writable, \
+                                           any standing-scope write (a revoke retry, a decide) re-persists \
+                                           memory; or decide a later ask standing:false→true again.",
+                                "standing_scope_dirty": true,
+                                "intentEntryHash": intent.hash})));
+                }
+            }
+        }
+    };
+    // Lifting means "asking again is welcome now": the window-bound refusal on the request this
+    // stood on (and any other refused ask for the path) would otherwise still answer `refused`
+    // until its 8 h window ran out, and the lift would look like it did nothing.
+    let now = crate::server::gate_escalation::now_secs();
+    let mut closed = 0u32;
+    for r in s.scope_requests.values_mut() {
+        if r.plugin_id == plugin_id && r.path == path && r.granted == Some(false) && r.expires_at > now {
+            r.expires_at = now;
+            closed += 1;
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({"lifted": true, "plugin_id": plugin_id, "path": path,
+                                             "window_refusals_closed": closed,
+                                             "witnessEntryHash": entry.hash})))
+}
+
 async fn scope_standing_revoke(
     State(state): State<SharedState>,
     Json(body): Json<serde_json::Value>,
@@ -5128,10 +6177,13 @@ async fn scope_standing_promote(
     if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "promotion of a live grant") {
         return refusal;
     }
+    // A grant this button already promoted (#1400) is found too, so a second press answers
+    // "already standing" below instead of "no live grant".
     let Some(live) = s
         .scope_requests
         .values()
-        .find(|r| r.plugin_id == plugin_id && r.reach_path() == path && r.is_live(now))
+        .find(|r| r.plugin_id == plugin_id && r.reach_path() == path
+                  && (r.is_live(now) || (r.ext.promoted_at.is_some() && r.revoked.is_none())))
         .cloned()
     else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
@@ -5150,7 +6202,7 @@ async fn scope_standing_promote(
     // add() replaces by (member, path)) instead of answering a no-op.
     if let Some(existing) = s.standing_scope.grants.iter()
         .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e)
-                  && (g.recursive || !live.recursive))
+                  && (g.recursive || !live.recursive) && g.modes.includes(live.ext.modes))
     {
         return (StatusCode::OK, Json(serde_json::json!({
             "status": "already_standing",
@@ -5160,6 +6212,32 @@ async fn scope_standing_promote(
             "granted_at": existing.granted_at,
             "standing_generation": s.standing_scope.generation,
             "note": "this grant is already standing; nothing was appended to the chain",
+        })));
+    }
+    if live.ext.promoted_at.is_some() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "that live grant was already promoted, and the standing grant it became is \
+                      no longer in force as it was (revoked, expired or edited); nothing to \
+                      promote — grant it again through /api/scope/grant if it is wanted",
+            "promoted_from_request": live.id,
+        })));
+    }
+    // A STANDING TWIN WITH OTHER MODES (#1345). `add` replaces by (member, path), so promoting
+    // here would rewrite the twin's modes to the live grant's: a twin holding a mode the live
+    // grant lacks would lose it silently, a narrowing nobody chose. Which modes the durable
+    // grant should carry is the operator's call, and Edit makes it explicitly.
+    if let Some(twin) = s.standing_scope.grants.iter()
+        .find(|g| g.member == plugin_id && g.path == path && g.expires_at.is_none_or(|e| now < e)
+                  && g.modes != live.ext.modes)
+    {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!(
+                "a standing grant on this path already allows {} and this live grant allows {}; \
+                 promoting would replace one with the other. Nothing was written. Edit the \
+                 standing grant instead, choosing its modes explicitly.",
+                twin.modes, live.ext.modes),
+            "standing_modes": twin.modes,
+            "live_modes": live.ext.modes,
         })));
     }
     let reason = {
@@ -5185,6 +6263,7 @@ async fn scope_standing_promote(
         "via": "operator_session",
         "origin": "promoted_from_live",
         "recursive": live.recursive,
+        "modes": live.ext.modes,
         "standing": true,
         "standing_expires_at": expires_at,
         "standing_generation": s.standing_scope.generation + 1,
@@ -5203,6 +6282,8 @@ async fn scope_standing_promote(
         expires_at,
         request_id: Some(live.id.clone()),
         recursive: live.recursive,
+        // Promotion changes how LONG a grant lasts, never what it allows (#1345).
+        modes: live.ext.modes,
     };
     if let Err(e) = s.commit_standing_scope(|st| st.add(grant)) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -5225,6 +6306,8 @@ async fn scope_standing_promote(
         "standing_expires_at": expires_at,
         "standing_generation": s.standing_scope.generation,
         "intent": intent.hash,
+        // #1400: the live grant is retired as promoted, after this record, in the same act.
+        "live_superseded": live.id,
     })) {
         Ok(e) => e,
         Err(e) => {
@@ -5243,6 +6326,12 @@ async fn scope_standing_promote(
             };
         }
     };
+    // CONVERT, NOT COPY (#1400, legion-claude for dp): the standing row now carries this reach
+    // and names the live request as its provenance, so the live grant is retired as PROMOTED.
+    // Left in force, it was a live twin the standing grant's Edit refused until it lapsed.
+    if let Some(r) = s.scope_requests.get_mut(&live.id) {
+        r.ext.promoted_at = Some(now);
+    }
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true,
         "plugin_id": plugin_id,
@@ -5252,8 +6341,8 @@ async fn scope_standing_promote(
         "generation": s.standing_scope.generation,
         "witnessEntryHash": success.hash,
         "durability": "STANDING — written to the vault; survives restart; revocable via \
-                       /api/scope/standing/revoke. The live grant remains until it lapses, or \
-                       until POST /api/scope/revoke withdraws it.",
+                       /api/scope/standing/revoke. The live grant it came from is retired as \
+                       promoted: the standing grant carries its reach from here.",
     })))
 }
 
@@ -5412,6 +6501,256 @@ async fn scope_standing_recursive(
         "applied_to": {"standing": false, "live": live_id},
         "generation": s.standing_scope.generation,
         "witnessEntryHash": entry.hash,
+    })))
+}
+
+/// Validate an operator-typed grant path for an EDIT (#1345). Stricter than a grant's
+/// `normalize_scope_path`, which resolves `..` lexically: here a `..` is refused rather than
+/// resolved, because the operator approves the path they typed and a before→after summary
+/// showing a path they did not type is the misreading this workflow exists to prevent.
+fn edit_path_arg(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("path must not be empty".into());
+    }
+    if raw.chars().any(|c| c.is_control()) {
+        return Err("path must not contain control characters".into());
+    }
+    if raw.split('/').any(|seg| seg == "..") {
+        return Err(format!("path must not contain '..' (got {raw}); type the path it should be"));
+    }
+    if raw.starts_with(crate::server::gate_escalation::UNPRICEABLE_PREFIX) {
+        return Err("that is an unenumerated-act key, not a path".into());
+    }
+    let path = crate::server::state::normalize_scope_path(raw);
+    crate::server::state::require_absolute_grant_path(&path)?;
+    if path == "/" {
+        return Err("a grant on the filesystem root is not a grant of scope".into());
+    }
+    Ok(path)
+}
+
+/// `POST /api/scope/standing/edit` — dp's Edit row (2026-10-22, #1345):
+/// `{plugin_id, path, new_path?, recursive, modes, reason, expected_generation, expected_existing?}`.
+///
+/// Changes ONE standing grant's path, reach (exact/recursive) and modes (r/w/e/d) as one act,
+/// so a staged edit is saved whole or not at all. The contract dp wrote:
+///   * **no mutation until Save**: this is the Save. Nothing on the page writes before it.
+///   * **bound to what the operator saw**: `expected_generation` is the store generation the
+///     page rendered; any mutation since (another tab, a peer ruling) refuses with 409 and
+///     writes nothing, because the before→after the operator approved was computed against a
+///     store that no longer exists. `expected_existing`, when sent, binds the row itself.
+///   * **identity kept**: the row is rewritten in place (`StandingScopeStore::edit`), so the
+///     old path is never left reachable beside the new one and the grant keeps its provenance.
+///   * **widening is named**: the response and both witness rows carry `widens` and on which
+///     axis, and a widening edit needs a reason, as every other widening here does.
+///   * **reassign stays separate**: there is no `member` field to edit.
+///
+/// A LIVE grant on the same (member, path) is a twin this edit would not move; leaving it would
+/// keep the old path or modes in force, so the edit is refused until it is revoked or lapses.
+///
+/// Order: INTENT → COMMIT → `scope_grant_edited`, with rollback if the terminal append fails,
+/// exactly as `scope_standing_recursive`.
+async fn scope_standing_edit(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use crate::server::standing_scope::{EditRefused, GrantEdit};
+    let bad = |e: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})));
+    let plugin_id = body.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let raw_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if plugin_id.is_empty() || raw_path.is_empty() {
+        return bad("plugin_id and path are required".into());
+    }
+    let path = crate::server::state::normalize_scope_path(&raw_path);
+    let new_path = match body.get("new_path").and_then(|v| v.as_str()) {
+        None => path.clone(),
+        Some(raw) => match edit_path_arg(raw) {
+            Ok(p) => p,
+            Err(e) => return bad(e),
+        },
+    };
+    let Some(recursive) = body.get("recursive").and_then(|v| v.as_bool()) else {
+        return bad("recursive must be explicitly true or false: Save sends the whole row".into());
+    };
+    if body.get("modes").is_none() {
+        return bad("modes is required: Save sends the whole row".into());
+    }
+    let modes = match modes_arg(&body) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    let Some(expected_generation) = body.get("expected_generation").and_then(|v| v.as_u64()) else {
+        return bad("expected_generation is required: an edit is bound to the store the operator saw".into());
+    };
+    let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let now = crate::server::gate_escalation::now_secs();
+
+    let mut s = state.lock().await;
+    let Some(before) = s.standing_scope.grants.iter()
+        .find(|g| g.member == plugin_id && g.path == path && g.is_live(now)).cloned()
+    else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "error": "no standing grant of record for that (plugin_id, path)"})));
+    };
+    if s.standing_scope.generation != expected_generation {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "the grants changed since this page read them; nothing was written. \
+                      Review the current row and edit again.",
+            "moved": true,
+            "generation": s.standing_scope.generation,
+        })));
+    }
+    if let Some(expected) = body.get("expected_existing") {
+        let current = standing_grant_binding(&s.standing_scope.grants, &plugin_id, &path, now);
+        if grant_binding_of(expected) != current {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "this grant is not the one you were shown; nothing was written.",
+                "moved": true,
+                "current": current,
+            })));
+        }
+    }
+    let mut after = before.clone();
+    after.path = new_path.clone();
+    after.recursive = recursive;
+    after.modes = modes;
+    if after == before {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "nothing changed; nothing witnessed",
+            "generation": s.standing_scope.generation,
+        })));
+    }
+    // Every refusal the store would make is made HERE, before the intent row: a refused edit
+    // must leave the chain as bit-identical as the store (O).
+    if after.path != before.path
+        && s.standing_scope.grants.iter().any(|g| g.member == plugin_id && g.path == after.path)
+    {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("{plugin_id} already holds a separate grant on {}; revoke one of \
+                              them first, so which reach wins is your explicit call. Nothing \
+                              was written.", after.path),
+        })));
+    }
+    let widens_modes = after.modes.widens(before.modes);
+    let widens_reach = GrantEdit::widens_reach(&before, &after);
+    let widens = widens_modes || widens_reach;
+    if widens && reason.is_empty() {
+        return bad("reason is required: this edit widens what the member can reach or do".into());
+    }
+    if let Some(refusal) = refuse_if_retired(&s, &plugin_id, "an edited grant") {
+        if widens {
+            return refusal;
+        }
+    }
+    // A live twin PROMOTED INTO this standing row (same request id: "make standing" before
+    // #1400 left it in force) is the same grant, not a second one: it is retired as promoted
+    // with this edit, after the terminal record. Any other live twin still refuses.
+    let mut superseded: Option<String> = None;
+    if let Some(twin) = s.scope_requests.values()
+        .find(|r| r.plugin_id == plugin_id && r.reach_path() == path && r.is_live(now))
+    {
+        if before.request_id.as_deref() == Some(twin.id.as_str()) {
+            superseded = Some(twin.id.clone());
+        } else {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": format!("a LIVE grant on this path ({}) would stay in force beside the edited \
+                                  one; revoke it (or let it lapse) first. Nothing was written.", twin.id),
+                "live_twin": twin.id,
+            })));
+        }
+    }
+    let row = |g: &crate::server::standing_scope::StandingGrant| serde_json::json!({
+        "path": g.path, "recursive": g.recursive, "modes": g.modes,
+    });
+    let subject = s.member_lct(&plugin_id);
+    let record = |kind: &str, extra: serde_json::Value| {
+        let mut v = serde_json::json!({
+            "kind": kind,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": subject,
+            "before": row(&before),
+            "after": row(&after),
+            "widens": widens,
+            "widens_on": {"modes": widens_modes, "reach": widens_reach},
+            "reason": reason,
+            "changed_by": "operator",
+            "via": "operator_session",
+            "identity": "the same standing row, rewritten in place: granted_at, granted_by, \
+                         request_id and expires_at are the original grant's",
+            "live_superseded": superseded,
+        });
+        if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in e { o.insert(k.clone(), val.clone()); }
+        }
+        v
+    };
+    let intent = match s.append_chain("scope_grant_edit_intent",
+        record("intent", serde_json::json!({"standing_generation": s.standing_scope.generation + 1}))) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("witness append failed, grant NOT edited: {e}")}))),
+    };
+    let prior = s.standing_scope.clone();
+    let change = GrantEdit { path: new_path.clone(), recursive, modes };
+    let mut refused: Option<EditRefused> = None;
+    if let Err(e) = s.commit_standing_scope(|st| {
+        if let Err(r) = st.edit(&plugin_id, &path, expected_generation, change) {
+            refused = Some(r);
+        }
+    }) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("grant NOT edited — vault write failed ({e}); the live store is \
+                              untouched (the candidate was persisted first). Retry."),
+            "state": "the chain holds the INTENT and no scope_grant_edited",
+            "intentEntryHash": intent.hash,
+        })));
+    }
+    if let Some(r) = refused {
+        // Unreachable under the lock (every refusal was checked above). If the store disagrees
+        // it wins: its refusal left the candidate unchanged, so what was persisted is the
+        // store as it was.
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": format!("the store refused the edit ({r:?}); nothing changed"),
+            "intentEntryHash": intent.hash,
+        })));
+    }
+    let success = match s.append_chain("scope_grant_edited",
+        record("terminal", serde_json::json!({
+            "standing_generation": s.standing_scope.generation, "intent": intent.hash}))) {
+        Ok(e) => e,
+        Err(e) => {
+            return match s.commit_standing_scope(|st| *st = prior) {
+                Ok(()) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("grant NOT edited — the terminal record failed ({e}); rolled \
+                                      back (live store and vault), the chain holds only the \
+                                      intent. Retry."),
+                    "intentEntryHash": intent.hash,
+                }))),
+                Err(rb) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                    "error": format!("THE EDIT IS LIVE but its terminal record could not be \
+                                      appended ({e}) AND the rollback failed ({rb}). Repair the \
+                                      chain — do not assume the store is consistent."),
+                    "intentEntryHash": intent.hash,
+                }))),
+            };
+        }
+    };
+    if let Some(id) = &superseded {
+        if let Some(r) = s.scope_requests.get_mut(id) {
+            r.ext.promoted_at = Some(now);
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "plugin_id": plugin_id,
+        "before": row(&before),
+        "after": row(&after),
+        "widens": widens,
+        "widens_on": {"modes": widens_modes, "reach": widens_reach},
+        "generation": s.standing_scope.generation,
+        "witnessEntryHash": success.hash,
+        "live_superseded": superseded,
     })))
 }
 
@@ -6037,7 +7376,7 @@ async fn orchestrator_connect(
 /// adapter for, and what is actually governed. Read-only; the write half is
 /// `/api/orchestrators/:id/connect` (govern) and `/api/agents/:id/ungovern`.
 async fn agents_inventory(State(state): State<SharedState>) -> impl IntoResponse {
-    match crate::server::agents::inventory() {
+    match crate::server::agents::inventory_off_thread().await {
         // `bypassed`: the operator's active gate bypasses, beside -- never merged into -- the
         // inventory's own verdicts. The inventory is not told; whether it reads a bypassed member
         // as miswired is its finding (dp, 2026-09-28: the bypass is the test of that detection).
@@ -6117,7 +7456,7 @@ async fn agent_gate_bypass(
                              r.bypassed_at, r.reason),
         })));
     }
-    let inv = match crate::server::agents::inventory() {
+    let inv = match crate::server::agents::inventory_off_thread().await {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
             "error": format!("the inventory could not run ({e}); refusing to edit a registration it cannot see"),
@@ -6269,7 +7608,7 @@ async fn agent_register(
             })),
         );
     }
-    let report = match crate::server::agents::inventory() {
+    let report = match crate::server::agents::inventory_off_thread().await {
         Ok(v) => v,
         Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
             "error": format!("cannot register what was not discovered: the inventory did not run ({e})")}))),
@@ -6934,8 +8273,13 @@ fn ungovern_ordered(
 /// So coverage now comes from the inventory, which already stats every hook target on the
 /// machine across the full scope chain and simply kept the list to itself. One discovery
 /// path, measured once, consumed by both surfaces.
-pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
-    let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
+///
+/// The inventory runs on the blocking pool. Call this BEFORE taking the state lock (#1183):
+/// the child takes about a second, and under the lock that second stalls every member's gate
+/// round-trip. Holding the lock does not freeze the filesystem, so discovering first gives up
+/// no guarantee. The hashes a verdict or a ratification rests on are still taken under the lock.
+pub(crate) async fn discovered_gate_paths_off_lock() -> Result<Vec<(String, String)>, String> {
+    let inv = crate::server::agents::inventory_off_thread().await.map_err(|e| e.to_string())?;
     discovered_gate_paths_from(&inv)
 }
 
@@ -6943,8 +8287,9 @@ pub(crate) fn discovered_gate_paths() -> Result<Vec<(String, String)>, String> {
 /// inventory read. The second list is what separates a stale expectation from a de-registered
 /// gate (#1156): a member that still declares a gate but has none registered was bypassed or
 /// miswired, and its ratified expectation is the only record that a gate belongs there.
-fn gate_inventory() -> Result<(Vec<(String, String)>, Vec<String>), String> {
-    let inv = crate::server::agents::inventory().map_err(|e| e.to_string())?;
+/// Off the lock and off the async workers, as above.
+async fn gate_inventory_off_lock() -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let inv = crate::server::agents::inventory_off_thread().await.map_err(|e| e.to_string())?;
     Ok((discovered_gate_paths_from(&inv)?, members_declaring_a_gate(&inv)))
 }
 
@@ -7514,10 +8859,12 @@ fn annotate_gate_verdicts(
 /// `GET /api/gates/verify` — hash every known gate and compare to the vault's ratified
 /// expectation. The DAEMON hashes the file; it never asks a gate about itself.
 async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
+    // Discovered before the lock (#1183); the hashes below are still taken under it.
+    let inventory = gate_inventory_off_lock().await;
     let s = state.lock().await;
     let exp = s.vault.gate_expectations();
     // An unmeasurable denominator is UNKNOWN, never VERIFIED.
-    let (discovered, declaring) = match gate_inventory() {
+    let (discovered, declaring) = match inventory {
         Ok((d, decl)) => (d, not_retired(decl, &s.retired_members)),
         Err(reason) => {
             return (
@@ -7616,10 +8963,13 @@ async fn gates_ratify(
                 .into_response()
         }
     };
-    let mut s = state.lock().await;
     // Ratify from the DISCOVERED set, for the same reason verify checks it: a hardcoded list
     // would bless whichever gates it happened to name and leave the rest unmentioned.
-    let discovered = match discovered_gate_paths() {
+    // Discovered before the lock (#1183). What gets recorded is still hashed under the lock
+    // and re-hashed just before the vault write, so a gate that changes in between is refused.
+    let discovered = discovered_gate_paths_off_lock().await;
+    let mut s = state.lock().await;
+    let discovered = match discovered {
         Ok(d) => d,
         Err(reason) => {
             return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -7674,8 +9024,9 @@ async fn gates_forget(
             }))).into_response()
         }
     };
+    let inventory = gate_inventory_off_lock().await; // before the lock (#1183)
     let mut s = state.lock().await;
-    let (discovered, declaring) = match gate_inventory() {
+    let (discovered, declaring) = match inventory {
         Ok((d, decl)) => (d, not_retired(decl, &s.retired_members)),
         Err(reason) => {
             // Without the discovered set this cannot tell a stale expectation from a live gate.
@@ -8241,6 +9592,7 @@ mod disposition_tests {
         let g = crate::server::standing_scope::StandingGrant {
             member: "m".into(), path: "/p".into(), granted_at: 1, granted_by: "operator".into(),
             reason: "r".into(), expires_at: None, request_id: None, recursive: false,
+            modes: crate::server::grant_modes::Modes::ALL,
         };
         assert_eq!(grant_binding_of(&row), standing_grant_binding(&[g.clone()], "m", "/p", 10));
         let expired = crate::server::standing_scope::StandingGrant { expires_at: Some(5), ..g };
@@ -9792,13 +11144,19 @@ mod disposition_tests {
     async fn revoking_a_live_grant_names_a_standing_grant_that_still_covers_it() {
         let (_dir, state) = test_state().await;
         let now = crate::server::gate_escalation::now_secs();
+        // A standing grant decided on its own, and a separate live grant on the same path. (Built
+        // directly: since #1400 "make standing" retires the live grant it promotes, so a promote
+        // no longer leaves a live grant in force beside its standing copy.)
         {
             let mut s = state.lock().await;
             s.scope_requests.insert("scope-live-s".into(), live_req("scope-live-s", "/x/tree", now));
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/x/tree".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "a separate standing grant".into(),
+                expires_at: None, request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
+            })).unwrap();
         }
-        let resp = scope_standing_promote(State(state.clone()), Json(serde_json::json!({
-            "plugin_id": "kimi-code", "path": "/x/tree"}))).await.into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
         let resp = scope_live_revoke(State(state.clone()), None, Json(serde_json::json!({"request_id": "scope-live-s"})))
             .await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -9877,6 +11235,7 @@ mod disposition_tests {
             member: "kimi-code".into(), path: "/y/tree".into(), granted_at: now,
             granted_by: "operator".into(), reason: "r".into(), expires_at: None,
             request_id: None, recursive: false,
+            modes: crate::server::grant_modes::Modes::ALL,
         })).unwrap();
         let rows = s.dashboard_snapshot(20).scope_grants;
         let tree: Vec<_> = rows.iter().filter(|r| r["path"] == "/y/tree").collect();
@@ -9932,6 +11291,7 @@ mod disposition_tests {
                 member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
             assert!(s.has_scope_grant("kimi-code", "/w/tree"));
             assert!(!s.has_scope_grant("kimi-code", "/w/tree/child.py"), "EXACT by default");
@@ -9981,6 +11341,7 @@ mod disposition_tests {
                 member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
         let (gen0, chain0) = { let s = state.lock().await; (s.standing_scope.generation, s.recent_chain(50).len()) };
@@ -10005,6 +11366,7 @@ mod disposition_tests {
                 member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
         let (before_grants, before_gen) = {
@@ -10037,6 +11399,7 @@ mod disposition_tests {
                 member: "kimi-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
         let gen0 = state.lock().await.standing_scope.generation;
@@ -10067,6 +11430,7 @@ mod disposition_tests {
             member: member.into(), path: path.into(), granted_at: now,
             granted_by: "operator".into(), reason: "r".into(), expires_at: None,
             request_id: None, recursive,
+            modes: crate::server::grant_modes::Modes::ALL,
         })).unwrap();
     }
 
@@ -10804,6 +12168,199 @@ mod disposition_tests {
         (s.standing_scope.grants.clone(), s.standing_scope.generation, s.recent_chain(50).len())
     }
 
+    async fn edit(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = scope_standing_edit(State(state.clone()), Json(body)).await.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// dp's Edit contract (2026-10-22, #1345): Save changes path, reach and modes in one act,
+    /// bound to the generation the page saw; the old path is not left live; the receipt names
+    /// before, after, widening and the operator.
+    #[tokio::test]
+    async fn edit_saves_path_reach_and_modes_as_one_witnessed_act() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "nomad-being").await;
+        assert_eq!(grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/gov", "reason": "read the law", "recursive": true})).await.0, StatusCode::OK);
+        let gen = state.lock().await.standing_scope.generation;
+
+        // NARROW: rwed recursive -> r recursive. No reason needed.
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "nomad-being", "path": "/w/gov",
+            "recursive": true, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!((out["widens"].clone(), out["before"]["modes"].clone(), out["after"]["modes"].clone()),
+                   (serde_json::json!(false), serde_json::json!("rwed"), serde_json::json!("r")));
+        {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.generation, gen + 1);
+            let chain = s.recent_chain(5);
+            let kinds: Vec<&str> = chain.iter().map(|e| e.event_type.as_str()).collect();
+            assert!(kinds.contains(&"scope_grant_edit_intent") && kinds.contains(&"scope_grant_edited"), "{kinds:?}");
+        }
+
+        // PATH + WIDEN: a sibling path widens, so a reason is required.
+        let gen = state.lock().await.standing_scope.generation;
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "nomad-being", "path": "/w/gov",
+            "new_path": "/w/forum", "recursive": true, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "a widening edit with no reason went through: {out}");
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "nomad-being", "path": "/w/gov",
+            "new_path": "/w/forum", "recursive": true, "modes": "rw", "reason": "post to the forum",
+            "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["widens_on"], serde_json::json!({"modes": true, "reach": true}));
+        let s = state.lock().await;
+        let mine: Vec<_> = s.standing_scope.grants.iter().filter(|g| g.member == "nomad-being").collect();
+        assert_eq!(mine.len(), 1, "the old path stayed live beside the new one");
+        assert_eq!((mine[0].path.as_str(), mine[0].modes.as_letters()), ("/w/forum", "rw".to_string()));
+        assert_eq!(mine[0].reason, "read the law", "the row keeps its provenance");
+    }
+
+    /// Every refusal leaves the store and the chain bit-identical (O).
+    #[tokio::test]
+    async fn an_edit_that_is_refused_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "nomad-being").await;
+        assert_eq!(grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/a", "reason": "r"})).await.0, StatusCode::OK);
+        assert_eq!(grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/b", "reason": "r"})).await.0, StatusCode::OK);
+        let gen = state.lock().await.standing_scope.generation;
+        let before = snapshot(&*state.lock().await);
+        let base = serde_json::json!({"plugin_id": "nomad-being", "path": "/w/a",
+            "recursive": false, "modes": "r", "expected_generation": gen});
+        let with = |k: &str, v: serde_json::Value| { let mut b = base.clone(); b[k] = v; b };
+        let cases = [
+            ("stale generation", with("expected_generation", serde_json::json!(gen - 1)), StatusCode::CONFLICT),
+            ("no generation", { let mut b = base.clone(); b.as_object_mut().unwrap().remove("expected_generation"); b }, StatusCode::BAD_REQUEST),
+            ("no modes", { let mut b = base.clone(); b.as_object_mut().unwrap().remove("modes"); b }, StatusCode::BAD_REQUEST),
+            ("empty modes", with("modes", serde_json::json!("")), StatusCode::BAD_REQUEST),
+            ("unknown mode", with("modes", serde_json::json!("rx")), StatusCode::BAD_REQUEST),
+            ("dot-dot path", with("new_path", serde_json::json!("/w/a/../../etc")), StatusCode::BAD_REQUEST),
+            ("relative path", with("new_path", serde_json::json!("w/a")), StatusCode::BAD_REQUEST),
+            ("root", with("new_path", serde_json::json!("/")), StatusCode::BAD_REQUEST),
+            ("collides", { let mut b = with("new_path", serde_json::json!("/w/b")); b["modes"] = serde_json::json!("rwed"); b["reason"] = serde_json::json!("move it"); b }, StatusCode::CONFLICT),
+            ("nothing changed", with("modes", serde_json::json!("rwed")), StatusCode::CONFLICT),
+            ("no such grant", with("path", serde_json::json!("/w/zz")), StatusCode::NOT_FOUND),
+            ("row moved", with("expected_existing", serde_json::json!({"reason": "other", "recursive": false,
+                "granted_by": "operator", "expires_at": null, "request_id": null})), StatusCode::CONFLICT),
+        ];
+        for (name, body, want) in cases {
+            let (st, out) = edit(&state, body).await;
+            assert_eq!(st, want, "{name}: {out}");
+            assert_eq!(snapshot(&*state.lock().await), before, "{name}: a refused edit wrote something");
+        }
+    }
+
+    /// A live twin on the edited path would keep the old reach in force; the edit says so.
+    #[tokio::test]
+    async fn an_edit_with_a_live_twin_is_refused() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "nomad-being").await;
+        assert_eq!(grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/a", "reason": "r"})).await.0, StatusCode::OK);
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-twin".into(), crate::server::state::ScopeRequest {
+                id: "scope-twin".into(), plugin_id: "nomad-being".into(), role: String::new(),
+                path: "/w/a".into(), reason: "twin".into(), requested_at: now, expires_at: now + 600,
+                granted: Some(true), decided_by: Some("operator".into()), decided_at: Some(now),
+                decision_reason: None, recursive: false, revoked: None, ext: Default::default(),
+            });
+        }
+        let gen = state.lock().await.standing_scope.generation;
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "nomad-being", "path": "/w/a",
+            "recursive": false, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{out}");
+        assert_eq!(out["live_twin"], "scope-twin");
+    }
+
+    /// #1400 (legion-claude for dp): "make standing" then Edit failed, because the promoted live
+    /// grant stayed in force as a live twin. Promotion now retires it as PROMOTED (not revoked:
+    /// nothing was taken from the member), and the edit goes through.
+    #[tokio::test]
+    async fn a_promoted_grant_can_be_edited_and_its_live_source_reads_promoted() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-live-9".into(), live_req("scope-live-9", "/z/tree", now));
+        }
+        let (st, out) = promote(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/z/tree"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        {
+            let s = state.lock().await;
+            let r = &s.scope_requests["scope-live-9"];
+            assert!(!r.is_live(now), "the live grant is no longer a grant in force beside its standing copy");
+            assert_eq!(r.status(now), "promoted");
+            assert!(r.revoked.is_none(), "promotion is not a revocation");
+            let ok = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_granted").unwrap();
+            assert_eq!(ok.event_data["live_superseded"], "scope-live-9");
+        }
+        // The promoted live grant is not a grant to revoke: the standing row carries the reach.
+        let resp = scope_live_revoke(State(state.clone()), None,
+            Json(serde_json::json!({"request_id": "scope-live-9"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "nothing live to revoke after a promotion");
+        // A second press still answers "already standing", not "no live grant".
+        let (st, out) = promote(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/z/tree"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["status"], "already_standing");
+        let gen = state.lock().await.standing_scope.generation;
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/z/tree",
+            "recursive": false, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::OK, "the converted grant edits as standing: {out}");
+    }
+
+    /// A grant promoted BEFORE #1400 left its live source in force. The edit treats that twin as
+    /// the same grant (its id is the standing row's request_id), retires it as promoted with the
+    /// edit, and says so.
+    #[tokio::test]
+    async fn an_edit_supersedes_the_live_grant_promoted_into_it() {
+        let (_dir, state) = test_state().await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.scope_requests.insert("scope-old".into(), live_req("scope-old", "/z/old", now));
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "kimi-code".into(), path: "/z/old".into(), granted_at: now,
+                granted_by: "operator".into(), reason: "promoted before #1400".into(),
+                expires_at: None, request_id: Some("scope-old".into()), recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
+            })).unwrap();
+        }
+        let gen = state.lock().await.standing_scope.generation;
+        let (st, out) = edit(&state, serde_json::json!({"plugin_id": "kimi-code", "path": "/z/old",
+            "recursive": false, "modes": "r", "expected_generation": gen})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["live_superseded"], "scope-old");
+        let s = state.lock().await;
+        assert_eq!(s.scope_requests["scope-old"].status(now), "promoted");
+        let done = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_grant_edited").unwrap();
+        assert_eq!(done.event_data["live_superseded"], "scope-old");
+    }
+
+    /// The direct grant and the decide path accept modes; once refuses them.
+    #[tokio::test]
+    async fn grants_carry_the_modes_they_were_given() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "nomad-being").await;
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/gov", "reason": "the law", "recursive": true, "modes": "r"})).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "nomad-being",
+            "path": "/w/x", "reason": "bad", "modes": "q"})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let s = state.lock().await;
+        let g = s.standing_scope.grants.iter().find(|g| g.path == "/w/gov").unwrap();
+        assert_eq!(g.modes, crate::server::grant_modes::Modes::READ);
+        assert!(!s.has_scope_grant("nomad-being", "/w/gov/law.rs"),
+                "a read-only grant answered an all-modes question");
+        assert!(s.has_scope_grant_for("nomad-being", "/w/gov/law.rs",
+                crate::server::grant_modes::Modes::READ));
+    }
+
     /// GPT's hold on #1006: reassign is ONE act. A recursive source arrives recursive, the
     /// source row is gone in the same commit, the generation moves once, and the terminal
     /// record carries the intent's hash and the generation the commit actually produced.
@@ -10983,6 +12540,7 @@ mod disposition_tests {
                 member: "claude-code".into(), path: "/w/tree".into(), granted_at: now,
                 granted_by: "operator".into(), reason: "r".into(), expires_at: None,
                 request_id: None, recursive: false,
+                modes: crate::server::grant_modes::Modes::ALL,
             })).unwrap();
         }
         let resp = scope_standing_recursive(State(state.clone()), Json(serde_json::json!({
@@ -11350,6 +12908,409 @@ mod disposition_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(!state.lock().await.has_scope_grant("codex", "/srv/asserted/b.txt"),
                 "the operator's revoke ends the peer's grant");
+    }
+
+    /// A member-filed ask (hestia#1409): a NOT-SAME peer may REFUSE a session-attributed one;
+    /// it may not grant one, the asker may not refuse its own, and an asserted asker's ask is
+    /// not peer-decidable in either direction (clause 0).
+    #[tokio::test]
+    async fn scope_peer_decide_refuses_a_member_filed_ask_but_never_grants_one() {
+        let (dir, state) = test_state().await;
+        let asker = connect(&state, "codex").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let f = dir.path().join("member-filed.txt");
+        std::fs::write(&f, "x").unwrap();
+        let ask = serde_json::json!({
+            "plugin_id": "codex", "session_id": asker.clone(), "path": f.to_str().unwrap(),
+            "reason": "a member-filed ask, for the peer-refusal test"});
+        let id = crate::server::handler::tool_request_scope(&state, &ask).await.unwrap()
+            ["request_id"].as_str().unwrap().to_string();
+        assert_eq!(state.lock().await.scope_requests[&id].ext.asker_basis,
+                   Some(crate::arbiter::AskerBasis::Session), "a session-attributed filing");
+        for d in ["once", "session", "standing"] {
+            let g = peer(&state, &kimi, serde_json::json!({
+                "request_id": &id, "decision": d, "reason": "a peer may not grant this"})).await;
+            assert_eq!(g["_hestia_error"]["code"], "hestia.scope_peer_decide_member_filed", "{d}: {g}");
+        }
+        let own = peer(&state, &asker, serde_json::json!({
+            "request_id": &id, "decision": "refuse", "reason": "withdrawing my own"})).await;
+        assert_eq!(own["_hestia_error"]["code"], "hestia.scope_peer_decide_self", "{own}");
+        assert_eq!(state.lock().await.scope_requests[&id].granted, None, "nothing decided yet");
+        let r = peer(&state, &kimi, serde_json::json!({
+            "request_id": &id, "decision": "refuse",
+            "reason": "already in your grant at governance/hestia; nothing to add"})).await;
+        assert_eq!(r["decided_by"], "peer:kimi-code", "{r}");
+        assert_eq!(r["peer_basis"]["origin"], "member_request", "{r}");
+        {
+            let s = state.lock().await;
+            let req = &s.scope_requests[&id];
+            assert_eq!(req.granted, Some(false));
+            assert_eq!(req.decided_by.as_deref(), Some("peer:kimi-code"));
+            assert!(req.decision_reason.as_deref().unwrap().contains("already in your grant"));
+        }
+        // ASSERTED (no session): a peer cannot refuse it either; the operator still can.
+        let a = crate::server::handler::tool_request_scope(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": f.to_str().unwrap(),
+            "reason": "an asserted member-filed ask"})).await.unwrap();
+        let aid = a["request_id"].as_str().unwrap().to_string();
+        assert_eq!(state.lock().await.scope_requests[&aid].ext.asker_basis,
+                   Some(crate::arbiter::AskerBasis::Asserted));
+        let p = peer(&state, &kimi, serde_json::json!({
+            "request_id": &aid, "decision": "refuse", "reason": "a peer refusing an asserted ask"})).await;
+        assert_eq!(p["_hestia_error"]["code"], "hestia.scope_peer_decide_ineligible", "{p}");
+        let (st, _) = decide(&state, serde_json::json!({
+            "request_id": &aid, "granted": false, "reason": "operator refuses"})).await;
+        assert_eq!(st, StatusCode::OK);
+        // A session that belongs to another member cannot file in codex's name.
+        let m = crate::server::handler::tool_request_scope(&state, &serde_json::json!({
+            "plugin_id": "codex", "session_id": kimi, "path": f.to_str().unwrap(),
+            "reason": "filing under another member's name"})).await.unwrap();
+        assert_eq!(m["_hestia_error"]["code"], "hestia.scope_request_asker_mismatch", "{m}");
+    }
+
+    /// A standing refusal (hestia#1417): once the operator refuses with standing:true, a later
+    /// gate claim for the path answers `refused` from the record and opens nothing, a member
+    /// ask for it is not filed, the operator can lift it, and a peer can add one but not lift it.
+    #[tokio::test]
+    async fn a_standing_refusal_closes_the_door_until_the_operator_lifts_it() {
+        let (dir, state) = test_state().await;
+        let f = dir.path().join("refused.txt");
+        std::fs::write(&f, "x").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        async fn count(state: &SharedState) -> usize { state.lock().await.scope_requests.len() }
+        // A gate-opened ask (a write, so the #1411 existence rule is not what answers).
+        let r = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        let id = r["request_id"].as_str().unwrap().to_string();
+        // No reason: refused, nothing stands.
+        let (st, out) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{out}");
+        assert!(state.lock().await.standing_scope.refusals.is_empty());
+        let (st, out) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true,
+            "reason": "this is the writable tree; read the snapshot instead"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        {
+            let s = state.lock().await;
+            let row = s.standing_scope.refusal_for("codex", &p).expect("a standing refusal");
+            assert_eq!(row.refused_by, "operator");
+            assert!(row.reason.contains("snapshot"));
+        }
+        // The next act: answered from the record, no new request, no new card.
+        let before = count(&state).await;
+        let again = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_eq!(again["verdict"], "refused", "{again}");
+        assert_eq!(again["standing"], true, "{again}");
+        assert!(again["detail"].as_str().unwrap().contains("snapshot"), "{again}");
+        assert_eq!(count(&state).await, before, "a standing refusal opens nothing");
+        // A member ask for the path is not filed.
+        let ask = crate::server::handler::tool_request_scope(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": &p, "reason": "asking for it by hand"})).await.unwrap();
+        assert_eq!(ask["status"], "refused_standing", "{ask}");
+        assert_eq!(count(&state).await, before);
+        // The operator lifts it; the next act opens a request again.
+        let resp = scope_refusal_lift(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "codex", "path": &p, "reason": "lifting"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p).is_none());
+        let reopened = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_eq!(reopened["verdict"], "opened", "{reopened}");
+        assert_eq!(count(&state).await, before + 1);
+        // A NOT-SAME peer can make its refusal standing too. A fresh path: the `reopened` claim
+        // above was ASSERTED, so its pending request could not be peer-cleared (clause 0).
+        let f2 = dir.path().join("refused-by-peer.txt");
+        std::fs::write(&f2, "x").unwrap();
+        let p2 = f2.to_str().unwrap().to_string();
+        let asker = connect(&state, "codex").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let (pid, _, _) = proven_claim(&state, "codex", &asker, &p2).await;
+        let pr = peer(&state, &kimi, serde_json::json!({
+            "request_id": &pid, "decision": "refuse", "standing": true,
+            "reason": "peer: the snapshot is where this is read"})).await;
+        assert_eq!(pr["decided_by"], "peer:kimi-code", "{pr}");
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.refusal_for("codex", &p2).unwrap().refused_by, "peer:kimi-code");
+    }
+
+    /// Nova on #1418 (1): a peer's standing refusal takes its reach from the REQUEST it was asked
+    /// to rule. An exact-file request refused standing leaves the file's siblings open; a subtree
+    /// request (`<dir>/*`) refused standing closes the subtree.
+    #[tokio::test]
+    async fn a_peers_standing_refusal_has_the_reach_of_the_request_it_rules() {
+        let (dir, state) = test_state().await;
+        let one = dir.path().join("one");
+        let two = dir.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        for f in [one.join("a.txt"), one.join("b.txt"), two.join("c.txt")] { std::fs::write(f, "x").unwrap(); }
+        let asker = connect(&state, "codex").await;
+        let kimi = connect(&state, "kimi-code").await;
+        // Exact file: the refusal is exact, the sibling still opens.
+        let a = one.join("a.txt").to_str().unwrap().to_string();
+        let (pid, _, _) = proven_claim(&state, "codex", &asker, &a).await;
+        let pr = peer(&state, &kimi, serde_json::json!({
+            "request_id": &pid, "decision": "refuse", "standing": true, "reason": "peer: not this file"})).await;
+        assert_eq!(pr["decided_by"], "peer:kimi-code", "{pr}");
+        assert_eq!(pr["recursive"], false, "an exact request refuses exactly: {pr}");
+        {
+            let s = state.lock().await;
+            let row = s.standing_scope.refusal_for("codex", &a).expect("standing refusal on a.txt");
+            assert!(!row.recursive, "the peer refused one file, not its directory");
+        }
+        let b = one.join("b.txt").to_str().unwrap().to_string();
+        let sibling = claim(&state, "codex", &b, &format!("cat {b}"), false).await;
+        assert_eq!(sibling["verdict"], "opened", "the sibling is not refused: {sibling}");
+        // Subtree request: the refusal has the subtree's reach.
+        let (pid2, _, _) = proven_claim(&state, "codex", &asker, &format!("{}/*", two.to_str().unwrap())).await;
+        let pr2 = peer(&state, &kimi, serde_json::json!({
+            "request_id": &pid2, "decision": "refuse", "standing": true, "reason": "peer: not this tree"})).await;
+        assert_eq!(pr2["decided_by"], "peer:kimi-code", "{pr2}");
+        assert_eq!(pr2["recursive"], true, "a subtree request refuses the subtree: {pr2}");
+        let c = two.join("c.txt").to_str().unwrap().to_string();
+        let under = claim(&state, "codex", &c, &format!("cat {c}"), false).await;
+        assert_eq!(under["verdict"], "refused", "{under}");
+        assert_eq!(under["standing"], true, "{under}");
+    }
+
+    /// Nova on #1418 (2): the lift is two-phase. A vault write that fails leaves the chain holding
+    /// a `scope_refusal_lift_intent` and NO `scope_refusal_lifted`, and the refusal still stands;
+    /// the successful lift's `lifted` row names its intent.
+    #[tokio::test]
+    async fn a_failed_lift_leaves_an_intent_and_the_refusal_standing() {
+        let (dir, state) = test_state().await;
+        let f = dir.path().join("held.txt");
+        std::fs::write(&f, "x").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        let r = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        let id = r["request_id"].as_str().unwrap().to_string();
+        let (st, out) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true, "reason": "closed"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        async fn kinds(state: &SharedState) -> Vec<String> {
+            state.lock().await.recent_chain(200).into_iter().map(|e| e.event_type).collect()
+        }
+        let before = kinds(&state).await;
+        let lifted_before = before.iter().filter(|k| *k == "scope_refusal_lifted").count();
+        // Inject: a directory where the vault's atomic-write temp file must go (the seam the
+        // state.rs durable-grant test uses). Only the vault fails; the chain stays writable.
+        std::fs::create_dir(dir.path().join("v.enc.tmp")).unwrap();
+        let resp = scope_refusal_lift(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "codex", "path": &p, "reason": "lifting"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p).is_some(),
+                "a failed commit leaves the refusal standing");
+        let after = kinds(&state).await;
+        assert_eq!(after.iter().filter(|k| *k == "scope_refusal_lifted").count(), lifted_before,
+                   "no row may claim a lift that never landed");
+        assert_eq!(after.iter().filter(|k| *k == "scope_refusal_lift_intent").count(),
+                   before.iter().filter(|k| *k == "scope_refusal_lift_intent").count() + 1,
+                   "the attempt is on the record as an INTENT");
+        // The same act is still answered from the record.
+        let again = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_eq!(again["verdict"], "refused", "{again}");
+        // Remove the injection: the lift lands, and its success row names its intent.
+        std::fs::remove_dir(dir.path().join("v.enc.tmp")).unwrap();
+        let resp = scope_refusal_lift(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "codex", "path": &p, "reason": "lifting"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.standing_scope.refusal_for("codex", &p).is_none());
+        let chain = s.recent_chain(200);
+        let lifted = chain.iter().filter(|e| e.event_type == "scope_refusal_lifted").last()
+            .expect("the success row");
+        let intent_hash = lifted.event_data["intent"].as_str().expect("names its intent");
+        assert!(chain.iter().any(|e| e.event_type == "scope_refusal_lift_intent" && e.hash == intent_hash),
+                "the named intent is on the chain");
+    }
+
+    /// nomad on #1418 (b): a standing grant that covers a standing refusal lifts it EXPLICITLY in
+    /// the same act, so the store never says closed where a grant has opened the door, and the
+    /// chain says who lifted it (the grant), not just that it is gone.
+    #[tokio::test]
+    async fn a_covering_standing_grant_lifts_the_refusal_explicitly() {
+        let (dir, state) = test_state().await;
+        let sub = dir.path().join("tree");
+        std::fs::create_dir_all(&sub).unwrap();
+        let f = sub.join("held.txt");
+        std::fs::write(&f, "x").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        let _sid = connect(&state, "codex").await; // `scope_grant` grants only to a member that has connected
+        let r = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        let id = r["request_id"].as_str().unwrap().to_string();
+        let (st, out) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true, "reason": "closed for now"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p).is_some());
+        // The operator grants the tree standing: the refusal under it is lifted, witnessed.
+        let resp = scope_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "codex", "path": sub.to_str().unwrap(), "recursive": true,
+            "reason": "the tree is theirs now"}))).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert!(s.standing_scope.refusal_for("codex", &p).is_none(), "the covering grant lifted it");
+        let lifted = s.recent_chain(200).into_iter()
+            .filter(|e| e.event_type == "scope_refusal_lifted").last()
+            .expect("the lift is witnessed, not silent");
+        assert_eq!(lifted.event_data["path"], p);
+        assert_eq!(lifted.event_data["via"], "covering_standing_grant");
+        assert!(lifted.event_data["lifted_by"].as_str().unwrap().starts_with("grant"), "{}", lifted.event_data);
+        assert_eq!(lifted.event_data["reason"], "closed for now");
+        drop(s);
+        let open = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_ne!(open["verdict"], "refused", "the door is open: {open}");
+    }
+
+    async fn lift(state: &SharedState, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        let resp = scope_refusal_lift(State(state.clone()), Json(body)).await.into_response();
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (st, serde_json::from_slice(&b).unwrap())
+    }
+
+    // `grant(state, body)` (scope_grant → (status, body)) is the helper defined earlier in this module.
+
+    async fn lifted_rows(state: &SharedState) -> usize {
+        state.lock().await.recent_chain(300).iter().filter(|e| e.event_type == "scope_refusal_lifted").count()
+    }
+
+    /// Nova on #1418 (residual 2): a standing grant lifts a refusal only when it opens what the
+    /// refusal closed, path AND modes. A `w`-only grant over a refused READ leaves the refusal
+    /// standing (the read is still unauthorized); an `r` grant lifts it. A refused ask whose modes
+    /// are not known (a Bash act, a member-filed ask) is lifted only by an all-modes grant.
+    #[tokio::test]
+    async fn a_grant_narrower_than_the_refused_ask_lifts_nothing() {
+        let (dir, state) = test_state().await;
+        let _sid = connect(&state, "codex").await;
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let f = tree.join("held.txt");
+        std::fs::write(&f, "x").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        // A READ, refused standing: the refusal records `r`.
+        let act = format!("Read {p}");
+        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
+            "act": &act, "act_digest": digest_of(&act), "spend": false,
+            "host_session_id": "sess-under-test"})).await.unwrap();
+        let id = r["request_id"].as_str().expect(&format!("opened: {r}")).to_string();
+        let (st, out) = decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true, "reason": "not this file"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(state.lock().await.standing_scope.refusal_for("codex", &p).unwrap().asked_modes(),
+                   crate::server::grant_modes::Modes::READ);
+        let rows = lifted_rows(&state).await;
+        // w-only over the tree: covers the path, opens no read, lifts nothing, witnesses nothing.
+        let (st, out) = grant(&state, serde_json::json!({"plugin_id": "codex", "path": tree.to_str().unwrap(),
+            "recursive": true, "modes": "w", "reason": "they may write here"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p).is_some(),
+                "a w-only grant must not lift a refused read");
+        assert_eq!(lifted_rows(&state).await, rows, "no lift row for a lift that did not happen");
+        // The refused read is still answered from the record, not re-asked.
+        let again = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+            "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
+            "act": &act, "act_digest": digest_of(&act), "spend": false,
+            "host_session_id": "sess-under-test"})).await.unwrap();
+        assert_eq!(again["verdict"], "refused", "{again}");
+        assert_eq!(again["standing"], true, "{again}");
+        // `r` over the tree opens what was closed: lifted, witnessed.
+        let (st, out) = grant(&state, serde_json::json!({"plugin_id": "codex", "path": tree.to_str().unwrap(),
+            "recursive": true, "modes": "r", "reason": "they may read here"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p).is_none());
+        assert_eq!(lifted_rows(&state).await, rows + 1);
+        // An ask of unknown modes (a Bash act): only an all-modes grant lifts it.
+        let tree2 = dir.path().join("tree2");
+        std::fs::create_dir_all(&tree2).unwrap();
+        let f2 = tree2.join("x.txt");
+        std::fs::write(&f2, "x").unwrap();
+        let p2 = f2.to_str().unwrap().to_string();
+        let r = claim(&state, "codex", &p2, &format!("Write -> {p2}"), false).await;
+        let id2 = r["request_id"].as_str().unwrap().to_string();
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &id2, "granted": false, "standing": true, "reason": "closed"})).await.0, StatusCode::OK);
+        assert_eq!(state.lock().await.standing_scope.refusal_for("codex", &p2).unwrap().asked_modes(),
+                   crate::server::grant_modes::Modes::ALL);
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "codex", "path": tree2.to_str().unwrap(),
+            "recursive": true, "modes": "rwe", "reason": "most of it"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p2).is_some(), "rwe is not rwed");
+        let (st, _) = grant(&state, serde_json::json!({"plugin_id": "codex", "path": tree2.to_str().unwrap(),
+            "recursive": true, "reason": "all of it"})).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(state.lock().await.standing_scope.refusal_for("codex", &p2).is_none());
+    }
+
+    /// Nova on #1418 (residual 1): when the lift's SUCCESS row cannot be witnessed, the refusal
+    /// is restored memory-first and persisted, and the response says which of the two happened.
+    /// Arm A: the persist lands → `restored`, vault and memory agree, the chain holds the intent
+    /// and no `lifted`. Arm B: the persist fails too → `UNKNOWN_REPAIR_REQUIRED`, the refusal
+    /// stands in memory (the gate still answers from it), `standing_scope_dirty` is set, and
+    /// nothing claims a restoration the vault did not take. Then, with both faults cleared, the
+    /// lift lands and names its intent.
+    #[tokio::test]
+    async fn a_lift_whose_success_cannot_be_witnessed_says_what_it_restored() {
+        let (dir, state) = test_state().await;
+        let f = dir.path().join("held.txt");
+        std::fs::write(&f, "x").unwrap();
+        let p = f.to_str().unwrap().to_string();
+        let r = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        let id = r["request_id"].as_str().unwrap().to_string();
+        assert_eq!(decide(&state, serde_json::json!({
+            "request_id": &id, "granted": false, "standing": true, "reason": "closed"})).await.0, StatusCode::OK);
+        async fn intents(state: &SharedState) -> usize {
+            state.lock().await.recent_chain(300).iter().filter(|e| e.event_type == "scope_refusal_lift_intent").count()
+        }
+        let (lifted0, intents0) = (lifted_rows(&state).await, intents(&state).await);
+        // Arm A: the success row faults, the rollback persists.
+        state.lock().await.chain_fault_on.insert("scope_refusal_lifted".into());
+        let (st, out) = lift(&state, serde_json::json!({"plugin_id": "codex", "path": &p, "reason": "lifting"})).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{out}");
+        assert_eq!(out["state"], "restored", "{out}");
+        {
+            let s = state.lock().await;
+            assert!(s.standing_scope.refusal_for("codex", &p).is_some(), "restored in memory");
+            assert!(!s.standing_scope_dirty, "the vault took the restoration");
+            let vault: crate::server::standing_scope::StandingScopeStore =
+                crate::vault::load_doc(&s.vault, "scope", "standing", "standing-scope.json").unwrap();
+            assert!(vault.refusals.iter().any(|r| r.member == "codex" && r.path == p), "restored in the vault");
+        }
+        assert_eq!(lifted_rows(&state).await, lifted0, "nothing claims a lift");
+        assert_eq!(intents(&state).await, intents0 + 1, "the attempt is on the record");
+        let again = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_eq!(again["verdict"], "refused", "{again}");
+        // Arm B: the success row faults AND the rollback's persist faults.
+        state.lock().await.vault_fault_on_persist = true;
+        let (st, out) = lift(&state, serde_json::json!({"plugin_id": "codex", "path": &p, "reason": "lifting"})).await;
+        assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR, "{out}");
+        assert_eq!(out["state"], "UNKNOWN_REPAIR_REQUIRED", "{out}");
+        assert_eq!(out["standing_scope_dirty"], true, "{out}");
+        assert!(out["intentEntryHash"].as_str().is_some(), "{out}");
+        {
+            let s = state.lock().await;
+            assert!(s.standing_scope.refusal_for("codex", &p).is_some(), "memory keeps the tighter state");
+            assert!(s.standing_scope_dirty, "memory tighter than the vault is declared, not hidden");
+            let vault: crate::server::standing_scope::StandingScopeStore =
+                crate::vault::load_doc(&s.vault, "scope", "standing", "standing-scope.json").unwrap();
+            assert!(!vault.refusals.iter().any(|r| r.member == "codex" && r.path == p),
+                    "the vault holds the lift: the response must not say restored");
+        }
+        assert_eq!(lifted_rows(&state).await, lifted0, "still nothing claims a lift");
+        let again = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
+        assert_eq!(again["verdict"], "refused", "the gate answers from memory: {again}");
+        // Faults cleared: the lift lands and its success names its intent.
+        {
+            let mut s = state.lock().await;
+            s.chain_fault_on.clear();
+            s.vault_fault_on_persist = false;
+        }
+        let (st, out) = lift(&state, serde_json::json!({"plugin_id": "codex", "path": &p, "reason": "lifting"})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let s = state.lock().await;
+        assert!(s.standing_scope.refusal_for("codex", &p).is_none());
+        assert!(!s.standing_scope_dirty, "a successful commit closes the window");
+        drop(s);
+        assert_eq!(lifted_rows(&state).await, lifted0 + 1);
     }
 
     /// Codex reviews of #1232, P2: RESERVE is all-or-none through the real handler's batch
@@ -11873,6 +13834,7 @@ mod disposition_tests {
                     added_at: 1,
                     added_by: "operator".into(),
                     reason: "predecessor".into(),
+                    ..Default::default()
                 })
             })
             .unwrap();
@@ -11931,6 +13893,64 @@ mod disposition_tests {
         assert_eq!(s.standing_scope.floor[0].reason, "common working surface");
     }
 
+    /// The floor's Edit Save (dp, 2026-10-23: "we want granularity and edit"): modes as on a
+    /// grant, a stale staging refused with nothing written, a Save that changes nothing
+    /// refused, and the witness recording before/after and whether it widens.
+    #[tokio::test]
+    async fn a_floor_edit_saves_modes_refuses_stale_and_empty_saves_and_names_widening() {
+        let (_dir, state) = test_state().await;
+        let post = |state: &SharedState, body: serde_json::Value| {
+            let state = state.clone();
+            async move { scope_floor_add(State(state), Json(body)).await.into_response() }
+        };
+        let resp = post(&state, serde_json::json!({
+            "path": "/x/law", "reason": "the governed see the law", "recursive": true, "modes": "r",
+        })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let gen = {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.floor[0].modes,
+                       crate::server::grant_modes::Modes::READ);
+            assert!(!s.standing_scope.floor_allows("/x/law/a.py"), "read-only is not reach");
+            s.standing_scope.generation
+        };
+        // A bad mode is refused before anything is witnessed.
+        let resp = post(&state, serde_json::json!({"path": "/x/law", "reason": "r", "modes": "rx"})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Stale staging: 409, nothing written.
+        let resp = post(&state, serde_json::json!({
+            "path": "/x/law", "reason": "widen", "recursive": true, "modes": "rw",
+            "expected_generation": gen + 7,
+        })).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        // A Save that changes nothing: 409.
+        let resp = post(&state, serde_json::json!({
+            "path": "/x/law", "reason": "same", "recursive": true, "modes": "r",
+            "expected_generation": gen,
+        })).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        {
+            let s = state.lock().await;
+            assert_eq!(s.standing_scope.generation, gen, "no refused Save moved the store");
+        }
+        // A real widening Save lands and the witness says it widens, with the before state.
+        let resp = post(&state, serde_json::json!({
+            "path": "/x/law", "reason": "let members write the law", "recursive": true,
+            "modes": "rw", "expected_generation": gen,
+        })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let s = state.lock().await;
+        assert_eq!(s.standing_scope.floor.len(), 1, "replaced by path, never forked");
+        assert_eq!(s.standing_scope.floor[0].modes.as_letters(), "rw");
+        // recent_chain is newest first: the first intent found is this Save's.
+        let intent = s.recent_chain(20).into_iter()
+            .find(|e| e.event_type == "society_floor_intent").unwrap();
+        let body = &intent.event_data;
+        assert_eq!(body["widens"], true, "{body}");
+        assert_eq!(body["before"]["modes"], "r", "{body}");
+        assert_eq!(body["modes"], "rw", "{body}");
+    }
+
     /// #490 NOT-SAME: a vault failure cannot leave a terminal removal claim for a path
     /// that restart resurrects. The candidate persist fails before live memory changes;
     /// the chain therefore contains only an intent, and restart reloads the unchanged floor.
@@ -11945,6 +13965,7 @@ mod disposition_tests {
                     added_at: 1,
                     added_by: "operator".into(),
                     reason: "restart invariant".into(),
+                    ..Default::default()
                 })
             })
             .unwrap();
@@ -12009,6 +14030,7 @@ mod disposition_tests {
                     added_at: 1,
                     added_by: "operator".into(),
                     reason: "terminal invariant".into(),
+                    ..Default::default()
                 })
             })
             .unwrap();
@@ -12655,6 +14677,82 @@ mod operator_vault_tests {
         assert!(!state.lock().await.instance_grants.is_empty(), "a revoke stood unrecorded");
     }
 
+    /// #1306 (dp, 2026-10-28, option 2): a loosening WITH an expiry survives a restart until that
+    /// expiry; one without does not; a revoke stays revoked; an expired row is never restored.
+    #[tokio::test]
+    async fn an_expiring_loosening_survives_a_restart_and_an_open_ended_one_does_not() {
+        async fn reopen(dir: &TempDir) -> SharedState {
+            let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+            crate::server::build_state(vault, dir.path(), "p").unwrap()
+        }
+        let key = |p: &str| (p.to_string(), "worker".to_string());
+        let (dir, state) = test_state().await;
+        let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r",
+            "expires_in_secs": 3600})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(body_json(r).await["durability"].as_str().unwrap().starts_with("vault until its expiry"));
+        let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "codex", "role": "worker", "preset": "permissive", "reason": "r"})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(body_json(r).await["durability"].as_str().unwrap().starts_with("memory-only"));
+        drop(state);
+
+        let state = reopen(&dir).await;
+        {
+            let s = state.lock().await;
+            let g = s.instance_grants.get(&key("kimi-code")).expect("the expiring loosening was not restored");
+            assert_eq!(g.preset, "permissive");
+            assert!(g.expires_at.is_some());
+            assert!(s.instance_grants.get(&key("codex")).is_none(), "an open-ended loosening outlived a restart");
+        }
+        // a revoke stays revoked across the next restart
+        let r = policy_revoke_instance_grant(State(state.clone()), Path(("kimi-code".into(), "worker".into())))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+        drop(state);
+        let state = reopen(&dir).await;
+        assert!(state.lock().await.instance_grants.is_empty(), "a revoked grant came back");
+
+        // an expired row in the document is never restored
+        {
+            let mut s = state.lock().await;
+            let rows = vec![crate::server::state::ExpiringGrantRow {
+                plugin_id: "kimi-code".into(), role: "worker".into(),
+                grant: crate::server::state::InstanceGrant {
+                    preset: "permissive".into(), granted_by: "operator".into(), granted_at: 1,
+                    reason: "r".into(), expires_at: Some(2),
+                },
+            }];
+            s.save_expiring_grants(&rows).unwrap();
+        }
+        drop(state);
+        let state = reopen(&dir).await;
+        assert!(state.lock().await.instance_grants.is_empty(), "an expired loosening was restored");
+    }
+
+    #[tokio::test]
+    async fn an_expiring_loosening_past_the_ceiling_or_out_of_range_is_refused() {
+        let (_dir, state) = test_state().await;
+        let ceiling = crate::server::state::MAX_EXPIRING_LOOSENING_SECS;
+        for secs in [ceiling + 1, u64::MAX] {
+            let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+                "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r",
+                "expires_in_secs": secs})))
+                .await.into_response();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{secs}");
+            assert!(state.lock().await.instance_grants.is_empty(), "{secs} granted something");
+        }
+        // the ceiling itself is accepted
+        let r = policy_set_instance_grant(State(state.clone()), Json(serde_json::json!({
+            "plugin_id": "kimi-code", "role": "worker", "preset": "permissive", "reason": "r",
+            "expires_in_secs": ceiling})))
+            .await.into_response();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn a_seat_config_write_whose_record_fails_restores_the_previous_document() {
         use super::super::seat_config as sc;
@@ -12749,5 +14847,172 @@ mod operator_vault_tests {
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let b = body_json(r).await;
         assert!(b.get("credential").is_none(), "a credential was released unrecorded: {b}");
+    }
+}
+
+#[cfg(test)]
+mod channel_route_tests {
+    //! #1344: the operator's channel surface. A binding is witnessed by the hash of its address
+    //! (never the address) and is not in force without its record; an answer is witnessed,
+    //! once only, and frees the member's budget; and the routes sit behind the operator gate.
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    fn body() -> serde_json::Value {
+        serde_json::json!({
+            "member": "legion-being", "channel_id": "dp", "recipient_class": "operator",
+            "adapter": "email", "address": "operator@example.invalid",
+            "reason": "the being may write to dp",
+        })
+    }
+
+    async fn set(state: &SharedState, b: serde_json::Value) -> axum::response::Response {
+        channel_binding_set(State(state.clone()), None, Json(b)).await.into_response()
+    }
+
+    async fn answer(state: &SharedState, id: u64) -> axum::response::Response {
+        channel_outbox_answer(State(state.clone()), None, Path(id)).await.into_response()
+    }
+
+    fn fail_on(dir: &TempDir, event: &str) -> rusqlite::Connection {
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_one BEFORE INSERT ON chain_entries WHEN NEW.event_type = '{event}' \
+             BEGIN SELECT RAISE(FAIL, 'injected witness failure'); END;"
+        ))
+        .unwrap();
+        conn
+    }
+
+    async fn outbox_row(state: &SharedState, n: u64) -> u64 {
+        let s = state.lock().await;
+        let lct = s.member_lct("legion-being").unwrap();
+        s.inbox_store
+            .channel_outbox_insert(&crate::storage::inbox::NewChannelOutbox {
+                member: "legion-being", member_lct: &lct, channel_id: "dp", recipient_class: "operator",
+                binding_version: 1, content: "m", content_sha256: "0", created: n, would_deny: false,
+                chain_hash: "h",
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_binding_is_refused_and_writes_nothing() {
+        let (_dir, state) = test_state().await;
+        for k in ["member", "channel_id", "recipient_class", "address", "reason"] {
+            let mut b = body();
+            b[k] = serde_json::json!("");
+            assert_eq!(set(&state, b).await.status(), StatusCode::BAD_REQUEST, "{k}");
+        }
+        let mut b = body();
+        b["channel_id"] = serde_json::json!("dp/../x");
+        assert_eq!(set(&state, b).await.status(), StatusCode::BAD_REQUEST);
+        let s = state.lock().await;
+        assert!(s.channel_bindings.bindings.is_empty());
+        assert!(!s.recent_chain(20).iter().any(|e| e.event_type.starts_with("channel_")));
+    }
+
+    #[tokio::test]
+    async fn a_binding_is_witnessed_by_its_address_hash_and_survives_restart() {
+        let (dir, state) = test_state().await;
+        assert_eq!(set(&state, body()).await.status(), StatusCode::OK);
+        {
+            let s = state.lock().await;
+            let row = s.recent_chain(20).into_iter().find(|e| e.event_type == "channel_binding_set").unwrap();
+            assert_eq!(row.event_data["address_sha256"].as_str().unwrap().len(), 64);
+            assert!(!row.event_data.to_string().contains("example.invalid"), "no address on the chain");
+        }
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        let s = state.lock().await;
+        let b = s.channel_bindings.get("legion-being", "dp").expect("restart must reload the binding");
+        assert_eq!((b.target(), b.version), ("dp:operator".to_string(), 1));
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_binding_is_rolled_back() {
+        let (dir, state) = test_state().await;
+        let conn = fail_on(&dir, "channel_binding_set");
+        assert_eq!(set(&state, body()).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.lock().await.channel_bindings.get("legion-being", "dp").is_none(),
+                "not in force without its record");
+        conn.execute_batch("DROP TRIGGER fail_one").unwrap();
+        assert_eq!(set(&state, body()).await.status(), StatusCode::OK, "the identical retry lands");
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_witnessed_once_and_frees_the_budget() {
+        let (_dir, state) = test_state().await;
+        let id = outbox_row(&state, 100).await;
+        let lct = state.lock().await.member_lct("legion-being").unwrap();
+        assert_eq!(state.lock().await.inbox_store.channel_unanswered(&lct, "dp", 0).unwrap().len(), 1);
+        assert_eq!(answer(&state, id + 99).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(answer(&state, id).await.status(), StatusCode::OK);
+        assert_eq!(answer(&state, id).await.status(), StatusCode::CONFLICT, "answered once, never moved");
+        let s = state.lock().await;
+        assert!(s.inbox_store.channel_unanswered(&lct, "dp", 0).unwrap().is_empty());
+        let rows: Vec<_> = s.recent_chain(20).into_iter().filter(|e| e.event_type == "channel_answer").collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_data["outbox_id"], id);
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_answer_is_not_recorded() {
+        let (dir, state) = test_state().await;
+        let id = outbox_row(&state, 100).await;
+        let _conn = fail_on(&dir, "channel_answer");
+        assert_eq!(answer(&state, id).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let s = state.lock().await;
+        assert!(s.inbox_store.channel_outbox_get(id).unwrap().unwrap().answered_at.is_none());
+    }
+
+    /// The routes are on the operator-gated router: no session, no answer and no outbox.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_channel_routes_refuse_a_request_without_an_operator_session() {
+        std::env::remove_var("HESTIA_OPERATOR_DEV_TOKEN");
+        let (_dir, state) = test_state().await;
+        let id = outbox_row(&state, 100).await;
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let bind = format!("127.0.0.1:{port}");
+        let served = state.clone();
+        let _server = tokio::spawn(async move {
+            let _ = super::serve_with_callback(served, &bind, None).await;
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let mut up = false;
+        for _ in 0..600 {
+            if client.get(format!("{base}/api/channel/outbox")).send().await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(up, "the test server never came up on {base}");
+        for (method, path) in [("GET", "/api/channel/outbox".to_string()), ("GET", "/api/channel/binding".to_string()),
+                               ("POST", "/api/channel/binding".to_string()),
+                               ("POST", format!("/api/channel/outbox/{id}/answer"))] {
+            let req = if method == "GET" { client.get(format!("{base}{path}")) }
+                      else { client.post(format!("{base}{path}")).json(&body()) };
+            let st = req.send().await.unwrap().status();
+            assert!(st == StatusCode::UNAUTHORIZED || st == StatusCode::FORBIDDEN, "{method} {path}: {st}");
+        }
+        let s = state.lock().await;
+        assert!(s.inbox_store.channel_outbox_get(id).unwrap().unwrap().answered_at.is_none());
+        assert!(s.channel_bindings.bindings.is_empty());
     }
 }

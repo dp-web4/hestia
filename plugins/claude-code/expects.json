@@ -20,6 +20,13 @@
       "hooks/law_inject.py",
       "hooks/disposition_deliver.py"
     ],
+    "mesh_member": "claude-code",
+    "requires": [
+      "member-mesh/session-mesh-inbox.sh",
+      "member-mesh/prompt-disposition-watch.sh",
+      "member-mesh/hestia-mesh.py"
+    ],
+    "_mesh_member_note": "#1373: this member carries the member mesh. install-members.sh installs plugins/member-mesh/RUNTIME_MANIFEST.txt's files (the two mesh hooks this member's template registers, and the CLI they call from their own directory) into the directory its harness runs the mesh hooks from, and records them in the manifest. The value is the member's mesh id, pinned on the template's mesh lines.",
     "gate_probe": {
       "entry": "hooks/pre_tool_use.py",
       "environment": {

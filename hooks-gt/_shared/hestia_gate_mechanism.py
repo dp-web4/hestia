@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 34026f2c12b3b5e96190e3f070f6543e93dbea962de3fe8161c48229bc857983  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -1210,6 +1210,16 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             # that serves a floor, and no deployed daemon did yet.
             "society_floor": [],
             "society_floor_digest": None,
+            # Read-only floor roots (dp, 2026-10-19: "the governed see the law"). Kept apart
+            # from `in_scope` because a grant carries reach and no mode (#1098 §2, #1345):
+            # an entry here admits READ acts only, and only in a core that knows the key.
+            "society_floor_read": [],
+            "in_scope_read": [],
+            # Grants NARROWED below all four modes (hestia #1345 part B), as
+            # {"entry": <in_scope spelling>, "modes": "r"|"rw"|...}. Apart from `in_scope` for
+            # the same reason as `in_scope_read`: a core that predates this key ignores it and
+            # admits nothing for them, so narrowing never widens on an older gate.
+            "in_scope_modes": [],
             "generation": None,
             "expires_at": None,
         }
@@ -1262,6 +1272,26 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
                         })
                         snap["scope_grants"].append(p.strip())
                         snap["in_scope"].append(_scope_entry_for_grant(p, rec))
+            # NARROWED grants (hestia #1345 part B). Since #1370 the two lists above carry only
+            # full-mode grants, and `grants_by_mode` carries every grant with its modes. Only
+            # the narrowed rows are taken from it (a full-mode row is already in `in_scope`),
+            # through the same `_scope_entry_for_grant` mapping. Absent on an older daemon:
+            # a no-op. A row whose modes are not a non-empty subset of "rwed" is skipped, so
+            # malformed data reads as no grant.
+            by_mode = scope.get("grants_by_mode")
+            if isinstance(by_mode, list):
+                for g in by_mode:
+                    if not isinstance(g, dict):
+                        continue
+                    p, modes = g.get("path"), g.get("modes")
+                    if not (isinstance(p, str) and p.strip() and isinstance(modes, str)):
+                        continue
+                    if not modes or modes == "rwed" or any(m not in "rwed" for m in modes):
+                        continue
+                    snap["in_scope_modes"].append({
+                        "entry": _scope_entry_for_grant(p, bool(g.get("recursive"))),
+                        "modes": "".join(m for m in "rwed" if m in modes),
+                    })
             # CERTIFICATION, issued by the authority (Sprint F R1): the standing store's
             # monotonic generation ("WHICH policy is this copy") and the daemon's honor
             # horizon for it. Booleans are excluded deliberately — isinstance(True, int)
@@ -1285,13 +1315,26 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             # Absent on an older daemon, in which case every line below is a no-op and the
             # snapshot is exactly the pre-floor one: a member talking to a daemon that has no
             # floor gets no floor, rather than an error or a guess.
+            # `recursive` rides the floor entry since the floor learned subtrees; absent on
+            # an older daemon, which reads as exact — the floor's meaning before it existed.
             floor = scope.get("society_floor")
             if isinstance(floor, list):
                 for f in floor:
                     p = f.get("path") if isinstance(f, dict) else None
                     if isinstance(p, str) and p.strip():
                         snap["society_floor"].append(p.strip())
-                        snap["in_scope"].append(_scope_entry_for_grant(p))
+                        snap["in_scope"].append(
+                            _scope_entry_for_grant(p, f.get("recursive") is True))
+            # The READ-ONLY floor: the same mapping, into a list the core consults for read
+            # acts alone. Absent on an older daemon, so nothing extra is admitted.
+            floor_read = scope.get("society_floor_read")
+            if isinstance(floor_read, list):
+                for f in floor_read:
+                    p = f.get("path") if isinstance(f, dict) else None
+                    if isinstance(p, str) and p.strip():
+                        snap["society_floor_read"].append(p.strip())
+                        snap["in_scope_read"].append(
+                            _scope_entry_for_grant(p, f.get("recursive") is True))
             floor_digest = scope.get("society_floor_digest")
             if isinstance(floor_digest, str) and len(floor_digest) == 64:
                 snap["society_floor_digest"] = floor_digest
@@ -1343,7 +1386,12 @@ def emit_attestation(allows, denies, *, plugin_id, role_lct, endpoint=None, dead
     `deadline` (stage C): no request starts after it (raises TimeoutError; the tally's caller
     swallows it, accounting never changes a decision).
     """
-    endpoint = endpoint or os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+    # #944: the endpoint is configuration. With none projected, attest nothing; never a
+    # guessed port (2026-10-06: a fallback to :7711 reached the live daemon from a CI
+    # harness and opened four real escalations under other members' names, #1246).
+    endpoint = endpoint or _discover_endpoint()
+    if endpoint is None:
+        return None
 
     def post(payload, timeout, hdrs=None):
         timeout = _step_timeout(timeout, deadline)
@@ -1450,8 +1498,12 @@ def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=
     gate-self session this call mints joins to the per-wake session the outcome rows carry.
 
     `deadline` (stage C): an absolute `time.monotonic()` bound. Each step keeps its fixed budget
-    but never runs past it, and no step starts after it (that is a None: refusal or loss)."""
-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+    but never runs past it, and no step starts after it (that is a None: refusal or loss).
+
+    No endpoint discovered (#944) is a None too: nothing is sent to a guessed port."""
+    endpoint = _discover_endpoint()
+    if endpoint is None:
+        return None
 
     def post(payload, hdrs, timeout):
         timeout = _step_timeout(timeout, deadline)
@@ -1714,8 +1766,12 @@ def scope_call(tool, args, *, plugin_id, role, client_name, host_session_id=None
     capped by it, so a slow connect can never let the MUTATING call go out after the caller has
     already decided. Returns the result dict, or None when nothing was sent (out of time before
     the mutating call), or `SCOPE_UNCERTAIN` when the mutating call was SENT and no answer came —
-    the daemon may have applied it. Never raises."""
-    endpoint = os.environ.get("HESTIA_ENDPOINT", "http://127.0.0.1:7711/mcp")
+    the daemon may have applied it. Never raises.
+
+    No endpoint discovered (#944) is None: nothing was sent, to any port."""
+    endpoint = _discover_endpoint()
+    if endpoint is None:
+        return None
     end = deadline if deadline is not None else time.monotonic() + 3.0
 
     def left(cap):

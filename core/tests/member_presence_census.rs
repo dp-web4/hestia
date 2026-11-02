@@ -249,6 +249,16 @@ enum SiteClass {
 }
 
 const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
+    // #1344 (2026-10-23, legion-claude): `tool_channel_send`. It NAMES the sender (the chain
+    // row's and outbox row's `member_lct`; `None` refuses, nothing recorded), and it GATES on a
+    // name: the unanswered budget (`would_deny`) counts the channel's rows whose member is the
+    // sender or `same_entity` with it. Keying the count on one LCT would have given each alias of
+    // a member its own budget, failing OPEN; `same_entity` (with the operator's alias records)
+    // is the repair the appeal pools use. Predicate, with the comparison pinned below.
+    ("server/handler.rs::tool_channel_send", &[
+        ".filter(|r| r.member == who.plugin_id || s.same_entity(&r.member, &who.plugin_id))",
+        "let Some(member_lct) = s.member_lct(&who.plugin_id) else {",
+    ], SiteClass::Predicate),
     ("server/handler.rs::gate_direct_tool", &[
         "let instance_lct = s.member_lct(&who.plugin_id);",
     ], SiteClass::Naming),
@@ -633,6 +643,30 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/http.rs::scope_live_revoke", &[
         "\"subject_instance_lct\": s.member_lct(&req.plugin_id),",
     ], SiteClass::Naming),
+    // ADDED 2026-10-27 (cbp-claude, hestia#1417: a refusal can stand like a grant). The
+    // operator's lift of a standing refusal, the third sibling of the two revokes above.
+    //
+    // READING, both questions. (1) Who gets named? The subject of a `scope_refusal_lifted`
+    // chain entry — the member whose standing refusal the operator just lifted. `plugin_id`
+    // is operator-typed, exactly as in `scope_standing_revoke`; a typo 404s on the
+    // `refusals` lookup before this line runs. (2) Compared to decide control flow? No — the
+    // lift keys on the store's `(member, path)` strings; the derived LCT is serialised into
+    // the witness entry and read by nothing. Naming, like its siblings.
+    ("server/http.rs::scope_refusal_lift", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
+    // ADDED 2026-10-27 (cbp-claude, hestia#1418, nomad's (b)): a STANDING GRANT that covers a
+    // standing refusal lifts it in the same act, and the lift is witnessed here, after the vault
+    // commit, as `scope_refusal_lifted` with `via: covering_standing_grant`.
+    //
+    // READING, both questions. (1) Who gets named? The subject of that chain entry — the member
+    // whose refusal the grant just lifted, read from the refusal row (`r.member`), which came
+    // from the store, not from operator typing. (2) Compared to decide control flow? No — which
+    // refusals lift is decided by `StandingRefusal::lifted_by` on the store's strings and modes;
+    // the derived LCT is serialised into the witness entry and read by nothing. Naming.
+    ("server/state.rs::commit_standing_scope", &[
+        "\"subject_instance_lct\": self.member_lct(&r.member),",
+    ], SiteClass::Naming),
     // ADDED 2026-09-08 (legion-claude, dp's "make standing" / "make recursive" buttons).
     // The census went red on the full `cargo test` after `--lib` was green — the exact
     // trap this file's header describes, and the reason the branch was not pushed on
@@ -660,6 +694,14 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // (2) Compared to decide control flow? No — keyed on `(member, path)` strings against
     // both stores; the LCT is serialised and read by nothing. Naming.
     ("server/http.rs::scope_standing_recursive", &[
+        "let subject = s.member_lct(&plugin_id);",
+    ], SiteClass::Naming),
+    // ADDED 2026-10-22 (nomad-claude, #1345 part A: the one-act grant Edit). (1) Changes who
+    // is named? No: it names the grant's own member in the edit's intent and terminal rows,
+    // the subject `scope_standing_recursive` names for the same kind of act. (2) Compared to
+    // decide control flow? No: the edit is keyed on `(member, path)` strings; the LCT is only
+    // serialised into the record. Naming. Caught by the full `cargo test` after `--lib`.
+    ("server/http.rs::scope_standing_edit", &[
         "let subject = s.member_lct(&plugin_id);",
     ], SiteClass::Naming),
     // ADDED 2026-09-09 (cbp, the atomic `reassign` — GPT's hold on #1006). Caught by the
@@ -763,6 +805,10 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
 /// asserts the two agree, so a new Predicate site without a pinned
 /// comparison — or a pinned comparison at a Naming site — is red on arrival.
 const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
+    // #1344: the channel-send budget counts the sender's rows AND its aliases'.
+    ("server/handler.rs::tool_channel_send", &[
+        ".filter(|r| r.member == who.plugin_id || s.same_entity(&r.member, &who.plugin_id))",
+    ]),
     // #1232 (2026-10-11): the scope-request peer pool (excludes the asker's aliases) and the
     // peer decide's self-refusal. See their readings in the line census.
     ("server/handler.rs::scope_peer_pool", &[

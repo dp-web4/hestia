@@ -327,6 +327,9 @@ def _run_probes(
         # subprocess timeout below. A non-harness invoker declares that bound; when the candidate
         # also finds a registration of itself, the smaller wins, so this can only shorten it.
         environment["HESTIA_HOOK_TIMEOUT_S"] = str(PROBE_TIMEOUT_S)
+        # A PROBE IS NOT AN ACT: nobody re-issues it, so a refusal must not open a peer scope
+        # request. Every cycle's deploy-hold probe opened one per member (dp, 2026-10-14).
+        environment["HESTIA_GATE_NO_ESCALATE"] = "1"
         # THE CANDIDATE GATE IS PROBED AGAINST THE CANDIDATE ENGINE, not the installed one.
         # Since #742/#747 a seat loads shared law only from HESTIA_SHARED_DIR or the installed
         # $HESTIA_HOME/shared, with no fallback. The first cycle after #747 merged (CBP,

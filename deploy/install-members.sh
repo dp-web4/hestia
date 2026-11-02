@@ -138,6 +138,30 @@ case "$_hh_early" in
     die "HESTIA_HOME resolves to '$_hh_early', which contains characters this installer will not write onto a hook line, into a sourced shell file or environment.d (allowed: letters, digits and / . _ + @ , : -). Move it to such a path." ;;
 esac
 
+# THE MEMBER MESH RUNTIME IS CHECKED HERE TOO, before any member file is written (Nova, #1374 review). Its
+# refusals are repo-side -- a manifest name that is not a bare filename, a source that is a symlink, a
+# plugins/member-mesh that resolves outside this checkout -- so they answer the same for every member; found
+# inside the member loop they would die after that member's own hooks were already written, a partial install.
+# The per-member block below uses mesh_names as validated here. Host-side anomalies (a symlinked TARGET, a
+# LOSS) stay per member: they skip that member's mesh, said aloud, and never stop the run.
+mesh_root="$REPO_ROOT/plugins/member-mesh"
+mesh_manifest="$mesh_root/RUNTIME_MANIFEST.txt"
+mesh_names=()
+if [ -f "$mesh_manifest" ]; then
+  mesh_real="$(cd "$mesh_root" && pwd -P)"
+  repo_real="$(cd "$REPO_ROOT" && pwd -P)"
+  [ "$mesh_real" = "$repo_real/plugins/member-mesh" ] || die "plugins/member-mesh resolves to $mesh_real, outside this checkout's plugins/"
+  mapfile -t mesh_names < <(sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*#/d' -e '/^$/d' "$mesh_manifest")
+  for name in "${mesh_names[@]}"; do
+    case "$name" in
+      .*|*/*|"") die "plugins/member-mesh/RUNTIME_MANIFEST.txt: '$name' is not a bare filename" ;;
+    esac
+    [[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || die "plugins/member-mesh/RUNTIME_MANIFEST.txt: '$name' is not a bare filename"
+    [ -L "$mesh_root/$name" ] && die "mesh runtime source $mesh_root/$name is a symlink"
+    [ -f "$mesh_root/$name" ] || die "mesh runtime source $mesh_root/$name does not exist"
+  done
+fi
+
 # ORDER IS LOAD-BEARING: the engine is installed and $HESTIA_HOME/shared is repointed
 # BEFORE any hook entrypoint is written. Hooks import their decision engine from that
 # symlink, so installing a hook first opens a window in which the installed hook is newer
@@ -524,6 +548,90 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
     # $(dirname "$0")/.., so its own directory wins when it is one of the files.
     if [ -z "$seed_anchor" ] || [ "$base" = "hydrate.sh" ]; then seed_anchor="$target_dir"; fi
   done
+
+  # --- THE MEMBER MESH RUNTIME (#1373) ------------------------------------------------------------
+  # A member that declares install.mesh_member carries the mesh: its template registers the two mesh
+  # hooks, and both run $(dirname "$0")/hestia-mesh.py. The three files are ONE shared runtime listed in
+  # plugins/member-mesh/RUNTIME_MANIFEST.txt (the _shared engine's shape), never copied into a member's
+  # plugin dir and never named by a path that leaves it.
+  #   WHERE: the directory the member's mesh hook is registered or planned at -- derived (invariant 1) --
+  #     and only when that is the member's own install.dest. A mesh hook registered anywhere else was put
+  #     there by hand (CBP's ~/.claude/hooks/member-mesh); it is left to plugins/member-mesh/install.sh,
+  #     whose pin and loss refusals own that layout, and said aloud.
+  #   WHAT (Nova, #1374 review): every manifest name is a bare filename; a source that is a symlink, or a
+  #     plugins/member-mesh that resolves outside this checkout, is refused at the preflight, before any
+  #     member file is written; a target that is a symlink skips this member's mesh, said aloud.
+  #   LOSS (member-mesh/install.sh's rule, kimi notice 352): an installed session-mesh-inbox.sh -- the
+  #     hook, where a member's grain is set -- that ASSIGNS a HESTIA_* the pinned line does not is not
+  #     overwritten: the overwrite would silently change the member's grain. Refused for this member,
+  #     named, and left for the operator. Only the pinned pair is credited, never the new source: a text
+  #     scan cannot tell the source's echoed banner from a live assignment, and crediting it would mask
+  #     exactly the loss this exists to catch (kimi, #1374 v2 review). hestia-mesh.py is not scanned,
+  #     as in install.sh: its HESTIA_*= text is docstrings and f-strings, so scanning it would refuse
+  #     every upgrade.
+  # Same backup (2) and per-file verify (3); each file is a row in the manifest.
+  # mesh_member is a presence flag here: there is one shared runtime and one manifest, not one per id.
+  mesh_id="$(python3 -c '
+import json,sys
+print((json.load(open(sys.argv[1])).get("install") or {}).get("mesh_member") or "")' "$expects")"
+  if [ -n "$mesh_id" ]; then
+    [ -f "$mesh_manifest" ] || die "$member declares mesh_member but $mesh_manifest is missing"
+    mesh_anchor="${registered[session-mesh-inbox.sh]:-${planned[$member/session-mesh-inbox.sh]:-}}"
+    mesh_dir=""; mesh_skip=""
+    if [ -z "$mesh_anchor" ]; then
+      mesh_skip="its mesh hooks are neither registered nor planned on this host"
+    else
+      mesh_dir="$(dirname "$mesh_anchor")"
+      if [ -n "$declared" ] && [ "$mesh_dir" != "$declared" ]; then
+        mesh_skip="its mesh hooks run from $mesh_dir, not hestia's dest $declared (hand-installed: plugins/member-mesh/install.sh owns that layout)"
+      fi
+    fi
+    if [ -z "$mesh_skip" ]; then
+      for name in "${mesh_names[@]}"; do
+        src="$mesh_root/$name"   # name, source and directory validated before any write (preflight above)
+        t="${registered[$name]:-${planned[$member/$name]:-}}"
+        if [ -n "$t" ] && [ "$(dirname "$t")" != "$mesh_dir" ]; then
+          mesh_skip="its $name is registered at $t, apart from session-mesh-inbox.sh in $mesh_dir"; break
+        fi
+        t="$mesh_dir/$name"
+        if [ -L "$t" ]; then mesh_skip="$t is a symlink"; break; fi
+        if [ "$name" = "session-mesh-inbox.sh" ] && [ -f "$t" ] && ! cmp -s "$src" "$t"; then
+          lost=""
+          for v in $(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*\/\//d' "$t" | grep -oE '(^|[[:space:]]|[;&(])HESTIA_[A-Z0-9_]*=' | grep -oE 'HESTIA_[A-Z0-9_]*' | sort -u); do
+            case "$v" in
+              HESTIA_MESH_PLUGIN|HESTIA_ROLE) : ;;
+              *) lost="$lost $v" ;;
+            esac
+          done
+          if [ -n "$lost" ]; then
+            mesh_skip="the installed $t assigns$lost, which its pinned line does not (see plugins/member-mesh/install.sh --check)"; break
+          fi
+        fi
+      done
+    fi
+    if [ -n "$mesh_skip" ]; then
+      log "  skip  member mesh — $mesh_skip"
+      any_skipped=1
+    else
+      for name in "${mesh_names[@]}"; do
+        src="$mesh_root/$name"; target="$mesh_dir/$name"
+        src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
+        if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$src_hash" ]; then
+          log "  ok    $name (member mesh, already current) -> $mesh_dir"
+        elif [ "$DRY_RUN" = "1" ]; then
+          log "  would $name (member mesh) -> $mesh_dir"
+        else
+          [ -d "$mesh_dir" ] || mkdir -p -m 0755 "$mesh_dir"
+          [ -f "$target" ] && cp -p "$target" "$target.pre-install.bak"
+          install -m 0755 "$src" "$target"
+          got="$(sha256sum "$target" | cut -d' ' -f1)"
+          [ "$got" = "$src_hash" ] || die "$member/$name verify FAILED (src $src_hash != installed $got)"
+          log "  wrote $name (member mesh) -> $mesh_dir"
+        fi
+        member_files_json="$member_files_json{\"file\":\"$name\",\"path\":\"$target\",\"sha256\":\"$src_hash\"},"
+      done
+    fi
+  fi
 
   # A member every one of whose files was unregistered installed NOTHING; recording it
   # would be invariant 4's failure one level down — a partial (here, empty) install

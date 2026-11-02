@@ -89,11 +89,13 @@ pub struct InFlightAction {
 
 /// An operator's scoped exception to society law for one `(plugin_id, role)`.
 ///
-/// Held in memory only — see `ServerState::instance_grants`. Carries WHO granted it and WHY,
+/// Held in memory — see `ServerState::instance_grants` — and, when it carries an expiry, ALSO in
+/// the vault (`EXPIRING_GRANTS_DOC`, dp 2026-10-28 on #1306) so a deploy's restart does not revoke
+/// it before the operator's own bound. Carries WHO granted it and WHY,
 /// because a loosening whose rationale is not recorded is indistinguishable after the fact from
 /// a misconfiguration, and this is the one control in the system that can widen what an agent
 /// may do.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstanceGrant {
     /// Preset the grant applies to this member instead of the society baseline.
     pub preset: String,
@@ -103,7 +105,42 @@ pub struct InstanceGrant {
     pub reason: String,
     /// Wall-clock expiry, when the operator set one. `None` means it lasts until revoked or
     /// until the daemon restarts — which it always eventually does, so no grant is permanent.
+    /// `Some` means it is ALSO kept in the vault and survives a restart until this second, and no
+    /// later: the bound the operator chose is the only thing that ends it short of a revoke.
     pub expires_at: Option<u64>,
+}
+
+/// The vault document holding the loosenings that carry an expiry: `(namespace, name, legacy file)`.
+///
+/// WHY (dp, 2026-10-28, #1306 option 2). A memory-only loosening was revoked by the next deploy's
+/// restart, and hestia-deploy restarts the daemon whenever main moves (every 4 h on the fleet), so an
+/// operator's per-member `permissive` lasted until an unrelated deploy, not a working day, and nothing
+/// said it had gone (dp, 10-13). The 2026-08-01 reason for memory-only still holds for a grant WITHOUT
+/// an expiry: a widening nobody remembers to revoke must not become permanent, and restart is what ends
+/// it. A grant WITH an expiry already has that end, set by the operator, so it can be durable without
+/// becoming permanent by inattention. Expired rows are never restored and are dropped on the next write.
+pub const EXPIRING_GRANTS_DOC: (&str, &str, &str) = ("policy", "expiring-grants", "expiring-grants.json");
+
+/// The longest an expiring loosening may last (nomad's HOLD on #1430). The durable kind's safety is
+/// "its end is the operator's own bound", which holds only if the bound is bounded: an
+/// `expires_in_secs` of a century would survive every restart, the permanence the 08-01 rule exists
+/// to prevent. Seven days covers "a working day" and a week away; longer is a STANDING decision, made
+/// on the standing surface, not a loosening that happens to outlive restarts. Refused above, never clamped.
+pub const MAX_EXPIRING_LOOSENING_SECS: u64 = 7 * 24 * 3600;
+
+/// One persisted expiring loosening: the key `ServerState::instance_grants` holds it under, and the grant.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ExpiringGrantRow {
+    pub plugin_id: String,
+    pub role: String,
+    pub grant: InstanceGrant,
+}
+
+impl PartialEq for InstanceGrant {
+    fn eq(&self, o: &Self) -> bool {
+        (self.preset.as_str(), self.granted_by.as_str(), self.granted_at, self.reason.as_str(), self.expires_at)
+            == (o.preset.as_str(), o.granted_by.as_str(), o.granted_at, o.reason.as_str(), o.expires_at)
+    }
 }
 
 impl InstanceGrant {
@@ -194,6 +231,12 @@ pub struct ScopeRequestExt {
     /// `Some` when the gate opened this request on a refusal; `None` when the member filed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateDenyOrigin>,
+    /// For a MEMBER-FILED ask: whether the asker was resolved from a live session when it was
+    /// recorded, or merely asserted (hestia#1409). A gate-opened request carries this on
+    /// `gate.asker_basis`. A NOT-SAME peer may REFUSE a session-attributed member-filed ask;
+    /// granting one stays the operator's. Rows written before this field read as asserted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asker_basis: Option<crate::arbiter::AskerBasis>,
     /// The operator answered ONE-TIME: this exact act (`gate.act_digest`), once, inside the
     /// claim window. Never a live grant: it is not served in `live_grants`, so no snapshot
     /// carries it; only `hestia_scope_claim` can spend it.
@@ -226,6 +269,18 @@ pub struct ScopeRequestExt {
     /// NOT-SAME basis the ruling rested on. `None` for an operator ruling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_basis: Option<serde_json::Value>,
+    /// What the live grant lets the member DO at its reach (#1345). Set by the decider, like
+    /// `recursive`; all four by default, which is what every live grant meant before.
+    #[serde(default, skip_serializing_if = "crate::server::grant_modes::is_all")]
+    pub modes: crate::server::grant_modes::Modes,
+    /// When the operator's "make standing" converted this live grant into a standing one
+    /// (#1400). From then on the standing row carries the reach, with this request's id as its
+    /// provenance, and this record is no longer a grant in force: not revoked (nothing was taken
+    /// from the member, so no revocation notice), but PROMOTED. Before this, the live grant
+    /// stayed in force beside its standing copy until it lapsed, and the standing grant's Edit
+    /// refused it as a live twin: "converted, then could not be edited".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at: Option<u64>,
 }
 
 impl ScopeRequestExt {
@@ -299,6 +354,7 @@ impl ScopeRequest {
         // window would pass). PRD_ALLOWLISTS §5.2: "no code path for session or permanent calls
         // the claim verb" — and, the converse, no one-time answer is served as policy.
         self.granted == Some(true) && now < self.expires_at && self.revoked.is_none() && !self.ext.once
+            && self.ext.promoted_at.is_none()
     }
 
     /// The path a live grant reaches from: the operator's chosen breadth, else the asked path.
@@ -322,7 +378,13 @@ impl ScopeRequest {
     /// Reach is by the grant's own rule (`covers_path`): exact unless the operator made it
     /// recursive — the same rule the standing store uses, so the two channels agree.
     pub fn grants(&self, path: &str, now: u64) -> bool {
+        self.grants_for(path, now, crate::server::grant_modes::Modes::ALL)
+    }
+
+    /// `grants`, and the grant includes every mode in `needed` (#1345).
+    pub fn grants_for(&self, path: &str, now: u64, needed: crate::server::grant_modes::Modes) -> bool {
         self.is_live(now)
+            && self.ext.modes.includes(needed)
             && crate::server::standing_scope::covers_path(self.reach_path(), self.recursive, path)
     }
 
@@ -334,6 +396,10 @@ impl ScopeRequest {
     pub fn status(&self, now: u64) -> &'static str {
         if self.revoked.is_some() {
             return "revoked";
+        }
+        if self.ext.promoted_at.is_some() {
+            // #1400: carried on by the standing grant that names this request as its provenance.
+            return "promoted";
         }
         if self.ext.once && (self.ext.spent_at.is_some() || self.ext.reservation_lapsed(now)) {
             return "spent";
@@ -370,7 +436,14 @@ pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
 /// | TIGHTENING          | vault (`instance_overlays`)         | **yes**          |
 /// | LIVE loosening      | memory (`instance_grants`,          | **no**           |
 /// |                     |  `scope_requests`)                  |                  |
+/// | EXPIRING loosening  | vault (`policy/expiring-grants`)    | **until expiry** |
+/// |                     |  + memory (`instance_grants`)       |                  |
 /// | STANDING loosening  | vault (`scope`/`standing` document) | **yes**          |
+///
+/// EXPIRING (dp, 2026-10-28, #1306 option 2): an operator's per-member preset loosening that carries
+/// an `expires_at` is restored after a restart until that second, because a deploy restarts the
+/// daemon every few hours and was revoking it early. It can't become permanent by inattention: its
+/// end is the operator's own bound. A loosening with no expiry is still LIVE (memory-only).
 ///
 /// The first two rows are the 2026-08-01 doctrine and are unchanged: a RESTRICTION has to be
 /// durable — a member restricted for cause must not be freed by a reboot — and a LIVE
@@ -593,6 +666,14 @@ pub struct ServerState {
     /// Never persisted: a restart reloads the vault copy, at which point memory and vault
     /// agree again (the grant resurrects, visibly, and a fresh revoke takes the normal path).
     pub standing_scope_dirty: bool,
+    /// TEST SEAMS for the two-phase witness arms that no external injection can time: a chain
+    /// append that fails for the named event types only (so an intent lands and its success row
+    /// does not), and a `persist_standing_scope` that fails (the memory-first rollback's vault
+    /// write). Compiled out of the daemon.
+    #[cfg(test)]
+    pub chain_fault_on: std::collections::HashSet<String>,
+    #[cfg(test)]
+    pub vault_fault_on_persist: bool,
     /// Moves on every policy republish (`server::published`).
     pub publication_version: u64,
     /// The vault policy-list generation the current publication was built from.
@@ -601,6 +682,9 @@ pub struct ServerState {
     /// and where the answer belongs. Operator-written through `commit_transport_bindings`,
     /// vault-persisted, read by `member_notify` at enqueue and by the egress plane.
     pub transport_bindings: crate::server::transport_binding::TransportBindingStore,
+    /// Channel bindings (#1344): where each member's `hestia_channel_send` to a channel goes.
+    /// Operator-written through `commit_channel_bindings`, vault-persisted.
+    pub channel_bindings: crate::server::channel::ChannelBindingStore,
     /// Hub-law gate (consolidation, 2026-07-10): the third fold input.
     /// `None` = no law file at `$HESTIA_HOME/law/hub-law.yaml` (no-op);
     /// `Some(Invalid)` fails closed. See `policy::law_gate`.
@@ -953,6 +1037,34 @@ impl ServerState {
                  acts under carriers nobody bound",
             )?
         };
+        let channel_bindings: crate::server::channel::ChannelBindingStore = {
+            use anyhow::Context;
+            crate::vault::load_doc(&vault, "channel", "bindings", "channel-bindings.json").context(
+                "channel-binding store unreadable: failing closed rather than sending members' \
+                 messages to recipients nobody bound",
+            )?
+        };
+        // #1306: the expiring loosenings, restored only while live. Unreadable fails CLOSED the
+        // other way from standing scope: an unreadable store restores NOTHING (no widening comes
+        // back on a doubt) and the daemon still starts, because losing a loosening is the safe side.
+        let restored_grants: HashMap<(String, String), InstanceGrant> = {
+            let (ns, name, legacy) = EXPIRING_GRANTS_DOC;
+            let rows: Vec<ExpiringGrantRow> = crate::vault::load_doc(&vault, ns, name, legacy).unwrap_or_else(|e| {
+                tracing::warn!("expiring-grants store unreadable ({e:#}): no expiring loosening restored");
+                Vec::new()
+            });
+            let now = crate::server::gate_escalation::now_secs();
+            rows.into_iter()
+                .filter(|r| r.grant.expires_at.is_some() && r.grant.is_live(now))
+                .map(|r| {
+                    // said, not silent (nomad on #1430): after a deploy a reader can see a loosening is live
+                    tracing::info!(plugin_id = %r.plugin_id, role = %r.role, preset = %r.grant.preset,
+                                   expires_at = ?r.grant.expires_at,
+                                   "restored an expiring loosening from the vault (#1306)");
+                    ((r.plugin_id, r.role), r.grant)
+                })
+                .collect()
+        };
         let standing_doc_present = vault.get_document("scope", "standing").is_some();
         let standing_scope: crate::server::standing_scope::StandingScopeStore = {
             use anyhow::Context;
@@ -1008,10 +1120,11 @@ impl ServerState {
             policy_engine: crate::server::published::Watched::new(policy_engine),
             role_policy_engines: crate::server::published::Watched::new(role_policy_engines),
             instance_policy_engines: crate::server::published::Watched::new(instance_policy_engines),
-            // Empty at every startup, by design: grants do not survive a restart. Escalations
-            // DO — see the rehydrate call after construction. The two are opposite on purpose:
-            // a human's ruling must survive a deploy, a standing permission must not.
-            instance_grants: crate::server::published::Watched::new(HashMap::new()),
+            // Empty at every startup EXCEPT for loosenings that carry an expiry (#1306): those
+            // are restored from the vault until their own `expires_at`. A grant with no expiry
+            // still does not survive a restart: restart is what ends a widening nobody revokes.
+            // Escalations DO survive — see the rehydrate call after construction.
+            instance_grants: crate::server::published::Watched::new(restored_grants),
             // Same reasoning, same lifetime: a widening dies with the daemon.
             scope_requests: crate::server::published::Watched::new(HashMap::new()),
             // The deliberate exception (row 3): standing grants are durable and were just
@@ -1024,9 +1137,14 @@ impl ServerState {
             standing_projection_audit: crate::server::published::Watched::new(None),
             // Memory was just loaded FROM the vault, so the two agree by construction.
             standing_scope_dirty: false,
+            #[cfg(test)]
+            chain_fault_on: std::collections::HashSet::new(),
+            #[cfg(test)]
+            vault_fault_on_persist: false,
             publication_version: 0,
             published_lists_gen: u64::MAX,
             transport_bindings,
+            channel_bindings,
             law_gate: crate::server::published::Watched::new(law_gate.map(Arc::new)),
             synthetic_plugins,
             home: home.to_path_buf(),
@@ -1358,15 +1476,25 @@ impl ServerState {
     /// grant of record", not "is this filesystem object reachable". A symlink is still a
     /// symlink; see `docs/GATE_BYPASS_CATALOG.md`.
     pub fn has_scope_grant(&self, plugin_id: &str, path: &str) -> bool {
+        // ALL MODES (#1345): every caller of this asks "may the member act here", without
+        // saying how, and answers `already_granted` / `in_force: permits` on a yes. A grant
+        // narrower than rwed cannot answer that yes, or a read-only grant would be reported
+        // in force for a write.
+        self.has_scope_grant_for(plugin_id, path, crate::server::grant_modes::Modes::ALL)
+    }
+
+    /// `has_scope_grant` for an act that needs exactly `needed`.
+    pub fn has_scope_grant_for(&self, plugin_id: &str, path: &str,
+                               needed: crate::server::grant_modes::Modes) -> bool {
         let now = crate::server::gate_escalation::now_secs();
         let want = normalize_scope_path(path);
         self.scope_requests
             .values()
-            .any(|r| r.plugin_id == plugin_id && r.grants(&want, now))
+            .any(|r| r.plugin_id == plugin_id && r.grants_for(&want, now, needed))
             // A STANDING grant answers the same question — "is there a grant of record for
             // exactly this path" — so a member re-asking for a path it durably holds hears
             // `already_granted` instead of filing an ask nobody needs to rule on.
-            || self.standing_scope.has_live(plugin_id, &want, now)
+            || self.standing_scope.has_live_for(plugin_id, &want, now, needed)
     }
 
     /// Every live STANDING grant this member holds (durable row of the asymmetry).
@@ -1384,6 +1512,10 @@ impl ServerState {
     /// entry points below — `commit_standing_scope` for widenings, `apply_standing_revoke`
     /// for tightenings — which encode what a failed persist means for each direction.
     pub fn persist_standing_scope(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.vault_fault_on_persist {
+            anyhow::bail!("injected vault fault (test seam)");
+        }
         crate::vault::save_doc(
             &mut self.vault,
             "scope",
@@ -1400,6 +1532,24 @@ impl ServerState {
     /// it, while the error text claimed the store was unchanged. Here unchangedness is a
     /// property of the construction: on any persist failure the live store was never
     /// touched, generation included, so there is nothing to claim and nothing to restore.
+    /// The live loosenings that carry an expiry, as the vault holds them, without `exclude` (a revoke
+    /// computes its candidate this way before anything changes). Sorted, so the document is stable.
+    pub fn expiring_grant_rows(&self, exclude: Option<&(String, String)>) -> Vec<ExpiringGrantRow> {
+        let now = crate::server::gate_escalation::now_secs();
+        let mut rows: Vec<ExpiringGrantRow> = self.instance_grants.iter()
+            .filter(|(k, g)| Some(*k) != exclude && g.expires_at.is_some() && g.is_live(now))
+            .map(|((p, r), g)| ExpiringGrantRow { plugin_id: p.clone(), role: r.clone(), grant: g.clone() })
+            .collect();
+        rows.sort_by(|a, b| (&a.plugin_id, &a.role).cmp(&(&b.plugin_id, &b.role)));
+        rows
+    }
+
+    /// Persist exactly `rows` as the expiring-grants document (#1306).
+    pub fn save_expiring_grants(&mut self, rows: &[ExpiringGrantRow]) -> Result<()> {
+        let (ns, name, legacy) = EXPIRING_GRANTS_DOC;
+        crate::vault::save_doc(&mut self.vault, ns, name, legacy, &rows.to_vec())
+    }
+
     pub fn commit_standing_scope<F>(&mut self, mutate: F) -> Result<()>
     where
         F: FnOnce(&mut crate::server::standing_scope::StandingScopeStore),
@@ -1407,11 +1557,38 @@ impl ServerState {
         let mut candidate = self.standing_scope.clone();
         mutate(&mut candidate);
         crate::vault::save_doc(&mut self.vault, "scope", "standing", "standing-scope.json", &candidate)?;
+        // Standing refusals the mutation removed by GRANTING over them (`StandingScopeStore::add`),
+        // witnessed after the commit so the record never says closed where the door is open
+        // (nomad on #1418). A refusal removed by the explicit lift route is witnessed by that
+        // route's own two-phase rows, not here.
+        let lifted: Vec<crate::server::standing_scope::StandingRefusal> = self.standing_scope.refusals.iter()
+            .filter(|old| !candidate.refusals.iter().any(|n| n.member == old.member && n.path == old.path))
+            .filter(|old| candidate.grants.iter().any(|g| old.lifted_by(g)))
+            .cloned()
+            .collect();
         *self.standing_scope = candidate;
         // The vault now holds exactly what memory holds, so any earlier revoke-persist
         // failure has been overtaken: the synced state is the tighter one plus this
         // committed mutation.
         self.standing_scope_dirty = false;
+        for r in lifted {
+            let by = self.standing_scope.grants.iter()
+                .find(|g| r.lifted_by(g))
+                .map(|g| format!("grant {}", g.request_id.clone().unwrap_or_else(|| g.path.clone())))
+                .unwrap_or_else(|| "grant".into());
+            self.append_chain("scope_refusal_lifted", serde_json::json!({
+                "plugin_id": r.member,
+                "subject_instance_lct": self.member_lct(&r.member),
+                "path": r.path,
+                "recursive": r.recursive,
+                "lifted_by": by,
+                "via": "covering_standing_grant",
+                "refused_by": r.refused_by,
+                "refused_at": r.refused_at,
+                "reason": r.reason,
+                "standing_generation": self.standing_scope.generation,
+            }))?;
+        }
         Ok(())
     }
 
@@ -1426,6 +1603,19 @@ impl ServerState {
         let out = mutate(&mut candidate);
         crate::vault::save_doc(&mut self.vault, "transport", "bindings", "transport-bindings.json", &candidate)?;
         self.transport_bindings = candidate;
+        Ok(out)
+    }
+
+    /// Mutate the channel-binding store through a candidate persisted BEFORE it becomes live
+    /// (the `commit_transport_bindings` construction).
+    pub fn commit_channel_bindings<F, R>(&mut self, mutate: F) -> Result<R>
+    where
+        F: FnOnce(&mut crate::server::channel::ChannelBindingStore) -> R,
+    {
+        let mut candidate = self.channel_bindings.clone();
+        let out = mutate(&mut candidate);
+        crate::vault::save_doc(&mut self.vault, "channel", "bindings", "channel-bindings.json", &candidate)?;
+        self.channel_bindings = candidate;
         Ok(out)
     }
 
@@ -1738,6 +1928,10 @@ impl ServerState {
         event_type: &str,
         event_data: serde_json::Value,
     ) -> Result<ChainEntry> {
+        #[cfg(test)]
+        if self.chain_fault_on.contains(event_type) {
+            anyhow::bail!("injected chain fault on {event_type} (test seam)");
+        }
         super::state_lock::time_section("chain.append", || {
             self.chain_store
                 .append(event_type, event_data, &self.sovereign_lct)
@@ -2628,7 +2822,9 @@ mod tests {
     #[test]
     fn confer_citizenship_records_a_birth_cert_in_the_ledger_only_on_quorum() {
         let (_dir, state) = make_state();
-        let subject = "lct:web4:mb32:bsubjectcitizen";
+        // a real key-derived subject (R6): the readable stand-in had a 14-char body where a derived id has 52
+        let subject_id = web4_core::derive_lct_id(&web4_core::crypto::KeyPair::generate().verifying_key());
+        let subject = subject_id.as_str();
         let w: Vec<web4_core::crypto::KeyPair> = (0..3)
             .map(|_| web4_core::crypto::KeyPair::generate())
             .collect();
@@ -2911,6 +3107,7 @@ mod tests {
             expires_at: None,
             request_id: None,
         recursive: false,
+        modes: crate::server::grant_modes::Modes::ALL,
         }
     }
 

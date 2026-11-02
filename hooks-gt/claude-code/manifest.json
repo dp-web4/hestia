@@ -12,7 +12,7 @@
     },
     {
       "path": "hooks/hooks.json",
-      "sha256": "99abbd954c119823bd411ddb4be4fe5d727819dd899700163da1b679a17a0ff7",
+      "sha256": "6b1c103d29ab0a19227b2e409a3a8a2b0560e576d82cac9c35f980a7da46b5ca",
       "source": "plugins/claude-code/hooks/hooks.json"
     },
     {
@@ -33,19 +33,19 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "f6933afe101b4da6ee6f05d103b8d2389ec9b81fe94f976f3a8afadca7c450ae",
+    "gt_version": "7d630395ef33d82fb7efde8c4c7b91d4a934330172e09b347c69ccc1aab9009d",
     "files": [
       {
         "path": "hestia_gate_core.py",
-        "sha256": "4ffb1fe401ed9671ee767adf272ccf1b902c75241e370bf01dc4f7e17618c786"
+        "sha256": "2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930"
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "34026f2c12b3b5e96190e3f070f6543e93dbea962de3fe8161c48229bc857983"
+        "sha256": "2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf"
       },
       {
         "path": "hestia_governance_closure.py",
-        "sha256": "e2d6fc7a1d56c388b4429d908d4b2db5b45116f274fdb34b3b94a33068ad11d3"
+        "sha256": "1f9a167c9793a1a416307b346b1013b343b421135675a5302a8b9deb60615e94"
       },
       {
         "path": "hestia_shell_classifier.py",
@@ -53,7 +53,7 @@
       },
       {
         "path": "hestia_single_gate.py",
-        "sha256": "7decae2320286a534a2262e0ebe294df005edd99e10428eb26f24e2478b6e3a1"
+        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
       },
       {
         "path": "hestia_witness_core.py",
@@ -61,6 +61,22 @@
       }
     ]
   },
-  "requires": [],
-  "gt_version": "eefe6029a8748d39eeadb9c25a1c2868d6f84a2fe461e9f9d251c35e2828de90"
+  "requires": [
+    {
+      "unit": "member-mesh",
+      "path": "hestia-mesh.py",
+      "sha256": "79db46f592c5b9f3d32260485578d6c0c8603f75ec12130beedee5573da4d1ce"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "prompt-disposition-watch.sh",
+      "sha256": "23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "session-mesh-inbox.sh",
+      "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+    }
+  ],
+  "gt_version": "f4765a1a248e0cbfd1bebdb34d20fd5e3e19c8f1739e21e6649d57434eddfa03"
 }

@@ -15,29 +15,19 @@ name: upgrade path
 # (preflight passes, seat projections and identity seeds present) and the next is a no-op, also
 # when the checkout spells the commit at a different abbreviation length.
 #
-# NON-BLOCKING ON PURPOSE, FOR NOW. This is its own workflow, and "upgrade path" is not among the
-# required status checks (cargo test / hook tests / plugin tests), so a red here does not block a
-# merge. It is red on main the day it lands: main's gates refuse `config.unbacked` under the
-# registration lines a previous-release host has, which is exactly #1237. The deployer-owned
-# registration reconciler is the fix; once it is on main and this job is green there, add
-# "upgrade path" to the required checks. NOTE for that day: a required check that a path filter
-# skips never reports, and GitHub then blocks the PR forever. Drop the `paths:` filter (or move
-# the filter into a step that exits 0) in the same change that makes it required.
+# REQUIRED since 2026-10-30 (web4#904 Phase 0). It was non-blocking while #1237 kept it red; it has
+# been green on its last 30 runs. The pull_request trigger carries no `paths:` filter because a
+# required check that a filter skips never reports and GitHub then blocks the PR forever. The push
+# trigger keeps its filter: nothing is required on a push.
 #
 # Previous release: on a PR, the base branch tip (every host deploys from main, so "the release
 # a host is on" is main); on a push to main, main~1. The harness's own default (the latest v* tag)
 # is for hand runs: v0.0.4 is ~970 commits behind main and predates the deploy surface.
 
 on:
+  # No `paths:` filter on pull_request: "upgrade path" is a REQUIRED check, and a required check
+  # that a path filter skips never reports, so GitHub would block that PR forever (2-6 min a run).
   pull_request:
-    paths:
-      - "deploy/**"
-      - "plugins/**"
-      - "core/**"
-      - "tools/hooks_gt*"
-      - "tools/seed_seat_config.py"
-      - "tools/upgrade_path*"
-      - ".github/workflows/upgrade-path.yml"
   push:
     branches: [main]
     paths:

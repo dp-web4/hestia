@@ -98,6 +98,12 @@ WITNESS_RESERVE_SECONDS = 1.0
 #: enforces on this process. A harness invocation is bounded by its registration; when both are
 #: known the smaller wins, so this can only shorten a registered bound.
 HOOK_TIMEOUT_ENV = "HESTIA_HOOK_TIMEOUT_S"
+#: The declaration a NON-harness invoker (the deploy preflight) makes that its event is a PROBE,
+#: not an act: a scope refusal is returned as a plain refusal and the daemon is asked nothing, so
+#: no peer scope request is opened for an act nobody will re-issue (dp, 2026-10-14: every deploy
+#: cycle's hold probe opened one per member). It can only withhold a request, never lift one:
+#: exactly "1" withholds, anything else is today's behaviour.
+NO_ESCALATE_ENV = "HESTIA_GATE_NO_ESCALATE"
 
 #: The rollout knob. ONE name for every seat, projected per seat by the vault as
 #: `<SEAT_TOKEN>__HESTIA_GATE_MODE` (the per-seat HESTIA_<SEAT>_GATE_MODE names are retired).
@@ -154,6 +160,12 @@ class GateEvent:
     session_id: Optional[str] = None
     tool_use_id: Optional[str] = None
     raw: dict = field(default_factory=dict)
+    #: Text the INVOKER declares will leave the machine (#1201): a being's web_search query, a
+    #: prompt for a remote model. Swept with the innate `egress.secret` rule, never scoped. It can
+    #: only add a deny, so an invoker that declares it cannot lift anything; one that declares
+    #: nothing is judged exactly as before. Harness tools are still found by name in
+    #: `egress_surfaces`; this field is for acts no harness tool name describes.
+    egress: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -642,6 +654,19 @@ def _mcp_repo(tool: str, tool_input: Any) -> Optional[str]:
     return None
 
 
+def _mcp_repo_full(tool: str, tool_input: Any) -> str:
+    """The FULL `owner/name` of the repository an MCP call names, read from the same keys as `_mcp_repo`, or "" when
+    the value carries no owner (#1392). Kept beside the bare name: the recursive-grant admission binds on it."""
+    if not (isinstance(tool, str) and tool.startswith("mcp__")) or not isinstance(tool_input, dict):
+        return ""
+    for key in ("repository_full_name", "repo_full_name", "repository", "repo"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            v = value.strip().rstrip("/")
+            return v if v.count("/") == 1 else ""
+    return ""
+
+
 def normalized_event(event: GateEvent) -> core.NormalizedEvent:
     """The core's view of the act. An apply_patch body is CONTENT: its targets are scoped,
     the body is never scanned as a command (the 2026-07-23 review false-deny class)."""
@@ -653,10 +678,13 @@ def normalized_event(event: GateEvent) -> core.NormalizedEvent:
         tool=event.tool,
         paths=list(dict.fromkeys(paths)),
         repos=[repo] if repo else [],
+        # #1392: keep the FULL remote identity next to the bare name; the recursive-grant admission binds on it.
+        repo_full=[_mcp_repo_full(event.tool, ti)] if repo else [],
         command=None if patch or (isinstance(event.tool, str) and event.tool.lower() == "apply_patch")
         else _command_text(ti),
         cwd=event.cwd,
         raw=event.raw if isinstance(event.raw, dict) else {},
+        egress=egress_surfaces(event),
     )
 
 
@@ -676,10 +704,17 @@ _WEB_TOOLS = ("webfetch", "websearch", "web_fetch", "google_web_search")
 
 
 def egress_surfaces(event: GateEvent) -> list:
-    """Egress strings the core's paths/command do not carry: a web tool's url/prompt/query and
-    the MCP transport context a shim lifts into `tool_input["_hestia_mcp_context"]`."""
+    """Egress strings the core's paths/command do not carry: the invoker's declared `egress`
+    (#1201), a web tool's url/prompt/query and the MCP transport context a shim lifts into
+    `tool_input["_hestia_mcp_context"]`. `normalized_event` hands the same list to the core as
+    `NormalizedEvent.egress`, so the core's Gate 1a (and its degraded mode) sweeps it too."""
     ti = event.tool_input if isinstance(event.tool_input, dict) else {}
-    out: list = []
+    # The declared part goes through the core's one normalizer: a string is ONE blob, never its
+    # characters (NOVA HOLD at 7a6e410b). Egress it cannot sweep is handed to the core WHOLE, so
+    # the core's Gate 1a (and its degraded mode) refuses it too. `_egress_precheck` refuses it here.
+    raw = getattr(event, "egress", None)
+    declared = core.egress_items(raw)
+    out: list = list(declared) if declared is not None else [raw]
     if isinstance(event.tool, str) and event.tool.lower() in _WEB_TOOLS:
         for key in ("url", "urls", "prompt", "query"):
             out.extend(_leaves(ti.get(key)))
@@ -1110,7 +1145,12 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
 
 def _egress_precheck(inv: _Invocation, cprofile: core.HarnessProfile) -> Optional[GateDecision]:
     forbidden = core.forbidden_tokens(cprofile)
+    unswept = core.egress_unsweepable_deny(inv.event)
+    if unswept is not None:
+        return _verdict_deny(unswept)
     for blob in egress_surfaces(inv.event):
+        if not isinstance(blob, str):
+            continue  # only unsweepable declared egress, refused just above
         low = blob.lower()
         for token in forbidden:
             if token in low:
@@ -1223,6 +1263,12 @@ def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
        them added, passes. The one-time approvals are recorded on `inv.scope_spend` and spent in
        ONE atomic call after society law permits the act — a denied act consumes nothing."""
     import dataclasses
+    if os.environ.get(NO_ESCALATE_ENV) == "1":
+        # A declared probe: refuse as the law judged it and ask the daemon nothing.
+        return _verdict_deny(core._deny(
+            v.rule, v.reason + f" Not escalated: the invoker declared {NO_ESCALATE_ENV}=1 (a probe, "
+            "not an act), so no scope request was opened.",
+            innate=bool(v.innate), target=v.target))
     ws = core.detect_workspace(cprofile)
     targets, cur = [], v
     while cur.blocks and cur.rule in mechanism.SCOPE_ESCALATING_RULES and getattr(cur, "target", ""):
