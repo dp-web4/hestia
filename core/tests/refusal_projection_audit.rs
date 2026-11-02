@@ -82,6 +82,25 @@ fn no_refusal_preserves_the_existing_empty_store_digest() {
     assert!(empty.divergence_from(&empty.clone()).is_empty());
 }
 
+#[test]
+fn streaming_refusal_encoding_keeps_the_prototype_digest() {
+    use sha2::{Digest, Sha256};
+    let (_, mut store) = pair();
+    store.refusals[0].reason = "large reason 🧪".repeat(40_000);
+    let r = &store.refusals[0];
+    // Independently reconstruct the original 44e6f2c9 whole-buffer encoding.
+    let encoded = serde_json::to_vec(&(
+        0_usize, &r.member, &r.path, r.recursive, r.refused_at, &r.refused_by,
+        &r.reason, &r.request_id, r.modes.map(|m| m.as_letters()),
+    )).unwrap();
+    let row = format!("refusal\u{1f}{}", hex::encode(Sha256::digest(encoded)));
+    let mut digest = Sha256::new();
+    digest.update(store.generation.to_be_bytes());
+    digest.update((row.len() as u64).to_be_bytes());
+    digest.update(row.as_bytes());
+    assert_eq!(store.authority_digest(), hex::encode(digest.finalize()));
+}
+
 #[tokio::test]
 async fn temporary_vault_verifier_rejects_missing_refusal_at_same_generation() {
     let home = tempfile::tempdir().unwrap();

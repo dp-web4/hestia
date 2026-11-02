@@ -595,11 +595,22 @@ impl StandingScopeStore {
     /// deliberately explicit, so a new field forces this encoding to be reviewed.
     fn refusal_row(index: usize, refusal: &StandingRefusal) -> String {
         let StandingRefusal { member, path, recursive, refused_at, refused_by, reason, request_id, modes } = refusal;
-        let encoded = serde_json::to_vec(&(
+        // A refusal's reason can be large. Stream the JSON encoding into the
+        // hash rather than allocating another full-size copy of its contents.
+        struct HashWriter(Sha256);
+        impl std::io::Write for HashWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut writer = HashWriter(Sha256::new());
+        serde_json::to_writer(&mut writer, &(
             index, member, path, recursive, refused_at, refused_by, reason, request_id,
             modes.map(|m| m.as_letters()),
         )).expect("standing refusal fields serialize as JSON");
-        format!("refusal\u{1f}{}", hex::encode(Sha256::digest(encoded)))
+        format!("refusal\u{1f}{}", hex::encode(writer.0.finalize()))
     }
 
     /// A canonical digest of the ENTIRE authority: floor plus every per-member grant, with
