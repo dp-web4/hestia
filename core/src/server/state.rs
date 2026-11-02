@@ -1670,8 +1670,12 @@ impl ServerState {
     /// an authority, which is exactly what the ruling says it must not be.
     pub fn verify_standing_projection(&self, now: u64) -> Result<crate::server::standing_scope::ProjectionAudit> {
         use crate::server::standing_scope::{ProjectionAudit, StandingScopeStore};
+        // `load_doc(&self.vault, ...)` reads the already-open Vault's document
+        // cache, not the durable file. Reopen it so a lost, unreadable or older
+        // file cannot be certified by a matching in-memory copy.
+        let durable_vault = self.vault.reopen()?;
         let vault_copy: StandingScopeStore =
-            crate::vault::load_doc(&self.vault, "scope", "standing", "standing-scope.json")?;
+            crate::vault::load_doc(&durable_vault, "scope", "standing", "standing-scope.json")?;
         let divergence = self.standing_scope.divergence_from(&vault_copy);
         Ok(ProjectionAudit {
             verified_at: now,

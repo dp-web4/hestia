@@ -27814,7 +27814,9 @@ mod standing_scope_surface_tests {
         s.commit_standing_scope(|st| {
             st.add(standing("synthetic", "/fixture/path", now, None))
         }).unwrap();
+        let started = std::time::Instant::now();
         assert!(s.verify_standing_projection(now).unwrap().matches);
+        eprintln!("synthetic clean projection audit: {:?}", started.elapsed());
 
         // A synthetic storage failure after the known-good state was loaded.
         // This is not a cooperating second writer and touches only this temp vault.
