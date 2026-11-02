@@ -255,9 +255,13 @@ impl Vault {
     /// Replace the policy lists and persist. Operator-only surface: the caller is
     /// responsible for having established operator authority BEFORE reaching here.
     pub fn set_policy_lists(&mut self, lists: policy_lists::PolicyLists) -> Result<()> {
-        self.data.policy_lists = lists;
+        let before = std::mem::replace(&mut self.data.policy_lists, lists);
+        if let Err(error) = self.save() {
+            self.data.policy_lists = before;
+            return Err(error);
+        }
         self.policy_lists_gen = next_policy_lists_gen();
-        self.save()
+        Ok(())
     }
 
     /// Ratified gate hashes. Read freely; only the operator surface may write them.
@@ -693,7 +697,7 @@ mod tests {
             bound_to: vec!["synthetic".into()], grants: vec![], enabled: true,
         });
         vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
-        assert!(vault.set_policy_lists(lists).is_err());
+        assert!(vault.set_policy_lists(lists.clone()).is_err());
         assert!(Vault::open(path.clone(), "p".into()).unwrap().policy_lists().is_empty());
 
         vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
@@ -702,6 +706,10 @@ mod tests {
         assert!(reopened.policy_lists().is_empty());
         assert!(vault.policy_lists().is_empty());
         assert_eq!(vault.policy_lists_generation(), generation);
+
+        vault.set_policy_lists(lists.clone()).unwrap();
+        assert_ne!(vault.policy_lists_generation(), generation);
+        assert_eq!(Vault::open(reopened.path().to_path_buf(), "p".into()).unwrap().policy_lists(), lists);
     }
 
     #[test]
