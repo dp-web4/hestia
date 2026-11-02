@@ -698,6 +698,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_witness_vouch_must_not_land_on_unrelated_save() {
+        let (dir, mut vault) = fresh_vault();
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let key = web4_core::crypto::KeyPair::generate();
+        let pubkey = key.verifying_key();
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("synthetic barrier failure".into())));
+        assert!(!vouch_witnessing_key(&mut vault, &mut registry, "test-seat", pubkey.clone()));
+        let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        assert!(load_members_checked(&reopened).unwrap().get("test-seat").unwrap()
+                    .operational_key_for(web4_core::WITNESS_PURPOSE) != Some(pubkey.clone()),
+                "the fault must precede the initial persisted effect");
+        vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        vault.put_document("fixture", "unrelated", b"synthetic".to_vec()).unwrap();
+        let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        assert!(load_members_checked(&reopened).unwrap().get("test-seat").unwrap()
+                    .operational_key_for(web4_core::WITNESS_PURPOSE) != Some(pubkey),
+                "a failed vouch must not be persisted by an unrelated save");
+    }
+
+    #[test]
     fn ensure_member_mints_persists_and_is_idempotent() {
         let (_dir, mut vault) = fresh_vault();
         let mut reg = MemberRegistry::default();
