@@ -6654,11 +6654,17 @@ async fn agent_delegation_revoke(
     }
     let mut done = record;
     if let Some(m) = done.as_object_mut() { m.insert("intent".into(), serde_json::json!(intent.hash)); }
-    let entry = s.append_chain("delegation_revoked", done).ok();
-    (StatusCode::OK, Json(serde_json::json!({
-        "ok": true, "plugin_id": plugin_id, "delegation_id": deleg_id,
-        "intentEntryHash": intent.hash, "witnessEntryHash": entry.map(|e| e.hash),
-    })))
+    match s.append_chain("delegation_revoked", done) {
+        Ok(entry) => (StatusCode::OK, Json(serde_json::json!({
+            "ok": true, "plugin_id": plugin_id, "delegation_id": deleg_id,
+            "intentEntryHash": intent.hash, "witnessEntryHash": entry.hash,
+        }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "error": format!("revocation was saved, but the terminal witness outcome is unknown: {e}. Inspect and reconcile before retrying"),
+            "vault_revocation_saved": true, "witness_status": "unknown", "plugin_id": plugin_id,
+            "delegation_id": deleg_id, "intentEntryHash": intent.hash,
+        }))),
+    }
 }
 
 /// Acts THIS ID TOOK since `cutoff` (RFC3339) -- the retire guard's evidence. A phantom, the
@@ -10669,6 +10675,9 @@ mod disposition_tests {
         assert!(!chain.iter().any(|e| e.event_type == "delegation_revoked"));
         assert_ne!(status, StatusCode::OK,
                    "unwitnessed revocation was reported complete: {}", response.0);
+        assert_eq!(response.0["vault_revocation_saved"], true);
+        assert_eq!(response.0["witness_status"], "unknown");
+        assert!(response.0["intentEntryHash"].is_string());
     }
 
     /// dp's fourth ask, the half #1079 left: manage an agent's delegated authority from the
