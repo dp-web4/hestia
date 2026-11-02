@@ -2718,6 +2718,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detached_failed_read_has_attempt_time_but_no_observation_time() {
+        let (_dir, raw) = make_state();
+        let state = Arc::new(super::super::state_lock::StateCell::new(raw));
+        assert!(!verify_standing_projection_with(&state, |_| Err(anyhow::anyhow!("synthetic failure"))).await);
+        let s = state.lock().await;
+        let audit = s.standing_projection_audit.as_ref().unwrap();
+        assert!(!audit.matches);
+        let wire = serde_json::to_value(audit).unwrap();
+        assert!(wire["verified_at"].is_null(), "a failed read did not observe the vault");
+        assert!(wire["attempted_at"].is_u64(), "the failed attempt remains observable");
+    }
+
+    #[tokio::test]
     async fn detached_projection_audit_releases_lock_and_rejects_changed_state() {
         let (_dir, raw) = make_state();
         let state = Arc::new(super::super::state_lock::StateCell::new(raw));
