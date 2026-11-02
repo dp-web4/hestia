@@ -407,17 +407,27 @@ pub fn vouch_witnessing_key(
     p.lct
         .authorize_operational_key(web4_core::WITNESS_PURPOSE, operational_pubkey, &binding_kp);
     let updated = p.lct.clone();
-    if let Err(e) = crate::vault::save_doc(
-        vault,
-        MEMBERS_NAMESPACE,
-        MEMBERS_DOC,
-        MEMBERS_LEGACY_FILE,
-        &persisted,
-    ) {
+    // Use the vault's batch document path so a pre-save failure restores the
+    // in-memory document index; a generic error can still be post-rename and
+    // therefore does not establish that the file was unchanged.
+    let bytes = match serde_json::to_vec_pretty(&persisted) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("[members] WARNING: serializing witnessing-key vouch failed ({e})");
+            return false;
+        }
+    };
+    if let Err(e) = vault.put_documents(MEMBERS_NAMESPACE, &[(MEMBERS_DOC.to_string(), bytes)]) {
         eprintln!(
-            "[members] WARNING: persisting witnessing-key vouch for '{plugin_id}' failed ({e})"
+            "[members] WARNING: witnessing-key vouch outcome is unknown for '{plugin_id}' ({e}); reconcile before retry"
         );
         return false;
+    }
+    // Match the existing save_doc migration behavior on successful persistence.
+    if let Some(legacy) = vault.home_dir().map(|home| home.join(MEMBERS_LEGACY_FILE)) {
+        if legacy.exists() {
+            let _ = std::fs::remove_file(legacy);
+        }
     }
     registry.members.insert(plugin_id.to_string(), updated);
     true
@@ -716,6 +726,24 @@ mod tests {
         assert!(load_members_checked(&reopened).unwrap().get("test-seat").unwrap()
                     .operational_key_for(web4_core::WITNESS_PURPOSE) != Some(pubkey),
                 "a failed vouch must not be persisted by an unrelated save");
+    }
+
+    #[test]
+    fn witness_vouch_preserves_legacy_registry_migration() {
+        let (dir, mut vault) = fresh_vault();
+        let mut registry = MemberRegistry::default();
+        ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor").unwrap();
+        let bytes = vault.get_document(MEMBERS_NAMESPACE, MEMBERS_DOC).unwrap().to_vec();
+        vault.remove_document(MEMBERS_NAMESPACE, MEMBERS_DOC).unwrap();
+        let legacy = dir.path().join(MEMBERS_LEGACY_FILE);
+        std::fs::write(&legacy, bytes).unwrap();
+        let key = web4_core::crypto::KeyPair::generate();
+        let pubkey = key.verifying_key();
+        assert!(vouch_witnessing_key(&mut vault, &mut registry, "test-seat", pubkey.clone()));
+        assert!(!legacy.exists(), "successful migration should remove the legacy sidecar");
+        let reopened = crate::vault::Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        assert_eq!(load_members_checked(&reopened).unwrap().get("test-seat").unwrap()
+                   .operational_key_for(web4_core::WITNESS_PURPOSE), Some(pubkey));
     }
 
     #[test]
