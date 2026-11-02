@@ -387,15 +387,13 @@ impl Vault {
     /// Store a master-tier document (config / metadata / state). Plaintext is
     /// held inside the outer-encrypted vault. Upserts by (namespace, name).
     pub fn put_document(&mut self, namespace: &str, name: &str, bytes: Vec<u8>) -> Result<()> {
-        let doc = Document::master(namespace, name, bytes);
-        match self.doc_pos(namespace, name) {
-            Some(i) => self.data.documents[i] = doc,
-            None => self.data.documents.push(doc),
-        }
-        self.save()
+        // Use the same in-memory rollback as the batch path. In particular,
+        // a rejected pre-save durability barrier must not leave this failed
+        // mutation staged for a later, otherwise unrelated save.
+        self.put_documents(namespace, &[(name.to_owned(), bytes)])
     }
 
-    /// Store SEVERAL master-tier documents as ONE commit: all of them land, or none does.
+    /// Store SEVERAL master-tier documents in one vault-file replacement.
     ///
     /// `put_document` saves per call, so a caller writing a set writes a sequence of commits,
     /// and a failure partway leaves the vault holding a prefix of what was intended. For an
@@ -403,10 +401,10 @@ impl Vault {
     /// namespace) a prefix is the worst outcome available — it is neither the old state nor
     /// the new one, and a ratchet that refuses non-empty namespaces can then never repair it.
     ///
-    /// The vault file is written whole, so staging every document and saving once IS the
-    /// atomic commit. On a failed save the in-memory index is rolled back to its snapshot, so
-    /// memory and disk still agree: without that, a caller that ignored the error would go on
-    /// serving documents the vault does not contain.
+    /// The vault file is written whole, so staging every document and saving once avoids a
+    /// partial document set. On an error the in-memory index is rolled back to its snapshot,
+    /// preventing a rejected mutation from riding on a later save. This does not prove disk
+    /// was unchanged: storage may report an error after rename, which requires reconciliation.
     pub fn put_documents(&mut self, namespace: &str, entries: &[(String, Vec<u8>)]) -> Result<()> {
         let snapshot = self.data.documents.clone();
         for (name, bytes) in entries {
