@@ -42,8 +42,10 @@ def pr(number, title, merged, comments=(), reviews=(), by="dp-web4"):
     return {
         "number": number, "title": title, "mergedAt": merged,
         "mergedBy": {"login": by},
-        "comments": [{"author": {"login": a}, "body": b} for a, b in comments],
-        "reviews": [{"author": {"login": a}, "body": b, "state": "COMMENTED"}
+        "comments": [{"author": {"login": a}, "body": b,
+                      "createdAt": "2020-01-01T00:00:00Z"} for a, b in comments],
+        "reviews": [{"author": {"login": a}, "body": b, "state": "COMMENTED",
+                     "submittedAt": "2020-01-01T00:00:00Z"}
                     for a, b in reviews],
     }
 
@@ -348,6 +350,39 @@ def arm_chain_unreadable_leaves_the_review_census_intact() -> None:
     out = census(prs, 200, seat_merges([], prs, REPO, window=300.0))
     check("review census survives an unreadable chain",
           out["unreviewed"] == 1 and out["seat_performed"] == 0)
+
+
+def arm_review_timing_is_evidence_not_an_assumption() -> None:
+    """Only demonstrably prior discussion is in the pre-merge proxy.
+
+    Missing, malformed, timezone-free, simultaneous and edited records are
+    unknown, not a negative review verdict; a later record is not prior.
+    """
+    merge = "2026-09-01T12:00:00Z"
+    cases = []
+    for number, stamp in enumerate(["2026-09-01T11:59:59Z", "2026-09-01T12:00:01Z",
+                                    "2026-09-01T12:00:00Z", None, "invalid",
+                                    "2026-09-01T11:59:59"], start=900):
+        item = pr(number, "findings: timing", merge)
+        item["comments"] = [{"author": {"login": "reviewer"}, "body": "x" * 300,
+                              "createdAt": stamp}]
+        cases.append(item)
+    edited = pr(906, "findings: edited", merge)
+    edited["reviews"] = [{"author": {"login": "reviewer"}, "body": "x" * 300,
+                          "submittedAt": "2026-09-01T11:59:59Z", "includesCreatedEdit": True}]
+    cases.append(edited)
+    mixed = pr(907, "findings: mixed", merge)
+    mixed["reviews"] = [{"author": {"login": "reviewer"}, "body": "x" * 300,
+                         "submittedAt": "2026-09-01T11:59:59Z"}]
+    mixed["comments"] = [{"author": {"login": "reviewer"}, "body": "x" * 300}]
+    cases.append(mixed)
+    result = census(cases, 200, {})
+    states = [row["reviewed"] for row in result["rows"]]
+    check("post-merge comment is not prior discussion", states[0:2] == [True, False], str(states))
+    check("uncertain timing stays unknown", states[2:7] == [None] * 5, str(states))
+    check("known prior discussion dominates an unknown row", states[7] is True, str(states))
+    check("unknown rows excluded from negative count", result["unreviewed"] == 1
+          and result["timing_unknown"] == 5, str(result))
 
 
 def main() -> int:

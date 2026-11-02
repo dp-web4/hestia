@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Did the merges that landed on main carry any peer review — and who performed them?
 
-`tools/merge_order_census.py` (#861) asked whether the open queue was *tangled*
-and found it was not. This answers the question underneath: of the PRs that
-actually landed, how many had been read by anybody first, and how many were
-merged by a seat rather than a human?
+`tools/merge_order_census.py` (#861) asked whether the open queue was *tangled*.
+This instrument measures pre-merge discussion and candidate performer evidence;
+neither proxy proves an independent review or identifies a merger by itself.
 
-**REVIEW.** A merge is `unreviewed` when nothing substantive was written about
-it in EITHER channel GitHub offers — issue comments or review objects — where
-substantive means a non-bot body over `--min-body` characters. The threshold is
+**DISCUSSION PROXY.** `unreviewed` is a historical field name: it counts PRs
+with no qualifying, demonstrably pre-merge discussion in either GitHub channel,
+not PRs proved unread. A long body can be the author's status note or unrelated
+discussion; a shared account also cannot establish reviewer independence. Bodies
+with ambiguous timestamps or later edits are counted separately as unknown.
+Qualifying means a non-bot body over `--min-body` characters. The threshold is
 doing real work: the codex connector posts a 90-char "create an environment for
 this repo" advert on many PRs, and counting that as review would report the
 queue as universally reviewed.
@@ -97,8 +99,9 @@ artifact of the window.
 WHAT THIS STILL CANNOT SEE. The chain records actions taken through the
 governed hook. A merge performed outside it — the GitHub web UI, an ungoverned
 shell, a seat whose hook was not installed — leaves no entry and is invisible
-here. Every number below is therefore a LOWER BOUND on seat participation, and
-the human-performed remainder is a residual, not a measurement.
+here. The timing join can also produce false positives, such as a failed wrapped
+command near an independent merge. This is a candidate estimate, not a strict
+lower bound; the human-performed remainder is not a measurement.
 """
 
 from __future__ import annotations
@@ -234,8 +237,32 @@ def _substantive(items, min_body: int) -> list[dict]:
     return out
 
 
+def _before_merge(items, min_body: int, merged_at: str, time_key: str):
+    """Return (prior, unknown), never promoting post-merge text to prior review.
+
+    Equal timestamps are ambiguous at GitHub's timestamp precision. An edited
+    body can have changed after merge even if its creation time was earlier.
+    """
+    prior, unknown = [], []
+    for item in _substantive(items, min_body):
+        stamp = item.get(time_key)
+        try:
+            instant = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            merged = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+            if instant.tzinfo is None or merged.tzinfo is None:
+                raise ValueError("timestamp lacks timezone")
+        except (AttributeError, TypeError, ValueError):
+            unknown.append(item)
+            continue
+        if instant == merged or (instant < merged and item.get("includesCreatedEdit")):
+            unknown.append(item)
+        elif instant < merged:
+            prior.append(item)
+    return prior, unknown
+
+
 def substantive_comments(pr: dict, min_body: int) -> list[dict]:
-    return _substantive(pr.get("comments"), min_body)
+    return _before_merge(pr.get("comments"), min_body, pr.get("mergedAt"), "createdAt")[0]
 
 
 def substantive_reviews(pr: dict, min_body: int) -> list[dict]:
@@ -246,7 +273,7 @@ def substantive_reviews(pr: dict, min_body: int) -> list[dict]:
     and because the two were conflated in the opposite direction by v1/v2,
     which assumed this one was empty. Counting it required measuring it.
     """
-    return _substantive(pr.get("reviews"), min_body)
+    return _before_merge(pr.get("reviews"), min_body, pr.get("mergedAt"), "submittedAt")[0]
 
 
 def is_findings(title: str) -> bool:
@@ -322,14 +349,18 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
         if not p.get("mergedAt"):
             continue
         record = corroborated.get(p["number"]) or {}
+        comments, uncertain_comments = _before_merge(p.get("comments"), min_body, p["mergedAt"], "createdAt")
+        reviews, uncertain_reviews = _before_merge(p.get("reviews"), min_body, p["mergedAt"], "submittedAt")
+        discussion = True if comments or reviews else (None if uncertain_comments or uncertain_reviews else False)
         rows.append({
             "number": p["number"],
             "title": p.get("title") or "",
             "mergedAt": p["mergedAt"],
-            "reviewed": bool(substantive_comments(p, min_body)
-                             or substantive_reviews(p, min_body)),
-            "reviewed_via_comment": bool(substantive_comments(p, min_body)),
-            "reviewed_via_review": bool(substantive_reviews(p, min_body)),
+            # A long comment is a discussion proxy, not proof of independent
+            # review or that a reviewer saw this version of the work.
+            "reviewed": discussion,
+            "reviewed_via_comment": bool(comments),
+            "reviewed_via_review": bool(reviews),
             "github_reviews": len(p.get("reviews") or []),
             "findings_class": is_findings(p.get("title") or ""),
             "mergedBy": (p.get("mergedBy") or {}).get("login"),
@@ -338,7 +369,8 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
             "seat_action_id": record.get("action_id"),
         })
     n = len(rows)
-    unrev = [r for r in rows if not r["reviewed"]]
+    unrev = [r for r in rows if r["reviewed"] is False]
+    unknown = [r for r in rows if r["reviewed"] is None]
     fnd = [r for r in rows if r["findings_class"]]
     code = [r for r in rows if not r["findings_class"]]
     seated = [r for r in rows if r["performed_by_seat"]]
@@ -348,7 +380,10 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
     gaps = sorted(abs(r["seat_gap_s"]) for r in seated)
     return {
         "n": n,
+        "review_proxy_limitations": "Long pre-merge discussion does not prove independent review or head coverage; unknown timing is separate.",
+        "performer_proxy_limitations": "Temporal association can be false positive or false negative; not a strict lower bound.",
         "unreviewed": len(unrev),
+        "timing_unknown": len(unknown),
         "unreviewed_pct": round(100 * len(unrev) / n, 1) if n else 0.0,
         "github_review_objects": sum(r["github_reviews"] for r in rows),
         # The channel split is reported, not just pooled, because the pooling is
@@ -361,9 +396,9 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
         "reviewed_both": sum(1 for r in rows
                              if r["reviewed_via_review"] and r["reviewed_via_comment"]),
         "findings_class": len(fnd),
-        "findings_unreviewed": sum(1 for r in fnd if not r["reviewed"]),
+        "findings_unreviewed": sum(1 for r in fnd if r["reviewed"] is False),
         "code_class": len(code),
-        "code_unreviewed": sum(1 for r in code if not r["reviewed"]),
+        "code_unreviewed": sum(1 for r in code if r["reviewed"] is False),
         "distinct_mergedBy": sorted({r["mergedBy"] for r in rows if r["mergedBy"]}),
         # The headline the credential cannot show: how many of these one GitHub
         # identity's merges were actually performed by a seat.
@@ -417,9 +452,10 @@ def main() -> int:
         return 0
 
     print(f"merged PRs examined: {out['n']}")
-    print(f"  unread in BOTH channels (no non-bot comment or review "
-          f"> {args.min_body} chars): "
+    print(f"  no qualifying pre-merge discussion in either channel "
+          f"(non-bot body > {args.min_body} chars; proxy, not proof of review): "
           f"{out['unreviewed']} ({out['unreviewed_pct']}%)")
+    print(f"  qualifying discussion with timing unknown: {out['timing_unknown']}")
     print(f"  GitHub review objects, all PRs pooled: {out['github_review_objects']}")
     print(f"    read via comment only {out['reviewed_comment_only']}, "
           f"via review object only {out['reviewed_review_only']} "
@@ -429,7 +465,7 @@ def main() -> int:
     print(f"  code-class:     {out['code_class']}, of which unreviewed "
           f"{out['code_unreviewed']}")
     print(f"  distinct mergedBy identities: {out['distinct_mergedBy']}")
-    print(f"  merges a SEAT performed: {out['seat_performed']} "
+    print(f"  temporally associated seat-merge candidates: {out['seat_performed']} "
           f"({out['seat_performed_pct']}%) {out['seat_performed_by']}")
     gap = out["median_corroboration_gap_s"]
     print(f"    corroborated within {args.merge_window:.0f}s of the merge instant; "
