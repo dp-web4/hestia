@@ -623,6 +623,25 @@ mod tests {
     }
 
     #[test]
+    fn member_mint_must_not_overwrite_unreadable_registry() {
+        for sealed in [false, true] {
+            let (dir, mut vault) = fresh_vault();
+            if sealed {
+                vault.seal_document(MEMBERS_NAMESPACE, MEMBERS_DOC, b"[]", "other-key").unwrap();
+            } else {
+                vault.put_document(MEMBERS_NAMESPACE, MEMBERS_DOC, b"not json".to_vec()).unwrap();
+            }
+            let before = std::fs::read(dir.path().join("v.enc")).unwrap();
+            let mut registry = MemberRegistry::default();
+            let created = ensure_member(&mut vault, &mut registry, "test-seat", false, "", "anchor");
+            let after = std::fs::read(dir.path().join("v.enc")).unwrap();
+            assert!(created.is_none() && before == after && registry.is_empty(),
+                    "unreadable registry was overwritten or advertised; sealed={sealed}, created={}, file_changed={}",
+                    created.is_some(), before != after);
+        }
+    }
+
+    #[test]
     fn ensure_member_mints_persists_and_is_idempotent() {
         let (_dir, mut vault) = fresh_vault();
         let mut reg = MemberRegistry::default();
