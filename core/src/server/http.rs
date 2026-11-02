@@ -6587,7 +6587,7 @@ async fn delegation_mode_set(
     let from = load_mode(&s.vault).ok().flatten().map(|d| d.mode).unwrap_or_else(|| "record".into());
     if let Err(e) = save_mode(&mut s.vault, mode, Some(reason.clone())) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-            "error": format!("nothing changed: {e:#}")})));
+            "error": format!("mode save failed; the outcome is unknown. Inspect and reconcile the vault and decision state before retrying: {e:#}")})));
     }
     s.delegation_gate.note_witnessed(mode);
     let entry = s.append_chain("delegation_gate_mode", stamp_gate(serde_json::json!({
@@ -10571,7 +10571,7 @@ mod disposition_tests {
             Json(serde_json::json!({"mode":"enforce", "reason":"synthetic"})),
         ).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(response.0["error"].as_str().unwrap().contains("nothing changed"));
+        assert!(response.0["error"].as_str().unwrap().contains("outcome is unknown"));
         let (staged, chain_after) = {
             let mut s = state.lock().await;
             let staged = load_mode(&s.vault).unwrap().map(|d| d.mode);
@@ -10603,7 +10603,7 @@ mod disposition_tests {
         };
         let error = response.0["error"].as_str().unwrap_or("");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(!error.contains("nothing changed"),
+        assert!(error.contains("outcome is unknown") && !error.contains("nothing changed"),
                 "false no-change response: {error}; reopened={persisted:?}, snapshot={snapshot:?}, chain_len={chain_len}");
     }
 
