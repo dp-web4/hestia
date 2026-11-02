@@ -54,6 +54,24 @@ loosen it. An unreadable vault yields the floor, never an empty (open) closure. 
 same reasoning as the core's "mirrored, not imported" note: a load failure must not disarm
 the check.
 
+EACH MEMBER'S INSTALLED SURFACE IS DERIVED FROM ITS INSTALL DECLARATION
+-----------------------------------------------------------------------
+A member's gate runs from where the installer put it, under the entry name its harness
+invokes, wired in by a harness config file — expects.json `install.dest`,
+`install.gate_probe.entry` and `install.registration.path`. Those three declarations ARE the
+member's governance surface on a running seat, so the closure derives it from them
+(_closure_from_install) instead of hoping each member's names match a basename list written
+before it existed: the dest dir becomes a dir marker, the entry basename a hooks-dir name,
+the registration path an exact path. A list keyed on names is a list of the members its
+author knew; a member with a different entry name or harness home falls outside it silently.
+
+The installed module has no manifests beside it ($HESTIA_HOME/shared holds the engine only),
+so its registry is empty and only the floor holds there. The floor therefore carries a
+SNAPSHOT of every member's install declaration (MEMBER_INSTALL_DECLARATIONS), derived by the
+same function, and a drift test pins that snapshot equal to the manifests — a member whose
+gate moves or is renamed without the snapshot following is red in CI, not open on a seat.
+Literal names stay in LITERAL_FLOOR too, as the backstop under both.
+
 FAIL-CLOSED CONTRACT — WITH A DELIBERATE, LOAD-BEARING ASYMMETRY
 ----------------------------------------------------------------
 classify() NEVER raises to the caller and this module never calls sys.exit (it returns a
@@ -100,6 +118,8 @@ __all__ = [
     "ClosureVerdict",
     "Closure",
     "LITERAL_FLOOR",
+    "FAILSAFE_CLOSURE",
+    "MEMBER_INSTALL_DECLARATIONS",
     "RULE_WRITE",
     "RULE_WRITE_UNPARSEABLE",
     "RULE_OUT_OF_GRAMMAR",
@@ -107,9 +127,13 @@ __all__ = [
     "RULE_INTERNAL",
     "RULE_READ_INTERNAL",
     "classify",
+    "write_verdicts",
     "load_closure",
     "default_closure",
     "attest_shims",
+    "resolve_location",
+    "declared_dest",
+    "registered_closure",
 ]
 
 # ── Rule ids (returned to the shim; the shim's refusal/witness names the RULE and the ACT) ──
@@ -144,15 +168,48 @@ class ClosureVerdict:
     `marker` is the matched closure element (the REASON); `resource` is the concrete
     argument that matched (the ACT — a human's basis for approving an escalation).
     `source` says which closure decided: "registry+floor" or "floor".
+    `resolved` are the other spellings of `resource` the match consulted — cwd-joined and
+    realpath'd, only where they differ — so an alias that matched by its destination carries
+    that destination to the escalation's price, not only the alias (Codex review of #1239).
+    `landing` is the one LOCATION the write reaches (#1247), what the daemon prices a member's
+    gate entry by: home-expanded, cwd-joined, realpath'd (`resolve_location`). It is a
+    separate field, not `resolved`, because the two answer different questions: `resolved`
+    lists every spelling the match consulted; `landing` names where the bytes go.
     """
     classification: str            # "none" | "read" | "write"
     rule: Optional[str] = None     # rule id on "write" (and diagnostics on read-internal)
     marker: Optional[str] = None   # matched closure element
     resource: Optional[str] = None  # the argument that resolved into the closure
     source: str = "floor"
+    resolved: tuple = ()
+    # The LOCATION the write reaches, as this classifier resolved it: home-expanded, joined
+    # onto the caller's cwd when relative, realpath'd (symlinks and `..` resolved). `resource`
+    # is the argument as written (it can be relative, or a name inside a `cd`); this is where it
+    # lands. Set on a resolved write only. It is what the daemon prices a member's gate entry
+    # from, by location, so the price never depends on how the act was spelled or summarised.
+    # (#1247 named this `resolved`; re-stacked on #1239, whose cleared `resolved` is the tuple
+    # above, it is `landing`.)
+    landing: Optional[str] = None
 
 
 # ── The closure — segment-pattern matchers, tighten-only union ──────────────────────────────
+def resolve_location(target: str, cwd: Optional[str] = None) -> Optional[str]:
+    """Where `target` lands: home-expanded, cwd-joined when relative, then realpath'd. A
+    relative target with no cwd to pin it is normalised but stays relative (realpath would
+    resolve it against THIS process's cwd, which is not the classified command's)."""
+    if not isinstance(target, str) or not target:
+        return None
+    try:
+        p = os.path.expanduser(target.replace("\\", "/"))
+        if not os.path.isabs(p):
+            if not (isinstance(cwd, str) and cwd):
+                return os.path.normpath(p)
+            p = os.path.join(os.path.expanduser(cwd), p)
+        return os.path.realpath(p)
+    except (OSError, ValueError):
+        return None
+
+
 def _segments(path: str) -> tuple:
     p = path.replace("\\", "/").rstrip("/")
     return tuple(s for s in p.split("/") if s not in ("", "."))
@@ -220,12 +277,11 @@ class Closure:
                 return base
         return None
 
-    def match(self, target: str, *, cwd: Optional[str] = None,
-              position: str = "write") -> Optional[str]:
-        """The matched closure element, or None. Candidates: raw, cwd-joined (when relative),
-        and realpath'd forms — resolve BEFORE segment comparison (symlink/.. aliasing)."""
+    def forms(self, target: str, *, cwd: Optional[str] = None) -> list:
+        """Every spelling `match` consults, raw first: raw, cwd-joined (when relative), and
+        realpath'd forms — resolved BEFORE segment comparison (symlink/.. aliasing)."""
         if not isinstance(target, str) or not target:
-            return None
+            return []
         cands = [target]
         norm = target.replace("\\", "/")
         rel = not os.path.isabs(norm) and not norm.startswith("~")
@@ -245,7 +301,12 @@ class Closure:
                     cands.append(rp)
             except (OSError, ValueError):
                 pass
-        for c in cands:
+        return cands
+
+    def match(self, target: str, *, cwd: Optional[str] = None,
+              position: str = "write") -> Optional[str]:
+        """The matched closure element, or None, over every form in `forms`."""
+        for c in self.forms(target, cwd=cwd):
             hit = self._match_segments(_segments(c), position)
             if hit:
                 return hit
@@ -265,12 +326,22 @@ LITERAL_FLOOR = Closure(
                                      # the pre-consolidation gate allowed exactly that, because
                                      # it protected known filenames, not the directory)
         ("hestia", "hooks"),
+        # The member mesh's FIRE FLAGS ($HESTIA_HOME/mesh-fire.d/<member>, #1373/#1374): a flag there turns a
+        # print-only watcher into one that launches a headless CLI for that member. install-watchers.sh checks
+        # owner/mode/symlinks, but every governed member runs as the operator's UID, so only the gate can tell
+        # the operator's flag from a member's. Creating, changing or removing anything in/under it is a closure
+        # write (Nova's release gate on #1374: "a file's mere presence should not convey operator authority").
+        ("mesh-fire.d",),
     ),
     files_anywhere=(
         "hestia_gate_core.py",
         "hestia_gate_mechanism.py",
         "hestia_governance_closure.py",   # this module is itself closure
         "gate_self_protection_test.py",
+        # THE common gate (one-gate stage C): every seat's shim delegates its whole decision
+        # to it. Governed wherever it lives, so the INSTALLED copy ($HESTIA_HOME/shared) is
+        # closure too, not only the repo copy under plugins/_shared.
+        "hestia_single_gate.py",
         # web4-hub DEPLOY closure (#415 / web4 #709, R7c limb): these decide WHICH hub
         # binary executes — a write redirecting which binary runs is equivalent to a
         # write to it, and that binary enforces its society's law. Distinctive names,
@@ -285,6 +356,9 @@ LITERAL_FLOOR = Closure(
         "post_tool_use.py",
         "witness.py",
         "law_inject.py",
+        # A harness whose gate entry is not named like the others. Also derived from that
+        # member's install declaration (below); listed here as the literal backstop.
+        "before_tool.py",
     ),
     exact_paths=(
         # The hub's STAGED EXECUTABLE (#415): deliberately a segment path, not a
@@ -296,9 +370,139 @@ LITERAL_FLOOR = Closure(
         (".codex", "config.toml"),
         (".kimi-code", "config.toml"),
         (".kimi", "config.toml"),
+        (".gemini", "settings.json"),
     ),
     source="floor",
 )
+
+
+# ── Install-declared surfaces — derived, so a member cannot fall outside by naming ──────────
+def _home_relative(path: str) -> tuple:
+    """Segments of an install path with its home anchor removed: `~/.x/hooks` -> (.x, hooks).
+    The closure matches by segment run / suffix, so the home it lands in does not matter."""
+    segs = _segments(path)
+    if segs and segs[0] in ("~", "$HOME", "${HOME}"):
+        segs = segs[1:]
+    return segs
+
+
+def _install_declaration(install: Any) -> Optional[dict]:
+    """The governance-relevant part of one expects.json `install` block, normalised:
+    {"member": str, "dest": str, "entry": str, "registration": [segments]}. None when unusable."""
+    if not isinstance(install, dict):
+        return None
+    member = install.get("member")
+    dest = install.get("dest")
+    probe = install.get("gate_probe")
+    entry = probe.get("entry") if isinstance(probe, dict) else None
+    reg = install.get("registration")
+    reg_path = reg.get("path") if isinstance(reg, dict) else None
+    out: dict = {}
+    if isinstance(member, str) and member:
+        out["member"] = member
+    if isinstance(dest, str) and dest:
+        out["dest"] = dest
+    if isinstance(entry, str) and entry:
+        out["entry"] = entry
+    if isinstance(reg_path, list) and reg_path and all(isinstance(s, str) for s in reg_path):
+        out["registration"] = list(reg_path)
+    return out or None
+
+
+def _closure_from_install(install: Any) -> Optional[Closure]:
+    """One member's installed governance surface, from its expects.json `install` block."""
+    return _closure_from_declaration(_install_declaration(install))
+
+
+def _closure_from_declaration(decl: Optional[dict]) -> Optional[Closure]:
+    """Derive one member's installed governance surface from its normalised declaration.
+
+    * dest  -> dir marker: every file the installer puts there (gate entry, witness, helpers,
+               and a NEW file dropped beside them) is a closure write.
+    * entry -> hooks-dir name: the entry basename governs under any hooks/ segment, as the
+               conventionally named entries already do (repo copies, published copies).
+    * registration -> exact path: the harness config that selects which gate runs.
+    A dest or registration of fewer than two segments is IGNORED, not widened: `hooks` or
+    `settings.json` alone would govern every same-named dir or file anywhere."""
+    if not isinstance(decl, dict):
+        return None
+    dirs, hooks_only, paths = [], [], []
+    dest = decl.get("dest")
+    if isinstance(dest, str):
+        segs = _home_relative(dest)
+        if len(segs) >= 2:
+            dirs.append(segs)
+    entry = decl.get("entry")
+    if isinstance(entry, str) and _segments(entry):
+        hooks_only.append(_segments(entry)[-1])
+    reg = decl.get("registration")
+    if isinstance(reg, (list, tuple)):
+        segs = tuple(s for s in reg if isinstance(s, str) and s not in ("", ".", "~"))
+        if len(segs) >= 2:
+            paths.append(segs)
+    if not (dirs or hooks_only or paths):
+        return None
+    return Closure(dir_markers=tuple(dirs), files_hooks_only=tuple(hooks_only),
+                   exact_paths=tuple(paths), source="install")
+
+
+# Snapshot of every member's install declaration, for the INSTALLED module (which has no
+# manifests beside it). Generated from plugins/*/expects.json by _install_declaration and
+# pinned equal to them by member_install_surface_test.py — edit the manifest, then this.
+MEMBER_INSTALL_DECLARATIONS = {
+    "claude-code": {"member": "claude-code", "dest": "~/.claude/hooks/hestia",
+                    "entry": "hooks/pre_tool_use.py", "registration": [".claude", "settings.json"]},
+    "codex": {"member": "codex", "dest": "~/.codex/hooks", "entry": "hooks/pre_tool_use.py",
+              "registration": [".codex", "config.toml"]},
+    "gemini": {"member": "gemini", "dest": "~/.gemini/hestia-plugins/gemini/hooks",
+               "entry": "hooks/before_tool.py", "registration": [".gemini", "settings.json"]},
+    "kimi": {"member": "kimi-code", "dest": "~/.kimi-code/hooks", "entry": "hooks/pre_tool_use.py",
+             "registration": [".kimi-code", "config.toml"]},
+}
+
+
+def declared_dest(member_id: str, home: Optional[str]) -> Optional[str]:
+    """Where this member's install declaration puts its hooks, home-expanded against `home` —
+    the caller's seat home, passed explicitly (no default: a home-relative dest with no home
+    names nowhere). None for a member with no declaration, or a home-relative dest without one."""
+    for decl in MEMBER_INSTALL_DECLARATIONS.values():
+        if decl.get("member") == member_id and isinstance(decl.get("dest"), str):
+            dest = decl["dest"]
+            if dest.startswith("~/"):
+                return os.path.join(home, dest[2:]) if home else None
+            return dest
+    return None
+
+
+def registered_closure(own_dirs: Iterable[str] = (), targets: Iterable[str] = ()) -> Closure:
+    """The EXECUTED governance surface of one seat, as absolute locations: the directories its
+    hestia-owned hooks run from (dir markers) and every hestia-owned hook its harness
+    registration actually points at (exact paths). Built at gate runtime from what the
+    harness REGISTERS (the caller reads the registration), unioned onto the declared closure
+    — a seat whose registration points somewhere no declaration names is governed there too.
+    Paths are realpath'd by the caller; a path of fewer than three segments is ignored rather
+    than widened (`/home/x` would govern a whole home)."""
+    dirs = tuple(seg for seg in (_segments(d) for d in own_dirs if isinstance(d, str))
+                 if len(seg) >= 3)
+    files = tuple(seg for seg in (_segments(t) for t in targets if isinstance(t, str))
+                  if len(seg) >= 3)
+    return Closure(dir_markers=dirs, exact_paths=files, source="registered")
+
+
+def _failsafe_closure() -> Closure:
+    out = LITERAL_FLOOR
+    for _name, decl in sorted(MEMBER_INSTALL_DECLARATIONS.items()):
+        extra = _closure_from_declaration(decl)
+        if extra is not None:
+            out = out.union(extra)
+    return Closure(out.dir_markers, out.files_anywhere, out.files_hooks_only, out.exact_paths,
+                   source="floor")
+
+
+try:
+    FAILSAFE_CLOSURE = _failsafe_closure()
+except Exception:  # noqa: BLE001 — never let the derivation disarm the literal floor
+    FAILSAFE_CLOSURE = LITERAL_FLOOR
 
 
 def _closure_from_manifest(manifest: dict) -> Optional[Closure]:
@@ -335,7 +539,8 @@ def _read_manifests_fs(plugins_root: str) -> dict:
 
 def load_closure(plugins_root: Optional[str] = None,
                  manifest_reader: Optional[Callable[[], dict]] = None) -> Closure:
-    """Assemble the closure: LITERAL_FLOOR ∪ every plugin manifest's declared closure.
+    """Assemble the closure: the fail-safe floor (LITERAL_FLOOR ∪ the install snapshot) ∪
+    every plugin manifest's declared closure ∪ every manifest's install-derived surface.
 
     `manifest_reader` (tests, vault-backed readers) returns {plugin_name: manifest_dict}.
     Default reads plugins/*/expects.json beside this module. NEVER raises; total failure
@@ -347,16 +552,24 @@ def load_closure(plugins_root: Optional[str] = None,
             root = plugins_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             manifests = _read_manifests_fs(root)
         if not isinstance(manifests, dict):
-            return LITERAL_FLOOR
-        result = LITERAL_FLOOR
+            return FAILSAFE_CLOSURE
+        result = FAILSAFE_CLOSURE
         for _name, manifest in sorted(manifests.items()):
-            extra = _closure_from_manifest(manifest)
-            if extra is not None:
-                result = result.union(extra)
+            for derive in (_closure_from_manifest, _closure_from_install_of):
+                try:
+                    extra = derive(manifest)
+                except Exception:  # noqa: BLE001 — a bad manifest adds nothing, removes nothing
+                    extra = None
+                if extra is not None:
+                    result = result.union(extra)
         return Closure(result.dir_markers, result.files_anywhere, result.files_hooks_only,
                        result.exact_paths, source="registry+floor")
     except Exception:
-        return LITERAL_FLOOR
+        return FAILSAFE_CLOSURE
+
+
+def _closure_from_install_of(manifest: Any) -> Optional[Closure]:
+    return _closure_from_install(manifest.get("install")) if isinstance(manifest, dict) else None
 
 
 _DEFAULT_CLOSURE: Optional[Closure] = None
@@ -726,7 +939,447 @@ def _opt_value(args: list, *names: str) -> Optional[str]:
     return None
 
 
-def _command_write_targets(words: list, stdin_src=None) -> list:
+# ── #1348: verbs that write through an option, an output operand, a script, or their input ──
+#
+# The model above knew the classic writers by their operands. Verbs that hide their output in
+# an OPTION (`sort -o F`), an OUTPUT OPERAND (`uniq IN OUT`), their own SCRIPT (`sed 'w F'`)
+# or by REPLACING THE INPUT (`gzip F`) were read positions, so they wrote gate files as reads.
+#
+# Two review rounds (Codex, #1349) showed that patching option SPELLINGS one at a time keeps
+# missing variants: attached values, later clusters, optional `=ARG`s, GNU's unique-prefix
+# abbreviations. So each modelled verb now has an OPTION TABLE and a real parser, and anything
+# the parser cannot account for is OUT OF GRAMMAR. A table is the whole statement of what we
+# understand about that verb; what is not in it is not guessed at.
+
+_FLAG, _RD, _WR, _EXEC, _OPT_RD, _OPT_WR = "flag", "read", "write", "exec", "opt-read", "opt-write"
+
+
+def _parse_opts(args: list, short: dict, long: dict):
+    """GNU getopt_long-style parse of `args` against a verb's table.
+
+    short: {letter: kind}; long: {name-without-dashes: kind}. Kinds: _FLAG (no value),
+    _RD / _WR (required value, read / written), _OPT_RD / _OPT_WR (optional value, only when
+    attached: `-iSUF`, `--name=V`), _EXEC (runs something: out of grammar).
+    Long names match exactly or by UNIQUE prefix, as getopt_long does (`--out=F` is
+    `--output=F`). Returns (writes, positionals, seen, values): written values, operands,
+    canonical option keys present, and {key: [values]} for every valued option.
+    Raises _OutOfGrammar on an unknown or ambiguous option, a missing value, or an _EXEC one."""
+    writes, pos, seen, values = [], [], set(), {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos.extend(args[i + 1:])
+            break
+        if a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if name in long:
+                key = name
+            else:
+                cands = [n for n in long if name and n.startswith(name)]
+                if len(cands) != 1:
+                    raise _OutOfGrammar()
+                key = cands[0]
+            kind = long[key]
+            seen.add("--" + key)
+            if kind == _EXEC:
+                raise _OutOfGrammar()
+            if kind == _FLAG:
+                if eq:
+                    raise _OutOfGrammar()
+            elif kind in (_RD, _WR):
+                if not eq:
+                    if i + 1 >= len(args):
+                        raise _OutOfGrammar()
+                    val = args[i + 1]
+                    i += 1
+                values.setdefault("--" + key, []).append(val)
+                if kind == _WR:
+                    writes.append(val)
+            else:  # optional value, attached only; a bare occurrence is recorded as None
+                values.setdefault("--" + key, []).append(val if eq else None)
+                if eq and kind == _OPT_WR:
+                    writes.append(val)
+            i += 1
+            continue
+        if a.startswith("-") and len(a) > 1:
+            body, j = a[1:], 0
+            while j < len(body):
+                ch = body[j]
+                kind = short.get(ch)
+                if kind is None:
+                    raise _OutOfGrammar()
+                seen.add("-" + ch)
+                if kind == _EXEC:
+                    raise _OutOfGrammar()
+                if kind == _FLAG:
+                    j += 1
+                    continue
+                val = body[j + 1:]
+                if kind in (_OPT_RD, _OPT_WR):
+                    # Per occurrence: a bare one is recorded as None, so a repeat that names a
+                    # file cannot hide it (`gawk -p/tmp/p -p`; Codex, #1349 round 6).
+                    values.setdefault("-" + ch, []).append(val or None)
+                    if val and kind == _OPT_WR:
+                        writes.append(val)
+                    break
+                if not val:
+                    if i + 1 >= len(args):
+                        raise _OutOfGrammar()
+                    val = args[i + 1]
+                    i += 1
+                values.setdefault("-" + ch, []).append(val)
+                if kind == _WR:
+                    writes.append(val)
+                break
+            i += 1
+            continue
+        pos.append(a)
+        i += 1
+    return writes, pos, seen, values
+
+
+def _table(flags: str = "", **kinds) -> dict:
+    """Short table: every letter of `flags` is a flag; kwargs map kind -> letters."""
+    t = {ch: _FLAG for ch in flags}
+    for kind, letters in kinds.items():
+        for ch in letters:
+            t[ch] = {"rd": _RD, "wr": _WR, "ex": _EXEC, "ord": _OPT_RD, "owr": _OPT_WR}[kind]
+    return t
+
+
+def _ltable(flags: str = "", **kinds) -> dict:
+    """Long table: space-separated names per kind."""
+    t = {n: _FLAG for n in flags.split()}
+    for kind, names in kinds.items():
+        for n in names.split():
+            t[n] = {"rd": _RD, "wr": _WR, "ex": _EXEC, "ord": _OPT_RD, "owr": _OPT_WR}[kind]
+    return t
+
+
+_COMMON_LONG = "help version"
+
+_SORT = (_table("bdfgiMhnRrVcCmsuz", rd="ktS", wr="oT"),
+         _ltable("ignore-leading-blanks dictionary-order ignore-case general-numeric-sort "
+                 "ignore-nonprinting month-sort human-numeric-sort numeric-sort random-sort "
+                 "reverse version-sort merge stable unique zero-terminated debug " + _COMMON_LONG,
+                 ord="check", rd="sort key field-separator buffer-size parallel batch-size "
+                 "random-source files0-from", wr="output temporary-directory",
+                 ex="compress-program"))
+_UNIQ = (_table("cdDiuz", rd="fsw"),
+         _ltable("count repeated ignore-case unique zero-terminated " + _COMMON_LONG,
+                 ord="all-repeated group", rd="skip-fields skip-chars check-chars"))
+_SPLIT = (_table("dxeu", rd="abClnt"),
+          _ltable("elide-empty-files unbuffered verbose " + _COMMON_LONG,
+                  ord="numeric-suffixes hex-suffixes",
+                  rd="suffix-length bytes line-bytes lines number separator additional-suffix",
+                  ex="filter"))
+_CSPLIT = (_table("ksqz", rd="bn", wr="f"),
+           _ltable("keep-files quiet silent elide-empty-files suppress-matched " + _COMMON_LONG,
+                   rd="suffix-format digits", wr="prefix"))
+_CURL = (_table("sSLfkiIvGNqgjlnBZMVhJRp0123456#O", rd="XHduAebmErTwxUCFyYzQtP",
+                wr="ocD", ex="K"),
+         _ltable("silent show-error location location-trusted fail fail-with-body fail-early "
+                 "insecure include head verbose get no-buffer compressed http1.0 http1.1 http2 "
+                 "http3 ipv4 ipv6 globoff remote-header-name remote-time progress-bar "
+                 "no-progress-meter create-dirs ssl ssl-reqd tlsv1.2 tlsv1.3 disable raw "
+                 "remote-name remote-name-all no-keepalive path-as-is " + _COMMON_LONG,
+                 rd="request header data data-raw data-binary data-urlencode user user-agent "
+                 "referer cookie max-time connect-timeout cert key cacert range upload-file "
+                 "write-out proxy proxy-user continue-at form form-string retry retry-delay "
+                 "retry-max-time json url max-filesize resolve interface oauth2-bearer tls-max "
+                 "limit-rate speed-limit speed-time max-redirs",
+                 wr="output dump-header cookie-jar trace trace-ascii stderr libcurl etag-save "
+                 "hsts alt-svc output-dir", ex="config"))
+_WGET = (_table("qvSNcxkpEKnrmb", rd="tTwUiQlARDIX", wr="OoaP", ex="e"),
+         _ltable("quiet verbose no-verbose server-response spider timestamping continue "
+                 "no-clobber recursive mirror page-requisites convert-links adjust-extension "
+                 "no-check-certificate no-parent no-directories force-directories "
+                 "no-host-directories content-disposition https-only inet4-only inet6-only "
+                 "background " + _COMMON_LONG,
+                 ex="execute config",
+                 rd="tries timeout wait user-agent input-file quota level accept reject "
+                 "domains header user password post-data post-file method body-data limit-rate "
+                 "referer max-redirect load-cookies",
+                 wr="output-document output-file append-output directory-prefix save-cookies "
+                 "warc-file rejected-log"))
+_TAR = (_table("crutxdAvzjJZapPkmOShWlBiMUw", rd="fCTXbNHKVL", wr="g", ex="FI"),
+        _ltable("create append update catenate concatenate list diff compare delete verbose "
+                "gzip gunzip bzip2 xz zstd lzip lzma auto-compress preserve-permissions "
+                "same-permissions absolute-names keep-old-files touch no-same-owner to-stdout "
+                "sparse dereference verify check-links ignore-zeros multi-volume no-recursion "
+                "recursion wildcards no-wildcards anchored no-anchored totals numeric-owner "
+                "no-xattrs xattrs acls selinux one-file-system null exclude-vcs "
+                "exclude-vcs-ignores sort " + _COMMON_LONG,
+                rd="file directory files-from exclude exclude-from newer newer-mtime format "
+                "starting-file label tape-length owner group mode mtime transform xform "
+                "strip-components blocking-factor exclude-tag",
+                wr="listed-incremental index-file volno-file",
+                ex="extract get info-script new-volume-script to-command use-compress-program "
+                "checkpoint-action rmt-command rsh-command"))
+_COMPRESS = (_table("cdfhklLnNqrtvVe0123456789", rd="STMFCDB", wr="o"),
+             _ltable("stdout to-stdout decompress uncompress force keep list license no-name "
+                     "name quiet recursive test verbose best fast rm rsyncable extreme ultra "
+                     "no-progress " + _COMMON_LONG,
+                     rd="suffix threads memlimit format check", ord="long", wr="output"))
+_SED = (_table("nErsuz", rd="el", ex="f", ord="i"),
+        _ltable("quiet silent posix debug sandbox regexp-extended separate unbuffered "
+                "null-data follow-symlinks " + _COMMON_LONG,
+                ord="in-place", rd="expression line-length", ex="file"))
+_AWK = (_table("bcPrSOMntVhC", rd="Fve", ex="fEil", owr="dpo", ord="DL"),
+        _ltable("characters-as-bytes traditional posix re-interval sandbox optimize "
+                "no-optimize use-lc-numeric bignum non-decimal-data copyright gen-pot csv "
+                + _COMMON_LONG,
+                rd="field-separator assign source", ex="file exec include load",
+                owr="dump-variables profile pretty-print", ord="debug lint"))
+_COMPRESSORS = frozenset({"gzip", "gunzip", "bzip2", "bunzip2", "xz", "unxz", "lzma", "unlzma",
+                          "zstd", "unzstd", "lz4", "compress", "uncompress", "pigz"})
+
+#: sed: a `w`/`W` command, or the `w` flag of `s///`, names a file the script WRITES.
+_SED_WRITE = re.compile(r"(?:^|[;{}\n]|\d|\$|/)\s*[wW]\s*\S|s(.).*?\1.*?\1[gpiImMeE0-9]*w")
+#: awk: output redirection inside print/printf, a command piped into getline, or system().
+#: A bare `>` elsewhere is a comparison (`NR>5`) and does not write.
+_AWK_WRITE = re.compile(r"\bprintf?\b[^;{}]*?(?:>|\|)|\|\s*getline|\bsystem\s*\(")
+#: Verbs that only read or print, safe to run from xargs / find -exec on governed paths.
+#: (rg is NOT here: `--pre CMD` runs a program on every input -- Codex, #1349. Each verb kept has
+#: no option that executes or writes, so its arguments cannot add an effect.)
+_PASSIVE_VERBS = frozenset({"grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "ls",
+                            "stat", "sha256sum", "sha1sum", "md5sum", "b2sum", "cksum",
+                            "echo", "printf", "basename", "dirname", "realpath", "readlink",
+                            "du", "test", "[", "true", "diff", "cmp"})
+#: find primaries: name -> (arity, kind). kind None = read; "w" = writes its first argument.
+_FIND_PRIMARIES = dict(
+    [(p, (0, None)) for p in (
+        "-print -print0 -ls -prune -quit -true -false -depth -mount -xdev -follow -empty "
+        "-readable -writable -executable -nouser -nogroup -daystart -noleaf -not -a -and -o "
+        "-or ! ( ) , -ignore_readdir_race -noignore_readdir_race").split()]
+    + [(p, (1, None)) for p in (
+        "-name -iname -path -ipath -wholename -iwholename -lname -ilname -regex -iregex "
+        "-regextype -type -xtype -maxdepth -mindepth -mtime -atime -ctime -mmin -amin -cmin "
+        "-newer -anewer -cnewer -size -perm -user -group -uid -gid -links -inum -samefile "
+        "-used -printf -fstype -context -files0-from").split()]
+    + [(p, (1, "w")) for p in "-fprint -fprint0 -fls".split()]
+    + [("-fprintf", (2, "w"))])
+
+
+#: Directories whose files are taken to be what their names say. A passive name anywhere else
+#: (`./cat`, `/tmp/x/cat`) is an arbitrary program that happens to share the name.
+_TRUSTED_BIN_DIRS = frozenset({"/bin", "/usr/bin"})
+#: `PATH` as a word anywhere in a command: an assignment, `export`, `read PATH`, `printf -v PATH`.
+#: find and xargs exec their command through PATH, so a bare name is trusted only when nothing
+#: in the command line can have changed it. Over-broad on purpose (`echo $PATH` counts): the
+#: cost is a refused find/xargs, never a misread one.
+_PATH_WORD = re.compile(r"(?<![A-Za-z0-9_])PATH(?![A-Za-z0-9_])")
+
+
+def _inner_is_passive(words: list, path_pinned: bool = False) -> bool:
+    """For xargs / find -exec: is the command they run one that only reads?
+
+    Identity, not basename (Nova, #1356 P1). The old test kept `os.path.basename(words[0])`, so
+    `find . -exec ./cat {} +` or `xargs /tmp/x/cat` -- any program NAMED like a passive verb --
+    read as passive while it could write anything. Now the program must be either a bare
+    passive name, looked up through a PATH this command line cannot have changed
+    (`path_pinned`, computed by _bash_write_targets over the whole line), or a passive name
+    directly inside /bin or /usr/bin. Every other spelling fails closed. An `env` that sets PATH
+    or takes options is a wrapper that changes how the name is found, so it fails closed too.
+    Default False: a caller that cannot vouch for PATH gets the refusal, not the trust.
+
+    The wrappers in front of the program get the same identity rule (codex / claude-code /
+    kimi-code, #1356 v3): _strip_wrappers matches a wrapper by basename, so `./env cat` or
+    `/tmp/x/nice cat` stripped an arbitrary program as if it were env or nice."""
+    words = list(words)
+    stripped = _strip_wrappers(words)
+    if not stripped:
+        return False
+    prefix = words[:len(words) - len(stripped)]
+    if any(_PATH_WORD.search(w) or w.startswith("-") for w in prefix):
+        return False
+    prev = ""
+    for w in prefix:
+        if _ASSIGN_RE.match(w):
+            continue
+        if prev == "timeout" and re.match(r"^\d", w):
+            prev = ""
+            continue  # the duration, not a program
+        if not _is_trusted_program(w, path_pinned):
+            return False
+        prev = os.path.basename(w)
+    prog = stripped[0]
+    if os.path.basename(prog) not in _PASSIVE_VERBS:
+        return False
+    return _is_trusted_program(prog, path_pinned)
+
+
+def _is_trusted_program(prog: str, path_pinned: bool) -> bool:
+    """Is `prog` the program its name says? A bare name is, when PATH is pinned; a path is only
+    when it sits directly in a trusted bin directory (normalized, so `/bin/../tmp/x` is not)."""
+    if "/" not in prog:
+        return path_pinned
+    return os.path.isabs(prog) and os.path.normpath(os.path.dirname(prog)) in _TRUSTED_BIN_DIRS
+
+
+def _find_exec_open(cur: list) -> bool:
+    """Is `cur` a find command with an -exec/-execdir/-ok/-okdir not yet terminated?"""
+    words = _strip_wrappers(cur) if cur else []
+    if not words or os.path.basename(words[0]) != "find":
+        return False
+    open_ = False
+    for w in words[1:]:
+        if w in ("-exec", "-execdir", "-ok", "-okdir"):
+            open_ = True
+        elif open_ and w in (";", "+"):
+            open_ = False
+    return open_
+
+
+def _expand_old_tar(args: list) -> list:
+    """`tar czf A x` -> `-c -z -f A x`: an undashed first word is a letter cluster whose
+    value letters take the following words in order."""
+    if not args or args[0].startswith("-") or not re.fullmatch(r"[A-Za-z]+", args[0]):
+        return args
+    out, k = [], 1
+    for ch in args[0]:
+        out.append("-" + ch)
+        if _TAR[0].get(ch) in (_RD, _WR):
+            if k >= len(args):
+                raise _OutOfGrammar()
+            out.append(args[k])
+            k += 1
+    return out + args[k:]
+
+
+def _find_write_targets(args: list, path_pinned: bool = False) -> list:
+    i = 0
+    while i < len(args) and args[i] in ("-H", "-L", "-P"):
+        i += 1
+    while i < len(args) and args[i] in ("-D", "-O") or (i < len(args) and args[i].startswith("-O")):
+        i += 2 if args[i] in ("-D", "-O") else 1
+    starts = []
+    while i < len(args) and not (args[i].startswith("-") or args[i] in ("!", "(", ")", ",")):
+        starts.append(args[i])
+        i += 1
+    out = []
+    while i < len(args):
+        p = args[i]
+        if p in ("-exec", "-execdir", "-ok", "-okdir"):
+            # The terminator is `+` or `;`. The walker keeps an escaped `\;` inside this simple
+            # command (see _bash_write_targets); none at all means the shell would reject it.
+            end = next((k for k in range(i + 1, len(args)) if args[k] in (";", "+")), len(args))
+            if not _inner_is_passive(args[i + 1:end], path_pinned):
+                raise _OutOfGrammar()  # runs a command that may write
+            i = end + 1
+            continue
+        if p == "-delete":
+            out.extend(starts or ["."])
+            i += 1
+            continue
+        if p.startswith("-newer") and len(p) == 8:  # -newerXY ref
+            i += 2
+            continue
+        spec = _FIND_PRIMARIES.get(p)
+        if spec is None:
+            raise _OutOfGrammar()  # an unknown primary may act
+        arity, kind = spec
+        if kind == "w" and i + 1 < len(args):
+            out.append(args[i + 1])
+        i += 1 + arity
+    return out
+
+
+def _output_verb_write_targets(name: str, args: list, path_pinned: bool = False):
+    """Write targets for the #1348 verbs, or None when `name` is not one of them."""
+    if name == "sort":
+        return _parse_opts(args, *_SORT)[0]
+    if name == "uniq":
+        w, pos, _, _ = _parse_opts(args, *_UNIQ)
+        return w + pos[1:2]
+    if name == "split":
+        w, pos, _, _ = _parse_opts(args, *_SPLIT)
+        return w + (pos[1:2] if len(pos) > 1 else ["."])   # default prefix `x` in the cwd
+    if name == "csplit":
+        w, pos, seen, _ = _parse_opts(args, *_CSPLIT)
+        return w if ("-f" in seen or "--prefix" in seen) else w + ["."]  # default `xx` in cwd
+    if name in ("mkdir", "mkfifo", "mknod"):
+        pos = _positionals(args, opts_with_value=("-m", "--mode", "-Z", "--context"))
+        return pos[:1] if name == "mknod" else pos
+    if name == "curl":
+        w, _, seen, vals = _parse_opts(args, *_CURL)
+        # --write-out is a small program: `%output{F}` / `%output{>>F}` open F for writing, and
+        # `@F` reads the program from a file this classifier does not read (Codex, #1349).
+        for fmt in vals.get("-w", []) + vals.get("--write-out", []):
+            if fmt.startswith("@") or "%output{" in fmt or "%{output" in fmt:
+                raise _OutOfGrammar()
+        w = [v for v in w if v != "-"]
+        if seen & {"-O", "--remote-name", "--remote-name-all"}:
+            w += vals.get("--output-dir", []) or ["."]       # named by the URL, in the cwd
+        return w
+    if name == "wget":
+        w, _, seen, _ = _parse_opts(args, *_WGET)
+        w = [v for v in w if v != "-"]
+        if not seen & {"--spider", "-O", "--output-document"} and "-P" not in seen \
+                and "--directory-prefix" not in seen:
+            w.append(".")                                    # named by the URL, in the cwd
+        return w
+    if name in ("tar", "bsdtar", "gtar"):
+        w, _, seen, vals = _parse_opts(_expand_old_tar(args), *_TAR)
+        if "-x" in seen:
+            raise _OutOfGrammar()  # extraction writes the archive's members wherever they say
+        modifying = seen & {"-c", "-r", "-u", "-A", "--create", "--append", "--update",
+                            "--catenate", "--concatenate", "--delete"}
+        if modifying:
+            w += vals.get("-f", []) + vals.get("--file", [])
+        return [v for v in w if v and v != "-"]
+    if name in _COMPRESSORS:
+        w, pos, seen, _ = _parse_opts(args, *_COMPRESS)
+        to_stdout = seen & {"-c", "--stdout", "--to-stdout", "-t", "--test", "-l", "--list"}
+        if to_stdout and "--rm" not in seen:
+            return w
+        # The input is replaced, or (-k) a sibling output is created beside it.
+        return w + pos
+    if name == "find":
+        return _find_write_targets(args, path_pinned)
+    if name == "xargs":
+        inner = _positionals(args, opts_with_value=(
+            "-I", "-i", "-n", "-L", "-l", "-P", "-d", "-E", "-e", "-s", "-a", "--arg-file",
+            "--delimiter", "--max-args", "--max-lines", "--max-procs", "--replace", "--eof",
+            "--max-chars"))
+        first = next((k for k, a in enumerate(args) if inner and a == inner[0]), None)
+        if first is None or not _inner_is_passive(args[first:], path_pinned):
+            raise _OutOfGrammar()  # runs a command that may write
+        return []
+    if name in ("awk", "gawk", "mawk", "nawk"):
+        w, pos, seen, vals = _parse_opts(args, *_AWK)
+        progs = vals.get("-e", []) + vals.get("--source", [])
+        if not progs:
+            progs = pos[:1]
+        if any(_AWK_WRITE.search(p) for p in progs):
+            raise _OutOfGrammar()
+        # Each of -d / -p / -o given WITHOUT a file writes its default (awkvars.out /
+        # awkprof.out) in the cwd -- per option: an explicit file for one does not stand in for
+        # another given bare (`gawk -d -p/tmp/prof` still writes ./awkvars.out; Codex, #1349).
+        for short_k, long_k in (("-d", "--dump-variables"), ("-p", "--profile"),
+                                ("-o", "--pretty-print")):
+            for k in (short_k, long_k):
+                # Any BARE occurrence writes the default, even if another occurrence names a
+                # file. (gawk honours that for -p/-o; for -d the last one wins, so counting a
+                # bare -d errs toward refusing -- the safe direction.)
+                if None in vals.get(k, []):
+                    w.append(".")
+        # An EMPTY `--dump-variables=` also writes the default awkvars.out in the cwd (gawk
+        # treats it as no file given). Not so for `--profile=` / `--pretty-print=`, which
+        # create nothing and print to stderr (Codex's probes, #1349 round 7).
+        if "" in vals.get("--dump-variables", []):
+            w.append(".")
+        return [x for x in w if x != ""]
+    if name in ("perl", "ruby"):
+        if any(a.startswith("-") and not a.startswith("--")
+               and re.match(r"^-[A-Za-z]*i", a) is not None for a in args):
+            raise _OutOfGrammar()  # rewrites every file operand; the script is opaque
+        return []
+    return None
+
+
+def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:
     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
     their file args are read positions by default (the anti-FP stance; the daemon's
     destructive preset stays behind anything exotic)."""
@@ -761,20 +1414,18 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
             raise _OpaqueWriter()
         return _patch_write_targets(pin)
     if name == "sed":
-        # In-place: `--in-place[=SUFFIX]`, `-i`, `-i.bak`, AND bundled short clusters that
-        # contain `i` (`-Ei`, `-nEi`, ...). A short cluster is `-<letters>` (not `--`); the
-        # regex fires when an `i` appears anywhere in that letter run before an attached suffix.
-        in_place = any(
-            a == "--in-place" or a.startswith("--in-place=")
-            or (a.startswith("-") and not a.startswith("--")
-                and re.match(r"^-[A-Za-z]*i", a) is not None)
-            for a in args)
-        if not in_place:
-            return []
-        script_flag = any(a in ("-e", "-f") or a.startswith(("--expression", "--file"))
-                          for a in args)
-        pos = _positionals(args, opts_with_value=("-e", "-f"))
-        return pos if script_flag else pos[1:]
+        # #1348: parsed against sed's option table (any spelling of -e/-f/-i), and a script
+        # with a `w`/`W` command or `s///w` is out of grammar: it names a file to write.
+        _, pos, seen, vals = _parse_opts(args, *_SED)
+        scripts = vals.get("-e", []) + vals.get("--expression", [])
+        operands = pos if scripts else pos[1:]
+        if not scripts:
+            scripts = pos[:1]
+        if any(_SED_WRITE.search(sc) for sc in scripts):
+            raise _OutOfGrammar()
+        if seen & {"-i", "--in-place"}:
+            return operands
+        return []
     if name in ("chmod", "chown", "chgrp"):
         pos = _positionals(args, opts_with_value=("--reference",))
         return pos[1:]
@@ -790,6 +1441,9 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
         return _positionals(args)
     if name == "touch":
         return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
+    verb_out = _output_verb_write_targets(name, args, path_pinned)
+    if verb_out is not None:
+        return verb_out
     if name == "git":
         # Skip global options to find the subcommand.
         i = 0
@@ -871,11 +1525,29 @@ def _command_write_targets(words: list, stdin_src=None) -> list:
             return _positionals(rest, opts_with_value=("-s", "--source"))
         if sub == "clean":
             return _positionals(rest)
-        return []
+        # #1348: any subcommand writes through `--output[=F]` / `--output-directory`, and git's
+        # parser accepts unique abbreviations (`--out=F`); plus `-o` where it means output.
+        out = []
+        for k, a in enumerate(rest):
+            if a.startswith("--out"):
+                nm, eq, val = a[2:].partition("=")
+                if "output".startswith(nm) or "output-directory".startswith(nm):
+                    if not eq and k + 1 < len(rest):
+                        val = rest[k + 1]
+                    if val:
+                        out.append(val)
+        if sub in ("format-patch", "archive", "bundle"):
+            out += [rest[k + 1] for k, a in enumerate(rest[:-1]) if a == "-o"]
+            out += [a[2:] for a in rest if a.startswith("-o") and len(a) > 2
+                    and not a.startswith("--")]
+        if sub == "bundle" and rest[:1] == ["create"] and len(rest) > 1:
+            out.append(rest[1])
+        return out
     return []
 
 
-def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None) -> str:
+def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None,
+                          path_pinned: bool = False) -> str:
     """Resolve ONE simple command: detect out-of-grammar heads (shell block, `bash -c`,
     `eval`, `git apply`/`patch` — the last two via _command_write_targets), track `cd` into
     the effective cwd, else append this command's cd-resolved write targets. Returns the
@@ -923,7 +1595,7 @@ def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None) 
             eff = d if (os.path.isabs(d) or d.startswith("~")) \
                 else os.path.normpath(os.path.join(eff or ".", d))
         return eff
-    for tg in _command_write_targets(words, stdin_src):  # may raise (git apply/am, patch)
+    for tg in _command_write_targets(words, stdin_src, path_pinned):  # may raise (git apply/am, patch)
         if _has_subst(tg):
             raise _OutOfGrammar()  # substitution in a write position
         targets.append(_join_eff(eff, tg))
@@ -964,14 +1636,34 @@ def _bash_write_targets(command: str) -> list:
     any out-of-grammar construct (caller -> out-of-grammar posture)."""
     toks = _tokenize(_strip_heredoc_bodies(command))
     targets, cur = [], []
+    # An out-of-grammar SIMPLE command is remembered, not raised on the spot: the walk goes on,
+    # so a later opaque writer (an unreadable `git apply` / `patch`, which refuses
+    # unconditionally) still decides. Raising at the first one let `tar -x ... && git apply
+    # <unreadable>` resolve to the weaker, vocabulary-conditional posture (#1348 replay).
+    deferred_oog = False
     stdin_src = None  # `< file` source for the current simple command (patch input)
     eff = ""  # relative cwd accumulator; cd within this command line adjusts it
+    # A bare name run by find -exec / xargs is found through PATH; trust it only when no word of
+    # this line (heredoc bodies included, to err toward refusing) names PATH (Nova, #1356).
+    path_pinned = not _PATH_WORD.search(command)
     i = 0
     while i < len(toks):
         t = toks[i]
+        if t == ";" and _find_exec_open(cur):
+            # `find ... -exec CMD {} \;`: the tokenizer cannot tell an escaped `\;` from a
+            # separator, and treating it as one ended `find` here and turned what follows
+            # (`-fprint F`, `-delete`) into a "command" of its own that writes nothing (#1349
+            # round 4). Keep it as find's terminator. For an unescaped `;` this over-reads
+            # (bash would end the command there and fail), which errs toward refusing.
+            cur.append(t)
+            i += 1
+            continue
         if t in _SEPARATORS:
             if cur:
-                eff = _flush_simple_command(cur, eff, targets, stdin_src)
+                try:
+                    eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
+                except _OutOfGrammar:
+                    deferred_oog = True
                 cur = []
             stdin_src = None
             i += 1
@@ -1002,7 +1694,12 @@ def _bash_write_targets(command: str) -> list:
         cur.append(t)
         i += 1
     if cur:
-        eff = _flush_simple_command(cur, eff, targets, stdin_src)
+        try:
+            eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
+        except _OutOfGrammar:
+            deferred_oog = True
+    if deferred_oog:
+        raise _OutOfGrammar()
     return targets
 
 
@@ -1011,8 +1708,21 @@ _PATH_KEYS = ("file_path", "path", "notebook_path")
 _BASH_TOOLS = frozenset({"Bash", "Shell"})
 # Tools whose path argument is a READ position. Anything not listed here and not Bash is
 # treated conservatively: its path keys are write positions (an unknown tool might mutate).
+# The lower-case names are the gemini/being spellings of the same reads (the gemini shim's
+# lineage map; a SAGE being's memory_read reaches the gate as `read_file` unmapped, #1342).
 _READ_PATH_TOOLS = frozenset({"Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite",
-                              "TodoList", "WebFetch", "WebSearch", "GetGoal"})
+                              "TodoList", "WebFetch", "WebSearch", "GetGoal",
+                              "read_file", "read_many_files", "glob", "search_file_content",
+                              "list_directory", "web_fetch", "google_web_search",
+                              # A being's scope ASK: its path is what it asks for, not a
+                              # destination. Filing records a petition; it does not write the
+                              # requested file (cbp-being, 2026-10-19).
+                              "request_scope"})
+# A being's COMPOSED reads (SAGE being_gate_client, #1361): the seat builds a grep / git read from
+# {pattern, path}, so their `path` is the read target, never a destination. The NAME buys nothing
+# else (review hold on #1362): a `command` such an event carries is classified for write positions
+# exactly as a Bash command is, and file_path / notebook_path keep the unknown-tool reading.
+_COMPOSED_READ_TOOLS = frozenset({"search", "git_read"})
 
 
 def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
@@ -1022,6 +1732,13 @@ def _write_position_targets(tool_name: str, tool_input: Any) -> tuple:
         return [], None
     if tool_name in _READ_PATH_TOOLS:
         return [], None
+    if tool_name in _COMPOSED_READ_TOOLS:
+        targets, note = [], None
+        if isinstance(tool_input.get("command"), str) and tool_input["command"].strip():
+            targets, note = _write_position_targets("Bash", {"command": tool_input["command"]})
+        rest = [v for k in _PATH_KEYS
+                if k != "path" and isinstance((v := tool_input.get(k)), str) and v]
+        return list(targets) + rest, note
     if tool_name in _BASH_TOOLS:
         cmd = tool_input.get("command")
         if not isinstance(cmd, str) or not cmd.strip():
@@ -1052,7 +1769,7 @@ def _read_position_mentions(tool_name: str, tool_input: Any) -> list:
     if not isinstance(tool_input, dict):
         return []
     out = []
-    if tool_name in _BASH_TOOLS:
+    if tool_name in _BASH_TOOLS or tool_name in _COMPOSED_READ_TOOLS:
         cmd = tool_input.get("command")
         if isinstance(cmd, str) and cmd.strip():
             try:
@@ -1066,20 +1783,20 @@ def _read_position_mentions(tool_name: str, tool_input: Any) -> list:
     return out
 
 
-def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
-             closure: Optional[Closure] = None) -> ClosureVerdict:
-    """Classify one tool call against the governance closure. NEVER raises.
-
-    Returns classification "write" (refuse + escalate), "read" (allow + witness), or "none".
-    See the module docstring for the fail-direction asymmetry between the two phases."""
+def _resolve_closure(closure: Optional[Closure]):
     try:
         if closure is None:
             closure = default_closure()
-        src = closure.source
+        return closure, closure.source
     except Exception:
-        closure, src = LITERAL_FLOOR, LITERAL_FLOOR.source
+        return FAILSAFE_CLOSURE, FAILSAFE_CLOSURE.source
 
-    # Phase 1 — WRITE positions. Internal errors here fail CLOSED.
+
+def _phase1_writes(tool_name: str, tool_input: Any, cwd: Optional[str], closure: Closure, src: str):
+    """Phase 1 — WRITE positions, as a generator: one "write" verdict per write-position
+    argument that resolves into the closure, in argument order. An opaque writer or an
+    internal error yields its single fail-closed verdict and stops. `classify` takes the
+    first; `write_verdicts` takes them all. Internal errors fail CLOSED."""
     try:
         targets, note = _write_position_targets(tool_name, tool_input)
         # OUT OF GRAMMAR (REPAIR 2): `targets` is the command's full vocabulary token list,
@@ -1089,22 +1806,64 @@ def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
         if note == "opaque-writer":
             # GPT second pass: the literal "any closure write" invariant. An opaque patch
             # whose content cannot be read is refused regardless of argv vocabulary.
-            return ClosureVerdict("write", RULE_OPAQUE_WRITER, None,
-                                  targets[0] if targets else "stdin", src)
+            yield ClosureVerdict("write", RULE_OPAQUE_WRITER, None,
+                                 targets[0] if targets else "stdin", src)
+            return
         position = "read" if note == "out-of-grammar" else "write"
+        if note == "out-of-grammar":
+            rule = RULE_OUT_OF_GRAMMAR
+        elif note == "unparseable":
+            rule = RULE_WRITE_UNPARSEABLE
+        else:
+            rule = RULE_WRITE
         for t in targets:
             marker = closure.match(t, cwd=cwd, position=position)
             if marker:
-                if note == "out-of-grammar":
-                    rule = RULE_OUT_OF_GRAMMAR
-                elif note == "unparseable":
-                    rule = RULE_WRITE_UNPARSEABLE
-                else:
-                    rule = RULE_WRITE
-                return ClosureVerdict("write", rule, marker, t, src)
+                # Lazily, so `classify` stops matching at the first target exactly as before.
+                # `landing`: where this write lands (cwd-joined, symlinks and `..` resolved), so
+                # every write verdict carries the LOCATION the daemon prices member gate entries
+                # by, not only the argument as written and its other spellings (#1247).
+                yield ClosureVerdict("write", rule, marker, t, src,
+                                     tuple(closure.forms(t, cwd=cwd)[1:]),
+                                     landing=resolve_location(t, cwd) if rule == RULE_WRITE
+                                     else None)
     except Exception as e:  # noqa: BLE001 — fail-closed: a broken write classifier must not admit
-        return ClosureVerdict("write", RULE_INTERNAL, None,
-                              f"internal:{type(e).__name__}", src)
+        yield ClosureVerdict("write", RULE_INTERNAL, None, f"internal:{type(e).__name__}", src)
+
+
+def write_verdicts(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
+                   closure: Optional[Closure] = None) -> list:
+    """EVERY write-position argument of one tool call that resolves into the closure, as one
+    "write" verdict each, in argument order (#810, recut of #812). NEVER raises.
+
+    `classify` answers WHETHER the act writes the closure and stops at the first target; the
+    escalation's price needs WHAT it writes — all of it — because a later target can be the
+    sovereign one, and the act summary the daemon also reads is bounded and can cut it out.
+    Empty means no closure write. An opaque writer or an internal error is one fail-closed
+    verdict with no marker: it names no target, and the caller must treat the write set as
+    unenumerated rather than as complete."""
+    closure, src = _resolve_closure(closure)
+    try:
+        return list(_phase1_writes(tool_name, tool_input, cwd, closure, src))
+    except Exception as e:  # noqa: BLE001
+        return [ClosureVerdict("write", RULE_INTERNAL, None, f"internal:{type(e).__name__}", src)]
+
+
+def classify(tool_name: str, tool_input: Any, *, cwd: Optional[str] = None,
+             closure: Optional[Closure] = None) -> ClosureVerdict:
+    """Classify one tool call against the governance closure. NEVER raises.
+
+    Returns classification "write" (refuse + escalate), "read" (allow + witness), or "none".
+    See the module docstring for the fail-direction asymmetry between the two phases."""
+    closure, src = _resolve_closure(closure)
+
+    # Phase 1 — WRITE positions (the first one decides). Internal errors here fail CLOSED.
+    try:
+        first = next(_phase1_writes(tool_name, tool_input, cwd, closure, src), None)
+    except Exception as e:  # noqa: BLE001
+        first = ClosureVerdict("write", RULE_INTERNAL, None, f"internal:{type(e).__name__}", src)
+    if first is not None:
+        return first
 
     # Phase 2 — READ mentions. Internal errors here must NOT block (reads cannot mutate the
     # closure; failing closed here is the FP loop). Nothing write-shaped can reach this phase.

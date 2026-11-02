@@ -33,6 +33,8 @@ codebase keeps finding in itself: a check that reports success while measuring n
 > the baseline artifact; gate-consolidation status below was refreshed on 2026-08-23 against the
 > subsequently merged work and keeps repo state separate from live-install evidence.
 
+> **October 2026 (as of 2026-10-23):** since 2026-10-05 one shared gate serves every harness on the fleet: Claude Code, Codex and Kimi in daily use, Gemini on the same code path. Across the 8-machine fleet the gate has recorded over 500,000 governed acts. October work added scope requests decided by a peer (not by the requesting agent), read-tool classification, and closure and miswiring detection. The August audit and the gate-consolidation summary below are the dated baselines this builds on. The assurance grade is unchanged: **A1, cooperative and tamper-evident** (see the warning below).
+
 **Standards and public-sector reviewers:** the [standards review entry point](docs/STANDARDS_REVIEW.md) maps Hestia's identity, delegated authority, runtime governance, provenance, audit, non-repudiation, and allow/deny/revoke mechanisms into current NIST / NCCoE agent-identity vocabulary, with explicit A1/A2 assurance boundaries.
 
 > ### ⚠️ The gate stops accidents, not adversaries
@@ -140,6 +142,18 @@ is stated rather than inferred away. Three tiers remain kept apart on purpose:*
 - **Plumbed** — code and tests exist, the path has not been driven end to end in anger.
   Not a euphemism for broken; it means nobody has yet found out.
 - **Not built** — stated so it cannot be inferred from silence.
+
+### Before you install: what the gate does not protect against
+
+These are open, and they bound what an install can promise:
+
+- **Connect is not authenticated yet** (#824). A process that can reach the daemon's port can
+  claim a member identity when it connects; principal binding comes before law, role, vault or
+  reputation, and it is not built.
+- **Same-user principals are not isolated** (#954). Processes running as one OS user can act as
+  one another's member identity.
+- **The gate stops accidents, not adversaries** (#49). It is a policy check inside the agent's
+  own process, with the agent's privileges. A capable agent that wants to route around it can.
 
 ### The governance layer — measured
 
@@ -251,6 +265,109 @@ hestia/
 └── demo/                 # Worked examples (consumer + enterprise)
 ```
 
+## Versions and releases
+
+**One version, one tag.** The daemon (`core`), the desktop app (`app`: `package.json`,
+`src-tauri/Cargo.toml`, `tauri.conf.json`), the shared wire crate (`wire`) and the three plugin
+SDKs release in lockstep (dp, 2026-10-11; web4#904). The number lives in the root
+[`VERSION`](VERSION) file and nowhere else by hand:
+
+- `python3 tools/version_sync.py` checks every manifest and lockfile entry against `VERSION`;
+  `--write` sets them all. CI runs it through `tools/version_sync_test.py`, so a PR that bumps
+  one manifest without the others is red.
+- A release is the tag `vX.Y.Z` with `X.Y.Z` equal to `VERSION`. `release.yml` refuses any
+  other tag before it builds. `hardbound-pak/` is a separate product line and is not covered.
+- **Release candidates** (dp, 2026-10-12) are tagged `vX.Y.Z-rc.N`, again with `X.Y.Z` equal to
+  `VERSION`, and `N` a number with no leading zero (`rc.0`, `rc.1`, `rc.12`). Nothing else is
+  accepted: not `-rc`, `-rc.`, `-rc.01`, `-RC.1` or `-beta.1`. An rc is published as a GitHub
+  **pre-release** and is never marked latest, so the installer, which resolves
+  `releases/latest` (#1279), never serves one. A plain `vX.Y.Z` is published as a normal release
+  and marked latest. The daemon's `--version` and every asset name carry the full tag
+  (`hestia 0.3.0 (v0.3.0-rc.1)`, `hestia-v0.3.0-rc.1-x86_64-unknown-linux-gnu.tar.gz`), while
+  `VERSION` and every manifest stay `0.3.0`. `python3 tools/version_sync.py --tag-kind <tag>`
+  prints `release` or `prerelease`.
+- Build ids are `git describe --tags --match 'v[0-9]*' --always --dirty`, so only release tags
+  name a build. The older `app-v*` tags (Android APKs) are never a daemon's build id. Every
+  producer and consumer (build.rs, hestia-deploy, install-members, the member-mesh watcher, the
+  upgrade-path harness) uses that one glob; `tools/build_tag_match_test.py` holds them to it.
+- **Handshake.** The daemon serves `GET /api/version` (no session) as
+  `{version, build_id, api_compat}`. The app reads it before any other route. An equal
+  `api_compat` is compatible (a different `version` shows as skew). A different `api_compat`,
+  or a daemon with no `/api/version` (older than 0.3.0), shows as an incompatible daemon instead
+  of route errors. Bump `hestia_wire::OPERATOR_API_COMPAT` in the same commit as any breaking
+  change to an operator route the app calls.
+- **One tag, one release.** Pushing `vX.Y.Z` runs `.github/workflows/release.yml`, which builds
+  the daemon (Linux x86_64/aarch64, macOS arm64), the desktop app (Linux x86_64 AppImage + deb,
+  macOS arm64 dmg + `.app.tar.gz`) and the Android APK from that tag, with web4 at `web4.pin`,
+  and publishes them under one GitHub Release with a `.sha256` per asset and a `SHA256SUMS`. The
+  release is created as a draft. `tools/release_publish.py` publishes it only when every asset
+  job succeeded and the draft holds exactly the expected 17 files; otherwise it stays a draft.
+  Dispatching
+  `release.yml` with no tag is a dry run: every build runs and uploads artifacts, and no release
+  is created. No Windows build yet: the app follows the daemon (#342).
+
+### Installing the daemon
+
+The daemon is the part everything else talks to: the vault, the society chain, the MCP endpoint
+and the dashboard. Install it first, then the app from the **same release**.
+
+**Prerequisites.** Linux with a systemd user session (a normal desktop login; on a headless box
+run `loginctl enable-linger $USER` first), or macOS on Apple Silicon. `curl`, `tar` and `python3`.
+Port 7711 on loopback free, or set `HESTIA_BIND`.
+
+**Install** a release by naming its tag. The installer is fetched from that tag, so it matches the
+binary it installs:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/dp-web4/hestia/vX.Y.Z/deploy/fleet/install.sh -o install.sh
+HESTIA_VERSION=vX.Y.Z bash install.sh
+```
+
+Without `HESTIA_VERSION` it installs GitHub's latest release, which is never a release candidate.
+It downloads the daemon for your platform, checks its `.sha256`, creates the vault and its
+passphrase (mode 600) under `HESTIA_HOME` (default `~/.hestia`), installs a systemd user unit or a
+launchd agent, and checks that the daemon answering on the port is the release it installed.
+Re-running it upgrades the binary and keeps the vault and chain.
+
+**Check it:**
+
+```sh
+curl -s http://127.0.0.1:7711/api/version     # {"version":"X.Y.Z","build_id":"vX.Y.Z",...}
+```
+
+Then open `http://127.0.0.1:7711/` and sign in as the operator.
+
+**The policy gate.** On a machine with Claude Code (`~/.claude` exists), the installer also installs the claude-code gate from the same release: the shared engine under `$HESTIA_HOME/shared`, the hooks registered in `~/.claude/settings.json`, and the seat's configuration in the vault. It needs `HESTIA_WORKSPACE` set to the directory your agent works in (the gate's scope root), bash 4 or newer (macOS: `brew install bash`), and an Ed25519 library for python3 (`python3 -m pip install --user cryptography`). Each missing prerequisite is named and the step is skipped, never guessed; the daemon is installed either way. **The installer grants the seat exactly that workspace,** as an operator act: signed with the operator key, recorded on the chain, and editable or revocable on the dashboard (sign in with `$HESTIA_HOME/operator.key`). Nothing outside it is granted; the seat's first act elsewhere is refused and files a scope request. A re-install never replaces or widens a grant you already made on that path. If the grant fails, the installer says so and exits non-zero. `HESTIA_SKIP_HOOK=1` skips the gate. Don't run the installer from inside a Claude Code session: the members' install refuses to let a governed session install its own gate.
+
+**Verify provenance.** Every asset of a release from v0.3.0-rc.3 on carries a Sigstore build
+attestation made by this repository's release workflow:
+
+```sh
+gh attestation verify hestia-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz --repo dp-web4/hestia
+```
+
+### Installing the desktop app
+
+Check a download against its `.sha256` (or `SHA256SUMS`), or verify its attestation as above.
+The desktop bundles carry provenance but no OS code signature yet, so the OS warns the first time.
+
+- **Linux, AppImage:** a download is not executable. Run
+  `chmod +x hestia-app-vX.Y.Z-x86_64-linux.AppImage`, then run the file. AppImages need FUSE 2
+  (`libfuse2`, `libfuse2t64` on Ubuntu 24.04+). Without it, run the file with
+  `--appimage-extract-and-run`.
+- **Linux, deb:** `sudo apt install ./hestia-app-vX.Y.Z-x86_64-linux.deb`. The package and its
+  binary are both `hestia-app` (`/usr/bin/hestia-app`); the name `hestia` is kept for the daemon.
+- **macOS (Apple Silicon):** open the `.dmg` and drag Hestia to Applications. The app is ad-hoc
+  signed but not notarized, so Gatekeeper blocks the first launch ("cannot be opened" or
+  "damaged"). Either open it once and then use System Settings → Privacy & Security → **Open
+  Anyway**, or clear the quarantine flag: `xattr -dr com.apple.quarantine /Applications/Hestia.app`.
+  Intel Macs are not built.
+- **Android:** the APK is signed with the project's release key (since v0.3.0-rc.3). It is not
+  on an app store: allow "install unknown apps" for your browser or file manager, then open it.
+
+The app checks the daemon's version over `/api/version` when it connects, so install the app and
+the daemon from the same release.
+
 ## Witnessed law
 
 Hestia is **policy-neutral**: it doesn't dictate how you run your own identity or
@@ -299,4 +416,4 @@ today) and the one-variable mitigation that closes them.
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). Commercial license available for closed-source use.
+[AGPL-3.0-or-later](LICENSE). Commercial license available for closed-source use. For interoperability with Web4/Hub, see Web4's [legal and patent scope guide](https://github.com/dp-web4/web4/blob/main/docs/LEGAL_AND_PATENT_SCOPE.md). That explanatory guide does not replace Hestia's own license or grant additional rights.

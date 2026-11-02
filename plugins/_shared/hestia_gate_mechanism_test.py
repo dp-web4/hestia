@@ -632,28 +632,35 @@ def test_the_review_door_comment_names_the_seats_own_identity():
     Measured over all three shims when this was written: 2 correct, 1 wrong. A singleton,
     not a class, which is why this is a six-line predicate and not a repo-wide lint.
     """
+    import json as _json
     import re
     here = os.path.dirname(os.path.abspath(__file__))
+    shims = _json.loads(os.environ.get("HESTIA_CONTRACT_SHIMS") or "{}")   # staging seam
     declaring = 0
-    for seat in ("claude-code", "codex", "kimi"):
-        path = os.path.join(here, "..", seat, "hooks", "pre_tool_use.py")
+    for seat in ("claude-code", "codex", "kimi", "gemini"):
+        hook = "before_tool.py" if seat == "gemini" else "pre_tool_use.py"
+        path = shims.get(seat) or os.path.join(here, "..", seat, "hooks", hook)
         if not os.path.exists(path):
             continue
         with open(path, encoding="utf-8", errors="replace") as fh:
             shim = fh.read()
-        if "declares_review_door=True" not in shim:
+        # Since one-gate stage C the declaration is a PROFILE entry the common gate passes on
+        # (`"declares_review_door": True`); before it, a call-site keyword. Both read the same.
+        if not re.search(r'declares_review_door(?:"\s*:\s*|\s*=\s*)True', shim):
             continue          # this seat does not claim the door; it has nothing to name
         declaring += 1
-        # The seat's asserted identity: the LAST string literal on its identity assignment.
-        # That is the bare literal in one spelling and the environment default in the other,
-        # and it is what every witness call on the seat passes.
+        # The seat's asserted identity: its PLUGIN_ID / MEMBER_ID assignment's last literal
+        # (pre-C) or its PROFILE `member_id` (stage C) — what every witness call passes.
         own = []
         for line in shim.splitlines():
-            head = re.match(r'^(?:HESTIA_)?PLUGIN_ID\s*=\s*(.+)$', line)
+            head = re.match(r'^(?:HESTIA_)?(?:PLUGIN|MEMBER)_ID\s*=\s*(.+)$', line)
             if head:
                 lits = re.findall(r'"([^"]+)"', head.group(1))
                 if lits:
                     own.append(lits[-1])
+            prof = re.match(r'^\s*"member_id"\s*:\s*"([^"]+)"', line)
+            if prof:
+                own.append(prof.group(1))
         check(f"{seat}_asserts_exactly_one_identity", len(set(own)) == 1, repr(own))
         named = re.findall(r"This seat HOLDS the review door:\s*([A-Za-z0-9_-]+)\s+reaches",
                            shim)
@@ -666,6 +673,56 @@ def test_the_review_door_comment_names_the_seats_own_identity():
     check("at_least_one_shim_declares_the_door", declaring > 0,
           "no shim beside this test declares the review door — a check that cannot look "
           "certifies nothing")
+
+
+def test_attempted_for_record_carries_past_the_display_bound():
+    """#648: the scope-request record must carry the act past the 220 display cut — a
+    NOT-SAME peer ruling from the record alone was refusing requests whose stored act
+    truncated inside the command (5 refusals, 2026-10-13)."""
+    cmd = "git apply " + "held/" + "a" * 300 + ".patch"
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("record act carries the whole 307-char command",
+          cmd in out and "…" not in out, repr(out[-60:]))
+
+
+def test_attempted_for_record_cut_is_visible_and_rare():
+    """A cut at the record bound is allowed — but it must SAY so, at SCOPE_ACT_MAX, with the
+    same marker the daemon writes. The pre-fix shape cut silently at 400 on the daemon and
+    at 220 on the gate."""
+    cmd = "x" * 5000
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("cut at SCOPE_ACT_MAX with the marker",
+          out.endswith(m.SCOPE_ACT_MARK) and len(out) == len("Bash: ") + m.SCOPE_ACT_MAX
+          + len(m.SCOPE_ACT_MARK), repr(out[-40:]))
+    cmd = "y" * 3000
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("under the bound: no cut, no marker",
+          out == f"Bash: {cmd}", repr(out[-40:]))
+
+
+def test_attempted_summary_display_bound_unchanged():
+    """The 220 display cut is the member-mid-task reader's bound (#185) — the record-depth
+    variant must not have widened IT."""
+    cmd = "z" * 300
+    out = m.attempted_summary("Bash", {"command": cmd}, command=cmd)
+    check("display summary still cuts at 220 with ' …'",
+          out == f"Bash: {'z' * 220} …", repr(out[-30:]))
+
+
+def test_attempted_for_record_keeps_the_redaction_rules():
+    """Record depth widens the bound, never the exposure: whole-withhold on credential-shaped
+    text, value-masking otherwise — identical rules to the display summary."""
+    cmd = "curl -H authorization: Bearer eye rolled off " + "q" * 300
+    # The shape list matches lowercase; the point here is the shape, not a real token.
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("credential-shaped command is withheld whole at record depth too",
+          "REDACTED" in out and "qqqq" not in out, repr(out[:120]))
+    # A bare `--token VALUE` is not credential-SHAPED (the shapes carry `token=`, `_token`),
+    # so the command survives with only the value masked — masking, not withholding.
+    cmd = "vault login --token hunter2 and then " + "b" * 300
+    out = m.attempted_for_record("Bash", {"command": cmd}, command=cmd)
+    check("key value masked, the rest of the long command survives",
+          "hunter2" not in out and "--token ***" in out and "bbb" in out, repr(out[:120]))
 
 
 ALL = [
@@ -699,6 +756,10 @@ ALL = [
     test_the_review_door_is_the_callers_assertion_not_the_librarys,
     test_the_review_capability_spelling_matches_the_daemons,
     test_the_review_door_comment_names_the_seats_own_identity,
+    test_attempted_for_record_carries_past_the_display_bound,
+    test_attempted_for_record_cut_is_visible_and_rare,
+    test_attempted_summary_display_bound_unchanged,
+    test_attempted_for_record_keeps_the_redaction_rules,
 ]
 
 if __name__ == "__main__":

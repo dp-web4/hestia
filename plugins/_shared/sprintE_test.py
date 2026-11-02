@@ -10,12 +10,12 @@ Arms (per the Sprint E design requirements):
   (a) mechanism accepts lowercase "bash" and populates begin_action `target` for a
       codex-shaped event (the one-character audit hole);
   (b) SafetyVerdict.kind present, populated per decision, backward-compatible;
-  (c) the unified deny recorder always carries target + verdict_available, and falls back
-      to the per-shim diagnostic log on witness failure (never raising, never silent);
-  (d) patched codex hook: no subprocess import, no CLAUDE_PRE, py_compile green;
-  (e) patched claude hook: no private McpHttp class, py_compile green;
-  (f) codex_gate_boundary_test.py against the patched codex copy: the transport-owned
-      arms pass (the self-protection arms are Sprint B's and stay red until B lands).
+  (c) ONE decision recorder: since one-gate stage C that is `record_decision` (the Sprint E
+      refusal recorder is retired; its arms live in tools/decision_witness_contract_test.py);
+  (d) codex hook: no subprocess import, no CLAUDE_PRE, py_compile green — and since stage C
+      no transport or recorder of its own: it delegates to the common gate;
+  (e) claude hook: no private McpHttp class, py_compile green — and the same delegation;
+  (f) retired: the codex boundary arms run on all four seats in seat_gate_boundary_test.py.
 
 check() RAISES so pytest sees each case; the __main__ runner collects.
 """
@@ -44,12 +44,15 @@ CODEX_HOOK = _pick(os.path.join(_PLUGINS, "codex", "hooks", HOOK),
                    os.path.join(E, "build", "plugins", "codex", "hooks", HOOK))
 CLAUDE_HOOK = _pick(os.path.join(_PLUGINS, "claude-code", "hooks", HOOK),
                     os.path.join(E, "build", "plugins", "claude-code", "hooks", HOOK))
-BOUNDARY = _pick(os.path.join(_PLUGINS, "codex", "hooks", "codex_gate_boundary_test.py"),
-                 os.path.join(E, "build", "plugins", "codex", "hooks",
-                              "codex_gate_boundary_test.py"))
 
+# Staging seams (unset in the repo and in CI), shared with the one-gate contract suites.
+_OVERLAY = json.loads(os.environ.get("HESTIA_CONTRACT_OVERLAY") or "{}")
+_SHIMS = json.loads(os.environ.get("HESTIA_CONTRACT_SHIMS") or "{}")
+CODEX_HOOK = _SHIMS.get("codex", CODEX_HOOK)
+CLAUDE_HOOK = _SHIMS.get("claude-code", CLAUDE_HOOK)
 spec = importlib.util.spec_from_file_location(
-    "hestia_gate_mechanism", os.path.join(SHARED, "hestia_gate_mechanism.py"))
+    "hestia_gate_mechanism",
+    _OVERLAY.get("hestia_gate_mechanism") or os.path.join(SHARED, "hestia_gate_mechanism.py"))
 m = importlib.util.module_from_spec(spec)
 sys.modules["hestia_gate_mechanism"] = m
 spec.loader.exec_module(m)
@@ -175,75 +178,21 @@ def test_action_id_attached_on_decided():
     check("action-id", v.action_id == "a1", str(v))
 
 
-# ---- (c) the ONE deny recorder ----
-def test_unified_recorder_carries_target_and_verdict_available():
-    fake = RecordingClient()
-    ok = m.witness_decision_unified(
-        fake, plugin_id="codex", decision="deny", rule="scope: out of MRH",
-        tool_name="bash", target="rm", session_id="sess-1",
-        verdict_available=False, attempted_summary="bash: rm -rf /x")
-    check("delivered", ok is True, "recorder should report delivery on a healthy client")
-    wit = fake.args_of("hestia_witness_decision")
-    check("witness-called", len(wit) == 1, str(fake.calls))
-    check("carries-target", wit[0].get("target") == "rm", str(wit))
-    check("carries-verdict-available", wit[0].get("verdict_available") is False, str(wit))
-    check("carries-plugin", wit[0].get("plugin_id") == "codex", str(wit))
-    check("carries-session", wit[0].get("session_id") == "sess-1", str(wit))
+# ---- (c) ONE decision recorder ----
+# The Sprint E refusal recorder (`witness_decision_unified`, its gate-denies-<member>.jsonl
+# fallback) is RETIRED in one-gate stage C: it recorded refusals only and read any outer RPC
+# `result` as delivered. Every seat's gate now records every final verdict through stage A's
+# receipt-validated `record_decision` (tools/decision_witness_contract_test.py owns its arms:
+# target, verdict_available, the fallback rule, never raising). What stays here is the
+# sprint's own claim, re-asserted on the new shape: there is exactly ONE recorder.
+def test_one_decision_recorder():
+    check("the-sprint-E-recorder-is-retired", not hasattr(m, "witness_decision_unified"))
+    check("its-fallback-log-is-retired", not hasattr(m, "_append_deny_fallback")
+          and not hasattr(m, "_deny_fallback_path"))
+    check("record_decision-is-the-recorder", callable(getattr(m, "record_decision", None)))
 
 
-def test_unified_recorder_falls_back_to_diagnostic_log():
-    with tempfile.TemporaryDirectory() as tmp:
-        old = os.environ.get("HESTIA_HOME")
-        os.environ["HESTIA_HOME"] = tmp
-        try:
-            failing = RecordingClient(raise_on="hestia_witness_decision")
-            ok = m.witness_decision_unified(
-                failing, plugin_id="codex", decision="deny", rule="scope: out of MRH",
-                tool_name="bash", target="rm", session_id="sess-1",
-                verdict_available=True, attempted_summary="bash: rm -rf /x")
-            check("not-delivered", ok is False, "failing client must report False")
-            log = os.path.join(tmp, "telemetry", "gate-denies-codex.jsonl")
-            check("fallback-exists", os.path.isfile(log), f"missing {log}")
-            row = json.loads(open(log, encoding="utf-8").readlines()[-1])
-            check("fallback-target", row.get("target") == "rm", str(row))
-            check("fallback-verdict-available", row.get("verdict_available") is True, str(row))
-            check("fallback-names-failure", "witness_delivery_failed" in row, str(row))
-            # No-client path (endpoint down) must also land in the log, not vanish.
-            m._discover_endpoint = lambda: None
-            ok2 = m.witness_decision_unified(
-                None, plugin_id="codex", decision="deny", rule="r", tool_name="Write",
-                target="/tmp/x", session_id=None, verdict_available=False,
-                attempted_summary="Write -> /tmp/x")
-            check("no-endpoint-fallback", ok2 is False, "no endpoint must fall back")
-            rows = open(log, encoding="utf-8").readlines()
-            check("two-rows", len(rows) == 2, f"{len(rows)} rows")
-        finally:
-            if old is None:
-                os.environ.pop("HESTIA_HOME", None)
-            else:
-                os.environ["HESTIA_HOME"] = old
-
-
-def test_unified_recorder_never_raises():
-    class Hostile:
-        def call_tool(self, *a, **k):
-            raise MemoryError("worst case")
-    # Even with a hostile client AND an unwritable fallback home, the recorder must not raise.
-    old = os.environ.get("HESTIA_HOME")
-    os.environ["HESTIA_HOME"] = "/dev/null/impossible"
-    try:
-        ok = m.witness_decision_unified(
-            Hostile(), plugin_id="codex", decision="deny", rule="r", tool_name="t",
-            target=None, session_id=None, verdict_available=False, attempted_summary="")
-        check("no-raise", ok is False, "must swallow and report False")
-    finally:
-        if old is None:
-            os.environ.pop("HESTIA_HOME", None)
-        else:
-            os.environ["HESTIA_HOME"] = old
-
-
-# ---- (d) patched codex hook — spawn machinery deleted ----
+# ---- (d) codex hook — spawn machinery deleted, and since stage C nothing of its own ----
 def test_codex_copy_no_spawn_machinery():
     src = open(CODEX_HOOK, encoding="utf-8").read()
     check("no-subprocess-import", "import subprocess" not in src,
@@ -251,53 +200,26 @@ def test_codex_copy_no_spawn_machinery():
     check("no-claude-pre", "CLAUDE_PRE" not in src, "spawn config constant must be gone")
     check("no-society-gate-env", "HESTIA_SOCIETY_GATE" not in src,
           "the spawn-target env knob must be gone with the spawn")
-    check("uses-mechanism", "query_society_safety" in src, "in-process call missing")
-    check("uses-unified-recorder", "witness_decision_unified" in src, "ONE deny recorder missing")
+    check("delegates-to-the-common-gate", "gate.decide(" in src, "decide() call missing")
+    check("no-transport-or-recorder-of-its-own", "query_society_safety" not in src
+          and "witness_decision" not in src, "a shim must not ask or record by itself")
     py_compile.compile(CODEX_HOOK, doraise=True)
 
 
-# ---- (e) patched claude hook — private client deleted ----
+# ---- (e) claude hook — private client deleted, and since stage C nothing of its own ----
 def test_claude_copy_no_private_client():
     src = open(CLAUDE_HOOK, encoding="utf-8").read()
     check("no-private-class", "class McpHttp" not in src, "private client class must be gone")
     check("no-private-poller", "def poll_policy" not in src, "private wait-poller must be gone")
     check("no-private-sse", "def parse_json_or_sse" not in src, "private SSE parser must be gone")
-    check("uses-mechanism", "query_society_safety" in src, "in-process call missing")
+    check("delegates-to-the-common-gate", "gate.decide(" in src, "decide() call missing")
+    check("no-transport-of-its-own", "query_society_safety" not in src and "urllib" not in src)
     py_compile.compile(CLAUDE_HOOK, doraise=True)
 
 
-# ---- (f) boundary test against the patched codex copy ----
-# Transport-owned arms (Sprint E) must pass; the self-protection arms are Sprint B's
-# codex work (codex has NO self-protection layer yet — PRD §5) and stay red until B lands.
-E_OWNED = {
-    "test_ordinary_write_uses_policy_path",
-    "test_hooks_dir_only_names_do_not_overreach",
-    "test_ordinary_write_daemon_down_fails_closed",
-}
-B_OWNED = {
-    "test_gate_file_write_refused_locally",
-    "test_apply_patch_to_gate_refused_locally",
-    "test_gate_file_bash_write_refused_locally",
-    "test_approved_gate_write_proceeds_to_policy",
-    "test_shared_mechanism_write_refused_anywhere",
-    "test_gate_file_read_allowed_and_witnessed",
-    "test_gate_write_refused_with_daemon_down",
-}
-
-
-def test_boundary_transport_arms_pass():
-    p = subprocess.run([sys.executable, BOUNDARY], capture_output=True, text=True, timeout=300)
-    passed = {ln.split()[1] for ln in p.stdout.splitlines() if ln.startswith("ok ")}
-    failed = {ln.split()[1] for ln in p.stdout.splitlines() if ln.startswith("FAIL ")}
-    check("boundary-ran", passed or failed, p.stdout + p.stderr)
-    missing = E_OWNED - passed
-    check("transport-arms-pass", not missing, f"E-owned arms red: {missing}\n{p.stdout}")
-    # Red B-owned arms are EXPECTED pre-B; a green one is a bonus, not a failure. But an arm
-    # neither passing nor failing means the test file changed shape — surface that.
-    unaccounted = (E_OWNED | B_OWNED) - passed - failed
-    check("all-arms-accounted", not unaccounted, f"unaccounted: {unaccounted}")
-    print(f"    boundary: {len(passed)} passed ({sorted(passed)}), "
-          f"{len(failed & B_OWNED)} B-owned red (expected pre-B)")
+# (f) RETIRED with codex_gate_boundary_test.py: every arm it ran (transport- and
+# self-protection-owned) now runs against all four seats' real gates in
+# plugins/_shared/seat_gate_boundary_test.py.
 
 
 ALL = [
@@ -307,12 +229,9 @@ ALL = [
     test_kind_field_populated,
     test_kind_none_on_no_verdict_and_backcompat,
     test_action_id_attached_on_decided,
-    test_unified_recorder_carries_target_and_verdict_available,
-    test_unified_recorder_falls_back_to_diagnostic_log,
-    test_unified_recorder_never_raises,
+    test_one_decision_recorder,
     test_codex_copy_no_spawn_machinery,
     test_claude_copy_no_private_client,
-    test_boundary_transport_arms_pass,
 ]
 
 if __name__ == "__main__":

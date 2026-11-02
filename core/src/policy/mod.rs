@@ -4,7 +4,8 @@
 //! legacy `claude-code/plugins/web4-governance/governance/` Python
 //! reference into the daemon. Four built-in presets:
 //!
-//! - `permissive` — no rules, all allowed (pure observation)
+//! - `permissive` — no society-safety rules (observe only); scope, governance closure and the
+//!   innate secret-egress rule still apply, because they run before the preset in the gate
 //! - `safety` — deny destructive bash, deny secret-file reads,
 //!   warn on network, warn on memory writes, warn on git-push-without-PAT
 //! - `strict` — deny everything except `Read`, `Glob`, `Grep`, `TodoWrite`

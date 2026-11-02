@@ -1,0 +1,2626 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -183,6 +183,9 @@
+     # THE common gate (one-gate stage C): every seat's shim delegates its whole decision to
+     # it, so after the cutover it is the single file whose edit changes all four seats.
+     "hestia_single_gate.py",
++    # A harness whose gate entry is not named pre_tool_use.py. The closure also derives each
++    # member's entry name from its install declaration; this is the canonical literal.
++    "before_tool.py",
+ )
+ 
+ 
+diff --git a/plugins/_shared/hestia_governance_closure.py b/plugins/_shared/hestia_governance_closure.py
+--- a/plugins/_shared/hestia_governance_closure.py
++++ b/plugins/_shared/hestia_governance_closure.py
+@@ -54,6 +54,24 @@
+ same reasoning as the core's "mirrored, not imported" note: a load failure must not disarm
+ the check.
+ 
++EACH MEMBER'S INSTALLED SURFACE IS DERIVED FROM ITS INSTALL DECLARATION
++-----------------------------------------------------------------------
++A member's gate runs from where the installer put it, under the entry name its harness
++invokes, wired in by a harness config file — expects.json `install.dest`,
++`install.gate_probe.entry` and `install.registration.path`. Those three declarations ARE the
++member's governance surface on a running seat, so the closure derives it from them
++(_closure_from_install) instead of hoping each member's names match a basename list written
++before it existed: the dest dir becomes a dir marker, the entry basename a hooks-dir name,
++the registration path an exact path. A list keyed on names is a list of the members its
++author knew; a member with a different entry name or harness home falls outside it silently.
++
++The installed module has no manifests beside it ($HESTIA_HOME/shared holds the engine only),
++so its registry is empty and only the floor holds there. The floor therefore carries a
++SNAPSHOT of every member's install declaration (MEMBER_INSTALL_DECLARATIONS), derived by the
++same function, and a drift test pins that snapshot equal to the manifests — a member whose
++gate moves or is renamed without the snapshot following is red in CI, not open on a seat.
++Literal names stay in LITERAL_FLOOR too, as the backstop under both.
++
+ FAIL-CLOSED CONTRACT — WITH A DELIBERATE, LOAD-BEARING ASYMMETRY
+ ----------------------------------------------------------------
+ classify() NEVER raises to the caller and this module never calls sys.exit (it returns a
+@@ -100,6 +118,8 @@
+     "ClosureVerdict",
+     "Closure",
+     "LITERAL_FLOOR",
++    "FAILSAFE_CLOSURE",
++    "MEMBER_INSTALL_DECLARATIONS",
+     "RULE_WRITE",
+     "RULE_WRITE_UNPARSEABLE",
+     "RULE_OUT_OF_GRAMMAR",
+@@ -111,6 +131,9 @@
+     "load_closure",
+     "default_closure",
+     "attest_shims",
++    "resolve_location",
++    "declared_dest",
++    "registered_closure",
+ ]
+ 
+ # ── Rule ids (returned to the shim; the shim's refusal/witness names the RULE and the ACT) ──
+@@ -148,6 +171,10 @@
+     `resolved` are the other spellings of `resource` the match consulted — cwd-joined and
+     realpath'd, only where they differ — so an alias that matched by its destination carries
+     that destination to the escalation's price, not only the alias (Codex review of #1239).
++    `landing` is the one LOCATION the write reaches (#1247), what the daemon prices a member's
++    gate entry by: home-expanded, cwd-joined, realpath'd (`resolve_location`). It is a
++    separate field, not `resolved`, because the two answer different questions: `resolved`
++    lists every spelling the match consulted; `landing` names where the bytes go.
+     """
+     classification: str            # "none" | "read" | "write"
+     rule: Optional[str] = None     # rule id on "write" (and diagnostics on read-internal)
+@@ -155,9 +182,34 @@
+     resource: Optional[str] = None  # the argument that resolved into the closure
+     source: str = "floor"
+     resolved: tuple = ()
++    # The LOCATION the write reaches, as this classifier resolved it: home-expanded, joined
++    # onto the caller's cwd when relative, realpath'd (symlinks and `..` resolved). `resource`
++    # is the argument as written (it can be relative, or a name inside a `cd`); this is where it
++    # lands. Set on a resolved write only. It is what the daemon prices a member's gate entry
++    # from, by location, so the price never depends on how the act was spelled or summarised.
++    # (#1247 named this `resolved`; re-stacked on #1239, whose cleared `resolved` is the tuple
++    # above, it is `landing`.)
++    landing: Optional[str] = None
+ 
+ 
+ # ── The closure — segment-pattern matchers, tighten-only union ──────────────────────────────
++def resolve_location(target: str, cwd: Optional[str] = None) -> Optional[str]:
++    """Where `target` lands: home-expanded, cwd-joined when relative, then realpath'd. A
++    relative target with no cwd to pin it is normalised but stays relative (realpath would
++    resolve it against THIS process's cwd, which is not the classified command's)."""
++    if not isinstance(target, str) or not target:
++        return None
++    try:
++        p = os.path.expanduser(target.replace("\\", "/"))
++        if not os.path.isabs(p):
++            if not (isinstance(cwd, str) and cwd):
++                return os.path.normpath(p)
++            p = os.path.join(os.path.expanduser(cwd), p)
++        return os.path.realpath(p)
++    except (OSError, ValueError):
++        return None
++
++
+ def _segments(path: str) -> tuple:
+     p = path.replace("\\", "/").rstrip("/")
+     return tuple(s for s in p.split("/") if s not in ("", "."))
+@@ -298,6 +350,9 @@
+         "post_tool_use.py",
+         "witness.py",
+         "law_inject.py",
++        # A harness whose gate entry is not named like the others. Also derived from that
++        # member's install declaration (below); listed here as the literal backstop.
++        "before_tool.py",
+     ),
+     exact_paths=(
+         # The hub's STAGED EXECUTABLE (#415): deliberately a segment path, not a
+@@ -309,9 +364,139 @@
+         (".codex", "config.toml"),
+         (".kimi-code", "config.toml"),
+         (".kimi", "config.toml"),
++        (".gemini", "settings.json"),
+     ),
+     source="floor",
+ )
++
++
++# ── Install-declared surfaces — derived, so a member cannot fall outside by naming ──────────
++def _home_relative(path: str) -> tuple:
++    """Segments of an install path with its home anchor removed: `~/.x/hooks` -> (.x, hooks).
++    The closure matches by segment run / suffix, so the home it lands in does not matter."""
++    segs = _segments(path)
++    if segs and segs[0] in ("~", "$HOME", "${HOME}"):
++        segs = segs[1:]
++    return segs
++
++
++def _install_declaration(install: Any) -> Optional[dict]:
++    """The governance-relevant part of one expects.json `install` block, normalised:
++    {"member": str, "dest": str, "entry": str, "registration": [segments]}. None when unusable."""
++    if not isinstance(install, dict):
++        return None
++    member = install.get("member")
++    dest = install.get("dest")
++    probe = install.get("gate_probe")
++    entry = probe.get("entry") if isinstance(probe, dict) else None
++    reg = install.get("registration")
++    reg_path = reg.get("path") if isinstance(reg, dict) else None
++    out: dict = {}
++    if isinstance(member, str) and member:
++        out["member"] = member
++    if isinstance(dest, str) and dest:
++        out["dest"] = dest
++    if isinstance(entry, str) and entry:
++        out["entry"] = entry
++    if isinstance(reg_path, list) and reg_path and all(isinstance(s, str) for s in reg_path):
++        out["registration"] = list(reg_path)
++    return out or None
++
++
++def _closure_from_install(install: Any) -> Optional[Closure]:
++    """One member's installed governance surface, from its expects.json `install` block."""
++    return _closure_from_declaration(_install_declaration(install))
++
++
++def _closure_from_declaration(decl: Optional[dict]) -> Optional[Closure]:
++    """Derive one member's installed governance surface from its normalised declaration.
++
++    * dest  -> dir marker: every file the installer puts there (gate entry, witness, helpers,
++               and a NEW file dropped beside them) is a closure write.
++    * entry -> hooks-dir name: the entry basename governs under any hooks/ segment, as the
++               conventionally named entries already do (repo copies, published copies).
++    * registration -> exact path: the harness config that selects which gate runs.
++    A dest or registration of fewer than two segments is IGNORED, not widened: `hooks` or
++    `settings.json` alone would govern every same-named dir or file anywhere."""
++    if not isinstance(decl, dict):
++        return None
++    dirs, hooks_only, paths = [], [], []
++    dest = decl.get("dest")
++    if isinstance(dest, str):
++        segs = _home_relative(dest)
++        if len(segs) >= 2:
++            dirs.append(segs)
++    entry = decl.get("entry")
++    if isinstance(entry, str) and _segments(entry):
++        hooks_only.append(_segments(entry)[-1])
++    reg = decl.get("registration")
++    if isinstance(reg, (list, tuple)):
++        segs = tuple(s for s in reg if isinstance(s, str) and s not in ("", ".", "~"))
++        if len(segs) >= 2:
++            paths.append(segs)
++    if not (dirs or hooks_only or paths):
++        return None
++    return Closure(dir_markers=tuple(dirs), files_hooks_only=tuple(hooks_only),
++                   exact_paths=tuple(paths), source="install")
++
++
++# Snapshot of every member's install declaration, for the INSTALLED module (which has no
++# manifests beside it). Generated from plugins/*/expects.json by _install_declaration and
++# pinned equal to them by member_install_surface_test.py — edit the manifest, then this.
++MEMBER_INSTALL_DECLARATIONS = {
++    "claude-code": {"member": "claude-code", "dest": "~/.claude/hooks/hestia",
++                    "entry": "hooks/pre_tool_use.py", "registration": [".claude", "settings.json"]},
++    "codex": {"member": "codex", "dest": "~/.codex/hooks", "entry": "hooks/pre_tool_use.py",
++              "registration": [".codex", "config.toml"]},
++    "gemini": {"member": "gemini", "dest": "~/.gemini/hestia-plugins/gemini/hooks",
++               "entry": "hooks/before_tool.py", "registration": [".gemini", "settings.json"]},
++    "kimi": {"member": "kimi-code", "dest": "~/.kimi-code/hooks", "entry": "hooks/pre_tool_use.py",
++             "registration": [".kimi-code", "config.toml"]},
++}
++
++
++def declared_dest(member_id: str, home: Optional[str]) -> Optional[str]:
++    """Where this member's install declaration puts its hooks, home-expanded against `home` —
++    the caller's seat home, passed explicitly (no default: a home-relative dest with no home
++    names nowhere). None for a member with no declaration, or a home-relative dest without one."""
++    for decl in MEMBER_INSTALL_DECLARATIONS.values():
++        if decl.get("member") == member_id and isinstance(decl.get("dest"), str):
++            dest = decl["dest"]
++            if dest.startswith("~/"):
++                return os.path.join(home, dest[2:]) if home else None
++            return dest
++    return None
++
++
++def registered_closure(own_dirs: Iterable[str] = (), targets: Iterable[str] = ()) -> Closure:
++    """The EXECUTED governance surface of one seat, as absolute locations: the directories its
++    hestia-owned hooks run from (dir markers) and every hestia-owned hook its harness
++    registration actually points at (exact paths). Built at gate runtime from what the
++    harness REGISTERS (the caller reads the registration), unioned onto the declared closure
++    — a seat whose registration points somewhere no declaration names is governed there too.
++    Paths are realpath'd by the caller; a path of fewer than three segments is ignored rather
++    than widened (`/home/x` would govern a whole home)."""
++    dirs = tuple(seg for seg in (_segments(d) for d in own_dirs if isinstance(d, str))
++                 if len(seg) >= 3)
++    files = tuple(seg for seg in (_segments(t) for t in targets if isinstance(t, str))
++                  if len(seg) >= 3)
++    return Closure(dir_markers=dirs, exact_paths=files, source="registered")
++
++
++def _failsafe_closure() -> Closure:
++    out = LITERAL_FLOOR
++    for _name, decl in sorted(MEMBER_INSTALL_DECLARATIONS.items()):
++        extra = _closure_from_declaration(decl)
++        if extra is not None:
++            out = out.union(extra)
++    return Closure(out.dir_markers, out.files_anywhere, out.files_hooks_only, out.exact_paths,
++                   source="floor")
++
++
++try:
++    FAILSAFE_CLOSURE = _failsafe_closure()
++except Exception:  # noqa: BLE001 — never let the derivation disarm the literal floor
++    FAILSAFE_CLOSURE = LITERAL_FLOOR
+ 
+ 
+ def _closure_from_manifest(manifest: dict) -> Optional[Closure]:
+@@ -348,7 +533,8 @@
+ 
+ def load_closure(plugins_root: Optional[str] = None,
+                  manifest_reader: Optional[Callable[[], dict]] = None) -> Closure:
+-    """Assemble the closure: LITERAL_FLOOR ∪ every plugin manifest's declared closure.
++    """Assemble the closure: the fail-safe floor (LITERAL_FLOOR ∪ the install snapshot) ∪
++    every plugin manifest's declared closure ∪ every manifest's install-derived surface.
+ 
+     `manifest_reader` (tests, vault-backed readers) returns {plugin_name: manifest_dict}.
+     Default reads plugins/*/expects.json beside this module. NEVER raises; total failure
+@@ -360,16 +546,24 @@
+             root = plugins_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+             manifests = _read_manifests_fs(root)
+         if not isinstance(manifests, dict):
+-            return LITERAL_FLOOR
+-        result = LITERAL_FLOOR
++            return FAILSAFE_CLOSURE
++        result = FAILSAFE_CLOSURE
+         for _name, manifest in sorted(manifests.items()):
+-            extra = _closure_from_manifest(manifest)
+-            if extra is not None:
+-                result = result.union(extra)
++            for derive in (_closure_from_manifest, _closure_from_install_of):
++                try:
++                    extra = derive(manifest)
++                except Exception:  # noqa: BLE001 — a bad manifest adds nothing, removes nothing
++                    extra = None
++                if extra is not None:
++                    result = result.union(extra)
+         return Closure(result.dir_markers, result.files_anywhere, result.files_hooks_only,
+                        result.exact_paths, source="registry+floor")
+     except Exception:
+-        return LITERAL_FLOOR
++        return FAILSAFE_CLOSURE
++
++
++def _closure_from_install_of(manifest: Any) -> Optional[Closure]:
++    return _closure_from_install(manifest.get("install")) if isinstance(manifest, dict) else None
+ 
+ 
+ _DEFAULT_CLOSURE: Optional[Closure] = None
+@@ -1085,7 +1279,7 @@
+             closure = default_closure()
+         return closure, closure.source
+     except Exception:
+-        return LITERAL_FLOOR, LITERAL_FLOOR.source
++        return FAILSAFE_CLOSURE, FAILSAFE_CLOSURE.source
+ 
+ 
+ def _phase1_writes(tool_name: str, tool_input: Any, cwd: Optional[str], closure: Closure, src: str):
+@@ -1116,8 +1310,13 @@
+             marker = closure.match(t, cwd=cwd, position=position)
+             if marker:
+                 # Lazily, so `classify` stops matching at the first target exactly as before.
++                # `landing`: where this write lands (cwd-joined, symlinks and `..` resolved), so
++                # every write verdict carries the LOCATION the daemon prices member gate entries
++                # by, not only the argument as written and its other spellings (#1247).
+                 yield ClosureVerdict("write", rule, marker, t, src,
+-                                     tuple(closure.forms(t, cwd=cwd)[1:]))
++                                     tuple(closure.forms(t, cwd=cwd)[1:]),
++                                     landing=resolve_location(t, cwd) if rule == RULE_WRITE
++                                     else None)
+     except Exception as e:  # noqa: BLE001 — fail-closed: a broken write classifier must not admit
+         yield ClosureVerdict("write", RULE_INTERNAL, None, f"internal:{type(e).__name__}", src)
+ 
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -196,6 +196,13 @@
+     on_timeout: str                       # what the harness does when the timeout expires
+     sources: tuple = ()                   # where each timeout came from, for the record
+     why: str = ""                         # why the bound is unknown, when it is
++    # What the harness's registration ACTUALLY points its hooks at (every event, every source
++    # that exists), read in the same pass as the timeout. The closure is built from install
++    # declarations; execution is built from this. `decide()` governs both (see
++    # `registered_surface`). `unreadable` names a source that exists but could not be parsed.
++    self_path: str = ""                   # realpath of the running gate
++    registered: tuple = ()                # ((source, absolute target), ...)
++    unreadable: tuple = ()                # (source, ...)
+ 
+ 
+ _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+@@ -264,8 +271,24 @@
+     return out
+ 
+ 
++_CONFIG_CACHE: dict = {}
++
++
+ def _load_config(path: str, reader: str):
+-    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan")."""
++    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan").
++    Cached on (path, reader, mtime, size): the timeout bound and the registered-surface read
++    parse each registration once per process, and a changed file is re-read."""
++    st = os.stat(path)
++    key = (path, reader, st.st_mtime_ns, st.st_size)
++    hit = _CONFIG_CACHE.get(key)
++    if hit is not None:
++        return hit
++    out = _load_config_uncached(path, reader)
++    _CONFIG_CACHE[key] = out
++    return out
++
++
++def _load_config_uncached(path: str, reader: str):
+     with open(path, "rb") as fh:
+         raw = fh.read()
+     if reader == "json-hook-commands":
+@@ -287,7 +310,68 @@
+     return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
+ 
+ 
++def _all_hook_commands(doc: Any, layout: str) -> list:
++    """Every hook command a parsed registration carries, on EVERY event (a witness is registered
++    on a different event from the gate)."""
++    out = []
++    hooks = doc.get("hooks") if isinstance(doc, dict) else None
++    if layout == "flat":
++        for tbl in hooks if isinstance(hooks, list) else []:
++            if isinstance(tbl, dict) and isinstance(tbl.get("command"), str):
++                out.append(tbl["command"])
++        return out
++    for groups in (hooks.values() if isinstance(hooks, dict) else ()):
++        for group in groups if isinstance(groups, list) else []:
++            for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
++                if isinstance(h, dict) and isinstance(h.get("command"), str):
++                    out.append(h["command"])
++    return out
++
++
++_SCAN_COMMAND = re.compile(r"""(?m)^\s*command\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')""")
++
++
++def registered_hooks(harness: dict, *, cwd: Optional[str] = None, env=None) -> tuple:
++    """(registered, unreadable): every absolute hook target the harness's registration sources
++    name, as ((source, target), ...), and the sources that exist but could not be read or
++    parsed. NEVER raises: a failure is reported as unreadable, which the caller treats as
++    "this source may register more than we saw" (fail closed)."""
++    env = os.environ if env is None else env
++    registered, unreadable = [], []
++    for reg in (harness or {}).get("registrations") or ():
++        try:
++            path = _expand(str(reg.get("path") or ""), env, cwd)
++            if not path or not os.path.isfile(path):
++                continue
++            reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
++            doc, how = _load_config(path, reader)
++            if how == "scan":
++                with open(path, encoding="utf-8", errors="replace") as fh:
++                    commands = [m.group(1) or m.group(2) or "" for m in _SCAN_COMMAND.finditer(fh.read())]
++            else:
++                commands = _all_hook_commands(doc, layout)
++            for command in commands:
++                for t in _command_targets(command, env):
++                    registered.append((path, t))
++        except Exception:  # noqa: BLE001 — an unreadable source: the caller fails closed
++            unreadable.append(str(reg.get("path") or "?"))
++    return tuple(registered), tuple(unreadable)
++
++
+ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
++                  env=None) -> HarnessBound:
++    """The harness bound (`_harness_bound`), carrying what the registration actually registers
++    (`registered_hooks`) and the running gate's own realpath. NEVER raises."""
++    b = _harness_bound(harness, self_path, start, cwd=cwd, env=env)
++    try:
++        registered, unreadable = registered_hooks(harness, cwd=cwd, env=env)
++        me = os.path.realpath(self_path) if self_path else ""
++        return replace(b, self_path=me, registered=registered, unreadable=unreadable)
++    except Exception:  # noqa: BLE001 — the bound itself stands; the surface fails closed later
++        return b
++
++
++def _harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
+                   env=None) -> HarnessBound:
+     """The deadline the harness's REAL registered timeout allows this hook process. NEVER raises.
+ 
+@@ -374,6 +458,84 @@
+                             f"the registration reader failed ({type(exc).__name__}: {exc})")
+ 
+ 
++# ── the EXECUTED surface: what this seat's harness registration actually runs ─────────────────
++
++#: The closure marker for a write to a seat's REGISTERED gate entry that no declared location
++#: covers (a legacy or hand-placed install). The daemon prices it sovereign_plus_peer, like a
++#: declared entry (core `bar_for`). Caller-asserted, so it can only raise the asker's own bar.
++REGISTERED_ENTRY_MARKER = "registered-gate-entry"
++
++
++@dataclass(frozen=True)
++class RegisteredSurface:
++    """One seat's executed governance surface. `own_dirs`: where hestia's hooks run from on this
++    seat (the running gate's realpath dir, always; the member's declared dest). `targets`: every
++    registered hook whose realpath lies in an own dir (the reconciler's and the census's
++    ownership rule: a same-named hook registered from another plugin's dir is FOREIGN and not
++    governed by being registered). `entries`: the gate entries among them (the running gate,
++    and any owned target named like it). `unreadable`: registration sources that could not be
++    read. Fail closed: whatever the registration says, the gate's own realpath and dir are
++    governed."""
++
++    self_path: str
++    own_dirs: tuple = ()
++    targets: tuple = ()
++    entries: tuple = ()
++    unreadable: tuple = ()
++
++    def closure(self):
++        return closure.default_closure().union(
++            closure.registered_closure(self.own_dirs, self.targets + self.entries),
++            source="registered+registry+floor")
++
++
++def _degenerate_dir(d: str, home: str) -> bool:
++    """A dir too broad to govern wholesale: the filesystem root, a home, or shallower."""
++    real = d.rstrip("/") or "/"
++    return (real == "/" or (bool(home) and real == home.rstrip("/"))
++            or len([x for x in real.split("/") if x]) < 3)
++
++
++def registered_surface(bound: Optional[HarnessBound], profile: GateProfile,
++                       env=None) -> Optional[RegisteredSurface]:
++    """The executed surface for this invocation, or None when there is no gate path to anchor
++    it (a non-seat caller). NEVER raises; a failure yields the minimum (self file and dir)."""
++    env = os.environ if env is None else env
++    self_path = (getattr(bound, "self_path", "") or
++                 (os.path.realpath(profile.gate_path) if profile.gate_path else ""))
++    if not self_path:
++        return None
++    # The seat's home from its environment only (no default): without one, nothing can be judged
++    # a home-level anchor, so only the file itself and its non-degenerate dir are governed.
++    home = os.path.realpath(env["HOME"]) if env.get("HOME") else ""
++    own = []
++    try:
++        d = os.path.dirname(self_path)
++        if not _degenerate_dir(d, home):
++            own.append(d)
++        dest = closure.declared_dest(profile.member_id, env.get("HOME"))
++        if dest:
++            rd = os.path.realpath(dest)
++            if rd not in own and not _degenerate_dir(rd, home):
++                own.append(rd)
++        base = os.path.basename(self_path)
++        targets, entries = [], [self_path]
++        for _source, t in getattr(bound, "registered", ()) or ():
++            rp = os.path.realpath(t)
++            if os.path.dirname(rp) not in own:
++                continue                      # foreign: another plugin's hook, not hestia's
++            if rp not in targets:
++                targets.append(rp)
++            if os.path.basename(rp) == base and rp not in entries:
++                entries.append(rp)
++        return RegisteredSurface(self_path, tuple(own), tuple(targets), tuple(entries),
++                                 tuple(getattr(bound, "unreadable", ()) or ()))
++    except Exception:  # noqa: BLE001 — the minimum, never fewer
++        d = os.path.dirname(self_path)
++        return RegisteredSurface(self_path, (d,) if not _degenerate_dir(d, home) else (),
++                                 (), (self_path,), ("registered surface failed",))
++
++
+ # ── invocation context ───────────────────────────────────────────────────────────────────────
+ 
+ @dataclass
+@@ -389,6 +551,7 @@
+     warnings: list = field(default_factory=list)   # [(rule, reason, verdict_available)]
+ 
+     budget: float = DEFAULT_DEADLINE_SECONDS
++    registered: Optional[RegisteredSurface] = None
+ 
+     @property
+     def phase_deadline(self) -> float:
+@@ -680,27 +843,146 @@
+     return tool, ti, targets, False
+ 
+ 
+-def _closure_view(event: GateEvent):
+-    """The closure classifier's verdict on this act (the first governed target decides)."""
++def _closure_view(event: GateEvent, against=None):
++    """The closure classifier's verdict on this act (the first governed target decides).
++    `against`: the closure to classify with (default: the declared one)."""
+     tool, ti, targets, is_patch = _closure_shape(event)
+     if is_patch:
+         found = None
+         for p in targets:
+-            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd)
++            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd, closure=against)
+             if cv.classification == "write":
+                 return cv
+             if cv.classification == "read" and found is None:
+                 found = cv
+         return found
+-    return closure.classify(tool, ti, cwd=event.cwd)
+-
+-
+-def _closure_write_set(event: GateEvent):
++    return closure.classify(tool, ti, cwd=event.cwd, closure=against)
++
++
++def _closure_verdict(inv: _Invocation):
++    """The declared closure's verdict, then — when it does not already refuse — the seat's
++    EXECUTED surface (`registered_surface`): a write to where this seat's registration actually
++    runs hestia's hooks is a closure write even where no declaration names the place. A write
++    reaching a registered gate entry escalates under REGISTERED_ENTRY_MARKER, priced like a
++    declared entry."""
++    cv = _closure_view(inv.event)
++    reg = inv.registered
++    if reg is None or (cv is not None and cv.classification == "write"):
++        return cv
++    rv = _closure_view(inv.event, reg.closure())
++    if rv is None or rv.classification != "write":
++        return cv if cv is not None else rv
++    if _reaches_registered_entry(getattr(rv, "landing", None), reg.entries):
++        rv = replace(rv, marker=REGISTERED_ENTRY_MARKER)
++    return rv
++
++
++_GLOB_CHARS = frozenset("*?[")
++
++
++def _reaches_registered_entry(target, entries) -> bool:
++    """True when this resolved write target CAN land on one of the seat's registered gate
++    entries: the entry itself, or a wildcard whose expansion can include it (Codex review of
++    #1247 at 18f91db, P1: `touch <legacy>/before_*` reached the running gate yet carried no
++    entry token, and the daemon — which knows only DECLARED locations — could not recover it).
++    The match is `_glob_over_regex`, which can only over-match a Bash glob: an over-match prices
++    higher, never lower."""
++    if not isinstance(target, str) or not target:
++        return False
++    if target in entries:
++        return True
++    if not _GLOB_CHARS.intersection(target):
++        return False
++    rx = _glob_over_regex(target)
++    return any(rx.fullmatch(e) for e in entries)
++
++
++def _glob_over_regex(pattern: str):
++    """A regex matching AT LEAST every path the Bash glob `pattern` can expand to. Not
++    `fnmatch` (Codex re-review of #1247 at 6976edbd, notice 18830, P1): fnmatch reads `[^z]` as
++    "`^` or `z`" and `[[:alpha:]]` as a bracket then a literal `]`, so both missed an entry Bash
++    expands them onto, and the write priced one approver. Here every bracket expression —
++    negated, ranged, POSIX class, whatever its locale reading — stands for ANY one character;
++    `*` and `?` may cross `/`; a backslash is optional before the ordinary character it escapes,
++    and consumes it; a backslash before `*`, `?` or `[` makes the rest of the pattern match
++    anything; and a `[` with no close Bash would accept does the same. Each choice can only
++    widen the set.
++
++    The escaped wildcard falls back rather than reading `\\[` as a literal `[` (Codex review of
++    held 29ae13a6, notice 18931, P2): the backslash used not to consume what it escaped, so the
++    `[` of `x\\[ab]y*` opened a bracket and `[ab]` shrank to one character, missing the
++    `x[ab]yes` Bash expands it onto. A literal reading would fix that pattern, but whether this
++    backslash still escapes depends on quoting the producer may already have removed (a quoted
++    backslash before a live `[`), and the safe answer to an uncertain reading is the wider one.
++
++    A bracket holding a `[` falls back too. Bash's own reading forks there: 5.2 expands
++    `[[=b=]]*` onto `bx` AND onto `[b]x` and `[=]x`, reading the first `[` as a literal and
++    `[=b=]` as the bracket. That fork surfaced when notice 18931's literal-bracket names joined
++    the differential corpus; one character for the whole bracket missed it."""
++    out, i, n = [], 0, len(pattern)
++    while i < n:
++        c = pattern[i]
++        if c == "*":
++            out.append(".*")
++        elif c == "?":
++            out.append(".")
++        elif c == "\\":
++            if i + 1 < n and pattern[i + 1] in _GLOB_CHARS:
++                out.append(r"\\?.*")
++                break
++            out.append(r"\\?")
++            if i + 1 < n:
++                i += 1
++                out.append(re.escape(pattern[i]))
++        elif c == "[":
++            end = _bracket_end(pattern, i)
++            if end is None or "[" in pattern[i + 1:end]:
++                out.append(".*")
++                break
++            out.append(".")
++            i = end
++        else:
++            out.append(re.escape(c))
++        i += 1
++    return re.compile("".join(out), re.DOTALL)
++
++
++def _bracket_end(pattern: str, start: int):
++    """Index of the `]` closing the bracket expression opened at `start`, read as Bash reads
++    it: a leading `!`/`^` negates, a `]` first in the list is literal, `[:…:]`, `[=…=]` and
++    `[.….]` are single items, a backslash escapes the next character. None when unclosed."""
++    i, n = start + 1, len(pattern)
++    if i < n and pattern[i] in "!^":
++        i += 1
++    if i < n and pattern[i] == "]":
++        i += 1
++    while i < n:
++        c = pattern[i]
++        if c == "]":
++            return i
++        if c == "\\":
++            i += 2
++            continue
++        if c == "[" and i + 1 < n and pattern[i + 1] in ":=.":
++            close = pattern.find(pattern[i + 1] + "]", i + 2)
++            if close != -1:
++                i = close + 2
++                continue
++        i += 1
++    return None
++
++
++def _closure_write_set(event: GateEvent, against=None):
+     """(targets, complete): EVERY governed write-position path this act resolves into the
+     closure, in order — not only the first, which is all `_closure_view` reports (Codex review
+     of #1239, P1-2: a later sovereign target beyond the bounded summary priced as nothing).
+     Each target rides with the other spellings the closure matched it by (cwd-joined,
+-    realpath'd), so an alias carries its destination (Codex review of #1239, P1-2).
++    realpath'd), so an alias carries its destination (Codex review of #1239, P1-2), and with
++    the LOCATION it lands at (`landing`, #1247) where that is not already among them: the
++    daemon prices a member's gate entry by where it is, and a relative or `cd`-qualified
++    spelling names no location.
++    `against`: the closure to enumerate with — the seat's registered surface when it has one, so
++    a write the executed surface governs is enumerated too (#1247).
+     `complete` is False when the write set could not be enumerated: an opaque writer, an
+     internal error, no target named, a command outside the grammar or unparseable (its
+     targets are vocabulary that matched, not resolved write positions: `$TARGET` names no
+@@ -710,17 +992,26 @@
+         tool, ti, targets, is_patch = _closure_shape(event)
+         if is_patch:
+             verdicts = [v for p in targets
+-                        for v in closure.write_verdicts("Write", {"file_path": p}, cwd=event.cwd)]
++                        for v in closure.write_verdicts("Write", {"file_path": p}, cwd=event.cwd,
++                                                        closure=against)]
+         else:
+-            verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd)
++            verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd, closure=against)
+         resolved = []
+         for v in verdicts:
+             if v.marker and v.resource:
+                 resolved.append(v.resource)
+                 resolved.extend(getattr(v, "resolved", ()))
++                landing = getattr(v, "landing", None)
++                if isinstance(landing, str) and landing and landing not in resolved:
++                    resolved.append(landing)
++        # COMPLETE: #1239's rule (every verdict a resolved write whose target is absolute or
++        # was pinned by a cwd-join / realpath), AND #1247's (its landing is an absolute
++        # location). Two conjuncts, so neither cleared rule can be the weaker reading: a write
++        # set either one calls incomplete rides the `unenumerated` sentinel, priced highest.
+         complete = bool(resolved) and all(
+             v.marker and v.rule == closure.RULE_WRITE
+             and (os.path.isabs(v.resource) or getattr(v, "resolved", ()))
++            and isinstance(getattr(v, "landing", None), str) and os.path.isabs(v.landing)
+             for v in verdicts)
+         return resolved, complete
+     except Exception:  # noqa: BLE001 — unenumerated is priced highest, never lowest
+@@ -729,7 +1020,7 @@
+ 
+ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
+     ev, prof = inv.event, inv.profile
+-    cv = _closure_view(ev)
++    cv = _closure_verdict(inv)
+     if cv is None or cv.classification not in ("read", "write"):
+         return None
+     marker = cv.marker or cv.rule or "governance"
+@@ -744,7 +1035,13 @@
+         except Exception:  # noqa: BLE001
+             pass
+         return None
+-    write_set = _closure_write_set(ev)
++    write_set = _closure_write_set(ev, inv.registered.closure() if inv.registered else None)
++    if inv.registered is not None and any(_reaches_registered_entry(t, inv.registered.entries)
++                                          for t in write_set[0]):
++        # A target is this seat's REGISTERED gate entry (one no declaration covers): say so
++        # in-band, so the daemon prices it like a declared entry even when it is not the target
++        # the closure reported first (`cv`'s marker covers only that one).
++        write_set = (write_set[0] + [REGISTERED_ENTRY_MARKER], write_set[1])
+     try:
+         claimed = _bounded(
+             inv.phase_deadline, mechanism.claim_self_write,
+@@ -756,11 +1053,11 @@
+             supersession=mechanism.SUPERSESSION_HARD_STOP,
+             deadline=inv.phase_deadline,
+             # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
+-            # path the closure resolved, not only the one `cv` reports. The daemon prices the bar
+-            # over the marker, the act and all of them, highest wins — `inv.attempted` is a
+-            # bounded, self-censoring summary that can cut a filename out (or withhold the whole
+-            # command); these are carried independently of it. An unenumerable write set is
+-            # said as such, and priced highest.
++            # path the closure resolved, not only the one `cv` reports — each with its other
++            # spellings and the LOCATION it lands at (#1247). The daemon prices the bar over the marker, the act and all of
++            # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
++            # cut a filename out (or withhold the whole command); these are carried
++            # independently of it. An unenumerable write set is said as such, and priced highest.
+             resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
+         if claimed is _LATE:
+             # Unknown, not "nothing happened": the daemon may have opened or matched an
+@@ -991,6 +1288,7 @@
+         if not isinstance(profile, GateProfile):
+             raise TypeError("decide requires a GateProfile")
+         inv = _Invocation(event=event, profile=profile, rollout=mode, deadline=deadline,
++                          registered=registered_surface(bound, profile),
+                           key=mechanism.correlation_key(event.raw), budget=budget)
+         inv.attempted = attempted_of(event)
+         return _sequence(inv, permitted_roles)
+diff --git a/plugins/_shared/seat_gate_boundary_test.py b/plugins/_shared/seat_gate_boundary_test.py
+--- a/plugins/_shared/seat_gate_boundary_test.py
++++ b/plugins/_shared/seat_gate_boundary_test.py
+@@ -19,6 +19,9 @@
+   - a write whose destination is a gate file is refused before the daemon is asked: an
+     escalation is claimed with the host session, `gate_self_access` witnessed, no begin_action;
+   - the same through the seat's shell tool (and codex's apply_patch);
++  - the seat's INSTALLED gate entry, witness and registration config (read from its own
++    expects.json install declaration, under the fixture HOME) are refused the same way, through
++    Write, Edit and every shell write form; every declared member must have a seat row here;
+   - a claimed human approval lifts the closure bar for that one call, and ordinary law runs;
+   - a distinctive governance name (the mechanism, the common gate) governs anywhere, while a
+     hooks-dir-only name outside a hooks dir is ordinary work;
+@@ -249,7 +252,7 @@
+             "tool_input": ti, "tool_use_id": f"toolu_sb{n}"}
+ 
+ 
+-def run(seat, home, event, *, declare=True, stdin=None, cwd=None):
++def run(seat, home, event, *, declare=True, stdin=None, cwd=None, shim_path=None):
+     env = {k: v for k, v in os.environ.items() if not k.startswith("HESTIA_")}
+     env.update({"HOME": home, "HESTIA_HOME": home, "PYTHONDONTWRITEBYTECODE": "1"})
+     env.pop("PYTHONPATH", None)
+@@ -258,7 +261,7 @@
+     # Launched in the fixture's repo, as a harness launched in a task repo is: the launch-cwd
+     # grant (the core's launch_cwd_repo) is what puts that repo in scope.
+     cwd = cwd or os.path.join(os.path.dirname(home), "ws", "hestia")
+-    p = subprocess.run([sys.executable, shim(seat)], input=stdin if stdin is not None else json.dumps(event),
++    p = subprocess.run([sys.executable, shim_path or shim(seat)], input=stdin if stdin is not None else json.dumps(event),
+                        capture_output=True, text=True, timeout=60, env=env, cwd=cwd)
+     try:
+         payload = json.loads(p.stdout.strip() or "null")
+@@ -391,6 +394,217 @@
+     _each_seat(arm)
+ 
+ 
++def _declared_members():
++    plugins = os.path.join(REPO, "plugins")
++    return sorted(d for d in os.listdir(plugins)
++                  if os.path.isfile(os.path.join(plugins, d, "expects.json")))
++
++
++def _install_surfaces(seat, home):
++    """{label: path}: the seat's INSTALLED gate entry, witness and registration config, read
++    from its own expects.json install declaration and placed under this fixture's HOME — where
++    the installer puts them on a running seat, not the repo copy under plugins/<seat>/hooks."""
++    with open(os.path.join(REPO, "plugins", seat, "expects.json"), encoding="utf-8") as fh:
++        inst = json.load(fh)["install"]
++    dest = inst["dest"]
++    dest = os.path.join(home, dest[2:]) if dest.startswith("~/") else dest
++    out = {"entry": os.path.join(dest, os.path.basename(inst["gate_probe"]["entry"])),
++           "registration": os.path.join(home, *inst["registration"]["path"])}
++    wit = [f for f in inst.get("files") or [] if os.path.basename(f).startswith("witness")]
++    if wit:
++        out["witness"] = os.path.join(dest, os.path.basename(wit[0]))
++    return out
++
++
++def test_every_declared_member_is_exercised_here():
++    """Covered by construction: a member with an expects.json and no seat row here would have
++    its installed surface go untested. Red until the seat is added to SEATS."""
++    missing = [m for m in _declared_members() if m not in SEATS]
++    check("every-declared-member-has-a-seat", not missing, f"declared but not exercised: {missing}")
++
++
++def test_installed_gate_entry_witness_and_registration_refused():
++    """Every seat, against its OWN installed surface: the gate entry the harness invokes, its
++    witness, and the harness config that registers it. Each write form is refused as
++    gate.self_access before the daemon is asked — the same strength the repo copy gets."""
++    def arm(seat, fx):
++        stub = Stub()
++        try:
++            home = fx.home(seat, stub.url)
++            src = os.path.join(fx.repo, "docs", "src.txt")
++            with open(src, "w", encoding="utf-8") as fh:
++                fh.write("x\n")
++            n = 0
++            for label, target in _install_surfaces(seat, home).items():
++                forms = [
++                    ("Write", {"file_path": target, "content": "x"}),
++                    ("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
++                    ("Bash", {"command": f"touch {target}"}),
++                    ("Bash", {"command": f"echo x > {target}"}),
++                    ("Bash", {"command": f"cp {src} {target}"}),
++                    ("Bash", {"command": f"mv {src} {target}"}),
++                    ("Bash", {"command": f"install -m 0755 {src} {target}"}),
++                    ("Bash", {"command": f"echo x | tee {target}"}),
++                    ("Bash", {"command": f"sed -i s/a/b/ {target}"}),
++                ]
++                for tool, ti in forms:
++                    n += 1
++                    form = tool if tool != "Bash" else ti["command"].split()[0] + (
++                        ">" if " > " in ti["command"] else "")
++                    mark = len(stub.calls)
++                    v, text, _ = run(seat, home, native(seat, tool, ti, n=n))
++                    check(f"{seat}-{label}-{form}-denied", v == "deny" and "gate.self_access" in text,
++                          f"{target}: {text}")
++                    check(f"{seat}-{label}-{form}-pre-daemon",
++                          "hestia_begin_action" not in [c for c, _ in stub.calls[mark:]], stub.calls[mark:])
++        finally:
++            stub.close()
++    _each_seat(arm)
++
++
++def test_installed_entry_claim_carries_the_resolved_location():
++    """The daemon prices a member's gate entry from the LOCATION the gate resolved, so the claim
++    must carry it whatever the spelling: relative to the event cwd, inside a `cd`, through `..`.
++    The argument as written (`resource`) can be a bare name; the resolved target cannot."""
++    def arm(seat, fx):
++        stub = Stub()
++        try:
++            home = fx.home(seat, stub.url)
++            target = _install_surfaces(seat, home)["entry"]
++            dest, base = os.path.dirname(target), os.path.basename(target)
++            os.makedirs(dest, exist_ok=True)
++            want = os.path.realpath(target)
++            forms = [
++                ("relative-write", "Write", {"file_path": base, "content": "x"}, dest),
++                ("cd-then-touch", "Bash", {"command": f"cd {dest} && touch {base}"}, None),
++                ("dotdot", "Bash", {"command": f"touch {dest}/sub/../{base}"}, None),
++            ]
++            for n, (label, tool, ti, cwd) in enumerate(forms, start=40):
++                mark = len(stub.calls)
++                ev = native(seat, tool, ti, n=n)
++                if cwd:
++                    ev["cwd"] = cwd
++                v, text, _ = run(seat, home, ev)
++                check(f"{seat}-{label}-denied", v == "deny" and "gate.self_access" in text, text)
++                claims = [a for c, a in stub.calls[mark:] if c == "hestia_gate_escalation_claim"]
++                check(f"{seat}-{label}-claim-carries-resolved-location",
++                      claims and want in (claims[0].get("resolved_targets") or []),
++                      (want, claims and claims[0].get("resolved_targets")))
++        finally:
++            stub.close()
++    _each_seat(arm)
++
++
++# ── the EXECUTED surface: a gate registered where no declaration names it ───────────────────
++#: (registration file under the fixture HOME, the gate's event, the witness's event)
++LEGACY_REG = {"claude-code": ((".claude", "settings.json"), "PreToolUse", "PostToolUse", 20),
++              "gemini": ((".gemini", "settings.json"), "BeforeTool", "AfterTool", 20000)}  # ms
++REGISTERED_ENTRY_MARKER = "registered-gate-entry"
++
++
++def _legacy_install(seat, home, foreign=(), extra_sources=()):
++    """The seat's real shim installed in a LEGACY members dir no declaration names, and the
++    harness registration pointing its gate and witness there (plus any foreign hooks)."""
++    member = SEATS[seat]["member"]
++    legacy = os.path.join(home, ".hestia", "members", member)
++    os.makedirs(legacy, exist_ok=True)
++    entry = os.path.join(legacy, SEATS[seat]["hook"][1])
++    shutil.copyfile(shim(seat), entry)
++    wit = os.path.join(legacy, "wit" + "ness.py")
++    with open(wit, "w", encoding="utf-8") as fh:
++        fh.write("# witness\n")
++    rel, pre, post, timeout = LEGACY_REG[seat]
++    doc = {"hooks": {
++        pre: [{"matcher": "*", "hooks": [{"type": "command", "command": f"python3 {c}", "timeout": timeout}
++                                         for c in (entry, *foreign)]}],
++        post: [{"matcher": "*", "hooks": [{"type": "command", "command": f"python3 {wit}", "timeout": timeout}]}]}}
++    reg = os.path.join(home, *rel)
++    os.makedirs(os.path.dirname(reg), exist_ok=True)
++    with open(reg, "w", encoding="utf-8") as fh:
++        json.dump(doc, fh)
++    for src, text in extra_sources:
++        with open(os.path.join(home, *src), "w", encoding="utf-8") as fh:
++            fh.write(text)
++    return os.path.realpath(legacy), os.path.realpath(entry), os.path.realpath(wit)
++
++
++def test_a_gate_registered_outside_every_declaration_is_refused():
++    """A seat whose registration runs hestia's gate and witness from a legacy dir: a write to
++    the gate, the witness, or a new file beside them is refused as gate.self_access before the
++    daemon is asked, and a write to the gate entry escalates under the registered-entry marker
++    (priced like a declared entry). RED on the declared closure alone."""
++    def arm(seat, fx):
++        if seat not in LEGACY_REG:
++            return
++        stub = Stub()
++        try:
++            home = fx.home(seat, stub.url)
++            legacy, entry, wit = _legacy_install(seat, home)
++            n = 70
++            for label, target in (("entry", entry), ("witness", wit),
++                                  ("beside", os.path.join(legacy, "dropped.py"))):
++                for tool, ti in (("Write", {"file_path": target, "content": "x"}),
++                                 ("Bash", {"command": f"echo x > {target}"})):
++                    n += 1
++                    mark = len(stub.calls)
++                    v, text, _ = run(seat, home, native(seat, tool, ti, n=n), shim_path=entry)
++                    check(f"{seat}-{label}-{tool}-refused", v == "deny" and "gate.self_access" in text, text)
++                    calls = stub.calls[mark:]
++                    check(f"{seat}-{label}-{tool}-pre-daemon",
++                          "hestia_begin_action" not in [c for c, _ in calls], calls)
++                    claims = [a for c, a in calls if c == "hestia_gate_escalation_claim"]
++                    if label == "entry":
++                        check(f"{seat}-entry-{tool}-marker",
++                              claims and claims[0].get("marker") == REGISTERED_ENTRY_MARKER, claims)
++        finally:
++            stub.close()
++    _each_seat(arm)
++
++
++def test_a_foreign_hook_in_the_same_registration_stays_ordinary():
++    """Another plugin's hook registered in the same file — even under the gate's basename — is
++    not hestia's: writing it is ordinary work, asked of the daemon, never a closure claim."""
++    def arm(seat, fx):
++        if seat not in LEGACY_REG:
++            return
++        stub = Stub()
++        try:
++            home = fx.home(seat, stub.url)
++            foreign = os.path.join(fx.repo, "vendor", "hardbound", "bin", SEATS[seat]["hook"][1])
++            os.makedirs(os.path.dirname(foreign), exist_ok=True)
++            with open(foreign, "w", encoding="utf-8") as fh:
++                fh.write("# another plugin's hook\n")
++            _legacy, entry, _wit = _legacy_install(seat, home, foreign=(foreign,))
++            v, text, _ = run(seat, home, native(seat, "Write", {"file_path": foreign, "content": "x"}, n=80),
++                             shim_path=entry)
++            check(f"{seat}-foreign-allowed", v == "allow", text)
++            check(f"{seat}-foreign-no-claim", "hestia_gate_escalation_claim" not in stub.names(), stub.names())
++        finally:
++            stub.close()
++    _each_seat(arm)
++
++
++def test_an_unreadable_registration_source_fails_closed():
++    """A second registration source that exists but cannot be parsed: the gate still governs its
++    own realpath and directory (the minimum, never fewer)."""
++    def arm(seat, fx):
++        if seat != "claude-code":
++            return
++        stub = Stub()
++        try:
++            home = fx.home(seat, stub.url)
++            legacy, entry, _wit = _legacy_install(
++                seat, home, extra_sources=(((".claude", "settings.local.json"), "{ not json"),))
++            for n, target in enumerate((entry, os.path.join(legacy, "dropped.py")), start=85):
++                v, text, _ = run(seat, home, native(seat, "Write", {"file_path": target, "content": "x"}, n=n),
++                                 shim_path=entry)
++                check(f"{seat}-unreadable-{os.path.basename(target)}-refused",
++                      v == "deny" and "gate.self_access" in text, text)
++        finally:
++            stub.close()
++    _each_seat(arm)
++
++
+ def test_approved_gate_write_proceeds_to_ordinary_law():
+     def arm(seat, fx):
+         stub = Stub(claim={"claimed": True, "permits_write": True, "decided_by": "test-operator",
+@@ -559,6 +773,12 @@
+ ALL = [
+     test_gate_file_write_refused_before_the_daemon,
+     test_gate_file_shell_write_refused,
++    test_every_declared_member_is_exercised_here,
++    test_installed_gate_entry_witness_and_registration_refused,
++    test_installed_entry_claim_carries_the_resolved_location,
++    test_a_gate_registered_outside_every_declaration_is_refused,
++    test_a_foreign_hook_in_the_same_registration_stays_ordinary,
++    test_an_unreadable_registration_source_fails_closed,
+     test_approved_gate_write_proceeds_to_ordinary_law,
+     test_distinctive_names_govern_anywhere_hooks_only_names_do_not,
+     test_ordinary_write_is_asked_allowed_and_recorded,
+diff --git a/plugins/_shared/member_install_surface_test.py b/plugins/_shared/member_install_surface_test.py
+new file mode 100755
+--- /dev/null
++++ b/plugins/_shared/member_install_surface_test.py
+@@ -0,0 +1,271 @@
++#!/usr/bin/env python3
++"""Every member's INSTALLED governance surface is closure — by construction, not by list.
++
++A member's gate does not only live at plugins/<member>/hooks/ in this repo. The installer puts
++it somewhere in the member's harness home (expects.json `install.dest`), under the entry name
++that harness invokes (`install.gate_probe.entry`), and wires it in through a harness config file
++(`install.registration.path`). Those three declarations ARE the member's governance surface on
++a running seat. A closure that names them from a hand-kept basename list covers exactly the
++members whose naming happened to match the list when it was written, and nothing tells you when
++a new member's does not.
++
++So this suite does not name members. It reads every plugins/*/expects.json and, for each one,
++asserts that a write to its installed gate entry, its installed witness, and its registration
++config is classified "write" — through every write form the classifier keys on: Claude-shaped
++Write/Edit, other harnesses' native write tools, and the shell write positions. A member added
++tomorrow is covered the moment its manifest lands, or this suite is red.
++
++Two closures are checked, because a running gate sees one and CI sees the other:
++  * INSTALLED: the closure module as installed has no plugins/*/expects.json beside it, so its
++    registry is empty — what it enforces is the module's own fail-safe floor. That floor must
++    already carry every member's install surface.
++  * REPO: the closure as loaded beside the manifests.
++And one drift pin: the floor's install snapshot must equal what the manifests declare, so a
++member whose manifest changes cannot silently diverge from what the installed gate enforces.
++
++check() RAISES so pytest sees each case; the __main__ runner collects (house convention).
++"""
++import json
++import os
++import sys
++import tempfile
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, HERE)
++import hestia_governance_closure as g  # noqa: E402
++
++PLUGINS = os.path.dirname(HERE)
++FAKE_HOME = "/home/surface-probe"
++_NEUTRAL_CWD = tempfile.mkdtemp(prefix="mis-neutral-")
++
++
++def check(name, cond, detail=""):
++    if not cond:
++        raise AssertionError(f"{name} — {str(detail)[:900]}")
++
++
++def manifests():
++    out = {}
++    for d in sorted(os.listdir(PLUGINS)):
++        p = os.path.join(PLUGINS, d, "expects.json")
++        if os.path.isfile(p):
++            with open(p, encoding="utf-8") as fh:
++                out[d] = json.load(fh)
++    return out
++
++
++def _home(path_str):
++    if path_str.startswith("~/"):
++        return FAKE_HOME + path_str[1:]
++    if path_str.startswith("$HOME/"):
++        return FAKE_HOME + path_str[5:]
++    return path_str
++
++
++def surfaces(manifest):
++    """{label: absolute installed path} for one member, read from its install declaration."""
++    inst = manifest.get("install") or {}
++    dest = _home(inst["dest"])
++    entry = (inst.get("gate_probe") or {})["entry"]
++    files = inst.get("files") or []
++    witness = [f for f in files if os.path.basename(f).startswith("witness")]
++    reg = (inst.get("registration") or {})["path"]
++    out = {"entry": os.path.join(dest, os.path.basename(entry)),
++           "registration": os.path.join(FAKE_HOME, *reg)}
++    if witness:
++        out["witness"] = os.path.join(dest, os.path.basename(witness[0]))
++    return out
++
++
++def write_forms(target):
++    """Every write form the classifier keys on, aimed at `target`."""
++    d, b = os.path.dirname(target), os.path.basename(target)
++    return [
++        ("Write", {"file_path": target, "content": "x"}),
++        ("Edit", {"file_path": target, "old_string": "a", "new_string": "b"}),
++        ("write_file", {"file_path": target, "content": "x"}),       # gemini native
++        ("replace", {"file_path": target, "old_string": "a", "new_string": "b"}),  # gemini
++        ("WriteFile", {"path": target, "content": "x"}),              # kimi native
++        ("StrReplaceFile", {"path": target, "edit": {"old": "a", "new": "b"}}),
++        ("Bash", {"command": f"touch {target}"}),
++        ("Bash", {"command": f"echo x > {target}"}),
++        ("Bash", {"command": f"echo x >> {target}"}),
++        ("Bash", {"command": f"cp /etc/hostname {target}"}),
++        ("Bash", {"command": f"mv /tmp/mis-src {target}"}),
++        ("Bash", {"command": f"install -m 0755 /tmp/mis-src {target}"}),
++        ("Bash", {"command": f"echo x | tee {target}"}),
++        ("Bash", {"command": f"sed -i s/a/b/ {target}"}),
++        ("Bash", {"command": f"cd {d} && touch {b}"}),
++    ]
++
++
++def installed_closure():
++    # What the INSTALLED module sees: no manifests beside it.
++    return g.load_closure(manifest_reader=lambda: {})
++
++
++def repo_closure():
++    return g.load_closure(plugins_root=PLUGINS)
++
++
++def _assert_all_writes(closure, tag):
++    ms = manifests()
++    check(f"{tag}-members-found", len(ms) >= 4, sorted(ms))
++    misses = []
++    for member, man in ms.items():
++        for label, target in surfaces(man).items():
++            for tool, ti in write_forms(target):
++                v = g.classify(tool, ti, cwd=_NEUTRAL_CWD, closure=closure)
++                if v.classification != "write":
++                    misses.append((member, label, tool, ti.get("command") or "", v.classification))
++    check(f"{tag}-every-member-surface-is-closure", not misses,
++          f"{len(misses)} uncovered: {misses[:12]}")
++
++
++def test_every_member_install_surface_is_closure_installed():
++    _assert_all_writes(installed_closure(), "installed")
++
++
++def test_every_member_install_surface_is_closure_repo():
++    _assert_all_writes(repo_closure(), "repo")
++
++
++def test_every_member_install_surface_is_closure_on_failure():
++    # A registry that raises falls back to the fail-safe floor — which must still hold.
++    def broken():
++        raise RuntimeError("registry unreadable")
++    _assert_all_writes(g.load_closure(manifest_reader=broken), "failsafe")
++
++
++def test_reading_an_install_surface_is_a_read_not_a_write():
++    # Over-denying a read manufactures bypasses: reconnaissance stays an allowed, witnessed read.
++    c = installed_closure()
++    for member, man in manifests().items():
++        for label, target in surfaces(man).items():
++            for tool, ti in (("Read", {"file_path": target}),
++                             ("Bash", {"command": f"cat {target}"}),
++                             ("Bash", {"command": f"cp {target} /tmp/mis-copy"})):
++                v = g.classify(tool, ti, cwd=_NEUTRAL_CWD, closure=c)
++                check(f"{member}-{label}-{tool}-read", v.classification == "read", (ti, v))
++
++
++def test_a_neighbour_of_the_surface_is_not_closure():
++    # The surface is the declared files, not the harness home: a note beside the registration,
++    # or a project file named like the entry outside any hooks dir, stays ordinary work.
++    c = installed_closure()
++    for member, man in manifests().items():
++        s = surfaces(man)
++        neighbour = os.path.join(os.path.dirname(s["registration"]), "notes.md")
++        v = g.classify("Write", {"file_path": neighbour, "content": "x"}, cwd=_NEUTRAL_CWD, closure=c)
++        check(f"{member}-registration-neighbour-is-ordinary", v.classification != "write", (neighbour, v))
++        stray = os.path.join(FAKE_HOME, "src", "proj", os.path.basename(s["entry"]))
++        v = g.classify("Write", {"file_path": stray, "content": "x"}, cwd=_NEUTRAL_CWD, closure=c)
++        check(f"{member}-entry-name-outside-hooks-is-ordinary", v.classification != "write", (stray, v))
++
++
++def test_floor_install_snapshot_matches_the_manifests():
++    """Drift pin. The installed module cannot read the manifests, so it carries a snapshot of
++    each member's install declaration. That snapshot must equal what the manifests declare —
++    adding, renaming or moving a member's gate without updating it is red here."""
++    snap = getattr(g, "MEMBER_INSTALL_DECLARATIONS", None)
++    check("snapshot-exists", isinstance(snap, dict), "closure module carries no install snapshot")
++    declared = {}
++    for member, man in manifests().items():
++        decl = g._install_declaration(man.get("install"))
++        if decl is not None:
++            declared[member] = decl
++    check("snapshot-equals-manifests", snap == declared,
++          f"snapshot {json.dumps(snap, sort_keys=True)} != manifests {json.dumps(declared, sort_keys=True)}")
++
++
++def test_a_new_member_is_covered_by_its_manifest_alone():
++    # A hypothetical member with an entry name, home and registration no list has seen: its
++    # manifest is enough for the repo-loaded closure, with no core edit.
++    novel = {"install": {"member": "novel", "dest": "~/.novel-harness/gate",
++                         "registration": {"path": [".novel-harness", "wiring.yaml"]},
++                         "files": ["hooks/on_call.py"],
++                         "gate_probe": {"entry": "hooks/on_call.py"}}}
++    c = g.load_closure(manifest_reader=lambda: {"novel": novel})
++    for label, target in surfaces(novel).items():
++        for tool, ti in write_forms(target):
++            v = g.classify(tool, ti, cwd=_NEUTRAL_CWD, closure=c)
++            check(f"novel-{label}-{tool}", v.classification == "write", (ti, v))
++
++
++def test_a_degenerate_declaration_does_not_widen_the_closure():
++    # A one-segment dest or registration would govern every same-named dir/file anywhere.
++    bad = {"install": {"dest": "~/hooks", "registration": {"path": ["settings.json"]},
++                       "gate_probe": {"entry": "hooks/x.py"}}}
++    c = g.load_closure(manifest_reader=lambda: {"bad": bad})
++    for p in ("/srv/app/hooks/readme.md", "/srv/app/settings.json"):
++        v = g.classify("Write", {"file_path": p, "content": "x"}, cwd=_NEUTRAL_CWD, closure=c)
++        check(f"degenerate-{p}", v.classification == "none", v)
++
++
++def test_the_verdict_carries_the_resolved_location():
++    """The daemon prices a member's gate entry by LOCATION, from the location the gate resolved
++    — never from how the act was spelled. So every spelling of a write to an installed entry
++    (relative to the cwd, inside a `cd`, through `..`, through a symlinked dir, home-relative)
++    carries the same resolved location; a `..` that only looks like the location by prefix
++    resolves outside it."""
++    c = installed_closure()
++    root = tempfile.mkdtemp(prefix="mis-resolved-")
++    for member, man in manifests().items():
++        inst = man["install"]
++        rel_dest = inst["dest"][2:] if inst["dest"].startswith("~/") else inst["dest"].lstrip("/")
++        dest = os.path.join(root, member, rel_dest)
++        os.makedirs(dest, exist_ok=True)
++        base = os.path.basename(inst["gate_probe"]["entry"])
++        want = os.path.realpath(os.path.join(dest, base))
++        alias = os.path.join(root, member + "-alias")
++        os.symlink(dest, alias)
++        for label, tool, ti, cwd in (
++            ("absolute", "Write", {"file_path": os.path.join(dest, base)}, _NEUTRAL_CWD),
++            ("relative-to-cwd", "Write", {"file_path": base}, dest),
++            ("dot-relative", "Write", {"file_path": "./" + base}, dest),
++            ("cd-then-touch", "Bash", {"command": f"cd {dest} && touch {base}"}, _NEUTRAL_CWD),
++            ("dotdot-inside", "Bash", {"command": f"touch {dest}/sub/../{base}"}, _NEUTRAL_CWD),
++            ("symlinked-dir", "Bash", {"command": f"echo x > {alias}/{base}"}, _NEUTRAL_CWD),
++            ("double-slash", "Write", {"file_path": dest + "//" + base}, _NEUTRAL_CWD),
++        ):
++            v = g.classify(tool, ti, cwd=cwd, closure=c)
++            check(f"{member}-{label}-write", v.classification == "write", (ti, v))
++            check(f"{member}-{label}-resolved", v.landing == want, (ti, v.landing, want))
++        # A `..` that leaves the dest: the resolved location is OUTSIDE it.
++        v = g.classify("Bash", {"command": f"touch {dest}/../{os.path.basename(dest)}-old/{base}"},
++                       cwd=_NEUTRAL_CWD, closure=c)
++        check(f"{member}-lookalike-resolves-outside",
++              v.landing is None or not v.landing.startswith(dest + os.sep), v)
++    # Reads and non-closure acts carry no resolved location.
++    v = g.classify("Read", {"file_path": os.path.join(FAKE_HOME, ".gemini", "settings.json")},
++                   cwd=_NEUTRAL_CWD, closure=c)
++    check("a-read-carries-no-resolved", v.landing is None, v)
++
++
++ALL = [
++    test_every_member_install_surface_is_closure_installed,
++    test_every_member_install_surface_is_closure_repo,
++    test_every_member_install_surface_is_closure_on_failure,
++    test_reading_an_install_surface_is_a_read_not_a_write,
++    test_a_neighbour_of_the_surface_is_not_closure,
++    test_floor_install_snapshot_matches_the_manifests,
++    test_a_new_member_is_covered_by_its_manifest_alone,
++    test_a_degenerate_declaration_does_not_widen_the_closure,
++    test_the_verdict_carries_the_resolved_location,
++]
++
++if __name__ == "__main__":
++    print("member install surface — every member's installed gate, witness and registration")
++    failed = []
++    for t in ALL:
++        try:
++            t()
++            print("PASS", t.__name__)
++        except Exception as e:  # noqa: BLE001 — collect
++            failed.append(t.__name__)
++            print("FAIL", t.__name__, "::", e)
++    print()
++    if failed:
++        print(f"FAILURES: {failed}")
++        sys.exit(1)
++    print(f"OK — {len(ALL)} tests")
+diff --git a/plugins/_shared/registered_surface_test.py b/plugins/_shared/registered_surface_test.py
+new file mode 100755
+--- /dev/null
++++ b/plugins/_shared/registered_surface_test.py
+@@ -0,0 +1,340 @@
++#!/usr/bin/env python3
++"""A seat's EXECUTED governance surface — what its harness registration actually runs — is closure.
++
++The shared closure is built from install DECLARATIONS. A harness executes whatever its
++registration file POINTS AT, and on a seat installed by an older release that can be somewhere
++no declaration names (a legacy members dir; a split layout with the gate in one dir and a hook in
++another). Measured on a seat in use: the registration file was protected and the gate it pointed
++at was not. Any gap between the declared and the executed surface is an unprotected gate.
++
++So the common gate reads its own harness's registration (`registered_hooks`, the same readers as
++the timeout bound, every event) and governs (`registered_surface`):
++  * the running gate's own realpath and directory — ALWAYS, whatever the registration says
++    (fail closed: an unreadable registration can only leave this minimum, never fewer);
++  * every registered hook whose realpath lies in a hestia-owned dir (the gate's dir, the member's
++    declared dest) — the reconciler's and the census's ownership rule;
++  * NOT a hook another plugin registered from its own dir, even under a hestia basename.
++
++check() RAISES so pytest sees each case; the __main__ runner collects (house convention).
++"""
++import json
++import os
++import sys
++import tempfile
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, HERE)
++import hestia_governance_closure as g  # noqa: E402
++import hestia_single_gate as gate  # noqa: E402
++
++ENTRY = "pre_" + "tool_use.py"
++WIT = "wit" + "ness.py"
++LAW = "law_" + "inject.py"
++GEM = "before_" + "tool.py"
++
++
++def check(name, cond, detail=""):
++    if not cond:
++        raise AssertionError(f"{name} — {str(detail)[:900]}")
++
++
++def _home():
++    return os.path.realpath(tempfile.mkdtemp(prefix="regsurf-home-"))
++
++
++def _touch(path, text="# hook\n"):
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w", encoding="utf-8") as fh:
++        fh.write(text)
++    return path
++
++
++def _json_reg(path, events):
++    """events: {event: [command, ...]} in Claude Code's nested shape."""
++    doc = {"hooks": {ev: [{"matcher": "*", "hooks": [{"type": "command", "command": c, "timeout": 20}
++                                                       for c in cmds]}]
++                     for ev, cmds in events.items()}}
++    _touch(path, json.dumps(doc))
++
++
++HARNESS_JSON = {"event": "PreToolUse", "timeout_unit_seconds": 1, "default_timeout_seconds": 60,
++                "margin_seconds": 1.5, "on_timeout": "fail-open",
++                "registrations": ({"reader": "json-hook-commands", "layout": "nested",
++                                   "path": "~/.claude/settings.json"},
++                                  {"reader": "json-hook-commands", "layout": "nested",
++                                   "path": "~/.claude/settings.local.json"})}
++
++
++def _surface(harness, self_path, home, member="claude-code"):
++    env = {"HOME": home, "PATH": os.environ.get("PATH", "")}
++    b = gate.harness_bound(harness, self_path, 0.0, env=env)
++    prof = gate.GateProfile(member_id=member, identity_path=None, gate_path=self_path)
++    return gate.registered_surface(b, prof, env=env), b
++
++
++def _write(target, c, cwd="/"):
++    return g.classify("Write", {"file_path": target, "content": "x"}, cwd=cwd, closure=c)
++
++
++def test_legacy_members_dir_is_governed():
++    """The layout measured on a seat in use: the registration points the gate and the witness at
++    a legacy members dir no declaration names. RED on the declared closure alone."""
++    home = _home()
++    legacy = os.path.join(home, ".hestia", "members", "claude-code")
++    gate_file, wit = _touch(os.path.join(legacy, ENTRY)), _touch(os.path.join(legacy, WIT))
++    _json_reg(os.path.join(home, ".claude", "settings.json"),
++              {"PreToolUse": [f"python3 {gate_file}"], "PostToolUse": [f"python3 {wit}"]})
++    static = g.default_closure()
++    check("control-declared-closure-misses-it", _write(gate_file, static).classification != "write",
++          _write(gate_file, static))
++    s, _b = _surface(HARNESS_JSON, gate_file, home)
++    check("own-dir", legacy in s.own_dirs, s)
++    check("targets", gate_file in s.targets and wit in s.targets, s)
++    check("entry", gate_file in s.entries, s)
++    c = s.closure()
++    for t in (gate_file, wit, os.path.join(legacy, "dropped_beside.py")):
++        v = _write(t, c)
++        check(f"governed-{os.path.basename(t)}", v.classification == "write", v)
++    # shell forms reach it too
++    v = g.classify("Bash", {"command": f"cd {legacy} && echo x > {ENTRY}"}, cwd="/", closure=c)
++    check("governed-shell", v.classification == "write", v)
++
++
++def test_split_layout_both_dirs_are_governed():
++    """Gate and witness in a legacy plugin dir, another hook at the declared dest."""
++    home = _home()
++    legacy = os.path.join(home, ".claude", "plugins", "hestia", "hooks")
++    dest = os.path.join(home, ".claude", "hooks", "hestia")
++    gate_file, wit = _touch(os.path.join(legacy, ENTRY)), _touch(os.path.join(legacy, WIT))
++    law = _touch(os.path.join(dest, LAW))
++    _json_reg(os.path.join(home, ".claude", "settings.json"),
++              {"PreToolUse": [f"python3 {gate_file}"], "PostToolUse": [f"python3 {wit}"],
++               "UserPromptSubmit": [f"python3 {law}"]})
++    s, _b = _surface(HARNESS_JSON, gate_file, home)
++    check("both-own-dirs", legacy in s.own_dirs and dest in s.own_dirs, s)
++    check("all-targets", {gate_file, wit, law} <= set(s.targets), s)
++    c = s.closure()
++    for t in (gate_file, wit, law, os.path.join(legacy, "x.py"), os.path.join(dest, "y.py")):
++        check(f"governed-{t[len(home):]}", _write(t, c).classification == "write", _write(t, c))
++
++
++def test_an_unreadable_registration_fails_closed():
++    """A source that exists but cannot be parsed: the gate's own realpath and dir stay governed
++    (the minimum), and the source is reported as unreadable."""
++    home = _home()
++    legacy = os.path.join(home, ".hestia", "members", "claude-code")
++    gate_file = _touch(os.path.join(legacy, ENTRY))
++    _touch(os.path.join(home, ".claude", "settings.json"), "{ not json")
++    s, _b = _surface(HARNESS_JSON, gate_file, home)
++    check("reported-unreadable", any("settings.json" in u for u in s.unreadable), s)
++    c = s.closure()
++    for t in (gate_file, os.path.join(legacy, "anything.py")):
++        check(f"minimum-{os.path.basename(t)}", _write(t, c).classification == "write", _write(t, c))
++    # And with no registration at all, the same minimum.
++    home2 = _home()
++    g2 = _touch(os.path.join(home2, ".hestia", "members", "claude-code", ENTRY))
++    s2, _ = _surface(HARNESS_JSON, g2, home2)
++    check("no-registration-minimum", _write(g2, s2.closure()).classification == "write", s2)
++
++
++def test_a_foreign_hook_is_not_governed_by_being_registered():
++    """Another plugin's hooks in the same registration file — one under a hestia basename — are
++    not hestia's: they stay ordinary work."""
++    home = _home()
++    legacy = os.path.join(home, ".hestia", "members", "claude-code")
++    gate_file = _touch(os.path.join(legacy, ENTRY))
++    foreign_same_name = _touch(os.path.join(home, "vendor", "hardbound", "bin", ENTRY))
++    foreign_other = _touch(os.path.join(home, "tools", "lint.sh"))
++    _json_reg(os.path.join(home, ".claude", "settings.json"),
++              {"PreToolUse": [f"python3 {gate_file}", f"python3 {foreign_same_name}"],
++               "PostToolUse": [f"bash {foreign_other}"]})
++    s, _b = _surface(HARNESS_JSON, gate_file, home)
++    check("foreign-not-owned", foreign_same_name not in s.targets and foreign_other not in s.targets, s)
++    c = s.closure()
++    for t in (foreign_same_name, foreign_other):
++        check(f"foreign-ordinary-{os.path.basename(t)}", _write(t, c).classification != "write",
++              _write(t, c))
++    check("own-still-governed", _write(gate_file, c).classification == "write", _write(gate_file, c))
++
++
++def test_toml_registrations_are_read_too():
++    """Both readers: a nested TOML (codex shape) and a flat one (kimi shape), every event."""
++    home = _home()
++    for layout, member, text in (
++        ("nested", "codex",
++         '[[hooks.PreToolUse]]\nmatcher = "*"\n[[hooks.PreToolUse.hooks]]\ntype = "command"\n'
++         'command = "python3 {g}"\ntimeout = 20\n'
++         '[[hooks.PostToolUse]]\nmatcher = "*"\n[[hooks.PostToolUse.hooks]]\ntype = "command"\n'
++         'command = "python3 {w}"\ntimeout = 20\n'),
++        ("flat", "kimi-code",
++         '[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {g}"\ntimeout = 20\n'
++         '[[hooks]]\nevent = "PostToolUse"\ncommand = "python3 {w}"\ntimeout = 20\n'),
++    ):
++        legacy = os.path.join(home, ".hestia", "members", member)
++        gate_file, wit = _touch(os.path.join(legacy, ENTRY)), _touch(os.path.join(legacy, WIT))
++        cfg = os.path.join(home, f".{member}-cfg", "config.toml")
++        _touch(cfg, text.format(g=gate_file, w=wit))
++        harness = dict(HARNESS_JSON, registrations=({"reader": "toml-hook-commands", "layout": layout,
++                                                     "path": cfg},))
++        s, _b = _surface(harness, gate_file, home, member=member)
++        check(f"{layout}-targets", {gate_file, wit} <= set(s.targets), s)
++        check(f"{layout}-witness-governed", _write(wit, s.closure()).classification == "write", s)
++
++
++def test_a_registered_entry_no_declaration_covers_escalates_under_the_entry_marker():
++    """Pricing: a write to a registered gate entry the declared closure does not cover carries the
++    registered-entry marker, which the daemon prices like a declared entry. A write to another
++    file in the same dir carries the directory, not the marker."""
++    home = _home()
++    legacy = os.path.join(home, ".hestia", "members", "gemini")
++    gate_file = _touch(os.path.join(legacy, GEM))
++    _json_reg(os.path.join(home, ".gemini", "settings.json"), {"BeforeTool": [f"python3 {gate_file}"]})
++    harness = dict(HARNESS_JSON, event="BeforeTool",
++                   registrations=({"reader": "json-hook-commands", "layout": "nested",
++                                   "path": "~/.gemini/settings.json"},))
++    s, _b = _surface(harness, gate_file, home, member="gemini")
++
++    class Inv:
++        registered = s
++
++        def __init__(self, ev):
++            self.event = ev
++
++    def verdict(target):
++        ev = gate.GateEvent(tool="write_file", tool_input={"file_path": target, "content": "x"},
++                            cwd="/", session_id="s", raw={})
++        return gate._closure_verdict(Inv(ev))
++
++    v = verdict(gate_file)
++    check("entry-write", v.classification == "write" and v.marker == gate.REGISTERED_ENTRY_MARKER, v)
++    v = verdict(os.path.join(legacy, "other.py"))
++    check("dir-write-not-entry-marker", v.classification == "write"
++          and v.marker != gate.REGISTERED_ENTRY_MARKER, v)
++
++    # A WILDCARD that can expand onto the entry carries the marker too (Codex review of #1247
++    # at 18f91db, P1): the daemon knows only declared locations, so evidence the gate drops here
++    # is unrecoverable there. One that cannot reach the entry is the negative control.
++    def bash(command):
++        ev = gate.GateEvent(tool="Bash", tool_input={"command": command}, cwd="/",
++                            session_id="s", raw={})
++        return ev, gate._closure_verdict(Inv(ev))
++
++    # `[^z]` and `[[:alpha:]]` are the Codex re-review's (notice 18830, P1): fnmatch missed both.
++    for pattern in ("before_*", "before_too?.py", "[ab]efore_tool.py", "[^z]efore_tool.py",
++                    "[!z]efore_tool.py", "[[:alpha:]]efore_tool.py", "[]b]efore_tool.py",
++                    # Escapes (Codex review of held 29ae13a6, notice 18931): whatever the
++                    # producer's quote/escape normalization makes of these, they still mark.
++                    "b\\efore_*", "\\before_tool.py", "before\\_tool.py"):
++        ev, v = bash("touch " + os.path.join(legacy, pattern))
++        check(f"glob-entry-marker:{pattern}", v.classification == "write"
++              and v.marker == gate.REGISTERED_ENTRY_MARKER, v)
++        targets, _complete = gate._closure_write_set(ev, s.closure())
++        check(f"glob-entry-reaches:{pattern}",
++              any(gate._reaches_registered_entry(t, s.entries) for t in targets), targets)
++    ev, v = bash("touch " + os.path.join(legacy, "after_*"))
++    check("glob-not-entry", v.classification == "write"
++          and v.marker != gate.REGISTERED_ENTRY_MARKER, v)
++    targets, _complete = gate._closure_write_set(ev, s.closure())
++    check("glob-not-entry-reaches", not any(gate._reaches_registered_entry(t, s.entries)
++                                            for t in targets), targets)
++
++
++def test_an_unresolved_destination_leaves_the_write_set_incomplete():
++    """`complete` is about the whole write set, not the targets that matched (Codex review of
++    #1247 at 18f91db, P1 inherited from #1239). A `$VAR` destination — in the protected dir or
++    beside a known target — and a relative destination with no cwd to pin it are unenumerated,
++    so the daemon prices the highest bar. A literal, located write set stays complete."""
++    home = _home()
++    hooks = os.path.join(home, "plugins", "m", "hooks")
++
++    def write_set(command, cwd="/"):
++        ev = gate.GateEvent(tool="Bash", tool_input={"command": command}, cwd=cwd,
++                            session_id="s", raw={})
++        return gate._closure_write_set(ev)
++
++    for label, command, cwd in (
++        ("var-in-protected-dir", f"touch {hooks}/$TARGET", "/"),
++        ("var-after-known", f'touch {hooks}/ordinary.txt; touch "$TARGET"', "/"),
++        ("relative-no-cwd", "touch plugins/m/hooks/ordinary.txt", None),
++    ):
++        targets, complete = write_set(command, cwd)
++        check(f"incomplete:{label}", targets and not complete, (targets, complete))
++    for label, command, cwd in (
++        ("literal-absolute", f"touch {hooks}/ordinary.txt {hooks}/{ENTRY}", "/"),
++        ("relative-with-cwd", "touch plugins/m/hooks/ordinary.txt", home),
++        ("glob-in-protected-dir", f"touch {hooks}/*.py", "/"),
++    ):
++        targets, complete = write_set(command, cwd)
++        check(f"complete:{label}", targets and complete, (targets, complete))
++
++
++def test_the_degenerate_anchor_is_not_widened():
++    """A gate run from a home or the root does not govern the whole home: only the file itself."""
++    home = _home()
++    gate_file = _touch(os.path.join(home, ENTRY))
++    s, _b = _surface(HARNESS_JSON, gate_file, home)
++    check("no-home-dir-marker", home not in s.own_dirs, s)
++    check("file-itself-governed", _write(gate_file, s.closure()).classification == "write", s)
++    check("home-neighbour-ordinary",
++          _write(os.path.join(home, "notes.md"), s.closure()).classification != "write", s)
++
++
++def test_the_entry_matcher_covers_every_bash_expansion():
++    """Differential against Bash itself (Codex re-review of #1247, notice 18830): for each
++    pattern, every name Bash's pathname expansion produces in a directory of candidate names
++    must satisfy `_reaches_registered_entry`. Over-matching is allowed (it prices higher);
++    missing one is the P1."""
++    import subprocess
++    d = tempfile.mkdtemp(prefix="glob-diff-")
++    # Literal-bracket and literal-wildcard names are Codex's notice-18931 P2: an escaped `\\[`
++    # is a literal `[`, and the earlier corpus had no name it could expand onto.
++    names = [GEM, "after_tool.py", "Before_tool.py", "]efore_tool.py", "zefore_tool.py",
++             "b.py", "before_tool.pyc", "x[ab]yes", "x[ab]efore_tool.py", "[b]efore_tool.py",
++             "*efore_tool.py", "?efore_tool.py", "[=]efore_tool.py", "[:]efore_tool.py"]
++    for name in names:
++        _touch(os.path.join(d, name))
++    patterns = ["before_*", "[^z]efore_tool.py", "[!z]efore_tool.py", "[^b]efore_tool.py",
++                "[[:alpha:]]efore_tool.py", "[[:upper:]]efore_tool.py", "[]b]efore_tool.py",
++                "[!]]efore_tool.py", "[a-c]efore_tool.py", "[[=b=]]efore_tool.py",
++                "[\\b]efore_tool.py", "?efore_*", "*[[:punct:]]py", "[b", "[!a-z]*",
++                "x\\[ab]y*", "x\\[ab]efore_*", "\\[b]*", "\\[b\\]efore_tool.py", "\\**",
++                "\\?efore*", "b\\efore_*", "\\before_tool.py", "x\\[a*", "*\\]*",
++                "[[=b=]]*", "[[=e=]]*", "[[.b.]]*", "[[:punct:]]*", "[![:alpha:]]*", "[[]*"]
++    for pattern in patterns:
++        out = subprocess.run(["bash", "-c", 'shopt -s nullglob; cd "$1" && for f in $2; '
++                              'do printf "%s\\0" "$f"; done', "_", d, pattern],
++                             capture_output=True, text=True, check=True).stdout
++        for got in filter(None, out.split("\0")):
++            full = os.path.join(d, got)
++            check(f"bash-expansion-covered:{pattern}->{got}",
++                  gate._reaches_registered_entry(os.path.join(d, pattern), [full]),
++                  (pattern, got))
++
++
++ALL = [
++    test_legacy_members_dir_is_governed,
++    test_split_layout_both_dirs_are_governed,
++    test_an_unreadable_registration_fails_closed,
++    test_a_foreign_hook_is_not_governed_by_being_registered,
++    test_toml_registrations_are_read_too,
++    test_a_registered_entry_no_declaration_covers_escalates_under_the_entry_marker,
++    test_an_unresolved_destination_leaves_the_write_set_incomplete,
++    test_the_degenerate_anchor_is_not_widened,
++    test_the_entry_matcher_covers_every_bash_expansion,
++]
++
++if __name__ == "__main__":
++    print("registered surface — what a seat's harness registration actually runs is closure")
++    failed = []
++    for t in ALL:
++        try:
++            t()
++            print("PASS", t.__name__)
++        except Exception as e:  # noqa: BLE001 — collect
++            failed.append(t.__name__)
++            print("FAIL", t.__name__, "::", e)
++    print()
++    if failed:
++        print(f"FAILURES: {failed}")
++        sys.exit(1)
++    print(f"OK — {len(ALL)} tests")
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 8510c4d5d6080e7601cbc239cd63687b19a0acf2e0985c0d6d7c98d83dc2fad5  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -184,6 +184,9 @@
+     # THE common gate (one-gate stage C): every seat's shim delegates its whole decision to
+     # it, so after the cutover it is the single file whose edit changes all four seats.
+     "hestia_single_gate.py",
++    # A harness whose gate entry is not named pre_tool_use.py. The closure also derives each
++    # member's entry name from its install declaration; this is the canonical literal.
++    "before_tool.py",
+ )
+ 
+ 
+diff --git a/hooks-gt/_shared/hestia_governance_closure.py b/hooks-gt/_shared/hestia_governance_closure.py
+--- a/hooks-gt/_shared/hestia_governance_closure.py
++++ b/hooks-gt/_shared/hestia_governance_closure.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: c2b29069707506d97ad5af7727df7cf68b2fa92df46562174d2e2d6c5fe64f6f  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: e2d6fc7a1d56c388b4429d908d4b2db5b45116f274fdb34b3b94a33068ad11d3  (published ground truth; manifest: hooks-gt)
+ """hestia_governance_closure — ONE governance-access classifier for every harness shim.
+ 
+ PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
+@@ -55,6 +55,24 @@
+ same reasoning as the core's "mirrored, not imported" note: a load failure must not disarm
+ the check.
+ 
++EACH MEMBER'S INSTALLED SURFACE IS DERIVED FROM ITS INSTALL DECLARATION
++-----------------------------------------------------------------------
++A member's gate runs from where the installer put it, under the entry name its harness
++invokes, wired in by a harness config file — expects.json `install.dest`,
++`install.gate_probe.entry` and `install.registration.path`. Those three declarations ARE the
++member's governance surface on a running seat, so the closure derives it from them
++(_closure_from_install) instead of hoping each member's names match a basename list written
++before it existed: the dest dir becomes a dir marker, the entry basename a hooks-dir name,
++the registration path an exact path. A list keyed on names is a list of the members its
++author knew; a member with a different entry name or harness home falls outside it silently.
++
++The installed module has no manifests beside it ($HESTIA_HOME/shared holds the engine only),
++so its registry is empty and only the floor holds there. The floor therefore carries a
++SNAPSHOT of every member's install declaration (MEMBER_INSTALL_DECLARATIONS), derived by the
++same function, and a drift test pins that snapshot equal to the manifests — a member whose
++gate moves or is renamed without the snapshot following is red in CI, not open on a seat.
++Literal names stay in LITERAL_FLOOR too, as the backstop under both.
++
+ FAIL-CLOSED CONTRACT — WITH A DELIBERATE, LOAD-BEARING ASYMMETRY
+ ----------------------------------------------------------------
+ classify() NEVER raises to the caller and this module never calls sys.exit (it returns a
+@@ -101,6 +119,8 @@
+     "ClosureVerdict",
+     "Closure",
+     "LITERAL_FLOOR",
++    "FAILSAFE_CLOSURE",
++    "MEMBER_INSTALL_DECLARATIONS",
+     "RULE_WRITE",
+     "RULE_WRITE_UNPARSEABLE",
+     "RULE_OUT_OF_GRAMMAR",
+@@ -112,6 +132,9 @@
+     "load_closure",
+     "default_closure",
+     "attest_shims",
++    "resolve_location",
++    "declared_dest",
++    "registered_closure",
+ ]
+ 
+ # ── Rule ids (returned to the shim; the shim's refusal/witness names the RULE and the ACT) ──
+@@ -149,6 +172,10 @@
+     `resolved` are the other spellings of `resource` the match consulted — cwd-joined and
+     realpath'd, only where they differ — so an alias that matched by its destination carries
+     that destination to the escalation's price, not only the alias (Codex review of #1239).
++    `landing` is the one LOCATION the write reaches (#1247), what the daemon prices a member's
++    gate entry by: home-expanded, cwd-joined, realpath'd (`resolve_location`). It is a
++    separate field, not `resolved`, because the two answer different questions: `resolved`
++    lists every spelling the match consulted; `landing` names where the bytes go.
+     """
+     classification: str            # "none" | "read" | "write"
+     rule: Optional[str] = None     # rule id on "write" (and diagnostics on read-internal)
+@@ -156,9 +183,34 @@
+     resource: Optional[str] = None  # the argument that resolved into the closure
+     source: str = "floor"
+     resolved: tuple = ()
++    # The LOCATION the write reaches, as this classifier resolved it: home-expanded, joined
++    # onto the caller's cwd when relative, realpath'd (symlinks and `..` resolved). `resource`
++    # is the argument as written (it can be relative, or a name inside a `cd`); this is where it
++    # lands. Set on a resolved write only. It is what the daemon prices a member's gate entry
++    # from, by location, so the price never depends on how the act was spelled or summarised.
++    # (#1247 named this `resolved`; re-stacked on #1239, whose cleared `resolved` is the tuple
++    # above, it is `landing`.)
++    landing: Optional[str] = None
+ 
+ 
+ # ── The closure — segment-pattern matchers, tighten-only union ──────────────────────────────
++def resolve_location(target: str, cwd: Optional[str] = None) -> Optional[str]:
++    """Where `target` lands: home-expanded, cwd-joined when relative, then realpath'd. A
++    relative target with no cwd to pin it is normalised but stays relative (realpath would
++    resolve it against THIS process's cwd, which is not the classified command's)."""
++    if not isinstance(target, str) or not target:
++        return None
++    try:
++        p = os.path.expanduser(target.replace("\\", "/"))
++        if not os.path.isabs(p):
++            if not (isinstance(cwd, str) and cwd):
++                return os.path.normpath(p)
++            p = os.path.join(os.path.expanduser(cwd), p)
++        return os.path.realpath(p)
++    except (OSError, ValueError):
++        return None
++
++
+ def _segments(path: str) -> tuple:
+     p = path.replace("\\", "/").rstrip("/")
+     return tuple(s for s in p.split("/") if s not in ("", "."))
+@@ -299,6 +351,9 @@
+         "post_tool_use.py",
+         "witness.py",
+         "law_inject.py",
++        # A harness whose gate entry is not named like the others. Also derived from that
++        # member's install declaration (below); listed here as the literal backstop.
++        "before_tool.py",
+     ),
+     exact_paths=(
+         # The hub's STAGED EXECUTABLE (#415): deliberately a segment path, not a
+@@ -310,9 +365,139 @@
+         (".codex", "config.toml"),
+         (".kimi-code", "config.toml"),
+         (".kimi", "config.toml"),
++        (".gemini", "settings.json"),
+     ),
+     source="floor",
+ )
++
++
++# ── Install-declared surfaces — derived, so a member cannot fall outside by naming ──────────
++def _home_relative(path: str) -> tuple:
++    """Segments of an install path with its home anchor removed: `~/.x/hooks` -> (.x, hooks).
++    The closure matches by segment run / suffix, so the home it lands in does not matter."""
++    segs = _segments(path)
++    if segs and segs[0] in ("~", "$HOME", "${HOME}"):
++        segs = segs[1:]
++    return segs
++
++
++def _install_declaration(install: Any) -> Optional[dict]:
++    """The governance-relevant part of one expects.json `install` block, normalised:
++    {"member": str, "dest": str, "entry": str, "registration": [segments]}. None when unusable."""
++    if not isinstance(install, dict):
++        return None
++    member = install.get("member")
++    dest = install.get("dest")
++    probe = install.get("gate_probe")
++    entry = probe.get("entry") if isinstance(probe, dict) else None
++    reg = install.get("registration")
++    reg_path = reg.get("path") if isinstance(reg, dict) else None
++    out: dict = {}
++    if isinstance(member, str) and member:
++        out["member"] = member
++    if isinstance(dest, str) and dest:
++        out["dest"] = dest
++    if isinstance(entry, str) and entry:
++        out["entry"] = entry
++    if isinstance(reg_path, list) and reg_path and all(isinstance(s, str) for s in reg_path):
++        out["registration"] = list(reg_path)
++    return out or None
++
++
++def _closure_from_install(install: Any) -> Optional[Closure]:
++    """One member's installed governance surface, from its expects.json `install` block."""
++    return _closure_from_declaration(_install_declaration(install))
++
++
++def _closure_from_declaration(decl: Optional[dict]) -> Optional[Closure]:
++    """Derive one member's installed governance surface from its normalised declaration.
++
++    * dest  -> dir marker: every file the installer puts there (gate entry, witness, helpers,
++               and a NEW file dropped beside them) is a closure write.
++    * entry -> hooks-dir name: the entry basename governs under any hooks/ segment, as the
++               conventionally named entries already do (repo copies, published copies).
++    * registration -> exact path: the harness config that selects which gate runs.
++    A dest or registration of fewer than two segments is IGNORED, not widened: `hooks` or
++    `settings.json` alone would govern every same-named dir or file anywhere."""
++    if not isinstance(decl, dict):
++        return None
++    dirs, hooks_only, paths = [], [], []
++    dest = decl.get("dest")
++    if isinstance(dest, str):
++        segs = _home_relative(dest)
++        if len(segs) >= 2:
++            dirs.append(segs)
++    entry = decl.get("entry")
++    if isinstance(entry, str) and _segments(entry):
++        hooks_only.append(_segments(entry)[-1])
++    reg = decl.get("registration")
++    if isinstance(reg, (list, tuple)):
++        segs = tuple(s for s in reg if isinstance(s, str) and s not in ("", ".", "~"))
++        if len(segs) >= 2:
++            paths.append(segs)
++    if not (dirs or hooks_only or paths):
++        return None
++    return Closure(dir_markers=tuple(dirs), files_hooks_only=tuple(hooks_only),
++                   exact_paths=tuple(paths), source="install")
++
++
++# Snapshot of every member's install declaration, for the INSTALLED module (which has no
++# manifests beside it). Generated from plugins/*/expects.json by _install_declaration and
++# pinned equal to them by member_install_surface_test.py — edit the manifest, then this.
++MEMBER_INSTALL_DECLARATIONS = {
++    "claude-code": {"member": "claude-code", "dest": "~/.claude/hooks/hestia",
++                    "entry": "hooks/pre_tool_use.py", "registration": [".claude", "settings.json"]},
++    "codex": {"member": "codex", "dest": "~/.codex/hooks", "entry": "hooks/pre_tool_use.py",
++              "registration": [".codex", "config.toml"]},
++    "gemini": {"member": "gemini", "dest": "~/.gemini/hestia-plugins/gemini/hooks",
++               "entry": "hooks/before_tool.py", "registration": [".gemini", "settings.json"]},
++    "kimi": {"member": "kimi-code", "dest": "~/.kimi-code/hooks", "entry": "hooks/pre_tool_use.py",
++             "registration": [".kimi-code", "config.toml"]},
++}
++
++
++def declared_dest(member_id: str, home: Optional[str]) -> Optional[str]:
++    """Where this member's install declaration puts its hooks, home-expanded against `home` —
++    the caller's seat home, passed explicitly (no default: a home-relative dest with no home
++    names nowhere). None for a member with no declaration, or a home-relative dest without one."""
++    for decl in MEMBER_INSTALL_DECLARATIONS.values():
++        if decl.get("member") == member_id and isinstance(decl.get("dest"), str):
++            dest = decl["dest"]
++            if dest.startswith("~/"):
++                return os.path.join(home, dest[2:]) if home else None
++            return dest
++    return None
++
++
++def registered_closure(own_dirs: Iterable[str] = (), targets: Iterable[str] = ()) -> Closure:
++    """The EXECUTED governance surface of one seat, as absolute locations: the directories its
++    hestia-owned hooks run from (dir markers) and every hestia-owned hook its harness
++    registration actually points at (exact paths). Built at gate runtime from what the
++    harness REGISTERS (the caller reads the registration), unioned onto the declared closure
++    — a seat whose registration points somewhere no declaration names is governed there too.
++    Paths are realpath'd by the caller; a path of fewer than three segments is ignored rather
++    than widened (`/home/x` would govern a whole home)."""
++    dirs = tuple(seg for seg in (_segments(d) for d in own_dirs if isinstance(d, str))
++                 if len(seg) >= 3)
++    files = tuple(seg for seg in (_segments(t) for t in targets if isinstance(t, str))
++                  if len(seg) >= 3)
++    return Closure(dir_markers=dirs, exact_paths=files, source="registered")
++
++
++def _failsafe_closure() -> Closure:
++    out = LITERAL_FLOOR
++    for _name, decl in sorted(MEMBER_INSTALL_DECLARATIONS.items()):
++        extra = _closure_from_declaration(decl)
++        if extra is not None:
++            out = out.union(extra)
++    return Closure(out.dir_markers, out.files_anywhere, out.files_hooks_only, out.exact_paths,
++                   source="floor")
++
++
++try:
++    FAILSAFE_CLOSURE = _failsafe_closure()
++except Exception:  # noqa: BLE001 — never let the derivation disarm the literal floor
++    FAILSAFE_CLOSURE = LITERAL_FLOOR
+ 
+ 
+ def _closure_from_manifest(manifest: dict) -> Optional[Closure]:
+@@ -349,7 +534,8 @@
+ 
+ def load_closure(plugins_root: Optional[str] = None,
+                  manifest_reader: Optional[Callable[[], dict]] = None) -> Closure:
+-    """Assemble the closure: LITERAL_FLOOR ∪ every plugin manifest's declared closure.
++    """Assemble the closure: the fail-safe floor (LITERAL_FLOOR ∪ the install snapshot) ∪
++    every plugin manifest's declared closure ∪ every manifest's install-derived surface.
+ 
+     `manifest_reader` (tests, vault-backed readers) returns {plugin_name: manifest_dict}.
+     Default reads plugins/*/expects.json beside this module. NEVER raises; total failure
+@@ -361,16 +547,24 @@
+             root = plugins_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+             manifests = _read_manifests_fs(root)
+         if not isinstance(manifests, dict):
+-            return LITERAL_FLOOR
+-        result = LITERAL_FLOOR
++            return FAILSAFE_CLOSURE
++        result = FAILSAFE_CLOSURE
+         for _name, manifest in sorted(manifests.items()):
+-            extra = _closure_from_manifest(manifest)
+-            if extra is not None:
+-                result = result.union(extra)
++            for derive in (_closure_from_manifest, _closure_from_install_of):
++                try:
++                    extra = derive(manifest)
++                except Exception:  # noqa: BLE001 — a bad manifest adds nothing, removes nothing
++                    extra = None
++                if extra is not None:
++                    result = result.union(extra)
+         return Closure(result.dir_markers, result.files_anywhere, result.files_hooks_only,
+                        result.exact_paths, source="registry+floor")
+     except Exception:
+-        return LITERAL_FLOOR
++        return FAILSAFE_CLOSURE
++
++
++def _closure_from_install_of(manifest: Any) -> Optional[Closure]:
++    return _closure_from_install(manifest.get("install")) if isinstance(manifest, dict) else None
+ 
+ 
+ _DEFAULT_CLOSURE: Optional[Closure] = None
+@@ -1086,7 +1280,7 @@
+             closure = default_closure()
+         return closure, closure.source
+     except Exception:
+-        return LITERAL_FLOOR, LITERAL_FLOOR.source
++        return FAILSAFE_CLOSURE, FAILSAFE_CLOSURE.source
+ 
+ 
+ def _phase1_writes(tool_name: str, tool_input: Any, cwd: Optional[str], closure: Closure, src: str):
+@@ -1117,8 +1311,13 @@
+             marker = closure.match(t, cwd=cwd, position=position)
+             if marker:
+                 # Lazily, so `classify` stops matching at the first target exactly as before.
++                # `landing`: where this write lands (cwd-joined, symlinks and `..` resolved), so
++                # every write verdict carries the LOCATION the daemon prices member gate entries
++                # by, not only the argument as written and its other spellings (#1247).
+                 yield ClosureVerdict("write", rule, marker, t, src,
+-                                     tuple(closure.forms(t, cwd=cwd)[1:]))
++                                     tuple(closure.forms(t, cwd=cwd)[1:]),
++                                     landing=resolve_location(t, cwd) if rule == RULE_WRITE
++                                     else None)
+     except Exception as e:  # noqa: BLE001 — fail-closed: a broken write classifier must not admit
+         yield ClosureVerdict("write", RULE_INTERNAL, None, f"internal:{type(e).__name__}", src)
+ 
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: d369028728faf2aebd24f8c979d29da4a29f876a39aa63619490a1dc1f8ed9f5  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 10cd8ec2bca7db3e42269c1e74544ae4a526cb9c9aac07bd82049dd7b966502a  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -197,6 +197,13 @@
+     on_timeout: str                       # what the harness does when the timeout expires
+     sources: tuple = ()                   # where each timeout came from, for the record
+     why: str = ""                         # why the bound is unknown, when it is
++    # What the harness's registration ACTUALLY points its hooks at (every event, every source
++    # that exists), read in the same pass as the timeout. The closure is built from install
++    # declarations; execution is built from this. `decide()` governs both (see
++    # `registered_surface`). `unreadable` names a source that exists but could not be parsed.
++    self_path: str = ""                   # realpath of the running gate
++    registered: tuple = ()                # ((source, absolute target), ...)
++    unreadable: tuple = ()                # (source, ...)
+ 
+ 
+ _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+@@ -265,8 +272,24 @@
+     return out
+ 
+ 
++_CONFIG_CACHE: dict = {}
++
++
+ def _load_config(path: str, reader: str):
+-    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan")."""
++    """(parsed document, None) or (None, why). A TOML config without tomllib is (None, "scan").
++    Cached on (path, reader, mtime, size): the timeout bound and the registered-surface read
++    parse each registration once per process, and a changed file is re-read."""
++    st = os.stat(path)
++    key = (path, reader, st.st_mtime_ns, st.st_size)
++    hit = _CONFIG_CACHE.get(key)
++    if hit is not None:
++        return hit
++    out = _load_config_uncached(path, reader)
++    _CONFIG_CACHE[key] = out
++    return out
++
++
++def _load_config_uncached(path: str, reader: str):
+     with open(path, "rb") as fh:
+         raw = fh.read()
+     if reader == "json-hook-commands":
+@@ -288,7 +311,68 @@
+     return [float(m.group(1)) for m in re.finditer(r"(?m)^\s*timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:#.*)?$", text)]
+ 
+ 
++def _all_hook_commands(doc: Any, layout: str) -> list:
++    """Every hook command a parsed registration carries, on EVERY event (a witness is registered
++    on a different event from the gate)."""
++    out = []
++    hooks = doc.get("hooks") if isinstance(doc, dict) else None
++    if layout == "flat":
++        for tbl in hooks if isinstance(hooks, list) else []:
++            if isinstance(tbl, dict) and isinstance(tbl.get("command"), str):
++                out.append(tbl["command"])
++        return out
++    for groups in (hooks.values() if isinstance(hooks, dict) else ()):
++        for group in groups if isinstance(groups, list) else []:
++            for h in (group.get("hooks") or []) if isinstance(group, dict) else []:
++                if isinstance(h, dict) and isinstance(h.get("command"), str):
++                    out.append(h["command"])
++    return out
++
++
++_SCAN_COMMAND = re.compile(r"""(?m)^\s*command\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')""")
++
++
++def registered_hooks(harness: dict, *, cwd: Optional[str] = None, env=None) -> tuple:
++    """(registered, unreadable): every absolute hook target the harness's registration sources
++    name, as ((source, target), ...), and the sources that exist but could not be read or
++    parsed. NEVER raises: a failure is reported as unreadable, which the caller treats as
++    "this source may register more than we saw" (fail closed)."""
++    env = os.environ if env is None else env
++    registered, unreadable = [], []
++    for reg in (harness or {}).get("registrations") or ():
++        try:
++            path = _expand(str(reg.get("path") or ""), env, cwd)
++            if not path or not os.path.isfile(path):
++                continue
++            reader, layout = reg.get("reader") or "", reg.get("layout") or "nested"
++            doc, how = _load_config(path, reader)
++            if how == "scan":
++                with open(path, encoding="utf-8", errors="replace") as fh:
++                    commands = [m.group(1) or m.group(2) or "" for m in _SCAN_COMMAND.finditer(fh.read())]
++            else:
++                commands = _all_hook_commands(doc, layout)
++            for command in commands:
++                for t in _command_targets(command, env):
++                    registered.append((path, t))
++        except Exception:  # noqa: BLE001 — an unreadable source: the caller fails closed
++            unreadable.append(str(reg.get("path") or "?"))
++    return tuple(registered), tuple(unreadable)
++
++
+ def harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
++                  env=None) -> HarnessBound:
++    """The harness bound (`_harness_bound`), carrying what the registration actually registers
++    (`registered_hooks`) and the running gate's own realpath. NEVER raises."""
++    b = _harness_bound(harness, self_path, start, cwd=cwd, env=env)
++    try:
++        registered, unreadable = registered_hooks(harness, cwd=cwd, env=env)
++        me = os.path.realpath(self_path) if self_path else ""
++        return replace(b, self_path=me, registered=registered, unreadable=unreadable)
++    except Exception:  # noqa: BLE001 — the bound itself stands; the surface fails closed later
++        return b
++
++
++def _harness_bound(harness: dict, self_path: str, start: float, *, cwd: Optional[str] = None,
+                   env=None) -> HarnessBound:
+     """The deadline the harness's REAL registered timeout allows this hook process. NEVER raises.
+ 
+@@ -375,6 +459,84 @@
+                             f"the registration reader failed ({type(exc).__name__}: {exc})")
+ 
+ 
++# ── the EXECUTED surface: what this seat's harness registration actually runs ─────────────────
++
++#: The closure marker for a write to a seat's REGISTERED gate entry that no declared location
++#: covers (a legacy or hand-placed install). The daemon prices it sovereign_plus_peer, like a
++#: declared entry (core `bar_for`). Caller-asserted, so it can only raise the asker's own bar.
++REGISTERED_ENTRY_MARKER = "registered-gate-entry"
++
++
++@dataclass(frozen=True)
++class RegisteredSurface:
++    """One seat's executed governance surface. `own_dirs`: where hestia's hooks run from on this
++    seat (the running gate's realpath dir, always; the member's declared dest). `targets`: every
++    registered hook whose realpath lies in an own dir (the reconciler's and the census's
++    ownership rule: a same-named hook registered from another plugin's dir is FOREIGN and not
++    governed by being registered). `entries`: the gate entries among them (the running gate,
++    and any owned target named like it). `unreadable`: registration sources that could not be
++    read. Fail closed: whatever the registration says, the gate's own realpath and dir are
++    governed."""
++
++    self_path: str
++    own_dirs: tuple = ()
++    targets: tuple = ()
++    entries: tuple = ()
++    unreadable: tuple = ()
++
++    def closure(self):
++        return closure.default_closure().union(
++            closure.registered_closure(self.own_dirs, self.targets + self.entries),
++            source="registered+registry+floor")
++
++
++def _degenerate_dir(d: str, home: str) -> bool:
++    """A dir too broad to govern wholesale: the filesystem root, a home, or shallower."""
++    real = d.rstrip("/") or "/"
++    return (real == "/" or (bool(home) and real == home.rstrip("/"))
++            or len([x for x in real.split("/") if x]) < 3)
++
++
++def registered_surface(bound: Optional[HarnessBound], profile: GateProfile,
++                       env=None) -> Optional[RegisteredSurface]:
++    """The executed surface for this invocation, or None when there is no gate path to anchor
++    it (a non-seat caller). NEVER raises; a failure yields the minimum (self file and dir)."""
++    env = os.environ if env is None else env
++    self_path = (getattr(bound, "self_path", "") or
++                 (os.path.realpath(profile.gate_path) if profile.gate_path else ""))
++    if not self_path:
++        return None
++    # The seat's home from its environment only (no default): without one, nothing can be judged
++    # a home-level anchor, so only the file itself and its non-degenerate dir are governed.
++    home = os.path.realpath(env["HOME"]) if env.get("HOME") else ""
++    own = []
++    try:
++        d = os.path.dirname(self_path)
++        if not _degenerate_dir(d, home):
++            own.append(d)
++        dest = closure.declared_dest(profile.member_id, env.get("HOME"))
++        if dest:
++            rd = os.path.realpath(dest)
++            if rd not in own and not _degenerate_dir(rd, home):
++                own.append(rd)
++        base = os.path.basename(self_path)
++        targets, entries = [], [self_path]
++        for _source, t in getattr(bound, "registered", ()) or ():
++            rp = os.path.realpath(t)
++            if os.path.dirname(rp) not in own:
++                continue                      # foreign: another plugin's hook, not hestia's
++            if rp not in targets:
++                targets.append(rp)
++            if os.path.basename(rp) == base and rp not in entries:
++                entries.append(rp)
++        return RegisteredSurface(self_path, tuple(own), tuple(targets), tuple(entries),
++                                 tuple(getattr(bound, "unreadable", ()) or ()))
++    except Exception:  # noqa: BLE001 — the minimum, never fewer
++        d = os.path.dirname(self_path)
++        return RegisteredSurface(self_path, (d,) if not _degenerate_dir(d, home) else (),
++                                 (), (self_path,), ("registered surface failed",))
++
++
+ # ── invocation context ───────────────────────────────────────────────────────────────────────
+ 
+ @dataclass
+@@ -390,6 +552,7 @@
+     warnings: list = field(default_factory=list)   # [(rule, reason, verdict_available)]
+ 
+     budget: float = DEFAULT_DEADLINE_SECONDS
++    registered: Optional[RegisteredSurface] = None
+ 
+     @property
+     def phase_deadline(self) -> float:
+@@ -681,27 +844,146 @@
+     return tool, ti, targets, False
+ 
+ 
+-def _closure_view(event: GateEvent):
+-    """The closure classifier's verdict on this act (the first governed target decides)."""
++def _closure_view(event: GateEvent, against=None):
++    """The closure classifier's verdict on this act (the first governed target decides).
++    `against`: the closure to classify with (default: the declared one)."""
+     tool, ti, targets, is_patch = _closure_shape(event)
+     if is_patch:
+         found = None
+         for p in targets:
+-            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd)
++            cv = closure.classify("Write", {"file_path": p}, cwd=event.cwd, closure=against)
+             if cv.classification == "write":
+                 return cv
+             if cv.classification == "read" and found is None:
+                 found = cv
+         return found
+-    return closure.classify(tool, ti, cwd=event.cwd)
+-
+-
+-def _closure_write_set(event: GateEvent):
++    return closure.classify(tool, ti, cwd=event.cwd, closure=against)
++
++
++def _closure_verdict(inv: _Invocation):
++    """The declared closure's verdict, then — when it does not already refuse — the seat's
++    EXECUTED surface (`registered_surface`): a write to where this seat's registration actually
++    runs hestia's hooks is a closure write even where no declaration names the place. A write
++    reaching a registered gate entry escalates under REGISTERED_ENTRY_MARKER, priced like a
++    declared entry."""
++    cv = _closure_view(inv.event)
++    reg = inv.registered
++    if reg is None or (cv is not None and cv.classification == "write"):
++        return cv
++    rv = _closure_view(inv.event, reg.closure())
++    if rv is None or rv.classification != "write":
++        return cv if cv is not None else rv
++    if _reaches_registered_entry(getattr(rv, "landing", None), reg.entries):
++        rv = replace(rv, marker=REGISTERED_ENTRY_MARKER)
++    return rv
++
++
++_GLOB_CHARS = frozenset("*?[")
++
++
++def _reaches_registered_entry(target, entries) -> bool:
++    """True when this resolved write target CAN land on one of the seat's registered gate
++    entries: the entry itself, or a wildcard whose expansion can include it (Codex review of
++    #1247 at 18f91db, P1: `touch <legacy>/before_*` reached the running gate yet carried no
++    entry token, and the daemon — which knows only DECLARED locations — could not recover it).
++    The match is `_glob_over_regex`, which can only over-match a Bash glob: an over-match prices
++    higher, never lower."""
++    if not isinstance(target, str) or not target:
++        return False
++    if target in entries:
++        return True
++    if not _GLOB_CHARS.intersection(target):
++        return False
++    rx = _glob_over_regex(target)
++    return any(rx.fullmatch(e) for e in entries)
++
++
++def _glob_over_regex(pattern: str):
++    """A regex matching AT LEAST every path the Bash glob `pattern` can expand to. Not
++    `fnmatch` (Codex re-review of #1247 at 6976edbd, notice 18830, P1): fnmatch reads `[^z]` as
++    "`^` or `z`" and `[[:alpha:]]` as a bracket then a literal `]`, so both missed an entry Bash
++    expands them onto, and the write priced one approver. Here every bracket expression —
++    negated, ranged, POSIX class, whatever its locale reading — stands for ANY one character;
++    `*` and `?` may cross `/`; a backslash is optional before the ordinary character it escapes,
++    and consumes it; a backslash before `*`, `?` or `[` makes the rest of the pattern match
++    anything; and a `[` with no close Bash would accept does the same. Each choice can only
++    widen the set.
++
++    The escaped wildcard falls back rather than reading `\\[` as a literal `[` (Codex review of
++    held 29ae13a6, notice 18931, P2): the backslash used not to consume what it escaped, so the
++    `[` of `x\\[ab]y*` opened a bracket and `[ab]` shrank to one character, missing the
++    `x[ab]yes` Bash expands it onto. A literal reading would fix that pattern, but whether this
++    backslash still escapes depends on quoting the producer may already have removed (a quoted
++    backslash before a live `[`), and the safe answer to an uncertain reading is the wider one.
++
++    A bracket holding a `[` falls back too. Bash's own reading forks there: 5.2 expands
++    `[[=b=]]*` onto `bx` AND onto `[b]x` and `[=]x`, reading the first `[` as a literal and
++    `[=b=]` as the bracket. That fork surfaced when notice 18931's literal-bracket names joined
++    the differential corpus; one character for the whole bracket missed it."""
++    out, i, n = [], 0, len(pattern)
++    while i < n:
++        c = pattern[i]
++        if c == "*":
++            out.append(".*")
++        elif c == "?":
++            out.append(".")
++        elif c == "\\":
++            if i + 1 < n and pattern[i + 1] in _GLOB_CHARS:
++                out.append(r"\\?.*")
++                break
++            out.append(r"\\?")
++            if i + 1 < n:
++                i += 1
++                out.append(re.escape(pattern[i]))
++        elif c == "[":
++            end = _bracket_end(pattern, i)
++            if end is None or "[" in pattern[i + 1:end]:
++                out.append(".*")
++                break
++            out.append(".")
++            i = end
++        else:
++            out.append(re.escape(c))
++        i += 1
++    return re.compile("".join(out), re.DOTALL)
++
++
++def _bracket_end(pattern: str, start: int):
++    """Index of the `]` closing the bracket expression opened at `start`, read as Bash reads
++    it: a leading `!`/`^` negates, a `]` first in the list is literal, `[:…:]`, `[=…=]` and
++    `[.….]` are single items, a backslash escapes the next character. None when unclosed."""
++    i, n = start + 1, len(pattern)
++    if i < n and pattern[i] in "!^":
++        i += 1
++    if i < n and pattern[i] == "]":
++        i += 1
++    while i < n:
++        c = pattern[i]
++        if c == "]":
++            return i
++        if c == "\\":
++            i += 2
++            continue
++        if c == "[" and i + 1 < n and pattern[i + 1] in ":=.":
++            close = pattern.find(pattern[i + 1] + "]", i + 2)
++            if close != -1:
++                i = close + 2
++                continue
++        i += 1
++    return None
++
++
++def _closure_write_set(event: GateEvent, against=None):
+     """(targets, complete): EVERY governed write-position path this act resolves into the
+     closure, in order — not only the first, which is all `_closure_view` reports (Codex review
+     of #1239, P1-2: a later sovereign target beyond the bounded summary priced as nothing).
+     Each target rides with the other spellings the closure matched it by (cwd-joined,
+-    realpath'd), so an alias carries its destination (Codex review of #1239, P1-2).
++    realpath'd), so an alias carries its destination (Codex review of #1239, P1-2), and with
++    the LOCATION it lands at (`landing`, #1247) where that is not already among them: the
++    daemon prices a member's gate entry by where it is, and a relative or `cd`-qualified
++    spelling names no location.
++    `against`: the closure to enumerate with — the seat's registered surface when it has one, so
++    a write the executed surface governs is enumerated too (#1247).
+     `complete` is False when the write set could not be enumerated: an opaque writer, an
+     internal error, no target named, a command outside the grammar or unparseable (its
+     targets are vocabulary that matched, not resolved write positions: `$TARGET` names no
+@@ -711,17 +993,26 @@
+         tool, ti, targets, is_patch = _closure_shape(event)
+         if is_patch:
+             verdicts = [v for p in targets
+-                        for v in closure.write_verdicts("Write", {"file_path": p}, cwd=event.cwd)]
++                        for v in closure.write_verdicts("Write", {"file_path": p}, cwd=event.cwd,
++                                                        closure=against)]
+         else:
+-            verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd)
++            verdicts = closure.write_verdicts(tool, ti, cwd=event.cwd, closure=against)
+         resolved = []
+         for v in verdicts:
+             if v.marker and v.resource:
+                 resolved.append(v.resource)
+                 resolved.extend(getattr(v, "resolved", ()))
++                landing = getattr(v, "landing", None)
++                if isinstance(landing, str) and landing and landing not in resolved:
++                    resolved.append(landing)
++        # COMPLETE: #1239's rule (every verdict a resolved write whose target is absolute or
++        # was pinned by a cwd-join / realpath), AND #1247's (its landing is an absolute
++        # location). Two conjuncts, so neither cleared rule can be the weaker reading: a write
++        # set either one calls incomplete rides the `unenumerated` sentinel, priced highest.
+         complete = bool(resolved) and all(
+             v.marker and v.rule == closure.RULE_WRITE
+             and (os.path.isabs(v.resource) or getattr(v, "resolved", ()))
++            and isinstance(getattr(v, "landing", None), str) and os.path.isabs(v.landing)
+             for v in verdicts)
+         return resolved, complete
+     except Exception:  # noqa: BLE001 — unenumerated is priced highest, never lowest
+@@ -730,7 +1021,7 @@
+ 
+ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
+     ev, prof = inv.event, inv.profile
+-    cv = _closure_view(ev)
++    cv = _closure_verdict(inv)
+     if cv is None or cv.classification not in ("read", "write"):
+         return None
+     marker = cv.marker or cv.rule or "governance"
+@@ -745,7 +1036,13 @@
+         except Exception:  # noqa: BLE001
+             pass
+         return None
+-    write_set = _closure_write_set(ev)
++    write_set = _closure_write_set(ev, inv.registered.closure() if inv.registered else None)
++    if inv.registered is not None and any(_reaches_registered_entry(t, inv.registered.entries)
++                                          for t in write_set[0]):
++        # A target is this seat's REGISTERED gate entry (one no declaration covers): say so
++        # in-band, so the daemon prices it like a declared entry even when it is not the target
++        # the closure reported first (`cv`'s marker covers only that one).
++        write_set = (write_set[0] + [REGISTERED_ENTRY_MARKER], write_set[1])
+     try:
+         claimed = _bounded(
+             inv.phase_deadline, mechanism.claim_self_write,
+@@ -757,11 +1054,11 @@
+             supersession=mechanism.SUPERSESSION_HARD_STOP,
+             deadline=inv.phase_deadline,
+             # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
+-            # path the closure resolved, not only the one `cv` reports. The daemon prices the bar
+-            # over the marker, the act and all of them, highest wins — `inv.attempted` is a
+-            # bounded, self-censoring summary that can cut a filename out (or withhold the whole
+-            # command); these are carried independently of it. An unenumerable write set is
+-            # said as such, and priced highest.
++            # path the closure resolved, not only the one `cv` reports — each with its other
++            # spellings and the LOCATION it lands at (#1247). The daemon prices the bar over the marker, the act and all of
++            # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
++            # cut a filename out (or withhold the whole command); these are carried
++            # independently of it. An unenumerable write set is said as such, and priced highest.
+             resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
+         if claimed is _LATE:
+             # Unknown, not "nothing happened": the daemon may have opened or matched an
+@@ -992,6 +1289,7 @@
+         if not isinstance(profile, GateProfile):
+             raise TypeError("decide requires a GateProfile")
+         inv = _Invocation(event=event, profile=profile, rollout=mode, deadline=deadline,
++                          registered=registered_surface(bound, profile),
+                           key=mechanism.correlation_key(event.raw), budget=budget)
+         inv.attempted = attempted_of(event)
+         return _sequence(inv, permitted_roles)
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855",
++      "sha256": "8510c4d5d6080e7601cbc239cd63687b19a0acf2e0985c0d6d7c98d83dc2fad5",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -17,7 +17,7 @@
+     },
+     {
+       "path": "hestia_governance_closure.py",
+-      "sha256": "c2b29069707506d97ad5af7727df7cf68b2fa92df46562174d2e2d6c5fe64f6f",
++      "sha256": "e2d6fc7a1d56c388b4429d908d4b2db5b45116f274fdb34b3b94a33068ad11d3",
+       "source": "plugins/_shared/hestia_governance_closure.py"
+     },
+     {
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "d369028728faf2aebd24f8c979d29da4a29f876a39aa63619490a1dc1f8ed9f5",
++      "sha256": "10cd8ec2bca7db3e42269c1e74544ae4a526cb9c9aac07bd82049dd7b966502a",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "a95cbcb1292180956634798c6705cf2664dc1d0d3907b5afa2a31e1d8801e2eb"
++  "gt_version": "aa1def96f9a0cd00974663018357ab4658d41ce34d2da3db3ec3f26465d3a71e"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "a95cbcb1292180956634798c6705cf2664dc1d0d3907b5afa2a31e1d8801e2eb",
++    "gt_version": "aa1def96f9a0cd00974663018357ab4658d41ce34d2da3db3ec3f26465d3a71e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855"
++        "sha256": "8510c4d5d6080e7601cbc239cd63687b19a0acf2e0985c0d6d7c98d83dc2fad5"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "c2b29069707506d97ad5af7727df7cf68b2fa92df46562174d2e2d6c5fe64f6f"
++        "sha256": "e2d6fc7a1d56c388b4429d908d4b2db5b45116f274fdb34b3b94a33068ad11d3"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "d369028728faf2aebd24f8c979d29da4a29f876a39aa63619490a1dc1f8ed9f5"
++        "sha256": "10cd8ec2bca7db3e42269c1e74544ae4a526cb9c9aac07bd82049dd7b966502a"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "f5c16bc97f3af24023b92bffaa14b84a48e18bd19f006dbd06551160411c7fa0"
++  "gt_version": "78f00311fb4aab8592eb0dd7fba2fb0f8d95acf2f2bd4bebd13f281a5c569301"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "a95cbcb1292180956634798c6705cf2664dc1d0d3907b5afa2a31e1d8801e2eb",
++    "gt_version": "aa1def96f9a0cd00974663018357ab4658d41ce34d2da3db3ec3f26465d3a71e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855"
++        "sha256": "8510c4d5d6080e7601cbc239cd63687b19a0acf2e0985c0d6d7c98d83dc2fad5"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "c2b29069707506d97ad5af7727df7cf68b2fa92df46562174d2e2d6c5fe64f6f"
++        "sha256": "e2d6fc7a1d56c388b4429d908d4b2db5b45116f274fdb34b3b94a33068ad11d3"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "d369028728faf2aebd24f8c979d29da4a29f876a39aa63619490a1dc1f8ed9f5"
++        "sha256": "10cd8ec2bca7db3e42269c1e74544ae4a526cb9c9aac07bd82049dd7b966502a"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "caf9cb9b4154ccf01e523e73ad47687ff94a68390a9a26a74d60d3ad8bff3f97"
++  "gt_version": "b8f958e85dd72dd542349d183eb52c2a8ff201ab22a28a9ba99a9f605d3bd32e"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "a95cbcb1292180956634798c6705cf2664dc1d0d3907b5afa2a31e1d8801e2eb",
++    "gt_version": "aa1def96f9a0cd00974663018357ab4658d41ce34d2da3db3ec3f26465d3a71e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855"
++        "sha256": "8510c4d5d6080e7601cbc239cd63687b19a0acf2e0985c0d6d7c98d83dc2fad5"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "c2b29069707506d97ad5af7727df7cf68b2fa92df46562174d2e2d6c5fe64f6f"
++        "sha256": "e2d6fc7a1d56c388b4429d908d4b2db5b45116f274fdb34b3b94a33068ad11d3"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "d369028728faf2aebd24f8c979d29da4a29f876a39aa63619490a1dc1f8ed9f5"
++        "sha256": "10cd8ec2bca7db3e42269c1e74544ae4a526cb9c9aac07bd82049dd7b966502a"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "e23a15ed4fc61cdc6bc5c2e60e8a9f21ecc4d0d5120c5558d1e739e3530b18c0"
++  "gt_version": "b104dc6929185c0486bb33c7ee78ea1f74d3b22c9efaf74371096ce46f5c367b"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "a95cbcb1292180956634798c6705cf2664dc1d0d3907b5afa2a31e1d8801e2eb",
++    "gt_version": "aa1def96f9a0cd00974663018357ab4658d41ce34d2da3db3ec3f26465d3a71e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "cd797980c479cb858359757273c575f6ba2e9ad0268a99773d10a3c9deea9855"
++        "sha256": "8510c4d5d6080e7601cbc239cd63687b19a0acf2e0985c0d6d7c98d83dc2fad5"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "c2b29069707506d97ad5af7727df7cf68b2fa92df46562174d2e2d6c5fe64f6f"
++        "sha256": "e2d6fc7a1d56c388b4429d908d4b2db5b45116f274fdb34b3b94a33068ad11d3"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "d369028728faf2aebd24f8c979d29da4a29f876a39aa63619490a1dc1f8ed9f5"
++        "sha256": "10cd8ec2bca7db3e42269c1e74544ae4a526cb9c9aac07bd82049dd7b966502a"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "a5806ae27a3d9b0123e29b13b6f8e10053f3017115d56b7d61a403a21bbf8338"
++  "gt_version": "e16e2e57de2e796c7194f32aff176d7f0efbb7e91684023b30e9e5e7af047e54"
+ }

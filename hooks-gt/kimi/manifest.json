@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hooks/hooks.json",
-      "sha256": "a40fc68686096fc0088094b0270d634f43d9714d269575c2de7e9fe09b5c8029",
+      "sha256": "cb7f5833f591f8ec646f75f7a7b0cd10ada3c464c61a582217b5750374af9a12",
       "source": "plugins/kimi/hooks/hooks.json"
     },
     {
@@ -22,7 +22,7 @@
     },
     {
       "path": "hooks/pre_tool_use.py",
-      "sha256": "47b47c0b34c3cbc5a0b4fd9b1111894d614c8b9daadad3d56e68a0141233d7d6",
+      "sha256": "eb8969c817fb4fb6d60db00a2ecc26e38bd8debfd02bf54be29e05636f3268b1",
       "source": "plugins/kimi/hooks/pre_tool_use.py"
     },
     {
@@ -33,23 +33,27 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "17f675c2b1d7f981b03e63a350e951cee778aa8cea071c3d005c9e13937bd6d7",
+    "gt_version": "7d630395ef33d82fb7efde8c4c7b91d4a934330172e09b347c69ccc1aab9009d",
     "files": [
       {
         "path": "hestia_gate_core.py",
-        "sha256": "3fbd8342c1f75a1015d7c12e709921f3a1e575f625c87e338b221a4f10ec07f5"
+        "sha256": "2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930"
       },
       {
         "path": "hestia_gate_mechanism.py",
-        "sha256": "b3e6d0ef2c718f65aaf2e21066f19308920098b5cea007f7b72bca1886303b49"
+        "sha256": "2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf"
       },
       {
         "path": "hestia_governance_closure.py",
-        "sha256": "2f759e13985a8e14cf2c41b2402c902eb57e4fa6e69d2cb36fb933209d51134b"
+        "sha256": "1f9a167c9793a1a416307b346b1013b343b421135675a5302a8b9deb60615e94"
       },
       {
         "path": "hestia_shell_classifier.py",
         "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2"
+      },
+      {
+        "path": "hestia_single_gate.py",
+        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
       },
       {
         "path": "hestia_witness_core.py",
@@ -57,6 +61,22 @@
       }
     ]
   },
-  "requires": [],
-  "gt_version": "51ec75931abab2b516d3c5747520f94ac754c554c0771c1b3c50c2318c114778"
+  "requires": [
+    {
+      "unit": "member-mesh",
+      "path": "hestia-mesh.py",
+      "sha256": "79db46f592c5b9f3d32260485578d6c0c8603f75ec12130beedee5573da4d1ce"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "prompt-disposition-watch.sh",
+      "sha256": "23ad2cc1aa28db404c892a694b19ee83ee64d9394827cf6cccbabaa003ca47e0"
+    },
+    {
+      "unit": "member-mesh",
+      "path": "session-mesh-inbox.sh",
+      "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+    }
+  ],
+  "gt_version": "685be317fa127c49d457a9789a50a4be166f9956d1c524e6df11143e1c285dd8"
 }

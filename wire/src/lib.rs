@@ -32,6 +32,27 @@
 
 #![forbid(unsafe_code)]
 
+/// Compatibility generation of the daemon's **operator API** (the `/api/*` routes the app
+/// calls), served by the daemon at `GET /api/version` as `api_compat` and compared by the app
+/// at connect.
+///
+/// The daemon and app release in lockstep under one version (root `VERSION`), but a pairing of
+/// different releases still happens in the field: an app updated before the host's daemon, a
+/// remote daemon on another machine. The version string says *which* release; this integer says
+/// whether the app can talk to it. The rule:
+///
+/// * **Equal** `api_compat`: compatible. A differing version is shown as skew, not an error.
+/// * **Different** `api_compat`: incompatible. The app shows a mismatch state instead of
+///   attempting routes whose shape it does not know.
+///
+/// Bump it in the same commit as any **breaking** change to an operator route the app calls
+/// (a removed or renamed route, a removed or retyped response field, a newly required request
+/// field). Additive changes (a new route, a new optional field) do not bump it. Both sides
+/// compile this one constant, so a bump cannot land on one side only.
+///
+/// History: 1 = the first handshake (hestia 0.3.0).
+pub const OPERATOR_API_COMPAT: u32 = 1;
+
 /// Domain separator for the operator-session transcript.
 ///
 /// Changing this string, the field order, or a field's spelling is a **v2 wire change** and

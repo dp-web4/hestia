@@ -78,6 +78,13 @@ with tempfile.TemporaryDirectory() as d:
     # A3: provenance header names the source log
     check("A3 provenance header", r.stdout.startswith("from kimi-20260202-000000.log"), repr(r.stdout[:80]))
 
+    # A3b: the header must NOT carry the full path (#1291). Since #1232 the log
+    # dir is outside a wake's granted scope; rendering it baited five+ gated
+    # reads and peer scope decisions in one day. The basename is the provenance.
+    check("A3b no full-path bait (#1291)",
+          os.path.join(d, "kimi-20260202-000000.log") not in r.stdout
+          and "full log" not in r.stdout, repr(r.stdout[:120]))
+
     # A4: line structure survives sanitization (the \\n-eating bug)
     write(os.path.join(d, "kimi-20260303-000000.log"), "first line\nsecond line\nthird line\n")
     r = run(d, "kimi")

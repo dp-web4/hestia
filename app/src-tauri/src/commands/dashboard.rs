@@ -13,25 +13,25 @@ pub async fn get_failures(state: State<'_, AppState>) -> Result<Value, String> {
     daemon::get(&state, "/api/failures").await
 }
 
-/// Liveness + auth state in one probe, so the offline screen can tell
-/// "daemon down" apart from "signed out" — they look identical otherwise
+/// Liveness, compatibility and auth state in one probe, so the UI can tell "daemon down",
+/// "daemon speaks a different API" and "signed out" apart. They look identical otherwise,
 /// and that ambiguity is what made v0.1.2 read as simply broken.
+///
+/// The probe is the unauthenticated `GET /api/version` handshake (web4#904). It replaced a
+/// `POST /api/operator/challenge`, which proved liveness but minted a nonce on every poll and
+/// said nothing about whether the daemon was a release this app can talk to.
 #[tauri::command]
 pub async fn get_daemon_status(state: State<'_, AppState>) -> Result<Value, String> {
     let url = state.daemon_url();
-    // The challenge route is unauthenticated by design: reaching it proves
-    // the daemon is up without needing a session.
-    let online = reqwest::Client::new()
-        .post(format!("{url}/api/operator/challenge"))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    // Always fresh here: this is the screen that tells the operator what is on the other end.
+    let h = crate::handshake::handshake(&url).await;
+    state.store_handshake(&url, &h);
     let status = state.operator_status();
     Ok(serde_json::json!({
-        "online": online,
+        "online": h.state.answered(),
         "url": url,
         "signed_in": status.signed_in,
         "operator_lct": status.lct_id,
+        "handshake": h,
     }))
 }

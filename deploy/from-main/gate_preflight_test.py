@@ -19,7 +19,8 @@ SPEC.loader.exec_module(gate_preflight)
 
 def make_member(repo: Path, home: Path, name: str, *, registered: bool = True,
                 outcome: str = "allow", reader: str = "json-hook-commands",
-                advisory: bool = False, body: str | None = None) -> None:
+                advisory: bool = False, body: str | None = None,
+                seat: str | None = None) -> None:
     plugin = repo / "plugins" / name
     hooks = plugin / "hooks"
     hooks.mkdir(parents=True)
@@ -34,6 +35,8 @@ def make_member(repo: Path, home: Path, name: str, *, registered: bool = True,
             "gate_probe": {"entry": "hooks/pre_tool_use.py", "events": [declared]},
         }
     }
+    if seat is not None:
+        spec["install"]["member"] = seat
     (plugin / "expects.json").write_text(json.dumps(spec), encoding="utf-8")
     if body is not None:
         pass
@@ -293,7 +296,185 @@ def test_a_projection_consuming_candidate_is_probed_against_the_candidate_engine
         assert rows == [{"member": "alpha", "probe": "read", "status": "ok"}]
 
 
+def test_the_throwaway_projection_is_keyed_by_the_seat_id_not_the_plugin_dir():
+    """kimi's plugin dir is `kimi` but its seat (install.member) and projection are `kimi-code`.
+    Keyed by the dir, the throwaway lookup missed `seats/kimi.env`, the probe kept the real
+    home, and the candidate loaded the INSTALLED engine (CBP 2026-10-05T22:20Z: kimi refused
+    `gate.bootstrap_unavailable`, codex and gemini -- whose names match -- passed)."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        repo, home = root / "repo", root / "home"
+        launcher_home = root / "launcher-home"
+        seats = launcher_home / "seats"
+        seats.mkdir(parents=True)
+        (seats / "beta-code.env").write_text(
+            f"HESTIA_HOME={launcher_home}\nHESTIA_SHARED_DIR={root / 'installed-shared'}\n",
+            encoding="utf-8",
+        )
+        expected = str((repo / "plugins" / "_shared").resolve())
+        body = (
+            "import os, sys; sys.stdin.read()\n"
+            "for line in open(os.path.join(os.environ['HESTIA_HOME'], 'seats', 'beta-code.env')):\n"
+            "    line = line.strip()\n"
+            "    if line and '=' in line:\n"
+            "        k, v = line.split('=', 1); os.environ[k] = v\n"
+            f"raise SystemExit(0 if os.environ.get('HESTIA_SHARED_DIR') == {expected!r} else 2)\n"
+        )
+        make_member(repo, home, "beta", body=body, seat="beta-code")
+        config = home / ".beta" / "settings.json"
+        installed = home / ".beta" / "hooks" / "pre_tool_use.py"
+        config.write_text(json.dumps({"hooks": [{"command": f'HESTIA_HOME="{launcher_home}" python3 {installed}'}]}),
+                          encoding="utf-8")
+        rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+        assert good, rows
+        assert rows == [{"member": "beta", "probe": "read", "status": "ok"}]
+
+
+def _templated_member(repo: Path, home: Path, name: str, *, with_registrar: bool = True) -> Path:
+    """A member the way a real plugin ships since the reconciler: install.dest, a hooks/hooks.json
+    template whose gate line renders the locator, and the CANDIDATE's own deploy/register-members.py
+    (copied from this tree). The host's registration is today's stale line: no HESTIA_HOME (#1237)."""
+    import shutil
+    plugin = repo / "plugins" / name
+    (plugin / "hooks").mkdir(parents=True)
+    event = {"hook_event_name": "PreToolUse", "tool_name": "Read", "tool_input": {"file_path": "{scratch}"}}
+    (plugin / "expects.json").write_text(json.dumps({"install": {
+        "member": name, "dest": f"~/.{name}/hooks", "default_role": "role:constellation:interactive-dev",
+        "registration": {"path": [f".{name}", "settings.json"], "reader": "json-hook-commands"},
+        "files": ["hooks/pre_tool_use.py"],
+        "gate_probe": {"entry": "hooks/pre_tool_use.py", "events": [{"label": "read", "event": event}]},
+    }}), encoding="utf-8")
+    (plugin / "hooks" / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "timeout": 10,
+         "command": f'HESTIA_HOME=@HESTIA_HOME@ HESTIA_ROLE="${{HESTIA_ROLE:-@HESTIA_DEFAULT_ROLE@}}" '
+                    f'python3 @HESTIA_PLUGIN_ROOT@/{name}/hooks/pre_tool_use.py'}]}]}}),
+        encoding="utf-8")
+    # the candidate also needs the launch role the line passes through (default: the declaration)
+    (plugin / "hooks" / "pre_tool_use.py").write_text(
+        _consumer_body().replace("raise SystemExit(0)\n",
+                                 "raise SystemExit(0 if os.environ.get('HESTIA_ROLE') == "
+                                 "os.environ.get('WANT_ROLE', 'role:constellation:interactive-dev') else 3)\n"),
+        encoding="utf-8")
+    if with_registrar:
+        (repo / "deploy").mkdir(parents=True, exist_ok=True)
+        shutil.copy(REPO / "deploy" / "register-members.py", repo / "deploy" / "register-members.py")
+    config = home / f".{name}" / "settings.json"
+    config.parent.mkdir(parents=True)
+    installed = home / f".{name}" / "hooks" / "pre_tool_use.py"
+    config.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": f"python3 {installed}", "timeout": 10}]}]}}, indent=2), encoding="utf-8")
+    return config
+
+
+def test_the_preflight_judges_the_rendered_line_not_the_stale_registered_one():
+    """dp 2026-10-06 (#1237, #1242): CBP, Legion and HUB refused every members' install since #1231
+    because the preflight probed the candidate under the REGISTERED line, which lacked HESTIA_HOME,
+    while the install -- now a reconciler -- is what rewrites that line. The preflight must judge
+    the line the install WILL write: a stale registration plus a candidate that needs the locator
+    PASSES, and the preflight writes nothing. An old candidate tree without the reconciler keeps
+    the old question (its install never rewrites the line), and an unset deploy HESTIA_HOME is
+    unmeasured -- the install would refuse to register -- never a silent pass."""
+    import os
+    saved = os.environ.get("HESTIA_HOME")
+    # the launcher's own role would (correctly) override the declared default: isolate from it
+    saved_role = os.environ.pop("HESTIA_ROLE", None)
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            repo, home = root / "repo", root / "home"
+            config = _templated_member(repo, home, "alpha")
+            before = config.read_bytes()
+            os.environ["HESTIA_HOME"] = str(root / "deploy-home")
+            rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert good, rows
+            assert rows == [{"member": "alpha", "probe": "read", "status": "ok"}], rows
+            assert config.read_bytes() == before, "the preflight wrote the registration"
+            # the role is a pass-through: a launcher's own HESTIA_ROLE wins over the declared default
+            os.environ["HESTIA_ROLE"] = os.environ["WANT_ROLE"] = "role:constellation:mesh-worker"
+            try:
+                rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+                assert good, rows
+            finally:
+                del os.environ["HESTIA_ROLE"], os.environ["WANT_ROLE"]
+            # the harness present with no config file yet: the gate the install will add is probed
+            config.unlink()
+            rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert good and rows == [{"member": "alpha", "probe": "read", "status": "ok"}], rows
+            assert not config.exists()
+            config.write_bytes(before)
+            # no deploy locator: nothing can be rendered, so nothing is certified
+            del os.environ["HESTIA_HOME"]
+            rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert not good, rows
+            assert rows[0]["status"] == "unmeasured" and "HESTIA_HOME is not set" in rows[0]["reason"], rows
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            repo, home = root / "repo", root / "home"
+            _templated_member(repo, home, "alpha", with_registrar=False)
+            os.environ["HESTIA_HOME"] = str(root / "deploy-home")
+            rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert not good and rows[0]["status"] == "refused" and "config.unbacked" in rows[0]["reason"], rows
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_HOME", None)
+        else:
+            os.environ["HESTIA_HOME"] = saved
+        if saved_role is not None:
+            os.environ["HESTIA_ROLE"] = saved_role
+
+
+def test_the_preflight_refuses_exactly_what_the_installer_refuses():
+    """Codex review 17401 P1: reconciled_commands() returned ok without the TOML placement and proof
+    the installer runs, so an owned gate written as a valid INLINE array (`hooks = [{...}]`) -- which
+    register_member() refuses, config untouched -- was certified by the preflight under a line that
+    would never be written: the new gate then runs under the stale, locator-less line. The two must
+    share one preparation: what the installer refuses, the preflight must not certify."""
+    import os
+    import importlib.util as ilu
+    saved = os.environ.get("HESTIA_HOME")
+    saved_role = os.environ.pop("HESTIA_ROLE", None)
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            repo, home = root / "repo", root / "home"
+            _templated_member(repo, home, "alpha")
+            spec_path = repo / "plugins" / "alpha" / "expects.json"
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            spec["install"]["registration"] = {"path": [".alpha", "config.toml"], "reader": "toml-hook-commands"}
+            spec_path.write_text(json.dumps(spec), encoding="utf-8")
+            installed = home / ".alpha" / "hooks" / "pre_tool_use.py"
+            installed.parent.mkdir(parents=True, exist_ok=True)
+            installed.write_text("# installed\n", encoding="utf-8")
+            toml = home / ".alpha" / "config.toml"
+            text = ('[[hooks.PreToolUse]]\nmatcher = "*"\n'
+                    f'hooks = [{{type = "command", command = "python3 {installed}", timeout = 10}}]\n')
+            toml.write_text(text, encoding="utf-8")
+            os.environ["HESTIA_HOME"] = str(root / "deploy-home")
+            # the installer's verdict on this host
+            rspec = ilu.spec_from_file_location("rm_for_test", repo / "deploy" / "register-members.py")
+            rm = ilu.module_from_spec(rspec)
+            rspec.loader.exec_module(rm)
+            verdict, lines = rm.register_member(
+                "alpha", spec["install"], json.loads((repo / "plugins" / "alpha" / "hooks" / "hooks.json").read_text()),
+                str(home), True, env={"HESTIA_HOME": os.environ["HESTIA_HOME"]}, source=str(repo / "plugins" / "alpha"))
+            assert verdict == "refused", (verdict, lines)
+            # ...and the preflight's, which must agree
+            rows, good = gate_preflight.run_probes(repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert not good, rows
+            assert rows[0]["status"] == "unmeasured" and "cannot be placed" in rows[0]["reason"], rows
+            assert toml.read_text(encoding="utf-8") == text
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_HOME", None)
+        else:
+            os.environ["HESTIA_HOME"] = saved
+        if saved_role is not None:
+            os.environ["HESTIA_ROLE"] = saved_role
+
+
 if __name__ == "__main__":
+    test_the_preflight_refuses_exactly_what_the_installer_refuses()
+    test_the_preflight_judges_the_rendered_line_not_the_stale_registered_one()
     test_registered_candidate_must_allow_the_declared_probe()
     test_registered_refusal_blocks_the_set_before_installation()
     test_advisory_refusal_is_logged_and_does_not_block()
@@ -307,4 +488,5 @@ if __name__ == "__main__":
     test_every_shipped_gate_declares_its_own_probe_shape()
     test_a_projection_consumer_is_probed_under_the_launcher_env_not_the_deploy_units()
     test_a_projection_consuming_candidate_is_probed_against_the_candidate_engine()
-    print("ok: 12 gate-preflight checks")
+    test_the_throwaway_projection_is_keyed_by_the_seat_id_not_the_plugin_dir()
+    print("ok: 15 gate-preflight checks")

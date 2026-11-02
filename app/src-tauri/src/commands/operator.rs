@@ -72,9 +72,20 @@ pub async fn operator_sign_in(
     } else {
         None
     };
+    // The sign-in handshake is itself an operator route whose shape can change: learn
+    // whether this daemon speaks our API before sending it a credential.
+    // One endpoint for the whole sign-in: the daemon that was probed is the one that mints the
+    // session, and the session is published only if that daemon is still the one selected.
+    let ep = state.endpoint();
+    crate::daemon::ensure_compatible(&state, &ep).await?;
     let vault = identity_vault::open_or_import(&path, legacy.as_deref(), passphrase.as_str())?;
-    let session = operator::authenticate(&state.daemon_url(), Arc::new(vault)).await?;
-    state.set_operator(session);
+    let session = operator::authenticate(&ep.url, Arc::new(vault)).await?;
+    if !state.set_operator_for(&ep, session) {
+        return Err(format!(
+            "daemon changed in Settings during sign-in; the session from {} was discarded — sign in again",
+            ep.url
+        ));
+    }
     Ok(state.operator_status())
 }
 

@@ -10,6 +10,7 @@
 //! chain appends) don't re-derive per write.
 
 pub mod chain;
+pub mod durability;
 pub mod inbox;
 pub mod trust;
 

@@ -166,6 +166,40 @@ export interface PendingScopeRequest {
   requested_at: number;
   expires_at: number;
   secs_remaining: number;
+  /**
+   * `gate_deny` when the GATE opened this on a refused act (2026-10-05); then `act` is what the
+   * operator rules on and `reason` is the gate's own sentence, not the member's. Absent on an
+   * older daemon, which reads as a member-filed ask.
+   */
+  origin?: "gate_deny" | "member_request";
+  rule?: string | null;
+  tool?: string | null;
+  act?: string | null;
+  reissues?: number;
+  /** The refused reach was a glob over this directory: only a recursive grant covers it. */
+  subtree?: boolean;
+  /** "This act once" is a choice only when the gate recorded an act to bind. */
+  once_available?: boolean;
+  /**
+   * dp, 2026-10-10 (#1232 narrowed): the gate could not enumerate what the refused act reaches
+   * (an expansion decides it), so the request names the ACT — `path` is the act-keyed
+   * `hestia:unpriceable:…` sentinel — and "this act once" is the only grant there is.
+   */
+  once_only?: boolean;
+  /** #1287 part 2: false when the request names no path (an act the gate could not enumerate). */
+  enumerable?: boolean;
+  /**
+   * #1287 part 2: the rulings the decide endpoint ACCEPTS for this request, from the same
+   * function its refusal reads. The card offers exactly these. Absent on an older daemon.
+   */
+  allowed_decisions?: ("once" | "session" | "standing" | "refuse")[];
+  /**
+   * dp, 2026-10-05: NOT-SAME peers invited to decide a gate-opened request. Non-empty = the
+   * request awaits a PEER and the operator's controls are an override; empty = no peer can
+   * clear it (an unproven asker, or no admissible peer) and it is the operator's.
+   */
+  invited_peers?: string[];
+  asker_basis?: "session" | "asserted" | null;
 }
 
 /**
@@ -266,12 +300,37 @@ export interface WriteEffect {
   note?: string;
 }
 
+/**
+ * The app/daemon handshake (web4#904), classified in the Rust shell
+ * (app/src-tauri/src/handshake.rs). `compatible` and `skew` may use operator routes;
+ * every other state means the shell refuses them with `message`.
+ */
+export type CompatState =
+  | "compatible"
+  | "skew"
+  | "incompatible"
+  | "no_version_endpoint"
+  | "malformed"
+  | "unreachable";
+
+export interface Handshake {
+  state: CompatState;
+  app_version: string;
+  app_api_compat: number;
+  daemon_version: string | null;
+  daemon_build_id: string | null;
+  daemon_api_compat: number | null;
+  message: string;
+}
+
 export interface DaemonStatus {
   online: boolean;
   /** Present since v0.2.0: distinguishes "daemon down" from "signed out". */
   signed_in?: boolean;
   operator_lct?: string | null;
   url: string;
+  /** Present since v0.3.0: what is on the other end, and whether this app can talk to it. */
+  handshake?: Handshake;
 }
 
 export interface RemoteEntry {

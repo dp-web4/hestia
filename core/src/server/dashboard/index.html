@@ -95,6 +95,18 @@
   .deployment-update:hover:not(:disabled) { background: color-mix(in srgb, var(--warning) 12%, transparent); }
   .deployment-update:disabled { cursor: default; opacity: 0.7; }
   .deployment-update.failed { border-color: var(--failure); color: var(--failure); }
+  .deployment-update.quiet { border-color: var(--fg-faint); color: var(--fg-dim); }
+  #generated-at.stale-stamp { color: var(--warning); font-weight: 600; }
+  .deployment-update.quiet:hover:not(:disabled) { background: color-mix(in srgb, var(--fg-faint) 12%, transparent); }
+  .deployment-auto {
+    appearance: none; border: 1px solid var(--fg-faint); border-radius: 999px;
+    background: transparent; color: var(--fg-dim); font: inherit; font-size: 0.68rem;
+    letter-spacing: 0.05em; text-transform: uppercase; padding: 0.2rem 0.55rem;
+    cursor: pointer;
+  }
+  .deployment-auto.on { border-color: var(--success); color: var(--success); }
+  .deployment-auto:hover:not(:disabled) { background: color-mix(in srgb, var(--fg-faint) 12%, transparent); }
+  .deployment-auto:disabled { cursor: default; opacity: 0.7; }
 
   /* Top-level view switch (agents | hubs), in the masthead by the Hestia mark. The content
      area below is one view or the other — see the HTML note at #agents-view. A segmented
@@ -144,6 +156,23 @@
      the half nobody develops at is the half that ships broken. `dvh` rather than `vh`
      because mobile browsers shrink the visual viewport as their chrome retracts. */
   .govern-scroll { max-height: 70dvh; overflow-y: auto; }
+
+  /* Hubs membership list (dp 2026-09-01; recut of #787): the hubs you are in, or could be.
+     Promoted from a collapsed <details> of URLs, because "which hubs am I a member of" is the
+     question this screen exists to answer and a URL list does not answer it. */
+  .hub-list { display: flex; flex-direction: column; gap: 0.4rem; margin: 0.6rem 0 0.9rem; }
+  .hub-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem;
+             border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem 0.65rem; }
+  .hub-row .hub-name { font-weight: 600; color: var(--fg); }
+  .hub-row .hub-url { color: var(--fg-dim); font-size: 0.85rem; }
+  .hub-row .spacer { flex: 1 1 auto; }
+  .hub-badge { font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase;
+               padding: 0.1rem 0.45rem; border-radius: 3px; border: 1px solid var(--border); }
+  .hub-badge.enrolled { color: var(--accent); border-color: var(--accent); }
+  .hub-badge.notmember { color: var(--fg-dim); }
+  /* "we could not ask" must never look like "no" */
+  .hub-badge.unknown { color: var(--warn, #d9a441); border-color: var(--warn, #d9a441); }
+  .btn-unimpl { opacity: 0.55; }
   .govern-pane-head { display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.5rem; }
   .govern-pane-head h2 { margin: 0; font-size: 0.95rem; }
   .policy-state { font-size: 0.72rem; color: var(--fg-dim); margin-left: auto; }
@@ -717,7 +746,10 @@
   .feed { max-height: 62vh; min-height: 16rem; overflow-y: auto; }
   .feed-row {
     display: grid;
-    grid-template-columns: 8rem 3.5rem 7rem 1fr 4rem 9rem;
+    /* Event column fits a 23-char name (operator_session_opened, gate_escalation_*) at this
+       font size; longer names clip with an ellipsis and show in full on hover. At 7rem
+       anything past ~13 chars ran into the detail column. */
+    grid-template-columns: 8rem 3.5rem 12rem 1fr 4rem 9rem;
     gap: 0.75rem;
     align-items: center;
     padding: 0.6rem 1.25rem;
@@ -739,7 +771,7 @@
   .feed-agent { display: block; color: var(--fg); line-height: 1.15; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .feed-pid { display: block; font-size: 0.72em; color: var(--fg-dim, #8b93a7); opacity: 0.8; line-height: 1.1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .feed-time { color: var(--fg-faint); font-variant-numeric: tabular-nums; text-align: right; }
-  .feed-event { color: var(--fg-dim); }
+  .feed-event { color: var(--fg-dim); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .feed-event.outcome { color: var(--fg); }
   .feed-tool { color: var(--accent); font-weight: 500; }
   .feed-detail { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -877,6 +909,17 @@
     border-radius: 4px; font-size: 11px; padding: 2px 8px; cursor: pointer; margin-left: 6px; }
   .grant-act:hover { filter: brightness(1.2); }
   .grant-reach { color: var(--accent); margin-left: 2px; font-weight: 600; }
+  /* r / w / e / d on the grant heading, after LIVE/STANDING (dp, 2026-10-22, #1345). Disabled
+     except in the row's Edit mode, so no stray click can change what a member may do. */
+  .grant-modes { display: inline-flex; gap: 4px; flex-wrap: wrap; font-size: 0.74rem; }
+  .grant-modes label { display: inline-flex; align-items: center; gap: 1px; color: var(--fg-dim);
+    border: 1px solid var(--border, var(--fg-dim)); border-radius: 3px; padding: 0 4px; }
+  .grant-modes label.on { color: var(--fg); }
+  .grant-modes input { margin: 0 2px 0 0; }
+  .grant-row.editing { border-color: var(--accent); }
+  .grant-edit-path { font: inherit; font-family: monospace; min-width: 18rem; flex: 1 1 18rem; }
+  .grant-edit-summary { flex-basis: 100%; font-size: 0.76rem; color: var(--fg-dim); white-space: pre-line; }
+  .grant-edit-summary.widens { color: var(--warning); }
   .grant-revoke { background: transparent; color: var(--coral); border: 1px solid var(--coral);
     border-radius: 4px; padding: 0.15rem 0.6rem; font: inherit; font-size: 0.72rem; cursor: pointer; }
 
@@ -929,6 +972,10 @@
      guard (line ~640); this rule was omitted and the banner was in fact permanently visible —
      only noticeable once it had a reason to appear. */
   .esc-banner[hidden] { display: none; }
+  /* Peer-routed only: present, not alarming (the peers decide first). */
+  .esc-banner.esc-banner-quiet { background: transparent; border-color: var(--border); color: var(--fg-dim); }
+  .esc-banner.esc-banner-quiet .esc-dot { background: var(--fg-dim); animation: none; }
+  .esc-banner.esc-banner-quiet .esc-banner-btn { background: var(--border); color: var(--fg); }
   .esc-banner { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; padding: 0.5rem 0.8rem;
     background: #ff7a6618; border: 1px solid var(--coral); border-radius: 6px; color: var(--coral); font-size: 0.82rem; }
   .esc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--coral); flex: none; animation: escpulse 2s ease-in-out infinite; }
@@ -1089,8 +1136,9 @@
          chip (`#govern-chip-badge`) rather than dropped, so the count that made dp look is
          still on the face of the nav. -->
     <div class="live">
-      <span class="deployment-health unknown" id="deployment-health" title="Deployment freshness">● deployment unknown</span>
+      <span class="deployment-health unknown" id="deployment-health" title="Whether a newer hestia is available">● update status unknown</span>
       <button class="deployment-update" id="deployment-update" type="button" hidden>update</button>
+      <button class="deployment-auto" id="deployment-auto" type="button" hidden aria-pressed="false">auto-update off</button>
       <span class="dot"></span>
       <span id="live-status">connecting…</span>
     </div>
@@ -1205,8 +1253,17 @@
       <!-- Known-hub list (#307 API): view/retarget without rebuild or relaunch.
            Collapsed by default — retargeting is an occasional operator act, not
            part of the daily read path. -->
+      <!-- The hubs you are in, or could be. `enrolled` is ASKED OF THE HUB
+           (/api/hub/memberships), never inferred from holding a local identity. -->
+      <div class="hub-list" id="hub-list"><div class="empty">checking hubs…</div></div>
+      <div class="hub-compose">
+        <button class="policy-btn btn-unimpl" id="hub-discover-btn"
+                title="Not implemented: there is no registry to search yet. Add a hub by URL below.">discover…</button>
+        <span class="hub-note" id="hub-list-note"></span>
+      </div>
+
       <details class="hub-urls" id="hub-urls-box">
-        <summary id="hub-urls-summary">hubs…</summary>
+        <summary id="hub-urls-summary">manage hub URLs…</summary>
         <div class="hub-compose">
           <select id="hub-urls-select"></select>
           <button class="policy-btn" id="hub-urls-activate">set active</button>
@@ -1356,6 +1413,29 @@
 
             <div class="pol-section-label">In force now</div>
             <div id="scope-grant-list"><div class="empty">loading…</div></div>
+
+            <div class="pol-section-label">Society floor — every member, present and future</div>
+            <div class="grant-note">
+              What <strong>every</strong> member may do without asking, where none of its own
+              grants reaches: <strong>a member's own grant always decides where it reaches</strong>,
+              and the floor never overrides it. <strong>r w e d</strong> are read, write, execute
+              and delete, as on a grant; <strong>/**</strong> reaches everything under the path.
+              Change an entry with <strong>edit</strong>; nothing is sent until Save, and every
+              change is witnessed and asks for a reason.
+            </div>
+            <div id="scope-floor-list"><div class="empty">loading…</div></div>
+            <div class="grant-row floor-add">
+              <input id="floor-add-path" type="text" placeholder="/absolute/path" spellcheck="false">
+              <span class="grant-modes" title="what every member may do here">
+                <label class="on" title="read"><input id="floor-add-r" type="checkbox" checked> r</label>
+                <label title="write"><input id="floor-add-w" type="checkbox"> w</label>
+                <label title="execute"><input id="floor-add-e" type="checkbox"> e</label>
+                <label title="delete"><input id="floor-add-d" type="checkbox"> d</label>
+              </span>
+              <label title="reach everything under the path"><input id="floor-add-rec" type="checkbox" checked> /**</label>
+              <input id="floor-add-reason" type="text" placeholder="reason (required)">
+              <button class="grant-act" id="floor-add-btn">add to floor</button>
+            </div>
 
             <div class="pol-section-label">Grant scope directly — no member request needed</div>
             <div class="grant-note">
@@ -1529,6 +1609,8 @@
                   <option value="3600">1 hour</option>
                   <option value="900">15 min</option>
                   <option value="14400">4 hours</option>
+                  <option value="28800">8 hours (survives a deploy)</option>
+                  <option value="86400">1 day (survives a deploy)</option>
                   <option value="">until restart</option>
                 </select>
                 <input class="pol-input" id="grant-reason" placeholder="reason (required)" size="24">
@@ -2059,6 +2141,16 @@
       if (!iso) return '—';
       const t = new Date(iso);
       return t.toLocaleTimeString();
+    },
+    // Time alone when it is today, date + time otherwise: a stamp from three days ago must
+    // not read like one from this afternoon.
+    stamp: iso => {
+      if (!iso) return '—';
+      const t = new Date(iso);
+      if (Number.isNaN(t.getTime())) return '—';
+      return t.toDateString() === new Date().toDateString()
+        ? t.toLocaleTimeString()
+        : t.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
     },
     relTime: iso => {
       if (!iso) return '';
@@ -3109,13 +3201,12 @@
         statusClass = verdict === 'deny' ? 'deny' : 'warn';
       } else if (e.event_type === 'session_started') {
         tool = e.plugin_id || '';
-        detail = 'session_started';
       } else if (e.event_type === 'vault_set') {
         tool = 'vault';
         detail = 'credential stored';
-      } else {
-        detail = e.event_type;
       }
+      // No fallback to the event name: the event column already shows it, and repeating it
+      // here read as a duplicated row ("policy_allow  policy_allow").
 
       // WHO acted, primary column (dp, 2026-08-11): the AGENT is what you read first, with its
       // capacity(role) small beneath it. The chain position — not useful at a glance — plus the
@@ -3136,7 +3227,7 @@
         <div class="feed-row${isNew ? ' new' : ''}">
           <span class="feed-pos" title="${escapeHtml(posHover)}"><span class="feed-agent">${memberName(whoAgent)}</span>${whoPid}</span>
           <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
-          <span class="feed-event ${e.event_type}">${escapeHtml(e.event_type)}</span>
+          <span class="feed-event ${escapeHtml(e.event_type)}" title="${escapeHtml(e.event_type)}">${escapeHtml(e.event_type)}</span>
           <span class="feed-detail" title="${escapeHtml(hover || detail)}">
             ${tool ? `<span class="feed-tool">${escapeHtml(tool)}</span> ` : ''}${escapeHtml(detail)}
           </span>
@@ -3338,62 +3429,221 @@
     renderFeed(data.recent);
     renderDeployment(data.deployment);
     $('sov-lct').textContent = data.society.sovereign_lct;
-    $('generated-at').textContent = `updated ${fmt.time(data.generated_at)}`;
+    lastGeneratedAt = data.generated_at;
+    renderGeneratedAt();
   }
+
+  // The footer's "updated" stamp is when the daemon last produced dashboard data. The page
+  // polls every few seconds, so a stamp minutes old means data has stopped arriving: the daemon
+  // is down, or up and no longer refreshing (the header can still read "live" then). It is
+  // re-rendered on a timer of its own, so it keeps ageing while every poll is failing.
+  let lastGeneratedAt = null;
+  const GENERATED_STALE_SECS = 120;
+  function renderGeneratedAt() {
+    const el = $('generated-at');
+    if (!el || !lastGeneratedAt) return;
+    const ageSecs = (Date.now() - new Date(lastGeneratedAt).getTime()) / 1000;
+    const stale = ageSecs > GENERATED_STALE_SECS;
+    el.textContent = `updated ${fmt.stamp(lastGeneratedAt)}` + (stale ? ` (${fmt.relTime(lastGeneratedAt)} ago)` : '');
+    el.classList.toggle('stale-stamp', stale);
+    el.title = stale
+      ? 'No fresh data from the hestia daemon since then. Check that the service is running (the header shows offline when it cannot be reached).'
+      : 'when the hestia daemon last produced this data';
+  }
+  setInterval(renderGeneratedAt, 30000);
+
+  // A click the daemon accepted, held until /api/dashboard shows it. The snapshot is served
+  // from the last refresh while the next one builds, so the poll right after the click can
+  // predate it; without this the button went back to "update" for a poll or two and then
+  // jumped to "updating…".
+  // An update is matched by the request_id the POST returned. A check has no id, so it is
+  // matched by the server's own stamp on the check (state and time) changing from what the
+  // last snapshot before the click showed. Never by comparing the browser's clock with the
+  // daemon's: viewed from another machine they differ (#1434 review).
+  let deploymentPending = null; // { action: 'update' | 'check', at: ms, requestId?, checkMark? }
+  let deploymentCheckMark = 'none'; // the last snapshot's check stamp
+  const DEPLOYMENT_PENDING_MAX_MS = 30000;
 
   function renderDeployment(deployment) {
     const d = deployment || { state: 'unknown', note: 'deployment status unavailable' };
+    renderAutoUpdate(d.auto_update);
     const el = $('deployment-health');
     const btn = $('deployment-update');
     const state = ['current', 'stale', 'unknown'].includes(d.state) ? d.state : 'unknown';
     const updateState = d.update_state || 'idle';
-    el.className = `deployment-health ${state}`;
-    el.textContent = state === 'current'
-      ? '● deployment current'
-      : state === 'stale' ? '! deployment stale' : '● deployment unknown';
-    el.title = `${d.note || 'deployment status unavailable'}${d.running_build ? ` (running ${d.running_build})` : ''}${d.current_build ? `; current ${d.current_build}` : ''}${d.update_note ? `; ${d.update_note}` : ''}`;
+    const updating = ['requested', 'held', 'running'].includes(updateState);
+    const updateFailed = updateState === 'failed';
+    // The update CHECK (hestia-deploy --check, every 4h and on "check for updates"): the only
+    // source that can say whether hestia main has moved. `state` cannot: it compares the
+    // running build with this box's own install record (#438). So the words follow the check:
+    // "up to date" only when a check said so, with the time it said it.
+    const chk = d.check_capable ? (d.check || null) : null;
+    const checkState = chk ? chk.state : (d.check_capable ? 'never' : 'none');
+    const checked = chk && chk.at ? ` · checked ${fmt.stamp(chk.at)}` : '';
+    const checkMark = chk ? `${chk.state}|${chk.at || ''}` : 'none';
+
+    if (deploymentPending) {
+      const p = deploymentPending;
+      const shown = p.action === 'update'
+        ? (p.requestId ? d.update_request_id === p.requestId : updating)
+        : (checkState === 'requested' || checkState === 'checking' || checkMark !== p.checkMark);
+      // Both times here are the browser's own, so this bound needs no clock agreement.
+      if (shown || Date.now() - p.at > DEPLOYMENT_PENDING_MAX_MS) deploymentPending = null;
+    }
+    deploymentCheckMark = checkMark;
+
+    // [status text, colour class, button label, button action, button style]
+    let view;
+    if (state === 'unknown') {
+      view = ['● update status unknown', 'unknown', null, null, ''];
+    } else if (deploymentPending) {
+      view = deploymentPending.action === 'update'
+        ? ['● updating…', 'unknown', 'updating…', null, 'quiet']
+        : ['● checking for updates…', 'unknown', 'checking…', null, 'quiet'];
+    } else if (updating) {
+      view = ['● updating…', 'unknown', updateState === 'held' ? 'update held' : 'updating…', null, 'quiet'];
+    } else if (state === 'stale') {
+      // The running build is not the one this box last installed: an install did not finish.
+      view = ['! install incomplete', 'stale', updateFailed ? 'retry update' : 'update', 'update', updateFailed ? 'failed' : ''];
+    } else if (updateFailed) {
+      view = ['! last update failed', 'stale', 'retry update', 'update', 'failed'];
+    } else if (checkState === 'requested' || checkState === 'checking') {
+      view = ['● checking for updates…', 'unknown', 'checking…', null, 'quiet'];
+    } else if (checkState === 'available') {
+      view = [`! update available${checked}`, 'stale', 'update', 'update', ''];
+    } else if (checkState === 'up-to-date') {
+      view = [`● up to date${checked}`, 'current', 'check for updates', 'check', 'quiet'];
+    } else if (checkState === 'failed') {
+      view = [`! update check failed${checked}`, 'stale', 'retry check', 'check', 'failed'];
+    } else if (checkState === 'unchecked') {
+      view = ['● not checked since this build', 'unknown', 'check for updates', 'check', 'quiet'];
+    } else if (checkState === 'never') {
+      view = ['● not checked yet', 'unknown', 'check for updates', 'check', 'quiet'];
+    } else {
+      // No check unit on this box (macOS, or installed before the check existed): nothing
+      // here can see hestia main, so say that, and offer the one action there is. The next
+      // update installs the check on Linux.
+      view = ['● update status unknown', 'unknown', 'update', 'update', 'quiet'];
+    }
+    const [text, colour, label, action, style] = view;
+    el.className = `deployment-health ${colour}`;
+    el.textContent = text;
+
+    const lines = [];
+    if (d.running_build) lines.push(`running ${d.running_build}`);
+    if (chk && chk.latest) lines.push(`hestia main at the last check: ${chk.latest}`);
+    if (d.check_capable) {
+      lines.push('checks for updates every 4h and when you click "check for updates"; a check installs nothing');
+    } else {
+      lines.push('no update check on this box: "update" fetches hestia main and installs it if it has moved');
+    }
+    if (state === 'stale') lines.push(d.note || 'the running build is not the one this box last installed');
+    if (d.update_note) lines.push(d.update_note);
+    if (d.last_cycle) {
+      // When the deploy supervisor last ran (timer, update or check) and how that run ended.
+      lines.push(`last deploy run ${fmt.stamp(d.last_cycle.at)}: ${d.last_cycle.result}`
+        + (d.last_cycle.detail ? ` ${d.last_cycle.detail}` : ''));
+    }
+    el.title = lines.join('\n');
 
     if (!btn) return;
-    const active = state === 'stale' && ['requested', 'held', 'running'].includes(updateState);
-    const failed = state === 'stale' && updateState === 'failed';
-    btn.hidden = state !== 'stale' || !d.update_capable;
-    btn.disabled = active;
-    btn.classList.toggle('failed', failed);
-    btn.textContent = updateState === 'held' ? 'update held' : active ? 'updating…' : failed ? 'retry update' : 'update';
-    btn.title = active
-      ? (d.update_note || 'deployment supervisor is updating this installation')
-      : failed ? (d.update_note || 'last update failed; retry')
-      : 'bring this deployment current through the registered supervisor';
+    btn.hidden = !d.update_capable || !label;
+    btn.disabled = !action;
+    btn.dataset.action = action || '';
+    btn.classList.toggle('failed', style === 'failed');
+    btn.classList.toggle('quiet', style === 'quiet');
+    btn.textContent = label || '';
+    btn.title = action === 'check'
+      ? 'ask whether a newer hestia is available; nothing is installed'
+      : action === 'update'
+        ? (chk && chk.latest && checkState === 'available'
+          ? `install ${chk.latest}: builds, installs and restarts the hestia daemon`
+          : 'fetch hestia main and install it if it has moved: builds, installs and restarts the hestia daemon')
+        : (d.update_note || 'deployment supervisor is working');
   }
+
+  // Scheduled auto-update (the hestia-deploy timer). Shown only where the timer is installed
+  // and the platform has a toggle; the update button works either way.
+  function renderAutoUpdate(autoUpdate) {
+    const btn = $('deployment-auto');
+    if (!btn || btn.dataset.busy) return;
+    const on = autoUpdate === 'on';
+    btn.hidden = !(on || autoUpdate === 'off');
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.textContent = on ? 'auto-update on' : 'auto-update off';
+    btn.title = on
+      ? 'This box deploys hestia main on a schedule (every 4h). Click to turn the schedule off; the update button still works.'
+      : 'Updates happen only when you click update. Click to deploy hestia main on a schedule (every 4h).';
+  }
+
+  (function wireAutoUpdate() {
+    const btn = $('deployment-auto');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (btn.disabled) return;
+      const turnOn = btn.getAttribute('aria-pressed') !== 'true';
+      if (turnOn && !confirm('Turn on scheduled auto-update?\n\nThis box will build and deploy hestia main every 4 hours, restarting the daemon and reinstalling the hooks when main has moved. If a scheduled run was missed, one may start right away.')) return;
+      btn.disabled = true;
+      btn.dataset.busy = '1';
+      btn.textContent = turnOn ? 'turning on…' : 'turning off…';
+      try {
+        const res = await apiFetch('/api/operator/deployment/auto-update', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled: turnOn }),
+        });
+        const body = await res.json().catch(() => ({}));
+        // The change can take effect and still be an error (its chain record failed): say
+        // what is now in force instead of "failed", so it is not clicked again.
+        if (!res.ok && body.outcome === 'changed') {
+          $('live-status').textContent = `auto-update is now ${body.status}; ${body.error}`;
+          return;
+        }
+        if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      } catch (error) {
+        $('live-status').textContent = `auto-update change failed (${error.message})`;
+      } finally {
+        btn.disabled = false;
+        delete btn.dataset.busy;
+        await tick();
+      }
+    });
+  })();
 
   (function wireDeploymentUpdate() {
     const btn = $('deployment-update');
     if (!btn) return;
     btn.addEventListener('click', async () => {
       if (btn.disabled) return;
+      // What the button does is what renderDeployment last decided: check, or update.
+      const checking = btn.dataset.action === 'check';
+      if (!checking && btn.dataset.action !== 'update') return;
       btn.disabled = true;
-      btn.textContent = 'requesting…';
+      btn.textContent = checking ? 'checking…' : 'requesting…';
       btn.classList.remove('failed');
+      // Taken before the POST: a poll that lands while it is in flight may already show the
+      // check, and must count as the change rather than become the baseline.
+      const checkMarkAtClick = deploymentCheckMark;
       try {
-        const res = await apiFetch('/api/operator/deployment/update', { method: 'POST' });
+        const res = checking
+          ? await apiFetch('/api/operator/deployment/check', { method: 'POST' })
+          : await apiFetch('/api/operator/deployment/update', { method: 'POST' });
         const body = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
-        if (body.status === 'current') {
-          await tick();
-          return;
-        }
-        btn.textContent = 'updating…';
-        $('live-status').textContent = 'updating…';
-        // Re-read authoritative supervisor state rather than inventing a client-side success.
-        // The daemon may disappear during restart; the ordinary poll will reconnect and only
-        // deployment.state=current clears the stale badge.
+        deploymentPending = { action: checking ? 'check' : 'update', at: Date.now(),
+          requestId: body.request_id || undefined, checkMark: checkMarkAtClick };
+        btn.textContent = checking ? 'checking…' : 'updating…';
+        $('live-status').textContent = checking ? 'checking for updates…' : 'updating…';
+        // Re-read authoritative supervisor state rather than inventing a client-side result.
+        // An update may restart the daemon; the ordinary poll reconnects and re-renders.
         await tick();
       } catch (error) {
         btn.disabled = false;
         btn.classList.add('failed');
-        btn.textContent = 'retry update';
-        btn.title = `update request failed: ${error.message}`;
-        $('live-status').textContent = `update failed (${error.message})`;
+        btn.textContent = checking ? 'retry check' : 'retry update';
+        btn.title = `${checking ? 'update check' : 'update'} request failed: ${error.message}`;
+        $('live-status').textContent = `${checking ? 'update check' : 'update'} failed (${error.message})`;
       }
     });
   })();
@@ -3475,7 +3725,13 @@
     .map(d => `<option value="${d}"${d===sel?' selected':''}>${d}</option>`).join('');
 
   function renderPolicy(p) {
-    $('pol-mode').textContent = `${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`;
+    {
+      const t = selectedOrch || null;
+      const g = t ? (lastData?.instance_grants ?? []).find(x => x.plugin_id === t) : null;
+      $('pol-mode').textContent = g
+        ? `${t}: ${g.preset} (live grant) · society: ${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`
+        : `${p.active_preset} · ${p.enforce ? 'enforcing' : 'audit'}`;
+    }
     // SAY WHAT THE BUTTONS WILL CHANGE. The scope was invisible, so a scoped-looking control
     // silently set the whole society twice in one session. The banner is loud when scoped,
     // because "this affects everyone" is the assumption that has to be defeated.
@@ -3487,9 +3743,21 @@
         : 'Presets below change the SOCIETY baseline — every member on this machine, including unattended ones. Select a member above to scope it.';
       scope.className = target ? 'pol-scope scoped' : 'pol-scope society';
     }
-    $('pol-presets').innerHTML = p.presets.map(pr =>
-      `<button class="filter-btn${pr.name===p.active_preset?' selected':''}" data-preset="${escapeHtml(pr.name)}" title="${escapeHtml(pr.description)}">${escapeHtml(pr.name)}</button>`
-    ).join('');
+    // HIGHLIGHT WHAT IS IN FORCE FOR WHAT THE BUTTONS TARGET (dp, 2026-10-13: "the permissive
+    // wasn't highlighted"). With a member selected, the buttons set THAT member's grant, so the
+    // lit button must be its effective preset -- its live grant if it has one, else the society
+    // baseline -- not always the society's. The society baseline stays marked when it differs.
+    const polTarget = selectedOrch || null;
+    const polGrant = polTarget ? (lastData?.instance_grants ?? []).find(g => g.plugin_id === polTarget) : null;
+    const inForce = polGrant ? polGrant.preset : p.active_preset;
+    $('pol-presets').innerHTML = p.presets.map(pr => {
+      const lit = pr.name === inForce;
+      const baseline = polGrant && pr.name === p.active_preset;
+      const why = lit && polGrant
+        ? ` — in force for ${polTarget} (live grant; dies with the daemon)`
+        : baseline ? ' — society baseline' : '';
+      return `<button class="filter-btn${lit ? ' selected' : ''}${baseline ? ' pol-baseline' : ''}" data-preset="${escapeHtml(pr.name)}" title="${escapeHtml(pr.description + why)}">${escapeHtml(pr.name)}${baseline ? ' <span class="pol-mode">(society)</span>' : ''}</button>`;
+    }).join('');
     $('pol-rules').innerHTML = p.preset_rules.map(r => `
       <div class="pol-rule">
         <div class="rinfo"><span class="rname">${escapeHtml(r.name)}</span><span class="rmatch">${escapeHtml(r.match)}</span></div>
@@ -3559,12 +3827,32 @@
 
   function renderScopeRequests(data) {
     const pend = data?.pending_scope_requests ?? [];
+    // dp, 2026-10-05: "scope escalations should go to peers not to me". Only requests NO peer
+    // can clear (an unproven asker, or no admissible peer) await the operator; the rest await a
+    // NOT-SAME peer and are shown here read-only with the operator's OVERRIDE.
+    const mine = pend.filter(r => scopeAwaitsOperator(r));
     const banner = $('scope-banner');
+    // THE BANNER IS THE ONLY DOOR TO THE DECIDE CONTROL ON THE MAIN VIEW (dp, 2026-10-13: "there is
+    // still no way to rule an escalation or scope request as standing/one time/live - that i can
+    // see"). It used to appear only for requests NO peer can clear; every gate-opened request
+    // invites peers, so on 10-13 every request was peer-routed, the banner never showed, and
+    // requests sat 8 h with no peer deciding and no sign to the operator. Routing is unchanged:
+    // peer-routed requests are still the peers to decide and the operator controls are an
+    // override -- but the operator is told they exist, quietly, with the age of the oldest.
     banner.hidden = pend.length === 0;
-    if (pend.length) {
-      const n = pend.length;
+    banner.classList?.toggle('esc-banner-quiet', mine.length === 0 && pend.length > 0);
+    if (mine.length) {
+      const n = mine.length;
+      const peer = pend.length - n;
       $('scope-banner-text').textContent =
-        `${n} scope request${n > 1 ? 's' : ''} awaiting your decision`;
+        `${n} scope request${n > 1 ? 's' : ''} awaiting your decision (no peer can clear it, or no peer ruled in time)`
+        + (peer ? ` (+${peer} with peers)` : '');
+    } else if (pend.length) {
+      const n = pend.length;
+      const oldest = Math.min(...pend.map(r => Number(r.requested_at) || Date.now() / 1000));
+      const age = escFmtAge(Math.max(0, Math.floor(Date.now() / 1000 - oldest)));
+      $('scope-banner-text').textContent =
+        `${n} scope request${n > 1 ? 's' : ''} with peers to decide (oldest ${age}) — you may override`;
     }
     $('scope-count').textContent = pend.length ? `${pend.length} pending` : '';
 
@@ -3599,20 +3887,64 @@
       row.className = 'esc-row';
       const path = String(r.path ?? '');
       const why = String(r.reason ?? '');
+      // A GATE-OPENED request (2026-10-05) is a refused act, not an ask: show the act the
+      // operator is ruling on, verbatim and labelled as the act — never as the member's reason,
+      // because the member did not choose to ask.
+      const fromGate = r.origin === 'gate_deny';
+      const basis = fromGate
+        ? `<div class="esc-why">refused act (${escapeHtml(String(r.rule ?? ''))}, ${
+            escapeHtml(String(r.tool ?? ''))}) — this is what you are ruling on:</div>
+           <pre class="esc-why scope-act">${escapeHtml(String(r.act ?? ''))}</pre>
+           <div class="esc-meta">opened by the gate; the member stated no reason${
+             (r.reissues ?? 0) > 0 ? ` · re-issued ${Number(r.reissues)}×` : ''}${
+             r.subtree ? ' · a glob over this directory: only a recursive grant covers it' : ''}</div>
+           <div class="esc-meta scope-route">${scopeRouteText(r)}</div>`
+        : `<div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>`;
       row.innerHTML = `
         <div class="esc-row-head">
-          <span class="esc-tool">read</span>
-          <span class="esc-who">claimed by ${memberName(r.claimed_by ?? '?')}${
+          <span class="esc-tool">${fromGate ? 'refused' : 'read'}</span>
+          <span class="esc-who">${fromGate ? 'member' : 'claimed by'} ${memberName(r.claimed_by ?? '?')}${
             r.role ? ' · ' + escapeHtml(String(r.role)) : ''}</span>
           <span class="esc-ttl" id="scope-ttl-${escapeHtml(String(r.request_id))}">${
             escapeHtml(`expires in ${escFmtAge(r.secs_remaining ?? 0)}`)}</span>
         </div>
-        <div class="esc-marker">${escapeHtml(path)}</div>
-        <div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>
-        <div class="esc-meta">id ${escapeHtml(String(r.request_id))} · grant is memory-only and expires</div>`;
+        <div class="esc-marker">${!scopeEnumerable(r)
+          ? 'no path: the gate cannot enumerate what this act reaches — approve it once, as written, or refuse'
+          : escapeHtml(path)}</div>
+        ${scopeOnceOnly(r) ? `<div class="esc-meta scope-once-why">${SCOPE_ONCE_ONLY_WHY}</div>` : ''}
+        ${basis}
+        <div class="esc-meta">id ${escapeHtml(String(r.request_id))}</div>`;
 
       const controls = document.createElement('div');
       controls.className = 'esc-controls';
+      // #1287 part 2: what this row may offer is the daemon's `allowed_decisions` — the set the
+      // decide endpoint accepts. A request with no session/standing ruling (an act the gate could
+      // not enumerate) renders exactly "Approve once" and "Refuse": no duration, no breadth, and
+      // no grant button whose click the endpoint would refuse.
+      const onceOnly = scopeOnceOnly(r);
+      const offersGrant = scopeDurationOptions(r).length > 0;
+      // DURATION, chosen at decide time (spec decide-scope-request): this act once — only when
+      // the gate recorded an act to bind (once_available) — for the session, or standing.
+      const duration = document.createElement('select');
+      duration.className = 'scope-duration';
+      for (const [v, label] of scopeDurationOptions(r)) {
+        const o = document.createElement('option');
+        o.value = v; o.textContent = label;
+        duration.appendChild(o);
+      }
+      // BREADTH, for session and standing: the exact path, or a directory above it (always
+      // recursive, never the root). The option text IS the path the grant will reach.
+      const breadth = document.createElement('select');
+      breadth.className = 'scope-breadth';
+      for (const opt of scopeBreadthOptions(path, !!r.subtree)) {
+        const o = document.createElement('option');
+        o.value = JSON.stringify(opt); o.textContent = opt.label;
+        breadth.appendChild(o);
+      }
+      const syncBreadth = () => { breadth.disabled = duration.value === 'once'; };
+      const chosenDuration = () => (onceOnly ? 'once' : duration.value);
+      duration.addEventListener('change', syncBreadth);
+      syncBreadth();
       const note = document.createElement('input');
       note.type = 'text';
       note.placeholder = 'note (required to grant)';
@@ -3636,7 +3968,9 @@
 
       const grantBtn = document.createElement('button');
       grantBtn.className = 'esc-approve';
-      grantBtn.textContent = 'grant';
+      // A peer-routed request: the operator's control is an OVERRIDE, labelled as one.
+      const override = !scopeAwaitsOperator(r);
+      grantBtn.textContent = scopeGrantLabel(r, override);
       grantBtn.disabled = !note.value.trim();
       grantBtn.title = 'A note is required to grant — it is recorded as the reason.';
       note.addEventListener('input', () => {
@@ -3651,11 +3985,8 @@
           const res = await apiFetch('/api/scope/decide', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              request_id: r.request_id,
-              granted,
-              reason: note.value.trim() || null,
-            }),
+            body: JSON.stringify(scopeDecideBody(r, granted, note.value.trim(), chosenDuration(),
+                                                 breadth.value ? JSON.parse(breadth.value) : null)),
           });
           if (!res.ok) {
             let msg = `HTTP ${res.status}`;
@@ -3677,17 +4008,122 @@
 
       const refuseBtn = document.createElement('button');
       refuseBtn.className = 'esc-deny';
-      refuseBtn.textContent = 'refuse';
+      refuseBtn.textContent = scopeRefuseLabel(r, override);
       grantBtn.addEventListener('click', () => decide(grantBtn, true));
       refuseBtn.addEventListener('click', () => decide(refuseBtn, false));
 
+      if (!onceOnly) {
+        controls.appendChild(duration);
+        controls.appendChild(breadth);
+      }
       controls.appendChild(note);
-      controls.appendChild(grantBtn);
+      if (offersGrant) controls.appendChild(grantBtn);
       controls.appendChild(refuseBtn);
       row.appendChild(controls);
       row.appendChild(err);
       list.appendChild(row);
     }
+  }
+
+  // ---- scope decide: duration, breadth, body (pure; pinned by
+  // tools/dashboard_scope_decide_contract_test.py, which also runs them under node) ----
+  // dp, 2026-10-05: a gate-opened request from a proven asker is decided by a NOT-SAME PEER;
+  // only one no peer can clear (no invited peer) awaits the operator.
+  // dp, 2026-10-13: "escalate to me after a timeout". The daemon says whose queue a request is
+  // in (`decided_by_default`, which turns "operator" once the peer window lapses); an older
+  // daemon without the field falls back to the routing rule.
+  function scopeAwaitsOperator(r) {
+    if (r && typeof r.decided_by_default === 'string') return r.decided_by_default !== 'peer';
+    return !(r && r.origin === 'gate_deny' && Array.isArray(r.invited_peers)
+             && r.invited_peers.length > 0);
+  }
+
+  function scopeRouteText(r) {
+    if (r && r.peer_window_lapsed) {
+      const mins = Math.round(Number(r.peer_window_secs || 0) / 60);
+      return `no invited peer (${(r.invited_peers || []).map(p => escapeHtml(String(p))).join(', ')}) ruled within ${mins} min — ESCALATED to you; a peer may still decide`;
+    }
+    if (scopeAwaitsOperator(r)) {
+      return 'no NOT-SAME peer can clear this (unproven asker, or no admissible peer) — it is yours to decide';
+    }
+    return 'awaiting a NOT-SAME peer — invited: ' + r.invited_peers.map(p => escapeHtml(String(p))).join(', ')
+      + ' · the controls below are your OVERRIDE';
+  }
+
+  // #1287 part 2: the rulings the decide endpoint ACCEPTS for this request, as the daemon
+  // reports them (`allowed_decisions`, from the function its refusal reads). An older daemon
+  // without the field falls back to the flags it did send (once_available, once_only).
+  function scopeAllowedDecisions(r) {
+    if (r && Array.isArray(r.allowed_decisions)) return r.allowed_decisions.map(String);
+    const out = [];
+    if (r && r.once_available === true) out.push('once');
+    // dp, 2026-10-10 (#1232 narrowed): the gate could not enumerate what this act reaches, so
+    // the request names the act, not a path — "this act once" is the only grant there is.
+    if (!(r && r.once_only === true)) out.push('session', 'standing');
+    out.push('refuse');
+    return out;
+  }
+
+  function scopeEnumerable(r) {
+    if (r && typeof r.enumerable === 'boolean') return r.enumerable;
+    return !(r && r.once_only === true);
+  }
+
+  // No session and no standing ruling: the act's reach is decided by an expansion, so the only
+  // grant is this exact act. The row renders exactly "Approve once" and "Refuse".
+  function scopeOnceOnly(r) {
+    const a = scopeAllowedDecisions(r);
+    return !a.includes('session') && !a.includes('standing');
+  }
+
+  const SCOPE_ONCE_ONLY_WHY =
+    'what this act reaches is decided by an expansion, so only this exact act can be approved';
+
+  function scopeGrantLabel(r, override) {
+    const base = scopeOnceOnly(r) ? 'Approve once' : 'grant';
+    return override ? `override: ${base}` : base;
+  }
+
+  function scopeRefuseLabel(r, override) {
+    const base = scopeOnceOnly(r) ? 'Refuse' : 'refuse';
+    return override ? `override: ${base}` : base;
+  }
+
+  function scopeDurationOptions(r) {
+    const a = scopeAllowedDecisions(r);
+    const out = [];
+    if (a.includes('once')) {
+      out.push(['once', 'this act once (spent by the identical act, inside the claim window)']);
+    }
+    if (a.includes('session')) out.push(['session', 'for the session (memory-only, expires)']);
+    if (a.includes('standing')) out.push(['standing', 'standing (vault; survives restart until revoked)']);
+    return out;
+  }
+
+  // Every option reaches the asked path: the path itself (exact unless the reach was a glob),
+  // the path and everything below it, and each directory ABOVE it, recursive — never the root.
+  function scopeBreadthOptions(path, subtree) {
+    const p = String(path || '').replace(/\/+$/, '');
+    const out = [];
+    if (!p.startsWith('/') || p === '') return out;
+    if (!subtree) out.push({ grant_path: null, recursive: false, label: `exactly ${p}` });
+    out.push({ grant_path: null, recursive: true, label: `${p}/** (this path and everything below)` });
+    const parts = p.split('/').filter(Boolean);
+    for (let i = parts.length - 1; i >= 1; i--) {
+      const anc = '/' + parts.slice(0, i).join('/');
+      out.push({ grant_path: anc, recursive: true, label: `${anc}/** (directory above, recursive)` });
+    }
+    return out;
+  }
+
+  function scopeDecideBody(r, granted, reason, duration, breadth) {
+    const body = { request_id: r.request_id, granted, reason: reason || null };
+    if (!granted) return body;              // a refusal carries no duration and no breadth
+    if (duration === 'once') { body.once = true; return body; }
+    body.standing = duration === 'standing';
+    body.recursive = !!(breadth && breadth.recursive);
+    if (breadth && breadth.grant_path) body.grant_path = breadth.grant_path;
+    return body;
   }
 
   // THE GOVERN CHIP BADGE — driven from the SNAPSHOT, on every tick.
@@ -3817,6 +4253,140 @@
   // have a grant" and "you have a grant until someone restarts the daemon" are different
   // facts and only one of them is what the operator thinks they bought. Standing renders
   // plain. There is no state in which a grant that is about to evaporate renders as calm.
+  // GRANT MODES (#1345): r read, w write, e execute, d delete. A grant without `modes` is from a
+  // daemon that predates them, where every grant allowed all four.
+  const GRANT_MODES = [['r', 'read'], ['w', 'write'], ['e', 'execute'], ['d', 'delete']];
+  function grantModeSet(m) { return new Set(String(m ?? 'rwed').split('')); }
+  function grantModeLetters(set) { return GRANT_MODES.map(([l]) => l).filter(l => set.has(l)).join(''); }
+  function grantModeBoxes(modes, enabled) {
+    const on = modes instanceof Set ? modes : grantModeSet(modes);
+    return `<span class="grant-modes" title="what this grant lets the member do here">${
+      GRANT_MODES.map(([l, word]) => `<label class="${on.has(l) ? 'on' : ''}" title="${word}"><input type="checkbox"
+        data-grant-mode="${l}" ${on.has(l) ? 'checked' : ''} ${enabled ? '' : 'disabled'}>${l}</label>`).join('')
+    }</span>`;
+  }
+
+  // The Edit row's staged draft: nothing is sent until Save (dp, 2026-10-22). One edit at a time.
+  let grantEdit = null;
+
+  // What Save would change, in words, and whether it WIDENS. Mirrors the daemon's rule
+  // (`GrantEdit::widens`): any added mode, exact made recursive, or a path outside the old
+  // reach. The daemon recomputes it and is the authority; this is so the operator reads it first.
+  function grantEditSummary(ed) {
+    const b = ed.before, d = ed.draft;
+    const lines = [];
+    const bm = grantModeLetters(b.modes), dm = grantModeLetters(d.modes);
+    if (d.path !== b.path) lines.push(`path: ${b.path} → ${d.path}`);
+    if (d.recursive !== b.recursive) lines.push(`reach: ${b.recursive ? 'recursive' : 'exact'} → ${d.recursive ? 'recursive' : 'exact'}`);
+    if (dm !== bm) lines.push(`modes: ${bm || '(none)'} → ${dm || '(none)'}`);
+    const under = (root, p) => p === root || p.startsWith(root.replace(/\/+$/, '') + '/');
+    const addsMode = [...d.modes].some(l => !b.modes.has(l));
+    const widensReach = d.recursive ? !(b.recursive && under(b.path, d.path))
+                                    : !(d.path === b.path || (b.recursive && under(b.path, d.path)));
+    return { lines, widens: addsMode || widensReach, empty: !lines.length, none: !d.modes.size };
+  }
+
+  function renderGrantEditRow(g) {
+    const ed = grantEdit;
+    const sum = grantEditSummary(ed);
+    const narrowed = ed.draft.modes.size < 4;
+    return `
+        <div class="grant-row editing">
+          <span class="grant-who">${memberName(g.plugin_id ?? '?')}</span>
+          <span class="grant-preset scope-standing">STANDING</span>
+          ${grantModeBoxes(ed.draft.modes, true)}
+          <input class="grant-edit-path" data-grant-edit-path value="${escapeHtml(ed.draft.path)}" spellcheck="false">
+          <label class="grant-ttl"><input type="checkbox" data-grant-edit-recursive ${ed.draft.recursive ? 'checked' : ''}> recursive (/**)</label>
+          <button class="grant-act" data-grant-edit-save ${sum.empty || sum.none ? 'disabled' : ''}>save</button>
+          <button class="grant-revoke" data-grant-edit-cancel>cancel</button>
+          <span class="grant-edit-summary${sum.widens ? ' widens' : ''}">${escapeHtml(
+            sum.none ? 'choose at least one of r, w, e, d (to remove the grant, revoke it)'
+            : sum.empty ? 'no change yet'
+            : sum.lines.join('\n') + (sum.widens ? '\n⚠ WIDENS what this member may reach or do (a reason is required)' : '\nnarrows only'))}${
+            narrowed ? escapeHtml('\nNote: until this machine\'s gate enforces modes (hestia #1345, part B), a grant narrower than rwed is withheld from the gate entirely, so it gives the member no reach at all. Nothing widens in the meantime.') : ''}</span>
+          <span class="grant-edit-summary widens grant-edit-moved" hidden>the grants changed since you opened this edit; Save will be refused. Cancel and edit again.</span>
+        </div>`;
+  }
+
+  // THE SOCIETY FLOOR (dp, 2026-08-16; modes and Edit 2026-10-23). One row per entry with the
+  // same r/w/e/d boxes and Edit -> Save/Cancel a grant has (#1370): an entry binds every member,
+  // so a stray click must never widen the whole society (Nova on #1347). The boxes are disabled
+  // outside Edit. Where a member's own grant reaches, it decides; the floor fills only the rest
+  // (PRD_ALLOWLISTS AC-1 as amended), and the note under each member says so.
+  let floorEdit = null;
+
+  // What Save would change, and whether it WIDENS: any added mode, or exact made recursive.
+  // The daemon recomputes `widens` and records it; this is so the operator reads it first.
+  function floorEditSummary(ed) {
+    const b = ed.before, d = ed.draft, lines = [];
+    const bm = grantModeLetters(b.modes), dm = grantModeLetters(d.modes);
+    if (d.recursive !== b.recursive) lines.push(`reach: ${b.recursive ? 'recursive' : 'exact'} → ${d.recursive ? 'recursive' : 'exact'}`);
+    if (dm !== bm) lines.push(`modes: ${bm || '(none)'} → ${dm || '(none)'}`);
+    const widens = [...d.modes].some(l => !b.modes.has(l)) || (d.recursive && !b.recursive);
+    return { lines, widens, empty: !lines.length, none: !d.modes.size };
+  }
+
+  function renderFloorEditRow(f) {
+    const p = escapeHtml(String(f.path ?? ''));
+    const sum = floorEditSummary(floorEdit);
+    return `
+        <div class="grant-row editing floor-editing">
+          <span class="grant-who">everyone</span>
+          <span class="grant-preset scope-standing">FLOOR</span>
+          ${grantModeBoxes(floorEdit.draft.modes, true)}
+          <code>${p}</code>
+          <label class="grant-ttl"><input type="checkbox" data-floor-edit-recursive ${floorEdit.draft.recursive ? 'checked' : ''}> recursive (/**)</label>
+          <button class="grant-act" data-floor-edit-save ${sum.empty || sum.none ? 'disabled' : ''}>save</button>
+          <button class="grant-revoke" data-floor-edit-cancel>cancel</button>
+          <span class="grant-edit-summary${sum.widens ? ' widens' : ''}">${escapeHtml(
+            sum.none ? 'choose at least one of r, w, e, d (to take the path off the floor, remove it)'
+            : sum.empty ? 'no change yet'
+            : sum.lines.join('\n') + (sum.widens ? '\n⚠ WIDENS what EVERY member may reach or do' : '\nnarrows only')
+              + '\nA reason is required: this changes every member at once.')}${
+            sum.none || sum.empty || floorEdit.draft.modes.size === 4 ? '' : escapeHtml(
+              '\nNote: until this machine\'s gate enforces modes (hestia #1345, part B), an entry with read is admitted for read acts only, and one without read is not served to the gate at all.')}</span>
+        </div>`;
+  }
+
+  // Every floor write: POST /api/scope/floor {path, reason, recursive, modes,
+  // expected_generation?} (replaces by path) and POST /api/scope/floor/remove {path, reason}.
+  // Always POSTs; tools/operator_surfaces_spec_test.py reads it as such (FIXED_METHOD_HELPERS).
+  async function floorPost(url, body, what, err) {
+    err.hidden = true;
+    try {
+      const res = await apiFetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      await tick(); renderScopeGrants(lastData);
+      return true;
+    } catch (e2) { err.textContent = `${what} failed: ${e2.message}`; err.hidden = false; return false; }
+  }
+
+  function renderSocietyFloor(data) {
+    const fl = $('scope-floor-list');
+    if (!fl) return;
+    if (!data) { fl.innerHTML = '<div class="empty">loading…</div>'; return; }
+    const rows = data.society_floor ?? [];
+    if (floorEdit && !rows.some(f => f.path === floorEdit.path)) floorEdit = null;
+    fl.innerHTML = rows.length ? rows.map(f => {
+      if (floorEdit && floorEdit.path === f.path) return renderFloorEditRow(f);
+      const p = escapeHtml(String(f.path ?? ''));
+      return `
+        <div class="grant-row">
+          <span class="grant-who">everyone</span>
+          <span class="grant-preset scope-standing">FLOOR</span>
+          ${grantModeBoxes(f.modes, false)}
+          <code>${p}${f.recursive ? '<span class="grant-reach" title="reaches the whole subtree">/**</span>' : ''}</code>
+          <span class="grant-why">${escapeHtml(String(f.reason ?? ''))}</span>
+          <button class="grant-act" data-floor-edit="${p}">edit</button>
+          <button class="grant-revoke" data-floor-remove="${p}">remove</button>
+        </div>`;
+    }).join('') : '<div class="empty">The floor is empty: no path is reachable by every member without a grant.</div>';
+  }
+
   function renderScopeGrants(data) {
     const gen = $('scope-gen');
     if (gen) {
@@ -3841,6 +4411,8 @@
             </div>`).join('')
         : '<div class="empty">No member is waiting on a scope decision.</div>';
     }
+
+    renderSocietyFloor(data);
 
     const list = $('scope-grant-list');
     if (!list) return;
@@ -3868,17 +4440,36 @@
         a path outside it will be denied until you grant one here.</div>`;
       return;
     }
+    // AN EDIT IN PROGRESS IS NOT REDRAWN UNDER THE OPERATOR (#1345). The list re-renders on every
+    // tick; rebuilding it mid-edit would drop focus and the half-typed path. The staged draft
+    // lives in `grantEdit`, and the row is kept as it is until Save or Cancel. If the store moved
+    // meanwhile, the row says so now, and the daemon refuses the Save anyway.
+    if (grantEdit && list.querySelector('.grant-row.editing')) {
+      const moved = (data.standing_generation ?? 0) !== grantEdit.generation;
+      const note = list.querySelector('.grant-edit-moved');
+      if (note) note.hidden = !moved;
+      return;
+    }
     list.innerHTML = rows.map(g => {
       const live = g.lifetime === 'live';
+      const editing = !live && grantEdit && grantEdit.member === g.plugin_id && grantEdit.path === g.path;
+      if (editing) return renderGrantEditRow(g);
       const secs = g.secs_remaining;
       const when = live
         ? `dies on restart · ${escFmtAge(secs ?? 0)} left`
         : (secs === null || secs === undefined ? 'until revoked' : `${escFmtAge(secs)} left`);
-      const origin = g.origin === 'operator_initiated' ? 'you granted this directly' : 'answered a request';
+      // A PEER's ruling (dp, 2026-10-05) is shown read-only with who decided and on what NOT-SAME
+      // basis; revoke stays available to the operator like any grant.
+      const byPeer = typeof g.granted_by === 'string' && g.granted_by.startsWith('peer:');
+      const pb = g.peer_basis || {};
+      const origin = g.origin === 'operator_initiated' ? 'you granted this directly'
+        : byPeer ? `decided by ${g.granted_by.slice(5)} (NOT-SAME peer, ${pb.independence ?? 'basis unknown'}, asker ${pb.asker_basis ?? '?'})`
+        : 'answered a request';
       return `
         <div class="grant-row">
           <span class="grant-who">${memberName(g.plugin_id ?? '?')}</span>
           <span class="grant-preset${live ? '' : ' scope-standing'}">${live ? 'LIVE' : 'STANDING'}</span>
+          ${grantModeBoxes(g.modes, false)}
           <code>${escapeHtml(String(g.path ?? ''))}${g.recursive ? '<span class="grant-reach" title="reaches the whole subtree">/**</span>' : ''}</code>
           <span class="grant-ttl">${escapeHtml(when)}</span>
           <span class="grant-why">${escapeHtml(origin)}${
@@ -3899,10 +4490,19 @@
             : `<button class="grant-revoke" data-revoke-member="${
             escapeHtml(String(g.plugin_id))}" data-revoke-path="${
             escapeHtml(String(g.path))}">revoke</button>`}
+          ${live ? '' : `<button class="grant-act" data-edit-member="${
+            escapeHtml(String(g.plugin_id))}" data-edit-path="${
+            escapeHtml(String(g.path))}" title="change this grant's path, reach and r/w/e/d together; nothing changes until Save">edit</button>`}
+          ${live ? '' : `<button class="grant-act" data-dup-member="${
+            escapeHtml(String(g.plugin_id))}" data-dup-path="${
+            escapeHtml(String(g.path))}"
+            title="give another member the same grant (path, reach, modes, term); ${
+            escapeHtml(memberName(g.plugin_id ?? '?'))} keeps this one">duplicate</button>`}
           ${live ? '' : `<button class="grant-act" data-move-member="${
             escapeHtml(String(g.plugin_id))}" data-move-path="${
             escapeHtml(String(g.path))}" data-move-recursive="${g.recursive ? 'true' : 'false'}"
-            title="give this same grant to a different member, in one act — the repair for a mistyped id">reassign</button>`}
+            title="MOVE this grant to a different member: ${
+            escapeHtml(memberName(g.plugin_id ?? '?'))} LOSES it (the repair for a mistyped id). To keep it and give another member the same grant, use duplicate">move</button>`}
         </div>`;
     }).join('');
   }
@@ -3922,14 +4522,68 @@
   // plus the spec it will implement. Never-flatter (#435/#438): an empty-looking
   // panel here would claim "this entity has no channels" when the truth is that
   // nobody has built the view.
+  // CHANNEL SENDS (#1344, slice 1, SHADOW): the operator's view of what members asked to send
+  // over the channels bound for them. Nothing here has left the machine. "Mark answered" is how
+  // the operator says the bound recipient replied (no email ingress yet), which frees that
+  // member's unanswered budget; the daemon witnesses it, once only.
+  async function renderChannelSends() {
+    const el = $('channel-sends');
+    if (!el) return;
+    try {
+      const [ob, bd] = await Promise.all([
+        apiFetch('/api/channel/outbox?limit=100').then(r => r.json()),
+        apiFetch('/api/channel/binding').then(r => r.json()),
+      ]);
+      const rows = ob.outbox || [], binds = bd.bindings || [];
+      const when = t => t ? new Date(t * 1000).toISOString().replace('T', ' ').slice(0, 16) + 'Z' : '';
+      const bindRows = binds.map(b => `<tr><td>${escapeHtml(b.member)}</td><td>${escapeHtml(b.channel_id)}</td>
+          <td>${escapeHtml(b.recipient_class)}</td><td>${escapeHtml(b.adapter)}</td>
+          <td>${escapeHtml(b.address)}</td><td>${escapeHtml(b.reason)}</td></tr>`).join('');
+      const obRows = rows.map(r => {
+        const state = r.would_deny ? 'would-deny (over budget)'
+          : r.answered_at ? `answered ${escapeHtml(when(r.answered_at))} by ${escapeHtml(r.answered_by || '?')}`
+          : `<button class="btn" data-channel-answer="${Number(r.id)}">Mark answered</button>`;
+        return `<tr><td>#${Number(r.id)}</td><td>${escapeHtml(when(r.created))}</td><td>${escapeHtml(r.member)}</td>
+          <td>${escapeHtml(r.channel_id)}</td><td style="white-space:pre-wrap">${escapeHtml(r.content)}</td><td>${state}</td></tr>`;
+      }).join('');
+      el.innerHTML = `
+        <h3>Channel sends <span class="pol-mode">shadow: nothing has left this machine</span></h3>
+        <p class="esc-note">Bindings (where each member's sends to a channel would go):</p>
+        ${binds.length ? `<table class="data"><tr><th>member</th><th>channel</th><th>class</th><th>adapter</th><th>address</th><th>reason</th></tr>${bindRows}</table>`
+                       : '<p class="esc-note">No channel is bound yet (<code>hestia channel bind</code>).</p>'}
+        <p class="esc-note">Outbox, newest first. A member may have 3 unanswered sends per channel per clock hour.</p>
+        ${rows.length ? `<table class="data"><tr><th>id</th><th>arrived</th><th>member</th><th>channel</th><th>message</th><th>state</th></tr>${obRows}</table>`
+                      : '<p class="esc-note">The outbox is empty.</p>'}`;
+    } catch (e) {
+      el.innerHTML = `<p class="esc-note">Channel sends could not be read: ${escapeHtml(e.message)}</p>`;
+    }
+  }
+
+  document.addEventListener('click', async (e) => {
+    const b = e.target && e.target.closest && e.target.closest('[data-channel-answer]');
+    if (!b) return;
+    const id = b.getAttribute('data-channel-answer');
+    if (!confirm(`Mark outbox #${id} answered? The recipient replied; this frees the member's budget. Once only.`)) return;
+    b.disabled = true;
+    try {
+      const res = await apiFetch(`/api/channel/outbox/${encodeURIComponent(id)}/answer`, { method: 'POST' });
+      const out = await res.json().catch(() => ({}));
+      // already-decided-409: answered elsewhere is not a failure; re-read and show it.
+      if (res.status === 409) { await renderChannelSends(); return; }
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      await renderChannelSends();
+    } catch (err) { b.disabled = false; alert(`mark answered failed: ${err.message}`); }
+  });
+
   function renderChannels() {
     const root = $('channels-body');
     if (!root) return;
     root.innerHTML = `
+      <div id="channel-sends"></div>
       <div class="devices-notice">
-        <strong>Not yet implemented.</strong> Channels is a reserved slot with a written
-        spec (PRD §5.9) and no machinery behind it yet. Nothing on this screen reads or
-        renders real channel state.
+        <strong>The rest is not yet implemented.</strong> Above: channel sends (#1344, shadow).
+        Everything else on this screen is a reserved slot with a written spec (PRD §5.9) and
+        no machinery behind it yet.
       </div>
       <div class="esc-note" style="margin-top:0.7rem">
         <p style="margin:0 0 0.5rem"><strong>What this screen will be:</strong> the gateway to every
@@ -3946,6 +4600,7 @@
         inquiry is itself a governed, witnessed act by the asker: others can learn who did what,
         and the asking leaves a trace.</p>
       </div>`;
+    renderChannelSends();
   }
 
   function renderDevices(data) {
@@ -4366,11 +5021,14 @@
         ${r.corroborations && r.corroborations.length
             ? `<div class="ledger-verdict">corroborated by ${escapeHtml(r.corroborations.join(', '))}</div>` : ''}
         ${verdict ? `<div class="ledger-verdict">${verdict}</div>` : ''}
+        ${decidable && ledgerOnceOnly(r) ? `
+          <div class="ledger-verdict scope-once-why">${SCOPE_ONCE_ONLY_WHY}</div>` : ''}
         ${decidable ? `
           <div class="esc-actions" style="margin-top:0.45rem;">
             <input class="esc-reason ledger-reason" type="text" placeholder="reason (required to approve)">
-            <button class="esc-approve ledger-approve" disabled>approve</button>
-            <button class="esc-deny ledger-deny">deny</button>
+            ${ledgerOffersGrant(r)
+              ? `<button class="esc-approve ledger-approve" disabled>${ledgerOnceOnly(r) ? 'Approve once' : 'approve'}</button>` : ''}
+            <button class="esc-deny ledger-deny">${ledgerOnceOnly(r) ? 'Refuse' : 'deny'}</button>
           </div>
           <div class="esc-err ledger-err" hidden></div>` : ''}
         ${renderLedgerIdentity(r)}
@@ -4401,21 +5059,45 @@
     </div>`;
   }
 
+  // #1287 part 2: a scope row carries the daemon's `allowed_decisions` (absent on an escalation
+  // and on an older daemon, which keeps the plain approve/deny). The ledger's approve is a plain
+  // exact grant; a request that accepts no session grant offers "Approve once" (once:true)
+  // instead, so the button sent is one the decide endpoint admits.
+  function ledgerOnceOnly(r) {
+    return r.kind === 'scope_request' && Array.isArray(r.allowed_decisions)
+      && r.allowed_decisions.length > 0 && !r.allowed_decisions.includes('session');
+  }
+
+  function ledgerOffersGrant(r) {
+    if (r.kind !== 'scope_request' || !Array.isArray(r.allowed_decisions)
+        || r.allowed_decisions.length === 0) return true;
+    return r.allowed_decisions.includes(ledgerOnceOnly(r) ? 'once' : 'session');
+  }
+
+  function ledgerScopeDecideBody(r, ok, reason) {
+    const body = { request_id: r.id, granted: ok, reason: reason || null };
+    if (ok && ledgerOnceOnly(r)) body.once = true;
+    return body;
+  }
+
   function wireLedgerRows(rows) {
+    const byId = new Map(rows.map(r => [String(r.id), r]));
     document.querySelectorAll('#ledger-list .ledger-row').forEach((el) => {
+      const deny0 = el.querySelector('.ledger-deny');
+      if (!deny0) return;
       const approve = el.querySelector('.ledger-approve');
-      if (!approve) return;
       const id = el.dataset.id, kind = el.dataset.kind;
+      const row = byId.get(String(id)) || { id, kind };
       const reason = el.querySelector('.ledger-reason');
       const deny = el.querySelector('.ledger-deny');
       const err = el.querySelector('.ledger-err');
       reason.value = ledgerDrafts.get(id) || '';
-      approve.disabled = !reason.value.trim();
+      if (approve) approve.disabled = !reason.value.trim();
       // Same asymmetry the daemon enforces and the escalation panel already uses: a deny needs
       // no justification, an approve does.
       reason.addEventListener('input', () => {
         ledgerDrafts.set(id, reason.value);
-        approve.disabled = !reason.value.trim();
+        if (approve) approve.disabled = !reason.value.trim();
       });
       const go = async (ok) => {
         err.hidden = true;
@@ -4423,7 +5105,7 @@
           const res = kind === 'scope_request'
             ? await apiFetch('/api/scope/decide', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ request_id: id, granted: ok, reason: reason.value.trim() || null }) })
+                body: JSON.stringify(ledgerScopeDecideBody(row, ok, reason.value.trim())) })
             : await apiFetch('/api/operator/gate-escalation', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ id, approve: ok, reason: reason.value.trim() || null }) });
@@ -4441,7 +5123,7 @@
           err.hidden = false;
         }
       };
-      approve.addEventListener('click', () => go(true));
+      if (approve) approve.addEventListener('click', () => go(true));
       deny.addEventListener('click', () => go(false));
     });
   }
@@ -5758,9 +6440,148 @@
 
     // Revoke, and the hand-off to the one decide control. Delegated, because the rows are
     // re-rendered on every tick and per-row listeners would be rebound continuously.
+    // EDIT (dp, 2026-10-22, #1345): stage path + reach + modes; nothing changes until Save.
+    // The floor's Edit row (same staging; a floor row is never a grant row).
+    pane.addEventListener('input', (e) => {
+      if (!floorEdit) return;
+      const row = e.target.closest('.grant-row.floor-editing');
+      if (!row) return;
+      if (e.target.matches('[data-floor-edit-recursive]')) floorEdit.draft.recursive = e.target.checked;
+      else if (e.target.matches('[data-grant-mode]')) {
+        const l = e.target.dataset.grantMode;
+        if (e.target.checked) floorEdit.draft.modes.add(l); else floorEdit.draft.modes.delete(l);
+      } else return;
+      renderSocietyFloor(lastData);
+    });
+    pane.addEventListener('input', (e) => {
+      if (!grantEdit) return;
+      const row = e.target.closest('.grant-row.editing:not(.floor-editing)');
+      if (!row) return;
+      if (e.target.matches('[data-grant-edit-path]')) grantEdit.draft.path = e.target.value.trim();
+      else if (e.target.matches('[data-grant-edit-recursive]')) grantEdit.draft.recursive = e.target.checked;
+      else if (e.target.matches('[data-grant-mode]')) {
+        const l = e.target.dataset.grantMode;
+        if (e.target.checked) grantEdit.draft.modes.add(l); else grantEdit.draft.modes.delete(l);
+        e.target.closest('label')?.classList.toggle('on', e.target.checked);
+      } else return;
+      // Refresh only the summary and Save: redrawing the row would steal the cursor.
+      const sum = grantEditSummary(grantEdit);
+      const box = row.querySelector('.grant-edit-summary:not(.grant-edit-moved)');
+      const tmp = document.createElement('div');
+      tmp.innerHTML = renderGrantEditRow({ plugin_id: grantEdit.member });
+      const fresh = tmp.querySelector('.grant-edit-summary:not(.grant-edit-moved)');
+      if (box && fresh) { box.className = fresh.className; box.textContent = fresh.textContent; }
+      const save = row.querySelector('[data-grant-edit-save]');
+      if (save) save.disabled = sum.empty || sum.none;
+    });
     pane.addEventListener('click', async (e) => {
       const open = e.target.closest('[data-open-scope]');
       if (open) { $('scope-modal').hidden = false; return; }
+      const ed = e.target.closest('[data-edit-member]');
+      if (ed) {
+        const member = ed.dataset.editMember, p = ed.dataset.editPath;
+        const g = (lastData?.scope_grants ?? []).find(x => x.lifetime === 'standing'
+          && x.plugin_id === member && x.path === p);
+        if (!g) return;
+        const before = { path: g.path, recursive: !!g.recursive, modes: grantModeSet(g.modes) };
+        grantEdit = { member, path: p, generation: lastData?.standing_generation ?? 0, row: g, before,
+                      draft: { path: before.path, recursive: before.recursive, modes: new Set(before.modes) } };
+        err.hidden = true;
+        renderScopeGrants(lastData);
+        return;
+      }
+      if (e.target.closest('[data-grant-edit-cancel]')) {
+        grantEdit = null; err.hidden = true;
+        renderScopeGrants(lastData);
+        return;
+      }
+      const save = e.target.closest('[data-grant-edit-save]');
+      if (save && grantEdit) {
+        const sum = grantEditSummary(grantEdit);
+        if (sum.empty || sum.none) return;
+        const head = `Save this edit to ${grantEdit.member}'s standing grant?\n\n${sum.lines.join('\n')}\n\n`;
+        const why = sum.widens
+          ? prompt(head + 'This WIDENS what the member may reach or do. Reason (required):')
+          : prompt(head + 'This only narrows. Reason (optional):');
+        if (why === null) return;
+        if (sum.widens && !why.trim()) { err.textContent = 'a reason is required to widen a grant'; err.hidden = false; return; }
+        save.disabled = true; err.hidden = true;
+        try {
+          const res = await apiFetch('/api/scope/standing/edit', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              plugin_id: grantEdit.member, path: grantEdit.path,
+              new_path: grantEdit.draft.path, recursive: grantEdit.draft.recursive,
+              modes: grantModeLetters(grantEdit.draft.modes), reason: why,
+              expected_generation: grantEdit.generation, expected_existing: grantEdit.row,
+            }),
+          });
+          const out = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+          grantEdit = null;
+          await tick(); renderScopeGrants(lastData);
+        } catch (e2) {
+          // The draft is kept: a refused Save leaves both the grant and the staged edit as they were.
+          err.textContent = `edit failed: ${e2.message}`; err.hidden = false; save.disabled = false;
+        }
+        return;
+      }
+      // SOCIETY FLOOR (floorPost above).
+      const fed = e.target.closest('[data-floor-edit]');
+      if (fed) {
+        const cur = (lastData?.society_floor ?? []).find(f => f.path === fed.dataset.floorEdit);
+        if (!cur) return;
+        const before = { recursive: !!cur.recursive, modes: grantModeSet(cur.modes) };
+        floorEdit = { path: cur.path, generation: lastData?.standing_generation ?? 0, before,
+                      draft: { recursive: before.recursive, modes: new Set(before.modes) } };
+        err.hidden = true;
+        renderSocietyFloor(lastData);
+        return;
+      }
+      if (e.target.closest('[data-floor-edit-cancel]')) {
+        floorEdit = null; err.hidden = true;
+        renderSocietyFloor(lastData);
+        return;
+      }
+      const fsave = e.target.closest('[data-floor-edit-save]');
+      if (fsave && floorEdit) {
+        const sum = floorEditSummary(floorEdit);
+        if (sum.empty || sum.none) return;
+        const why = prompt(`Save this change to the society floor, for EVERY member?\n\n${floorEdit.path}\n${sum.lines.join('\n')}\n\n`
+          + (sum.widens ? 'This WIDENS what every member may reach or do.\n' : 'This only narrows.\n') + 'Reason (required):');
+        if (why === null) return;
+        if (!why.trim()) { err.textContent = 'a reason is required to change the floor'; err.hidden = false; return; }
+        fsave.disabled = true;
+        const ok = await floorPost('/api/scope/floor', {
+          path: floorEdit.path, reason: why, recursive: floorEdit.draft.recursive,
+          modes: grantModeLetters(floorEdit.draft.modes), expected_generation: floorEdit.generation,
+        }, 'floor edit', err);
+        // A refused Save keeps the draft: the entry and the staged edit both stay as they were.
+        if (ok) { floorEdit = null; renderSocietyFloor(lastData); } else fsave.disabled = false;
+        return;
+      }
+      const rm = e.target.closest('[data-floor-remove]');
+      if (rm) {
+        const p = rm.dataset.floorRemove;
+        const why = prompt(`Remove ${p} from the society floor?\n\nThis narrows EVERY member at once. Reason:`);
+        if (why === null) return;
+        rm.disabled = true;
+        if (!await floorPost('/api/scope/floor/remove', { path: p, reason: why }, 'floor remove', err)) rm.disabled = false;
+        return;
+      }
+      if (e.target.closest('#floor-add-btn')) {
+        const p = ($('floor-add-path')?.value ?? '').trim();
+        const why = ($('floor-add-reason')?.value ?? '').trim();
+        const modes = ['r', 'w', 'e', 'd'].filter(l => $(`floor-add-${l}`)?.checked).join('');
+        if (!p || !why) { err.textContent = 'a floor entry needs an absolute path and a reason'; err.hidden = false; return; }
+        if (!modes) { err.textContent = 'a floor entry needs at least one of r, w, e, d'; err.hidden = false; return; }
+        const body = { path: p, reason: why, recursive: !!$('floor-add-rec')?.checked, modes };
+        if (!confirm(`Add to the society floor, for EVERY member without a grant of its own there?\n\n${p}${body.recursive ? '/**' : ''}\nmodes: ${modes}`)) return;
+        if (await floorPost('/api/scope/floor', body, 'floor add', err)) {
+          $('floor-add-path').value = ''; $('floor-add-reason').value = '';
+        }
+        return;
+      }
       // make standing — POST /api/scope/standing/promote
       const pro = e.target.closest('[data-promote-member]');
       if (pro) {
@@ -5821,7 +6642,11 @@
           err.textContent = 'reassign: no other member has connected to this daemon yet.';
           err.hidden = false; return;
         }
-        const to = prompt(`Reassign this ${rec ? 'recursive' : 'exact'} grant from "${from}" to which member?\n\n${p2}\n\n`
+        // #1399: this MOVES the grant. Said in the prompt, not left to the button's name: an
+        // operator read "assign" as a copy and claude-code lost its toolchain grant.
+        const to = prompt(`MOVE this ${rec ? 'recursive' : 'exact'} grant from "${from}" to which member?\n\n${p2}\n\n`
+          + `"${from}" will LOSE this grant. To keep it and give another member the same grant, `
+          + `cancel and use "duplicate".\n\n`
           + `Members this daemon has actually seen:\n  ${seen.join('\n  ')}\n\n`
           + `Type the destination id exactly:`);
         if (to === null) return;
@@ -5846,6 +6671,61 @@
         } catch (e2) {
           err.textContent = `reassign failed: ${e2.message}`;
           err.hidden = false; mv.disabled = false;
+        }
+        return;
+      }
+
+      // DUPLICATE (#1399, legion-claude for dp): the same grant (path, reach, modes, term) for
+      // another member, the holder keeping theirs. "The operator gives a being the same toolchain
+      // reach its seat already has" is the common case, and "assign" moved it instead. One
+      // operator grant through the same door as the grant form (/api/scope/grant), bound with
+      // `expected_existing: null`, so a grant the destination already holds on that path is
+      // refused rather than silently replaced.
+      const dup = e.target.closest('[data-dup-member]');
+      if (dup) {
+        const from = dup.dataset.dupMember, p2 = dup.dataset.dupPath;
+        const g = (lastData?.scope_grants ?? []).find(x => x.lifetime === 'standing'
+          && x.plugin_id === from && x.path === p2);
+        if (!g) return;
+        const seen = [...knownMembers.keys()].filter(id => id !== from);
+        if (!seen.length) {
+          err.textContent = 'duplicate: no other member has connected to this daemon yet.';
+          err.hidden = false; return;
+        }
+        const modes = grantModeLetters(grantModeSet(g.modes));
+        const term = (g.secs_remaining === null || g.secs_remaining === undefined)
+          ? 'until revoked' : `${escFmtAge(g.secs_remaining)} left`;
+        const to = prompt(`DUPLICATE this grant for another member ("${from}" keeps it):\n\n`
+          + `${p2}${g.recursive ? '/**' : ''}  modes ${modes}  ${term}\n\n`
+          + `Members this daemon has actually seen:\n  ${seen.join('\n  ')}\n\n`
+          + `Type the member id exactly:`);
+        if (to === null) return;
+        const dest = to.trim();
+        if (!dest) return;
+        if (!knownMembers.has(dest)) {
+          err.textContent = `duplicate refused: "${dest}" is not a member this daemon has seen.`;
+          err.hidden = false; return;
+        }
+        const why = prompt(`Reason (required — this widens ${dest}'s reach):`,
+          `same grant as ${from}${g.reason ? ': ' + g.reason : ''}`);
+        if (why === null || !why.trim()) return;
+        dup.disabled = true; err.hidden = true;
+        try {
+          const body = { plugin_id: dest, path: p2, recursive: !!g.recursive, modes,
+                         reason: why, expected_existing: null };
+          if (g.secs_remaining !== null && g.secs_remaining !== undefined) {
+            body.expires_in_secs = Math.max(1, Math.floor(g.secs_remaining));
+          }
+          const r = await apiFetch('/api/scope/grant', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const o = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(o?.error || `HTTP ${r.status}`);
+          await tick(); renderScopeGrants(lastData);
+        } catch (e2) {
+          err.textContent = `duplicate failed: ${e2.message}`;
+          err.hidden = false; dup.disabled = false;
         }
         return;
       }
@@ -6234,7 +7114,123 @@
   // hubUrls included (codex review, PR #384): without it, the pre-sign-in 401
   // left the hub list permanently "unavailable" — status/topics recover via
   // this hook and the poll, and the list must recover with them.
-  window.__hubRefresh = () => { hubStatus(); hubTopics(); hubUrls(); };
+  // Which hubs am I actually a member of? Asked of each hub, not inferred from the
+  // presence of a local identity — holding an identity says nothing about who admitted it.
+  async function hubMemberships() {
+    const box = $('hub-list'); if (!box) return;
+    let d;
+    try {
+      const r = await hubFetch('/api/hub/memberships');
+      d = await r.json();
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    } catch (e) {
+      box.innerHTML = '<div class="empty">could not read hub list</div>'; return;
+    }
+    const sup = d.supported || {};
+    const rows = (d.hubs || []);
+    if (!rows.length) { box.innerHTML = '<div class="empty">no hubs known yet — add one below</div>'; return; }
+    box.innerHTML = '';
+    for (const h of rows) {
+      const row = document.createElement('div');
+      row.className = 'hub-row';
+      // null enrollment is UNKNOWN, not "no". Three unknowns, not interchangeable: never asked
+      // (hub down), asked but the answer was not about membership (probe_error), or no reading.
+      // Each keeps the amber badge and carries its reason on hover.
+      const st = h.enrolled === true ? ['enrolled','enrolled']
+               : h.enrolled === false ? ['notmember','not a member']
+               : !h.reachable ? ['unknown','unreachable']
+               : h.probe_error ? ['unknown','undetermined']
+               : ['unknown','unknown'];
+      const name = h.hub_name || h.label || '(unnamed hub)';
+      row.innerHTML =
+        '<span class="hub-name"></span>' +
+        '<span class="hub-badge ' + st[0] + '">' + st[1] + '</span>' +
+        '<span class="hub-url"></span><span class="spacer"></span>';
+      // Set through the DOM: escapeHtml lives in the first <script> block, out of scope here.
+      if (h.probe_error) row.querySelector('.hub-badge').title = h.probe_error;
+      row.querySelector('.hub-name').textContent = name + (h.active ? ' ·  active' : '');
+      row.querySelector('.hub-url').textContent = h.url;
+
+      // apply — the member-initiated join. Join targets the ACTIVE hub, so the row is made
+      // active first, and a failed retarget ABORTS (applying to B and joining A is the worst
+      // available outcome). PUT: /api/hub/urls/active is PUT-only.
+      if (h.enrolled !== true) {
+        const b = document.createElement('button');
+        b.className = 'policy-btn'; b.textContent = 'apply';
+        // HESTIA_HUB_URL pins the target: retargeting this row would not change where join
+        // goes, so only the pinned (active) row can apply.
+        const pinnedElsewhere = d.active_source === 'env' && !h.active;
+        b.disabled = !h.reachable || pinnedElsewhere;
+        if (pinnedElsewhere) b.title = 'HESTIA_HUB_URL pins this daemon to another hub; applying here would join that one instead.';
+        b.onclick = async () => {
+          note('hub-list-note', '', 'applying…');
+          try {
+            if (!h.active) {
+              const a = await hubFetch('/api/hub/urls/active', { method: 'PUT',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ url: h.url }) });
+              if (!a.ok) {
+                const ad = await a.json().catch(() => ({}));
+                note('hub-list-note', 'err',
+                  'could not target ' + h.url + ' — ' + (ad.error || ('HTTP ' + a.status)) +
+                  '. Not applying, so the request cannot reach the wrong hub.');
+                return;
+              }
+            }
+            const r = await hubFetch('/api/hub/join', { method: 'POST',
+              headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) });
+            const j = await r.json().catch(() => ({}));
+            if (r.ok && j.status === 'admitted') note('hub-list-note', 'ok', 'admitted to ' + name);
+            else if (r.ok && j.status === 'pending') note('hub-list-note', 'warn', 'pending — queued for the hub operator');
+            else note('hub-list-note', 'err', j.error || ('HTTP ' + r.status));
+          } catch (e) { note('hub-list-note', 'err', e.message); }
+          hubMemberships();
+        };
+        row.appendChild(b);
+      }
+
+      // withdraw — real since web4#804 (R8.2 exit without penalty): this node ends its OWN
+      // membership; the hub cannot decline. Shown only where the hub says you are a member.
+      if (h.enrolled === true && sup.withdraw) {
+        const w = document.createElement('button');
+        w.className = 'policy-btn'; w.textContent = 'withdraw';
+        w.title = 'End your membership of this hub. The hub cannot refuse, and re-joining later is a new application.';
+        w.onclick = async () => {
+          if (!confirm('Withdraw from ' + name + '?\n\nThis ends your membership now. Re-joining is a new application, not an undo.')) return;
+          const reason = prompt('Reason (optional, recorded by the hub):', '') ;
+          if (reason === null) return;
+          note('hub-list-note', '', 'withdrawing…');
+          try {
+            const r = await hubFetch('/api/hub/withdraw', { method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ url: h.url, reason }) });
+            const j = await r.json().catch(() => ({}));
+            if (r.ok && j.status === 'withdrawn') {
+              const vac = ((j.detail || {}).roles_vacated || []);
+              note('hub-list-note', 'ok', 'withdrawn from ' + name +
+                (vac.length ? ' — roles left vacant: ' + vac.join(', ') : ''));
+            } else if (r.ok && j.status === 'not_a_member') {
+              note('hub-list-note', 'warn', 'already not a member of ' + name + ' — ' + (j.detail || ''));
+            } else note('hub-list-note', 'err', j.error || ('HTTP ' + r.status));
+          } catch (e) { note('hub-list-note', 'err', e.message); }
+          hubMemberships();
+        };
+        row.appendChild(w);
+      }
+
+      // remove from list — local only, and labelled so it cannot be read as leaving
+      const rm = document.createElement('button');
+      rm.className = 'policy-btn'; rm.textContent = 'remove from list';
+      rm.title = 'Forgets this hub\'s URL on this device. It does NOT end your membership — ' +
+                 'use withdraw for that.';
+      rm.onclick = async () => { await hubUrlsRemove(h.url, 'hub-list-note'); hubMemberships(); };
+      row.appendChild(rm);
+
+      box.appendChild(row);
+    }
+  }
+
+  window.__hubRefresh = () => { hubStatus(); hubTopics(); hubUrls(); hubMemberships(); };
 
   // ---- known-hub list (#307): view + retarget, no rebuild/relaunch ----------
   async function hubUrls() {
@@ -6276,17 +7272,21 @@
       else note('hub-urls-note', 'err', d.error || ('HTTP ' + r.status));
     } catch (e) { note('hub-urls-note', 'err', e.message); }
   });
-  $('hub-urls-remove').addEventListener('click', async () => {
-    const url = $('hub-urls-select').value;
-    if (!url) { note('hub-urls-note', 'warn', 'nothing selected'); return; }
+  // Forgetting a hub URL is reachable from two places (the select below and each membership
+  // row), so it is ONE function; `noteId` keeps feedback next to the control used.
+  async function hubUrlsRemove(url, noteId) {
+    noteId = noteId || 'hub-urls-note';
+    if (!url) { note(noteId, 'warn', 'nothing selected'); return; }
     try {
       const r = await hubFetch('/api/hub/urls', { method: 'DELETE',
         headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) });
       const d = await r.json().catch(() => ({}));
       if (r.ok) hubRetargeted('removed: ' + url);
-      else note('hub-urls-note', 'err', d.error || ('HTTP ' + r.status));
-    } catch (e) { note('hub-urls-note', 'err', e.message); }
-  });
+      else note(noteId, 'err', d.error || ('HTTP ' + r.status));
+    } catch (e) { note(noteId, 'err', e.message); }
+  }
+  $('hub-urls-remove').addEventListener('click',
+    () => hubUrlsRemove($('hub-urls-select').value));
   $('hub-urls-add').addEventListener('click', async () => {
     const url = $('hub-urls-add-url').value.trim();
     if (!url) { note('hub-urls-note', 'warn', 'enter a URL'); return; }

@@ -62,6 +62,11 @@ pub enum CoreError {
 
     #[error("HOME directory not set")]
     NoHomeDirectory,
+
+    /// A vault save was refused because the witness chain could not first be made durable
+    /// (group commit): the vault may never get ahead of the chain rows that justify it.
+    #[error("vault save refused: {0}")]
+    SaveBarrier(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

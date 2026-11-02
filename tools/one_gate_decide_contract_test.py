@@ -71,7 +71,8 @@ def load_engine():
     """The shared engine as the gate imports it, with any staging overlay first."""
     if str(SHARED) not in sys.path:
         sys.path.insert(0, str(SHARED))
-    for name in ("hestia_gate_mechanism", "hestia_single_gate"):
+    for name in ("hestia_witness_core", "hestia_gate_core", "hestia_governance_closure",
+                 "hestia_gate_mechanism", "hestia_single_gate"):
         path = OVERLAY.get(name)
         if path and name not in sys.modules:
             spec = importlib.util.spec_from_file_location(name, path)
@@ -104,10 +105,15 @@ class Policy:
     """What the stub answers. `query(begin_args) -> allow|warn|deny`; the rest are switches."""
 
     def __init__(self, query=None, *, superseded=False, claim="escalate", witness="receipt",
-                 delays=None, snapshot=True, cold_connect=0.0):
+                 delays=None, snapshot=True, cold_connect=0.0, scope_claim=None,
+                 scope_spend_fails=False, scope_lost=None):
         self.query = query or (lambda a: "allow")
         self.superseded = superseded
         self.claim = claim                 # escalate | approve
+        # hestia_scope_claim: path -> opened | pending | approved | in_force | refused | absent
+        self.scope_claim = scope_claim or (lambda path: "opened")
+        self.scope_spend_fails = scope_spend_fails   # the atomic reserve refuses (a race)
+        self.scope_lost = scope_lost or {}           # {op: seconds}: apply, then answer too late
         self.witness = witness             # receipt | refuse-allow | refuse-all | old
         self.delays = delays or {}         # {tool name: seconds, "*": seconds}
         self.snapshot = snapshot           # False: the snapshot connect is refused
@@ -120,6 +126,7 @@ class Stub:
         self.calls: list = []              # (tool, args, plugin_id-of-session)
         self.sessions: dict = {}
         self.decided: dict = {}            # action_id -> decision
+        self.scope_ops: dict = {}          # op_key -> reserved | committed | released
         self.lock = threading.Lock()
         stub = self
 
@@ -210,6 +217,39 @@ class Stub:
             return _ok(rid, {"claimed": False, "permits_write": False,
                              "escalation_id": "stub-esc-" + uuid.uuid4().hex[:8],
                              "how_to_decide": "stub: nobody decides"})
+        if name == "hestia_scope_claim" and "op" in args:
+            # RESERVE / COMMIT / RELEASE / LOOKUP, like the daemon's scope_claim_spend_all.
+            op, key = args.get("op"), args.get("op_key")
+            with self.lock:
+                if op == "reserve":
+                    verdicts = [p.scope_claim(x) for x in args.get("paths") or []]
+                    if p.scope_spend_fails or not all(v in ("approved", "in_force") for v in verdicts):
+                        out = {"verdict": "not_all", "permits": False, "reserved": [],
+                               "detail": "stub: not every path covered; nothing reserved"}
+                    else:
+                        self.scope_ops[key] = "reserved"
+                        out = {"verdict": "reserved", "permits": True, "op_key": key}
+                elif op in ("commit", "release"):
+                    if self.scope_ops.get(key) == "reserved":
+                        self.scope_ops[key] = "committed" if op == "commit" else "released"
+                        out = {"verdict": self.scope_ops[key], "op_key": key}
+                    else:
+                        out = {"verdict": "unknown" if key not in self.scope_ops else "settled"}
+                else:
+                    out = {"verdict": self.scope_ops.get(key, "unknown")}
+            lost = p.scope_lost.get(op)
+            if lost:
+                time.sleep(lost)               # the mutation LANDED; the answer arrives too late
+            return _ok(rid, out)
+        if name == "hestia_scope_claim":
+            path = args.get("path") or ""
+            verdict = p.scope_claim(path)
+            if verdict == "absent":            # an older daemon: no such verb
+                return _ok(rid, {"ok": True})
+            rid_ = "scope-stub" + str(abs(hash(path)) % 10**6)
+            permits = verdict in ("in_force", "approved")
+            return _ok(rid, {"verdict": verdict, "request_id": rid_, "permits": permits,
+                             "detail": f"stub {verdict}", "path": path})
         if name == "hestia_request_witness":
             return _ok(rid, {"ok": True, "witnessEntryHash": "c" * 64})
         if name == "hestia_witness_decision":
@@ -242,6 +282,22 @@ def closed_port_url():
 SEATS = ("claude-code", "codex", "kimi", "gemini")
 SEAT_SHIM = {"claude-code": "claude-code/hooks/pre_tool_use.py", "codex": "codex/hooks/pre_tool_use.py",
              "kimi": "kimi/hooks/pre_tool_use.py", "gemini": "gemini/hooks/before_tool.py"}
+#: Staging only: {"seat": "/path/to/shim.py"} in place of the repo's shim (the shim twin of
+#: HESTIA_CONTRACT_OVERLAY; unset in the repo and in CI).
+SHIM_OVERRIDE = json.loads(os.getenv("HESTIA_CONTRACT_SHIMS") or "{}")
+
+
+def shim_path(seat) -> pathlib.Path:
+    return pathlib.Path(SHIM_OVERRIDE.get(seat) or PLUGINS / SEAT_SHIM[seat])
+
+
+def _shim_module(seat):
+    """The seat's shim, imported (its HARNESS and PROFILE are data the tests read)."""
+    spec = importlib.util.spec_from_file_location(f"contract_shim_{seat.replace('-', '_')}",
+                                                  shim_path(seat))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 SEAT_MEMBER = {"claude-code": "claude-code", "codex": "codex", "kimi": "kimi-code", "gemini": "gemini"}
 SEAT_HOME = {"claude-code": "~/.claude", "codex": "~/.codex", "kimi": "~/.kimi-code", "gemini": "~/.gemini"}
 SEAT_MODE_ENV = {"codex": "HESTIA_CODEX_GATE_MODE", "kimi": "HESTIA_KIMI_GATE_MODE",
@@ -457,8 +513,19 @@ def test_the_gate_owns_no_cache_no_client_and_one_recorder(m, g, wc, home):
                    "call_tool", "globals"):
         check(f"no-use-of-{banned}", banned not in names and banned not in attrs)
     check("no-actions-dir-literal", "/tmp/hestia-actions" not in src and "hestia-actions" not in src)
+    # Stage C: the gate READS its seat's harness registration (harness_bound), so open() may
+    # appear — in a literal read mode only. Any other open is a private file write.
     opens = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "open"]
-    check("no-file-writes", not opens, len(opens))
+    def _mode(call):
+        if len(call.args) >= 2 and isinstance(call.args[1], ast.Constant):
+            return call.args[1].value
+        for kw in call.keywords:
+            if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                return kw.value.value
+        return "r" if len(call.args) < 2 and not any(k.arg == "mode" for k in call.keywords) else None
+    writes = [ast.unparse(n) for n in opens if _mode(n) not in ("r", "rb")]
+    check("no-file-writes", not writes, writes)
+    check("registration-reads-are-reads", len(opens) >= 1, len(opens))
     recorders = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
                  and getattr(n.func, "attr", None) == "record_decision"]
     check("exactly-one-record_decision-call-site", len(recorders) == 1, len(recorders))
@@ -477,9 +544,26 @@ def test_the_gate_owns_no_cache_no_client_and_one_recorder(m, g, wc, home):
         direct = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
                   and getattr(n.func, "attr", None) == name]
         check(f"{name}-never-called-unbounded", not direct, len(direct))
-    check("api-version", g.GATE_API_VERSION == "decide/1")
+    # Stage C: every bounded mechanism call ALSO hands the mechanism the deadline itself, so no
+    # request starts after it (`_bounded` is the belt).
+    mech_calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                  and getattr(n.func, "id", None) == "_bounded" and len(n.args) >= 2
+                  and isinstance(n.args[1], ast.Attribute)
+                  and getattr(n.args[1].value, "id", None) == "mechanism"]
+    check("mechanism-calls-found", len(mech_calls) >= 6, len(mech_calls))
+    for call in mech_calls:
+        check(f"{call.args[1].attr}-gets-the-deadline",
+              "deadline" in {k.arg for k in call.keywords}, ast.unparse(call)[:120])
+    check("api-version", g.GATE_API_VERSION == "decide/2")
     for gone in ("GATE_DEADLINE_SECONDS", "MIN_HARNESS_TIMEOUT_SECONDS", "HARNESS_MARGIN_SECONDS"):
         check(f"no-law-level-harness-timeout-{gone}", not hasattr(g, gone))
+    check("remedies-moved-to-the-core", not hasattr(g, "GATE_REMEDIES") and all(
+        r in core_remedies(g) for r in ("invocation.superseded", "gate.evidence_uncommitted",
+                                        "gate.internal_error", "gate.harness_timeout_unknown")))
+
+
+def core_remedies(g):
+    return g.core.REMEDIES
 
 
 def test_one_deadline_bounds_the_whole_invocation(m, g, wc, home):
@@ -522,9 +606,9 @@ def test_one_deadline_bounds_the_whole_invocation(m, g, wc, home):
         check("short-deadline-bounded", took < 2.4, f"{took:.2f}s")
     finally:
         stub.close()
-    # A daemon slower than the act can wait for: the deployed mechanism's own 4 s budget expires
-    # first here (begin 4 s, then no time to poll), so this pins the composed result — a recorded
-    # no-verdict deny inside the deadline. The cut BY the caller's deadline is the 2 s case above.
+    # A daemon slower than the act can wait for (begin 4 s, poll 4 s): the society phase runs to
+    # the phase deadline (the mechanism takes it itself since stage C), the poll is cut there, and
+    # the result is a recorded no-verdict deny from the reserve, inside the deadline.
     stub = Stub(Policy(delays={"hestia_begin_action": 4.0, "hestia_query_policy": 4.0}))
     try:
         with _Env(m, stub.url, home):
@@ -548,29 +632,31 @@ def test_one_deadline_bounds_the_whole_invocation(m, g, wc, home):
         check("slow-daemon-not-a-permit", d.decision == "deny", d)
     finally:
         stub.close()
-    # The seams run inside the bounded worker (C12b: each spy must be reached), and B passes
-    # the deployed mechanism no `deadline=` it does not have (stage C adds it).
+    # The seams run inside the bounded worker (C12b: each spy must be reached), and since stage
+    # C each is handed the phase deadline itself: a value inside the invocation's deadline.
     seen = {}
     orig_q, orig_f = m.query_society_safety, m.fetch_policy_snapshot
 
     def spy_q(*a, **kw):
-        seen["q"] = (threading.current_thread().name, sorted(kw))
+        seen["q"] = (threading.current_thread().name, sorted(kw), kw.get("deadline"), time.monotonic())
         return orig_q(*a, **kw)
 
     def spy_f(*a, **kw):
-        seen["f"] = (threading.current_thread().name, sorted(kw))
+        seen["f"] = (threading.current_thread().name, sorted(kw), kw.get("deadline"), time.monotonic())
         return orig_f(*a, **kw)
 
     stub = Stub()
     m.query_society_safety, m.fetch_policy_snapshot = spy_q, spy_f
     try:
         with _Env(m, stub.url, home):
-            _decide(g, "codex", "Bash", {"command": "ls"}, home)
+            t0 = time.monotonic()
+            _decide(g, "codex", "Bash", {"command": "ls"}, home, budget_seconds=6.0)
         for k in ("q", "f"):
             check(f"spy-{k}-reached", k in seen, seen)
-            name, kws = seen.get(k, ("", []))
+            name, kws, dl, at = seen.get(k, ("", [], None, 0.0))
             check(f"spy-{k}-ran-bounded", name == "hestia-decide-bounded", name)
-            check(f"spy-{k}-no-deadline-kw-in-B", "deadline" not in kws, kws)
+            check(f"spy-{k}-deadline-threaded", isinstance(dl, float) and at < dl <= t0 + 6.0
+                  - g.WITNESS_RESERVE_SECONDS + 0.05, (dl, at, t0))
     finally:
         m.query_society_safety, m.fetch_policy_snapshot = orig_q, orig_f
         stub.close()
@@ -601,14 +687,12 @@ def test_reads_meet_the_same_local_law_on_every_seat(m, g, wc, home):
                 d, _ = _decide(g, seat, "Read", {"file_path": cred}, home)
                 check(f"{seat}-credential-read-up", d.decision == "deny" and d.rule == "egress.secret", d)
                 d, _ = _decide(g, seat, "Read", {"file_path": outside}, home)
+                # The LAW GAP stage B pinned here is CLOSED (2026-10-05, dp: "yes on gate gap,
+                # let's fix it"): codex reads by `cat`, and the core's command scope now judges a
+                # shell path outside the workspace exactly like a Read path. Every seat agrees.
+                check(f"{seat}-out-of-scope-read-up", d.decision == "deny" and d.rule.startswith("mrh."), d)
                 if seat == "codex":
-                    # LAW GAP, pinned (reported to dp, not fixed in B): codex reads by `cat`, and the
-                    # core's command scope judges only tokens UNDER the workspace, so a shell read of
-                    # an absolute path outside it is unscoped — on every seat, today and in decide().
-                    check(f"{seat}-out-of-scope-SHELL-read-up-is-the-known-law-gap",
-                          d.decision == "allow", d)
-                else:
-                    check(f"{seat}-out-of-scope-read-up", d.decision == "deny" and d.rule.startswith("mrh."), d)
+                    check(f"{seat}-out-of-scope-SHELL-read-is-mrh-command", d.rule == "mrh.command", d)
             with _Env(m, closed_port_url(), home):
                 d, _ = _decide(g, seat, "Read", {"file_path": cred}, home)
                 check(f"{seat}-credential-read-down", d.decision == "deny" and d.rule == "egress.secret", d)
@@ -629,13 +713,63 @@ def test_reads_meet_the_same_local_law_on_every_seat(m, g, wc, home):
         stub.close()
 
 
-def test_b_leaves_the_deployed_mechanism_untouched(m, g, wc, home):
-    """dp, 2026-10-01: B must not modify the mechanism (sovereign bar). Its budgets are the
-    deployed ones; decide() bounds them from outside until stage C threads `deadline=`."""
+def test_c_threads_the_deadline_through_the_mechanism(m, g, wc, home):
+    """Stage C (plan §4 0b): every helper takes `deadline=`, backward-compatible (None is the
+    deployed behaviour), and NO request starts after it. The 5 s per-request cap applies only
+    without a caller deadline: a slow-but-alive cold connect inside a longer deadline answers."""
     import inspect
-    for fn in (m.query_society_safety, m._fetch_policy_snapshot_once, m.gate_self_call):
-        check(f"{fn.__name__}-has-no-deadline-in-B", "deadline" not in inspect.signature(fn).parameters)
-    check("record_decision-takes-the-deadline", "deadline" in inspect.signature(m.record_decision).parameters)
+    for fn in (m.query_society_safety, m.fetch_policy_snapshot, m._fetch_policy_snapshot_once,
+               m.gate_self_call, m.witness_gate_self, m.claim_self_write, m.tally_scope,
+               m.emit_attestation, m.record_decision):
+        p = inspect.signature(fn).parameters.get("deadline")
+        check(f"{fn.__name__}-takes-a-deadline", p is not None and p.default is None, p)
+    check("the-old-refusal-recorder-is-gone", not hasattr(m, "witness_decision_unified"))
+    # An exhausted deadline: no request is made at all, by any helper.
+    stub = Stub()
+    try:
+        with _Env(m, stub.url, home):
+            past = time.monotonic() - 0.01
+            v = m.query_society_safety({"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                                       plugin_id="codex", host_agent="codex", deadline=past)
+            check("exhausted-society-is-a-no-verdict", not v.allow and not v.decided
+                  and v.cause == "timeout", v)
+            check("exhausted-snapshot-is-none", m.fetch_policy_snapshot(
+                "codex", deadline=past, use_cache=False) is None)
+            check("exhausted-gate-self-is-none", m.gate_self_call(
+                "hestia_request_witness", {}, plugin_id="codex", role="r", client_name="c",
+                deadline=past) is None)
+            r = m.record_decision(None, plugin_id="codex", decision="deny", rule="x", tool_name="Bash",
+                                  target=None, session_id=None, verdict_available=True,
+                                  attempted_summary="", deadline=past)
+            check("exhausted-record-is-unreachable", r.status == "unreachable", r)
+        check("exhausted-deadline-made-no-request", stub.calls == [], stub.calls)
+    finally:
+        stub.close()
+    # A snapshot deadline shorter than the retry pause skips the retry (and its sleep).
+    with _Env(m, closed_port_url(), home):
+        t0 = time.monotonic()
+        snap = m.fetch_policy_snapshot("codex", deadline=time.monotonic() + 0.2, use_cache=False)
+        took = time.monotonic() - t0
+    check("snapshot-retry-skipped-inside-a-short-deadline", snap is None and took < 0.3, took)
+    # The cap: a 5.5 s first connect (slower than REQUEST_TIMEOUT_S) inside a 9 s deadline answers;
+    # the same connect with no caller deadline is the deployed no-verdict.
+    stub = Stub(Policy(cold_connect=5.5))
+    try:
+        with _Env(m, stub.url, home):
+            v = m.query_society_safety({"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                                       plugin_id="codex", host_agent="codex",
+                                       deadline=time.monotonic() + 9.0)
+        check("caller-deadline-lifts-the-5s-cap", v.allow and v.decided, v)
+    finally:
+        stub.close()
+    stub = Stub(Policy(cold_connect=5.5))
+    try:
+        with _Env(m, stub.url, home):
+            v = m.query_society_safety({"tool_name": "Bash", "tool_input": {"command": "ls"}},
+                                       plugin_id="kimi-code", host_agent="kimi-code")
+        check("no-deadline-keeps-the-deployed-cap", not v.decided, v)
+    finally:
+        stub.close()
 
 
 def test_superseded_is_denied_in_every_mode(m, g, wc, home):
@@ -682,6 +816,530 @@ def test_daemon_verdicts_and_the_warn_rollout(m, g, wc, home):
         check("daemon-warn", d.decision == "warn" and d.rule == "society.safety.warn" and d.evidence_committed, d)
     finally:
         stub.close()
+
+
+def hashlib_sha(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_a_declared_probe_opens_no_scope_request(m, g, wc, home):
+    """dp, 2026-10-14 ("needless frictions are bad"): the deploy preflight's hold probe opened a
+    peer scope request per member every cycle. A non-harness invoker that declares
+    HESTIA_GATE_NO_ESCALATE=1 gets the refusal the law gives and the daemon is asked nothing;
+    any other value keeps today's escalation."""
+    stub = Stub(Policy())
+    saved = os.environ.get("HESTIA_GATE_NO_ESCALATE")
+    try:
+        os.environ["HESTIA_GATE_NO_ESCALATE"] = "1"
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Bash", {"command": "touch /etc/hostname"}, home)
+        check("probe-refused-as-law-judged", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("probe-asks-no-scope-claim", not stub.named("hestia_scope_claim"), stub.calls[-3:])
+        check("probe-carries-no-escalation-id", not getattr(d, "escalation_id", None), d)
+        check("probe-says-why", "HESTIA_GATE_NO_ESCALATE" in (d.reason or ""), d.reason)
+        os.environ["HESTIA_GATE_NO_ESCALATE"] = "0"
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Bash", {"command": "touch /etc/hostname"}, home)
+        check("probe-flag-other-value-still-escalates", len(stub.named("hestia_scope_claim")) == 1,
+              stub.calls[-3:])
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_GATE_NO_ESCALATE", None)
+        else:
+            os.environ["HESTIA_GATE_NO_ESCALATE"] = saved
+        stub.close()
+
+
+def test_declared_egress_is_swept_and_never_scoped(m, g, wc, home):
+    """#1201 (NOVA's 10-03 acceptance contract): `egress` is text that LEAVES the machine (a
+    being's web_search query, SAGE #335; a remote model's prompt, #1338). Gate 1a sweeps it with
+    the innate `egress.secret` rule; Gate 1b never path- or command-scopes it; natural language
+    with path-like words stays allowed; an event that declares none is judged exactly as before;
+    and the web-tool surfaces the gate already finds by name reach the core through the same
+    field, so its separate precheck could go without moving a verdict."""
+    core = g.core
+    # Assembled from parts, like CRED_PATH: the literal never has to be typed.
+    secret_q = "how do i rotate " + "~/." + "ssh/id_" + "rsa safely"
+    # Starts with an absolute path outside every scope: if any stage read egress as a path, this
+    # would be refused mrh.* (measured: a repo-relative-looking query resolves in scope and hides it).
+    benign_q = "/etc/ollama models config and ~/projects layout for qwen weights"
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            for seat in SEATS:
+                prof = profile_for(g, seat, home)
+                ev = to_event(g, seat, native_event(seat, "web_search", {"query": secret_q}, str(REPO), 1))
+                ev.egress = [secret_q]
+                d = g.decide(ev, prof)
+                check(f"{seat}-declared-egress-secret-denied",
+                      d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
+                check(f"{seat}-declared-egress-reaches-the-core",
+                      secret_q in g.normalized_event(ev).egress, g.normalized_event(ev))
+                ev = to_event(g, seat, native_event(seat, "web_search", {"query": benign_q}, str(REPO), 2))
+                ev.egress = [benign_q]
+                d = g.decide(ev, prof)
+                check(f"{seat}-benign-egress-never-scoped",
+                      d.decision == "allow" and not d.rule.startswith("mrh.")
+                      and d.rule != "egress.secret", d)
+
+            # The core alone, in its full law and in its degraded mode (egress is the one rule no
+            # mode relaxes), with no path, repo or command for the old sweep to see.
+            cprof = profile_for(g, "kimi", home).core_profile()
+            for q, want in ((secret_q, True), (benign_q, False)):
+                nev = core.NormalizedEvent(tool="web_search", egress=[q], cwd=str(REPO))
+                for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
+                                ("degraded", core.degraded_verdict(nev, cprof))):
+                    tag = f"core-{name}-{'secret' if want else 'benign'}"
+                    check(tag, (v.decision == "deny" and v.rule == "egress.secret" and v.innate) if want
+                          else v.rule != "egress.secret", v)
+
+            # NOVA HOLD at 7a6e410b: a BARE STRING is one blob, never its characters. The first
+            # patch ran `list(...)` over it, so `~/.ssh/id_rsa` became one-character blobs that
+            # matched no token and the act was allowed. Nested lists flatten to their strings.
+            for shape, val in (("str", secret_q), ("nested", [[secret_q]]), ("tuple", (secret_q,))):
+                for seat in SEATS:
+                    prof = profile_for(g, seat, home)
+                    ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 40))
+                    ev.egress = val
+                    d = g.decide(ev, prof)
+                    check(f"{seat}-direct-{shape}-egress-secret-denied",
+                          d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
+                    check(f"{seat}-direct-{shape}-egress-reaches-the-core-whole",
+                          secret_q in g.normalized_event(ev).egress, g.normalized_event(ev))
+                nev = core.NormalizedEvent(tool="web_search", egress=val, cwd=str(REPO))
+                for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
+                                ("degraded", core.degraded_verdict(nev, cprof))):
+                    check(f"core-{name}-direct-{shape}-secret",
+                          v.decision == "deny" and v.rule == "egress.secret" and v.innate, v)
+            for seat in SEATS:
+                prof = profile_for(g, seat, home)
+                ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 41))
+                ev.egress = benign_q
+                d = g.decide(ev, prof)
+                check(f"{seat}-direct-str-benign-allowed-and-unscoped",
+                      d.decision == "allow" and not d.rule.startswith("mrh.") and d.rule != "egress.secret", d)
+            nev = core.NormalizedEvent(tool="web_search", egress=benign_q, cwd=str(REPO))
+            for name, v in (("evaluate", core.evaluate(nev, cprof, workspace=str(REPO))),
+                            ("degraded", core.degraded_verdict(nev, cprof))):
+                check(f"core-{name}-direct-str-benign", v.rule != "egress.secret", v)
+
+            # Egress the gate cannot read whole FAILS CLOSED, even when its text is benign:
+            # a dict, bytes, a number, a set, a generator, or a list holding one of them.
+            unsweepable = (("dict", lambda: {"q": benign_q}), ("bytes", lambda: benign_q.encode()),
+                           ("int", lambda: 7), ("set", lambda: {benign_q}),
+                           ("generator", lambda: (q for q in [benign_q])),
+                           ("list-with-dict", lambda: [benign_q, {"q": benign_q}]))
+            for shape, make in unsweepable:
+                for seat in SEATS:
+                    prof = profile_for(g, seat, home)
+                    ev = to_event(g, seat, native_event(seat, "web_search", {"query": "x"}, str(REPO), 42))
+                    ev.egress = make()
+                    d = g.decide(ev, prof)
+                    check(f"{seat}-unsweepable-{shape}-fails-closed",
+                          d.decision == "deny" and d.rule == "egress.secret" and d.innate, d)
+                for name, fn in (("evaluate", lambda n: core.evaluate(n, cprof, workspace=str(REPO))),
+                                 ("degraded", lambda n: core.degraded_verdict(n, cprof))):
+                    v = fn(core.NormalizedEvent(tool="web_search", egress=make(), cwd=str(REPO)))
+                    check(f"core-{name}-unsweepable-{shape}-fails-closed",
+                          v.decision == "deny" and v.rule == "egress.secret" and v.innate, v)
+                # The single gate hands it to the core whole, so the core refuses it on its own.
+                ev = to_event(g, "kimi", native_event("kimi", "web_search", {"query": "x"}, str(REPO), 43))
+                ev.egress = make()
+                v = core.evaluate(g.normalized_event(ev), cprof, workspace=str(REPO))
+                check(f"handoff-unsweepable-{shape}-core-alone-denies",
+                      v.decision == "deny" and v.rule == "egress.secret", v)
+
+            # Default-empty parity: declaring nothing and declaring [] are judged identically,
+            # across a write, a shell read, an innate deny and a web tool.
+            for i, (seat, tool, ti) in enumerate((
+                    ("codex", *_act(IN_SCOPE_EDIT)),
+                    ("claude-code", "Bash", {"command": "cat /etc/hostname"}),
+                    ("kimi", "Bash", {"command": "cat ~/." + "ssh/id_rsa"}),
+                    ("gemini", "WebFetch", {"url": "https://x.example/?q=." + "env"}))):
+                prof = profile_for(g, seat, home)
+                a = g.decide(to_event(g, seat, native_event(seat, tool, ti, str(REPO), 10 + i)), prof)
+                ev = to_event(g, seat, native_event(seat, tool, ti, str(REPO), 20 + i))
+                ev.egress = []
+                b = g.decide(ev, prof)
+                check(f"default-empty-parity-{seat}-{tool}", (a.decision, a.rule) == (b.decision, b.rule),
+                      (a, b))
+
+            # The Gemini migration pin: every web-tool surface `egress_surfaces` finds by name now
+            # rides `NormalizedEvent.egress`, and the core denies it ON ITS OWN, so deleting the
+            # shim-era precheck would not move these verdicts.
+            for i, (tool, ti) in enumerate((
+                    ("WebFetch", {"url": "https://x.example/?q=." + "env"}),
+                    ("WebFetch", {"url": "https://x.example/", "prompt": "summarise ~/." + "ssh/id_rsa"}),
+                    ("WebSearch", {"query": "where is ~/." + "ssh/id_rsa"}))):
+                ev = to_event(g, "gemini", native_event("gemini", tool, ti, str(REPO), 30 + i))
+                nev = g.normalized_event(ev)
+                v = core.evaluate(nev, profile_for(g, "gemini", home).core_profile(), workspace=str(REPO))
+                check(f"migration-core-alone-denies-{tool}-{i}",
+                      v.decision == "deny" and v.rule == "egress.secret", (nev.egress, v))
+    finally:
+        stub.close()
+
+
+def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home):
+    """dp, 2026-10-05: "escalation should allow standing grants". An `mrh.path` / `mrh.command`
+    refusal asks the daemon ONCE (`hestia_scope_claim`): a request is opened (or re-found) on the
+    operator's queue and the deny names its id; an operator's one-time approval or a grant in
+    force lifts exactly the refused path for this act; a refusal stays refused."""
+    one, two = "/etc/hostname", "/etc/os-release"
+    # (1) opened: the deny names the request, carries it as escalation_id, and the claim carried
+    # the resolved path, the act, the rule and the request key.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {one}"}, home)
+        claims = [a for a, _ in stub.named("hestia_scope_claim")]
+        check("scope-opened-denies", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("scope-opened-one-claim", len(claims) == 1, claims)
+        c = claims[0] if claims else {}
+        check("scope-claim-carries-path", c.get("path") == one, c)
+        check("scope-claim-carries-act", one in (c.get("act") or ""), c)
+        check("scope-claim-carries-rule", c.get("rule") == "mrh.command", c)
+        check("scope-claim-carries-key", c.get("request_key") == m.scope_request_key("claude-code", one), c)
+        check("scope-claim-only-peeks", c.get("spend") is False, c)
+        dg = c.get("act_digest") or ""
+        check("scope-claim-carries-a-complete-act-digest", len(dg) == 64 and dg != hashlib_sha(
+            "Bash\x1f" + (c.get("act") or "")), c)
+        check("scope-claim-no-batch-spend-on-a-refusal", not [a for a in claims if "paths" in a], claims)
+        check("scope-deny-names-the-request", d.escalation_id and d.escalation_id in d.reason, d)
+        check("scope-deny-says-reissue", "re-issue this identical act" in d.reason, d.reason)
+        # dp, 2026-10-05: peers decide; the deny says so and says the asker cannot.
+        check("scope-deny-routes-to-peers", "NOT-SAME peer decides" in d.reason
+              and "cannot decide it yourself" in d.reason, d.reason)
+        # A Read refusal escalates the same way (mrh.path).
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "kimi", "Read", {"file_path": one}, home)
+        check("scope-read-escalates", d.decision == "deny" and d.rule == "mrh.path" and d.escalation_id, d)
+    finally:
+        stub.close()
+    # (2) approved once / in force: lifted, and the act goes on to society law.
+    for verdict in ("approved", "in_force"):
+        stub = Stub(Policy(scope_claim=lambda p, v=verdict: v))
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+            check(f"scope-{verdict}-lifts", d.decision == "allow", d)
+            check(f"scope-{verdict}-asks-society", len(stub.named("hestia_begin_action")) == 1)
+            check(f"scope-{verdict}-notice", any("scope " + verdict in n for n in d.notices), d.notices)
+        finally:
+            stub.close()
+    # (3) refused: stays refused and says so.
+    stub = Stub(Policy(scope_claim=lambda p: "refused"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-refused-denies", d.decision == "deny" and "REFUSED" in d.reason, d)
+        check("scope-refused-no-society", not stub.named("hestia_begin_action"))
+    finally:
+        stub.close()
+    # (4) an older daemon without the verb: still refused, and the remedy door is named.
+    stub = Stub(Policy(scope_claim=lambda p: "absent"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-old-daemon-denies", d.decision == "deny" and "hestia_request_scope" in d.reason, d)
+        check("scope-old-daemon-no-id", d.escalation_id is None, d)
+    finally:
+        stub.close()
+    # (5) two refused paths: PEEK both first, spend only when both lift; one un-approved path
+    # spends nothing (a one-time approval is not burned on an act that is still refused).
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one} {two}"}, home)
+        calls = [a for a, _ in stub.named("hestia_scope_claim")]
+        peeks = [a.get("spend") for a in calls if "op" not in a]
+        ops = [a.get("op") for a in calls if "op" in a]
+        check("scope-two-paths-lift", d.decision == "allow", d)
+        check("scope-two-paths-peek-only", peeks == [False, False], peeks)
+        reserve = [a for a in calls if a.get("op") == "reserve"]
+        check("scope-two-paths-one-reserve-then-commit",
+              ops == ["reserve", "commit"] and sorted(reserve[0]["paths"]) == sorted([one, two])
+              and len(reserve[0].get("act_digest") or "") == 64, calls)
+        order = [t if t != "hestia_scope_claim" else "claim:" + str(a.get("op"))
+                 for t, a, _p in stub.calls
+                 if t in ("hestia_begin_action", "hestia_witness_decision", "hestia_scope_claim")]
+        check("scope-reserve-after-society-commit-after-evidence",
+              order.index("claim:reserve") > order.index("hestia_begin_action")
+              and order.index("claim:commit") > order.index("hestia_witness_decision"), order)
+        check("scope-committed-in-stub", list(stub.scope_ops.values()) == ["committed"], stub.scope_ops)
+    finally:
+        stub.close()
+    # (5b) Codex P2 regressions: a denied act consumes NOTHING.
+    #   - society denies after every scope path was approved: nothing reserved at all;
+    stub = Stub(Policy(scope_claim=lambda p: "approved", query=lambda a: "deny"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        ops = [a for a, _ in stub.named("hestia_scope_claim") if "op" in a]
+        check("scope-society-deny-reserves-nothing", d.decision == "deny" and d.rule == "society.safety"
+              and not ops, (d, ops))
+    finally:
+        stub.close()
+    #   - the act's FINAL EVIDENCE fails to commit (gate.evidence_uncommitted): the reservation
+    #     is RELEASED, never committed;
+    stub = Stub(Policy(scope_claim=lambda p: "approved", witness="refuse-allow"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-failed-final-witness-releases", d.decision == "deny"
+              and d.rule == "gate.evidence_uncommitted"
+              and list(stub.scope_ops.values()) == ["released"]
+              and any("released" in n for n in d.notices), (d, stub.scope_ops))
+    finally:
+        stub.close()
+    #   - LOST RESPONSE on reserve (it landed; the answer came too late): the gate looks the
+    #     operation up — the stub answers slowly too, so the outcome stays UNCERTAIN, the act is
+    #     denied, a release is attempted, and the text says uncertain, never "nothing consumed";
+    stub = Stub(Policy(scope_claim=lambda p: "approved", scope_lost={"reserve": 6.0, "lookup": 6.0,
+                                                                     "release": 6.0}))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-lost-reserve-is-uncertain", d.decision == "deny"
+              and "UNCERTAIN" in d.reason and "nothing was consumed" not in d.reason, d)
+    finally:
+        stub.close()
+    #   - lost reserve answer but a prompt LOOKUP: the gate learns it reserved and proceeds;
+    stub = Stub(Policy(scope_claim=lambda p: "approved", scope_lost={"reserve": 6.0}))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home, budget_seconds=12)
+        ops = [a.get("op") for a, _ in stub.named("hestia_scope_claim") if "op" in a]
+        check("scope-lost-reserve-recovered-by-lookup", d.decision == "allow"
+              and ops[:2] == ["reserve", "lookup"] and "commit" in ops, (d, ops))
+    finally:
+        stub.close()
+    #   - DELAYED TRANSPORT before anything is sent: a deadline that runs out during the peeks
+    #     never lets a reserve go out after the gate has decided.
+    stub = Stub(Policy(scope_claim=lambda p: "approved", delays={"hestia_connect": 0.0,
+                                                                 "hestia_scope_claim": 2.5}))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home, budget_seconds=2.0)
+        time.sleep(3.0)                     # let any abandoned worker finish whatever it would do
+        ops = [a.get("op") for a, _ in stub.named("hestia_scope_claim") if "op" in a]
+        check("scope-delayed-transport-sends-no-late-reserve", d.decision == "deny" and not ops,
+              (d, ops))
+    finally:
+        stub.close()
+    #   - more refused paths than the gate collects: refused before ANY claim;
+    many = [f"/etc/review-probe-{i}" for i in range(g.SCOPE_CLAIM_MAX_PATHS + 1)]
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "cat " + " ".join(many)}, home)
+        check("scope-incomplete-collection-claims-nothing",
+              d.decision == "deny" and not stub.named("hestia_scope_claim"), (d, stub.calls[-3:]))
+    finally:
+        stub.close()
+    #   - the atomic reserve itself refuses (a race): denied, and it CAN say nothing was consumed.
+    stub = Stub(Policy(scope_claim=lambda p: "approved", scope_spend_fails=True))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-failed-reserve-denies", d.decision == "deny"
+              and "could not be reserved" in d.reason and "nothing was consumed" in d.reason
+              and not stub.scope_ops, d)
+    finally:
+        stub.close()
+    # (5c) Codex P1-1 regressions: the act digest covers the COMPLETE act, so acts that share a
+    # display summary never share a binding.
+    pairs = [
+        ("Write", {"file_path": one, "content": "one"}, {"file_path": one, "content": "two"}),
+        ("Edit", {"file_path": one, "old_string": "a", "new_string": "one"},
+         {"file_path": one, "old_string": "a", "new_string": "two"}),
+        ("Bash", {"command": f"TOKEN=one cat {one}"}, {"command": f"TOKEN=two cat {one}"}),
+        ("Bash", {"command": ": " + "x" * 410 + f"; cat {one}"},
+         {"command": ": " + "x" * 410 + f"; echo changed > {one}"}),
+        ("Bash", {"command": f"printf 'a  b' > {one}"}, {"command": f"printf 'a b' > {one}"}),
+    ]
+    for i, (tool, a, b) in enumerate(pairs):
+        check(f"scope-digest-distinguishes-{i}-{tool}",
+              m.scope_act_digest(tool, a, "/w", "s") != m.scope_act_digest(tool, b, "/w", "s"))
+    check("scope-digest-binds-cwd", m.scope_act_digest("Bash", {"command": "cat x"}, "/a", "s")
+          != m.scope_act_digest("Bash", {"command": "cat x"}, "/b", "s"))
+    check("scope-digest-binds-session", m.scope_act_digest("Bash", {"command": "cat x"}, "/a", "s1")
+          != m.scope_act_digest("Bash", {"command": "cat x"}, "/a", "s2"))
+    check("scope-digest-ignores-description",
+          m.scope_act_digest("Bash", {"command": "cat x", "description": "one"}, "/a", "s")
+          == m.scope_act_digest("Bash", {"command": "cat x", "description": "two"}, "/a", "s"))
+    stub = Stub(Policy(scope_claim=lambda p: "approved" if p == one else "opened"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one} {two}"}, home)
+        spends = [a.get("spend") for a, _ in stub.named("hestia_scope_claim")]
+        check("scope-partial-denies", d.decision == "deny" and d.escalation_id, d)
+        check("scope-partial-spends-nothing", True not in spends, spends)
+        check("scope-partial-names-the-open-path", two in d.reason, d.reason)
+    finally:
+        stub.close()
+    # (6) the warn rollout softens the scope refusal into a warning and opens nothing.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": f"cat {one}"}, home, rollout="warn")
+        check("scope-warn-rollout-warns", d.decision == "warn" and d.rule.startswith("mrh."), d)
+        check("scope-warn-rollout-opens-nothing", not stub.named("hestia_scope_claim"))
+    finally:
+        stub.close()
+    # (7) device sinks and temp roots are never escalated.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "ls 2>/dev/null >/tmp/x"}, home)
+        check("scope-sinks-allowed", d.decision == "allow", d)
+        check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
+    finally:
+        stub.close()
+
+
+def test_an_unenumerated_reach_is_refused_with_rewrite_guidance(m, g, wc, home):
+    """dp, 2026-10-10 ("narrow and land"): nothing an expansion produces is modelled. dp, 2026-10-14
+    (hestia#1313, option b): a command whose reach depends on one is refused under its OWN rule,
+    `mrh.command.unenumerated`, which is not a scope-escalating rule. So the gate asks the daemon
+    nothing (no peer scope request is opened, for the act or for any concrete path beside it),
+    and the remedy names the rewrite that works. Never a silent allow (Codex 17054
+    P1-output-model: `cat "$(date +/x)"` was allowed)."""
+    unenum = g.core.UNENUMERATED_TARGET
+    rule = "mrh.command.unenumerated"
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": 'cat "$(date +/etc/hostname)"'}, home)
+        claims = stub.named("hestia_scope_claim")
+        check("unenum-17054-date-format-is-refused", d.decision == "deny" and d.rule == rule, d)
+        check("unenum-opens-no-request", claims == [] and not d.escalation_id, (claims, d))
+        check("unenum-remedy-names-the-rewrite", "spell every path out literally" in d.remedy
+              and "script file" in d.remedy and "not a recast" in d.remedy, d.remedy)
+        check("unenum-says-no-request", "No scope request was opened" in d.remedy, d.remedy)
+        check("unenum-no-once-only-promise", "only ONCE" not in d.reason + d.remedy, d)
+        check("unenum-names-the-expansion", "a command substitution" in d.reason, d.reason)
+    finally:
+        stub.close()
+    # Even a daemon that WOULD approve is never asked: there is no approval route as written.
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "cat /tmp/run-$(date +%s)/../x"}, home)
+        check("unenum-never-lifted", d.decision == "deny" and d.rule == rule, d)
+        check("unenum-daemon-never-asked", stub.named("hestia_scope_claim") == [], stub.named("hestia_scope_claim"))
+    finally:
+        stub.close()
+    # A concrete refusal in the same act is not escalated either: the act cannot pass as written.
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            # `$D` alone would resolve (dp, 2026-10-11: one literal binds); `$E` does not.
+            d, _ = _decide(g, "codex", "Bash", {"command": "D=/etc/hostname; cat $D $E"}, home)
+        check("unenum-mixed-is-refused-unescalated", d.decision == "deny" and d.rule == rule
+              and stub.named("hestia_scope_claim") == [], (d, stub.named("hestia_scope_claim")))
+    finally:
+        stub.close()
+    # The once-only lift still exists in the core (a trial scope carrying the sentinel), but no
+    # path in the gate builds that scope any more; pinned so a later change notices.
+    check("unenum-core-target-unchanged", unenum == "hestia:unpriceable:unenumerated", unenum)
+    # Codex 17054 P1-quote-context, through decide(): the live substitution is found and judged.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "codex", "Bash", {"command": "printf '%s\\n' \"'$(cat /etc/hostname)'\""}, home)
+        check("unenum-17054-quote-context-refused", d.decision == "deny" and d.rule == "mrh.command"
+              and "/etc/hostname" in d.reason, d)
+    finally:
+        stub.close()
+
+
+def test_a_reach_that_names_nothing_opens_no_scope_request(m, g, wc, home):
+    """hestia#1327: `_dir_bases` composes a relative `cd` under every earlier base, so a fired
+    session whose cwd is outside the grant judges `cd /ws && ls a/b; cd a` at `<cwd>/a/a/b`, a
+    path that does not exist; each such PHANTOM opened a peer scope request for nothing. A refused
+    reach where neither the path nor its parent exists is refused under `mrh.command.nonexistent`,
+    which does not escalate (the #1313 pattern). A real path, a new file in an existing directory
+    and a glob over an existing directory still escalate."""
+    rule = "mrh.command.nonexistent"
+    phantom = "/etc/hestia-1327-phantom/deeper/x"     # nearest existing ancestor /etc: a reach
+    stub = Stub(Policy(scope_claim=lambda p: "approved"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {phantom}"}, home)
+        check("phantom-is-refused-under-its-rule", d.decision == "deny" and d.rule == rule, d)
+        check("phantom-opens-no-request", stub.named("hestia_scope_claim") == [] and not d.escalation_id,
+              (stub.named("hestia_scope_claim"), d))
+        check("phantom-reason-names-the-path", phantom in d.reason and "names nothing" in d.reason, d.reason)
+        check("phantom-remedy-says-no-request", "No scope request was opened" in d.remedy
+              and "absolutely" in d.remedy, d.remedy)
+        check("phantom-target-is-the-path", d.target == phantom if hasattr(d, "target") else True, d)
+    finally:
+        stub.close()
+    # Still a real ask: an existing path, a new file in an existing directory, a glob over one.
+    for name, cmd in (("existing", "cat /etc/hostname"), ("new-file", "echo x > /etc/hestia-1327-new.txt"),
+                      ("glob", "ls /etc/*")):
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, "claude-code", "Bash", {"command": cmd}, home)
+            check(f"phantom-{name}-still-escalates", d.decision == "deny" and d.rule == "mrh.command"
+                  and len(stub.named("hestia_scope_claim")) == 1 and d.escalation_id, (cmd, d))
+        finally:
+            stub.close()
+    # A mix asks nothing, in either order: the act cannot pass as written, so (as for #1313) no
+    # request is opened for the real path beside the phantom either.
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {phantom} /etc/hostname"}, home)
+        check("phantom-first-mix-asks-nothing", d.rule == rule and stub.named("hestia_scope_claim") == [], d)
+    finally:
+        stub.close()
+    stub = Stub(Policy())
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat /etc/hostname {phantom}"}, home)
+        check("real-first-mix-asks-nothing", d.rule == rule and stub.named("hestia_scope_claim") == [], d)
+    finally:
+        stub.close()
+
+
+def test_prose_in_a_message_position_is_data_on_every_seat(m, g, wc, home):
+    """#1287 part 1 (2026-10-13): a seat put prose with `*` and quotes in R and passed "$R" as
+    `--reason`; the literal rule made the act a once-only scope request although nothing in it is a
+    path. A value that cannot bind is unenumerated only where its use is judged as a PATH. Every
+    seat: the exact shape is allowed (and asks society law); a glob-valued name in a path position
+    is still a request; an UNQUOTED glob-valued name in the message position is still a request, and
+    so is an unquoted value that field splitting breaks into more arguments (Codex HOLD 21675)."""
+    prose = ("Refused: no seat asked for this. The act is the deploy preflight's advisory hold probe "
+             "(deploy/from-main/hestia-deploy.sh ~L605, plugins/*/expects.json 'evaluate deploy hold'), "
+             "fired for ever …")
+    exact = f'cd {REPO}; R="{prose}"; hestia gate deny 0123abcd --as claude-code --reason "$R"'
+    unenum = g.core.UNENUMERATED_TARGET
+    for seat in SEATS:
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, seat, "Bash", {"command": exact}, home)
+                check(f"1287-{seat}-prose-reason-allowed", d.decision == "allow", d)
+                check(f"1287-{seat}-prose-reason-asks-society", len(stub.named("hestia_begin_action")) == 1)
+                d, _ = _decide(g, seat, "Bash", {"command": 'F="a*"; cat $F'}, home)
+                check(f"1287-{seat}-glob-var-path-is-refused", d.decision == "deny"
+                      and d.rule == "mrh.command.unenumerated", d)
+                d, _ = _decide(g, seat, "Bash", {"command": 'R="/tmp/review-probe/*"; hestia gate deny X --reason $R'}, home)
+                check(f"1287-{seat}-unquoted-glob-reason-is-refused", d.decision == "deny"
+                      and d.rule == "mrh.command.unenumerated", d)
+                # Codex HOLD 21675: unquoted, the value splits and `--body-file` becomes gh's argument.
+                d, _ = _decide(g, seat, "Bash", {"command": 'R="hi --body-file /etc/hostname"; gh pr create --title $R'}, home)
+                check(f"1289-{seat}-unquoted-split-title-is-refused", d.decision == "deny"
+                      and d.rule == "mrh.command.unenumerated", d)
+            # hestia#1313: none of these opens a scope request any more.
+            check(f"1313-{seat}-no-requests-opened", stub.named("hestia_scope_claim") == [],
+                  stub.named("hestia_scope_claim"))
+        finally:
+            stub.close()
 
 
 def test_degraded_posture(m, g, wc, home):
@@ -874,21 +1532,218 @@ def test_an_internal_error_fails_closed_through_the_one_recorder(m, g, wc, home)
         stub.close()
 
 
-def test_stage_b_is_unwired(m, g, wc, home):
-    callers = []
-    for root in ("plugins", "integrations", "hooks-gt"):
-        base = REPO / root
-        if not base.is_dir():
-            continue
-        for p in base.rglob("*.py"):
-            # The certified template names the gate by design (stage C copies it); it is not a seat.
-            if p.parent.name in ("_shared", "_template") or p.name.endswith("_test.py"):
-                continue
-            if "hestia_single_gate" in p.read_text(encoding="utf-8", errors="replace"):
-                callers.append(str(p.relative_to(REPO)))
-    check("no-seat-imports-the-common-gate-yet", callers == [], callers)
+def test_stage_c_wires_every_seat(m, g, wc, home):
+    """Every seat's gate IS the template: it loads hestia_single_gate, asks harness_bound() for its
+    deadline and passes it as `bound=`; nothing else in the shim calls the mechanism. The
+    installer deploys the gate (RUNTIME_MANIFEST.txt)."""
+    for seat in SEATS:
+        src = shim_path(seat).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        calls = {ast.unparse(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+        check(f"{seat}-loads-the-common-gate", '"hestia_single_gate"' in src)
+        check(f"{seat}-asks-for-its-harness-bound", "gate.harness_bound" in calls, sorted(calls))
+        decides = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                   and ast.unparse(n.func) == "gate.decide"]
+        check(f"{seat}-decides-once-with-the-bound", len(decides) == 1
+              and "bound" in {k.arg for k in decides[0].keywords}, len(decides))
+        check(f"{seat}-no-mechanism-of-its-own", "hestia_gate_mechanism" not in src
+              and "hestia_gate_core" not in src and "witness_decision" not in src)
+        import re as _re
+        check(f"{seat}-no-per-seat-rollout-knob", not _re.search(r"HESTIA_[A-Z]+_GATE_MODE", src))
+        check(f"{seat}-drops-a-launcher-rollout", 'os.environ.pop("HESTIA_GATE_MODE", None)' in src)
     manifest = (SHARED / "RUNTIME_MANIFEST.txt").read_text(encoding="utf-8")
-    check("not-in-runtime-manifest-until-C", "hestia_single_gate" not in manifest)
+    check("in-the-runtime-manifest", "hestia_single_gate.py" in manifest.split())
+
+
+def _write_registration(path: pathlib.Path, seat: str, hook: pathlib.Path, timeout,
+                        extra_timeout=None) -> None:
+    """The harness's own config FORMAT, registering `hook` on its gate event: claude-code
+    nested JSON (seconds), codex nested TOML, kimi flat TOML, gemini nested JSON (ms). Written at
+    a NEUTRAL path naming a NEUTRAL hook (`gate_hook.py`): the reader under test is the format,
+    and no fixture carries a governed file name or config path. `extra_timeout` adds a second
+    registration of the same hook (the smallest must win); `timeout=None` omits the field."""
+    t = "" if timeout is None else f"\ntimeout = {timeout}"
+    def entry(tv):
+        e = {"type": "command", "command": f"python3 {hook}"}
+        if tv is not None:
+            e["timeout"] = tv
+        return e
+    if seat in ("claude-code", "gemini"):
+        ev = "BeforeTool" if seat == "gemini" else "PreToolUse"
+        groups = [{"matcher": "*", "hooks": [entry(timeout)]}]
+        if extra_timeout is not None:
+            groups.append({"matcher": "Bash", "hooks": [entry(extra_timeout)]})
+        path.write_text(json.dumps({"hooks": {ev: groups, "PostToolUse": [
+            {"hooks": [{"type": "command", "command": "python3 /x/other.py", "timeout": 1}]}]}}))
+    elif seat == "codex":
+        body = (f'[features]\ncodex_hooks = true\n\n[[hooks.PreToolUse]]\nmatcher = ".*"\n\n'
+                f'[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "python3 {hook}"{t}\n')
+        if extra_timeout is not None:
+            body += (f'\n[[hooks.PreToolUse]]\nmatcher = "shell"\n\n[[hooks.PreToolUse.hooks]]\n'
+                     f'type = "command"\ncommand = "python3 {hook}"\ntimeout = {extra_timeout}\n')
+        body += '\n[hooks.state]\n\n[hooks.state."x:pre:0:0"]\ntrusted_hash = "sha256:aa"\n'
+        path.write_text(body)
+    else:
+        body = f'[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {hook}"{t}\n'
+        if extra_timeout is not None:
+            body += f'\n[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {hook}"\ntimeout = {extra_timeout}\n'
+        body += '\n[[hooks]]\nevent = "SessionStart"\ncommand = "/x/other.sh"\ntimeout = 1\n'
+        path.write_text(body)
+
+
+def _neutral_harness(harness: dict, path: pathlib.Path) -> dict:
+    """The seat's REAL harness data with its primary registration's reader and layout, pointed at
+    a neutral fixture path."""
+    primary = dict(harness["registrations"][0])
+    primary["path"] = str(path)
+    return dict(harness, registrations=(primary,))
+
+
+#: Each seat's template registration timeout, in the harness's own unit.
+TEMPLATE_TIMEOUT = {"claude-code": 10, "codex": 15, "kimi": 15, "gemini": 15000}
+
+
+def test_the_bound_is_the_real_registration(m, g, wc, home):
+    """THE SAFETY INVARIANT (dp 2026-10-02): the deadline is the hook process's start plus the
+    timeout the harness REALLY enforces, read from its live registration, minus the margin — for
+    every seat, in each harness's own config shape and unit. Never the default, never a template;
+    the smallest of several registrations wins; an unreadable or absent one is refused."""
+    real_config = {"claude-code": ("json-hook-commands", "nested", "settings.json", 1, 60),
+                   "codex": ("toml-hook-commands", "nested", "config.toml", 1, None),
+                   "kimi": ("toml-hook-commands", "flat", "config.toml", 1, None),
+                   "gemini": ("json-hook-commands", "nested", "settings.json", 0.001, 60)}
+    for seat in SEATS:
+        shim_mod = _shim_module(seat)
+        reader, layout, cfg_name, unit, default = real_config[seat]
+        primary = shim_mod.HARNESS["registrations"][0]
+        check(f"{seat}-declares-its-real-config", primary["reader"] == reader
+              and primary.get("layout", "nested") == layout and primary["path"].endswith(cfg_name)
+              and shim_mod.HARNESS["timeout_unit_seconds"] == unit
+              and shim_mod.HARNESS["default_timeout_seconds"] == default, shim_mod.HARNESS)
+        with tempfile.TemporaryDirectory() as td:
+            h = pathlib.Path(td)
+            env = {"HOME": str(h)}
+            cfg = h / f"seat-config.{cfg_name.rsplit('.', 1)[1]}"
+            harness = _neutral_harness(shim_mod.HARNESS, cfg)
+            shim = h / "hooks" / "gate_hook.py"     # never created: realpath needs no file
+            t0 = time.monotonic()
+            b = g.harness_bound(harness, str(shim), t0, env=env)
+            check(f"{seat}-no-registration-no-bound", b.deadline is None and b.why, b)
+            # A registration timeout that differs from the template proves it is READ: 7 s.
+            seven = 7000 if seat == "gemini" else 7
+            _write_registration(cfg, seat, shim, seven)
+            b = g.harness_bound(harness, str(shim), t0, env=env)
+            check(f"{seat}-bound-is-the-registered-7s", b.timeout_seconds is not None
+                  and abs(b.timeout_seconds - 7.0) < 1e-9, b)
+            check(f"{seat}-deadline-strictly-below-the-harness", b.deadline is not None
+                  and b.deadline < t0 + 7.0 and abs(b.deadline - (t0 + 7.0 - harness["margin_seconds"])) < 1e-6, b)
+            check(f"{seat}-declares-what-the-harness-does", "fail-open" in b.on_timeout, b)
+            b2 = g.harness_bound(harness, str(shim), t0, env=dict(env, HESTIA_HOOK_TIMEOUT_S="4"))
+            check(f"{seat}-a-declaration-can-only-shorten", b2.timeout_seconds == 4.0, b2)
+            b3 = g.harness_bound(harness, str(shim), t0, env=dict(env, HESTIA_HOOK_TIMEOUT_S="60"))
+            check(f"{seat}-a-declaration-cannot-lengthen", abs(b3.timeout_seconds - 7.0) < 1e-9, b3)
+            # Two registrations of the same hook: the SMALLER one bounds this invocation.
+            _write_registration(cfg, seat, shim, seven, extra_timeout=4000 if seat == "gemini" else 4)
+            b = g.harness_bound(harness, str(shim), t0, env=env)
+            check(f"{seat}-the-smallest-registration-wins", b.timeout_seconds == 4.0, b)
+            # No timeout field: the harness's documented default, or a refusal when unknown.
+            _write_registration(cfg, seat, shim, None)
+            b = g.harness_bound(harness, str(shim), t0, env=env)
+            if default is None:
+                check(f"{seat}-untimed-with-unknown-default-refused", b.deadline is None, b)
+            else:
+                check(f"{seat}-untimed-uses-the-harness-default", b.timeout_seconds == float(default), b)
+            # An unreadable config that names the hook establishes nothing.
+            cfg.write_text("{not json or toml")
+            b = g.harness_bound(harness, str(shim), t0, env=env)
+            check(f"{seat}-unreadable-config-no-bound", b.deadline is None, b)
+
+
+def test_an_unknown_or_spent_bound_refuses_without_asking(m, g, wc, home):
+    stub = Stub()
+    try:
+        with _Env(m, stub.url, home):
+            raw = native_event("codex", "Bash", {"command": "ls"}, str(REPO), 11)
+            unknown = g.HarnessBound(None, None, 1.5, "fail-open: test", (), "no registration found")
+            d = g.decide(to_event(g, "codex", raw), profile_for(g, "codex", home), bound=unknown)
+            check("unknown-bound-denied", d.decision == "deny" and d.rule == "gate.harness_timeout_unknown"
+                  and d.innate and not d.verdict_available, d)
+            spent = g.HarnessBound(time.monotonic() - 0.1, 1.0, 1.5, "fail-open: test", ("t",))
+            d = g.decide(to_event(g, "codex", raw), profile_for(g, "codex", home), bound=spent)
+            check("spent-bound-denied", d.decision == "deny" and d.rule == "gate.harness_timeout_unknown", d)
+        check("refused-before-any-daemon-call", stub.calls == [], stub.calls)
+    finally:
+        stub.close()
+    # A real bound short enough that a cold connect cannot fit: a recorded fail-closed deny that
+    # ends INSIDE the bound (the harness never gets to kill the hook), never a permit.
+    stub = Stub(Policy(cold_connect=4.6))
+    try:
+        with _Env(m, stub.url, home):
+            raw = native_event("codex", "Bash", {"command": "ls"}, str(REPO), 12)
+            start = time.monotonic()
+            b = g.HarnessBound(start + 3.5, 5.0, 1.5, "fail-open: test", ("registered 5s",))
+            d = g.decide(to_event(g, "codex", raw), profile_for(g, "codex", home), bound=b)
+            took = time.monotonic() - start
+        print(f"  5 s registration, cold member: {d.decision} {d.rule} in {took:.2f}s")
+        check("short-registration-cold-connect-fails-closed", d.decision == "deny"
+              and d.rule in ("gate.degraded", "society.unreachable"), d)
+        check("short-registration-ends-inside-the-bound", took < 3.5 + 0.25, f"{took:.2f}s")
+    finally:
+        stub.close()
+
+
+def test_the_launch_role_bound_is_the_gates(m, g, wc, home):
+    """#1084 moved into the common gate: a projection that permits launch roles refuses any
+    other launch role, on every seat; no declared set checks nothing."""
+    stub = Stub()
+    saved = os.environ.get("HESTIA_ROLE")
+    try:
+        with _Env(m, stub.url, home):
+            os.environ["HESTIA_ROLE"] = "role:constellation:mesh-worker"
+            for seat in SEATS:
+                raw = native_event(seat, "Read", {"file_path": str(REPO / "README.md")}, str(REPO), 13)
+                d = g.decide(to_event(g, seat, raw), profile_for(g, seat, home),
+                             permitted_roles="role:constellation:interactive-dev")
+                check(f"{seat}-unlisted-launch-role-refused", d.decision == "deny"
+                      and d.rule == "config.miswired" and d.innate, d)
+                d = g.decide(to_event(g, seat, raw), profile_for(g, seat, home),
+                             permitted_roles="role:constellation:mesh-worker")
+                check(f"{seat}-listed-launch-role-proceeds", d.decision == "allow", d)
+                d = g.decide(to_event(g, seat, raw), profile_for(g, seat, home), permitted_roles="")
+                check(f"{seat}-no-declared-set-checks-nothing", d.decision == "allow", d)
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_ROLE", None)
+        else:
+            os.environ["HESTIA_ROLE"] = saved
+        stub.close()
+
+
+def test_the_mcp_transport_is_command_scoped(m, g, wc, home):
+    """C10 (plan §4 0b), aligned upward from gemini: the MCP transport context's local reach
+    (server command, args, cwd) is command-scoped like a shell command; its url is egress only."""
+    stub = Stub()
+    try:
+        with _Env(m, stub.url, home):
+            sibling = REPO.parent / "decide-contract-ungranted-sibling"
+            sibling.mkdir(exist_ok=True)
+            try:
+                raw = native_event("gemini", "mcp_fs_read", {"path": "x"}, str(REPO), 14)
+                raw["mcp_context"] = {"server_name": "fs", "tool_name": "read", "command": "npx",
+                                      "args": ["-y", "server-filesystem", str(sibling)]}
+                d, = (g.decide(to_event(g, "gemini", raw), profile_for(g, "gemini", home)),)
+                check("mcp-arg-outside-scope-denied", d.decision == "deny" and d.rule == "mrh.command", d)
+                raw["mcp_context"]["args"] = ["-y", "server-filesystem", str(REPO)]
+                d = g.decide(to_event(g, "gemini", raw), profile_for(g, "gemini", home))
+                check("mcp-arg-inside-scope-allowed", d.decision == "allow", d)
+                raw["mcp_context"] = {"server_name": "web", "tool_name": "get",
+                                      "url": "https://mcp.example/sse"}
+                d = g.decide(to_event(g, "gemini", raw), profile_for(g, "gemini", home))
+                check("mcp-url-is-not-command-scoped", d.decision == "allow", d)
+            finally:
+                sibling.rmdir()
+    finally:
+        stub.close()
 
 
 #: Tests that measure the deadline run at the real DEFAULT_DEADLINE_SECONDS. The others pin
@@ -906,16 +1761,26 @@ CONTRACT_TESTS = [
     test_the_key_from_the_raw_event_reaches_every_join,
     test_the_gate_owns_no_cache_no_client_and_one_recorder,
     test_one_deadline_bounds_the_whole_invocation,
-    test_b_leaves_the_deployed_mechanism_untouched,
+    test_c_threads_the_deadline_through_the_mechanism,
     test_reads_meet_the_same_local_law_on_every_seat,
     test_superseded_is_denied_in_every_mode,
     test_daemon_verdicts_and_the_warn_rollout,
+    test_a_declared_probe_opens_no_scope_request,
+    test_declared_egress_is_swept_and_never_scoped,
+    test_a_scope_refusal_is_an_escalation_with_a_standing_option,
+    test_an_unenumerated_reach_is_refused_with_rewrite_guidance,
+    test_a_reach_that_names_nothing_opens_no_scope_request,
+    test_prose_in_a_message_position_is_data_on_every_seat,
     test_degraded_posture,
     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
     test_closure_approval_lifts_only_the_closure_bar,
     test_an_internal_error_fails_closed_through_the_one_recorder,
-    test_stage_b_is_unwired,
+    test_stage_c_wires_every_seat,
+    test_the_bound_is_the_real_registration,
+    test_an_unknown_or_spent_bound_refuses_without_asking,
+    test_the_launch_role_bound_is_the_gates,
+    test_the_mcp_transport_is_command_scoped,
 ]
 
 
@@ -1047,6 +1912,15 @@ DECLARED_DIVERGENCES = {
         "`verdict.allow`, and gemini's spawned governor exit code, so a daemon WARN reached those "
         "members as a silent allow; claude-code alone rendered it. decide() surfaces it on every "
         "seat (C10 capability parity).") for s in ("codex", "kimi", "gemini")},
+    # Stage C: ONE rollout knob (HESTIA_GATE_MODE, projected per seat by the vault) replaces
+    # the per-seat HESTIA_<SEAT>_GATE_MODE names. claude-code had no knob at all, so under
+    # HESTIA_GATE_MODE=warn its TUNABLE denies now warn, as every other seat's did (C5: no
+    # per-seat law, and no odd seat out). The default is enforce; innate and no-verdict denies
+    # never soften. Visible only in the legacy comparison, which runs old claude-code at enforce.
+    **{("claude-code", c): (
+        "ONE ROLLOUT KNOB (C5): claude-code gains HESTIA_GATE_MODE; under warn a tunable deny "
+        "(a decided scope or society refusal) warns, as on every seat. Default enforce.")
+       for c in ("warn-scope-write-etc", "warn-daemon-denies-rm")},
 }
 
 
@@ -1065,6 +1939,11 @@ def _classify_old(seat, rc, out, err):
 
 def _old_rule(text):
     import re
+    # A stage-C shim renders `hestia: <verb> [<rule id>]` (hestia_single_gate.render).
+    first = re.search(r"hestia: (?:deny|warn) \[((?:gate|mrh|egress|society|invocation|config)\.[a-z_.]+)\]",
+                      text)
+    if first:
+        return first.group(1)
     for pat in (r"governance-closure-[a-z-]+", r"\[gate-self(?:-access)?\]", r"gate\.self_access",
                 r"egress\.secret", r"mrh\.(?:path|command|repo)", r"\[scope\]", r"\[degraded\]",
                 r"gate\.degraded", r"\[fail-closed\]", r"\[safety\]", r"invocation-superseded",
@@ -1082,16 +1961,29 @@ def _render(value, mapping):
     return json.loads(s)
 
 
-def _seat_home(root: pathlib.Path, seat: str, endpoint: str) -> pathlib.Path:
-    home = root / f"{seat}-{abs(hash(endpoint)) % 10**8}"
+SEAT_IDENTITY_ENV = {"claude-code": "HESTIA_CLAUDE_IDENTITY", "codex": "HESTIA_CODEX_IDENTITY",
+                     "kimi": "HESTIA_KIMI_IDENTITY", "gemini": "HESTIA_GEMINI_IDENTITY"}
+
+
+def _seat_home(root: pathlib.Path, seat: str, endpoint: str, shared: pathlib.Path,
+               shim: pathlib.Path, rollout: str = "enforce") -> pathlib.Path:
+    """A throwaway seat home: the vault projection the shim loads (its only config source, the
+    rollout included). The invoker's timeout declaration rides the environment (_seat_env)."""
+    home = root / f"{seat}-{abs(hash((endpoint, str(shared), str(shim), rollout))) % 10**8}"
     if home.is_dir():
         return home
     (home / "seats").mkdir(parents=True)
-    values = {"HESTIA_HOME": str(home), "HESTIA_SHARED_DIR": str(SHARED),
+    values = {"HESTIA_HOME": str(home), "HESTIA_SHARED_DIR": str(shared),
               "HESTIA_WORKSPACE": str(REPO.parent), "HESTIA_ENDPOINT": endpoint}
-    for member in {SEAT_MEMBER[seat], "claude-code"}:   # gemini's Gate 2 spawns claude-code's gate
+    for member in {SEAT_MEMBER[seat], "claude-code"}:   # the legacy gemini spawned claude-code's gate
+        token = "".join(c.upper() if c.isalnum() else "_" for c in member)
         body = ["# rendered from the vault by hestia (decide-contract fixture)", f"# member: {member}"]
         body += [f"{k}={values[k]}" for k in sorted(values)]
+        if member == SEAT_MEMBER[seat]:
+            body += [f"{token}__HESTIA_HARNESS_HOME={home / SEAT_HOME[seat][2:]}",
+                     f"{token}__{SEAT_IDENTITY_ENV[seat]}={home / 'identity.json'}",
+                     f"{token}__HESTIA_OBSERVE_DIR={home / 'observe'}",
+                     f"{token}__HESTIA_GATE_MODE={rollout}"]
         (home / "seats" / f"{member}.env").write_text("\n".join(body) + "\n", encoding="utf-8")
     (home / "identity.json").write_text(json.dumps({"plugin_id": SEAT_MEMBER[seat],
                                                     "role": "role:constellation:member",
@@ -1099,9 +1991,9 @@ def _seat_home(root: pathlib.Path, seat: str, endpoint: str) -> pathlib.Path:
     return home
 
 
-def _seat_env(seat, home, endpoint, rollout):
+def _seat_env(seat, home, endpoint, rollout, shared: pathlib.Path, legacy_claude: pathlib.Path = None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("HESTIA_")}
-    env.update({"HOME": str(home), "HESTIA_HOME": str(home), "HESTIA_SHARED_DIR": str(SHARED),
+    env.update({"HOME": str(home), "HESTIA_HOME": str(home), "HESTIA_SHARED_DIR": str(shared),
                 "HESTIA_WORKSPACE": str(REPO.parent), "HESTIA_ENDPOINT": endpoint,
                 "HESTIA_STATE_DIR": str(home / "state"), "HESTIA_OBSERVE_DIR": str(home / "observe"),
                 "HESTIA_KIMI_IDENTITY": str(home / "identity.json"),
@@ -1109,12 +2001,24 @@ def _seat_env(seat, home, endpoint, rollout):
                 "HESTIA_GEMINI_IDENTITY": str(home / "identity.json"),
                 "HESTIA_KIMI_LAUNCH_CWD": str(REPO), "HESTIA_CODEX_LAUNCH_CWD": str(REPO),
                 "HESTIA_GEMINI_LAUNCH_CWD": str(REPO),
-                "HESTIA_SOCIETY_GATE": str(PLUGINS / SEAT_SHIM["claude-code"]),
+                # ONE rollout knob for every seat since stage C, and it is the VAULT's: the shim
+                # drops a launcher-supplied value. The launcher here always says warn; the seat
+                # must follow its projection (the case's rollout), or a cell diverges.
+                "HESTIA_GATE_MODE": "warn",
+                # The invoker's declaration of the timeout it enforces on the shim: the parity
+                # harness is not a registered harness (the registration READER is covered, per
+                # harness format, by test_the_bound_is_the_real_registration).
+                "HESTIA_HOOK_TIMEOUT_S": str(TEMPLATE_TIMEOUT[seat] / (1000 if seat == "gemini" else 1)),
                 "PYTHONDONTWRITEBYTECODE": "1"})
-    if seat in SEAT_MODE_ENV:
-        env[SEAT_MODE_ENV[seat]] = rollout
+    if legacy_claude is not None:
+        # ... and, for a pre-C gate, the per-seat knob it read, and gemini's spawned governor.
+        if seat in SEAT_MODE_ENV:
+            env[SEAT_MODE_ENV[seat]] = rollout
+        env["HESTIA_SOCIETY_GATE"] = str(legacy_claude)
     if OVERLAY:
         env["HESTIA_CONTRACT_OVERLAY"] = json.dumps(OVERLAY)
+    if SHIM_OVERRIDE:
+        env["HESTIA_CONTRACT_SHIMS"] = json.dumps(SHIM_OVERRIDE)
     env["HESTIA_CONTRACT_REPO"] = str(REPO)
     return env
 
@@ -1135,14 +2039,36 @@ def decide_probe() -> int:
     return 0
 
 
-def _probe_pair(stub, pol, seat, raw, env, rollout):
-    """One seat's current gate and decide() on the same event, under the same stub policy."""
+def engine_dir(root: pathlib.Path) -> pathlib.Path:
+    """The engine a seat's shim loads in a fixture: every RUNTIME_MANIFEST module from
+    plugins/_shared — with HESTIA_CONTRACT_OVERLAY's staged copies in place of theirs — copied
+    into a fixture `shared` dir, because a shim's `_load_gate` requires the gate at its installed
+    name. Outside staging the parity arm points the shims at plugins/_shared itself."""
+    import shutil
+    dest = root / "engine" / "shared"
+    if dest.is_dir():
+        return dest
+    dest.mkdir(parents=True)
+    names = [ln.strip() for ln in (SHARED / "RUNTIME_MANIFEST.txt").read_text(encoding="utf-8").splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    for name in dict.fromkeys(names + [f"{m}.py" for m in OVERLAY]):
+        src = OVERLAY.get(name[:-3]) or SHARED / name
+        shutil.copyfile(src, dest / name)
+    return dest
+
+
+def _run_gate(argv, raw, env):
+    return subprocess.run(argv, input=json.dumps(raw), capture_output=True, text=True,
+                          cwd=str(REPO), env=env, timeout=60)
+
+
+def _probe_pair(stub, pol, seat, raw, env, rollout, gate_argv):
+    """One seat's gate (`gate_argv`: the real shim, or a legacy gate) and decide() on the same
+    event, under the same stub policy."""
     if pol != "down":
         stub.policy = POLICIES[pol]()
     mark = len(stub.calls)
-    old = subprocess.run([sys.executable, str(PLUGINS / SEAT_SHIM[seat])],
-                         input=json.dumps(raw), capture_output=True, text=True,
-                         cwd=str(REPO), env=env, timeout=60)
+    old = _run_gate(gate_argv, raw, env)
     old_v, old_text = _classify_old(seat, old.returncode, old.stdout, old.stderr)
     old_asked = sorted({p for t, a, p in stub.calls[mark:] if t == "hestia_begin_action"})
     if pol != "down":
@@ -1161,66 +2087,127 @@ def _probe_pair(stub, pol, seat, raw, env, rollout):
             "elapsed": nd.get("elapsed"), "old_text": old_text.strip()[-400:]}
 
 
-def run_parity(report: bool = False):
+#: C8 (cross-seat verdict parity) after the cutover: the cases where the SAME act still gets a
+#: different verdict class on different seats, each with its reason. The test fails on a cell
+#: that differs undeclared and on a declaration that no longer differs.
+#: `scope-read-etc` was declared here (stage B: codex reads through `cat`, and the core judged
+#: only shell tokens under the workspace). CLOSED by #1232: a shell path outside the workspace is
+#: judged like a Read path, so all four seats refuse it (mrh.path / mrh.command) and the cell no
+#: longer differs. Kept as a comment so the stale-declaration check stays honest about why.
+DECLARED_SEAT_DIFFERENCES = {}
+
+
+def _legacy_tree(ref: str, root: pathlib.Path) -> pathlib.Path:
+    """The pre-cutover gates and their engine, exactly as committed at `ref`, extracted read-only
+    into a temp dir (`git archive | tar -x`): the stage B comparison, re-runnable after C."""
+    dest = root / "legacy"
+    dest.mkdir()
+    archive = subprocess.run(["git", "-C", str(REPO), "archive", ref, "plugins"],
+                             capture_output=True, check=True, timeout=120)
+    subprocess.run(["tar", "-x", "-C", str(dest)], input=archive.stdout, check=True, timeout=120)
+    return dest / "plugins"
+
+
+def run_parity(report: bool = False, legacy_ref: str = None):
+    """Default: each seat's REAL shim (its registration, its translation, its exit channel) vs
+    decide() on the same act — they must agree on every cell — and the four seats vs each other
+    (C8). `legacy_ref`: each seat's PRE-cutover gate at that ref vs decide(), against
+    DECLARED_DIVERGENCES (the stage B table, now live behaviour)."""
+    missing_patch = REPO / "scratchpad" / "decide-parity-missing.patch"
+    check("missing-patch-fixture-is-absent", not missing_patch.exists(), str(missing_patch))
     rows = []
     with tempfile.TemporaryDirectory(prefix="decide-parity-") as tmp:
         root = pathlib.Path(tmp)
+        legacy = _legacy_tree(legacy_ref, root) if legacy_ref else None
         stub = Stub()
         dead = closed_port_url()
         try:
             for n, (case, tool, tin, pol, rollout) in enumerate(PARITY_CASES, start=1):
                 for seat in SEATS:
                     hook = "before_tool.py" if seat == "gemini" else "pre_tool_use.py"
-                    # The SAME input means the seat's own posture: claude-code has no rollout knob
-                    # and always enforces, so both arms run it at enforce.
-                    seat_rollout = rollout if seat in SEAT_MODE_ENV else "enforce"
                     act = _render(tin, {"{REPO}": str(REPO), "{CRED}": CRED_PATH, "{HOME}": PROBE_HOME,
                                         "{SELF}": seat, "{HOOK}": hook})
                     raw = native_event(seat, tool, act, str(REPO), n)
                     endpoint = dead if pol == "down" else stub.url
                     if pol != "down":
                         stub.policy = POLICIES[pol]()
-                    home = _seat_home(root, seat, endpoint)
-                    env = _seat_env(seat, home, endpoint, seat_rollout)
-                    cell = _probe_pair(stub, pol, seat, raw, env, seat_rollout)
+                    if legacy is not None:
+                        # A pre-C gate read its own per-seat knob, and claude-code had none: the
+                        # legacy arm runs claude-code at enforce, as it always ran.
+                        gate_rollout = rollout if seat in SEAT_MODE_ENV else "enforce"
+                        shim = legacy / SEAT_SHIM[seat]
+                        gate_argv = [sys.executable, str(shim)]
+                        home = _seat_home(root, seat, endpoint, legacy / "_shared", shim, rollout)
+                        env = _seat_env(seat, home, endpoint, gate_rollout, legacy / "_shared",
+                                        legacy_claude=legacy / SEAT_SHIM["claude-code"])
+                    else:
+                        shim = shim_path(seat)
+                        gate_argv = [sys.executable, str(shim)]
+                        shared = engine_dir(root) if OVERLAY else SHARED
+                        home = _seat_home(root, seat, endpoint, shared, shim, rollout)
+                        env = _seat_env(seat, home, endpoint, rollout, shared)
+                    cell = _probe_pair(stub, pol, seat, raw, env, rollout, gate_argv)
                     retried = False
-                    if cell["old"] != cell["new"] and (seat, case) not in DECLARED_DIVERGENCES:
+                    declared = DECLARED_DIVERGENCES if legacy is not None else {}
+                    if cell["old"] != cell["new"] and (seat, case) not in declared:
                         # A loaded box can stall a healthy loopback round trip past the
                         # deadline (#423 class). Retry the PAIR once; a real divergence repeats.
-                        cell = _probe_pair(stub, pol, seat, raw, env, seat_rollout)
+                        cell = _probe_pair(stub, pol, seat, raw, env, rollout, gate_argv)
                         retried = True
                     rows.append({"case": case, "seat": seat, "retried": retried, **cell})
         finally:
             stub.close()
     found = {(r["seat"], r["case"]) for r in rows if r["old"] != r["new"]}
-    undeclared = sorted(found - set(DECLARED_DIVERGENCES))
-    stale = sorted(set(DECLARED_DIVERGENCES) - found)
-    check("parity-no-undeclared-divergence", not undeclared,
+    declared = DECLARED_DIVERGENCES if legacy_ref else {}
+    undeclared = sorted(found - set(declared))
+    stale = sorted(set(declared) - found)
+    label = "legacy-parity" if legacy_ref else "shim-parity"
+    check(f"{label}-no-undeclared-divergence", not undeclared,
           [(s, c, next((r["old"], r["old_rule"], r["new"], r["new_rule"], r["old_text"][-200:])
                        for r in rows if (r["seat"], r["case"]) == (s, c))) for s, c in undeclared])
-    check("parity-no-stale-declaration", not stale, stale)
+    check(f"{label}-no-stale-declaration", not stale, stale)
     # Agreement alone would let both arms loosen together; the tightening is a verdict, not a pair.
     missing = [r for r in rows if r["case"].startswith("apply-missing-patch")]
+    expected_missing = {(seat, case) for seat in SEATS
+                        for case in ("apply-missing-patch", "apply-missing-patch-chained")}
+    check("tightening-missing-patch-all-cells-measured",
+          {(r["seat"], r["case"]) for r in missing} == expected_missing)
     check("tightening-missing-patch-apply-denied-both-arms",
           missing and all(r["old"] == "deny" and r["new"] == "deny" for r in missing),
           [(r["seat"], r["case"], r["old"], r["new"]) for r in missing
            if (r["old"], r["new"]) != ("deny", "deny")])
-    check("parity-decide-never-crashed", not any(r["new"] == "CRASH" for r in rows),
+    check(f"{label}-decide-never-crashed", not any(r["new"] == "CRASH" for r in rows),
           [r for r in rows if r["new"] == "CRASH"][:2])
-    # Finding 1: gemini's governor asked the daemon AS claude-code; decide() asks as gemini.
-    gem = [r for r in rows if r["seat"] == "gemini" and r["old_asked_as"]]
-    check("finding-1-gemini-old-asked-as-claude-code",
-          gem and all(r["old_asked_as"] == ["claude-code"] for r in gem), gem[:2])
+    if legacy_ref:
+        # Finding 1: gemini's governor asked the daemon AS claude-code; decide() asks as gemini.
+        gem = [r for r in rows if r["seat"] == "gemini" and r["old_asked_as"]]
+        check("finding-1-gemini-old-asked-as-claude-code",
+              gem and all(r["old_asked_as"] == ["claude-code"] for r in gem), gem[:2])
+    else:
+        # C8 over the real shims: the same act, the same verdict class, on every seat.
+        differing = {c for c, *_ in PARITY_CASES
+                     if len({r["old"] for r in rows if r["case"] == c}) > 1}
+        check("c8-no-undeclared-seat-difference", differing <= set(DECLARED_SEAT_DIFFERENCES),
+              {c: {r["seat"]: (r["old"], r["old_rule"]) for r in rows if r["case"] == c}
+               for c in sorted(differing - set(DECLARED_SEAT_DIFFERENCES))})
+        check("c8-no-stale-seat-difference", set(DECLARED_SEAT_DIFFERENCES) <= differing,
+              sorted(set(DECLARED_SEAT_DIFFERENCES) - differing))
+        # Every seat asks the daemon as ITSELF.
+        for r in rows:
+            check(f"{r['seat']}-{r['case']}-asks-as-itself",
+                  r["old_asked_as"] in ([], [SEAT_MEMBER[r["seat"]]]), r["old_asked_as"])
     check("finding-1-gemini-decide-asks-as-gemini",
           all(r["new_asked_as"] in ([], ["gemini"]) for r in rows if r["seat"] == "gemini"))
     if report:
-        print_report(rows)
-    RAN.append(f"parity {len(PARITY_CASES)}x{len(SEATS)}")
+        print_report(rows, legacy_ref)
+    RAN.append(f"{label} {len(PARITY_CASES)}x{len(SEATS)}")
     return rows
 
 
-def print_report(rows):
-    print("\n| case | " + " | ".join(SEATS) + " |")
+def print_report(rows, legacy_ref=None):
+    arm = f"legacy gate at {legacy_ref}" if legacy_ref else "real shim"
+    print(f"\ncells read `{arm} → decide()`\n")
+    print("| case | " + " | ".join(SEATS) + " |")
     print("|---|" + "---|" * len(SEATS))
     for case, *_ in PARITY_CASES:
         cells = []
@@ -1231,9 +2218,9 @@ def print_report(rows):
                     + f" <sub>{r['old_rule'] or '·'} / {r['new_rule'] or '·'}</sub>")
             cells.append(cell)
         print(f"| {case} | " + " | ".join(cells) + " |")
-    print("\nsociety asked as (old → decide): " + "; ".join(
+    print("\nsociety asked as (gate → decide): " + ("; ".join(
         f"{r['seat']}:{r['case']} {r['old_asked_as']}→{r['new_asked_as']}"
-        for r in rows if r["old_asked_as"] != r["new_asked_as"]))
+        for r in rows if r["old_asked_as"] != r["new_asked_as"]) or "identical on every cell"))
     again = [f"{r['seat']}:{r['case']}" for r in rows if r.get("retried")]
     print(f"\nretried once after a diverging first probe: {again or 'none'}")
     slow = max((r["elapsed"] or 0) for r in rows)
@@ -1267,19 +2254,44 @@ def test_against_an_isolated_real_daemon(m, g, wc, home):
 
     with _Env(m, url, home):
         # The FIRST consequential act may meet a cold daemon (4.4 s measured on a DEBUG build):
-        # it is then an explicit society.unreachable deny inside the deadline, never a hang.
+        # it is then an explicit cold deny inside the deadline, never a hang. Which rule names it
+        # depends on which leg met the cold connect: the policy snapshot (`gate.degraded`, every
+        # act denied without it since dp 2026-10-01) or the society query (`society.unreachable`).
+        # Measured on the stage-C isolated daemon: the snapshot leg, gate.degraded in 8.0 s.
         first = run("Bash", {"command": "ls -la"}, 1)
         check("real-first-is-allow-or-explicit-cold-deny",
               (first.decision == "allow" and first.evidence_committed)
-              or (first.decision == "deny" and first.rule == "society.unreachable"), first)
+              or (first.decision == "deny" and first.rule in ("society.unreachable", "gate.degraded")),
+              first)
         d = run("Bash", {"command": "ls -la"}, 2)
         check("real-allow-committed-as-policy_allow", d.decision == "allow" and d.evidence_committed
               and d.action_id, d)
-        d = run("Bash", {"command": "rm -rf /home/user/data"}, 3)
+        # A relative target that exists nowhere: SCOPE has nothing to judge and the daemon's law
+        # refuses it (safety preset `rm -rf v21out`). Since 2026-10-05 the old
+        # `rm -rf /home/user/data` is refused by scope first, before the law is asked.
+        d = run("Bash", {"command": "rm -rf decide-contract-probe-out"}, 3)
         check("real-daemon-deny", d.decision == "deny" and d.rule == "society.safety", d)
         check("real-daemon-deny-one-row", d.evidence_committed, d)
         d = run("Read", {"file_path": str(REPO / "README.md")}, 4)
         check("real-read-allowed-and-recorded", d.decision == "allow" and d.evidence_committed, d)
+        # A scope refusal against the REAL daemon opens a request, and a re-issue finds it
+        # (hestia_scope_claim, 2026-10-05). An older daemon answers no-channel; say so.
+        d = run("Bash", {"command": "cat /etc/hostname"}, 5)
+        check("real-scope-refusal-is-mrh-command", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("real-scope-refusal-opens-a-request", bool(d.escalation_id)
+              and str(d.escalation_id).startswith("scope-"), d)
+        again = run("Bash", {"command": "cat /etc/hostname"}, 6)
+        check("real-scope-reissue-finds-the-same-request", again.escalation_id == d.escalation_id,
+              (d.escalation_id, again.escalation_id))
+        check("real-scope-reissue-says-pending", "still pending" in again.reason, again.reason)
+        # dp, 2026-10-14 (hestia#1313): an act whose reach an expansion decides is refused under
+        # its own rule against the real handler too, and opens no request, on a re-issue either.
+        u = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 7)
+        check("real-unenumerated-own-rule", u.decision == "deny"
+              and u.rule == "mrh.command.unenumerated", u)
+        check("real-unenumerated-opens-no-request", not u.escalation_id, u)
+        u2 = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 8)
+        check("real-unenumerated-reissue-opens-none", not u2.escalation_id, u2)
 
 
 def teardown_module(module=None):
@@ -1293,6 +2305,7 @@ def main(argv) -> int:
     if "--decide-probe" in argv:
         return decide_probe()
     only = argv[argv.index("--only") + 1] if "--only" in argv else None
+    legacy_ref = argv[argv.index("--legacy-ref") + 1] if "--legacy-ref" in argv else None
     m, g, wc = load_engine()
     with tempfile.TemporaryDirectory(prefix="decide-contract-home-") as h:
         home = pathlib.Path(h)
@@ -1316,7 +2329,7 @@ def main(argv) -> int:
                 g.DEFAULT_DEADLINE_SECONDS = real_deadline
         if only != "contract":
             try:
-                run_parity(report="--report" in argv)
+                run_parity(report="--report" in argv, legacy_ref=legacy_ref)
             except Exception as e:  # noqa: BLE001
                 import traceback
                 FAILS.append(f"parity raised {type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}")
