@@ -38,6 +38,12 @@ thread_local! {
     static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Fail one vault save on this test thread immediately before publication.
+#[cfg(test)]
+pub(crate) fn fail_next_save_before_rename() {
+    FAIL_BEFORE_RENAME.with(|flag| flag.set(true));
+}
+
 /// The cleartext contents of the vault — serialized to JSON, then encrypted on disk.
 ///
 /// **Schema versions**
