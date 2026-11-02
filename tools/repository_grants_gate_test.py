@@ -104,6 +104,19 @@ class RepositoryGrants(unittest.TestCase):
             )
             self.assertTrue(g.core.evaluate(ev, prof, self.ws, policy=pol).blocks)
 
+    def test_recursive_local_repo_path_does_not_grant_foreign_remote(self):
+        self.scope["repository_grants"] = []
+        self.scope["live_grants"] = []
+        self.assertTrue(self.verdict(repo="foreign/project").blocks,
+                        "control: no grant refuses the foreign remote")
+        self.scope["live_grants"] = [{"path": self.ws + "/project", "recursive": True}]
+        prof, pol = self.policy()
+        for tool in ("mcp__github__fetch_pr", "mcp__github__delete_file"):
+            with self.subTest(tool=tool):
+                verdict = self.verdict(tool=tool, repo="foreign/project", policy=(prof, pol))
+                self.assertTrue(verdict.blocks,
+                                f"local path must not grant foreign remote: {verdict}; scope={pol.scope}")
+
     def test_certification_and_expiry(self):
         for key, values in {
             "generation": [None, True, "7"],
