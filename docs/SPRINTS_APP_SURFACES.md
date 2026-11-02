@@ -93,6 +93,21 @@ So **3a** is the read surface and **3b** the actions, the same caution as decide
 **Acceptance, measured:** with `agent-inventory` uninstalled, the app shows the daemon's reason. The
 test asserts on the reason text, so a regression to an empty list fails it.
 
+**3b as built (2026-09-28).** Retire and reinstate, offered where the dashboard offers them: on
+member ids this seat has recorded that nothing on the machine accounts for — never on an installed
+agent's row. Retire carries reason + ref; the daemon's live-member 409 renders as a question with its
+act count and a confirmation the operator ticks (never pre-ticked); an id another view already
+retired is reported and **not re-sent** (last edit wins in the engine, so the app looks first);
+reinstate names the grants it did not restore. **Ungovern stays held** (its route still discards its
+record and takes no reason — #1131 class A).
+
+**Correction — `connect` is not built into the app.** Reading the route to build on it:
+`/api/orchestrators/:id/connect` installs only a PostToolUse **witness** hook, not the gate. A
+"connect" button beside an UNGOVERNED row would promise governance it does not deliver; governing is
+the members' installer's act (`register-members.py` + `install-members.sh`, run by hestia-deploy).
+The route itself was fixed in the same PR (intent recorded before the install; the record's failure
+reported, not discarded), since the dashboard still calls it.
+
 **Note:** hestia #1076 adds beings to this inventory. When it lands a being appears here with no app
 change — the shape is the daemon's, which is the point of building against the route.
 

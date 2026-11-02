@@ -17,6 +17,8 @@ export interface ActivityStats {
 
 export interface TrustView {
   plugin_id: string;
+  /** Set when this id was merged into another: its acts count toward that one. */
+  aliased_to?: string | null;
   entity_id: string;
   level: string;
   // Canonical unmeasured-handling: a dimension with zero observations is null
@@ -504,6 +506,8 @@ export interface AgentRow {
   launchers?: BeingLauncher[];
   /** The MEMBER id (agent-inventory `member`); `plugin` is the older fallback. */
   member?: string;
+  /** Multiple governance ids explicitly found in launchers, when present. */
+  members?: string[];
   /** Each registered hook target, qualified: a hestia gate is `is_gate && owned_by_hestia`. */
   hook_targets?: HookTarget[];
 }
@@ -528,6 +532,7 @@ export interface GateBypass {
 /** `GET /api/agents`. UNKNOWN carries a reason and must never render as an empty, clean list. */
 export interface AgentInventory {
   status: "GOVERNED" | "UNGOVERNED_PRESENT" | "UNKNOWN" | string;
+  unknown?: string[];
   reason?: string;
   machine?: string;
   installed?: string[];
@@ -539,6 +544,19 @@ export interface AgentInventory {
   /** Active gate bypasses, BESIDE the inventory's verdicts (the daemon does not tell the inventory). */
   bypassed?: Record<string, GateBypass>;
 }
+
+/** What a retire/reinstate came back as. Conflicts are outcomes, not errors (PRD §1a). */
+export type MemberActOutcome =
+  | { outcome: "retired" | "reinstated"; result: Record<string, unknown> }
+  | { outcome: "retired_unrecorded" | "reinstated_unrecorded"; result: Record<string, unknown> }
+  | { outcome: "already_retired" | "already_reinstated"; detail: string }
+  | {
+      outcome: "needs_confirmation";
+      detail: string;
+      acts_recently: number | null;
+      unmeasurable: boolean;
+      window_hours: number | null;
+    };
 
 /**
  * One grant in force, from the snapshot. `live` dies at the next daemon restart; `standing`

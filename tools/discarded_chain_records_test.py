@@ -47,9 +47,7 @@ CLASS_A = [
 ]
 
 # event -> the PR that fixes it. Remove the entry when that PR lands; a stale entry fails.
-KNOWN_OPEN = {
-    "orchestrator_connect": "hestia PR 1164 (connect records its intent before it installs)",
-}
+KNOWN_OPEN: dict[str, str] = {}
 
 
 def _sources() -> list[tuple[str, str]]:
