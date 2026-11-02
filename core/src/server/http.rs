@@ -11616,6 +11616,58 @@ mod disposition_tests {
         assert_eq!(s.recent_chain(100).len(), old_chain, "conflict writes no intent");
     }
 
+    // Proposed evidence contract, not a currently implemented request field. These
+    // controls expose why `is_retired == false` alone cannot bind the viewed state.
+    #[tokio::test]
+    async fn conditional_retire_accepts_an_unchanged_view() {
+        let (_dir, state) = test_state().await;
+        let (retirement_generation, standing_generation) = {
+            let s = state.lock().await;
+            (s.retired_members.generation, s.standing_scope.generation)
+        };
+        let (status, _) = retire_if_unretired(&state, "old-id", serde_json::json!({
+            "reason":"current", "ref":"r1", "expected_retirement_generation": retirement_generation,
+            "expected_standing_generation": standing_generation
+        })).await;
+        assert_eq!(status, StatusCode::OK, "the repair must not refuse every current view");
+        assert!(state.lock().await.retired_members.is_retired("old-id"));
+    }
+
+    #[tokio::test]
+    async fn conditional_retire_rejects_stale_view_after_retire_reinstate_aba() {
+        let (_dir, state) = test_state().await;
+        let observed_generation = state.lock().await.retired_members.generation;
+        let (status, _) = retire(&state, "old-id", serde_json::json!({"reason":"first", "ref":"r1"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = reinstate(&state, "old-id", serde_json::json!({"reason":"reverse"})).await;
+        assert_eq!(status, StatusCode::OK);
+        {
+            let s = state.lock().await;
+            assert!(!s.retired_members.is_retired("old-id"));
+            assert_ne!(s.retired_members.generation, observed_generation);
+        }
+        let (status, _) = retire_if_unretired(&state, "old-id", serde_json::json!({
+            "reason":"stale", "ref":"r2", "expected_retirement_generation": observed_generation
+        })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "a stale view must not retire after ABA");
+        assert!(!state.lock().await.retired_members.is_retired("old-id"));
+    }
+
+    #[tokio::test]
+    async fn conditional_retire_rejects_stale_view_after_grant_change() {
+        let (_dir, state) = test_state().await;
+        let observed_generation = state.lock().await.standing_scope.generation;
+        seed_grant(&state, "old-id", "/fixture/reach", false).await;
+        assert_ne!(state.lock().await.standing_scope.generation, observed_generation);
+        let (status, _) = retire_if_unretired(&state, "old-id", serde_json::json!({
+            "reason":"stale", "ref":"r2", "expected_standing_generation": observed_generation
+        })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "new authority must invalidate the view");
+        let s = state.lock().await;
+        assert!(!s.retired_members.is_retired("old-id"));
+        assert!(s.standing_scope.grants.iter().any(|g| g.member == "old-id" && g.path == "/fixture/reach"));
+    }
+
     #[tokio::test]
     async fn conditional_retire_allows_new_member_and_legacy_route_can_restate() {
         let (_dir, state) = test_state().await;
