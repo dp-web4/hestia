@@ -4256,12 +4256,13 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     // intent — never persist an unbounded payload into a less-protected surface — by
     // requiring the SENDER to bound and scrub, and by clamping here regardless, since a
     // gate that over-shares must not be able to make the daemon over-store.
-    let attempted = optional_string(args, "attempted").map(|a| {
-        let mut a = redact_secrets(&a);
+    let attempted_whole = optional_string(args, "attempted").map(|a| redact_secrets(&a));
+    let attempted = attempted_whole.clone().map(|a| {
         if a.chars().count() > ATTEMPTED_MAX {
-            a = a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]";
+            a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
+        } else {
+            a
         }
-        a
     });
     let declared_role = optional_string(args, "role").unwrap_or_default();
     let role_lct = crate::reputation::normalize_constellation_role(&declared_role);
@@ -4304,7 +4305,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         &plugin_id,
         &tool_name,
         Some(target.as_str()),
-        attempted.as_deref(),
+        attempted_whole.as_deref(),
     );
     // The context fields exactly as this path's row writes them (`row` below: no policy_version,
     // `enforced: true`), so rehydration from the chain yields the same key.
@@ -33872,6 +33873,26 @@ mod verdict_feedback_tests {
         drop(state);
         let reopened = safety_state(&dir).await;
         check(tool_witness_decision(&reopened, &args).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn witnessed_long_attempts_do_not_share_a_repeat_key() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let prefix = "x".repeat(ATTEMPTED_MAX + 20);
+        let mut first_args = witnessed("mrh.path");
+        first_args["action_id"] = json!(Uuid::new_v4().to_string());
+        first_args["attempted"] = json!(prefix.clone() + "first");
+        let first = tool_witness_decision(&state, &first_args).await.unwrap();
+
+        let mut second_args = witnessed("mrh.path");
+        second_args["action_id"] = json!(Uuid::new_v4().to_string());
+        second_args["attempted"] = json!(prefix + "second");
+        let second = tool_witness_decision(&state, &second_args).await.unwrap();
+        assert_ne!(first["feedback"]["act"], second["feedback"]["act"],
+            "different long attempts must not share a digest");
+        assert_eq!(second["feedback"]["repeat_of"], Value::Null,
+            "a shared capped prefix is not a repeated act: {second}");
     }
 
     #[tokio::test]
