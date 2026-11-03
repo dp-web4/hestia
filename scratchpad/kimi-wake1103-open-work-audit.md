@@ -6,7 +6,7 @@ Scope: all 20 open PRs at audit start and all 325 open issues by number, title, 
 
 - Closed #1462 as contained in #1467 (both its head and original #1164 are ancestors of #1467 head 92effaba).
 - Opened #1491 for #1475, the parity-corpus expectation mismatch. Test/tooling only; independent review and CI required.
-- Updated #1488 to af259ac9 with whole-attempt, committed-feedback, core-generation, and law-door repairs. All 21 focused lib + 4 context controls pass locally; CI and independent final review required.
+- Updated #1488 to af259ac9 with whole-attempt, committed-feedback, core-generation, and law-door repairs. All 22 focused lib + 4 context controls pass locally; CI and independent final review required.
 - Opened #1492 for #1236: full lock-concurrency suite plus new stdin parity control passes.
 - Ran the requested pinned synthetic build of #1325's combined candidate b6d09940: all 19 request_load tests passed; no live chain was read.
 - Ran #1487 recovery prototype f964d8d3: 8 backup + 6 chain snapshot + 20 affected binary tests passed against synthetic fixtures.
@@ -17,7 +17,7 @@ Earlier oldest-five audit: #1164 closed as superseded by #1467; #1275 closed as 
 
 | PR | Current disposition |
 |---|---|
-| #1488 | Actionable: updated to af259ac9. All 21 focused lib + 4 context controls green locally; hosted CI/final review pending. |
+| #1488 | Actionable: updated to af259ac9. All 22 focused lib + 4 context controls green locally; hosted CI/final review pending. |
 | #1487 | HOLD: safe staging direction good; recovery prototype f964d8d3 passes 8+6+20 synthetic tests here. Platform/SQLCipher, caller/privacy and operator decisions remain. |
 | #1467 | Draft HOLD: retirement/inventory integration preserved; terminal-witness/outcome recovery unresolved. |
 | #1462 | CLOSED in this audit: contained in #1467, not merged. |
