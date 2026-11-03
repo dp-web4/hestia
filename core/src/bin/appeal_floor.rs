@@ -58,6 +58,17 @@ use anyhow::{Context, Result};
 use hestia::storage::{SqliteChainStore, storage_key};
 use hestia::vault::storage::default_hestia_home;
 
+fn snapshot_tempdir() -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("hestia-appeal-floor-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().context("creating private temp copy dir")
+}
+
 /// Mirrors `handler.rs`'s `APPEAL_CHAIN_WINDOW`. Overridable with `--window` so
 /// the margin can be probed, but the DEFAULT MUST TRACK the handler constant —
 /// a report computed against a different window than the one that rules is a
@@ -222,9 +233,8 @@ fn main() -> Result<()> {
     let key = storage_key(&home, &passphrase).context("deriving storage key")?;
 
     let src_db = home.join("witness.db");
-    let tmp_dir = std::env::temp_dir().join(format!("hestia-appeal-floor-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir).context("creating temp copy dir")?;
-    let copy_db = tmp_dir.join("witness.db");
+    let tmp_dir = snapshot_tempdir()?;
+    let copy_db = tmp_dir.path().join("witness.db");
     SqliteChainStore::backup_encrypted(&src_db, &copy_db, key)
         .with_context(|| format!("snapshotting sealed chain {}", src_db.display()))?;
 
@@ -319,8 +329,9 @@ fn main() -> Result<()> {
         }
     }
 
-    let _ = std::fs::remove_file(&copy_db);
-    let _ = std::fs::remove_dir(&tmp_dir);
+    // Close SQLite before removing the directory and its sidecars.
+    drop(store);
+    drop(tmp_dir);
 
     let floor = head.saturating_sub(window);
     let unruled: Vec<&Appeal> = appeals
@@ -530,6 +541,23 @@ fn read_passphrase(home: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_directories_are_exclusive_and_cleaned_up() {
+        let first = snapshot_tempdir().unwrap();
+        let second = snapshot_tempdir().unwrap();
+        assert_ne!(first.path(), second.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(first.path()).unwrap().permissions().mode() & 0o077, 0);
+        }
+        let owned = first.path().to_path_buf();
+        std::fs::write(owned.join("synthetic-sidecar"), b"test").unwrap();
+        drop(first);
+        assert!(!owned.exists());
+        assert!(second.path().exists());
+    }
 
     /// The two denies kimi-code ruled on 2026-07-28T17:42Z, and the nested
     /// appeals that cite them. Real hashes and real positions: this is the

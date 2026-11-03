@@ -38,6 +38,17 @@ use hestia::storage::{SqliteChainStore, storage_key};
 use hestia::vault::storage::default_hestia_home;
 use web4_trust_core::EntityTrust;
 
+fn snapshot_tempdir() -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("hestia-calib-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().context("creating private temp copy dir")
+}
+
 fn main() -> Result<()> {
     let mut out_path: Option<PathBuf> = None;
     let mut mode = String::from("outcome");
@@ -84,9 +95,8 @@ fn main() -> Result<()> {
     // committed frames may live in `witness.db-wal`. SQLite's backup API folds a
     // consistent view into another encrypted DB; plaintext never hits disk.
     let src_db = home.join("witness.db");
-    let tmp_dir = std::env::temp_dir().join(format!("hestia-calib-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir).context("creating temp copy dir")?;
-    let copy_db = tmp_dir.join("witness.db");
+    let tmp_dir = snapshot_tempdir()?;
+    let copy_db = tmp_dir.path().join("witness.db");
     SqliteChainStore::backup_encrypted(&src_db, &copy_db, key)
         .with_context(|| format!("snapshotting sealed chain {}", src_db.display()))?;
 
@@ -320,9 +330,9 @@ fn main() -> Result<()> {
     w.flush()?;
     drop(w);
 
-    // Best-effort cleanup of the encrypted copy.
-    let _ = std::fs::remove_file(&copy_db);
-    let _ = std::fs::remove_dir(&tmp_dir);
+    // Close SQLite before removing the directory and its sidecars.
+    drop(store);
+    drop(tmp_dir);
 
     if gate {
         eprintln!(
@@ -367,6 +377,26 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    #[test]
+    fn snapshot_directories_are_exclusive_and_cleaned_up() {
+        let first = super::snapshot_tempdir().unwrap();
+        let second = super::snapshot_tempdir().unwrap();
+        assert_ne!(first.path(), second.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(first.path()).unwrap().permissions().mode() & 0o077, 0);
+        }
+        let owned = first.path().to_path_buf();
+        std::fs::write(owned.join("synthetic-sidecar"), b"test").unwrap();
+        drop(first);
+        assert!(!owned.exists());
+        assert!(second.path().exists());
+    }
 }
 
 /// Read the passphrase the same way the daemon can: `HESTIA_PASSPHRASE` env, or
