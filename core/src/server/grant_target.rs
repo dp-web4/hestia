@@ -58,7 +58,7 @@ impl GrantTarget {
                 // only retain its exact sentinel here; the caller still decides
                 // whether the request is eligible for a one-act ruling.
                 if super::state::unpriceable_scope_path(path).as_deref() == Some(path.as_str()) {
-                    if grant_path.is_some() || recursive {
+                    if reach != path || recursive {
                         return Err("an unenumerated act cannot choose path breadth or recursion".into());
                     }
                     return Ok(Self::Path { path: path.clone(), recursive: false });
@@ -342,7 +342,7 @@ mod tests {
         let asked = GrantTarget::Path { path: sentinel.into(), recursive: false };
         assert_eq!(asked.decision_reach(None, false).unwrap().as_path(), Some((sentinel, false)));
         assert!(asked.decision_reach(None, true).is_err());
-        assert!(asked.decision_reach(Some(sentinel), false).is_err());
+        assert_eq!(asked.decision_reach(Some(sentinel), false).unwrap().as_path(), Some((sentinel, false)));
         assert!(asked.decision_reach(Some("/work"), true).is_err());
         let malformed = GrantTarget::Path { path: "hestia:unpriceable:bogus#0123456789abcdef".into(),
                                             recursive: false };
