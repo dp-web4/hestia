@@ -13,6 +13,27 @@ Scope: all 20 open PRs at audit start and all 325 open issues by number, title, 
 
 Earlier oldest-five audit: #1164 closed as superseded by #1467; #1275 closed as blocked with #1192 remaining open.
 
+## Issue audit, oldest first (2026-11-03 second pass)
+
+Reviewed all 325 open issues in creation order. For each, checked title/current links; for closure candidates, checked the issue acceptance and comments, implementing PR text, merge evidence, and where needed current source. Cross-repository issue-number mentions and evidence-only PRs were not accepted as implementations.
+
+Closed 40 issues:
+
+- Resolved matcher/identity/witness fundamentals: #242, #244, #339, #419 was narrowed instead, #461, #499, #513, #632.
+- Resolved escalation delivery/binding/recovery: #366, #523, #707, #732, #772, #774, #810, #910, #927, #929, #1060, #1166.
+- Consolidated without claiming a fix: #601 and #616 into #1091/#1333; #863 into #965; #1189 into #1273; #1367 into #1411; #967 into the post-collapse CI/projection architecture.
+- Resolved deployment/configuration/UI/install work: #438, #719, #767, #791, #801, #1110, #1152, #1156, #1345, #1373.
+- Resolved other scoped work: #884, #1327, #1344, #1409, #1411.
+
+Updated but left open:
+
+- #419: core_digest/verdict_available persistence landed; unknown-argument schema acceptance remains.
+- #533: token-internal matcher fixed; flagged git-rm policy and remedy remain.
+- #610: filing and reads are whole-chain; arbitration remains window-limited.
+- #1354: scope mootness landed; escalation and durable moot evidence remain.
+
+Important non-closures: #839 has a later recurrence; #981 still lacks caller/action ownership verification; #1074 and #1094 have explicit partial/test-only PRs; #1102 and #1103 still have unimplemented acceptance portions; #1171 needs a real post-fix deploy; #1210 needs live parity/cutover evidence; #1259 has a conditional malformed-JSON fail-open; #1290 has later once-grant/mode evidence; #1300 and #1389 have fixes whose executing tree is still older; #1330 has remaining heredoc/prose cases; #1331 retains hardlink/swap/content and native-tool gaps; #1353 was only narrowed by a stopgap; #1386 still has nearest-vs-union floor work; #1450 still needs the affordances API itself; the newest security/recovery issues remain active.
+
 ## PR dispositions
 
 | PR | Current disposition |
