@@ -1,8 +1,9 @@
 # held: #1262 re-cut on main (critical-timeout protocol, canonical or MISWIRED)
 
-kimi-code's #1262, round-2 head `d94149b3` (10-07), merged with main (`95d6d0b7`, re-cut on `2b3d0ca2`). **NOT applied.**
-kimi-code handed the PR over on 10-26. Its commits are the change; this directory only re-cuts
-it so it applies to today's main.
+kimi-code's #1262, round-2 head `d94149b3` (10-07), was previously merged for preparation
+against historical main bases `95d6d0b7` and `2b3d0ca2`. **NOT applied.** kimi-code handed
+the PR over on 10-26. This directory prepares held artifacts; it does not establish that any
+particular artifact applies to current main or is authorized for application.
 
 Patch (v4, 2026-11-03): `held/a656f67d34b0976a9c0e892e480f2f809644d90735dea69d1b436e897c3395b4.patch`, the same builder re-run on main `83f57eb8` after #1469 (which changed `hestia_gate_mechanism.py` and the manifests; same 19 files, cache contract PASS). SUPERSEDED v3: `held/e612a448a1ac59da2381a9aee0cc72960dd7faa58b28a280c7f6d66df05f0aa9.patch`, cut by this builder (with Codex's cache repair, `7811c2ab`) on `827b3e7d` (v0.3.0), reproduced byte-identically by cbp-claude; no gate file changed between `827b3e7d` and main at the time of the cut. SUPERSEDED: `held/9ee3fe6c1efdb3dc80ea11d7fa70ec03d143af08bcdf46cd2041e6409b6e56b9.patch` (re-cut 2026-10-27 on main `2b3d0ca2`, after #1412 moved the manifests; the sources are unchanged). Superseded: `held/565e424e….patch` (on `95d6d0b7`) (19 files:
 the same set as #1262, sources plus the hooks-gt mirror and manifests).
@@ -36,9 +37,15 @@ build's neutral copies overlaid):
 
 ## Applying
 
-Governed (plugins/_shared, hooks-gt): it needs dp's escalation. `git apply` of the patch on a
-`main` worktree at `95d6d0b7`, then the test above unmodified. If main has moved, re-run
-`build_1262.py <worktree> <out>`, which re-cuts offset-tolerantly or stops.
+The v4 artifact named above was built on `83f57eb8`, not on the historical `95d6d0b7` base.
+Before any proposed application, compare the target to the exact full build base and verify the
+artifact digest, source, ground-truth closure and independent regression evidence. If the target
+has moved, prepare and review a fresh artifact; an offset-tolerant build is not proof of behavioral
+compatibility. The current v4 template wording also makes an unverified universal timing claim;
+correct it and regenerate the artifact before requesting application. Obtain independent review,
+passing exact-head checks and a new explicit operator decision bound to the exact candidate and
+base. An earlier approval or a green build is not authorization for a different artifact. No
+application instruction here grants permission to change governed sources or ground truth.
 
 ## Review-only cache experiment
 
