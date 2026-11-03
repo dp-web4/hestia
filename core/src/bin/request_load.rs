@@ -234,10 +234,12 @@ struct Req {
     // absence of evidence must not be counted as an available peer.
     no_peer: Option<bool>,
     opened: Option<DateTime<Utc>>,
+    opened_position: Option<u64>,
     expires_at: Option<i64>,
     outcome: &'static str, // open | incomplete | granted | refused | lapsed | withdrawn
     ruler: &'static str,
     ruled_at: Option<DateTime<Utc>>,
+    ruled_position: Option<u64>,
 }
 
 fn s<'a>(d: &'a Value, k: &str) -> Option<&'a str> {
@@ -259,7 +261,7 @@ fn no_peer_at_open(gate_opened: bool, data: &Value) -> Option<bool> {
 
 /// Apply one scope event to a tracked request. Kept separate so synthetic
 /// sequences exercise the actual report logic without opening a live chain.
-fn observe_scope_outcome(r: &mut Req, event: &str, d: &Value, at: DateTime<Utc>) {
+fn observe_scope_outcome(r: &mut Req, event: &str, d: &Value, at: DateTime<Utc>, position: u64) {
     if r.ruled_at.is_some() {
         return;
     }
@@ -274,6 +276,7 @@ fn observe_scope_outcome(r: &mut Req, event: &str, d: &Value, at: DateTime<Utc>)
         r.ruler = classify_ruler(s(d, "granted_by").or_else(|| s(d, "decided_by")),
                                  s(d, "via").or_else(|| s(d, "decided_via")), None);
         r.ruled_at = Some(at);
+        r.ruled_position = Some(position);
     }
 }
 
@@ -393,16 +396,18 @@ fn main() -> Result<()> {
                         gate_opened,
                         no_peer,
                         opened: Some(e.timestamp),
+                        opened_position: Some(e.chain_position),
                         expires_at: d.get("expires_at").and_then(Value::as_i64),
                         outcome: "open",
                         ruler: "",
                         ruled_at: None,
+                        ruled_position: None,
                     });
                 }
                 "scope_granted" | "scope_grant_intent" | "scope_refused" => {
                     let Some(id) = s(d, "request_id") else { continue };
                     if let Some(r) = reqs.get_mut(&format!("s:{id}")) {
-                        observe_scope_outcome(r, &e.event_type, d, e.timestamp);
+                        observe_scope_outcome(r, &e.event_type, d, e.timestamp, e.chain_position);
                     }
                 }
                 "gate_escalation_opened" if e.timestamp >= since => {
@@ -558,35 +563,51 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
     Value::Object(out)
 }
 
-/// Re-asks: within each (member, path) group of two or more requests, ordered by when they were
-/// opened, every request after the first is a re-ask. Counted by the outcome of the FIRST ask, and
-/// by whether it came within 10 minutes of the previous request's ruling (a re-ask after an
-/// unruled previous request is counted separately).
+/// Re-asks within each (member, path) group, ordered by witnessed opening position, not by a
+/// possibly tied or regressing wall clock. Positions establish record order, not when an
+/// underlying effect occurred. Missing/duplicate positions make the group order unknown.
+/// Time gaps are only reported when they agree with that witnessed order.
 fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
     let mut by_first = BTreeMap::new();
     let (mut total, mut within_10m, mut after_unruled, mut timing_unknown) = (0u64, 0u64, 0u64, 0u64);
     for mut g in groups.into_iter().filter(|g| g.len() > 1) {
-        g.sort_by_key(|r| r.opened);
+        g.sort_by_key(|r| r.opened_position);
+        let positions_unknown = g.iter().any(|r| r.opened_position.is_none())
+            || g.windows(2).any(|w| w[0].opened_position == w[1].opened_position);
+        if positions_unknown {
+            let count = (g.len() - 1) as u64;
+            total += count;
+            timing_unknown += count;
+            *by_first.entry("unknown".to_string()).or_insert(0u64) += count;
+            continue;
+        }
         let first = g[0].outcome;
         for w in g.windows(2) {
             total += 1;
             *by_first.entry(first.to_string()).or_insert(0u64) += 1;
-            match (w[0].ruled_at, w[1].opened) {
-                (Some(ruled), Some(next)) => {
-                    let gap = (next - ruled).num_seconds();
+            let next_position = w[1].opened_position.expect("validated above");
+            match (w[0].opened, w[1].opened) {
+                (Some(previous), Some(next)) if next >= previous => {}
+                _ => {
+                    timing_unknown += 1; // missing clock or clock order contradicts witness order
+                    continue;
+                }
+            }
+            if w[0].ruled_position.is_some_and(|p| p <= w[0].opened_position.expect("validated above")) {
+                timing_unknown += 1; // a ruling cannot precede its own recorded request
+                continue;
+            }
+            match (w[0].ruled_position, w[0].ruled_at, w[1].opened) {
+                (Some(position), Some(ruled), Some(next)) if position < next_position => {
                     if next < ruled {
-                        // The previous request was eventually ruled, but was
-                        // still pending when the next request was opened.
-                        after_unruled += 1;
-                    } else if next == ruled {
-                        // Timestamps alone cannot order equal instants.
-                        timing_unknown += 1;
-                    } else if (0..=600).contains(&gap) {
+                        timing_unknown += 1; // witnessed ruling preceded the ask, clock disagrees
+                    } else if (next - ruled).num_seconds() <= 600 {
                         within_10m += 1;
                     }
                 }
-                (None, Some(_)) => after_unruled += 1,
-                (_, None) => timing_unknown += 1,
+                (Some(position), _, _) if position > next_position => after_unruled += 1,
+                (None, None, Some(_)) => after_unruled += 1,
+                _ => timing_unknown += 1,
             }
         }
     }
@@ -782,15 +803,17 @@ mod tests {
         let mut r = Req { kind: "scope", outcome: "open", ..Default::default() };
         let at = DateTime::<Utc>::from_timestamp(100, 0).unwrap();
         let evidence = json!({"granted_by":"operator"});
-        observe_scope_outcome(&mut r, "scope_grant_intent", &evidence, at);
+        observe_scope_outcome(&mut r, "scope_grant_intent", &evidence, at, 1);
         assert_eq!(r.outcome, "incomplete");
         assert!(r.ruled_at.is_none());
-        observe_scope_outcome(&mut r, "scope_granted", &evidence, at);
+        assert!(r.ruled_position.is_none());
+        observe_scope_outcome(&mut r, "scope_granted", &evidence, at, 2);
         assert_eq!(r.outcome, "granted");
         assert_eq!(r.ruled_at, Some(at));
+        assert_eq!(r.ruled_position, Some(2));
         let mut refused = Req { kind: "scope", outcome: "open", ..Default::default() };
-        observe_scope_outcome(&mut refused, "scope_grant_intent", &evidence, at);
-        observe_scope_outcome(&mut refused, "scope_refused", &evidence, at);
+        observe_scope_outcome(&mut refused, "scope_grant_intent", &evidence, at, 1);
+        observe_scope_outcome(&mut refused, "scope_refused", &evidence, at, 2);
         assert_eq!(refused.outcome, "refused");
     }
 
@@ -858,7 +881,8 @@ mod tests {
 
     fn req(key: &str, opened: i64, outcome: &'static str, ruled: Option<i64>) -> Req {
         let t = |x: i64| DateTime::<Utc>::from_timestamp(x, 0);
-        Req { kind: "scope", path_key: key.into(), opened: t(opened), outcome, ruled_at: ruled.and_then(t), ..Default::default() }
+        Req { kind: "scope", path_key: key.into(), opened: t(opened), opened_position: Some(opened as u64),
+              outcome, ruled_at: ruled.and_then(t), ruled_position: ruled.map(|x| x as u64), ..Default::default() }
     }
 
     #[test]
@@ -885,6 +909,40 @@ mod tests {
         assert_eq!(v["previous_request_unruled"], 1);
         assert_eq!(v["previous_ruling_order_unknown"], 1);
         assert_eq!(v["within_10_min_of_previous_ruling"], 1);
+    }
+
+    #[test]
+    fn reask_order_uses_witness_positions_and_refuses_ambiguous_evidence() {
+        let mut first = req("a", 100, "refused", Some(200));
+        let mut second = req("a", 100, "granted", Some(300));
+        first.opened_position = Some(1);
+        first.ruled_position = Some(4); // this ruling was witnessed after the next opening
+        second.opened_position = Some(2);
+        second.ruled_position = Some(5);
+        let forward = reask_split(vec![vec![&first, &second]]);
+        let backward = reask_split(vec![vec![&second, &first]]);
+        assert_eq!(forward, backward, "input iteration order cannot choose the first ask");
+        assert_eq!(forward["by_outcome_of_first_ask"]["refused"], 1);
+        assert_eq!(forward["previous_request_unruled"], 1);
+
+        second.opened_position = Some(1); // invalid duplicate opening positions
+        let duplicate = reask_split(vec![vec![&first, &second]]);
+        assert_eq!(duplicate["by_outcome_of_first_ask"]["unknown"], 1);
+        assert_eq!(duplicate["previous_ruling_order_unknown"], 1);
+        second.opened_position = None;
+        let missing = reask_split(vec![vec![&first, &second]]);
+        assert_eq!(missing["by_outcome_of_first_ask"]["unknown"], 1);
+        assert_eq!(missing["previous_ruling_order_unknown"], 1);
+
+        let mut earlier = req("b", 200, "granted", Some(250));
+        let mut later = req("b", 100, "open", None);
+        earlier.opened_position = Some(1);
+        earlier.ruled_position = Some(2);
+        later.opened_position = Some(3); // wall clock went backwards
+        let clock = reask_split(vec![vec![&earlier, &later]]);
+        assert_eq!(clock["by_outcome_of_first_ask"]["granted"], 1);
+        assert_eq!(clock["previous_ruling_order_unknown"], 1);
+        assert_eq!(clock["within_10_min_of_previous_ruling"], 0);
     }
 
     #[test]
