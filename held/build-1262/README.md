@@ -4,7 +4,7 @@ kimi-code's #1262, round-2 head `d94149b3` (10-07), merged with main (`95d6d0b7`
 kimi-code handed the PR over on 10-26. Its commits are the change; this directory only re-cuts
 it so it applies to today's main.
 
-Patch (v3, 2026-11-03): `held/e612a448a1ac59da2381a9aee0cc72960dd7faa58b28a280c7f6d66df05f0aa9.patch`, cut by this builder (with Codex's cache repair, `7811c2ab`) on `827b3e7d` (v0.3.0), reproduced byte-identically by cbp-claude; no gate file changed between `827b3e7d` and main at the time of the cut. SUPERSEDED: `held/9ee3fe6c1efdb3dc80ea11d7fa70ec03d143af08bcdf46cd2041e6409b6e56b9.patch` (re-cut 2026-10-27 on main `2b3d0ca2`, after #1412 moved the manifests; the sources are unchanged). Superseded: `held/565e424e….patch` (on `95d6d0b7`) (19 files:
+Patch (v4, 2026-11-03): `held/a656f67d34b0976a9c0e892e480f2f809644d90735dea69d1b436e897c3395b4.patch`, the same builder re-run on main `83f57eb8` after #1469 (which changed `hestia_gate_mechanism.py` and the manifests; same 19 files, cache contract PASS). SUPERSEDED v3: `held/e612a448a1ac59da2381a9aee0cc72960dd7faa58b28a280c7f6d66df05f0aa9.patch`, cut by this builder (with Codex's cache repair, `7811c2ab`) on `827b3e7d` (v0.3.0), reproduced byte-identically by cbp-claude; no gate file changed between `827b3e7d` and main at the time of the cut. SUPERSEDED: `held/9ee3fe6c1efdb3dc80ea11d7fa70ec03d143af08bcdf46cd2041e6409b6e56b9.patch` (re-cut 2026-10-27 on main `2b3d0ca2`, after #1412 moved the manifests; the sources are unchanged). Superseded: `held/565e424e….patch` (on `95d6d0b7`) (19 files:
 the same set as #1262, sources plus the hooks-gt mirror and manifests).
 
 ## The conflicts, and how they were resolved
