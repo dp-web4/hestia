@@ -38,8 +38,8 @@ impl GrantTarget {
         hex::encode(h.finalize())
     }
 
-    /// Resolve the decider's breadth without crossing target domains. Callers
-    /// normalize filesystem paths before this check, as for standing grants.
+    /// Resolve the decider's breadth without crossing target domains. Filesystem
+    /// paths must already be normalized; this primitive checks that precondition.
     /// A repository's owner/name is immutable: path breadth is never meaningful
     /// for it, even when the supplied text happens to equal the repository name.
     pub fn decision_reach(
@@ -54,6 +54,24 @@ impl GrantTarget {
             Self::Repository(_) => Ok(self.clone()),
             Self::Path { path, .. } => {
                 let reach = grant_path.unwrap_or(path);
+                // The gate's unenumerated act is not a filesystem grant. It can
+                // only retain its exact sentinel here; the caller still decides
+                // whether the request is eligible for a one-act ruling.
+                if super::state::unpriceable_scope_path(path).as_deref() == Some(path.as_str()) {
+                    if grant_path.is_some() || recursive {
+                        return Err("an unenumerated act cannot choose path breadth or recursion".into());
+                    }
+                    return Ok(Self::Path { path: path.clone(), recursive: false });
+                }
+                // Validate even the equal-path arm: a future caller must not
+                // turn an unnormalized root spelling into broad reach.
+                for value in [path.as_str(), reach] {
+                    if !value.starts_with('/') || value == "/"
+                        || super::state::normalize_scope_path(value) != value
+                    {
+                        return Err("scope decision requires normalized absolute paths below the root".into());
+                    }
+                }
                 if reach != path {
                     if !reach.starts_with('/')
                         || reach == "/"
@@ -301,6 +319,34 @@ mod tests {
                 "accepted {path}"
             );
         }
+    }
+
+    #[test]
+    fn decision_reach_rejects_noncanonical_or_root_paths_even_when_equal() {
+        let asked = GrantTarget::Path { path: "/work/tree/file".into(), recursive: false };
+        for reach in ["//", "/work//tree", "/work/./tree", "/work/x/../tree", "/work/tree/"] {
+            assert!(asked.decision_reach(Some(reach), true).is_err(), "accepted {reach}");
+        }
+        for path in ["/", "//", "/work//tree", "/work/./tree", "relative/file"] {
+            let invalid = GrantTarget::Path { path: path.into(), recursive: false };
+            assert!(invalid.decision_reach(None, false).is_err(), "accepted asked path {path}");
+            assert!(invalid.decision_reach(Some(path), true).is_err(), "accepted equal path {path}");
+        }
+        assert_eq!(asked.decision_reach(Some("/work/tree"), true).unwrap().as_path(),
+                   Some(("/work/tree", true)));
+    }
+
+    #[test]
+    fn decision_reach_retains_exact_unenumerated_sentinel_only() {
+        let sentinel = "hestia:unpriceable:unenumerated#0123456789abcdef";
+        let asked = GrantTarget::Path { path: sentinel.into(), recursive: false };
+        assert_eq!(asked.decision_reach(None, false).unwrap().as_path(), Some((sentinel, false)));
+        assert!(asked.decision_reach(None, true).is_err());
+        assert!(asked.decision_reach(Some(sentinel), false).is_err());
+        assert!(asked.decision_reach(Some("/work"), true).is_err());
+        let malformed = GrantTarget::Path { path: "hestia:unpriceable:bogus#0123456789abcdef".into(),
+                                            recursive: false };
+        assert!(malformed.decision_reach(None, false).is_err());
     }
 
     #[test]
