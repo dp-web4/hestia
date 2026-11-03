@@ -59,7 +59,7 @@ if ! command -v flock >/dev/null 2>&1; then
     echo "[mesh-lock] no lock tool (neither flock(1) nor python3) — refusing to fire $PLUGIN unbounded" >&2
     exit 69
   }
-  exec python3 - "$LOCK" "$WAIT" "$HOLDER" "$PLUGIN" "$@" <<'PY'
+  exec python3 -c '
 import os
 import sys
 import time
@@ -73,7 +73,7 @@ except ImportError:
 path, wait_s, holder, plugin = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
 cmd = sys.argv[5:]
 fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
-started = time.time()
+started = time.monotonic()
 told = False
 while True:
     try:
@@ -90,7 +90,7 @@ while True:
             except OSError:
                 pass
             told = True
-        if time.time() - started >= wait_s:
+        if time.monotonic() - started >= wait_s:
             sys.stderr.write("[mesh-lock] REFUSED: %s still locked after %ss — the holder has\n" % (plugin, wait_s))
             sys.stderr.write("[mesh-lock] outlived its own 1800s timeout. Not starting a second session.\n")
             sys.exit(75)
@@ -120,7 +120,7 @@ except OSError:
     pass
 # A signal death is -N from Popen; report 128+N as bash does, so the watcher sees the same rc.
 sys.exit(128 - rc if rc < 0 else rc)
-PY
+' "$LOCK" "$WAIT" "$HOLDER" "$PLUGIN" "$@"
 fi
 
 # Append, never truncate: `9>` would blank the file at open() — i.e. BEFORE the
