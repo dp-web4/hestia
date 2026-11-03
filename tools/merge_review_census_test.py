@@ -25,6 +25,7 @@ from merge_review_census import (  # noqa: E402
     _CACHE_SCHEMA, census, is_findings, merge_calls, scan_chain, seat_merges, substantive_comments,
     substantive_reviews,
 )
+from merge_review_parser import classify_outcomes  # noqa: E402
 
 FAILURES: list[str] = []
 REPO = "dp-web4/hestia"
@@ -267,6 +268,22 @@ def arm_ambiguous_shell_text_is_not_attributed() -> None:
           report["performer_status"] == "partial" and report["seat_performed"] is None
           and report["seat_candidate_count"] == 0 and report["ambiguous_outcomes"] == 2,
           str(report))
+
+
+def arm_supplied_records_are_classified_without_acquiring_a_chain() -> None:
+    """The classifier consumes only its iterable; it does not acquire or authenticate it."""
+    entries = [
+        {"eventType": "outcome", "timestamp": "2026-01-01T00:00:00Z", "chainPosition": 1,
+         "eventData": {"success": True, "action_id": "synthetic", "plugin_id": "synthetic",
+                       "target": "gh pr merge 42 --repo example/repo --merge"}},
+        {"eventType": "outcome", "eventData": {"success": True, "target": "printf ';' gh pr merge 42"}},
+        {"eventType": "policy_decision", "eventData": {"success": True, "target": "gh pr merge 43"}},
+        {"eventType": "outcome", "eventData": {"success": False, "target": "gh pr merge 44"}},
+    ]
+    hits = classify_outcomes(iter(entries))
+    check("one supplied direct candidate", len(hits) == 2 and hits[0]["calls"] == [[42, "example/repo"]], str(hits))
+    check("ambiguous supplied outcome remains unknown", hits[-1] == {"calls": None, "ambiguous_count": 1}, str(hits))
+    check("raw target text is not retained", all("target" not in hit for hit in hits), str(hits))
 
 
 def arm_old_or_invalid_cache_is_not_a_measured_zero() -> None:
