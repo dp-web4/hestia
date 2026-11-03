@@ -1715,7 +1715,8 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // then witnesses this same verdict is answered with this row, not a duplicate of it.
     let mut decision_entry_hash: Option<String> = None;
     // WHAT WAS ATTEMPTED, scrubbed and bounded: the row's `attempted` and half of the act key.
-    let attempted = full_command.map(redact_secrets).map(|a| {
+    let attempted_whole = full_command.map(redact_secrets);
+    let attempted = attempted_whole.clone().map(|a| {
         if a.chars().count() > ATTEMPTED_MAX {
             a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
         } else {
@@ -1731,24 +1732,26 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     if evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced {
         // The routes `guidance()` and the operating law already name, as data: adjust the
         // request, ask the operator, or dispute the rule. An invariant would drop them all.
-        use super::verdict_feedback::Door;
-        feedback = feedback.with_doors(vec![
-            Door::new("modify_request", None, None),
-            Door::new("escalate", None, Some("operator")),
-            Door::new("appeal", Some("hestia_appeal"), None),
-        ]);
+        // Which routes are real depends on the level (`daemon_doors`): a law-level deny's only
+        // route is the governance escalation; an invariant drops them all.
+        let level = feedback.level();
+        feedback = feedback.with_doors(super::verdict_feedback::daemon_doors(level));
     }
+    // Over the WHOLE redacted attempt, not the row's capped text: two long commands that agree up
+    // to ATTEMPTED_MAX are different acts (NOVA's hold on 93611e46).
     let act = super::verdict_feedback::act_digest(
         &plugin_id_for_chain,
         &action.tool_name,
         target,
-        attempted.as_deref(),
+        attempted_whole.as_deref(),
     );
+    // The context fields exactly as this path's row writes them (`own_data` below).
     let repeat_key = super::verdict_feedback::repeat_key(
         &plugin_id_for_chain,
         &act,
         evaluation.decision.as_str(),
         rule_for_level,
+        &json!({"policy_version": policy_version, "role_lct": role_lct, "enforced": evaluation.enforced}),
     );
     feedback.act = Some(act);
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
@@ -4294,14 +4297,24 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     let doors_stripped = offered_doors - feedback.doors().len();
     feedback.premise_check = stated.premise_check;
     feedback.effects = stated.effects;
+    if feedback.premise_check.is_some() || feedback.effects.is_some() {
+        feedback.stated_by = Some("caller".into());
+    }
     let act = super::verdict_feedback::act_digest(
         &plugin_id,
         &tool_name,
         Some(target.as_str()),
         attempted.as_deref(),
     );
-    let repeat_key =
-        super::verdict_feedback::repeat_key(&plugin_id, &act, verdict.as_str(), &rule_id);
+    // The context fields exactly as this path's row writes them (`row` below: no policy_version,
+    // `enforced: true`), so rehydration from the chain yields the same key.
+    let repeat_key = super::verdict_feedback::repeat_key(
+        &plugin_id,
+        &act,
+        verdict.as_str(),
+        &rule_id,
+        &json!({"role_lct": role_lct, "enforced": true}),
+    );
     feedback.act = Some(act);
 
     let mut s = state.lock().await;
@@ -4324,10 +4337,32 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         .map(str::to_string);
     if let (Some(hash), Some(a)) = (existing, action_id) {
         let settled = settle_decision_charge(&mut s, &plugin_id, a, None)?;
+        // AN EXISTING ROW'S HASH IS NEVER PAIRED WITH FEEDBACK IT DOES NOT HOLD (NOVA's hold on
+        // 93611e46; reproduced by Codex's control `b38af004`, run on cbp). Nothing is appended here,
+        // so the receipt hands back the COMMITTED row's own feedback (null for a row without one, or
+        // one that cannot be read) and says whether this call's feedback differed and was not
+        // recorded. Not a refusal: the existing row is often the daemon's own society-path verdict,
+        // which a seat legitimately witnesses again with its own doors and level, and refusing would
+        // turn that accepted receipt into an error the caller retries.
+        let committed = s
+            .chain_store
+            .read_by_hash(&hash)
+            .ok()
+            .flatten()
+            .and_then(|e| e.event_data.get("feedback").cloned())
+            .unwrap_or(Value::Null);
         // The same verdict delivered again for the same action is not a repeated ACT.
         feedback.repeat_of = earlier.filter(|h| *h != hash);
+        let strip = |mut v: Value| {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("repeat_of");
+            }
+            v
+        };
+        let differed = strip(committed.clone()) != strip(feedback.to_value());
         return Ok(json!({
-            "feedback": feedback.to_value(),
+            "feedback": committed,
+            "feedbackRecorded": !differed,
             "doorsStripped": doors_stripped,
             "witnessEntryHash": hash,
             "eventType": verdict.event_type(),
@@ -33788,6 +33823,23 @@ mod verdict_feedback_tests {
     }
 
     #[tokio::test]
+    async fn caller_stated_premise_and_effects_are_labelled_on_receipt_and_row() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        let plain = tool_witness_decision(&state, &args).await.unwrap();
+        assert!(plain["feedback"].get("stated_by").is_none(), "nothing stated, nothing labelled: {plain}");
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["premise_check"] = json!({"status": "holds", "evidence": ["seen"]});
+        let out = tool_witness_decision(&state, &args).await.unwrap();
+        assert_eq!(out["feedback"]["stated_by"], json!("caller"), "{out}");
+        let recorded = row(&state, out["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(recorded["feedback"]["stated_by"], json!("caller"));
+    }
+
+    #[tokio::test]
     async fn retry_feedback_never_claims_unwitnessed_new_fields_under_an_old_hash() {
         let dir = seeded_home().0;
         let state = safety_state(&dir).await;
@@ -33795,7 +33847,7 @@ mod verdict_feedback_tests {
         args["action_id"] = json!(Uuid::new_v4().to_string());
         args["level"] = json!("act");
         args["serves"] = json!("q7");
-        args["premise_check"] = json!({"status": "supported", "evidence": ["first"]});
+        args["premise_check"] = json!({"status": "holds", "evidence": ["first"]});
         let first = tool_witness_decision(&state, &args).await.unwrap();
         assert_eq!(first["recorded"], json!("appended"), "{first}");
         let hash = first["witnessEntryHash"].as_str().unwrap().to_string();

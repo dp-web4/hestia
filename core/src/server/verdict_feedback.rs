@@ -120,6 +120,24 @@ pub fn level_for_rule(rule_id: &str) -> FeedbackLevel {
     }
 }
 
+/// THE DOORS THE DAEMON OFFERS FOLLOW THE LEVEL (NOVA's hold on 93611e46). Until then every enforced
+/// deny offered the same three: modify the request, ask the operator, appeal. At the `law` level
+/// (the governance surface, `gate.self_access`) two of those are false routes: "modify the request"
+/// there means reaching the governed file another way, which the operating law tells a member NOT to
+/// do, and a gate escalation is not appealable. The one real route is the governance escalation the
+/// operator decides. An `invariant` offers none (and `with_doors` drops any).
+pub fn daemon_doors(level: FeedbackLevel) -> Vec<Door> {
+    match level {
+        FeedbackLevel::Invariant => Vec::new(),
+        FeedbackLevel::Law => vec![Door::new("escalate", Some("hestia_gate_escalation_open"), Some("operator"))],
+        FeedbackLevel::Act | FeedbackLevel::Goal => vec![
+            Door::new("modify_request", None, None),
+            Door::new("escalate", None, Some("operator")),
+            Door::new("appeal", Some("hestia_appeal"), None),
+        ],
+    }
+}
+
 /// The level a verdict carries, given its rule and an optionally STATED level (by the gate that
 /// decided, or a ruling member). A rule the daemon classifies as invariant stays invariant
 /// whatever is stated: an invariant cannot be argued down to a level that offers doors.
@@ -222,8 +240,15 @@ pub struct VerdictFeedback {
     pub act: Option<String>,
     doors: Vec<Door>,
     pub premise_check: Option<PremiseCheck>,
-    /// The chain hash of the FIRST witnessed verdict for the identical act, decision and rule by
-    /// the same member, when there is one. An identical act is answered by reference.
+    /// WHO STATED `premise_check` AND `effects` (NOVA's hold on 93611e46): `"caller"` when the party
+    /// that sent the witness supplied them. The daemon passes them through and does not certify them,
+    /// and a reader of the receipt or the row must be able to tell. Absent when neither was stated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stated_by: Option<String>,
+    /// The chain hash of the first witnessed verdict on record for the identical act, decision and
+    /// rule by the same member IN THE SAME DECISION CONTEXT (policy generation, role, enforcement),
+    /// when the bounded index still holds one. A best-effort HINT: an evicted or not-yet-replayed key
+    /// yields none, so its absence never means "first ever" (NOVA's hold on 93611e46).
     pub repeat_of: Option<String>,
     pub effects: Option<Effects>,
 }
@@ -243,6 +268,8 @@ struct VerdictFeedbackWire {
     #[serde(default)]
     premise_check: Option<PremiseCheck>,
     #[serde(default)]
+    stated_by: Option<String>,
+    #[serde(default)]
     repeat_of: Option<String>,
     #[serde(default)]
     effects: Option<Effects>,
@@ -253,6 +280,7 @@ impl From<VerdictFeedbackWire> for VerdictFeedback {
         let mut f = VerdictFeedback::new(w.serves.as_deref());
         f.act = w.act;
         f.premise_check = w.premise_check;
+        f.stated_by = w.stated_by;
         f.repeat_of = w.repeat_of;
         f.effects = w.effects;
         f.set_level(w.level);
@@ -275,6 +303,7 @@ impl VerdictFeedback {
             act: None,
             doors: Vec::new(),
             premise_check: None,
+            stated_by: None,
             repeat_of: None,
             effects: None,
         }
@@ -458,15 +487,28 @@ pub fn act_digest(
     format!("{:x}", h.finalize())
 }
 
-/// The identity of a verdict for repeat purposes: the same member, act, decision and rule.
-pub type RepeatKey = (String, String, String, String);
+/// The identity of a verdict for repeat purposes: the same member, act, decision and rule, decided in
+/// the same context. The fifth element is that context, canonical.
+pub type RepeatKey = (String, String, String, String, String);
 
-pub fn repeat_key(member: &str, act: &str, decision: &str, rule_id: &str) -> RepeatKey {
+/// THE DECISION CONTEXT IS PART OF "THE SAME VERDICT" (NOVA's hold on 93611e46; Codex's controls
+/// `e74786fb`). A deny under policy generation 1 is not a repeat of one under generation 2, nor one
+/// under another role or enforcement state: the law changed, so the earlier verdict is not an answer.
+/// Read from the row's OWN fields (`policy_version`, `role_lct`, `enforced`), absent ones as null,
+/// and the live paths pass exactly the values they write, so a key rebuilt from the chain at startup
+/// equals the key computed live.
+pub fn decision_context(row: &Value) -> String {
+    let f = |k: &str| row.get(k).cloned().unwrap_or(Value::Null);
+    serde_json::json!([f("policy_version"), f("role_lct"), f("enforced")]).to_string()
+}
+
+pub fn repeat_key(member: &str, act: &str, decision: &str, rule_id: &str, context: &Value) -> RepeatKey {
     (
         member.to_string(),
         act.to_string(),
         decision.to_string(),
         rule_id.to_string(),
+        decision_context(context),
     )
 }
 
@@ -474,8 +516,8 @@ pub fn repeat_key(member: &str, act: &str, decision: &str, rule_id: &str) -> Rep
 /// reads.
 pub const REPEAT_INDEX_CAP: usize = 16_384;
 
-/// The first witnessed verdict per `(member, act, decision, rule)`. This is how an identical act
-/// is answered by reference (`repeat_of`). Built from committed rows only, and rebuilt from the
+/// The first witnessed verdict per `(member, act, decision, rule, context)`. This is how an identical
+/// act is answered by reference (`repeat_of`). Built from committed rows only, and rebuilt from the
 /// chain at startup, so it is a projection of the witness record and not a second source of truth.
 /// Bounded; oldest keys evicted first.
 #[derive(Debug, Clone)]
@@ -536,7 +578,7 @@ pub fn row_repeat_key(data: &Value) -> Option<RepeatKey> {
     let decision = data.get("decision")?.as_str()?;
     let rule = data.get("rule_id").and_then(Value::as_str).unwrap_or("");
     let act = data.get("feedback")?.get("act")?.as_str()?;
-    Some(repeat_key(member, act, decision, rule))
+    Some(repeat_key(member, act, decision, rule, data))
 }
 
 /// Rebuild the repeat index from the chain at startup. A failed read is reported and yields an
@@ -569,6 +611,31 @@ pub fn rehydrate(chain: &crate::storage::chain::SqliteChainStore) -> RepeatIndex
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_law_level_deny_offers_only_the_governance_escalation() {
+        let law = daemon_doors(FeedbackLevel::Law);
+        assert_eq!(law.len(), 1, "{law:?}");
+        assert_eq!(law[0].kind, "escalate");
+        assert_eq!(law[0].tool.as_deref(), Some("hestia_gate_escalation_open"));
+        assert_eq!(law[0].to.as_deref(), Some("operator"));
+        assert!(!law.iter().any(|d| d.kind == "modify_request" || d.kind == "appeal"),
+            "no route around the governed file, and a gate escalation is not appealable");
+        assert!(daemon_doors(FeedbackLevel::Invariant).is_empty());
+        let act: Vec<_> = daemon_doors(FeedbackLevel::Act).into_iter().map(|d| d.kind).collect();
+        assert_eq!(act, ["modify_request", "escalate", "appeal"]);
+        assert_eq!(level_for_rule("gate.self_access"), FeedbackLevel::Law,
+            "the rule the law doors are for is classified law");
+    }
+
+    #[test]
+    fn stated_by_round_trips_and_is_absent_by_default() {
+        let mut f = VerdictFeedback::new(None);
+        assert!(f.to_value().get("stated_by").is_none());
+        f.stated_by = Some("caller".into());
+        let back: VerdictFeedback = serde_json::from_value(f.to_value()).unwrap();
+        assert_eq!(back.stated_by.as_deref(), Some("caller"));
+    }
 
     fn doors() -> Vec<Door> {
         vec![
@@ -724,14 +791,17 @@ mod tests {
     #[test]
     fn the_repeat_index_keeps_the_first_verdict_and_is_bounded() {
         let mut idx = RepeatIndex::with_cap(2);
-        let k = |n: &str| repeat_key("m", n, "deny", "r");
+        let ctx = serde_json::json!({});
+        let k = |n: &str| repeat_key("m", n, "deny", "r", &ctx);
         idx.record(k("a"), "h1");
         idx.record(k("a"), "h2");
         assert_eq!(idx.earlier(&k("a")), Some("h1"));
         // Same act, different decision or rule: not a repeat.
-        assert_eq!(idx.earlier(&repeat_key("m", "a", "warn", "r")), None);
-        assert_eq!(idx.earlier(&repeat_key("m", "a", "deny", "other")), None);
-        assert_eq!(idx.earlier(&repeat_key("other", "a", "deny", "r")), None);
+        assert_eq!(idx.earlier(&repeat_key("m", "a", "warn", "r", &ctx)), None);
+        assert_eq!(idx.earlier(&repeat_key("m", "a", "deny", "other", &ctx)), None);
+        assert_eq!(idx.earlier(&repeat_key("other", "a", "deny", "r", &ctx)), None);
+        let gen2 = serde_json::json!({"policy_version": 2});
+        assert_eq!(idx.earlier(&repeat_key("m", "a", "deny", "r", &gen2)), None, "another law generation");
         idx.record(k("b"), "h3");
         idx.record(k("c"), "h4");
         assert_eq!(idx.len(), 2);
