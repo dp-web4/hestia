@@ -33788,6 +33788,36 @@ mod verdict_feedback_tests {
     }
 
     #[tokio::test]
+    async fn retry_feedback_never_claims_unwitnessed_new_fields_under_an_old_hash() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["level"] = json!("act");
+        args["serves"] = json!("q7");
+        args["premise_check"] = json!({"status": "supported", "evidence": ["first"]});
+        let first = tool_witness_decision(&state, &args).await.unwrap();
+        assert_eq!(first["recorded"], json!("appended"), "{first}");
+        let hash = first["witnessEntryHash"].as_str().unwrap().to_string();
+        let recorded = row(&state, &hash).await;
+        assert_eq!(first["feedback"], recorded["feedback"]);
+
+        args["level"] = json!("goal");
+        args["serves"] = json!("q8");
+        args["premise_check"] = json!({"status": "refuted", "evidence": ["second"]});
+        let check = |again: Value| {
+            assert_eq!(again["recorded"], json!("existing"), "{again}");
+            assert_eq!(again["witnessEntryHash"], json!(&hash), "{again}");
+            assert!(again["feedback"].is_null() || again["feedback"] == recorded["feedback"],
+                "an old witness hash must not attest newly supplied feedback: {again}");
+        };
+        check(tool_witness_decision(&state, &args).await.unwrap());
+        drop(state);
+        let reopened = safety_state(&dir).await;
+        check(tool_witness_decision(&reopened, &args).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn an_invariant_witnessed_verdict_carries_no_doors_whatever_was_offered() {
         let dir = seeded_home().0;
         let state = safety_state(&dir).await;
