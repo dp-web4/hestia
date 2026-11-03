@@ -10,12 +10,14 @@ Run:  python3 tools/gate_parity_runner_test.py   (exit 1 on failure)
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
 import urllib.request
+from contextlib import redirect_stdout
 
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("gate_parity_runner", HERE / "gate_parity_runner.py")
@@ -67,13 +69,89 @@ def test_unenumerated_command_refusal_is_scope_not_unknown():
     assert not cell.degraded
 
 
-def test_corpus_reconciles_tightening_and_neutral_daemon_expectations():
+def test_corpus_preserves_law_and_neutral_daemon_expectations():
     rows = {row[0]: row for row in runner.CORPUS}
     xargs = rows["closure-fp18-xargs-read"]
     assert xargs[4] == "deny:scope" and "unenumerated" in xargs[5], xargs
     destructive = rows["destructive-rm-chained"]
-    assert destructive[4] == "allow", destructive
-    assert "daemon" in destructive[5] and "outside /tmp" in destructive[5], destructive
+    assert destructive[4] == "deny:safety-preset", destructive
+    assert runner.expected_for(destructive, oracle=runner.LAW_ORACLE) == "deny:safety-preset"
+    assert runner.expected_for(destructive, oracle=runner.NEUTRAL_STUB_ORACLE) == "allow"
+    assert "even when SCRATCH is under /tmp" in destructive[5], destructive
+
+
+def test_oracle_comparators_reject_opposite_verdicts():
+    # Canned verdicts, not policy measurements. The fixture commands remain inert strings;
+    # the real-daemon test is still skipped. These controls reject either oracle being
+    # silently replaced by the other, including a comparator that accepts every result.
+    rows = {row[0]: row for row in runner.CORPUS}
+    chained = rows["destructive-rm-chained"]
+    rendered = runner.render_value(chained[3], {"{SCRATCH}": "/tmp/gate-parity-fixture"})
+    assert rendered == {"command": "cd /tmp/gate-parity-fixture && rm -rf out"}
+    allow = runner.Cell("allow", "", "none", False, False)
+    safety_deny = runner.Cell("deny", "deny-destructive-commands", "safety-preset", False, False)
+    law = runner.expected_for(chained, oracle=runner.LAW_ORACLE)
+    stub = runner.expected_for(chained, oracle=runner.NEUTRAL_STUB_ORACLE)
+    assert runner.cell_matches_expected(safety_deny, law) is True
+    assert runner.cell_matches_expected(allow, law) is False
+    assert runner.cell_matches_expected(allow, stub) is True
+    assert runner.cell_matches_expected(safety_deny, stub) is False
+
+    # The standalone absolute /tmp act stays an allow under both oracles. This positive
+    # distinguishes the safety law's shape from a blanket deny of every destructive row.
+    standalone = rows["destructive-rm-standalone-tmp"]
+    for oracle in (runner.LAW_ORACLE, runner.NEUTRAL_STUB_ORACLE):
+        expected = runner.expected_for(standalone, oracle=oracle)
+        assert expected == "allow"
+        assert runner.cell_matches_expected(allow, expected) is True
+        assert runner.cell_matches_expected(safety_deny, expected) is False
+
+
+def test_unknown_oracle_is_rejected():
+    try:
+        runner.expected_for(runner.CORPUS[0], oracle="unknown-daemon")
+    except ValueError:
+        return
+    raise AssertionError("an unknown oracle must not silently inherit another oracle")
+
+
+def test_neutral_matrix_reports_law_separately():
+    # Replace the shim invocation, so no gate or fixture command is executed. Only the
+    # throwaway stub's neutral reply is requested, to exercise report assembly honestly.
+    seen = []
+    original = runner.run_shim
+
+    def neutral_reply(_shim, event, env, _cwd, _timeout):
+        seen.append(event["tool_input"])
+        _sid, reply = _post(env["HESTIA_ENDPOINT"], {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "hestia_query_policy", "arguments": {}}})
+        assert reply["result"]["structuredContent"]["decision"] == "allow"
+        return canned(0)
+
+    acts = [act for act in runner.CORPUS if act[0].startswith("destructive-rm-")]
+    runner.run_shim = neutral_reply
+    try:
+        report = runner.run_matrix(["kimi"], acts, 5.0)
+    finally:
+        runner.run_shim = original
+    assert len(seen) == len(acts) == 2
+    assert report["oracle"] == runner.NEUTRAL_STUB_ORACLE
+    assert report["law_oracle"] == runner.LAW_ORACLE
+    assert report["real_daemon_tested"] is False
+    rows = {row["id"]: row for row in report["rows"]}
+    chained = rows["destructive-rm-chained"]
+    assert chained["expected"] == "allow" and chained["law_expected"] == "deny:safety-preset"
+    standalone = rows["destructive-rm-standalone-tmp"]
+    assert standalone["expected"] == standalone["law_expected"] == "allow"
+    assert all(row["seats"]["kimi"]["matches_expected"] is True for row in report["rows"])
+    assert all(not row["seats"]["kimi"]["degraded"] for row in report["rows"])
+    output = io.StringIO()
+    with redirect_stdout(output):
+        runner.print_report(report)
+    assert "oracle: neutral-stub" in output.getvalue()
+    assert "law_expected=deny:safety-preset" in output.getvalue()
+    assert "real-daemon validation: skipped" in output.getvalue()
 
 
 def test_gate_self_deny_is_governance_closure_and_escalatable():
@@ -348,7 +426,10 @@ if __name__ == "__main__":
     test_core_deny_carries_its_rule_id_on_claude()
     test_kimi_scope_bracket_reads_as_scope_family()
     test_unenumerated_command_refusal_is_scope_not_unknown()
-    test_corpus_reconciles_tightening_and_neutral_daemon_expectations()
+    test_corpus_preserves_law_and_neutral_daemon_expectations()
+    test_oracle_comparators_reject_opposite_verdicts()
+    test_unknown_oracle_is_rejected()
+    test_neutral_matrix_reports_law_separately()
     test_gate_self_deny_is_governance_closure_and_escalatable()
     test_fail_closed_no_verdict_is_degraded_not_a_ruling()
     test_config_refusal_is_degraded()
@@ -371,4 +452,4 @@ if __name__ == "__main__":
     test_smoke_act_against_a_fake_shim()
     test_seat_env_strips_ambient_and_pins_the_stub()
     test_corpus_is_loaded_and_unmodified_shape()
-    print("ok: 28 gate-parity-runner checks")
+    print("ok: 31 gate-parity-runner checks")
