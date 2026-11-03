@@ -531,6 +531,17 @@ fn refuse_snapshot_sidecars(destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn snapshot_staging_dir(parent: &Path) -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".hestia-snapshot-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(parent).context("creating private chain snapshot staging directory")
+}
+
 impl SqliteChainStore {
     /// Copy one consistent encrypted chain snapshot while its live daemon may
     /// continue appending in WAL mode.
@@ -592,8 +603,7 @@ impl SqliteChainStore {
             Some(path) if !path.as_os_str().is_empty() => path,
             _ => Path::new("."),
         };
-        let staging_dir = tempfile::Builder::new().prefix(".hestia-snapshot-")
-            .tempdir_in(parent).context("creating private chain snapshot staging directory")?;
+        let staging_dir = snapshot_staging_dir(parent)?;
         let staged = tempfile::NamedTempFile::new_in(staging_dir.path())
             .context("creating private chain snapshot staging file")?;
         let mut destination = Connection::open(staged.path()).with_context(|| {
@@ -2598,6 +2608,20 @@ mod tests {
         let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY);
         assert!(!source_path.exists(), "a read-only snapshot must not create its source");
         assert!(result.is_err(), "a missing source must not produce an empty snapshot");
+    }
+
+    #[test]
+    fn snapshot_staging_directory_is_owner_only_and_removed_on_drop() {
+        let parent = TempDir::new().unwrap();
+        let staging = snapshot_staging_dir(parent.path()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(staging.path()).unwrap().permissions().mode() & 0o077, 0);
+        }
+        let owned = staging.path().to_path_buf();
+        drop(staging);
+        assert!(!owned.exists());
     }
 
     #[test]
