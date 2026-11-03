@@ -20,9 +20,10 @@ What is measured is therefore each shim's LOCAL decision surface (closure classi
 scope/egress law, degraded posture, emit contract) with the daemon layer present but
 neutralized. Consequences, stated so the table is read honestly:
 
-  * Rows whose expected verdict is produced DAEMON-SIDE (the destructive preset — e.g.
-    `cd X && rm -rf out`) measure `allow` on every seat here and flag as
-    expected-mismatches. That is a stub limitation, not four gate bugs.
+  * Rows whose refusal is produced DAEMON-SIDE (the destructive preset — e.g.
+    `cd X && rm -rf out`) expect `allow` here: the neutral daemon has no such
+    refusal to return. Their corpus notes preserve the production expectation;
+    this matrix does not measure that daemon-side law.
   * `degraded` marks a fail-closed-NO-VERDICT cell (config.unbacked, no-shared-authority,
     [fail-closed], [degraded], a crash, a timeout, one of the gate's no-verdict rules —
     gate.harness_timeout_unknown "was not judged", gate.internal_error,
@@ -320,7 +321,7 @@ _FAMILY_RULES = [
     (re.compile(r"governance-closure-[a-z-]+"), "governance-closure"),
     (re.compile(r"\[gate-self(?:-access)?\]|gate\.self_access|gate_self_access"),
      "governance-closure"),
-    (re.compile(r"\[(egress\.secret|mrh\.(?:path|command|repo))\]"), "scope"),
+    (re.compile(r"\[(egress\.secret|mrh\.(?:path|command|repo)(?:\.[a-z0-9_-]+)?)\]"), "scope"),
     (re.compile(r"\[scope\]"), "scope"),
     (re.compile(r"\[safety\]|society[.-]safety|society\.safety"), "safety-preset"),
 ]
@@ -335,7 +336,7 @@ _DEGRADED_RE = re.compile(
 _WARN_RE = re.compile(r"hestia: warn|would-deny \(audit-only\)")
 _RULE_ID_RE = re.compile(
     r"governance-closure-[a-z-]+|gate-self-access|gate\.self_access|egress\.secret|"
-    r"mrh\.(?:path|command|repo)|society\.[a-z]+|gate\.degraded")
+    r"mrh\.(?:path|command|repo)(?:\.[a-z0-9_-]+)?|society\.[a-z]+|gate\.degraded")
 
 
 def _stdout_deny_payload(stdout: str) -> bool:

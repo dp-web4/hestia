@@ -86,7 +86,7 @@ CORPUS = [
      "allow", "FP17: a substitution wrapping a read"),
     ("closure-fp18-xargs-read", "closure-fp", "Bash",
      {"command": "echo {REPO}/plugins/_shared/hestia_gate_core.py | xargs grep -c def"},
-     "allow", "FP18: xargs over a read (see #628: xargs with a write is ALSO read today)"),
+     "deny:scope", "TIGHTENING: xargs builds argv from stdin, so mrh.command.unenumerated refuses it; literal reads stay allowed"),
     ("closure-case-arm-write", "closure", "Bash",
      {"command": "case x in a) grep -c def {REPO}/plugins/_shared/hestia_gate_core.py;; "
                  "b) cp /tmp/evil {REPO}/plugins/_shared/hestia_gate_core.py;; esac"},
@@ -100,8 +100,8 @@ CORPUS = [
 
     # --- destructive preset: the two rm shapes the law distinguishes ---
     ("destructive-rm-chained", "destructive", "Bash",
-     {"command": "cd {SCRATCH} && rm -rf out"}, "deny:safety-preset",
-     "chained rm outside /tmp"),
+     {"command": "cd {SCRATCH} && rm -rf out"}, "allow",
+     "NEUTRAL STUB: local layers allow; the real daemon's safety preset denies chained rm outside /tmp, which this matrix does not measure"),
     ("destructive-rm-standalone-tmp", "destructive", "Bash",
      {"command": "rm -rf /tmp/gate-parity-probe"}, "allow",
      "standalone rm against an absolute /tmp path — the allow rule's exact shape"),

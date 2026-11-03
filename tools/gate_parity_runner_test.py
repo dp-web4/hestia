@@ -58,6 +58,24 @@ def test_kimi_scope_bracket_reads_as_scope_family():
     assert (cell.verdict, cell.family) == ("deny", "scope"), cell
 
 
+def test_unenumerated_command_refusal_is_scope_not_unknown():
+    cell = runner.classify_cell(
+        "claude-code", canned(2, stderr="hestia: deny [mrh.command.unenumerated] — argv built "
+                                         "from stdin (`xargs`) cannot be modelled\n"))
+    assert (cell.verdict, cell.family, cell.rule) == (
+        "deny", "scope", "mrh.command.unenumerated"), cell
+    assert not cell.degraded
+
+
+def test_corpus_reconciles_tightening_and_neutral_daemon_expectations():
+    rows = {row[0]: row for row in runner.CORPUS}
+    xargs = rows["closure-fp18-xargs-read"]
+    assert xargs[4] == "deny:scope" and "unenumerated" in xargs[5], xargs
+    destructive = rows["destructive-rm-chained"]
+    assert destructive[4] == "allow", destructive
+    assert "daemon" in destructive[5] and "outside /tmp" in destructive[5], destructive
+
+
 def test_gate_self_deny_is_governance_closure_and_escalatable():
     kimi_text = ("hestia: deny [gate-self] — 'Edit' would WRITE to the governance surface: "
                  "/r/plugins/_shared/hestia_gate_core.py (matched marker 'plugins/_shared'; "
@@ -329,6 +347,8 @@ if __name__ == "__main__":
     test_warn_is_exit_zero_with_warn_text()
     test_core_deny_carries_its_rule_id_on_claude()
     test_kimi_scope_bracket_reads_as_scope_family()
+    test_unenumerated_command_refusal_is_scope_not_unknown()
+    test_corpus_reconciles_tightening_and_neutral_daemon_expectations()
     test_gate_self_deny_is_governance_closure_and_escalatable()
     test_fail_closed_no_verdict_is_degraded_not_a_ruling()
     test_config_refusal_is_degraded()
@@ -351,4 +371,4 @@ if __name__ == "__main__":
     test_smoke_act_against_a_fake_shim()
     test_seat_env_strips_ambient_and_pins_the_stub()
     test_corpus_is_loaded_and_unmodified_shape()
-    print("ok: 26 gate-parity-runner checks")
+    print("ok: 28 gate-parity-runner checks")
