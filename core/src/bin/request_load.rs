@@ -226,7 +226,7 @@ struct Req {
     member: String,
     rule: String,  // scope: rule (gate-opened) or "member_asked"; escalation: marker class
     path_class: &'static str,
-    path_key: String, // only for the re-ask join; never printed
+    path_key: Option<(String, String)>, // recorded member and path; never printed
     home_dotdir: Option<String>, // first component under $HOME, for the home_dotdir class only
     other_marker: Option<&'static str>, // published name, for the escalation `other` class only
     gate_opened: bool,
@@ -244,6 +244,14 @@ struct Req {
 
 fn s<'a>(d: &'a Value, k: &str) -> Option<&'a str> {
     d.get(k).and_then(Value::as_str)
+}
+
+/// Only comparable recorded keys can establish a re-ask. A tuple avoids
+/// delimiter collisions; it does not prove canonical paths or member identity.
+fn reask_key(member: Option<&str>, path: Option<&str>) -> Option<(String, String)> {
+    let member = member.filter(|value| !value.trim().is_empty())?;
+    let path = path.filter(|value| !value.trim().is_empty())?;
+    Some((member.to_string(), path.to_string()))
 }
 
 /// The opening-time invitation list is evidence about that instant only.
@@ -387,7 +395,7 @@ fn main() -> Result<()> {
                     let member = s(d, "plugin_id").unwrap_or("?").to_string();
                     reqs.entry(format!("s:{id}")).or_insert(Req {
                         kind: "scope",
-                        path_key: format!("{member}\u{0}{path}"),
+                        path_key: reask_key(s(d, "plugin_id"), s(d, "path")),
                         member,
                         rule: if gate_opened { public_scope_rule(s(d, "rule").unwrap_or("")).into() } else { "member_asked".into() },
                         path_class: classify_path(path, &workspaces, &home_dir),
@@ -484,11 +492,17 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
         "operator: granted_by/decided_by 'operator' or via 'operator_session'; delegate: 'delegate:*' or via 'delegation'; \
          peer: 'peer:*', via 'peer_not_same', or another member id; asker: an escalation ruled by its own asker (a withdrawal); \
          other: anything else"));
-    let mut groups: HashMap<&str, Vec<&Req>> = HashMap::new();
+    let mut groups: HashMap<(&str, &str), Vec<&Req>> = HashMap::new();
+    let mut unknown_reask_keys = 0u64;
     for r in reqs.values().filter(|r| r.kind == "scope") {
-        groups.entry(r.path_key.as_str()).or_default().push(r);
+        if let Some((member, path)) = &r.path_key {
+            groups.entry((member.as_str(), path.as_str())).or_default().push(r);
+        } else {
+            unknown_reask_keys += 1;
+        }
     }
-    let reasks = reask_split(groups.into_values().collect());
+    let mut reasks = reask_split(groups.into_values().collect());
+    reasks["unknown_key_requests"] = json!(unknown_reask_keys);
     for kind in ["scope", "escalation"] {
         let rs: Vec<&Req> = reqs.values().filter(|r| r.kind == kind).collect();
         let mut by_member = BTreeMap::new();
@@ -543,6 +557,9 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
             k.insert("gate_opened_peer_invitation_unknown".into(), json!(peer_unknown));
             k.insert("by_path_class".into(), json!(by_path));
             k.insert("reasked_same_member_and_path".into(), reasks["reasks"].clone());
+            k.insert("reask_key_limitation".into(), json!(
+                "Only matching recorded member/path pairs within this window are compared; unknown keys, aliases and unobserved requests may hide re-asks."
+            ));
             k.insert("home_dotdir_by_first_component".into(), json!(by_sub));
             k.insert("reasks".into(), reasks.clone());
         } else {
@@ -639,7 +656,9 @@ fn render_markdown(r: &Value) -> String {
             writeln!(out, "- gate-opened invitation evidence at opening: no peer {}; peer invited {}; unknown {}",
                      k["gate_opened_with_no_admissible_peer"], k["gate_opened_with_peer_invited"],
                      k["gate_opened_peer_invitation_unknown"]).unwrap();
-            writeln!(out, "- re-asked after the first (same member and path): {}", k["reasked_same_member_and_path"]).unwrap();
+            writeln!(out, "- re-asked after the first (same recorded member and path): {}; requests with unknown join key: {}",
+                     k["reasked_same_member_and_path"], k["reasks"]["unknown_key_requests"]).unwrap();
+            writeln!(out, "- re-ask limitation: {}", k["reask_key_limitation"].as_str().unwrap_or("")).unwrap();
             let ra = &k["reasks"];
             writeln!(out, "- re-asks after the first: {}; by outcome of the first ask: {}; within 10 min of the previous ruling: {}; previous unruled: {}; ruling order unknown: {}",
                      ra["reasks"], ra["by_outcome_of_first_ask"], ra["within_10_min_of_previous_ruling"],
@@ -876,6 +895,25 @@ mod tests {
     }
 
     #[test]
+    fn unknown_and_delimiter_bearing_keys_are_not_conflated() {
+        assert_eq!(reask_key(None, Some("/item")), None);
+        assert_eq!(reask_key(Some("member"), None), None);
+        assert_eq!(reask_key(Some(" "), Some("/item")), None);
+        assert_eq!(reask_key(Some("member"), Some("")), None);
+        assert_ne!(reask_key(Some("a\0b"), Some("c")), reask_key(Some("a"), Some("b\0c")));
+
+        let mut requests = HashMap::new();
+        requests.insert("known-a".into(), req("item", 100, "refused", Some(200)));
+        requests.insert("known-b".into(), req("item", 300, "open", None));
+        requests.insert("unknown-a".into(), Req { kind: "scope", ..Default::default() });
+        requests.insert("unknown-b".into(), Req { kind: "scope", ..Default::default() });
+        let report = summarize(&requests, 7, 4, &Utc::now(), &[]);
+        assert_eq!(report["scope"]["reasks"]["reasks"], 1);
+        assert_eq!(report["scope"]["reasks"]["unknown_key_requests"], 2);
+        assert!(render_markdown(&report).contains("requests with unknown join key: 2"));
+    }
+
+    #[test]
     fn only_published_governance_names_leave_the_other_class() {
         assert_eq!(published_marker_name("/home/u/.hestia/hooks/law_inject.py"), "law_inject.py");
         assert_eq!(published_marker_name(".claude/settings.json"), "settings.json");
@@ -887,7 +925,7 @@ mod tests {
 
     fn req(key: &str, opened: i64, outcome: &'static str, ruled: Option<i64>) -> Req {
         let t = |x: i64| DateTime::<Utc>::from_timestamp(x, 0);
-        Req { kind: "scope", path_key: key.into(), opened: t(opened), opened_position: Some(opened as u64),
+        Req { kind: "scope", path_key: Some(("member".into(), key.into())), opened: t(opened), opened_position: Some(opened as u64),
               outcome, ruled_at: ruled.and_then(t), ruled_position: ruled.map(|x| x as u64), ..Default::default() }
     }
 
