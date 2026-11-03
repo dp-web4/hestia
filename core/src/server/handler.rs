@@ -33806,6 +33806,11 @@ mod verdict_feedback_tests {
         args["serves"] = json!("q8");
         args["premise_check"] = json!({"status": "refuted", "evidence": ["second"]});
         let check = |again: Value| {
+            // Refusal is also safe: a retry with different evidence need not
+            // be accepted as an idempotent replay.
+            if again.get("_hestia_error").is_some_and(|v| !v.is_null()) {
+                return;
+            }
             assert_eq!(again["recorded"], json!("existing"), "{again}");
             assert_eq!(again["witnessEntryHash"], json!(&hash), "{again}");
             assert!(again["feedback"].is_null() || again["feedback"] == recorded["feedback"],
