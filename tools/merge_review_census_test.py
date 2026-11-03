@@ -286,11 +286,12 @@ def arm_supplied_records_are_classified_without_acquiring_a_chain() -> None:
         {"eventType": "outcome", "eventData": {"target": "gh pr merge 46"}},
         {"eventType": "outcome", "eventData": {"success": True, "target": 123}},
         {"eventType": "outcome", "eventData": "malformed"},
+        {"eventData": {"success": True, "target": "gh pr merge 47"}},
     ]
     hits = classify_outcomes(iter(entries))
     check("one supplied direct candidate", len(hits) == 2 and hits[0]["calls"] == [[42, "example/repo"]], str(hits))
     check("failed, malformed and ambiguous outcomes remain unknown",
-          hits[-1] == {"calls": None, "ambiguous_count": 6}, str(hits))
+          hits[-1] == {"calls": None, "ambiguous_count": 7}, str(hits))
     check("raw target text is not retained", all("target" not in hit for hit in hits), str(hits))
 
 

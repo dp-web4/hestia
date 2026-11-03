@@ -70,7 +70,11 @@ def classify_outcomes(entries: Iterable[dict]) -> list[dict]:
         if not isinstance(entry, dict):
             ambiguous += 1
             continue
-        if entry.get("eventType") != "outcome":
+        event_type = entry.get("eventType")
+        if not isinstance(event_type, str) or not event_type:
+            ambiguous += 1
+            continue
+        if event_type != "outcome":
             continue
         data = entry.get("eventData")
         if not isinstance(data, dict):
