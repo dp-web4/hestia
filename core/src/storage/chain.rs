@@ -531,6 +531,47 @@ fn refuse_snapshot_sidecars(destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn refuse_existing_snapshot(destination: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(_) => anyhow::bail!("REFUSED: chain snapshot destination already exists"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("checking chain snapshot destination"),
+    }
+}
+
+/// Publication has begun and an error cannot establish whether a destination
+/// was created. A caller must not treat this as an ordinary no-effect failure.
+#[derive(Debug, thiserror::Error)]
+#[error("chain snapshot publication outcome UNKNOWN; destination may exist; inspect before retry: {source}")]
+pub struct SnapshotPublicationUnknown {
+    #[source]
+    source: std::io::Error,
+}
+
+/// Keep an owned private directory for manual inspection on an unknown
+/// publication outcome. This preserves what remains, not necessarily the
+/// staging file; neither retention nor a later reopen proves crash durability.
+/// Other errors drop the directory normally. A retained encrypted snapshot
+/// needs an operator-owned retention and cleanup decision.
+pub fn retain_unknown_snapshot_directory(
+    directory: tempfile::TempDir,
+    result: Result<()>,
+) -> Result<tempfile::TempDir> {
+    match result {
+        Ok(()) => Ok(directory),
+        Err(error) if error.downcast_ref::<SnapshotPublicationUnknown>().is_some() => {
+            let retained = directory.keep();
+            Err(error.context(format!(
+                "snapshot directory retained for operator inspection at {}; \
+                 destination and staging files may or may not exist; do not retry or remove \
+                 until inspected under the applicable retention policy",
+                retained.display()
+            )))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn snapshot_staging_dir(parent: &Path) -> Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     builder.prefix(".hestia-snapshot-");
@@ -570,6 +611,25 @@ impl SqliteChainStore {
         key: [u8; 32],
         after_alias_check: F,
     ) -> Result<()> {
+        Self::backup_encrypted_with_hooks(
+            source_path, destination_path, key, after_alias_check, || {}, || Ok(()),
+        )
+    }
+
+    // Deterministic failure seams are used only by the synthetic tests.
+    fn backup_encrypted_with_hooks<F, G, H>(
+        source_path: &Path,
+        destination_path: &Path,
+        key: [u8; 32],
+        after_alias_check: F,
+        before_publish: G,
+        after_publish: H,
+    ) -> Result<()>
+    where
+        F: FnOnce(),
+        G: FnOnce(),
+        H: FnOnce() -> std::io::Result<()>,
+    {
         anyhow::ensure!(
             source_path != destination_path,
             "chain snapshot destination must differ from its source"
@@ -581,6 +641,7 @@ impl SqliteChainStore {
         }
         refuse_snapshot_alias(source_path, destination_path)?;
         refuse_snapshot_sidecars(destination_path)?;
+        refuse_existing_snapshot(destination_path)?;
         after_alias_check();
         // The alias check and open are separate operations. Do not recreate a
         // source removed between them, and do not replace a destination if
@@ -628,9 +689,11 @@ impl SqliteChainStore {
         // replacement between the check and rename.
         refuse_snapshot_alias(source_path, destination_path)?;
         refuse_snapshot_sidecars(destination_path)?;
+        refuse_existing_snapshot(destination_path)?;
+        before_publish();
         staged.persist_noclobber(destination_path)
-            .map_err(|error| error.error)
-            .context("publishing staged chain snapshot")?;
+            .map_err(|error| SnapshotPublicationUnknown { source: error.error })?;
+        after_publish().map_err(|source| SnapshotPublicationUnknown { source })?;
         Ok(())
     }
 
@@ -2678,8 +2741,80 @@ mod tests {
         let source = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
         source.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
         std::fs::write(&destination_path, b"old snapshot").unwrap();
-        assert!(SqliteChainStore::backup_encrypted(&source_path, &destination_path, TEST_KEY).is_err());
+        let error = SqliteChainStore::backup_encrypted(&source_path, &destination_path, TEST_KEY).unwrap_err();
+        assert!(format!("{error:#}").contains("REFUSED"));
+        assert!(error.downcast_ref::<SnapshotPublicationUnknown>().is_none());
         assert_eq!(std::fs::read(&destination_path).unwrap(), b"old snapshot");
+    }
+
+    #[test]
+    fn wrong_key_does_not_create_a_fresh_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let destination_path = dir.path().join("destination.db");
+        let source = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        source.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+        drop(source);
+        let error = SqliteChainStore::backup_encrypted(&source_path, &destination_path, [9u8; 32]).unwrap_err();
+        assert!(error.downcast_ref::<SnapshotPublicationUnknown>().is_none());
+        assert!(!destination_path.exists());
+    }
+
+    #[test]
+    fn publish_error_during_concurrent_destination_creation_is_unknown() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let destination_path = dir.path().join("destination.db");
+        let source = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        source.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+        let result = SqliteChainStore::backup_encrypted_with_hooks(
+            &source_path, &destination_path, TEST_KEY, || {},
+            || std::fs::write(&destination_path, b"concurrent destination").unwrap(),
+            || Ok(()),
+        );
+        let error = result.unwrap_err();
+        assert!(error.downcast_ref::<SnapshotPublicationUnknown>().is_some());
+        assert_eq!(std::fs::read(&destination_path).unwrap(), b"concurrent destination");
+    }
+
+    #[test]
+    fn post_publish_error_is_unknown_even_when_snapshot_can_be_reopened() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let owned = tempfile::tempdir_in(dir.path()).unwrap();
+        let destination_path = owned.path().join("destination.db");
+        let source = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        source.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+        let result = SqliteChainStore::backup_encrypted_with_hooks(
+            &source_path, &destination_path, TEST_KEY, || {}, || {},
+            || Err(std::io::Error::other("synthetic post-publication failure")),
+        );
+        let error = retain_unknown_snapshot_directory(owned, result).unwrap_err();
+        assert!(error.downcast_ref::<SnapshotPublicationUnknown>().is_some());
+        assert!(format!("{error:#}").contains("retained for operator inspection"));
+        let snapshot = SqliteChainStore::open(&destination_path, TEST_KEY).unwrap();
+        assert_eq!(snapshot.read_recent(10).unwrap()[0].event_type, "synthetic");
+    }
+
+    #[test]
+    fn unknown_retains_owned_directory_but_prepublication_error_cleans_it() {
+        let root = TempDir::new().unwrap();
+        let uncertain = tempfile::tempdir_in(root.path()).unwrap();
+        let uncertain_path = uncertain.path().to_path_buf();
+        std::fs::write(uncertain_path.join("snapshot"), b"synthetic").unwrap();
+        let unknown = anyhow::Error::new(SnapshotPublicationUnknown {
+            source: std::io::Error::other("synthetic"),
+        }).context("outer context");
+        let error = retain_unknown_snapshot_directory(uncertain, Err(unknown)).unwrap_err();
+        assert!(error.downcast_ref::<SnapshotPublicationUnknown>().is_some());
+        assert!(uncertain_path.join("snapshot").exists());
+        assert!(format!("{error:#}").contains("retained for operator inspection"));
+
+        let failed = tempfile::tempdir_in(root.path()).unwrap();
+        let failed_path = failed.path().to_path_buf();
+        let error = retain_unknown_snapshot_directory(failed, Err(anyhow::anyhow!("prepublication"))).unwrap_err();
+        assert!(error.downcast_ref::<SnapshotPublicationUnknown>().is_none());
+        assert!(!failed_path.exists());
     }
 
     #[test]

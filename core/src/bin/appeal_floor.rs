@@ -235,8 +235,9 @@ fn main() -> Result<()> {
     let src_db = home.join("witness.db");
     let tmp_dir = snapshot_tempdir()?;
     let copy_db = tmp_dir.path().join("witness.db");
-    SqliteChainStore::backup_encrypted(&src_db, &copy_db, key)
-        .with_context(|| format!("snapshotting sealed chain {}", src_db.display()))?;
+    let backup = SqliteChainStore::backup_encrypted(&src_db, &copy_db, key)
+        .with_context(|| format!("snapshotting sealed chain {}", src_db.display()));
+    let tmp_dir = hestia::storage::chain::retain_unknown_snapshot_directory(tmp_dir, backup)?;
 
     let store = SqliteChainStore::open(&copy_db, key)
         .context("opening sealed chain copy (wrong passphrase => AEAD/open error)")?;

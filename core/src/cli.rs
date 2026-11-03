@@ -5049,9 +5049,10 @@ fn cmd_chain_verify(home: &std::path::Path) -> AnyResult<()> {
     // Dropping `tmp` removes only the directory this call created.
     let tmp = chain_verify_snapshot_dir()?;
     let copy = tmp.path().join("witness.db");
+    let backup = hestia::storage::SqliteChainStore::backup_encrypted(home.join("witness.db"), &copy, key)
+        .context("snapshotting the witness chain");
+    let tmp = hestia::storage::chain::retain_unknown_snapshot_directory(tmp, backup)?;
     let v = (|| -> AnyResult<hestia::storage::ChainVerification> {
-        hestia::storage::SqliteChainStore::backup_encrypted(home.join("witness.db"), &copy, key)
-            .context("snapshotting the witness chain")?;
         let store = hestia::storage::SqliteChainStore::open(&copy, key)?;
         store.verify_chain()
     })()?;
