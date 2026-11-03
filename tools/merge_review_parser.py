@@ -3,6 +3,8 @@
 No filesystem, network, chain walker or credential access happens here. A caller
 is responsible for authorization, provenance, completeness and retention of its
 input. A parsed target is only a candidate, never proof of execution or identity.
+The output can still contain sensitive identifiers and timestamps: omitting raw
+target text does not make it safe to retain, share or publish.
 """
 
 from __future__ import annotations
