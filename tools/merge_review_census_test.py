@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from merge_review_census import (  # noqa: E402
-    census, is_findings, merge_calls, seat_merges, substantive_comments,
+    _CACHE_SCHEMA, census, is_findings, merge_calls, scan_chain, seat_merges, substantive_comments,
     substantive_reviews,
 )
 
@@ -224,17 +224,70 @@ def arm_the_census_reading_itself_is_not_a_merge() -> None:
     target = ("python3 - <<'PY'\nfrom pathlib import Path\nimport sys\n"
               "sys.path.insert(0, 'tools')\nimport merge_review_census as m\n"
               "# gh pr merge 353 appears in the docstring\nPY")
-    check("reading the census is not merging", merge_calls(target) == [],
+    check("heredoc stays unknown, not a counted merge", merge_calls(target) is None,
           str(merge_calls(target)))
 
 
 def arm_unlexable_target_is_dropped_not_guessed() -> None:
-    """An unbalanced quote must under-count, never fall back to text matching.
+    """An unbalanced quote is unknown, never a measured negative or a guessed call.
 
     Sabotage: replace the ValueError guard with a regex fallback and this goes
     red — which is the whole v1 failure mode returning.
     """
-    check("unlexable line is skipped", merge_calls("gh pr merge 5 \"unclosed") == [])
+    check("unlexable target is unknown", merge_calls("gh pr merge 5 \"unclosed") is None)
+
+
+def arm_ambiguous_shell_text_is_not_attributed() -> None:
+    """Literal data and shell expansion cannot become a performer observation."""
+    for target in [
+        "python3 - <<'END'\ngh pr merge 532 --merge\nEND",
+        "python3 - <<END\ngh pr merge 532 --merge\nEND",
+        "python3 - <<-END\n\tgh pr merge 532 --merge\n\tEND",
+        "echo $(gh pr merge 532 --merge)",
+        "echo `gh pr merge 532 --merge`",
+        "diff <(gh pr merge 532 --merge) /dev/null",
+        "gh pr merge 532 --merge\npython3 - <<END\nexample\nEND",
+    ]:
+        check("ambiguous target remains unknown", merge_calls(target) is None, repr(target))
+    quoted = "printf 'example:\ngh pr merge 532 --merge\n'"
+    check("multiline quoted data is not a command", merge_calls(quoted) == [], str(merge_calls(quoted)))
+    hits = [{"calls": None, "ambiguous_count": 2}]
+    merged = seat_merges(hits, [pr(532, "synthetic", "2026-08-01T00:00:00Z")], REPO, 300)
+    report = census([pr(532, "synthetic", "2026-08-01T00:00:00Z")], 200, merged)
+    check("ambiguous source is partial, not a measured zero",
+          report["performer_status"] == "partial" and report["seat_performed"] is None
+          and report["seat_candidate_count"] == 0 and report["ambiguous_outcomes"] == 2,
+          str(report))
+
+
+def arm_old_or_invalid_cache_is_not_a_measured_zero() -> None:
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        cache = Path(directory) / "synthetic.json"
+        for content in ([], {"schema": _CACHE_SCHEMA, "hits": [{"calls": None, "ambiguous_count": -1}]}):
+            cache.write_text(json.dumps(content))
+            try:
+                scan_chain(10, cache)
+            except ValueError:
+                refused = True
+            else:
+                refused = False
+            check("old or malformed cache refused", refused)
+        cache.write_text(json.dumps({"schema": _CACHE_SCHEMA, "hits": []}))
+        check("new empty cache remains observed zero", scan_chain(10, cache) == [])
+
+
+def arm_missing_performer_or_timezone_is_unknown() -> None:
+    prs = [pr(532, "synthetic", "2026-08-01T00:00:00Z")]
+    no_actor = hit(None, "gh pr merge 532 --merge", "2026-08-01T00:00:01Z")
+    no_zone = hit("seat", "gh pr merge 532 --merge", "2026-08-01T00:00:01")
+    merged = seat_merges([no_actor, no_zone], prs, REPO, 300)
+    result = census(prs, 200, merged)
+    check("missing actor or timezone does not become a measured negative",
+          result["performer_status"] == "partial" and result["seat_performed"] is None
+          and result["ambiguous_outcomes"] == 2, str(result))
 
 
 # --------------------------------------------------------------------------
@@ -244,20 +297,22 @@ def arm_unlexable_target_is_dropped_not_guessed() -> None:
 def arm_wrapper_success_needs_a_merge_instant() -> None:
     """codex #3: `success: true` is the SHELL's exit code, not the merge's.
 
-    The target is #532's real one: `2>&1 | tail -5; echo "rc=$?"` exits zero
-    whether or not `gh` did. The two hits below are byte-identical in every
+    The measured target includes a shell expansion and is now unknown. The
+    synthetic wrapper below still exits zero whether or not `gh` did. The two hits are identical in every
     field the parser reads EXCEPT the timestamp. Only the one that lands beside
     the merge instant counts; the other is reported as uncorroborated.
 
     Sabotage: drop the window test in seat_merges and this goes red, because
     both hits would be accepted and the masked failure would be a merge.
     """
-    target = 'gh pr merge 532 --squash --delete-branch 2>&1 | tail -5; echo "rc=$?"'
+    actual = 'gh pr merge 532 --squash --delete-branch 2>&1 | tail -5; echo "rc=$?"'
+    check("wrapper with expansion is unknown", merge_calls(actual) is None)
+    target = 'gh pr merge 532 --squash --delete-branch 2>&1 | tail -5; echo done'
     prs = [pr(532, "x", "2026-08-19T05:00:51Z")]
 
     real = seat_merges([hit("claude-code", target, "2026-08-19T05:00:56Z")],
                        prs, REPO, window=300.0)
-    check("outcome beside the merge instant is a merge",
+    check("outcome beside the merge instant is a candidate",
           set(real["corroborated"]) == {532}
           and real["corroborated"][532]["seat"] == "claude-code")
 
@@ -321,21 +376,22 @@ def arm_nearest_outcome_wins_over_a_retry() -> None:
 
 
 def arm_a_seat_merge_is_reported_against_the_credential() -> None:
-    """End to end: mergedBy says dp-web4, the census says a seat did it.
+    """End to end: the temporal match remains a candidate, not proven authorship.
 
     This is the finding in one row. Sabotage: return an empty dict from
-    seat_merges and this goes red on seat_performed.
+    seat_merges and this goes red on seat_candidate_count.
     """
     prs = [pr(532, "fix: x", "2026-08-19T05:00:51Z"),
            pr(533, "fix: y", "2026-08-19T06:00:00Z")]
     merges = seat_merges([hit("claude-code", "gh pr merge 532 --squash",
                               "2026-08-19T05:00:56Z")], prs, REPO, window=300.0)
     out = census(prs, 200, merges)
-    check("seat merge reported behind one credential",
-          out["distinct_mergedBy"] == ["dp-web4"] and out["seat_performed"] == 1
-          and out["seat_performed_by"] == {"claude-code": 1}
-          and out["seat_performed_numbers"] == [532]
-          and out["rows"][0]["performed_by_seat"] == "claude-code"
+    check("candidate reported without asserting who merged",
+          out["distinct_mergedBy"] == ["dp-web4"] and out["seat_performed"] is None
+          and out["seat_candidate_count"] == 1 and out["seat_candidate_by"] == {"claude-code": 1}
+          and out["seat_candidate_numbers"] == [532]
+          and out["rows"][0]["candidate_seat"] == "claude-code"
+          and out["rows"][0]["performed_by_seat"] is None
           and out["rows"][1]["performed_by_seat"] is None, str(out["seat_performed_by"]))
 
 
@@ -349,7 +405,8 @@ def arm_empty_chain_leaves_the_review_census_intact() -> None:
            pr(41, "fix: b", "2026-08-02T00:00:00Z", comments=[("dp-web4", "x" * 300)])]
     out = census(prs, 200, seat_merges([], prs, REPO, window=300.0))
     check("review census survives an empty observed chain",
-          out["unreviewed"] == 1 and out["seat_performed"] == 0)
+          out["unreviewed"] == 1 and out["seat_performed"] is None
+          and out["seat_candidate_count"] == 0)
 
 
 def arm_unavailable_chain_is_not_a_zero_performer_count() -> None:
@@ -370,8 +427,9 @@ def arm_unavailable_chain_is_not_a_zero_performer_count() -> None:
           and out.get("seat_performed") is None and out.get("seat_performed_pct") is None
           and out.get("seat_performed_by") is None and out["unreviewed"] == 1, str(out))
     observed = census(prs, 200, seat_merges([], prs, REPO, window=300.0))
-    check("successful empty scan is measured zero", observed.get("performer_status") == "observed"
-          and observed.get("seat_performed") == 0 and observed.get("seat_performed_pct") == 0.0)
+    check("successful empty scan has zero candidates, not proven performers",
+          observed.get("performer_status") == "observed" and observed.get("seat_performed") is None
+          and observed.get("seat_candidate_count") == 0 and observed.get("seat_candidate_pct") == 0.0)
     empty = census([], 200, seat_merges([], [], REPO, window=300.0))
     check("no merged PR denominator is not zero percent", empty.get("seat_performed_pct") is None)
     stdout, stderr = io.StringIO(), io.StringIO()

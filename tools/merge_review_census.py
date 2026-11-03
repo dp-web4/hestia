@@ -68,13 +68,11 @@ third version of that reader, and the first one that is not measuring itself.
 Three filters stand between a chain entry and a counted merge, and each closes
 a defect codex demonstrated:
 
-  1. COMMAND POSITION. `gh pr merge N` is counted only when it opens a command
-     segment after shell lexing — not when it appears inside a quoted argument.
-     This is structural, not a tool blacklist: `rg 'gh pr merge 697' logs/` and
-     `printf 'gh pr merge 532'` both lex to a single token that is not at a
-     command position, so both are rejected without naming `rg` or `printf`.
-     v2 guarded only the codex-exec branch and let these through on the record
-     branch, which is the basis the finding treated as authoritative.
+  1. COMMAND POSITION. A candidate must open a segment after shell lexing;
+     quoted text is not a command position. Heredocs, expansions, comments,
+     continuations and unlexable targets are explicitly unknown, not counted or
+     silently treated as negatives. This deliberately loses recall. Lexical
+     position still cannot prove that a shell reached or executed the command.
 
   2. OUTCOME, SUCCESS, NO ERROR. Only `outcome` entries with `success is True`
      and a null `error` count. v2 accepted an entry with NO `success` key at
@@ -130,11 +128,11 @@ _GH, _PR, _MERGE = "gh", "pr", "merge"
 # Shell metacharacters that END a command segment. shlex with
 # punctuation_chars=True emits these as their own tokens, so a segment boundary
 # is a token test rather than a regex on raw text.
-_SEGMENT_BREAK = set("&|;()")
+_SEGMENT_BREAK = set("&|;()\n")
 
 
-def merge_calls(target: str) -> list[tuple[int, str | None]]:
-    """(pr_number, explicit_repo) for every `gh pr merge N` at a COMMAND position.
+def merge_calls(target: str) -> list[tuple[int, str | None]] | None:
+    """Candidate calls at command positions, or None when shell context is ambiguous.
 
     The whole defence against counting a search as a merge lives here, and it is
     structural rather than a blacklist. After shell lexing, `rg 'gh pr merge 697'`
@@ -142,26 +140,30 @@ def merge_calls(target: str) -> list[tuple[int, str | None]]:
     that token does not open a segment. `printf 'gh pr merge 532'` is the same
     shape. A real merge lexes to `['gh','pr','merge','532',...]` with `gh` first.
 
-    Lexing is per LINE because a heredoc body or an unbalanced quote elsewhere in
-    a multi-line target would otherwise raise and discard the whole entry. An
-    unlexable line is skipped, which UNDER-counts: the conservative direction for
-    a census whose claim is that seats merge more than anyone believes.
+    Lex the whole target so a newline inside a quoted argument never becomes a
+    new command. Heredocs, shell expansions, comments and line continuations
+    are intentionally not modeled: these return unknown, not an empty result.
+    Even a parsed command plus a matching timestamp is only a candidate, not
+    proof that the shell executed it or that it performed the merge.
     """
+    target = target or ""
+    if any(marker in target for marker in ("<<", "$", "`", "#", "<(", ">(", "\\\n", "\\\r\n")):
+        return None
+    try:
+        lexer = shlex.shlex(target, posix=True, punctuation_chars="();<>|&\n")
+        lexer.whitespace = " \t\r"  # preserve unquoted newlines as command boundaries
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return None
     calls: list[tuple[int, str | None]] = []
-    for line in (target or "").splitlines():
-        try:
-            lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
-            lexer.whitespace_split = True
-            tokens = list(lexer)
-        except ValueError:
-            continue
-        segment: list[str] = []
-        for token in tokens + [";"]:
-            if token and set(token) <= _SEGMENT_BREAK:
-                calls.extend(_merge_in_segment(segment))
-                segment = []
-            else:
-                segment.append(token)
+    segment: list[str] = []
+    for token in tokens + [";"]:
+        if token == "\n" or (token and set(token) <= _SEGMENT_BREAK):
+            calls.extend(_merge_in_segment(segment))
+            segment = []
+        else:
+            segment.append(token)
     return calls
 
 
@@ -188,24 +190,48 @@ def _epoch(ts: str) -> float:
         head, _, rest = ts.partition(".")
         m = re.match(r"(\d+)(.*)", rest)
         ts = f"{head}.{m.group(1)[:6]}{m.group(2)}"
-    return datetime.fromisoformat(ts).timestamp()
+    instant = datetime.fromisoformat(ts)
+    if instant.tzinfo is None:
+        raise ValueError("timestamp lacks timezone")
+    return instant.timestamp()
+
+
+_CACHE_SCHEMA = "merge-candidates-unknown-shell-v2"
 
 
 def scan_chain(max_entries: int, cache: Path | None) -> list[dict]:
     """Every successful `outcome` entry whose target merges something.
 
     Walking 230k entries costs ~6 minutes at ~1.6 ms/hop, so the scan is
-    cacheable. The cache holds only entries that already passed the command-
-    position filter, which is why it is small enough to commit to a scratch path
-    and re-read.
+    cacheable. The versioned cache holds candidate metadata and an aggregate
+    ambiguous count, not raw targets. Old caches lack the unknown classification
+    and must not be silently reused as if they had it. A cache is a historical
+    snapshot, not proof that the chain has not changed since it was written.
     """
     if cache and cache.is_file():
-        return json.loads(cache.read_text())
+        saved = json.loads(cache.read_text())
+        if not isinstance(saved, dict) or saved.get("schema") != _CACHE_SCHEMA or not isinstance(saved.get("hits"), list):
+            raise ValueError("unversioned or incompatible chain cache; a fresh authorized scan is needed")
+        for hit in saved["hits"]:
+            if not isinstance(hit, dict) or "calls" not in hit:
+                raise ValueError("invalid chain cache entry")
+            calls = hit["calls"]
+            if calls is None:
+                count = hit.get("ambiguous_count")
+                if type(count) is not int or count < 1:
+                    raise ValueError("invalid ambiguous target count")
+            elif not isinstance(calls, list) or any(
+                not isinstance(call, list) or len(call) != 2 or type(call[0]) is not int
+                or not (call[1] is None or isinstance(call[1], str)) for call in calls
+            ):
+                raise ValueError("invalid cached merge candidates")
+        return saved["hits"]
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from chain_walk import ChainWalker  # noqa: E402  (optional dep: needs the daemon)
 
     found: list[dict] = []
+    ambiguous = 0
     for entry in ChainWalker().walk(max_entries=max_entries):
         if entry.get("eventType") != "outcome":
             continue
@@ -213,7 +239,10 @@ def scan_chain(max_entries: int, cache: Path | None) -> list[dict]:
         if data.get("success") is not True or data.get("error"):
             continue
         calls = merge_calls(data.get("target") or "")
-        if not calls:
+        if calls is None:
+            ambiguous += 1
+            continue
+        if calls == []:
             continue
         found.append({
             "action_id": data.get("action_id"),
@@ -222,8 +251,12 @@ def scan_chain(max_entries: int, cache: Path | None) -> list[dict]:
             "chain_position": entry.get("chainPosition"),
             "calls": [[n, r] for n, r in calls],
         })
+    if ambiguous:
+        # Aggregate only: retaining every unrelated command would inflate the
+        # cache and leak metadata, and cannot identify which PR was affected.
+        found.append({"calls": None, "ambiguous_count": ambiguous})
     if cache:
-        cache.write_text(json.dumps(found, indent=1))
+        cache.write_text(json.dumps({"schema": _CACHE_SCHEMA, "hits": found}, indent=1))
     return found
 
 
@@ -306,11 +339,10 @@ def is_findings(title: str) -> bool:
 
 def seat_merges(hits: list[dict], prs: list[dict], repo: str,
                 window: float, back_slack: float = 30.0) -> dict:
-    """PR number -> who merged it, corroborated against the GitHub merge instant.
+    """PR number -> temporally associated candidate, not a proven performer.
 
-    `hits` are chain outcome entries that already passed `merge_calls`. Passing
-    that filter means the seat RAN a merge command that exited zero — it does
-    NOT mean the merge happened, because the zero can belong to a wrapper
+    `hits` are chain outcomes classified by `merge_calls`. A candidate is not
+    proof that the shell reached or executed it; zero can belong to a wrapper
     (`... 2>&1 | tail -5; echo "rc=$?"` succeeds whether or not `gh` did). The
     corroboration below is what supplies the missing link: the outcome is
     accepted only if it lands within `window` seconds AFTER the PR's `mergedAt`.
@@ -332,11 +364,20 @@ def seat_merges(hits: list[dict], prs: list[dict], repo: str,
     best: dict[int, dict] = {}
     uncorroborated: list[dict] = []
     foreign = 0
+    ambiguous_outcomes = 0
     for hit in hits:
+        if hit.get("calls") is None:
+            ambiguous_outcomes += hit.get("ambiguous_count", 1)
+            continue
+        if not isinstance(hit.get("plugin_id"), str) or not hit["plugin_id"].strip():
+            ambiguous_outcomes += 1
+            continue
         try:
             outcome_ts = _epoch(hit["ts"])
-        except (ValueError, TypeError):
+        except (AttributeError, KeyError, ValueError, TypeError):
+            ambiguous_outcomes += 1
             continue
+        ambiguous_hit = False
         for number, explicit_repo in hit["calls"]:
             if explicit_repo and explicit_repo != repo:
                 foreign += 1
@@ -344,7 +385,11 @@ def seat_merges(hits: list[dict], prs: list[dict], repo: str,
             stamp = merged_at.get(number)
             if not stamp:
                 continue
-            gap = outcome_ts - _epoch(stamp)
+            try:
+                gap = outcome_ts - _epoch(stamp)
+            except (AttributeError, ValueError, TypeError):
+                ambiguous_hit = True
+                continue
             row = {"seat": hit["plugin_id"], "gap_s": round(gap, 2),
                    "action_id": hit["action_id"],
                    "chain_position": hit["chain_position"]}
@@ -353,8 +398,10 @@ def seat_merges(hits: list[dict], prs: list[dict], repo: str,
                     best[number] = row
             else:
                 uncorroborated.append(dict(row, number=number))
+        if ambiguous_hit:
+            ambiguous_outcomes += 1
     return {"corroborated": best, "uncorroborated": uncorroborated,
-            "foreign_repo": foreign}
+            "foreign_repo": foreign, "ambiguous_outcomes": ambiguous_outcomes}
 
 
 def fetch(repo: str, limit: int) -> list[dict]:
@@ -390,7 +437,9 @@ def census(prs: list[dict], min_body: int, merges: dict | None) -> dict:
             "github_reviews": len(p.get("reviews") or []),
             "findings_class": is_findings(p.get("title") or ""),
             "mergedBy": (p.get("mergedBy") or {}).get("login"),
-            "performed_by_seat": record.get("seat"),
+            # A timing match is a candidate association, never proof of who merged.
+            "performed_by_seat": None,
+            "candidate_seat": record.get("seat"),
             "seat_gap_s": record.get("gap_s"),
             "seat_action_id": record.get("action_id"),
         })
@@ -399,10 +448,10 @@ def census(prs: list[dict], min_body: int, merges: dict | None) -> dict:
     unknown = [r for r in rows if r["reviewed"] is None]
     fnd = [r for r in rows if r["findings_class"]]
     code = [r for r in rows if not r["findings_class"]]
-    seated = [r for r in rows if r["performed_by_seat"]]
+    seated = [r for r in rows if r["candidate_seat"]]
     by_seat: dict[str, int] = {}
     for r in seated:
-        by_seat[r["performed_by_seat"]] = by_seat.get(r["performed_by_seat"], 0) + 1
+        by_seat[r["candidate_seat"]] = by_seat.get(r["candidate_seat"], 0) + 1
     gaps = sorted(abs(r["seat_gap_s"]) for r in seated)
     known = n - len(unknown)
     return {
@@ -434,11 +483,18 @@ def census(prs: list[dict], min_body: int, merges: dict | None) -> dict:
         "distinct_mergedBy": sorted({r["mergedBy"] for r in rows if r["mergedBy"]}),
         # The headline the credential cannot show: how many of these one GitHub
         # identity's merges were actually performed by a seat.
-        "performer_status": "observed" if performer_observed else "unavailable",
-        "seat_performed": len(seated) if performer_observed else None,
-        "seat_performed_pct": round(100 * len(seated) / n, 1) if performer_observed and n else None,
-        "seat_performed_by": dict(sorted(by_seat.items())) if performer_observed else None,
-        "seat_performed_numbers": sorted(r["number"] for r in seated) if performer_observed else None,
+        "performer_status": ("unavailable" if not performer_observed else
+                             "partial" if merges.get("ambiguous_outcomes", 0) else "observed"),
+        "ambiguous_outcomes": merges.get("ambiguous_outcomes", 0) if performer_observed else None,
+        # Preserve legacy keys as explicitly unknown, not as actor attribution.
+        "seat_performed": None,
+        "seat_performed_pct": None,
+        "seat_performed_by": None,
+        "seat_performed_numbers": None,
+        "seat_candidate_count": len(seated) if performer_observed else None,
+        "seat_candidate_by": dict(sorted(by_seat.items())) if performer_observed else None,
+        "seat_candidate_pct": round(100 * len(seated) / n, 1) if performer_observed and n else None,
+        "seat_candidate_numbers": sorted(r["number"] for r in seated) if performer_observed else None,
         "median_corroboration_gap_s": gaps[len(gaps) // 2] if gaps else None,
         # Successful merge COMMANDS with no merge instant near them. Not noise:
         # this is the bucket a wrapper-masked failure falls into, and it is the
@@ -505,9 +561,12 @@ def main() -> int:
     if out["performer_status"] == "unavailable":
         print("  performer evidence unavailable (not a measured zero)")
         return 0
-    percentage = f"{out['seat_performed_pct']}%" if out["seat_performed_pct"] is not None else "n/a"
-    print(f"  temporally associated seat-merge candidates: {out['seat_performed']} "
-          f"({percentage}) {out['seat_performed_by']}")
+    if out["performer_status"] == "partial":
+        print(f"  performer evidence partial: {out['ambiguous_outcomes']} outcome(s) could not be "
+              "classified or attributed; they cannot be linked reliably to individual PRs")
+    percentage = f"{out['seat_candidate_pct']}%" if out["seat_candidate_pct"] is not None else "n/a"
+    print(f"  temporally associated seat-merge candidates: {out['seat_candidate_count']} "
+          f"({percentage}) {out['seat_candidate_by']}")
     gap = out["median_corroboration_gap_s"]
     print(f"    corroborated within {args.merge_window:.0f}s of the merge instant; "
           f"median gap {f'{gap}s' if gap is not None else 'n/a (none found)'}")
