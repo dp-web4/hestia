@@ -32,8 +32,9 @@ queue as universally reviewed.
 authenticates as the same GitHub identity (`dp-web4`), so a seat merge and a
 human merge are the same row.
 
-THE PERFORMER IS READ FROM THE WITNESS CHAIN, NOT FROM LOG TEXT. This is the
-third version of that reader, and the first one that is not measuring itself.
+HISTORICAL CONTEXT: the earlier reader derived candidate evidence from the
+witness chain, not log text. The historical claims below describe earlier
+measurements, not validated conclusions from the conservative parser now here.
 
   v1 matched the merge command against raw log TEXT, guessed the seat from the
   log FILENAME, and joined on a "wake span" taken as the lexical min/max of
@@ -68,11 +69,10 @@ third version of that reader, and the first one that is not measuring itself.
 Three filters stand between a chain entry and a counted merge, and each closes
 a defect codex demonstrated:
 
-  1. COMMAND POSITION. A candidate must open a segment after shell lexing;
-     quoted text is not a command position. Heredocs, expansions, comments,
-     continuations and unlexable targets are explicitly unknown, not counted or
-     silently treated as negatives. This deliberately loses recall. Lexical
-     position still cannot prove that a shell reached or executed the command.
+  1. DIRECT COMMAND. Only a simple, direct candidate is recognized. Compound,
+     quoted-separator, escaped, expanded, or otherwise ambiguous targets are
+     unknown. Other commands may invoke wrappers and are unknown too. This
+     deliberately loses recall; syntax alone does not prove execution.
 
   2. OUTCOME, SUCCESS, NO ERROR. Only `outcome` entries with `success is True`
      and a null `error` count. v2 accepted an entry with NO `success` key at
@@ -83,16 +83,15 @@ a defect codex demonstrated:
      wrapper's exit status, not the merge's: the #532 target ends
      `2>&1 | tail -5; echo "rc=$?"`, where the pipeline observes `tail` and the
      `echo` makes the shell succeed regardless. So a successful command is not
-     evidence of a successful merge. A seat merge is counted only when the
+     evidence of a successful merge. A candidate is retained only when the
      outcome's timestamp falls within `--merge-window` seconds AFTER the PR's
      GitHub `mergedAt`. Commands that pass 1 and 2 but land nowhere near a
-     merge instant are reported separately as `uncorroborated` — that bucket
-     is where a masked failure lives, and it is 30 rows deep.
+     merge instant are reported separately as `uncorroborated`. The previous
+     30-row count predates the direct-only parser and is not a current result.
 
-The corroboration is tight rather than tuned: the median gap between the merge
-instant and the outcome record is under 5 seconds, and the count moves by 3
-rows between a 60-second window and a 30-minute one. The result is not an
-artifact of the window.
+Earlier measurements reported a median gap under 5 seconds and a difference of
+3 rows between 60-second and 30-minute windows. They have not been revalidated
+for the direct-only parser or proved complete.
 
 WHAT THIS STILL CANNOT SEE. The chain records actions taken through the
 governed hook. A merge performed outside it — the GitHub web UI, an ungoverned
@@ -125,57 +124,48 @@ FINDINGS_PREFIXES = ("findings", "census", "docs", "shim ledger")
 # learned this the expensive way (see the module docstring); the layout is the
 # fix.
 _GH, _PR, _MERGE = "gh", "pr", "merge"
-# Shell metacharacters that END a command segment. shlex with
-# punctuation_chars=True emits these as their own tokens, so a segment boundary
-# is a token test rather than a regex on raw text.
-_SEGMENT_BREAK = set("&|;()\n")
-
-
 def merge_calls(target: str) -> list[tuple[int, str | None]] | None:
-    """Candidate calls at command positions, or None when shell context is ambiguous.
+    """Recognize a simple direct candidate; everything else is unknown.
 
-    The whole defence against counting a search as a merge lives here, and it is
-    structural rather than a blacklist. After shell lexing, `rg 'gh pr merge 697'`
-    is three tokens — `rg`, `-n`, and the single token `gh pr merge 697` — and
-    that token does not open a segment. `printf 'gh pr merge 532'` is the same
-    shape. A real merge lexes to `['gh','pr','merge','532',...]` with `gh` first.
-
-    Lex the whole target so a newline inside a quoted argument never becomes a
-    new command. Heredocs, shell expansions, comments and line continuations
-    are intentionally not modeled: these return unknown, not an empty result.
-    Even a parsed command plus a matching timestamp is only a candidate, not
-    proof that the shell executed it or that it performed the merge.
+    shlex discards quote provenance, so its punctuation tokens cannot safely
+    distinguish a quoted separator from shell syntax. Reject either form before
+    lexing. This intentionally sacrifices recall and is not a shell parser.
+    A candidate, even with a matching timestamp, does not prove execution.
     """
     target = target or ""
-    if any(marker in target for marker in ("<<", "$", "`", "#", "<(", ">(", "\\\n", "\\\r\n")):
+    if any(marker in target for marker in ("$", "`", "#", "\\", "\n", "\r", ";", "&", "|", "(", ")", "<", ">", "*", "?", "[", "]", "{", "}", "~")):
         return None
     try:
-        lexer = shlex.shlex(target, posix=True, punctuation_chars="();<>|&\n")
-        lexer.whitespace = " \t\r"  # preserve unquoted newlines as command boundaries
-        lexer.whitespace_split = True
-        tokens = list(lexer)
+        tokens = shlex.split(target, comments=False, posix=True)
     except ValueError:
         return None
-    calls: list[tuple[int, str | None]] = []
-    segment: list[str] = []
-    for token in tokens + [";"]:
-        if token == "\n" or (token and set(token) <= _SEGMENT_BREAK):
-            calls.extend(_merge_in_segment(segment))
-            segment = []
-        else:
-            segment.append(token)
-    return calls
+    calls = _merge_in_segment(tokens)
+    return calls if calls else None
 
 
 def _merge_in_segment(seg: list[str]) -> list[tuple[int, str | None]]:
     if len(seg) < 4 or seg[:3] != [_GH, _PR, _MERGE] or not seg[3].isdigit():
         return []
     repo = None
-    for i, tok in enumerate(seg):
-        if tok == "--repo" and i + 1 < len(seg):
-            repo = seg[i + 1]
+    flags = {"--merge", "--squash", "--rebase", "--delete-branch",
+             "--delete-branch=false", "--admin", "--auto", "--disable-auto"}
+    i = 4
+    while i < len(seg):
+        tok = seg[i]
+        if tok in flags:
+            i += 1
+            continue
+        if tok in ("--repo", "-R") and i + 1 < len(seg):
+            candidate = seg[i + 1]
+            i += 2
         elif tok.startswith("--repo="):
-            repo = tok.split("=", 1)[1]
+            candidate = tok.split("=", 1)[1]
+            i += 1
+        else:
+            return []  # Unrecognized flags and arguments are not parsed safely.
+        if repo is not None or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", candidate):
+            return []
+        repo = candidate
     return [(int(seg[3]), repo)]
 
 
@@ -196,7 +186,7 @@ def _epoch(ts: str) -> float:
     return instant.timestamp()
 
 
-_CACHE_SCHEMA = "merge-candidates-unknown-shell-v2"
+_CACHE_SCHEMA = "merge-candidates-direct-only-v3"
 
 
 def scan_chain(max_entries: int, cache: Path | None) -> list[dict]:
@@ -344,8 +334,8 @@ def seat_merges(hits: list[dict], prs: list[dict], repo: str,
     `hits` are chain outcomes classified by `merge_calls`. A candidate is not
     proof that the shell reached or executed it; zero can belong to a wrapper
     (`... 2>&1 | tail -5; echo "rc=$?"` succeeds whether or not `gh` did). The
-    corroboration below is what supplies the missing link: the outcome is
-    accepted only if it lands within `window` seconds AFTER the PR's `mergedAt`.
+    timing association is not proof: a candidate is retained only if its outcome
+    lands within `window` seconds AFTER the PR's `mergedAt`.
 
     `back_slack` allows a small NEGATIVE gap for clock skew between the GitHub
     API's stamp and the local chain's. It is deliberately much tighter than
@@ -356,7 +346,7 @@ def seat_merges(hits: list[dict], prs: list[dict], repo: str,
       * `uncorroborated` — a successful merge command with no merge instant near
         it. A masked failure and a stale retry both land here.
       * `foreign_repo`   — an explicit `--repo` naming something else. Without
-        this, `gh pr merge 31 --repo dp-web4/private-context` matches THIS
+        this, a merge in `example/other` can match THIS
         repo's #31, 26 days away, and reads as a wild clock error rather than
         the different repository it is.
     """
@@ -517,7 +507,7 @@ def main() -> int:
                     help="reuse/store the chain scan; a full walk costs ~6 min")
     ap.add_argument("--merge-window", type=float, default=300.0,
                     help="seconds after mergedAt within which a seat's outcome "
-                         "record corroborates that seat performed the merge")
+                         "record is associated with a candidate")
     ap.add_argument("--since", default=None, help="only merges on/after this ISO date")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()

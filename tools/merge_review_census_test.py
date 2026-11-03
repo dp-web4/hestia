@@ -172,22 +172,23 @@ def arm_mergedby_cannot_separate_seats() -> None:
 # --------------------------------------------------------------------------
 
 def arm_real_merge_is_at_a_command_position() -> None:
-    """The positive case, in the shapes the chain actually holds.
+    """Direct candidates are recognized; compound shapes are unknown.
 
     Sabotage: require `seg[0] == 'gh'` to be the token at index 1 and this goes
     red on every form.
     """
     forms = {
         "gh pr merge 532 --squash --delete-branch": [(532, None)],
-        "cd /repo && gh pr merge 353 --merge": [(353, None)],
-        "set -euo pipefail\ngh pr merge 729 --merge --delete-branch=false\ngit fetch":
-            [(729, None)],
         "gh pr merge 796 --repo dp-web4/hestia --squash": [(796, "dp-web4/hestia")],
-        "gh pr ready 490 && gh pr merge 490 --merge": [(490, None)],
+        "gh pr merge 796 -R example/other --merge": [(796, "example/other")],
     }
     for target, want in forms.items():
         check(f"command position: {target[:34]!r}", merge_calls(target) == want,
               str(merge_calls(target)))
+    for target in ["cd /repo && gh pr merge 353 --merge",
+                   "set -euo pipefail\ngh pr merge 729 --merge\ngit fetch",
+                   "gh pr ready 490 && gh pr merge 490 --merge"]:
+        check("compound target is unknown", merge_calls(target) is None, repr(target))
 
 
 def arm_searching_for_a_merge_is_not_performing_one() -> None:
@@ -208,7 +209,7 @@ def arm_searching_for_a_merge_is_not_performing_one() -> None:
         "printf 'gh pr merge 532'",
         'grep -rhE "gh pr merge 236" /logs/ 2>/dev/null | head',
     ]:
-        check(f"search is not a merge: {target[:38]!r}", merge_calls(target) == [])
+        check(f"search is not attributed: {target[:38]!r}", merge_calls(target) is None)
 
 
 def arm_the_census_reading_itself_is_not_a_merge() -> None:
@@ -247,10 +248,18 @@ def arm_ambiguous_shell_text_is_not_attributed() -> None:
         "echo `gh pr merge 532 --merge`",
         "diff <(gh pr merge 532 --merge) /dev/null",
         "gh pr merge 532 --merge\npython3 - <<END\nexample\nEND",
+        "printf ';' gh pr merge 532",
+        r"echo \; gh pr merge 532",
+        "printf '\n' gh pr merge 532",
+        "echo ok | gh pr merge 532",
+        "gh pr merge 532 --repo example/*",
+        "gh pr merge 532 -R",
+        "gh pr merge 532 --body --repo example/other",
+        "gh pr merge 532 --repo example/one --repo example/two",
     ]:
         check("ambiguous target remains unknown", merge_calls(target) is None, repr(target))
     quoted = "printf 'example:\ngh pr merge 532 --merge\n'"
-    check("multiline quoted data is not a command", merge_calls(quoted) == [], str(merge_calls(quoted)))
+    check("multiline quoted data is unknown", merge_calls(quoted) is None, str(merge_calls(quoted)))
     hits = [{"calls": None, "ambiguous_count": 2}]
     merged = seat_merges(hits, [pr(532, "synthetic", "2026-08-01T00:00:00Z")], REPO, 300)
     report = census([pr(532, "synthetic", "2026-08-01T00:00:00Z")], 200, merged)
@@ -266,7 +275,8 @@ def arm_old_or_invalid_cache_is_not_a_measured_zero() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         cache = Path(directory) / "synthetic.json"
-        for content in ([], {"schema": _CACHE_SCHEMA, "hits": [{"calls": None, "ambiguous_count": -1}]}):
+        for content in ([], {"schema": "merge-candidates-unknown-shell-v2", "hits": []},
+                        {"schema": _CACHE_SCHEMA, "hits": [{"calls": None, "ambiguous_count": -1}]}):
             cache.write_text(json.dumps(content))
             try:
                 scan_chain(10, cache)
@@ -307,7 +317,9 @@ def arm_wrapper_success_needs_a_merge_instant() -> None:
     """
     actual = 'gh pr merge 532 --squash --delete-branch 2>&1 | tail -5; echo "rc=$?"'
     check("wrapper with expansion is unknown", merge_calls(actual) is None)
-    target = 'gh pr merge 532 --squash --delete-branch 2>&1 | tail -5; echo done'
+    wrapper = 'gh pr merge 532 --squash --delete-branch 2>&1 | tail -5; echo done'
+    check("wrapper without expansion is also unknown", merge_calls(wrapper) is None)
+    target = 'gh pr merge 532 --squash --delete-branch'
     prs = [pr(532, "x", "2026-08-19T05:00:51Z")]
 
     real = seat_merges([hit("claude-code", target, "2026-08-19T05:00:56Z")],
