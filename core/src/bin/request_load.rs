@@ -564,7 +564,7 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
 /// unruled previous request is counted separately).
 fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
     let mut by_first = BTreeMap::new();
-    let (mut total, mut within_10m, mut after_unruled) = (0u64, 0u64, 0u64);
+    let (mut total, mut within_10m, mut after_unruled, mut timing_unknown) = (0u64, 0u64, 0u64, 0u64);
     for mut g in groups.into_iter().filter(|g| g.len() > 1) {
         g.sort_by_key(|r| r.opened);
         let first = g[0].outcome;
@@ -574,11 +574,19 @@ fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
             match (w[0].ruled_at, w[1].opened) {
                 (Some(ruled), Some(next)) => {
                     let gap = (next - ruled).num_seconds();
-                    if (0..=600).contains(&gap) {
+                    if next < ruled {
+                        // The previous request was eventually ruled, but was
+                        // still pending when the next request was opened.
+                        after_unruled += 1;
+                    } else if next == ruled {
+                        // Timestamps alone cannot order equal instants.
+                        timing_unknown += 1;
+                    } else if (0..=600).contains(&gap) {
                         within_10m += 1;
                     }
                 }
-                _ => after_unruled += 1,
+                (None, Some(_)) => after_unruled += 1,
+                (_, None) => timing_unknown += 1,
             }
         }
     }
@@ -587,6 +595,7 @@ fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
         "by_outcome_of_first_ask": by_first,
         "within_10_min_of_previous_ruling": within_10m,
         "previous_request_unruled": after_unruled,
+        "previous_ruling_order_unknown": timing_unknown,
     })
 }
 
@@ -605,8 +614,9 @@ fn render_markdown(r: &Value) -> String {
                      k["gate_opened_peer_invitation_unknown"]).unwrap();
             writeln!(out, "- re-asked after the first (same member and path): {}", k["reasked_same_member_and_path"]).unwrap();
             let ra = &k["reasks"];
-            writeln!(out, "- re-asks after the first: {}; by outcome of the first ask: {}; within 10 min of the previous ruling: {}; previous unruled: {}",
-                     ra["reasks"], ra["by_outcome_of_first_ask"], ra["within_10_min_of_previous_ruling"], ra["previous_request_unruled"]).unwrap();
+            writeln!(out, "- re-asks after the first: {}; by outcome of the first ask: {}; within 10 min of the previous ruling: {}; previous unruled: {}; ruling order unknown: {}",
+                     ra["reasks"], ra["by_outcome_of_first_ask"], ra["within_10_min_of_previous_ruling"],
+                     ra["previous_request_unruled"], ra["previous_ruling_order_unknown"]).unwrap();
         }
         let t = &k["time_to_ruling_secs"];
         writeln!(out, "- ruled: {}; time to ruling median {} s, p90 {} s", k["ruled_count"], t["median"], t["p90"]).unwrap();
@@ -863,6 +873,18 @@ mod tests {
         // a2 came 300 s after a1's ruling (within); a3 came 1400 s after a2's (not); b2 followed an unruled b1.
         assert_eq!(v["within_10_min_of_previous_ruling"], 1);
         assert_eq!(v["previous_request_unruled"], 1);
+    }
+
+    #[test]
+    fn reask_timing_uses_ruling_at_the_time_of_the_next_ask() {
+        let overlapping = [req("a", 100, "granted", Some(500)), req("a", 300, "open", None)];
+        let tied = [req("b", 100, "granted", Some(300)), req("b", 300, "open", None)];
+        let after = [req("c", 100, "granted", Some(200)), req("c", 300, "open", None)];
+        let v = reask_split(vec![overlapping.iter().collect(), tied.iter().collect(), after.iter().collect()]);
+        assert_eq!(v["reasks"], 3);
+        assert_eq!(v["previous_request_unruled"], 1);
+        assert_eq!(v["previous_ruling_order_unknown"], 1);
+        assert_eq!(v["within_10_min_of_previous_ruling"], 1);
     }
 
     #[test]
