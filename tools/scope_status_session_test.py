@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""hestia #1450 phase 0 step A: the gate's policy-snapshot fetch sends hestia_scope_status the session hestia_connect
-returned -- the same one it sends hestia_operating_law. Drives the real fetch_policy_snapshot against a recording fake
-daemon. argv: <dir with mechanism_rev.py | ""> ("" = this worktree's own mechanism, the control). Not test-shaped: on
-the base mechanism it fails, by design; at apply time it moves to tools/ as a test."""
+"""hestia #1450 phase 0 step A (applied 2026-11-03 under escalation a8c1fc5bd170dd7f, #1469): the gate's
+policy-snapshot fetch sends hestia_scope_status the session hestia_connect returned -- the same one it sends
+hestia_operating_law. Drives the real fetch_policy_snapshot against a recording fake daemon, plus two controls: a stale
+session the daemon serves unbound widens nothing, and a refused (other member's) session carries no grants.
+Run: python3 tools/scope_status_session_test.py   (an optional argv names a dir holding mechanism_rev.py, for a
+held revision's overlay)."""
 import importlib.util
 import os
 import pathlib
 import sys
 
-wt = pathlib.Path(__file__).resolve().parents[2]
+wt = pathlib.Path(__file__).resolve().parents[1]
 shared = wt / "plugins" / "_shared"
 sys.path.insert(0, str(shared))
 ov = sys.argv[1] if len(sys.argv) > 1 else ""

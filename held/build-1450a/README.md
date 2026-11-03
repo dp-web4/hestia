@@ -28,4 +28,4 @@ The gate's policy-snapshot fetch (`fetch_policy_snapshot`, `plugins/_shared/hest
 | `link_reach_test`, `every_allow_reach_test` (#1435's, on the re-cut) | PASS, PASS |
 | `endpoint_fallback_test` (#1464's, on the re-cut) | 5 passed |
 
-At apply time, `session_sent_check.py` moves to `tools/scope_status_session_test.py`.
+**Applied 2026-11-03** under escalation `a8c1fc5bd170dd7f` (dp), patch `5fdabcfc…`; the applied tree reverses cleanly against it. `session_sent_check.py` is now `tools/scope_status_session_test.py`, run by CI's `tools/*_test.py` glob.
