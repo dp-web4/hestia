@@ -880,7 +880,7 @@ structural and holds today; G2 is unverified and should be probed, not assumed.*
 
 ## 17. Class T — the timeout pair: un-governing a member by raising a number
 
-**Status: structural, live on every fail-open-engine member, and silent in both directions.**
+**Status: structural failure mode on fail-open harnesses; reproduced on dated 2026-09-04 and 2026-10-05 configurations. Current deployed hook timing is unverified by this entry.**
 Found 2026-08-07 while diagnosing intermittent kimi denies; flagged by dp as something the
 system should re-check periodically rather than trust once.
 
@@ -888,14 +888,25 @@ system should re-check periodically rather than trust once.
 
 A member whose harness **fails open** on hook timeout can only be governed because its gate
 is the fail-closed party — it must reach a verdict and `exit 2` *before* the harness deadline.
-That makes two independently-editable numbers load-bearing together:
+That makes the **complete hook execution path** load-bearing: the selected member/harness timeout,
+the actual shim configuration, every helper and retry budget, fixed work, and the host's ability
+to deliver the blocking verdict all matter. The former numerical shortcut is **not a
+sufficient invariant**:
 
-```
-gate internal budget   <   harness hook timeout
+```text
+gate internal budget < harness hook timeout    # INSUFFICIENT
 ```
 
-Push the budget above the timeout and the gate never finishes in time. The harness then does
-what it always does on an overrun: **allow**. Every subsequent call is ungoverned.
+A helper may spend its own budget more than once within a single hook. The 2026-09-04 Class T
+measurements on then-installed shims found a three-window composition (approximately
+`3 * min(helper_budget, request_cap) + seat_overhead`), despite individual budgets appearing
+smaller than the harness timeout. That fit is historical, not a universal or current bound.
+
+The requirement is that a **single enforced whole-hook deadline**, including retries,
+unbudgeted work and delivery margin, expires safely *before the harness's measured timeout*.
+The harness's actual fail-open/fail-closed behavior must be verified for that invocation
+type and version. A locally fail-closed `exit 2` **after** a fail-open harness has stopped
+listening does not block the effect.
 
 ### Why it is worse than an ordinary misconfiguration
 
@@ -904,7 +915,7 @@ It is invisible from both of the places anyone would look:
 - **No denies appear** — because none happen. The member sails through.
 - **The witness chain looks clean** — not merely quiet, but *correct*. A chain records refusals
   and acts; an act that was never gated leaves no gap to notice.
-- **Nothing logs.** The harness allowing on overrun is its documented behaviour, not an error.
+- **The chain may not log a verdict.** Whether the harness itself logs an overrun depends on its implementation/configuration; a clean Hestia log is not proof that a blocking hook completed.
 
 A fully un-governed member is therefore indistinguishable, on every surface hestia offers, from
 a well-behaved one. This is the [[null-state-twin]] at the level of a whole member: the green
@@ -932,10 +943,12 @@ correct path diverge, and nothing in the system marks the fork.
 
 ### Mitigation
 
-- **Assert the invariant where both numbers are visible.** The launcher knows the harness
-  timeout and passes the budget; it is the only place the pair is co-located. A gate that
-  cannot prove it fits inside its harness deadline should refuse to start rather than run
-  ungoverned.
+- **Prove the whole-hook deadline, not an arithmetic pair.** The launcher/registrar must
+  use the *installed* harness timeout and shim configuration, establish one absolute deadline
+  shared by helpers/retries and a delivery margin, and test that the harness receives the
+  blocking verdict before it stops waiting. Reject or disable a miswired install rather than
+  claiming protection from a budget comparison alone. A successful preflight check is not
+  proof against arbitrary scheduling starvation.
 - **Audit the pair on a schedule** (dp, 2026-08-07). Per-member, since the timeout default
   differs by harness — see `agent-atlas/talk-to/*/descriptor.md`, which now records the
   engine-verified figure for kimi (`hook.timeout ?? 30s`, config honoured).
@@ -946,6 +959,28 @@ correct path diverge, and nothing in the system marks the fork.
 - **Do not source a harness timeout from memory.** The figure that sized kimi's budget
   travelled from conversation → PRD → cited authority without ever being measured, and was
   wrong by 5–10× (`PRD_GOVERNANCE.md` §8.3, corrected in place with the propagation path kept).
+
+### Measurement history and current-source boundary
+
+- [Hestia #939](https://github.com/dp-web4/hestia/pull/939) carries the 2026-09-04
+  black-hole-daemon Class T measurements and the later 2026-10-05 CBP remeasurement.
+  Those observations showed that the old budget-pair test cleared seats whose blocking
+  verdict arrived after the harness stopped waiting. They also exposed test-harness
+  endpoint overrides that accidentally measured the healthy daemon instead of the
+  intended black hole. The report is evidence about those dated builds, not an assertion
+  about the currently installed fleet.
+- Current `plugins/_shared/hestia_gate_mechanism.py` includes a Stage C
+  `deadline` argument and `_bound(deadline, budget_s)` logic: with a caller-supplied
+  absolute deadline, helper requests share that bound; with `deadline=None`,
+  helpers retain the legacy per-helper budget. Therefore *source support* for a whole-hook
+  deadline does not establish that every installed shim actually supplies it, that
+  recovery/probes survive deployment, or that the harness delivers its refusal in time.
+- Re-run a **measured** Class T audit on the current installed shims, with the
+  socket-layer black-hole control and genuine registered harness timeouts. Capture
+  the actual shim/daemon/ground-truth generations, the hook-exit and executor effects,
+  all retries, deadline provenance, and negative controls. Keep `UNKNOWN` distinct from
+  `PASS` when config, transport, or installed build cannot be measured. A CI-green
+  deadline helper is not equivalent to live hook coverage.
 
 ### Relation to other classes
 
