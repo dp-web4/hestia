@@ -586,7 +586,8 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
 /// Time gaps are only reported when they agree with that witnessed order.
 fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
     let mut by_first = BTreeMap::new();
-    let (mut total, mut within_10m, mut after_unruled, mut timing_unknown) = (0u64, 0u64, 0u64, 0u64);
+    let (mut total, mut within_10m, mut after_10m, mut after_unruled, mut timing_unknown) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
     for mut g in groups.into_iter().filter(|g| g.len() > 1) {
         g.sort_by_key(|r| r.opened_position);
         let positions_unknown = g.iter().any(|r| r.opened_position.is_none())
@@ -618,8 +619,10 @@ fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
                 (Some(position), Some(ruled), Some(next)) if position < next_position => {
                     if next < ruled {
                         timing_unknown += 1; // witnessed ruling preceded the ask, clock disagrees
-                    } else if (next - ruled).num_seconds() <= 600 {
+                    } else if next - ruled <= chrono::Duration::seconds(600) {
                         within_10m += 1;
+                    } else {
+                        after_10m += 1;
                     }
                 }
                 (Some(position), Some(ruled), Some(next)) if position > next_position => {
@@ -638,6 +641,7 @@ fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
         "reasks": total,
         "by_outcome_of_first_ask": by_first,
         "within_10_min_of_previous_ruling": within_10m,
+        "after_10_min_of_previous_ruling": after_10m,
         "previous_request_unruled": after_unruled,
         "previous_ruling_order_unknown": timing_unknown,
     })
@@ -660,9 +664,10 @@ fn render_markdown(r: &Value) -> String {
                      k["reasked_same_member_and_path"], k["reasks"]["unknown_key_requests"]).unwrap();
             writeln!(out, "- re-ask limitation: {}", k["reask_key_limitation"].as_str().unwrap_or("")).unwrap();
             let ra = &k["reasks"];
-            writeln!(out, "- re-asks after the first: {}; by outcome of the first ask: {}; within 10 min of the previous ruling: {}; previous unruled: {}; ruling order unknown: {}",
+            writeln!(out, "- re-asks after the first: {}; by outcome of the first ask: {}; within 10 min of the previous ruling: {}; after 10 min: {}; previous unruled: {}; ruling order unknown: {}",
                      ra["reasks"], ra["by_outcome_of_first_ask"], ra["within_10_min_of_previous_ruling"],
-                     ra["previous_request_unruled"], ra["previous_ruling_order_unknown"]).unwrap();
+                     ra["after_10_min_of_previous_ruling"], ra["previous_request_unruled"],
+                     ra["previous_ruling_order_unknown"]).unwrap();
         }
         let t = &k["time_to_ruling_secs"];
         writeln!(out, "- ruled: {}; time to ruling median {} s, p90 {} s", k["ruled_count"], t["median"], t["p90"]).unwrap();
@@ -940,7 +945,24 @@ mod tests {
         assert_eq!(v["by_outcome_of_first_ask"]["lapsed"], 1);
         // a2 came 300 s after a1's ruling (within); a3 came 1400 s after a2's (not); b2 followed an unruled b1.
         assert_eq!(v["within_10_min_of_previous_ruling"], 1);
+        assert_eq!(v["after_10_min_of_previous_ruling"], 1);
         assert_eq!(v["previous_request_unruled"], 1);
+    }
+
+    #[test]
+    fn ten_minute_boundary_preserves_fractional_seconds() {
+        let mut first = req("a", 100, "granted", Some(200));
+        let mut next = req("a", 800, "open", None);
+        first.opened_position = Some(1);
+        first.ruled_position = Some(2);
+        next.opened_position = Some(3);
+        let at_boundary = reask_split(vec![vec![&first, &next]]);
+        assert_eq!(at_boundary["within_10_min_of_previous_ruling"], 1);
+        assert_eq!(at_boundary["after_10_min_of_previous_ruling"], 0);
+        next.opened = DateTime::<Utc>::from_timestamp_millis(800_001);
+        let past_boundary = reask_split(vec![vec![&first, &next]]);
+        assert_eq!(past_boundary["within_10_min_of_previous_ruling"], 0);
+        assert_eq!(past_boundary["after_10_min_of_previous_ruling"], 1);
     }
 
     #[test]
