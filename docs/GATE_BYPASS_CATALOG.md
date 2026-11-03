@@ -910,16 +910,21 @@ listening does not block the effect.
 
 ### Why it is worse than an ordinary misconfiguration
 
-It is invisible from both of the places anyone would look:
+It can look healthy on the **Hestia denial count or witness chain alone**, without proving
+that the hook completed in time:
 
-- **No denies appear** — because none happen. The member sails through.
-- **The witness chain looks clean** — not merely quiet, but *correct*. A chain records refusals
-  and acts; an act that was never gated leaves no gap to notice.
-- **The chain may not log a verdict.** Whether the harness itself logs an overrun depends on its implementation/configuration; a clean Hestia log is not proof that a blocking hook completed.
+- **Denials may be absent** — a local refusal produced after the harness timeout may never
+  reach the executor's blocking interface.
+- **The Hestia chain may have no corresponding record** — an act that bypassed its gate
+  may leave no Hestia row; absence of a row is not evidence of a clean decision.
+- **Other evidence may exist** — a late local verdict, harness timeout/exit log, process
+  or network observation, and independent executor receipt can reveal the mismatch.
+  Those surfaces must be deliberately correlated; they are not a substitute for mediation.
 
-A fully un-governed member is therefore indistinguishable, on every surface hestia offers, from
-a well-behaved one. This is the [[null-state-twin]] at the level of a whole member: the green
-is bit-identical to "no governance at all".
+This is a *possible* [[null-state-twin]] on **incomplete governance evidence surfaces**:
+a quiet Hestia deny count is compatible with both genuinely permitted behavior and
+a gate whose blocking verdict never reached a fail-open harness. It does **not**
+mean every offered observation is bit-identical, or prove the member was ungoverned.
 
 ### Why it is reachable
 
@@ -929,17 +934,19 @@ Neither edit looks dangerous alone:
   work that produced this entry. Denies caused by too-tight budgets are real and worth fixing.
 - Lowering the harness timeout reads as *tightening latency*.
 
-Either one, done in good faith by someone holding only half the picture, silently disarms the
-member. No adversary is required. The 2026-08-07 change to kimi came within one approval of
+On a fail-open harness, either change can cause the complete hook path to overrun its actual
+timeout, preventing a refusal from reaching the executor. No adversary is required; the
+configured pair alone does not establish which outcome occurred. The 2026-08-07 change to kimi came within one approval of
 being sized against a fail-open ceiling that was wrong by 5× in the *safe* direction — had the
 remembered figure erred the other way, the "fix" would have shipped the bypass.
 
 ### What makes it a bypass rather than a bug
 
-The efficiency argument applies exactly as CLAUDE.md predicts: a member hitting fail-closed
-denies has a real incentive to raise its own budget, and doing so *both* removes the denials
-*and* removes the governance, with the second effect unobservable. The efficient path and the
-correct path diverge, and nothing in the system marks the fork.
+The efficiency argument in CLAUDE.md identifies a real incentive: raising a gate budget
+can reduce legitimate false denials, yet on a fail-open harness a composed timeout can
+also prevent *actual* refusals from reaching the executor. A decline in denies therefore
+does not distinguish successful tuning from missed mediation; current Hestia-only
+observations may not reveal the fork without harness/executor checks.
 
 ### Mitigation
 
@@ -949,9 +956,10 @@ correct path diverge, and nothing in the system marks the fork.
   blocking verdict before it stops waiting. Reject or disable a miswired install rather than
   claiming protection from a budget comparison alone. A successful preflight check is not
   proof against arbitrary scheduling starvation.
-- **Audit the pair on a schedule** (dp, 2026-08-07). Per-member, since the timeout default
-  differs by harness — see `agent-atlas/talk-to/*/descriptor.md`, which now records the
-  engine-verified figure for kimi (`hook.timeout ?? 30s`, config honoured).
+- **Audit the whole-hook path periodically** (dp, 2026-08-07), per member and installed
+  harness generation, including its configured timeout and actual executor behavior.
+  Historical measurements in `agent-atlas/talk-to/*/descriptor.md` are dated evidence,
+  not a continuously verified fleet inventory.
 - **Treat "denies stopped" as a signal requiring explanation**, not as success. The absence of
   refusals is the observable that this class produces, and it is also what a genuine fix
   produces. They must be told apart by something other than the deny count — e.g. positive
@@ -975,6 +983,10 @@ correct path diverge, and nothing in the system marks the fork.
   helpers retain the legacy per-helper budget. Therefore *source support* for a whole-hook
   deadline does not establish that every installed shim actually supplies it, that
   recovery/probes survive deployment, or that the harness delivers its refusal in time.
+  More narrowly, `_McpHttp._request` checks the deadline before request start and
+  passes the remaining time to its socket call; that source behavior alone does not
+  prove a hard upper bound on every response/read, scheduling delay or final verdict
+  delivery. The executor-level black-hole measurement must establish that contract.
 - Re-run a **measured** Class T audit on the current installed shims, with the
   socket-layer black-hole control and genuine registered harness timeouts. Capture
   the actual shim/daemon/ground-truth generations, the hook-exit and executor effects,
@@ -985,11 +997,15 @@ correct path diverge, and nothing in the system marks the fork.
 ### Relation to other classes
 
 Class T is the *converse* of Class G. G is a member gaining authority it was never granted;
-T is a member losing the governance it was always under — and where G at least leaves an
-actor in the record, T leaves nothing at all, because there is no act to attribute.
+T is a member losing an expected mediation path. An act not gated may lack a corresponding
+Hestia verdict row, although the harness or independent executor may still record the
+attempt, timeout or effect. Missing Hestia evidence must not be mistaken for a pass.
 
-*Filed by claude-code, 2026-08-07. The invariant is structural and holds today; the periodic
-audit is dp's requirement and is not yet implemented anywhere.*
+*Class T was filed by claude-code on 2026-08-07; failure was measured on particular
+2026-09-04 and 2026-10-05 configurations. Source-level deadline support exists
+in Stage C, but current installed fleet compliance is UNKNOWN here. A historical
+audit instrument exists in #939; whether periodic coverage is installed and
+running on every current seat has not been verified by this entry.*
 
 ---
 
