@@ -230,7 +230,9 @@ struct Req {
     home_dotdir: Option<String>, // first component under $HOME, for the home_dotdir class only
     other_marker: Option<&'static str>, // published name, for the escalation `other` class only
     gate_opened: bool,
-    no_peer: bool,
+    // None means the opening event did not carry a valid invitation list;
+    // absence of evidence must not be counted as an available peer.
+    no_peer: Option<bool>,
     opened: Option<DateTime<Utc>>,
     expires_at: Option<i64>,
     outcome: &'static str, // open | incomplete | granted | refused | lapsed | withdrawn
@@ -240,6 +242,19 @@ struct Req {
 
 fn s<'a>(d: &'a Value, k: &str) -> Option<&'a str> {
     d.get(k).and_then(Value::as_str)
+}
+
+/// The opening-time invitation list is evidence about that instant only.
+/// Missing or malformed historical fields do not establish peer eligibility.
+fn no_peer_at_open(gate_opened: bool, data: &Value) -> Option<bool> {
+    if !gate_opened {
+        return None;
+    }
+    let invited = data.get("invited_peers")?.as_array()?;
+    if !invited.iter().all(|member| member.as_str().is_some_and(|id| !id.trim().is_empty())) {
+        return None;
+    }
+    Some(invited.is_empty())
 }
 
 /// Apply one scope event to a tracked request. Kept separate so synthetic
@@ -365,8 +380,7 @@ fn main() -> Result<()> {
                     let Some(id) = s(d, "request_id").or_else(|| s(d, "id")) else { continue };
                     let path = s(d, "path").unwrap_or("");
                     let gate_opened = s(d, "origin") == Some("gate_deny");
-                    let no_peer = gate_opened
-                        && d.get("invited_peers").and_then(Value::as_array).is_some_and(|a| a.is_empty());
+                    let no_peer = no_peer_at_open(gate_opened, d);
                     let member = s(d, "plugin_id").unwrap_or("?").to_string();
                     reqs.entry(format!("s:{id}")).or_insert(Req {
                         kind: "scope",
@@ -481,7 +495,7 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
         let mut by_outcome_ruler = BTreeMap::new();
         let mut by_sub = BTreeMap::new();
         let mut latencies: Vec<i64> = Vec::new();
-        let (mut gate_opened, mut no_peer) = (0u64, 0u64);
+        let (mut gate_opened, mut no_peer, mut peer_invited, mut peer_unknown) = (0u64, 0u64, 0u64, 0u64);
         for r in &rs {
             bump(&mut by_member, &r.member);
             bump(&mut by_rule, &r.rule);
@@ -506,7 +520,13 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
                 latencies.push((t - o).num_seconds());
             }
             gate_opened += r.gate_opened as u64;
-            no_peer += r.no_peer as u64;
+            if r.gate_opened && kind == "scope" {
+                match r.no_peer {
+                    Some(true) => no_peer += 1,
+                    Some(false) => peer_invited += 1,
+                    None => peer_unknown += 1,
+                }
+            }
         }
         latencies.sort_unstable();
         let mut k = serde_json::Map::new();
@@ -514,6 +534,8 @@ fn summarize(reqs: &HashMap<String, Req>, days: i64, scanned: u64, now: &DateTim
         k.insert("gate_opened".into(), json!(gate_opened));
         if kind == "scope" {
             k.insert("gate_opened_with_no_admissible_peer".into(), json!(no_peer));
+            k.insert("gate_opened_with_peer_invited".into(), json!(peer_invited));
+            k.insert("gate_opened_peer_invitation_unknown".into(), json!(peer_unknown));
             k.insert("by_path_class".into(), json!(by_path));
             k.insert("reasked_same_member_and_path".into(), reasks["reasks"].clone());
             k.insert("home_dotdir_by_first_component".into(), json!(by_sub));
@@ -578,7 +600,9 @@ fn render_markdown(r: &Value) -> String {
         writeln!(out, "### {} ({} opened, {} by the gate)\n", if kind == "scope" { "Scope requests" } else { "Governance escalations" },
                  k["total"], k["gate_opened"]).unwrap();
         if kind == "scope" {
-            writeln!(out, "- gate-opened with no admissible peer (operator only): {}", k["gate_opened_with_no_admissible_peer"]).unwrap();
+            writeln!(out, "- gate-opened invitation evidence at opening: no peer {}; peer invited {}; unknown {}",
+                     k["gate_opened_with_no_admissible_peer"], k["gate_opened_with_peer_invited"],
+                     k["gate_opened_peer_invitation_unknown"]).unwrap();
             writeln!(out, "- re-asked after the first (same member and path): {}", k["reasked_same_member_and_path"]).unwrap();
             let ra = &k["reasks"];
             writeln!(out, "- re-asks after the first: {}; by outcome of the first ask: {}; within 10 min of the previous ruling: {}; previous unruled: {}",
@@ -758,6 +782,33 @@ mod tests {
         observe_scope_outcome(&mut refused, "scope_grant_intent", &evidence, at);
         observe_scope_outcome(&mut refused, "scope_refused", &evidence, at);
         assert_eq!(refused.outcome, "refused");
+    }
+
+    #[test]
+    fn gate_opening_peer_evidence_keeps_missing_and_malformed_unknown() {
+        assert_eq!(no_peer_at_open(true, &json!({"invited_peers": []})), Some(true));
+        assert_eq!(no_peer_at_open(true, &json!({"invited_peers": ["peer-a"]})), Some(false));
+        for data in [json!({}), json!({"invited_peers": null}),
+                     json!({"invited_peers": "peer-a"}), json!({"invited_peers": [null]}),
+                     json!({"invited_peers": [""]})] {
+            assert_eq!(no_peer_at_open(true, &data), None);
+        }
+        assert_eq!(no_peer_at_open(false, &json!({"invited_peers": []})), None);
+
+        let mut requests = HashMap::new();
+        for (id, evidence) in [("no", Some(true)), ("yes", Some(false)), ("unknown", None)] {
+            requests.insert(id.into(), Req { kind: "scope", gate_opened: true,
+                no_peer: evidence, ..Default::default() });
+        }
+        requests.insert("manual".into(), Req { kind: "scope", gate_opened: false,
+            no_peer: None, ..Default::default() });
+        let report = summarize(&requests, 7, 4, &Utc::now(), &[]);
+        let scope = &report["scope"];
+        assert_eq!(scope["gate_opened"], 3);
+        assert_eq!(scope["gate_opened_with_no_admissible_peer"], 1);
+        assert_eq!(scope["gate_opened_with_peer_invited"], 1);
+        assert_eq!(scope["gate_opened_peer_invitation_unknown"], 1);
+        assert!(render_markdown(&report).contains("no peer 1; peer invited 1; unknown 1"));
     }
 
     #[cfg(unix)]
