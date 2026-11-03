@@ -287,6 +287,17 @@ check("8e. baseline: under flock(1) a leaked grandchild keeps the member busy",
 check("8f. python3 fallback matches: a leaked grandchild keeps the member busy",
       rc_py == (0, EX_TEMPFAIL), f"rc={rc_py} — the fallback released the lock while a child of the fire still ran")
 
+# 8g. The fallback program itself must not consume the payload's stdin.
+with tempfile.TemporaryDirectory() as tmp:
+    expected = "known stdin through both lock paths\n"
+    normal = run([LOCKER, "claude-code", "cat"], base_env(tmp), input=expected)
+    env = base_env(tmp)
+    env["PATH"] = fallback_path(tmp)
+    fallback = run([LOCKER, "claude-code", "cat"], env, input=expected)
+    check("8g. flock(1) and python3 fallback deliver identical caller stdin to the child",
+          normal.returncode == fallback.returncode == 0 and normal.stdout == fallback.stdout == expected,
+          f"normal={normal.stdout!r} fallback={fallback.stdout!r}")
+
 print(f"\nfailures={len(failures)}")
 for f in failures:
     print(f"  - {f}")
