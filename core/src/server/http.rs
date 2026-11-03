@@ -13185,9 +13185,8 @@ mod disposition_tests {
         }
         let before = kinds(&state).await;
         let lifted_before = before.iter().filter(|k| *k == "scope_refusal_lifted").count();
-        // Inject: a directory where the vault's atomic-write temp file must go (the seam the
-        // state.rs durable-grant test uses). Only the vault fails; the chain stays writable.
-        std::fs::create_dir(dir.path().join("v.enc.tmp")).unwrap();
+        // Fail only the next vault publication on this test thread; the chain stays writable.
+        crate::vault::storage::fail_next_save_before_rename();
         let resp = scope_refusal_lift(State(state.clone()), Json(serde_json::json!({
             "plugin_id": "codex", "path": &p, "reason": "lifting"}))).await.into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -13202,8 +13201,7 @@ mod disposition_tests {
         // The same act is still answered from the record.
         let again = claim(&state, "codex", &p, &format!("Write -> {p}"), false).await;
         assert_eq!(again["verdict"], "refused", "{again}");
-        // Remove the injection: the lift lands, and its success row names its intent.
-        std::fs::remove_dir(dir.path().join("v.enc.tmp")).unwrap();
+        // The one-shot injection is consumed: retry lands and names its intent.
         let resp = scope_refusal_lift(State(state.clone()), Json(serde_json::json!({
             "plugin_id": "codex", "path": &p, "reason": "lifting"}))).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -14066,9 +14064,8 @@ mod disposition_tests {
             (s.standing_scope.floor.clone(), s.standing_scope.generation)
         };
 
-        // Vault writes use v.enc.tmp then rename. A directory at that path fails the
-        // persist without affecting witness.db, so this isolates stage two.
-        std::fs::create_dir(dir.path().join("v.enc.tmp")).unwrap();
+        // Fail the staged vault save just before rename, without affecting witness.db.
+        crate::vault::storage::fail_next_save_before_rename();
         let resp = scope_floor_remove(
             State(state.clone()),
             Json(serde_json::json!({
@@ -14078,7 +14075,6 @@ mod disposition_tests {
         )
         .await
         .into_response();
-        std::fs::remove_dir(dir.path().join("v.enc.tmp")).unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         {

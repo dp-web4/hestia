@@ -3276,14 +3276,12 @@ mod tests {
 
     /// THE FORCED-FAILURE ARM (GPT review of #462) — the arm the old ordering got wrong.
     ///
-    /// The failure is injected by putting a DIRECTORY where the vault's atomic-write temp file
-    /// must go (`storage::save` writes `<vault>.enc.tmp` then renames). That is deliberate:
-    /// it fails ONLY the vault, leaves the chain's `witness.db` fully writable, and does not
-    /// depend on file permissions — which are unreliable under root and on NTFS mounts, so a
-    /// chmod-based version of this test would silently pass by not failing at all.
+    /// Inject the test-only pre-rename vault failure after staging. It fails only this thread's
+    /// next vault publication, leaving the witness chain writable and avoiding permissions-based
+    /// assumptions that vary by platform or privilege.
     #[test]
     fn a_failed_commit_leaves_an_intent_and_no_scope_granted() {
-        let (dir, mut state) = make_state();
+        let (_dir, mut state) = make_state();
 
         // Land one good grant first, so the test proves the failure is caused by the
         // injection and not by the mechanism never having worked.
@@ -3296,15 +3294,14 @@ mod tests {
         let gen_before = state.standing_scope.generation;
         let kinds_before = kinds(&state);
 
-        // Inject: a directory cannot be opened as the temp file.
-        std::fs::create_dir(dir.path().join("v.enc.tmp")).unwrap();
+        crate::vault::storage::fail_next_save_before_rename();
 
         let err = state
             .witness_and_commit_standing_grant(
                 a_grant("codex", "/w/second"),
                 serde_json::json!({"plugin_id": "codex", "path": "/w/second"}),
             )
-            .expect_err("the vault write must fail with a directory in the temp path");
+            .expect_err("the staged vault write must fail before rename");
 
         let intent_hash = match err {
             StandingGrantFailure::NotCommitted { intent_hash, .. } => intent_hash,
