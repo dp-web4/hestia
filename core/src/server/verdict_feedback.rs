@@ -467,8 +467,10 @@ pub fn parse_stated(args: &Value) -> Result<StatedFeedback, (&'static str, Strin
     })
 }
 
-/// The digest of an act: who (member), what (tool), to which target, attempting what. Hashed so
-/// the key can sit on the chain without carrying the attempted text twice.
+/// The digest of an act label: who (member), what (tool), to which target, attempting what.
+/// Hashed so the key can sit on the chain without carrying the attempted text twice. The input is
+/// redacted, so two different original inputs can collapse to one label; `repeat_of` is a hint,
+/// never a proof that the original acts were identical.
 pub fn act_digest(
     member: &str,
     tool_name: &str,
@@ -493,13 +495,15 @@ pub type RepeatKey = (String, String, String, String, String);
 
 /// THE DECISION CONTEXT IS PART OF "THE SAME VERDICT" (NOVA's hold on 93611e46; Codex's controls
 /// `e74786fb`). A deny under policy generation 1 is not a repeat of one under generation 2, nor one
-/// under another role or enforcement state: the law changed, so the earlier verdict is not an answer.
-/// Read from the row's OWN fields (`policy_version`, `role_lct`, `enforced`), absent ones as null,
-/// and the live paths pass exactly the values they write, so a key rebuilt from the chain at startup
-/// equals the key computed live.
+/// under another role, enforcement state, or gate generation: the law changed, so the earlier verdict
+/// is not an answer. Read from the row's OWN fields (`policy_version`, `role_lct`, `enforced`,
+/// `core_digest`), absent ones as null, and the live paths pass exactly the values they write, so a
+/// key rebuilt from the chain at startup equals the key computed live. Missing generation is unknown,
+/// not proof of sameness: `repeat_of` is a bounded same-normalized/redacted-attempt hint, never proof
+/// that the original inputs or law were identical.
 pub fn decision_context(row: &Value) -> String {
     let f = |k: &str| row.get(k).cloned().unwrap_or(Value::Null);
-    serde_json::json!([f("policy_version"), f("role_lct"), f("enforced")]).to_string()
+    serde_json::json!([f("policy_version"), f("role_lct"), f("enforced"), f("core_digest")]).to_string()
 }
 
 pub fn repeat_key(member: &str, act: &str, decision: &str, rule_id: &str, context: &Value) -> RepeatKey {
