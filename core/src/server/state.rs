@@ -83,6 +83,10 @@ pub struct InFlightAction {
     /// not itself a stable per-orchestrator-session identifier. `None` = the host
     /// didn't supply one.
     pub host_session_id: Option<String>,
+    /// The goal or question id this act is for, as the caller stated it at `begin_action`
+    /// (`serves`). `None` = unstated; the verdict then reads `serves: "unknown"`. Carried onto
+    /// the verdict's feedback so a refusal is addressed to the goal it bears on.
+    pub serves: Option<String>,
     pub started_at: DateTime<Utc>,
     pub chain_position: u64,
 }
@@ -571,6 +575,10 @@ pub struct ServerState {
     /// whose charge was applied — exactly one, whatever writes the rows and in whatever order.
     /// Rebuilt at startup. See `decision_witness::DecisionLedger`.
     pub decision_ledger: super::decision_witness::DecisionLedger,
+    /// The first witnessed verdict per (member, act, decision, rule): how an identical act is
+    /// answered by reference (`feedback.repeat_of`). Rebuilt from the chain at startup. See
+    /// `verdict_feedback::RepeatIndex`.
+    pub repeat_index: super::verdict_feedback::RepeatIndex,
     pub trust_store: TrustStore,
     /// Durable inbound mailbox (entity-edge inbox): still-sealed notices parked
     /// by `hestia_notify {defer: true}` before the hub is ACKed, drained by
@@ -1147,6 +1155,7 @@ impl ServerState {
                 &home.join(super::decision_witness::SETTLED_FILE),
                 trust_projection_since,
             ),
+            repeat_index: super::verdict_feedback::rehydrate(&chain_store),
             chain_store,
             trust_store,
             inbox_store: Arc::new(inbox_store),
