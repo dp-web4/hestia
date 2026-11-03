@@ -352,6 +352,36 @@ def arm_chain_unreadable_leaves_the_review_census_intact() -> None:
           out["unreviewed"] == 1 and out["seat_performed"] == 0)
 
 
+def arm_unavailable_chain_is_not_a_zero_performer_count() -> None:
+    """A failed or skipped observation is unknown, not a measured zero."""
+    import contextlib
+    import io
+    import json
+    from unittest.mock import patch
+    import merge_review_census as tool
+
+    prs = [pr(40, "findings: a", "2026-08-01T00:00:00Z")]
+    try:
+        out = census(prs, 200, None)
+    except Exception as exc:
+        check("unavailable chain is represented without an exception", False, type(exc).__name__)
+        return
+    check("unavailable is not zero", out.get("performer_status") == "unavailable"
+          and out.get("seat_performed") is None and out.get("seat_performed_pct") is None
+          and out.get("seat_performed_by") is None and out["unreviewed"] == 1, str(out))
+    observed = census(prs, 200, seat_merges([], prs, REPO, window=300.0))
+    check("successful empty scan is measured zero", observed.get("performer_status") == "observed"
+          and observed.get("seat_performed") == 0 and observed.get("seat_performed_pct") == 0.0)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with patch.object(sys, "argv", ["census", "--json"]), patch.object(tool, "fetch", return_value=prs), \
+            patch.object(tool, "scan_chain", side_effect=OSError("synthetic unavailable")), \
+            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        result = tool.main()
+    data = json.loads(stdout.getvalue())
+    check("CLI retains unknown on scan failure", result == 0 and data.get("performer_status") == "unavailable"
+          and data.get("seat_performed") is None and data.get("seat_performed_pct") is None, str(data))
+
+
 def arm_review_timing_is_evidence_not_an_assumption() -> None:
     """Only demonstrably prior discussion is in the pre-merge proxy.
 
