@@ -880,7 +880,7 @@ structural and holds today; G2 is unverified and should be probed, not assumed.*
 
 ## 17. Class T — the timeout pair: un-governing a member by raising a number
 
-**Status: structural, live on every fail-open-engine member, and silent in both directions.**
+**Status: structural failure mode on fail-open harnesses; reproduced on dated 2026-09-04 and 2026-10-05 configurations. Current deployed hook timing is unverified by this entry.**
 Found 2026-08-07 while diagnosing intermittent kimi denies; flagged by dp as something the
 system should re-check periodically rather than trust once.
 
@@ -888,27 +888,43 @@ system should re-check periodically rather than trust once.
 
 A member whose harness **fails open** on hook timeout can only be governed because its gate
 is the fail-closed party — it must reach a verdict and `exit 2` *before* the harness deadline.
-That makes two independently-editable numbers load-bearing together:
+That makes the **complete hook execution path** load-bearing: the selected member/harness timeout,
+the actual shim configuration, every helper and retry budget, fixed work, and the host's ability
+to deliver the blocking verdict all matter. The former numerical shortcut is **not a
+sufficient invariant**:
 
-```
-gate internal budget   <   harness hook timeout
+```text
+gate internal budget < harness hook timeout    # INSUFFICIENT
 ```
 
-Push the budget above the timeout and the gate never finishes in time. The harness then does
-what it always does on an overrun: **allow**. Every subsequent call is ungoverned.
+A helper may spend its own budget more than once within a single hook. The 2026-09-04 Class T
+measurements on then-installed shims found a three-window composition (approximately
+`3 * min(helper_budget, request_cap) + seat_overhead`), despite individual budgets appearing
+smaller than the harness timeout. That fit is historical, not a universal or current bound.
+
+The requirement is that a **single enforced whole-hook deadline**, including retries,
+unbudgeted work and delivery margin, expires safely *before the harness's measured timeout*.
+The harness's actual fail-open/fail-closed behavior must be verified for that invocation
+type and version. A locally fail-closed `exit 2` **after** a fail-open harness has stopped
+listening does not block the effect.
 
 ### Why it is worse than an ordinary misconfiguration
 
-It is invisible from both of the places anyone would look:
+It can look healthy on the **Hestia denial count or witness chain alone**, without proving
+that the hook completed in time:
 
-- **No denies appear** — because none happen. The member sails through.
-- **The witness chain looks clean** — not merely quiet, but *correct*. A chain records refusals
-  and acts; an act that was never gated leaves no gap to notice.
-- **Nothing logs.** The harness allowing on overrun is its documented behaviour, not an error.
+- **Denials may be absent** — a local refusal produced after the harness timeout may never
+  reach the executor's blocking interface.
+- **The Hestia chain may have no corresponding record** — an act that bypassed its gate
+  may leave no Hestia row; absence of a row is not evidence of a clean decision.
+- **Other evidence may exist** — a late local verdict, harness timeout/exit log, process
+  or network observation, and independent executor receipt can reveal the mismatch.
+  Those surfaces must be deliberately correlated; they are not a substitute for mediation.
 
-A fully un-governed member is therefore indistinguishable, on every surface hestia offers, from
-a well-behaved one. This is the [[null-state-twin]] at the level of a whole member: the green
-is bit-identical to "no governance at all".
+This is a *possible* [[null-state-twin]] on **incomplete governance evidence surfaces**:
+a quiet Hestia deny count is compatible with both genuinely permitted behavior and
+a gate whose blocking verdict never reached a fail-open harness. It does **not**
+mean every offered observation is bit-identical, or prove the member was ungoverned.
 
 ### Why it is reachable
 
@@ -918,27 +934,32 @@ Neither edit looks dangerous alone:
   work that produced this entry. Denies caused by too-tight budgets are real and worth fixing.
 - Lowering the harness timeout reads as *tightening latency*.
 
-Either one, done in good faith by someone holding only half the picture, silently disarms the
-member. No adversary is required. The 2026-08-07 change to kimi came within one approval of
+On a fail-open harness, either change can cause the complete hook path to overrun its actual
+timeout, preventing a refusal from reaching the executor. No adversary is required; the
+configured pair alone does not establish which outcome occurred. The 2026-08-07 change to kimi came within one approval of
 being sized against a fail-open ceiling that was wrong by 5× in the *safe* direction — had the
 remembered figure erred the other way, the "fix" would have shipped the bypass.
 
 ### What makes it a bypass rather than a bug
 
-The efficiency argument applies exactly as CLAUDE.md predicts: a member hitting fail-closed
-denies has a real incentive to raise its own budget, and doing so *both* removes the denials
-*and* removes the governance, with the second effect unobservable. The efficient path and the
-correct path diverge, and nothing in the system marks the fork.
+The efficiency argument in CLAUDE.md identifies a real incentive: raising a gate budget
+can reduce legitimate false denials, yet on a fail-open harness a composed timeout can
+also prevent *actual* refusals from reaching the executor. A decline in denies therefore
+does not distinguish successful tuning from missed mediation; current Hestia-only
+observations may not reveal the fork without harness/executor checks.
 
 ### Mitigation
 
-- **Assert the invariant where both numbers are visible.** The launcher knows the harness
-  timeout and passes the budget; it is the only place the pair is co-located. A gate that
-  cannot prove it fits inside its harness deadline should refuse to start rather than run
-  ungoverned.
-- **Audit the pair on a schedule** (dp, 2026-08-07). Per-member, since the timeout default
-  differs by harness — see `agent-atlas/talk-to/*/descriptor.md`, which now records the
-  engine-verified figure for kimi (`hook.timeout ?? 30s`, config honoured).
+- **Prove the whole-hook deadline, not an arithmetic pair.** The launcher/registrar must
+  use the *installed* harness timeout and shim configuration, establish one absolute deadline
+  shared by helpers/retries and a delivery margin, and test that the harness receives the
+  blocking verdict before it stops waiting. Reject or disable a miswired install rather than
+  claiming protection from a budget comparison alone. A successful preflight check is not
+  proof against arbitrary scheduling starvation.
+- **Audit the whole-hook path periodically** (dp, 2026-08-07), per member and installed
+  harness generation, including its configured timeout and actual executor behavior.
+  Historical measurements in `agent-atlas/talk-to/*/descriptor.md` are dated evidence,
+  not a continuously verified fleet inventory.
 - **Treat "denies stopped" as a signal requiring explanation**, not as success. The absence of
   refusals is the observable that this class produces, and it is also what a genuine fix
   produces. They must be told apart by something other than the deny count — e.g. positive
@@ -947,14 +968,44 @@ correct path diverge, and nothing in the system marks the fork.
   travelled from conversation → PRD → cited authority without ever being measured, and was
   wrong by 5–10× (`PRD_GOVERNANCE.md` §8.3, corrected in place with the propagation path kept).
 
+### Measurement history and current-source boundary
+
+- [Hestia #939](https://github.com/dp-web4/hestia/pull/939) carries the 2026-09-04
+  black-hole-daemon Class T measurements and the later 2026-10-05 CBP remeasurement.
+  Those observations showed that the old budget-pair test cleared seats whose blocking
+  verdict arrived after the harness stopped waiting. They also exposed test-harness
+  endpoint overrides that accidentally measured the healthy daemon instead of the
+  intended black hole. The report is evidence about those dated builds, not an assertion
+  about the currently installed fleet.
+- Current `plugins/_shared/hestia_gate_mechanism.py` includes a Stage C
+  `deadline` argument and `_bound(deadline, budget_s)` logic: with a caller-supplied
+  absolute deadline, helper requests share that bound; with `deadline=None`,
+  helpers retain the legacy per-helper budget. Therefore *source support* for a whole-hook
+  deadline does not establish that every installed shim actually supplies it, that
+  recovery/probes survive deployment, or that the harness delivers its refusal in time.
+  More narrowly, `_McpHttp._request` checks the deadline before request start and
+  passes the remaining time to its socket call; that source behavior alone does not
+  prove a hard upper bound on every response/read, scheduling delay or final verdict
+  delivery. The executor-level black-hole measurement must establish that contract.
+- Re-run a **measured** Class T audit on the current installed shims, with the
+  socket-layer black-hole control and genuine registered harness timeouts. Capture
+  the actual shim/daemon/ground-truth generations, the hook-exit and executor effects,
+  all retries, deadline provenance, and negative controls. Keep `UNKNOWN` distinct from
+  `PASS` when config, transport, or installed build cannot be measured. A CI-green
+  deadline helper is not equivalent to live hook coverage.
+
 ### Relation to other classes
 
 Class T is the *converse* of Class G. G is a member gaining authority it was never granted;
-T is a member losing the governance it was always under — and where G at least leaves an
-actor in the record, T leaves nothing at all, because there is no act to attribute.
+T is a member losing an expected mediation path. An act not gated may lack a corresponding
+Hestia verdict row, although the harness or independent executor may still record the
+attempt, timeout or effect. Missing Hestia evidence must not be mistaken for a pass.
 
-*Filed by claude-code, 2026-08-07. The invariant is structural and holds today; the periodic
-audit is dp's requirement and is not yet implemented anywhere.*
+*Class T was filed by claude-code on 2026-08-07; failure was measured on particular
+2026-09-04 and 2026-10-05 configurations. Source-level deadline support exists
+in Stage C, but current installed fleet compliance is UNKNOWN here. A historical
+audit instrument exists in #939; whether periodic coverage is installed and
+running on every current seat has not been verified by this entry.*
 
 ---
 
