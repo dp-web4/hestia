@@ -291,13 +291,18 @@ def arm_old_or_invalid_cache_is_not_a_measured_zero() -> None:
 
 def arm_missing_performer_or_timezone_is_unknown() -> None:
     prs = [pr(532, "synthetic", "2026-08-01T00:00:00Z")]
-    no_actor = hit(None, "gh pr merge 532 --merge", "2026-08-01T00:00:01Z")
-    no_zone = hit("seat", "gh pr merge 532 --merge", "2026-08-01T00:00:01")
+    no_actor = hit(None, "gh pr merge 532 --repo dp-web4/hestia --merge", "2026-08-01T00:00:01Z")
+    no_zone = hit("seat", "gh pr merge 532 --repo dp-web4/hestia --merge", "2026-08-01T00:00:01")
     merged = seat_merges([no_actor, no_zone], prs, REPO, 300)
     result = census(prs, 200, merged)
     check("missing actor or timezone does not become a measured negative",
           result["performer_status"] == "partial" and result["seat_performed"] is None
           and result["ambiguous_outcomes"] == 2, str(result))
+    no_repo = hit("seat", "gh pr merge 532 --merge", "2026-08-01T00:00:01Z")
+    no_repo_result = seat_merges([no_repo], prs, REPO, 300)
+    check("missing explicit repo is unknown, not attributed to this repo",
+          no_repo_result["corroborated"] == {} and no_repo_result["ambiguous_outcomes"] == 1,
+          str(no_repo_result))
 
 
 # --------------------------------------------------------------------------
@@ -319,7 +324,7 @@ def arm_wrapper_success_needs_a_merge_instant() -> None:
     check("wrapper with expansion is unknown", merge_calls(actual) is None)
     wrapper = 'gh pr merge 532 --squash --delete-branch 2>&1 | tail -5; echo done'
     check("wrapper without expansion is also unknown", merge_calls(wrapper) is None)
-    target = 'gh pr merge 532 --squash --delete-branch'
+    target = 'gh pr merge 532 --repo dp-web4/hestia --squash --delete-branch'
     prs = [pr(532, "x", "2026-08-19T05:00:51Z")]
 
     real = seat_merges([hit("claude-code", target, "2026-08-19T05:00:56Z")],
@@ -344,7 +349,7 @@ def arm_merge_before_the_instant_is_rejected() -> None:
     Sabotage: widen back_slack to the full window and this goes red.
     """
     prs = [pr(700, "x", "2026-08-28T06:00:00Z")]
-    early = seat_merges([hit("kimi-code", "gh pr merge 700 --squash",
+    early = seat_merges([hit("kimi-code", "gh pr merge 700 --repo dp-web4/hestia --squash",
                              "2026-08-28T05:50:00Z")], prs, REPO, window=3600.0)
     check("outcome 10 min BEFORE the instant is rejected",
           early["corroborated"] == {}, str(early))
@@ -379,8 +384,8 @@ def arm_nearest_outcome_wins_over_a_retry() -> None:
     """
     prs = [pr(800, "x", "2026-09-01T00:00:00Z")]
     out = seat_merges(
-        [hit("codex", "gh pr merge 800 --merge", "2026-09-01T00:04:00Z", "far", 2),
-         hit("claude-code", "gh pr merge 800 --merge", "2026-09-01T00:00:03Z", "near", 1)],
+        [hit("codex", "gh pr merge 800 --repo dp-web4/hestia --merge", "2026-09-01T00:04:00Z", "far", 2),
+         hit("claude-code", "gh pr merge 800 --repo dp-web4/hestia --merge", "2026-09-01T00:00:03Z", "near", 1)],
         prs, REPO, window=300.0)
     check("nearest outcome wins", set(out["corroborated"]) == {800}
           and out["corroborated"][800]["seat"] == "claude-code"
@@ -395,7 +400,7 @@ def arm_a_seat_merge_is_reported_against_the_credential() -> None:
     """
     prs = [pr(532, "fix: x", "2026-08-19T05:00:51Z"),
            pr(533, "fix: y", "2026-08-19T06:00:00Z")]
-    merges = seat_merges([hit("claude-code", "gh pr merge 532 --squash",
+    merges = seat_merges([hit("claude-code", "gh pr merge 532 --repo dp-web4/hestia --squash",
                               "2026-08-19T05:00:56Z")], prs, REPO, window=300.0)
     out = census(prs, 200, merges)
     check("candidate reported without asserting who merged",

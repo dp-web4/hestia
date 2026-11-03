@@ -369,6 +369,11 @@ def seat_merges(hits: list[dict], prs: list[dict], repo: str,
             continue
         ambiguous_hit = False
         for number, explicit_repo in hit["calls"]:
+            if explicit_repo is None:
+                # The recorded target does not establish the working directory
+                # or GitHub's repository selection at the time of invocation.
+                ambiguous_hit = True
+                continue
             if explicit_repo and explicit_repo != repo:
                 foreign += 1
                 continue
