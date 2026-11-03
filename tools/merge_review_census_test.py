@@ -339,8 +339,8 @@ def arm_a_seat_merge_is_reported_against_the_credential() -> None:
           and out["rows"][1]["performed_by_seat"] is None, str(out["seat_performed_by"]))
 
 
-def arm_chain_unreadable_leaves_the_review_census_intact() -> None:
-    """The review half must not depend on the daemon being up.
+def arm_empty_chain_leaves_the_review_census_intact() -> None:
+    """An observed empty chain must not affect the review half.
 
     Sabotage: read merges before computing `reviewed` and this goes red when
     the chain is empty.
@@ -348,7 +348,7 @@ def arm_chain_unreadable_leaves_the_review_census_intact() -> None:
     prs = [pr(40, "findings: a", "2026-08-01T00:00:00Z"),
            pr(41, "fix: b", "2026-08-02T00:00:00Z", comments=[("dp-web4", "x" * 300)])]
     out = census(prs, 200, seat_merges([], prs, REPO, window=300.0))
-    check("review census survives an unreadable chain",
+    check("review census survives an empty observed chain",
           out["unreviewed"] == 1 and out["seat_performed"] == 0)
 
 
@@ -372,6 +372,8 @@ def arm_unavailable_chain_is_not_a_zero_performer_count() -> None:
     observed = census(prs, 200, seat_merges([], prs, REPO, window=300.0))
     check("successful empty scan is measured zero", observed.get("performer_status") == "observed"
           and observed.get("seat_performed") == 0 and observed.get("seat_performed_pct") == 0.0)
+    empty = census([], 200, seat_merges([], [], REPO, window=300.0))
+    check("no merged PR denominator is not zero percent", empty.get("seat_performed_pct") is None)
     stdout, stderr = io.StringIO(), io.StringIO()
     with patch.object(sys, "argv", ["census", "--json"]), patch.object(tool, "fetch", return_value=prs), \
             patch.object(tool, "scan_chain", side_effect=OSError("synthetic unavailable")), \
@@ -380,6 +382,39 @@ def arm_unavailable_chain_is_not_a_zero_performer_count() -> None:
     data = json.loads(stdout.getvalue())
     check("CLI retains unknown on scan failure", result == 0 and data.get("performer_status") == "unavailable"
           and data.get("seat_performed") is None and data.get("seat_performed_pct") is None, str(data))
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with patch.object(sys, "argv", ["census"]), patch.object(tool, "fetch", return_value=prs), \
+            patch.object(tool, "scan_chain", side_effect=OSError("synthetic unavailable")), \
+            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        result = tool.main()
+    check("text output labels unavailable without a zero count", result == 0
+          and "performer evidence unavailable" in stdout.getvalue()
+          and "temporally associated seat-merge candidates:" not in stdout.getvalue(), stdout.getvalue())
+
+
+def arm_missing_authors_and_known_bot_accounts_are_not_human_discussion() -> None:
+    merged = "2026-08-01T12:00:00Z"
+    def item(number, author, body, edited=False):
+        row = pr(number, "fix: synthetic", merged)
+        row["comments"] = [{"author": author, "body": body, "includesCreatedEdit": edited,
+                            "createdAt": "2026-08-01T11:00:00Z"}]
+        return row
+
+    post_merge = item(7, None, "x" * 300)
+    post_merge["comments"][0]["createdAt"] = "2026-08-01T13:00:00Z"
+    unknown_time = item(8, None, "x" * 300)
+    unknown_time["comments"][0]["createdAt"] = None
+    review = pr(9, "fix: synthetic", merged)
+    review["reviews"] = [{"author": None, "body": "x" * 300, "submittedAt": "2026-08-01T11:00:00Z"}]
+    examples = [item(1, None, "x" * 300), item(2, {}, "x" * 300),
+                item(3, {"login": "automation[bot]"}, "x" * 300),
+                item(4, {"login": "automation", "__typename": "Bot"}, "x" * 300),
+                item(5, {"login": "reviewer"}, "x" * 300),
+                item(6, None, "short", True), post_merge, unknown_time, review]
+    result = census(examples, 200, {})
+    states = [row["reviewed"] for row in result["rows"]]
+    check("missing author is unknown and known bots do not count",
+          states == [None, None, False, False, True, None, False, None, None], str(states))
 
 
 def arm_review_timing_is_evidence_not_an_assumption() -> None:

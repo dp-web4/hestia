@@ -227,10 +227,25 @@ def scan_chain(max_entries: int, cache: Path | None) -> list[dict]:
     return found
 
 
+def _author_class(item: dict) -> str:
+    """Classify known bots, identifiable logins, and missing attribution.
+
+    A non-bot-looking login is not proof of a human or independent reviewer.
+    """
+    author = item.get("author")
+    if not isinstance(author, dict):
+        return "unknown"
+    login = author.get("login")
+    if (author.get("__typename") == "Bot" or author.get("is_bot") is True or
+            (isinstance(login, str) and (login.casefold() in BOT_LOGINS or login.casefold().endswith("[bot]")))):
+        return "bot"
+    return "identified" if isinstance(login, str) and login.strip() else "unknown"
+
+
 def _substantive(items, min_body: int) -> list[dict]:
     out = []
     for it in items or []:
-        if ((it.get("author") or {}).get("login")) in BOT_LOGINS:
+        if _author_class(it) != "identified":
             continue
         if len(it.get("body") or "") > min_body:
             out.append(it)
@@ -247,7 +262,8 @@ def _before_merge(items, min_body: int, merged_at: str, time_key: str):
     """
     prior, unknown = [], []
     for item in items or []:
-        if ((item.get("author") or {}).get("login")) in BOT_LOGINS:
+        author = _author_class(item)
+        if author == "bot":
             continue
         substantive = len(item.get("body") or "") > min_body
         if not substantive and not item.get("includesCreatedEdit"):
@@ -261,7 +277,7 @@ def _before_merge(items, min_body: int, merged_at: str, time_key: str):
         except (AttributeError, TypeError, ValueError):
             unknown.append(item)
             continue
-        if instant == merged or (instant < merged and item.get("includesCreatedEdit")):
+        if instant == merged or (instant < merged and (item.get("includesCreatedEdit") or author == "unknown")):
             unknown.append(item)
         elif instant < merged:
             prior.append(item)
@@ -349,8 +365,11 @@ def fetch(repo: str, limit: int) -> list[dict]:
     return json.loads(subprocess.run(cmd, capture_output=True, text=True, check=True).stdout)
 
 
-def census(prs: list[dict], min_body: int, merges: dict) -> dict:
-    corroborated = merges.get("corroborated") or {}
+def census(prs: list[dict], min_body: int, merges: dict | None) -> dict:
+    # None means the source could not be observed; an empty mapping is a
+    # successful observation with no matches. Neither proves who merged.
+    performer_observed = merges is not None
+    corroborated = (merges.get("corroborated") or {}) if performer_observed else {}
     rows = []
     for p in prs:
         if not p.get("mergedAt"):
@@ -415,16 +434,17 @@ def census(prs: list[dict], min_body: int, merges: dict) -> dict:
         "distinct_mergedBy": sorted({r["mergedBy"] for r in rows if r["mergedBy"]}),
         # The headline the credential cannot show: how many of these one GitHub
         # identity's merges were actually performed by a seat.
-        "seat_performed": len(seated),
-        "seat_performed_pct": round(100 * len(seated) / n, 1) if n else 0.0,
-        "seat_performed_by": dict(sorted(by_seat.items())),
-        "seat_performed_numbers": sorted(r["number"] for r in seated),
+        "performer_status": "observed" if performer_observed else "unavailable",
+        "seat_performed": len(seated) if performer_observed else None,
+        "seat_performed_pct": round(100 * len(seated) / n, 1) if performer_observed and n else None,
+        "seat_performed_by": dict(sorted(by_seat.items())) if performer_observed else None,
+        "seat_performed_numbers": sorted(r["number"] for r in seated) if performer_observed else None,
         "median_corroboration_gap_s": gaps[len(gaps) // 2] if gaps else None,
         # Successful merge COMMANDS with no merge instant near them. Not noise:
         # this is the bucket a wrapper-masked failure falls into, and it is the
         # reason `success: true` alone is not evidence of a merge.
-        "uncorroborated_commands": len(merges.get("uncorroborated") or []),
-        "foreign_repo_commands": merges.get("foreign_repo", 0),
+        "uncorroborated_commands": len(merges.get("uncorroborated") or []) if performer_observed else None,
+        "foreign_repo_commands": merges.get("foreign_repo", 0) if performer_observed else None,
         "rows": rows,
     }
 
@@ -456,8 +476,8 @@ def main() -> int:
         print(f"chain unreadable ({exc.__class__.__name__}: {exc}); "
               f"performer census SKIPPED — review census still valid",
               file=sys.stderr)
-        hits = []
-    merges = seat_merges(hits, prs, args.repo, args.merge_window)
+        hits = None
+    merges = seat_merges(hits, prs, args.repo, args.merge_window) if hits is not None else None
     out = census(prs, args.min_body, merges)
 
     if args.json:
@@ -482,8 +502,12 @@ def main() -> int:
     print(f"  code-class:     {out['code_class']}, no discussion {out['code_unreviewed']}, "
           f"timing unknown {out['code_timing_unknown']}")
     print(f"  distinct mergedBy identities: {out['distinct_mergedBy']}")
+    if out["performer_status"] == "unavailable":
+        print("  performer evidence unavailable (not a measured zero)")
+        return 0
+    percentage = f"{out['seat_performed_pct']}%" if out["seat_performed_pct"] is not None else "n/a"
     print(f"  temporally associated seat-merge candidates: {out['seat_performed']} "
-          f"({out['seat_performed_pct']}%) {out['seat_performed_by']}")
+          f"({percentage}) {out['seat_performed_by']}")
     gap = out["median_corroboration_gap_s"]
     print(f"    corroborated within {args.merge_window:.0f}s of the merge instant; "
           f"median gap {f'{gap}s' if gap is not None else 'n/a (none found)'}")
