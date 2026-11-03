@@ -41,7 +41,9 @@ if ov:
             spec.loader.exec_module(mod)
 os.chdir(wt)
 src = open(test, encoding="utf-8").read()
-if '__name__ == "__main__"' in src or "__name__ == '__main__'" in src:
+# A script runs as a script: a __main__ guard, or top-level rows with no pytest test_ function at all
+# (#1464's endpoint_fallback_test.py) — pytest collects nothing from those and reports "no tests ran".
+if '__name__ == "__main__"' in src or "__name__ == '__main__'" in src or "def test_" not in src:
     sys.argv = [test]
     runpy.run_path(test, run_name="__main__")
 else:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 2d38c2591880ad7a703c4db83f86ff4c7ac642259029d7bc022898460c61a4bf  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -1236,8 +1236,11 @@ def _fetch_policy_snapshot_uncached(plugin_id: str, host_agent: Optional[str],
             if isinstance(grant, dict):
                 snap["operator_grant"] = grant
         stage = "scope_status"
+        # The session goes with the read (hestia #1450 phase 0): scope_status returns this member's grants
+        # and request history, and a daemon that binds the read to its caller answers only for the member
+        # whose session asks. This is the session hestia_operating_law was just sent.
         scope = _unwrap_tool_result(
-            client.call_tool("hestia_scope_status", {"plugin_id": plugin_id}))
+            client.call_tool("hestia_scope_status", {"plugin_id": plugin_id, "session_id": session_id}))
         if isinstance(scope, dict) and "_hestia_error" not in scope:
             grants = scope.get("live_grants")
             if isinstance(grants, list):
