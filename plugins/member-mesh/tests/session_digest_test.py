@@ -104,6 +104,24 @@ class DigestTests(unittest.TestCase):
         self.assertIn('may repeat', text)
         self.assertIn('"id": 1,', self.call(rows=[notice()])[0])
 
+    def test_failed_emit_does_not_suppress_the_queued_notice(self):
+        # A successful peek or cursor write is not a delivered hook response.
+        # Simulate output failure after the snapshot has been selected, without
+        # draining the synthetic inbox; either exit or error is acceptable here.
+        payload = dict(hook_event_name='UserPromptSubmit', session_id='session-a', agent_id='')
+        with patch.object(d.sys, 'stdin', io.StringIO(json.dumps(payload))), \
+                patch.object(d, 'peek', return_value=[notice()]) as peek, \
+                patch.object(d, 'emit', side_effect=OSError('synthetic output failure')), \
+                patch.object(d.time, 'time', return_value=1000):
+            try:
+                d.main()
+            except OSError:
+                pass
+        self.assertEqual(peek.call_count, 1)
+        text, calls = self.call(rows=[notice()], now=1031)
+        self.assertEqual(calls, 1)
+        self.assertIn('"id": 1,', text)
+
     def test_peek_and_fallback_save_failure_still_one_unknown(self):
         with patch.object(d, 'write_state', side_effect=OSError('disk full')):
             text, _ = self.call(error=RuntimeError('daemon unavailable'))
