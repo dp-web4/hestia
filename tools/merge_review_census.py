@@ -75,7 +75,9 @@ a defect codex demonstrated:
      deliberately loses recall; syntax alone does not prove execution.
 
   2. OUTCOME, SUCCESS, NO ERROR. Only `outcome` entries with `success is True`
-     and a null `error` count. v2 accepted an entry with NO `success` key at
+     and a null `error` become candidates. Failed, malformed or unknown outcomes
+     are unknown rather than proof that an attempted effect did not happen.
+     v2 accepted an entry with NO `success` key at
      all, which meant `policy_decision` events — records of a merge the gate
      BLOCKED — were counted as merges performed.
 
@@ -138,11 +140,11 @@ def _epoch(ts: str) -> float:
     return instant.timestamp()
 
 
-_CACHE_SCHEMA = "merge-candidates-direct-only-v3"
+_CACHE_SCHEMA = "merge-candidates-failed-unknown-v4"
 
 
 def scan_chain(max_entries: int, cache: Path | None) -> list[dict]:
-    """Every successful `outcome` entry whose target merges something.
+    """Candidate successful outcomes plus a count of unclassifiable outcomes.
 
     Walking 230k entries costs ~6 minutes at ~1.6 ms/hop, so the scan is
     cacheable. The versioned cache holds candidate metadata and an aggregate

@@ -261,6 +261,8 @@ def arm_ambiguous_shell_text_is_not_attributed() -> None:
         check("ambiguous target remains unknown", merge_calls(target) is None, repr(target))
     quoted = "printf 'example:\ngh pr merge 532 --merge\n'"
     check("multiline quoted data is unknown", merge_calls(quoted) is None, str(merge_calls(quoted)))
+    check("non-ASCII numeric text stays unknown", merge_calls("gh pr merge ²") is None)
+    check("oversized numeric text stays unknown", merge_calls("gh pr merge " + "9" * 5000) is None)
     hits = [{"calls": None, "ambiguous_count": 2}]
     merged = seat_merges(hits, [pr(532, "synthetic", "2026-08-01T00:00:00Z")], REPO, 300)
     report = census([pr(532, "synthetic", "2026-08-01T00:00:00Z")], 200, merged)
@@ -279,10 +281,16 @@ def arm_supplied_records_are_classified_without_acquiring_a_chain() -> None:
         {"eventType": "outcome", "eventData": {"success": True, "target": "printf ';' gh pr merge 42"}},
         {"eventType": "policy_decision", "eventData": {"success": True, "target": "gh pr merge 43"}},
         {"eventType": "outcome", "eventData": {"success": False, "target": "gh pr merge 44"}},
+        {"eventType": "outcome", "eventData": {"success": True, "error": "synthetic",
+                                               "target": "gh pr merge 45"}},
+        {"eventType": "outcome", "eventData": {"target": "gh pr merge 46"}},
+        {"eventType": "outcome", "eventData": {"success": True, "target": 123}},
+        {"eventType": "outcome", "eventData": "malformed"},
     ]
     hits = classify_outcomes(iter(entries))
     check("one supplied direct candidate", len(hits) == 2 and hits[0]["calls"] == [[42, "example/repo"]], str(hits))
-    check("ambiguous supplied outcome remains unknown", hits[-1] == {"calls": None, "ambiguous_count": 1}, str(hits))
+    check("failed, malformed and ambiguous outcomes remain unknown",
+          hits[-1] == {"calls": None, "ambiguous_count": 6}, str(hits))
     check("raw target text is not retained", all("target" not in hit for hit in hits), str(hits))
 
 
@@ -293,6 +301,7 @@ def arm_old_or_invalid_cache_is_not_a_measured_zero() -> None:
     with tempfile.TemporaryDirectory() as directory:
         cache = Path(directory) / "synthetic.json"
         for content in ([], {"schema": "merge-candidates-unknown-shell-v2", "hits": []},
+                        {"schema": "merge-candidates-direct-only-v3", "hits": []},
                         {"schema": _CACHE_SCHEMA, "hits": [{"calls": None, "ambiguous_count": -1}]}):
             cache.write_text(json.dumps(content))
             try:

@@ -15,7 +15,7 @@ from collections.abc import Iterable
 _GH, _PR, _MERGE = "gh", "pr", "merge"
 
 
-def merge_calls(target: str) -> list[tuple[int, str | None]] | None:
+def merge_calls(target: object) -> list[tuple[int, str | None]] | None:
     """Recognize a simple direct candidate; everything else is unknown.
 
     shlex discards quote provenance, so its punctuation tokens cannot safely
@@ -23,7 +23,8 @@ def merge_calls(target: str) -> list[tuple[int, str | None]] | None:
     lexing. This intentionally sacrifices recall and is not a shell parser.
     A candidate, even with a matching timestamp, does not prove execution.
     """
-    target = target or ""
+    if not isinstance(target, str):
+        return None
     if any(marker in target for marker in ("$", "`", "#", "\\", "\n", "\r", ";", "&", "|", "(", ")", "<", ">", "*", "?", "[", "]", "{", "}", "~")):
         return None
     try:
@@ -35,7 +36,8 @@ def merge_calls(target: str) -> list[tuple[int, str | None]] | None:
 
 
 def _merge_in_segment(seg: list[str]) -> list[tuple[int, str | None]]:
-    if len(seg) < 4 or seg[:3] != [_GH, _PR, _MERGE] or not seg[3].isdigit():
+    if (len(seg) < 4 or seg[:3] != [_GH, _PR, _MERGE]
+            or len(seg[3]) > 20 or not seg[3].isascii() or not seg[3].isdigit()):
         return []
     repo = None
     flags = {"--merge", "--squash", "--rebase", "--delete-branch",
@@ -65,16 +67,25 @@ def classify_outcomes(entries: Iterable[dict]) -> list[dict]:
     found: list[dict] = []
     ambiguous = 0
     for entry in entries:
+        if not isinstance(entry, dict):
+            ambiguous += 1
+            continue
         if entry.get("eventType") != "outcome":
             continue
-        data = entry.get("eventData") or {}
-        if data.get("success") is not True or data.get("error"):
+        data = entry.get("eventData")
+        if not isinstance(data, dict):
+            ambiguous += 1
             continue
-        calls = merge_calls(data.get("target") or "")
+        calls = merge_calls(data.get("target"))
         if calls is None:
             ambiguous += 1
             continue
         if calls == []:
+            continue
+        if data.get("success") is not True or data.get("error"):
+            # A failed/unknown response does not prove that the effect did not
+            # occur before a transport or post-effect failure.
+            ambiguous += 1
             continue
         found.append({
             "action_id": data.get("action_id"),
