@@ -30,6 +30,7 @@ pub mod channel;
 mod state;
 pub mod state_lock;
 pub mod published;
+pub mod verdict_feedback;
 
 pub use dashboard::{
     ActivityStats, DashboardSnapshot, DeploymentHealth, RecentEntry, SocietyView, TrustView,
