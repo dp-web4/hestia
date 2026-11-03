@@ -605,7 +605,13 @@ fn reask_split(groups: Vec<Vec<&Req>>) -> Value {
                         within_10m += 1;
                     }
                 }
-                (Some(position), _, _) if position > next_position => after_unruled += 1,
+                (Some(position), Some(ruled), Some(next)) if position > next_position => {
+                    if ruled < next {
+                        timing_unknown += 1; // clock places this later witness before the ask
+                    } else {
+                        after_unruled += 1;
+                    }
+                }
                 (None, None, Some(_)) => after_unruled += 1,
                 _ => timing_unknown += 1,
             }
@@ -943,6 +949,22 @@ mod tests {
         assert_eq!(clock["by_outcome_of_first_ask"]["granted"], 1);
         assert_eq!(clock["previous_ruling_order_unknown"], 1);
         assert_eq!(clock["within_10_min_of_previous_ruling"], 0);
+
+        let mut earlier = req("c", 100, "granted", Some(300));
+        let mut later = req("c", 200, "open", None);
+        earlier.opened_position = Some(1);
+        earlier.ruled_position = Some(2);
+        later.opened_position = Some(3); // rule witness before next ask, but clock says after
+        let contradiction = reask_split(vec![vec![&earlier, &later]]);
+        assert_eq!(contradiction["previous_ruling_order_unknown"], 1);
+        assert_eq!(contradiction["within_10_min_of_previous_ruling"], 0);
+        earlier.ruled_position = Some(4); // witness after the ask, clock still says after: consistent
+        let consistent = reask_split(vec![vec![&earlier, &later]]);
+        assert_eq!(consistent["previous_request_unruled"], 1);
+        earlier.ruled_at = DateTime::<Utc>::from_timestamp(150, 0); // now clock says before
+        let contradiction = reask_split(vec![vec![&earlier, &later]]);
+        assert_eq!(contradiction["previous_ruling_order_unknown"], 1);
+        assert_eq!(contradiction["previous_request_unruled"], 0);
     }
 
     #[test]
