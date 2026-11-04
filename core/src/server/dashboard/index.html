@@ -2253,11 +2253,12 @@
     ungovernable:   'installed, no hestia adapter exists yet',
     governed:       'installed, wired, and the wiring resolves',
     dormant_plugin: 'adapter ready; this harness is not installed here',
+    windows_host:   'installed on the Windows host; this WSL seat cannot gate it',
     unprovisioned_being: 'a being is here, but no launcher this inventory can read runs it as a member',
     unknown:        'the inventory could not establish this member\'s coverage',
   };
-  const GOV_SEVERITY = { miswired: 'red', partial: 'amber', ungoverned: 'amber', ungovernable: 'amber', unprovisioned_being: 'amber', unknown: 'amber', governed: 'green', dormant_plugin: 'grey' };
-  const GOV_LABEL = { miswired: 'MISWIRED — fails open', partial: 'partial — not enforced', ungoverned: 'not wired', ungovernable: 'no adapter yet', unprovisioned_being: 'being not provisioned', unknown: 'coverage unknown', governed: 'governed', dormant_plugin: 'not installed here' };
+  const GOV_SEVERITY = { miswired: 'red', partial: 'amber', ungoverned: 'amber', ungovernable: 'amber', unprovisioned_being: 'amber', windows_host: 'amber', unknown: 'amber', governed: 'green', dormant_plugin: 'grey' };
+  const GOV_LABEL = { miswired: 'MISWIRED — fails open', partial: 'partial — not enforced', ungoverned: 'not wired', ungovernable: 'no adapter yet', unprovisioned_being: 'being not provisioned', windows_host: 'on Windows host — not gated', unknown: 'coverage unknown', governed: 'governed', dormant_plugin: 'not installed here' };
   let govByAgent = {};   // plugin_id -> coverage state, from /api/agents
   async function loadGovernance() {
     try {
@@ -5289,6 +5290,11 @@
     // no plugin exists" would send the operator to build an adapter nobody needs.
     { key: 'unprovisioned_being', tone: 'amber', title: 'A being’s daemon is here, and nothing launches it as a member',
       remedy: 'Cognition may be running; nothing acts under governance. Provision it: mint its identity on this host, join, have the operator admit it, then install the heartbeat unit that starts its gateway with --member <machine>-being.' },
+    // hestia#1495: found through a WSL drive mount (e.g. codex.exe). It is here and acting on this
+    // machine, so it is not "not installed"; and its Windows config is not this seat's, so a
+    // register button would mint a member nothing gates.
+    { key: 'windows_host', tone: 'amber', title: 'Installed on the Windows host — this WSL seat cannot govern it',
+      remedy: 'The Windows copy reads its own Windows config and cannot run this seat’s hooks. To govern it today, install the same harness inside WSL (for Codex: npm i -g @openai/codex), then rescan: it will appear as ungoverned with a register button. Governing the Windows copy itself is tracked in hestia#1495.' },
     { key: 'miswired_3p', tone: 'amber', title: "A third party's gate is dead",
       remedy: 'Not hestia’s gate and not ours to rewrite, but the harness is failing open on it.' },
     { key: 'governed', tone: 'green', title: 'Governed', remedy: '' },
@@ -5456,7 +5462,7 @@
       governanceId: x.member || x.plugin || '',
       name: a.harness || id,
       installed: !!x.installed,
-      executable: x.executable || '',
+      executable: x.executable || x.windows_host_executable || '',
       configs: Array.isArray(x.configs_read) ? x.configs_read.length : 0,
       failure,
       blocking: Array.isArray(a.blocking_events) ? a.blocking_events : [],
