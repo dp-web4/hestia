@@ -1297,6 +1297,7 @@ impl ServerState {
         if self.vault.policy().operator_access_bootstrapped() {
             return Ok(None); // window shut — no re-entry
         }
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let kp = web4_core::crypto::KeyPair::generate();
         let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
@@ -1330,9 +1331,12 @@ impl ServerState {
             serde_json::to_vec_pretty(&cred).unwrap_or_default(),
         )
         .map_err(|e| anyhow::anyhow!("writing operator.key: {e}"))?;
-        let mut perms = std::fs::metadata(&key_path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&key_path, perms)?;
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&key_path)?.permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&key_path, perms)?;
+        }
 
         let mut policy = self.vault.policy().clone();
         policy.operator_access.push(crate::vault::OperatorIdentity {

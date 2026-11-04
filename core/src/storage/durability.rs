@@ -282,11 +282,20 @@ impl Durability {
         }
     }
 
+    /// Open a file so it can be flushed. Windows' FlushFileBuffers needs write access;
+    /// a read-only handle fails with "Access is denied" (os error 5).
+    fn open_for_sync(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        #[cfg(windows)]
+        { std::fs::OpenOptions::new().read(true).write(true).open(path) }
+        #[cfg(not(windows))]
+        { std::fs::File::open(path) }
+    }
+
     fn fsync_files(&self) -> Result<()> {
         if self.fail_next_sync.swap(false, Ordering::AcqRel) {
             return Err(anyhow!("injected fsync failure"));
         }
-        match std::fs::File::open(&self.wal_path) {
+        match Self::open_for_sync(&self.wal_path) {
             Ok(f) => {
                 f.sync_data()?;
                 // A freshly created WAL needs its directory entry durable too.
@@ -302,7 +311,7 @@ impl Durability {
             // No WAL file: everything committed is already in the main database (a
             // checkpoint truncated it); sync that instead.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::File::open(&self.db_path)?.sync_data()?;
+                Self::open_for_sync(&self.db_path)?.sync_data()?;
             }
             Err(e) => return Err(e.into()),
         }

@@ -171,25 +171,28 @@ fn acquire_platform_lock(lock_path: &Path) -> Result<WriterLease> {
     })
 }
 
+// A real OS lock (LockFileEx on Windows), released by the OS when the process dies. The old
+// branch used "the file exists" as the lock, so a killed daemon locked the vault for good.
 #[cfg(not(unix))]
 fn acquire_platform_lock(lock_path: &Path) -> Result<WriterLease> {
-    let file = match OpenOptions::new()
-        .create_new(true)
+    let file = OpenOptions::new()
+        .create(true)
         .read(true)
         .write(true)
         .open(lock_path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        .map_err(|e| CoreError::io(lock_path, e))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
             return Err(CoreError::VaultWriterBusy(lock_path.to_path_buf()));
         }
-        Err(e) => return Err(CoreError::io(lock_path, e)),
-    };
+        Err(std::fs::TryLockError::Error(e)) => return Err(CoreError::io(lock_path, e)),
+    }
 
     Ok(WriterLease {
         _file: file,
         path: lock_path.to_path_buf(),
-        remove_on_drop: true,
+        remove_on_drop: false,
     })
 }
 
