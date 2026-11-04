@@ -5294,7 +5294,7 @@
     // machine, so it is not "not installed"; and its Windows config is not this seat's, so a
     // register button would mint a member nothing gates.
     { key: 'windows_host', tone: 'amber', title: 'Installed on the Windows host — this WSL seat cannot govern it',
-      remedy: 'The Windows copy reads its own Windows config and cannot run this seat’s hooks. To govern it today, install the same harness inside WSL (for Codex: npm i -g @openai/codex), then rescan: it will appear as ungoverned with a register button. Governing the Windows copy itself is tracked in hestia#1495.' },
+      remedy: 'The Windows copy reads its own Windows config, and hestia does not wire Windows-side hooks yet. The goal is one hestia governing both sides (hestia#1495). Interim workaround: install the same harness inside WSL (for Codex: npm i -g @openai/codex), then rescan: it will appear as ungoverned with a register button.' },
     { key: 'miswired_3p', tone: 'amber', title: "A third party's gate is dead",
       remedy: 'Not hestia’s gate and not ours to rewrite, but the harness is failing open on it.' },
     { key: 'governed', tone: 'green', title: 'Governed', remedy: '' },
