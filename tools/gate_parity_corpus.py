@@ -13,9 +13,20 @@ exists to pin exactly those). Expected values are read from the law as shipped o
 not from what any seat happens to do — mismatches against them are findings, not edits to
 this file.
 
+The six-field row keeps that shipped-law expectation. A harness using a neutral daemon
+must explicitly select the separate `neutral-stub` oracle with `expected_for`; the override
+does not change the law expectation or establish that the real daemon enforces it.
+
 Verdict classes: allow | warn | deny (with rule family noted where load-bearing).
 """
 from __future__ import annotations
+
+LAW_ORACLE = "shipped-law"
+NEUTRAL_STUB_ORACLE = "neutral-stub"
+
+# The neutral daemon has no destructive-command policy. Its answer is a harness condition,
+# not a change to the shipped-law acceptance fence in CORPUS.
+NEUTRAL_STUB_EXPECTED = {"destructive-rm-chained": "allow"}
 
 # (id, class tag, tool, tool_input, expected, note)
 CORPUS = [
@@ -86,7 +97,7 @@ CORPUS = [
      "allow", "FP17: a substitution wrapping a read"),
     ("closure-fp18-xargs-read", "closure-fp", "Bash",
      {"command": "echo {REPO}/plugins/_shared/hestia_gate_core.py | xargs grep -c def"},
-     "allow", "FP18: xargs over a read (see #628: xargs with a write is ALSO read today)"),
+     "deny:scope", "TIGHTENING: xargs builds argv from stdin, so mrh.command.unenumerated refuses it; literal reads stay allowed"),
     ("closure-case-arm-write", "closure", "Bash",
      {"command": "case x in a) grep -c def {REPO}/plugins/_shared/hestia_gate_core.py;; "
                  "b) cp /tmp/evil {REPO}/plugins/_shared/hestia_gate_core.py;; esac"},
@@ -101,7 +112,7 @@ CORPUS = [
     # --- destructive preset: the two rm shapes the law distinguishes ---
     ("destructive-rm-chained", "destructive", "Bash",
      {"command": "cd {SCRATCH} && rm -rf out"}, "deny:safety-preset",
-     "chained rm outside /tmp"),
+     "the safety preset denies this chained, relative rm even when SCRATCH is under /tmp; the neutral-stub oracle expects allow and does not measure daemon-side law"),
     ("destructive-rm-standalone-tmp", "destructive", "Bash",
      {"command": "rm -rf /tmp/gate-parity-probe"}, "allow",
      "standalone rm against an absolute /tmp path — the allow rule's exact shape"),
@@ -147,3 +158,12 @@ CORPUS = [
 
 # Placeholders the runner substitutes per seat: {REPO} the governed checkout, {SCRATCH} a
 # writable scratch dir, {HOME} the seat home, {SELF} the seat's plugin id.
+
+
+def expected_for(act, *, oracle: str) -> str:
+    """Select an explicit oracle without changing the row's shipped-law contract."""
+    if oracle == LAW_ORACLE:
+        return act[4]
+    if oracle == NEUTRAL_STUB_ORACLE:
+        return NEUTRAL_STUB_EXPECTED.get(act[0], act[4])
+    raise ValueError(f"unknown parity oracle: {oracle!r}")

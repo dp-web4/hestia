@@ -20,9 +20,11 @@ What is measured is therefore each shim's LOCAL decision surface (closure classi
 scope/egress law, degraded posture, emit contract) with the daemon layer present but
 neutralized. Consequences, stated so the table is read honestly:
 
-  * Rows whose expected verdict is produced DAEMON-SIDE (the destructive preset — e.g.
-    `cd X && rm -rf out`) measure `allow` on every seat here and flag as
-    expected-mismatches. That is a stub limitation, not four gate bugs.
+  * Rows whose refusal is produced DAEMON-SIDE (the destructive preset — e.g.
+    `cd X && rm -rf out`) select `allow` from the explicit `neutral-stub` oracle here.
+    The corpus's six-field row retains the shipped-law denial. The report carries both
+    `expected` and `law_expected`, names the oracle, and marks real-daemon validation
+    skipped: this matrix does not measure that daemon-side law.
   * `degraded` marks a fail-closed-NO-VERDICT cell (config.unbacked, no-shared-authority,
     [fail-closed], [degraded], a crash, a timeout, one of the gate's no-verdict rules —
     gate.harness_timeout_unknown "was not judged", gate.internal_error,
@@ -77,7 +79,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 TOOLS = REPO / "tools"
 sys.path.insert(0, str(TOOLS))
-from gate_parity_corpus import CORPUS  # noqa: E402
+from gate_parity_corpus import (  # noqa: E402
+    CORPUS, LAW_ORACLE, NEUTRAL_STUB_ORACLE, expected_for,
+)
 
 # The seat projection fixture: renders exactly what the daemon would render for a seat
 # ($HESTIA_HOME/seats/<plugin>.env) so projection-consuming shims get the real shape.
@@ -320,7 +324,7 @@ _FAMILY_RULES = [
     (re.compile(r"governance-closure-[a-z-]+"), "governance-closure"),
     (re.compile(r"\[gate-self(?:-access)?\]|gate\.self_access|gate_self_access"),
      "governance-closure"),
-    (re.compile(r"\[(egress\.secret|mrh\.(?:path|command|repo))\]"), "scope"),
+    (re.compile(r"\[(egress\.secret|mrh\.(?:path|command|repo)(?:\.[a-z0-9_-]+)?)\]"), "scope"),
     (re.compile(r"\[scope\]"), "scope"),
     (re.compile(r"\[safety\]|society[.-]safety|society\.safety"), "safety-preset"),
 ]
@@ -335,7 +339,7 @@ _DEGRADED_RE = re.compile(
 _WARN_RE = re.compile(r"hestia: warn|would-deny \(audit-only\)")
 _RULE_ID_RE = re.compile(
     r"governance-closure-[a-z-]+|gate-self-access|gate\.self_access|egress\.secret|"
-    r"mrh\.(?:path|command|repo)|society\.[a-z]+|gate\.degraded")
+    r"mrh\.(?:path|command|repo)(?:\.[a-z0-9_-]+)?|society\.[a-z]+|gate\.degraded")
 
 
 def _stdout_deny_payload(stdout: str) -> bool:
@@ -536,9 +540,13 @@ def run_shim(shim_path: Path, event: dict, env: dict, cwd: Path, timeout: float)
 
 
 def run_matrix(seats: list[str], acts: list, timeout: float) -> dict:
+    # This harness always starts StubDaemon. It must never select the law oracle while
+    # reporting a neutral daemon's verdicts as evidence of real-daemon enforcement.
+    oracle = NEUTRAL_STUB_ORACLE
     report: dict = {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "repo": str(REPO), "workspace": WORKSPACE, "shared_dir": SHARED_DIR,
-                    "probe_home": PROBE_HOME, "seats": seats, "cells": {}, "rows": []}
+                    "probe_home": PROBE_HOME, "seats": seats, "cells": {}, "rows": [],
+                    "oracle": oracle, "law_oracle": LAW_ORACLE, "real_daemon_tested": False}
     with tempfile.TemporaryDirectory(prefix="gate-parity-") as tmp:
         root = Path(tmp)
         scratch = build_scratch(root)
@@ -581,9 +589,10 @@ def run_matrix(seats: list[str], acts: list, timeout: float) -> dict:
             report["stub_requests"] = stub.summary()
             report["seats_without_daemon_contact"] = no_contact
     for act in acts:
-        act_id, act_class, tool, _ti, expected, note = act
+        act_id, act_class, tool, _ti, law_expected, note = act
+        expected = expected_for(act, oracle=oracle)
         row = {"id": act_id, "class": act_class, "tool": tool, "expected": expected,
-               "note": note, "seats": {}}
+               "law_expected": law_expected, "note": note, "seats": {}}
         for seat in seats:
             cell = report["cells"][f"{act_id}|{seat}"]
             row["seats"][seat] = {"verdict": cell["verdict"], "rule": cell["rule"],
@@ -620,6 +629,8 @@ def print_report(report: dict) -> None:
     print(f"gate parity — {len(report['rows'])} acts x {len(seats)} seats "
           f"(stub daemon: {sum(report['stub_requests'].values())} requests served)")
     print(f"repo: {report['repo']}   workspace: {report['workspace']}")
+    print(f"oracle: {report['oracle']}   law oracle: {report['law_oracle']}")
+    print("real-daemon validation: skipped (neutral stub only)")
     no_contact = report.get("seats_without_daemon_contact") or []
     if no_contact:
         print(f"!! BROKEN HARNESS: {', '.join(no_contact)} never contacted the stub daemon "
@@ -632,6 +643,8 @@ def print_report(report: dict) -> None:
     mismatches: list[str] = []
     for row in report["rows"]:
         flags = []
+        if row["expected"] != row["law_expected"]:
+            flags.append(f"expected={row['expected']},law_expected={row['law_expected']}")
         if row["diverged"]:
             n_diverge += 1
             flags.append("DIVERGES")
