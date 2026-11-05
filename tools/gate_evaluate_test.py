@@ -50,6 +50,7 @@ class _Stub(http.server.BaseHTTPRequestHandler):
     method and tool it is asked, so anything the belt fails to stop is seen here."""
 
     asked: list = []
+    connect_args: list = []
     ws: str = ""
 
     def log_message(self, *a):
@@ -60,6 +61,8 @@ class _Stub(http.server.BaseHTTPRequestHandler):
         method = body.get("method")
         name = (body.get("params") or {}).get("name") if method == "tools/call" else method
         _Stub.asked.append(name)
+        if name == "hestia_connect":
+            _Stub.connect_args.append((body.get("params") or {}).get("arguments") or {})
         if "id" not in body:
             self.send_response(202)
             self.end_headers()
@@ -113,6 +116,7 @@ def main() -> int:
                                              "fetch_policy_snapshot")}
     import urllib.request
     urlopen_before = urllib.request.urlopen
+    call_tool_before = m._McpHttp.call_tool
     daemon(ws)
     reads = ge.READ_TOOLS
 
@@ -156,6 +160,9 @@ def main() -> int:
     check("closure_read_passes_to_law", out["rule"] != "gate.self_access", out)
     check("closure_read_witnessed_nothing", set(asked) <= reads, asked)
     check("closure_read_no_refused_side_effect", out["refused_side_effects"] == [], out)
+    check("every_snapshot_connect_is_dry_run",
+          _Stub.connect_args and all(a.get("dry_run") is True for a in _Stub.connect_args),
+          _Stub.connect_args)
 
     # The belt, at the wire: a write tool posted the way `scope_call` posts it (raw urllib, not
     # the mechanism's client) is refused before it is sent, and the daemon never sees it.
@@ -174,7 +181,20 @@ def main() -> int:
             pass
         check("belt_records_the_refusal", rec["refused_calls"] == ["hestia_request_scope"], rec)
     check("belt_never_reached_the_daemon", "hestia_request_scope" not in _Stub.asked, _Stub.asked)
+    with ge._dry(m, ge.load_gate()[0]) as rec:
+        req = urllib.request.Request(endpoint, data=json.dumps(
+            {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+             "params": {"name": "hestia_connect", "arguments": {}}}).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            check("belt_refuses_non_dry_connect", False, "the call went through")
+        except ge.SideEffectRefused:
+            pass
+        check("belt_records_non_dry_connect", rec["refused_calls"] == ["hestia_connect without dry_run"], rec)
+    check("non_dry_connect_never_reached_the_daemon", "hestia_connect" not in _Stub.asked, _Stub.asked)
     check("restored_urlopen", urllib.request.urlopen is urlopen_before)
+    check("restored_call_tool", m._McpHttp.call_tool is call_tool_before)
 
     for n, fn in originals.items():
         check(f"restored_{n}", getattr(m, n) is fn, n)

@@ -164,12 +164,26 @@ def _dry(mechanism, gate, snapshot=None):
                 name = method
         except Exception:  # noqa: BLE001 — an unreadable request is not a read
             name = None
-        if name not in READ_TOOLS and name not in ("initialize", "notifications/initialized"):
+        if name == "hestia_connect":
+            arguments = (body.get("params") or {}).get("arguments") or {}
+            if arguments.get("dry_run") is not True:
+                rec["refused_calls"].append("hestia_connect without dry_run")
+                raise SideEffectRefused("hestia_connect without dry_run")
+        elif name not in READ_TOOLS and name not in ("initialize", "notifications/initialized"):
             rec["refused_calls"].append(name or "<unreadable request>")
             raise SideEffectRefused(str(name))
         return real_urlopen(req, *a, **kw)
 
+    real_call_tool = mechanism._McpHttp.call_tool
+
+    def call_tool(client, name, arguments):
+        if name == "hestia_connect":
+            arguments = dict(arguments)
+            arguments["dry_run"] = True
+        return real_call_tool(client, name, arguments)
+
     try:
+        put(mechanism._McpHttp, "call_tool", call_tool)
         put(mechanism, "claim_self_write", claim_self_write)
         put(mechanism, "witness_gate_self", witness_gate_self)
         put(mechanism, "claim_scope", claim_scope)

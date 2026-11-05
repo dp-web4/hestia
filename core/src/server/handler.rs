@@ -850,6 +850,25 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // A dry-run connect returns the handshake's shape without accepting any of its state. It
+    // precedes the reuse directory and every lock or durable write: no session, member mint,
+    // capability/projection observation or witness row. The unregistered id preserves the
+    // following scope_status read's missing-session compatibility behavior.
+    if args.get("dry_run").and_then(Value::as_bool) == Some(true) {
+        return Ok(json!({
+            "sessionId": format!("dry-run:{plugin_id}"),
+            "softLct": Value::Null,
+            "assignedRole": requested_role,
+            "constellationRole": constellation_role,
+            "roleDeclarationHonored": role_declaration_honored,
+            "roleBasis": role_basis,
+            "gateCapabilityReportAccepted": false,
+            "protocolVersion": 1,
+            "reused": false,
+            "dryRun": true,
+        }));
+    }
+
     // THE REUSE ARM, LOCK-FREE (stage 2). The gate connects on every tool call, and for a known
     // (member, host session) a connect is a liveness bump and nothing else (Guard A below). That
     // answer is served from the session directory published beside the policy snapshot, without
@@ -15255,6 +15274,44 @@ mod tests {
             1,
             "synthetic gets no presence"
         );
+    }
+
+    #[tokio::test]
+    async fn connect_dry_run_accepts_no_session_member_capability_projection_or_chain_state() {
+        let (_dir, shared) = make_shared_state();
+        shared.lock().await.retired_members.retire(crate::server::retirement::RetiredMember {
+            plugin_id: "retired".into(),
+            retired_at: crate::server::gate_escalation::now_secs(),
+            reason: "dry-run control".into(),
+            evidence_ref: "test".into(),
+            revoked_paths: vec![],
+            was_active: false,
+            retired_by: "lct:web4:operator:test".into(),
+        });
+        let chain_before = shared.lock().await.chain_len();
+
+        for id in ["first-seen", "retired"] {
+            let out = tool_connect(&shared, &json!({
+                "plugin_id": id,
+                "host_agent": "test",
+                "dry_run": true,
+                "gate_capabilities": ["escalation-review:v1"],
+                "projection_sha256": "a".repeat(64),
+            })).await.unwrap();
+            assert_eq!(out["dryRun"], true);
+            assert_eq!(out["sessionId"], format!("dry-run:{id}"));
+            assert_eq!(out["gateCapabilityReportAccepted"], false);
+            assert_eq!(out["softLct"], Value::Null);
+        }
+
+        let s = shared.lock().await;
+        assert_eq!(s.chain_len(), chain_before, "no witness row, including a retired id");
+        assert_eq!(s.sessions.len(), 0, "no fresh or reused session was registered");
+        assert_eq!(s.member_registry.len(), 0, "no first-seen member was minted");
+        assert!(s.gate_capabilities.get("first-seen").is_none(), "no first-seen capability report");
+        assert!(s.gate_capabilities.get("retired").is_none(), "no retired-id capability report");
+        assert!(s.seat_live.is_empty(), "no projection observation was accepted");
+        assert_eq!(s.retired_members.retired.len(), 1, "the pre-existing retirement is unchanged");
     }
 
     /// Spec §7.8.2 "deliver only to that authenticated LCT" + RWOA O-clause:
