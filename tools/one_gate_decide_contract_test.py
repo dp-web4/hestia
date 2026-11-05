@@ -247,6 +247,9 @@ class Stub:
             if verdict == "absent":            # an older daemon: no such verb
                 return _ok(rid, {"ok": True})
             rid_ = "scope-stub" + str(abs(hash(path)) % 10**6)
+            if verdict == "not_asked":        # dp, 2026-11-05: nothing opened, a refusal recorded
+                return _ok(rid, {"verdict": verdict, "refusal_id": "refusal-stub" + rid_[10:],
+                                 "permits": False, "detail": "stub not_asked", "path": path})
             permits = verdict in ("in_force", "approved")
             return _ok(rid, {"verdict": verdict, "request_id": rid_, "permits": permits,
                              "detail": f"stub {verdict}", "path": path})
@@ -1015,6 +1018,24 @@ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home)
         with _Env(m, stub.url, home):
             d, _ = _decide(g, "kimi", "Read", {"file_path": one}, home)
         check("scope-read-escalates", d.decision == "deny" and d.rule == "mrh.path" and d.escalation_id, d)
+    finally:
+        stub.close()
+    # (1b) dp, 2026-11-05: the current daemon opens NOTHING. The deny says nothing was sent,
+    # names the deliberate escalation with the refusal id, and carries no escalation_id
+    # (nothing is pending, so there is nothing to watch).
+    stub = Stub(Policy(scope_claim=lambda p: "not_asked"))
+    try:
+        with _Env(m, stub.url, home):
+            d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {one}"}, home)
+        check("scope-not-asked-denies", d.decision == "deny" and d.rule == "mrh.command", d)
+        check("scope-not-asked-says-nothing-sent",
+              "Nothing was sent to the operator or to any peer" in d.reason, d.reason)
+        check("scope-not-asked-names-the-door",
+              "hestia scope escalate refusal-stub" in d.reason and "--as claude-code" in d.reason,
+              d.reason)
+        check("scope-not-asked-no-escalation-id", d.escalation_id is None, d)
+        check("scope-not-asked-no-pending-talk", "is open for" not in d.reason
+              and "still pending" not in d.reason, d.reason)
     finally:
         stub.close()
     # (2) approved once / in force: lifted, and the act goes on to society law.

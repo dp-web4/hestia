@@ -1,0 +1,307 @@
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+--- a/plugins/_shared/hestia_gate_mechanism.py
++++ b/plugins/_shared/hestia_gate_mechanism.py
+@@ -1885,7 +1885,10 @@
+     Verdicts — the daemon owns every one; this function re-derives nothing:
+       * "approved"   — an operator granted THIS act once; spent now (single use, claim window).
+       * "in_force"   — a live or standing grant already covers the path (the snapshot raced).
+-      * "opened"     — no request stood; one was opened on the operator's queue.
++      * "not_asked"  — nothing stood, and NOTHING WAS OPENED (dp, 2026-11-05: the gate does not
++                       ask on the member's behalf). The third element is the REFUSAL id the
++                       member may escalate deliberately (`hestia scope escalate`).
++      * "opened"     — a request was opened (only a daemon older than 2026-11-05 does this).
+       * "pending"    — the request for this path is still waiting; same id, no new record.
+       * "refused"    — the operator refused it; re-issuing does not re-open it inside the window.
+       * "not_opened" — the daemon declined to open one (its cap, or it predates the verb).
+@@ -1932,6 +1935,9 @@
+         return verdict, str(r.get("detail") or verdict), rid
+     if verdict in ("opened", "pending", "refused") and isinstance(rid, str) and rid:
+         return verdict, str(r.get("detail") or verdict), rid
++    refusal_id = r.get("refusal_id")
++    if verdict == "not_asked" and isinstance(refusal_id, str) and refusal_id:
++        return verdict, str(r.get("detail") or verdict), refusal_id
+     why = r.get("detail") or r.get("error") or "this daemon has no scope-claim verb (is it upgraded?)"
+     return "not_opened", str(why), None
+ 
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -1315,9 +1315,14 @@
+             inv.notices.append(f"hestia: scope {verdict} for {t} — {detail}")
+         return None
+ 
+-    notes, first_id = [], None
++    notes, first_id, refusals = [], None, []
+     for t, verdict, detail, rid in answers:
+         if verdict in ("approved", "in_force"):
++            continue
++        if verdict == "not_asked":
++            # dp, 2026-11-05: the gate asks nobody on the member's behalf. Say so, and name the
++            # deliberate door; the refusal id is not an escalation id (nothing is pending).
++            refusals.append((t, rid))
+             continue
+         if rid and first_id is None:
+             first_id = rid
+@@ -1340,6 +1345,14 @@
+         else:
+             notes.append(f"No scope request could be opened for '{t}' ({detail}); ask with "
+                          f"hestia_request_scope (one path, with a reason).")
++    if refusals:
++        member = prof.member_id
++        door = "; ".join(f"'{t}': hestia scope escalate {rid} --as {member} --reason '...'"
++                         for t, rid in refusals)
++        notes.append("Nothing was sent to the operator or to any peer. If the work does not need "
++                     "this, nothing more is owed. If it does, escalate it as a deliberate act, "
++                     "saying what you are doing and why it needs the path: " + door
++                     + " (or hestia_scope_escalate with that refusal_id).")
+     reason = v.reason + " " + " ".join(notes)
+     return GateDecision("deny", v.rule, reason, v.remedy, innate=bool(v.innate),
+                         escalation_id=first_id)
+diff --git a/hooks-gt/_shared/hestia_gate_mechanism.py b/hooks-gt/_shared/hestia_gate_mechanism.py
+--- a/hooks-gt/_shared/hestia_gate_mechanism.py
++++ b/hooks-gt/_shared/hestia_gate_mechanism.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 4cd7de9934e2f0ec3bd79906782873e1bc19264dfe17433b225dc3f91f97d88e  (published ground truth; manifest: hooks-gt)
+ """Shared in-process daemon-query mechanism — the society-safety verdict path.
+ 
+ PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
+@@ -1886,7 +1886,10 @@
+     Verdicts — the daemon owns every one; this function re-derives nothing:
+       * "approved"   — an operator granted THIS act once; spent now (single use, claim window).
+       * "in_force"   — a live or standing grant already covers the path (the snapshot raced).
+-      * "opened"     — no request stood; one was opened on the operator's queue.
++      * "not_asked"  — nothing stood, and NOTHING WAS OPENED (dp, 2026-11-05: the gate does not
++                       ask on the member's behalf). The third element is the REFUSAL id the
++                       member may escalate deliberately (`hestia scope escalate`).
++      * "opened"     — a request was opened (only a daemon older than 2026-11-05 does this).
+       * "pending"    — the request for this path is still waiting; same id, no new record.
+       * "refused"    — the operator refused it; re-issuing does not re-open it inside the window.
+       * "not_opened" — the daemon declined to open one (its cap, or it predates the verb).
+@@ -1933,6 +1936,9 @@
+         return verdict, str(r.get("detail") or verdict), rid
+     if verdict in ("opened", "pending", "refused") and isinstance(rid, str) and rid:
+         return verdict, str(r.get("detail") or verdict), rid
++    refusal_id = r.get("refusal_id")
++    if verdict == "not_asked" and isinstance(refusal_id, str) and refusal_id:
++        return verdict, str(r.get("detail") or verdict), refusal_id
+     why = r.get("detail") or r.get("error") or "this daemon has no scope-claim verb (is it upgraded?)"
+     return "not_opened", str(why), None
+ 
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: d1edfc2f0d8c4efbf40947db39d8a8735be1c11d846a50191867f8a406938d68  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -1316,9 +1316,14 @@
+             inv.notices.append(f"hestia: scope {verdict} for {t} — {detail}")
+         return None
+ 
+-    notes, first_id = [], None
++    notes, first_id, refusals = [], None, []
+     for t, verdict, detail, rid in answers:
+         if verdict in ("approved", "in_force"):
++            continue
++        if verdict == "not_asked":
++            # dp, 2026-11-05: the gate asks nobody on the member's behalf. Say so, and name the
++            # deliberate door; the refusal id is not an escalation id (nothing is pending).
++            refusals.append((t, rid))
+             continue
+         if rid and first_id is None:
+             first_id = rid
+@@ -1341,6 +1346,14 @@
+         else:
+             notes.append(f"No scope request could be opened for '{t}' ({detail}); ask with "
+                          f"hestia_request_scope (one path, with a reason).")
++    if refusals:
++        member = prof.member_id
++        door = "; ".join(f"'{t}': hestia scope escalate {rid} --as {member} --reason '...'"
++                         for t, rid in refusals)
++        notes.append("Nothing was sent to the operator or to any peer. If the work does not need "
++                     "this, nothing more is owed. If it does, escalate it as a deliberate act, "
++                     "saying what you are doing and why it needs the path: " + door
++                     + " (or hestia_scope_escalate with that refusal_id).")
+     reason = v.reason + " " + " ".join(notes)
+     return GateDecision("deny", v.rule, reason, v.remedy, innate=bool(v.innate),
+                         escalation_id=first_id)
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -12,7 +12,7 @@
+     },
+     {
+       "path": "hestia_gate_mechanism.py",
+-      "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2",
++      "sha256": "4cd7de9934e2f0ec3bd79906782873e1bc19264dfe17433b225dc3f91f97d88e",
+       "source": "plugins/_shared/hestia_gate_mechanism.py"
+     },
+     {
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21",
++      "sha256": "d1edfc2f0d8c4efbf40947db39d8a8735be1c11d846a50191867f8a406938d68",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "4f20f9525e731a3c77a19b11c50a5b9653daebdfe094cea0688c7704b467f450"
++  "gt_version": "d9cbfbeaf8e4e0fd1686ba48b220eae1e58eee72b47b882862bf3757372903e3"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4f20f9525e731a3c77a19b11c50a5b9653daebdfe094cea0688c7704b467f450",
++    "gt_version": "d9cbfbeaf8e4e0fd1686ba48b220eae1e58eee72b47b882862bf3757372903e3",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "4cd7de9934e2f0ec3bd79906782873e1bc19264dfe17433b225dc3f91f97d88e"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "d1edfc2f0d8c4efbf40947db39d8a8735be1c11d846a50191867f8a406938d68"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "94aaa892b759a43d2c5dc9fc0105b0a02ea6902d0403d2bf8d65ea36b3c666ca"
++  "gt_version": "c8d3524fdd17c45a6a35263129a38c45e3a5041806d4bd6aafe506310ffdebc6"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4f20f9525e731a3c77a19b11c50a5b9653daebdfe094cea0688c7704b467f450",
++    "gt_version": "d9cbfbeaf8e4e0fd1686ba48b220eae1e58eee72b47b882862bf3757372903e3",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "4cd7de9934e2f0ec3bd79906782873e1bc19264dfe17433b225dc3f91f97d88e"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "d1edfc2f0d8c4efbf40947db39d8a8735be1c11d846a50191867f8a406938d68"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "9951872dc332b3e24bc043326fdc9138de00d0f06feb7eb8a63674c0c3b9d25f"
++  "gt_version": "634b6fe59b4885c582a5221a9edce819992f0f130ff96f52baa83e86940108af"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4f20f9525e731a3c77a19b11c50a5b9653daebdfe094cea0688c7704b467f450",
++    "gt_version": "d9cbfbeaf8e4e0fd1686ba48b220eae1e58eee72b47b882862bf3757372903e3",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "4cd7de9934e2f0ec3bd79906782873e1bc19264dfe17433b225dc3f91f97d88e"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "d1edfc2f0d8c4efbf40947db39d8a8735be1c11d846a50191867f8a406938d68"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "81c2b127bea1dd478dd8eacce01b0895b0ade6550600fdb533a7aae7ebded74f"
++  "gt_version": "9ea2deef5cc1ac3ce56724ab047e7d15d84218ceb84c9a6b6ea1b8fd6b2fc70c"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "4f20f9525e731a3c77a19b11c50a5b9653daebdfe094cea0688c7704b467f450",
++    "gt_version": "d9cbfbeaf8e4e0fd1686ba48b220eae1e58eee72b47b882862bf3757372903e3",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "4cd7de9934e2f0ec3bd79906782873e1bc19264dfe17433b225dc3f91f97d88e"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "d1edfc2f0d8c4efbf40947db39d8a8735be1c11d846a50191867f8a406938d68"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "022f57dce4707b379c142318e076df5904568f3f0e27acef15ff146903f7ea61"
+     }
+   ],
+-  "gt_version": "8a87c37ca571edebe7049899f3cbd160891a386b11d7371e127421cb4a3b266a"
++  "gt_version": "b55772e1be469a99e8a02d728a7a7fa5366924dd9847661982fa40f13a2eaf6d"
+ }

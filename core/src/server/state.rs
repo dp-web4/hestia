@@ -326,7 +326,42 @@ pub struct GateDenyOrigin {
     /// asserted asker's request is the operator's. Rows written before this field are asserted.
     #[serde(default)]
     pub asker_basis: crate::arbiter::AskerBasis,
+    /// The recorded refusal this request was escalated from (dp, 2026-11-05: the gate no longer
+    /// opens requests; the member escalates one deliberately). `None` on rows the gate opened
+    /// under the 2026-10-05 auto-open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_from: Option<String>,
+    /// The member's own reason for escalating: what the decider reads beside the act.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_reason: Option<String>,
 }
+
+/// A scope REFUSAL the gate recorded instead of opening a request (dp, 2026-11-05: "don't do
+/// gate-generated scope requests to the operator. instead, deny with option to escalate. if the
+/// agent really needs it, they can escalate as a deliberate act. 'opened by the gate on a
+/// refused bash' is noise.").
+///
+/// It holds what the gate knew (the act, the rule, the digest a one-time approval would bind to)
+/// so a DELIBERATE `hestia_scope_escalate` can open the request with the gate's evidence and the
+/// member's own reason. It sits in no queue, invites nobody and is shown to nobody: it is the
+/// deny's memory, not an ask. Memory-only and short-lived, like the requests it may become.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GateRefusal {
+    pub id: String,
+    pub plugin_id: String,
+    pub role: String,
+    /// The refused path as the gate sent it (a `/*` glob or the unenumerated sentinel kept).
+    pub raw_path: String,
+    pub path: String,
+    pub origin: GateDenyOrigin,
+    pub refused_at: u64,
+    pub expires_at: u64,
+}
+
+/// How long a refusal stays escalatable. Re-issuing the act refreshes it.
+pub const GATE_REFUSAL_TTL_SECS: u64 = 2 * 3600;
+/// The most refusals held at once (all members); past it the oldest are dropped.
+pub const GATE_REFUSAL_MAX: usize = 512;
 
 /// What a retirement actually removed, by channel.
 #[derive(Debug, Default, Clone, serde::Serialize, PartialEq)]
@@ -653,6 +688,9 @@ pub struct ServerState {
     /// Loaded at startup, written back through `persist_standing_scope` on every operator
     /// decision. Mutated ONLY from the operator-gated HTTP surface; no MCP tool reaches it
     /// (`no_mcp_tool_can_mutate_standing_scope`). See `server::standing_scope`.
+    /// Scope refusals the gate recorded (see `GateRefusal`), keyed by refusal id. Not published:
+    /// nothing reads them but `hestia_scope_escalate`.
+    pub gate_refusals: HashMap<String, GateRefusal>,
     pub standing_scope: crate::server::published::Watched<crate::server::standing_scope::StandingScopeStore>,
     /// Ids the operator has retired on THIS seat: no longer parties, their standing grants
     /// revoked in the same commit, hidden from the default agent view. Rebuilt from the vault
@@ -1177,6 +1215,7 @@ impl ServerState {
             scope_requests: crate::server::published::Watched::new(HashMap::new()),
             // The deliberate exception (row 3): standing grants are durable and were just
             // loaded from the vault, so an operator's standing ruling survives the deploy.
+            gate_refusals: HashMap::new(),
             standing_scope: crate::server::published::Watched::new(standing_scope),
             authority_status: crate::server::published::Watched::new(authority_status),
             // No verification has run yet. Deliberately not a synthetic "matches: true":

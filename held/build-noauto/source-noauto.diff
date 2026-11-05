@@ -1,0 +1,62 @@
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+index 854ef38c..66004274 100755
+--- a/plugins/_shared/hestia_gate_mechanism.py
++++ b/plugins/_shared/hestia_gate_mechanism.py
+@@ -1885,7 +1885,10 @@ def claim_scope(path, tool_name, attempted, rule, *, plugin_id, role, client_nam
+     Verdicts — the daemon owns every one; this function re-derives nothing:
+       * "approved"   — an operator granted THIS act once; spent now (single use, claim window).
+       * "in_force"   — a live or standing grant already covers the path (the snapshot raced).
+-      * "opened"     — no request stood; one was opened on the operator's queue.
++      * "not_asked"  — nothing stood, and NOTHING WAS OPENED (dp, 2026-11-05: the gate does not
++                       ask on the member's behalf). The third element is the REFUSAL id the
++                       member may escalate deliberately (`hestia scope escalate`).
++      * "opened"     — a request was opened (only a daemon older than 2026-11-05 does this).
+       * "pending"    — the request for this path is still waiting; same id, no new record.
+       * "refused"    — the operator refused it; re-issuing does not re-open it inside the window.
+       * "not_opened" — the daemon declined to open one (its cap, or it predates the verb).
+@@ -1932,6 +1935,9 @@ def claim_scope(path, tool_name, attempted, rule, *, plugin_id, role, client_nam
+         return verdict, str(r.get("detail") or verdict), rid
+     if verdict in ("opened", "pending", "refused") and isinstance(rid, str) and rid:
+         return verdict, str(r.get("detail") or verdict), rid
++    refusal_id = r.get("refusal_id")
++    if verdict == "not_asked" and isinstance(refusal_id, str) and refusal_id:
++        return verdict, str(r.get("detail") or verdict), refusal_id
+     why = r.get("detail") or r.get("error") or "this daemon has no scope-claim verb (is it upgraded?)"
+     return "not_opened", str(why), None
+ 
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+index e6fc0059..7b54a328 100644
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -1315,10 +1315,15 @@ def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
+             inv.notices.append(f"hestia: scope {verdict} for {t} — {detail}")
+         return None
+ 
+-    notes, first_id = [], None
++    notes, first_id, refusals = [], None, []
+     for t, verdict, detail, rid in answers:
+         if verdict in ("approved", "in_force"):
+             continue
++        if verdict == "not_asked":
++            # dp, 2026-11-05: the gate asks nobody on the member's behalf. Say so, and name the
++            # deliberate door; the refusal id is not an escalation id (nothing is pending).
++            refusals.append((t, rid))
++            continue
+         if rid and first_id is None:
+             first_id = rid
+         if verdict in ("opened", "pending") and t.startswith(core.UNPRICEABLE_PREFIX):
+@@ -1340,6 +1345,14 @@ def _scope_escalation(inv: _Invocation, nev: core.NormalizedEvent,
+         else:
+             notes.append(f"No scope request could be opened for '{t}' ({detail}); ask with "
+                          f"hestia_request_scope (one path, with a reason).")
++    if refusals:
++        member = prof.member_id
++        door = "; ".join(f"'{t}': hestia scope escalate {rid} --as {member} --reason '...'"
++                         for t, rid in refusals)
++        notes.append("Nothing was sent to the operator or to any peer. If the work does not need "
++                     "this, nothing more is owed. If it does, escalate it as a deliberate act, "
++                     "saying what you are doing and why it needs the path: " + door
++                     + " (or hestia_scope_escalate with that refusal_id).")
+     reason = v.reason + " " + " ".join(notes)
+     return GateDecision("deny", v.rule, reason, v.remedy, innate=bool(v.innate),
+                         escalation_id=first_id)

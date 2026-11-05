@@ -1796,6 +1796,8 @@ impl ServerState {
                             "tool": r.ext.gate.as_ref().map(|g| g.tool.clone()),
                             "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
                             "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
+                            "member_reason": r.ext.gate.as_ref().and_then(|g| g.member_reason.clone()),
+                            "escalated_from": r.ext.gate.as_ref().and_then(|g| g.escalated_from.clone()),
                             "subtree": r.ext.gate.as_ref().is_some_and(|g| g.subtree),
                             "once_available": r.ext.gate.is_some(),
                             // dp, 2026-10-10 (#1232 narrowed): an act the gate could not

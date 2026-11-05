@@ -104,6 +104,7 @@ impl ServerHandler for HestiaServer {
             "hestia_request_scope" => tool_request_scope(&self.state, &args).await,
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
             "hestia_scope_claim" => tool_scope_claim(&self.state, &args).await,
+            "hestia_scope_escalate" => tool_scope_escalate(&self.state, &args).await,
             "hestia_scope_peer_decide" => tool_scope_peer_decide(&self.state, &args).await,
             "hestia_scope_request_view" => tool_scope_request_view(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
@@ -319,6 +320,7 @@ pub(crate) fn reports_shared_state(name: &str) -> bool {
             // gate lets an act run on `approved`. So the reply waits for those rows to be
             // durable. A peer decide may report a request it did not write the same way.
             | "hestia_scope_claim"
+            | "hestia_scope_escalate"
             | "hestia_scope_peer_decide"
     )
 }
@@ -419,7 +421,11 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_scope_claim",
-            "The GATE's question after it refuses you a path (mrh.path / mrh.command) — your gate calls this, you normally do not. It ASKS and READS; it never decides: a grant already in force answers in_force; a one-time approval the operator made for exactly this act (same act string) answers approved and is spent (single use, claim window); a request still pending for this path answers pending with the SAME id (a re-issue never mints a second ask); a refusal inside its window answers refused; otherwise a scope request is opened on the operator's queue, carrying the refused act, and the operator rules it once, for the session, or standing, at the breadth they choose. Watch it with hestia_scope_status and re-issue the identical act afterwards. Not the appeal channel: hestia_appeal disputes whether the deny was right",
+            "The GATE's question after it refuses you a path (mrh.path / mrh.command) — your gate calls this, you normally do not. It ASKS and READS; it never decides: a grant already in force answers in_force; a one-time approval the operator made for exactly this act (same act string) answers approved and is spent (single use, claim window); a request still pending for this path answers pending with the SAME id (a re-issue never mints a second ask); a refusal inside its window answers refused; otherwise NOTHING is opened: the refusal is recorded and answered not_asked with a refusal_id, and nobody is told (dp, 2026-11-05). If you really need the path, escalate deliberately with hestia_scope_escalate. Not the appeal channel: hestia_appeal disputes whether the deny was right",
+        ),
+        t(
+            "hestia_scope_escalate",
+            "Escalate ONE scope refusal the gate recorded (its deny names the refusal_id) into a scope request, as a deliberate act. Pass plugin_id, refusal_id and reason: what you are doing and why it needs this path (the decider has only that sentence and the refused act). The gate never asks on your behalf (dp, 2026-11-05); this is how you ask. The request carries the gate's record of the act, so a one-time approval binds to exactly that act; a NOT-SAME peer decides it, the operator may override, and you cannot decide it yourself. Only the member the gate refused may escalate its refusal. Watch it with hestia_scope_status and re-issue the identical act after it is ruled. CLI: hestia scope escalate <refusal_id> --as <member> --reason '...'",
         ),
         t(
             "hestia_gate_escalation_open",
@@ -13808,6 +13814,9 @@ mod tests {
                     || l == "hestia_scope_status"
                     || l == "hestia_scope_arbitrate"
                     || l == "hestia_scope_claim"
+                    // dp 2026-11-05: ASKS (opens a request from the member's own refusal);
+                    // decides nothing. Held by `scope_escalate_*`.
+                    || l == "hestia_scope_escalate"
                     // dp 2026-10-05: gate-opened scope requests go to NOT-SAME peers. Held by
                     // the behavioural tests `scope_peer_decide_*` (self refused in both
                     // directions, asserted asker refused, record names peer and basis).
@@ -24962,13 +24971,38 @@ fn valid_act_digest(args: &Value) -> Option<String> {
 ///   * a request still PENDING for (member, path) answers `pending` with ITS id — a re-issue
 ///     never mints a second ask (legion-being, #956: nine ids for three paths);
 ///   * a REFUSED request inside its window answers `refused` — re-issuing does not reopen it;
-///   * otherwise a request is OPENED, carrying the act, the rule, the tool and the session,
-///     and the operator rules it once / for the session / standing, at the breadth they choose.
+///   * otherwise NOTHING IS OPENED (dp, 2026-11-05, reversing the 10-05 auto-open: "don't do
+///     gate-generated scope requests to the operator. instead, deny with option to escalate. if
+///     the agent really needs it, they can escalate as a deliberate act. 'opened by the gate on
+///     a refused bash' is noise."). The refusal is RECORDED (`GateRefusal`: in no queue, shown
+///     to nobody) and answered `not_asked` with a `refusal_id`. The member may then escalate it
+///     DELIBERATELY with `hestia_scope_escalate` (CLI: `hestia scope escalate`), giving its own
+///     reason; only that opens a request, carrying the gate's act, rule, tool and digest, and a
+///     peer or the operator rules it once / for the session / standing, as before.
+///
+///     Why the reversal: every refusal became an ask nobody made. Test text that merely
+///     mentioned a system path, or one exploratory `find`, reached the operator's queue as
+///     "<member> wants <path>", read as intent, and to a new user looks like an agent probing.
+///     The asker side suffered too: cbp-being treated requests it never chose as open loops
+///     and pinged the operator about them every five minutes (2026-11-05).
 ///
 /// WHAT IT CANNOT DO, by construction (`no_mcp_tool_can_decide_a_scope_request` and the
 /// behavioural tests below): it never sets `granted`, never touches the standing store, and
 /// spends only a one-time approval an operator made for this member and this act.
 pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolResult {
+    scope_claim_inner(state, args, None).await
+}
+
+/// A member's deliberate escalation of a recorded refusal: its own reason, and the act exactly
+/// as the gate recorded it (already capped and masked, so it is not re-cut).
+struct ScopeEscalation {
+    refusal_id: String,
+    reason: String,
+    act: String,
+}
+
+async fn scope_claim_inner(state: &SharedState, args: &Value,
+                           escalation: Option<ScopeEscalation>) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
     use crate::server::state::{
         normalize_scope_path, GateDenyOrigin, ScopeRequest, ScopeRequestExt,
@@ -25003,12 +25037,17 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
     // made a cut act indistinguishable from a complete one — the shape #648's scope-path
     // instance was refused over), then re-masked on receipt — the layer-2 parity
     // `policy_decision.attempted` already has (see `redact_secrets`).
-    let act_raw = optional_string(args, "act").unwrap_or_default();
-    let act = redact_secrets(&if act_raw.chars().count() > SCOPE_ACT_MAX {
-        act_raw.chars().take(SCOPE_ACT_MAX).collect::<String>() + "…[truncated]"
-    } else {
-        act_raw
-    });
+    let act = match &escalation {
+        Some(e) => e.act.clone(),
+        None => {
+            let act_raw = optional_string(args, "act").unwrap_or_default();
+            redact_secrets(&if act_raw.chars().count() > SCOPE_ACT_MAX {
+                act_raw.chars().take(SCOPE_ACT_MAX).collect::<String>() + "…[truncated]"
+            } else {
+                act_raw
+            })
+        }
+    };
     let spend = args.get("spend").and_then(Value::as_bool).unwrap_or(true);
     let role = optional_string(args, "role").unwrap_or_default();
     let host_session_id = optional_string(args, "host_session_id");
@@ -25197,7 +25236,21 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         }));
     }
 
-    // (5) THE CAP.
+    // (5) NOT ASKED. Without a deliberate escalation the refusal is recorded and nothing opens.
+    let Some(escalation) = escalation else {
+        return Ok(record_gate_refusal(&mut s, now, GateRefusalDraft {
+            plugin_id: &plugin_id, role: &role, raw_path: trimmed, path: &path,
+            origin: GateDenyOrigin {
+                rule: rule.clone(), tool: tool.clone(), act: act.clone(),
+                act_digest: act_digest.clone(), request_key: key.clone(),
+                host_session_id: host_session_id.clone(), subtree, reissues: 0, asker_basis,
+                escalated_from: None, member_reason: None,
+            },
+            once_only: unpriceable.is_some(),
+        }));
+    };
+
+    // (5b) THE CAP — on deliberate escalations now, which should never reach it.
     let open_by_gate = s
         .scope_requests
         .values()
@@ -25224,10 +25277,11 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         let hex: String = h.finalize()[..6].iter().map(|b| format!("{b:02x}")).collect();
         format!("scope-{hex}")
     };
-    // The record's `reason` says what happened, in the gate's voice — never presented as the
-    // member's rationale, because the member did not choose to ask.
+    // The record's `reason` leads with the MEMBER's own words (it chose to ask), then the gate's
+    // account of the refused act, so the decider has both.
     let reason = format!(
-        "opened by the gate on a refused {} ({rule}){}; act: {act}",
+        "{}. Escalated by the member from a refused {} ({rule}){}; act: {act}",
+        escalation.reason,
         if tool.is_empty() { "act" } else { tool.as_str() },
         if subtree {
             " — a glob over this directory: only a recursive grant covers it"
@@ -25249,6 +25303,8 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         subtree,
         reissues: 0,
         asker_basis,
+        escalated_from: Some(escalation.refusal_id.clone()),
+        member_reason: Some(escalation.reason.clone()),
     };
     // WHO DECIDES (dp, 2026-10-05: "scope escalations should go to peers not to me"): the
     // NOT-SAME peers, invited exactly as gate escalations invite them. An asserted asker cannot
@@ -25275,6 +25331,8 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
             "reason": reason,
             "expires_at": expires_at,
             "origin": "gate_deny",
+            "escalated_from": escalation.refusal_id,
+            "member_reason": escalation.reason,
             "rule": rule,
             "tool_name": tool,
             "act": act,
@@ -25282,8 +25340,9 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
             "request_key": key,
             "host_session_id": host_session_id,
             "subtree": subtree,
-            "assurance": "A1 — opened by the plugin gate on a refusal; the member asked nothing. \
-                          Tamper-EVIDENT, not tamper-proof.",
+            "assurance": "A1 — opened by the member's deliberate escalation of a gate refusal; the \
+                          act is the gate's record, the reason is the member's. Tamper-EVIDENT, \
+                          not tamper-proof.",
         }),
     )?;
     s.scope_requests.insert(
@@ -25321,9 +25380,11 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
                                               "dispatch_error": e.to_string()})),
         }
     }
+    s.gate_refusals.remove(&escalation.refusal_id);
     Ok(json!({
         "verdict": "opened",
         "permits": false,
+        "escalated_from": escalation.refusal_id,
         "request_id": id,
         "path": path,
         "subtree": subtree,
@@ -25335,12 +25396,168 @@ pub(crate) async fn tool_scope_claim(state: &SharedState, args: &Value) -> ToolR
         "on_timeout": "REFUSED — no answer within the window is a refusal, not a retry",
         "how_to_decide": scope_how_to_decide(&id, invited.is_empty(), unpriceable.is_some()),
         "detail": if invited.is_empty() {
-            "refused; a scope request was opened — no NOT-SAME peer can clear it (the asker is \
+            "escalated; a scope request was opened — no NOT-SAME peer can clear it (the asker is \
              unproven or no admissible peer exists), so the operator decides"
         } else {
-            "refused; a scope request was opened and NOT-SAME peers were invited to decide it"
+            "escalated; a scope request was opened and NOT-SAME peers were invited to decide it"
         },
     }))
+}
+
+/// What the gate knew about one refusal, before it is recorded.
+struct GateRefusalDraft<'a> {
+    plugin_id: &'a str,
+    role: &'a str,
+    raw_path: &'a str,
+    path: &'a str,
+    origin: crate::server::state::GateDenyOrigin,
+    once_only: bool,
+}
+
+/// The id a refusal is escalated by: derived from member, path and act, so re-issuing the same
+/// refused act finds the same id rather than minting another.
+fn gate_refusal_id(plugin_id: &str, path: &str, act_digest: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(format!("hestia:gate-refusal\u{1f}{plugin_id}\u{1f}{path}\u{1f}{act_digest}").as_bytes());
+    let hex: String = h.finalize()[..6].iter().map(|b| format!("{b:02x}")).collect();
+    format!("refusal-{hex}")
+}
+
+/// Record a refusal (no chain row: the policy decision is already witnessed, and this is the
+/// deny's memory, not an act) and answer `not_asked` with the way forward.
+fn record_gate_refusal(s: &mut super::state::ServerState, now: u64, d: GateRefusalDraft) -> Value {
+    use crate::server::state::{GateRefusal, GATE_REFUSAL_MAX, GATE_REFUSAL_TTL_SECS};
+    let id = gate_refusal_id(d.plugin_id, d.path, &d.origin.act_digest);
+    s.gate_refusals.retain(|_, r| r.expires_at > now);
+    if !s.gate_refusals.contains_key(&id) && s.gate_refusals.len() >= GATE_REFUSAL_MAX {
+        if let Some(oldest) = s.gate_refusals.values().min_by_key(|r| r.refused_at).map(|r| r.id.clone()) {
+            s.gate_refusals.remove(&oldest);
+        }
+    }
+    let expires_at = now + GATE_REFUSAL_TTL_SECS;
+    let reissues = s.gate_refusals.get(&id).map(|r| r.origin.reissues.saturating_add(1)).unwrap_or(0);
+    let mut origin = d.origin;
+    origin.reissues = reissues;
+    let key = origin.request_key.clone();
+    s.gate_refusals.insert(id.clone(), GateRefusal {
+        id: id.clone(), plugin_id: d.plugin_id.to_string(), role: d.role.to_string(),
+        raw_path: d.raw_path.to_string(), path: d.path.to_string(), origin,
+        refused_at: now, expires_at,
+    });
+    let cli = format!("hestia scope escalate {id} --as {} --reason '<what you are doing, and why \
+                       it needs this path>'", d.plugin_id);
+    json!({
+        "verdict": "not_asked",
+        "permits": false,
+        "refusal_id": id,
+        "path": d.path,
+        "request_key": key,
+        "expires_at": expires_at,
+        "once_only": d.once_only,
+        "escalate": {
+            "tool": "hestia_scope_escalate",
+            "args": {"refusal_id": id, "reason": "<what you are doing, and why it needs this path>"},
+            "cli": cli,
+        },
+        "detail": format!(
+            "refused; nothing was sent to the operator or to any peer. If the work does not need \
+             this path, nothing more is owed. If it does, escalate as a deliberate act: {cli} \
+             (or hestia_scope_escalate with refusal_id {id}). The refusal stays escalatable for \
+             {} h; re-issuing the act keeps the same id.", GATE_REFUSAL_TTL_SECS / 3600),
+    })
+}
+
+/// `hestia_scope_escalate` — a member turns ONE recorded gate refusal into a scope request, as a
+/// deliberate act with its own reason (dp, 2026-11-05). The request carries the gate's record of
+/// the act (so a one-time approval still binds to exactly that act) and the member's reason, and
+/// is decided exactly as a gate-opened request was: by a NOT-SAME peer, the operator overriding.
+/// Only the member the gate refused may escalate its refusal.
+pub(crate) async fn tool_scope_escalate(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::server::gate_escalation::now_secs;
+    let asserted = require_string(args, "plugin_id")?;
+    let refusal_id = require_string(args, "refusal_id")?;
+    let reason = require_string(args, "reason")?.trim().to_string();
+    if reason.len() < 12 {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_escalate_reason_thin",
+            "the reason is too thin to decide on. Say what you are doing and why this path is \
+             needed for it; the decider has only this sentence and the refused act. Nothing was \
+             opened",
+            None,
+        ));
+    }
+    let session_id_arg = optional_session_id(args);
+    let refusal = {
+        let s = state.lock().await;
+        if let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) {
+            if who.plugin_id != asserted {
+                return Ok(hestia_error_envelope(
+                    "hestia.scope_claim_asker_mismatch",
+                    "the session you presented belongs to a different member than the plugin_id \
+                     you asserted; nothing was opened",
+                    Some(json!({ "asserted": asserted, "session_member": who.plugin_id })),
+                ));
+            }
+        }
+        match s.gate_refusals.get(&refusal_id) {
+            Some(r) if r.expires_at > now_secs() => r.clone(),
+            _ => {
+                return Ok(hestia_error_envelope(
+                    "hestia.scope_refusal_unknown",
+                    "no live refusal has this id (it lapsed, the daemon restarted, or it was \
+                     already escalated). Re-issue the act: its deny names a fresh refusal id. \
+                     Nothing was opened",
+                    Some(json!({ "refusal_id": refusal_id })),
+                ));
+            }
+        }
+    };
+    if refusal.plugin_id != asserted {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_escalate_not_yours",
+            "a refusal is escalated only by the member the gate refused; nothing was opened",
+            Some(json!({ "refusal_id": refusal_id })),
+        ));
+    }
+    let o = &refusal.origin;
+    let mut inner = json!({
+        "plugin_id": refusal.plugin_id,
+        "role": refusal.role,
+        "path": refusal.raw_path,
+        "rule": o.rule,
+        "tool_name": o.tool,
+        "act_digest": o.act_digest,
+        "spend": false,
+    });
+    if let Some(h) = &o.host_session_id {
+        inner["host_session_id"] = json!(h);
+    }
+    if let Some(sid) = &session_id_arg {
+        inner["session_id"] = json!(sid);
+    }
+    scope_claim_inner(state, &inner, Some(ScopeEscalation {
+        refusal_id: refusal.id.clone(), reason, act: o.act.clone(),
+    })).await
+}
+
+/// TEST SEAM: the flow a member takes now — the gate's claim, then (if it was only recorded) a
+/// deliberate escalation of that refusal. Tests of what happens AFTER a request exists use this.
+#[cfg(test)]
+pub(crate) async fn claim_and_escalate(state: &SharedState, args: &Value) -> ToolResult {
+    let first = tool_scope_claim(state, args).await?;
+    if first["verdict"] != json!("not_asked") {
+        return Ok(first);
+    }
+    let mut e = json!({
+        "plugin_id": args["plugin_id"],
+        "refusal_id": first["refusal_id"],
+        "reason": "test: the member escalates this refusal deliberately",
+    });
+    if let Some(sid) = args.get("session_id") {
+        e["session_id"] = sid.clone();
+    }
+    tool_scope_escalate(state, &e).await
 }
 
 /// The recipe a gate-opened scope request names. Peers first (dp, 2026-10-05); the operator is
@@ -27144,6 +27361,8 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
                     "rule": r.ext.gate.as_ref().map(|g| g.rule.clone()),
                     "act": r.ext.gate.as_ref().map(|g| g.act.clone()),
                     "reissues": r.ext.gate.as_ref().map(|g| g.reissues).unwrap_or(0),
+                    "member_reason": r.ext.gate.as_ref().and_then(|g| g.member_reason.clone()),
+                    "escalated_from": r.ext.gate.as_ref().and_then(|g| g.escalated_from.clone()),
                     "invited_peers": r.ext.invited_peers,
                 })
             })
@@ -32897,7 +33116,7 @@ mod durable_reads_tests {
                           "tool_name": "Bash", "act": "cat /srv/durable-claim.txt",
                           "act_digest": "a".repeat(64), "spend": false});
         let hold = durability.hold_flush_for_test();
-        let first = tool_scope_claim(&state, &args).await.unwrap();
+        let first = claim_and_escalate(&state, &args).await.unwrap();
         assert_eq!(first["verdict"], json!("opened"), "{first}");
         let st = state.clone();
         let a2 = args.clone();
@@ -32928,7 +33147,7 @@ mod durable_reads_tests {
 
         // 604 chars: whole under the record bound (the old silent take cut this at 400).
         let long_act = format!("cat {}", "q".repeat(600));
-        let opened = tool_scope_claim(
+        let opened = claim_and_escalate(
             &state,
             &json!({"plugin_id": "codex", "path": "/srv/depth.txt", "rule": "mrh.command",
                     "tool_name": "Bash", "act": long_act, "act_digest": "b".repeat(64),
@@ -32944,7 +33163,7 @@ mod durable_reads_tests {
 
         // Past SCOPE_ACT_MAX: the cut is allowed but must announce itself.
         let huge = "x".repeat(SCOPE_ACT_MAX + 50);
-        let opened = tool_scope_claim(
+        let opened = claim_and_escalate(
             &state,
             &json!({"plugin_id": "codex", "path": "/srv/depth2.txt", "rule": "mrh.command",
                     "tool_name": "Bash", "act": huge, "act_digest": "c".repeat(64),
@@ -32960,7 +33179,7 @@ mod durable_reads_tests {
 
         // Receipt-side value-masking fires on this field too (the gate masks first; the
         // daemon re-masks whatever it is handed).
-        let opened = tool_scope_claim(
+        let opened = claim_and_escalate(
             &state,
             &json!({"plugin_id": "codex", "path": "/srv/depth3.txt", "rule": "mrh.command",
                     "tool_name": "Bash", "act": "curl --token sekritexample https://x",
@@ -33620,8 +33839,8 @@ mod existence_first_tests {
         assert_eq!(r["verdict"], "not_opened", "{r}");
         assert_eq!(r["reason"], "nonexistent", "a missing path is not there: {r}");
         assert_eq!(pending(&state).await, before, "a read of nothing opens nothing");
-        let w = tool_scope_claim(&state, &claim("Write")).await.unwrap();
-        assert_eq!(w["verdict"], "opened", "a write may be creating it: {w}");
+        let w = claim_and_escalate(&state, &claim("Write")).await.unwrap();
+        assert_eq!(w["verdict"], "opened", "a write may be creating it, once escalated: {w}");
     }
 
     /// The daemon's read-tool list must EQUAL the gate's (READ_ONLY_PATH_TOOLS ∪ every

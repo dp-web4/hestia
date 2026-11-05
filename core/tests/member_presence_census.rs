@@ -593,7 +593,9 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // attendance). (2) Compared to decide control flow? No — every decision keys on
     // `(plugin_id, path)` strings, the request id and the act digest; the derived LCT is
     // serialised into the entry and read by nothing. Naming.
-    ("server/handler.rs::tool_scope_claim", &[
+    // 2026-11-05: the body moved into `scope_claim_inner` (shared by the gate's claim and the
+    // member's deliberate `tool_scope_escalate`); same two lines, same Naming class.
+    ("server/handler.rs::scope_claim_inner", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
