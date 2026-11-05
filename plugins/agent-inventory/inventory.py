@@ -1641,7 +1641,7 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
         return inspect_being(atlas_id, roots, atlas)
     exes, dirnames, plugin_dir = names_for(atlas_id)
     exe = real_executable(exes, roots)
-    host_exe = None if exe else windows_host_executable(exes, roots)
+    host_exe = windows_host_executable(exes, roots)
     homes = [HOME / d for d in dirnames if (HOME / d).is_dir()]
     plugin_available = registry().has(plugin_dir)
     declared = expects(plugin_dir)
@@ -1951,9 +1951,9 @@ def classify(recs: list[dict]) -> dict:
         elif r["installed"] and not r["governed"]:
             key = "ungoverned" if r["plugin_available"] else "ungovernable"
             gaps[key].append(r["agent"])
-        elif r.get("windows_host_executable") and not r["installed"]:
-            # Present on this machine, ungoverned, and not governable from this seat. Filing it
-            # under dormant_plugin would read as "absent", the inversion this report exists to stop.
+        if r.get("windows_host_executable"):
+            # An independent Windows presence remains a gap even when a Linux executable is also
+            # installed and governed: that other copy cannot be gated by this seat's Linux hooks.
             gaps["windows_host"].append(r["agent"])
         elif r["plugin_available"] and not r["installed"]:
             gaps["dormant_plugin"].append(r["agent"])
@@ -1982,14 +1982,14 @@ def member_states(recs: list[dict]) -> dict[str, str]:
             st = "miswired"
         elif r.get("installed") and r.get("partial"):
             st = "partial"
+        elif r.get("windows_host_executable"):
+            st = "windows_host"
         elif r.get("installed") and not r.get("governed"):
             st = "ungoverned" if r.get("plugin_available") else "ungovernable"
         elif r.get("installed") and r.get("unknown"):
             st = "unknown"
         elif r.get("installed"):
             st = "governed"
-        elif r.get("windows_host_executable"):
-            st = "windows_host"
         elif r.get("plugin_available"):
             st = "dormant_plugin"
         else:

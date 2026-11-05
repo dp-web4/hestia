@@ -422,6 +422,7 @@ def test_windows_host_harness_is_its_own_state():
     "not installed here" and Discover offered nothing. It must be its own state: not absent
     (it is here), and not installed (this seat cannot gate it)."""
     orig = inventory.WSL_DRIVE_ROOT
+    orig_registry = inventory.REGISTRY
     try:
         with tempfile.TemporaryDirectory() as d:
             mnt = Path(d) / "mnt"
@@ -438,8 +439,21 @@ def test_windows_host_harness_is_its_own_state():
                   inventory.windows_host_executable(["codex"], [str(linux_bin)]), None)
             check("no Windows copy -> None",
                   inventory.windows_host_executable(["gemini"], [str(win_bin)]), None)
+            (linux_bin / "codex").write_bytes(b"#!/bin/sh\n")
+            (linux_bin / "codex").chmod(0o755)
+            class Registry:
+                def has(self, _plugin):
+                    return True
+                def expects(self, _plugin):
+                    return {}
+            inventory.REGISTRY = Registry()
+            dual = inventory.inspect("codex", [str(linux_bin), str(win_bin)])
+            check("dual install keeps Linux installed", dual["installed"], True)
+            check("dual install preserves Windows-host evidence",
+                  dual["windows_host_executable"], str(win_bin / "codex.exe"))
     finally:
         inventory.WSL_DRIVE_ROOT = orig
+        inventory.REGISTRY = orig_registry
 
     def rec(**kw):
         base = {"agent": "codex", "member": "codex", "installed": False, "plugin_available": True,
@@ -455,6 +469,13 @@ def test_windows_host_harness_is_its_own_state():
     both = rec(installed=True, windows_host_executable=None)
     check("a Linux install is classified as before",
           inventory.classify([both])["windows_host"], [])
+    dual = rec(installed=True, governed=True)
+    check("dual install keeps the Windows gap",
+          inventory.classify([dual])["windows_host"], ["codex"])
+    check("dual install is present, not OK", inventory.status_of(inventory.classify([dual]), []),
+          "UNGOVERNED_PRESENT")
+    check("dual member state remains windows_host",
+          inventory.member_states([dual]).get("codex"), "windows_host")
     check("no Windows copy -> still dormant",
           inventory.classify([rec(windows_host_executable=None)])["dormant_plugin"], ["codex"])
 
