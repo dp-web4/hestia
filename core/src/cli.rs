@@ -204,6 +204,19 @@ enum GateCmd {
         json: bool,
     },
 
+    /// Escalate ONE governance-write refusal into an escalation, as a deliberate act (dp,
+    /// 2026-11-05: the gate no longer opens escalations on its own). The deny names the
+    /// refusal id. Requires --as (only the refused member may escalate its refusal). A scope
+    /// refusal id is accepted too.
+    Escalate {
+        /// The refusal id from the deny text (refusal-xxxxxxxxxxxx)
+        refusal_id: String,
+        /// What you are doing, and why it needs this write. The decider has only this sentence
+        /// and the refused act.
+        #[arg(long)]
+        reason: String,
+    },
+
     /// Show one escalation's current state (unknown and expired are the same answer)
     Poll {
         /// Escalation id from the deny text
@@ -1221,6 +1234,12 @@ pub fn run() -> AnyResult<()> {
                 GateCmd::Poll { escalation_id, wait } => {
                     gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role, wait)
                 }
+                GateCmd::Escalate { refusal_id, reason } => match asserted_id {
+                    Some(who) => gate_cli::gate_escalate(&endpoint, &who, &role, &refusal_id, &reason),
+                    None => anyhow::bail!(
+                        "hestia gate escalate needs --as <member>: only the member the gate refused may escalate its refusal"
+                    ),
+                },
                 GateCmd::Lookup { request_key } => {
                     gate_cli::lookup(&endpoint, &request_key, asserted_id, &role)
                 }

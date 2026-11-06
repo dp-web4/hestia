@@ -68,7 +68,8 @@ fn production_body(rel: &str, want_fn: &str) -> String {
 /// measuring the same thing.
 #[test]
 fn both_ingest_paths_take_reason_bare() {
-    for f in ["tool_gate_escalation_open", "tool_gate_escalation_claim"] {
+    // 2026-11-05: the claim door's body lives in `gate_escalation_claim_inner` now.
+    for f in ["tool_gate_escalation_open", "gate_escalation_claim_inner"] {
         let body = production_body("server/handler.rs", f);
         assert!(
             body.contains(r#"let stated_reason = optional_string(args, "reason");"#),

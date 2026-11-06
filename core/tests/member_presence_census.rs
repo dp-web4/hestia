@@ -519,7 +519,9 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // Was two identical lines; the duplicate was the hand-rolled fallback payload this
     // change deleted in favour of `opened_payload`. The remaining line is the claim
     // response's own attribution, which is not the chain entry and did not move.
-    ("server/handler.rs::tool_gate_escalation_claim", &[
+    // 2026-11-05: the body moved into `gate_escalation_claim_inner` (shared by the gate's claim
+    // and the member's deliberate escalation); the naming site is the same `claimed` row.
+    ("server/handler.rs::gate_escalation_claim_inner", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
     ], SiteClass::Naming),
     // ADDED 2026-09-29 (#1169, the reclaim of one lost claim answer, #1166/#774). Red on CI

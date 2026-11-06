@@ -400,6 +400,17 @@ pub fn scope_escalate(endpoint: &str, as_member: &str, refusal_id: &str, reason:
     Ok(())
 }
 
+/// `hestia gate escalate` — the member's deliberate escalation of one governance-write refusal.
+pub fn gate_escalate(endpoint: &str, as_member: &str, role: &str, refusal_id: &str, reason: &str) -> Result<()> {
+    let mut m = Mcp::connect(endpoint)?;
+    let (sid, who) = open_session(&mut m, as_member, role)?;
+    banner(&who);
+    let r = m.tool("hestia_gate_escalation_escalate", json!({"session_id": sid, "plugin_id": as_member,
+                                                             "refusal_id": refusal_id, "reason": reason}))?;
+    println!("{}", serde_json::to_string_pretty(&r).context("encoding the escalation")?);
+    Ok(())
+}
+
 pub fn scope_peer_decide(endpoint: &str, as_member: &str, request_id: &str, decision: &str,
                          grant_path: Option<String>, recursive: bool, modes: Option<String>,
                          reason: &str) -> Result<()> {

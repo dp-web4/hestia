@@ -3895,7 +3895,12 @@
         ? `<div class="esc-why">refused act (${escapeHtml(String(r.rule ?? ''))}, ${
             escapeHtml(String(r.tool ?? ''))}) — this is what you are ruling on:</div>
            <pre class="esc-why scope-act">${escapeHtml(String(r.act ?? ''))}</pre>
-           <div class="esc-meta">opened by the gate; the member stated no reason${
+           ${r.member_reason
+             ? `<div class="esc-why">member's reason: ${escapeHtml(String(r.member_reason))}</div>`
+             : ''}
+           <div class="esc-meta">${r.member_reason
+             ? 'escalated by the member from a gate refusal'
+             : 'opened by the gate; the member stated no reason'}${
              (r.reissues ?? 0) > 0 ? ` · re-issued ${Number(r.reissues)}×` : ''}${
              r.subtree ? ' · a glob over this directory: only a recursive grant covers it' : ''}</div>
            <div class="esc-meta scope-route">${scopeRouteText(r)}</div>`
