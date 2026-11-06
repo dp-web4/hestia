@@ -5354,12 +5354,18 @@
     const placed = new Set();
     const groups = [];
     for (const g of DISCOVER_GROUPS) {
-      const ids = g.key === 'unknown' ? unknownIds : listed(g.key).filter(id => !isUnknown.has(id));
+      const ids = g.key === 'unknown' ? unknownIds
+        : g.key === 'windows_host' ? listed(g.key)
+        : listed(g.key).filter(id => !isUnknown.has(id));
       if (!ids.length) continue;
       ids.forEach(id => placed.add(id));
-      groups.push({ key: g.key, tone: g.tone, title: g.title, remedy: g.remedy,
+      const dualInstall = g.key === 'windows_host' && ids.some(id => byAgent[id] && byAgent[id].installed);
+      const remedy = dualInstall
+        ? 'The Windows copy remains a separate, ungated installation. Linux is already installed here, so another WSL install is not the remedy; wire the Windows-side gate before treating this row as covered.'
+        : g.remedy;
+      groups.push({ key: g.key, tone: g.tone, title: g.title, remedy,
                     rows: ids.map(id => {
-                      const row = discoverRow(id, byAgent[id]);
+                      const row = discoverRow(id, byAgent[id], g.key);
                       if (g.key === 'unknown') row.alsoFiledUnder = DISCOVER_GROUPS.map(o => o.key)
                         .filter(k => k !== 'unknown' && listed(k).includes(id));
                       return row;
@@ -5451,7 +5457,7 @@
     };
   }
 
-  function discoverRow(id, d) {
+  function discoverRow(id, d, groupKey) {
     const x = d || {};
     const a = x.atlas || {};
     // Undefined is not false. A descriptor that does not say how the harness fails must not
@@ -5462,7 +5468,9 @@
       governanceId: x.member || x.plugin || '',
       name: a.harness || id,
       installed: !!x.installed,
-      executable: x.executable || x.windows_host_executable || '',
+      executable: groupKey === 'windows_host'
+        ? (x.windows_host_executable || '')
+        : (x.executable || ''),
       configs: Array.isArray(x.configs_read) ? x.configs_read.length : 0,
       failure,
       blocking: Array.isArray(a.blocking_events) ? a.blocking_events : [],
@@ -5476,8 +5484,8 @@
       // INSTALLED HERE, and nothing less (dp, 2026-09-27): the atlas knows harnesses this machine
       // does not have, and registering one mints a member for something absent. The route refuses
       // it too (register_refusal_not_here); the button just does not offer it.
-      registerable: x.installed === true && !x.governed && (!!(x.plugin && String(x.plugin).trim())
-                                    || x.kind === 'being' || a.kind === 'being'),
+      registerable: groupKey !== 'windows_host' && x.installed === true && !x.governed
+        && (!!(x.plugin && String(x.plugin).trim()) || x.kind === 'being' || a.kind === 'being'),
       // The inventory's own words for what it could not determine about THIS agent.
       // Provenance only (atlas SCHEMA.md): shown, and nothing here decides on it.
       being: x.kind === 'being' || a.kind === 'being',
