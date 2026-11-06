@@ -17,9 +17,9 @@ with every mechanism call that WRITES replaced by a recorder:
   record_decision, scope_batch, tally_scope -> nothing recorded, reserved or counted
 
 and the wire is belted: any request other than the MCP handshake and the three tools the snapshot read uses
-(connect, operating_law, scope_status) raises, so a new write path in the gate fails this
-loudly instead of acting. The snapshot is the member's own, fetched exactly as the hook
-fetches it, uncached.
+(dry-run connect, operating_law, scope_status) raises, so a new write path in the gate fails this
+loudly instead of acting. The snapshot is the member's own, fetched through the hook's uncached
+path. A separate dry-run connect RPC makes a legacy daemon refuse before it can mint a session.
 
 THE BOUNDARY (dp chose #1450 option (a), 2026-11-03): the answer is scoped to the CLAIMED
 member and session. The claim is not authenticated — proof of caller ownership is #824 (and
@@ -51,7 +51,7 @@ from contextlib import contextmanager
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
 #: The daemon tools a snapshot read uses. Anything else is a side effect this dry run refuses.
-READ_TOOLS = frozenset({"hestia_connect", "hestia_operating_law", "hestia_scope_status"})
+READ_TOOLS = frozenset({"hestia_connect_dry_run", "hestia_operating_law", "hestia_scope_status"})
 
 
 class SideEffectRefused(RuntimeError):
@@ -164,23 +164,62 @@ def _dry(mechanism, gate, snapshot=None):
                 name = method
         except Exception:  # noqa: BLE001 — an unreadable request is not a read
             name = None
-        if name == "hestia_connect":
-            arguments = (body.get("params") or {}).get("arguments") or {}
-            if arguments.get("dry_run") is not True:
-                rec["refused_calls"].append("hestia_connect without dry_run")
-                raise SideEffectRefused("hestia_connect without dry_run")
-        elif name not in READ_TOOLS and name not in ("initialize", "notifications/initialized"):
+        arguments = (body.get("params") or {}).get("arguments") or {}
+        if name in ("hestia_operating_law", "hestia_scope_status") and arguments.get("dry_run") is not True:
+            rec["refused_calls"].append(name + " without dry_run")
+            raise SideEffectRefused(name + " without dry_run")
+        if name not in READ_TOOLS and name not in ("initialize", "notifications/initialized"):
             rec["refused_calls"].append(name or "<unreadable request>")
             raise SideEffectRefused(str(name))
         return real_urlopen(req, *a, **kw)
 
     real_call_tool = mechanism._McpHttp.call_tool
+    snapshot_identity = {}
 
     def call_tool(client, name, arguments):
         if name == "hestia_connect":
+            snapshot_identity.clear()
+            snapshot_identity.update({
+                "plugin_id": arguments.get("plugin_id"),
+                "role": arguments.get("role"),
+            })
+            name = "hestia_connect_dry_run"
+        elif name in ("hestia_operating_law", "hestia_scope_status"):
+            if not snapshot_identity.get("plugin_id"):
+                raise SideEffectRefused(name + " before dry-run connect")
             arguments = dict(arguments)
             arguments["dry_run"] = True
-        return real_call_tool(client, name, arguments)
+            arguments["plugin_id"] = snapshot_identity["plugin_id"]
+            if snapshot_identity.get("role"):
+                arguments["role"] = snapshot_identity["role"]
+        reply = real_call_tool(client, name, arguments)
+        payload = mechanism._unwrap_tool_result(reply)
+        problem = None
+        if name == "hestia_connect_dry_run":
+            expected = "dry-run:" + str(snapshot_identity["plugin_id"])
+            if (payload.get("dryRun") is not True
+                    or payload.get("dryRunSnapshotContract") != 1
+                    or payload.get("sessionId") != expected):
+                problem = "dry-run snapshot contract unavailable"
+        elif name == "hestia_operating_law":
+            identity = payload.get("identity") or {}
+            if ("_hestia_error" in payload
+                    or identity.get("plugin_id") != snapshot_identity["plugin_id"]
+                    or not isinstance(identity.get("role"), str)
+                    or not isinstance(payload.get("law_hash"), str)
+                    or "operator_grant" not in payload):
+                problem = "dry-run operating law unavailable or incomplete"
+        elif name == "hestia_scope_status":
+            if ("_hestia_error" in payload
+                    or payload.get("dryRun") is not True
+                    or payload.get("plugin_id") != snapshot_identity["plugin_id"]
+                    or payload.get("caller_bound") is not False
+                    or not isinstance(payload.get("unbound_reads_since_start"), int)):
+                problem = "dry-run scope status unavailable or incomplete"
+        if problem:
+            rec["refused_calls"].append(problem)
+            raise SideEffectRefused(problem)
+        return reply
 
     try:
         put(mechanism._McpHttp, "call_tool", call_tool)

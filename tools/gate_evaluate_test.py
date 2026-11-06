@@ -50,7 +50,10 @@ class _Stub(http.server.BaseHTTPRequestHandler):
     method and tool it is asked, so anything the belt fails to stop is seen here."""
 
     asked: list = []
-    connect_args: list = []
+    dry_args: list = []
+    real_connects: int = 0
+    legacy: bool = False
+    broken_law: bool = False
     ws: str = ""
 
     def log_message(self, *a):
@@ -61,8 +64,11 @@ class _Stub(http.server.BaseHTTPRequestHandler):
         method = body.get("method")
         name = (body.get("params") or {}).get("name") if method == "tools/call" else method
         _Stub.asked.append(name)
+        arguments = (body.get("params") or {}).get("arguments") or {}
         if name == "hestia_connect":
-            _Stub.connect_args.append((body.get("params") or {}).get("arguments") or {})
+            _Stub.real_connects += 1
+        if name in ("hestia_connect_dry_run", "hestia_operating_law", "hestia_scope_status"):
+            _Stub.dry_args.append((name, arguments))
         if "id" not in body:
             self.send_response(202)
             self.end_headers()
@@ -71,16 +77,23 @@ class _Stub(http.server.BaseHTTPRequestHandler):
             result = {"protocolVersion": "2024-11-05", "capabilities": {},
                       "serverInfo": {"name": "stub", "version": "1"}}
         else:
+            law = {"identity": {"plugin_id": "kimi-code", "role": "role:constellation:member"},
+                   "law_hash": "h-stub", "operator_grant": None}
+            if _Stub.broken_law:
+                law.pop("law_hash")
             sc = {"hestia_connect": {"sessionId": "stub-session", "ok": True},
-                  "hestia_operating_law": {
-                      "identity": {"plugin_id": "kimi-code", "role": "role:constellation:member"},
-                      "law_hash": "h-stub"},
+                  "hestia_connect_dry_run": {
+                      "sessionId": "dry-run:kimi-code", "ok": True,
+                      "dryRun": True, "dryRunSnapshotContract": 1},
+                  "hestia_operating_law": law,
                   "hestia_scope_status": {
                       "plugin_id": "kimi-code", "requests": [], "live_grants": [],
                       "standing_grants": [{"path": _Stub.ws + "/web4", "recursive": True}],
                       "generation": 1, "snapshot_expires_at": int(time.time()) + 3600,
-                      "caller_bound": True},
+                      "caller_bound": False, "dryRun": True, "unbound_reads_since_start": 0},
                   }.get(name, {"ok": True, "recorded": name})
+            if _Stub.legacy and name == "hestia_connect_dry_run":
+                sc = {"_hestia_error": {"code": "hestia.unknown_tool"}}
             result = {"structuredContent": sc, "content": [{"type": "text", "text": json.dumps(sc)}]}
         out = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": result}).encode()
         self.send_response(200)
@@ -102,6 +115,8 @@ def daemon(ws):
 
 def run(tool, tool_input, ws):
     _Stub.asked = []
+    _Stub.dry_args = []
+    _Stub.real_connects = 0
     out = ge.evaluate(tool, tool_input, member="kimi-code", cwd=ws, session_id="sess-eval-test")
     return out, [a for a in _Stub.asked if a not in HANDSHAKE]
 
@@ -160,9 +175,30 @@ def main() -> int:
     check("closure_read_passes_to_law", out["rule"] != "gate.self_access", out)
     check("closure_read_witnessed_nothing", set(asked) <= reads, asked)
     check("closure_read_no_refused_side_effect", out["refused_side_effects"] == [], out)
-    check("every_snapshot_connect_is_dry_run",
-          _Stub.connect_args and all(a.get("dry_run") is True for a in _Stub.connect_args),
-          _Stub.connect_args)
+    check("snapshot_uses_separate_dry_run_connect",
+          [n for n, _ in _Stub.dry_args] == [
+              "hestia_connect_dry_run", "hestia_operating_law", "hestia_scope_status"],
+          _Stub.dry_args)
+    check("snapshot_law_and_scope_are_explicit_dry_runs",
+          all(a.get("dry_run") is True for n, a in _Stub.dry_args
+              if n != "hestia_connect_dry_run"), _Stub.dry_args)
+    check("successful_snapshot_never_really_connects", _Stub.real_connects == 0)
+
+    _Stub.legacy = True
+    out, asked = run("Read", {"file_path": inside}, ws)
+    _Stub.legacy = False
+    check("legacy_daemon_is_an_explicit_error", out["answer"] == "error", out)
+    check("legacy_daemon_gets_only_the_safe_unknown_rpc",
+          asked and set(asked) == {"hestia_connect_dry_run"}, asked)
+    check("legacy_daemon_never_gets_a_mutating_connect", _Stub.real_connects == 0)
+
+    _Stub.broken_law = True
+    out, asked = run("Read", {"file_path": inside}, ws)
+    _Stub.broken_law = False
+    check("incomplete_law_is_an_explicit_error", out["answer"] == "error", out)
+    check("incomplete_law_is_not_silently_partial",
+          "dry-run operating law unavailable or incomplete" in out["refused_side_effects"], out)
+    check("incomplete_law_never_reaches_scope_status", "hestia_scope_status" not in asked, asked)
 
     # The belt, at the wire: a write tool posted the way `scope_call` posts it (raw urllib, not
     # the mechanism's client) is refused before it is sent, and the daemon never sees it.
@@ -191,7 +227,7 @@ def main() -> int:
             check("belt_refuses_non_dry_connect", False, "the call went through")
         except ge.SideEffectRefused:
             pass
-        check("belt_records_non_dry_connect", rec["refused_calls"] == ["hestia_connect without dry_run"], rec)
+        check("belt_records_non_dry_connect", rec["refused_calls"] == ["hestia_connect"], rec)
     check("non_dry_connect_never_reached_the_daemon", "hestia_connect" not in _Stub.asked, _Stub.asked)
     check("restored_urlopen", urllib.request.urlopen is urlopen_before)
     check("restored_call_tool", m._McpHttp.call_tool is call_tool_before)
