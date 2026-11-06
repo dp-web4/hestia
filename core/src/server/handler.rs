@@ -377,7 +377,7 @@ fn hestia_tools() -> Vec<Tool> {
             "hestia_connect_dry_run",
             "Start a side-effect-free gate-evaluation snapshot: no session, member mint, capability/projection observation or witness row. The returned synthetic identity is accepted only by the dry-run law and scope-read paths",
         ),
-        t("hestia_begin_action", "Begin tracking an R6/R7 action"),
+        t("hestia_begin_action", "Begin tracking an R6/R7 action. Optional `serves`: the goal or question id the act is for; its verdict's `feedback.serves` carries it (\"unknown\" when unstated)"),
         t(
             "hestia_record_outcome",
             "Submit an action outcome with optional explicit closure claims",
@@ -1107,6 +1107,19 @@ pub(crate) async fn tool_begin_action(state: &SharedState, args: &Value) -> Tool
     // a reclaim LESS likely, so a caller naming someone else's key gains nothing.
     let correlation_key = optional_string(args, "correlation_key")
         .filter(|k| super::gate_escalation::valid_correlation_key(k));
+    // WHAT THE ACT IS FOR: the goal or question id it serves. Optional; carried onto the
+    // verdict's feedback (`feedback.serves`, "unknown" when unstated) so a refusal is addressed
+    // to the goal it bears on. A value that was SENT and is unusable is refused, never dropped.
+    let serves = match super::verdict_feedback::parse_serves(args.get("serves")) {
+        Ok(v) => v,
+        Err(message) => {
+            return Ok(hestia_error_envelope(
+                "hestia.begin_action_arg",
+                &message,
+                Some(json!({"arg": "serves"})),
+            ));
+        }
+    };
 
     let mut s = state.lock().await;
     let action_id = Uuid::new_v4();
@@ -1140,6 +1153,7 @@ its permit now belongs to another invocation, so this one may not begin"),
             parameters,
             intent,
             host_session_id,
+            serves: serves.clone(),
             started_at,
             chain_position,
         },
@@ -1149,6 +1163,8 @@ its permit now belongs to another invocation, so this one may not begin"),
         "actionId": action_id,
         "startedAt": started_at.to_rfc3339(),
         "chainPosition": chain_position,
+        // Echoed so the caller can see what its verdicts will be addressed to.
+        "serves": super::verdict_feedback::normalize_serves(serves.as_deref()),
     }))
 }
 
@@ -1741,7 +1757,52 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // as `decisionEntryHash` and kept on the in-flight action (one-gate stage A): a gate that
     // then witnesses this same verdict is answered with this row, not a duplicate of it.
     let mut decision_entry_hash: Option<String> = None;
+    // WHAT WAS ATTEMPTED, scrubbed and bounded: the row's `attempted` and half of the act key.
+    let attempted_whole = full_command.map(redact_secrets);
+    let attempted = attempted_whole.clone().map(|a| {
+        if a.chars().count() > ATTEMPTED_MAX {
+            a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
+        } else {
+            a
+        }
+    });
+    // THE VERDICT AS FEEDBACK (`verdict_feedback`): which level of the actor's work this verdict
+    // is true at, the goal it bears on, the routes left open, and whether this identical act was
+    // already decided. Additive: every existing field of the reply and the row is unchanged.
+    let mut feedback = super::verdict_feedback::VerdictFeedback::new(action.serves.as_deref());
+    let rule_for_level = evaluation.rule_id.as_deref().unwrap_or("");
+    feedback.set_level(super::verdict_feedback::resolve_level(rule_for_level, None));
+    if evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced {
+        // The routes `guidance()` and the operating law already name, as data: adjust the
+        // request, ask the operator, or dispute the rule. An invariant would drop them all.
+        // Which routes are real depends on the level (`daemon_doors`): a law-level deny's only
+        // route is the governance escalation; an invariant drops them all.
+        let level = feedback.level();
+        feedback = feedback.with_doors(super::verdict_feedback::daemon_doors(level));
+    }
+    // Over the WHOLE redacted attempt, not the row's capped text: two long commands that agree up
+    // to ATTEMPTED_MAX are different acts (NOVA's hold on 93611e46).
+    let act = super::verdict_feedback::act_digest(
+        &plugin_id_for_chain,
+        &action.tool_name,
+        target,
+        attempted_whole.as_deref(),
+    );
+    // The context fields exactly as this path's row writes them (`own_data` below).
+    let repeat_key = super::verdict_feedback::repeat_key(
+        &plugin_id_for_chain,
+        &act,
+        evaluation.decision.as_str(),
+        rule_for_level,
+        &json!({"policy_version": policy_version, "role_lct": role_lct, "enforced": evaluation.enforced}),
+    );
+    feedback.act = Some(act);
+    let mut committed_feedback = None;
+    let mut feedback_recorded = false;
     if evaluation.decision != crate::policy::PolicyDecision::Allow {
+        // An identical act already decided the same way under the same rule is answered by
+        // reference to the first such verdict on the witness record.
+        feedback.repeat_of = s.repeat_index.earlier(&repeat_key).map(str::to_string);
         // DURABLE READS: a refusal may answer with a row another request committed.
         crate::storage::durability::note_observed(s.chain_store.durability(), s.chain_len());
         // A deny blocks before execution, so this is the ONLY witnessed record of a
@@ -1759,6 +1820,25 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             .existing_row(&plugin_id_for_chain, action_id, verdict)
             .map(str::to_string)
         {
+            // The same action ruled again is not a repeated ACT: do not reference its own row.
+            if feedback.repeat_of.as_deref() == Some(existing.as_str()) {
+                feedback.repeat_of = None;
+            }
+            let committed = s
+                .chain_store
+                .read_by_hash(&existing)
+                .ok()
+                .flatten()
+                .and_then(|e| e.event_data.get("feedback").cloned())
+                .unwrap_or(Value::Null);
+            let strip = |mut v: Value| {
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("repeat_of");
+                }
+                v
+            };
+            feedback_recorded = strip(committed.clone()) == strip(feedback.to_value());
+            committed_feedback = Some(committed);
             decision_entry_hash = Some(existing);
             let _ = settle_decision_charge(&mut s, &plugin_id_for_chain, action_id, None);
         } else {
@@ -1800,16 +1880,18 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 // so an Edit or an MCP deny recorded a verdict against a path with no
                 // trace of the operation. Stored explicitly and scrubbed, so the UI has
                 // one field to read for every tool rather than a per-tool special case.
-                "attempted": full_command
-                    .map(redact_secrets)
-                    .map(|a| if a.chars().count() > ATTEMPTED_MAX {
-                        a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
-                    } else { a }),
+                "attempted": attempted,
+                // The verdict as feedback: level, serves, act key, doors, repeat_of (above).
+                "feedback": feedback.to_value(),
             });
         if let Some(h) = &charge_held_by {
             own_data["charge_held_by"] = json!(h);
         }
         let own_row = s.append_chain("policy_decision", own_data);
+        feedback_recorded = own_row.is_ok();
+        if let Ok(row) = &own_row {
+            s.repeat_index.record(repeat_key.clone(), &row.hash);
+        }
         // The verdict never depends on this append (as before: a failed append was, and is,
         // not a reason to change the ruling). What changes is that its success is no longer
         // discarded: only a COMMITTED row is remembered, reported — or charged (below).
@@ -1895,6 +1977,11 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         "status": "decided",
         "nextPollMs": serde_json::Value::Null,
         "policyVersion": policy_version,
+        // Additive (verdict-as-feedback): `level` act|goal|law|invariant, `serves`, `act`,
+        // `doors` (never any on an invariant), `premise_check`, `repeat_of`, `effects`.
+        // An existing decision hash is paired only with the feedback committed in that row.
+        "feedback": committed_feedback.unwrap_or_else(|| feedback.to_value()),
+        "feedbackRecorded": feedback_recorded,
     }))
 }
 
@@ -4232,17 +4319,76 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     // intent — never persist an unbounded payload into a less-protected surface — by
     // requiring the SENDER to bound and scrub, and by clamping here regardless, since a
     // gate that over-shares must not be able to make the daemon over-store.
-    let attempted = optional_string(args, "attempted").map(|a| {
-        let mut a = redact_secrets(&a);
+    let attempted_whole = optional_string(args, "attempted").map(|a| redact_secrets(&a));
+    let attempted = attempted_whole.clone().map(|a| {
         if a.chars().count() > ATTEMPTED_MAX {
-            a = a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]";
+            a.chars().take(ATTEMPTED_MAX).collect::<String>() + "…[truncated]"
+        } else {
+            a
         }
-        a
     });
     let declared_role = optional_string(args, "role").unwrap_or_default();
     let role_lct = crate::reputation::normalize_constellation_role(&declared_role);
+    // THE VERDICT AS FEEDBACK (`verdict_feedback`). The deciding gate may state the level, the
+    // doors it offered, and — when it (or a ruling member) can establish them — a premise check
+    // and effects. All optional; a value that was SENT and is unusable is refused, never dropped.
+    let stated = match super::verdict_feedback::parse_stated(args) {
+        Ok(f) => f,
+        Err((arg, message)) => {
+            return Ok(hestia_error_envelope(
+                "hestia.witness_decision_arg",
+                &message,
+                Some(json!({"arg": arg})),
+            ));
+        }
+    };
+    let serves_arg = match super::verdict_feedback::parse_serves(args.get("serves")) {
+        Ok(v) => v,
+        Err(message) => {
+            return Ok(hestia_error_envelope(
+                "hestia.witness_decision_arg",
+                &message,
+                Some(json!({"arg": "serves"})),
+            ));
+        }
+    };
+    let offered_doors = stated.doors.len();
+    let mut feedback = super::verdict_feedback::VerdictFeedback::new(None);
+    feedback.set_level(super::verdict_feedback::resolve_level(&rule_id, stated.level));
+    // An invariant verdict carries no doors: whatever the gate offered is dropped here, and the
+    // receipt counts what was dropped so the gate can see its own envelope was corrected.
+    feedback = feedback.with_doors(stated.doors);
+    let doors_stripped = offered_doors - feedback.doors().len();
+    feedback.premise_check = stated.premise_check;
+    feedback.effects = stated.effects;
+    if feedback.premise_check.is_some() || feedback.effects.is_some() {
+        feedback.stated_by = Some("caller".into());
+    }
+    let act = super::verdict_feedback::act_digest(
+        &plugin_id,
+        &tool_name,
+        Some(target.as_str()),
+        attempted_whole.as_deref(),
+    );
+    // The context fields exactly as this path's row writes them (`row` below: no policy_version,
+    // `enforced: true`), so rehydration from the chain yields the same key.
+    let repeat_key = super::verdict_feedback::repeat_key(
+        &plugin_id,
+        &act,
+        verdict.as_str(),
+        &rule_id,
+        &json!({"role_lct": role_lct, "enforced": true, "core_digest": core_digest.as_deref()}),
+    );
+    feedback.act = Some(act);
 
     let mut s = state.lock().await;
+    // `serves`: as sent, else as the named action stated it at begin, else "unknown".
+    feedback.serves = super::verdict_feedback::normalize_serves(
+        serves_arg
+            .as_deref()
+            .or_else(|| action_id.and_then(|a| s.actions.get(&a)).and_then(|a| a.serves.as_deref())),
+    );
+    let earlier = s.repeat_index.earlier(&repeat_key).map(str::to_string);
     // ONE VERDICT, ONE ROW. A committed row already witnesses this verdict for this member and
     // action — the daemon's own (`query_policy` on the society-safety path), or this same
     // witness delivered twice. The gate's witness of the same verdict IS that row: hand back
@@ -4255,7 +4401,33 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         .map(str::to_string);
     if let (Some(hash), Some(a)) = (existing, action_id) {
         let settled = settle_decision_charge(&mut s, &plugin_id, a, None)?;
+        // AN EXISTING ROW'S HASH IS NEVER PAIRED WITH FEEDBACK IT DOES NOT HOLD (NOVA's hold on
+        // 93611e46; reproduced by Codex's control `b38af004`, run on cbp). Nothing is appended here,
+        // so the receipt hands back the COMMITTED row's own feedback (null for a row without one, or
+        // one that cannot be read) and says whether this call's feedback differed and was not
+        // recorded. Not a refusal: the existing row is often the daemon's own society-path verdict,
+        // which a seat legitimately witnesses again with its own doors and level, and refusing would
+        // turn that accepted receipt into an error the caller retries.
+        let committed = s
+            .chain_store
+            .read_by_hash(&hash)
+            .ok()
+            .flatten()
+            .and_then(|e| e.event_data.get("feedback").cloned())
+            .unwrap_or(Value::Null);
+        // The same verdict delivered again for the same action is not a repeated ACT.
+        feedback.repeat_of = earlier.filter(|h| *h != hash);
+        let strip = |mut v: Value| {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("repeat_of");
+            }
+            v
+        };
+        let differed = strip(committed.clone()) != strip(feedback.to_value());
         return Ok(json!({
+            "feedback": committed,
+            "feedbackRecorded": !differed,
+            "doorsStripped": doors_stripped,
             "witnessEntryHash": hash,
             "eventType": verdict.event_type(),
             "decision": verdict.as_str(),
@@ -4299,6 +4471,8 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         "rule_id": rule_id,
         "verdict_available": verdict_available,
     });
+    feedback.repeat_of = earlier;
+    row["feedback"] = feedback.to_value();
     // Join keys and the deployed-generation attestation ride the row only when SENT, so a
     // deployed refusal shim that sends none of them writes exactly the row it always wrote.
     // `core_digest` was sent by every shim since REPAIR 5 and dropped here until now.
@@ -4323,6 +4497,7 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
     // A failed append is an `Err` → `hestia.internal_error` on the wire, with no hash: the
     // caller's receipt check then reads it as NOT committed, which is the point.
     let entry = s.append_chain(verdict.event_type(), row)?;
+    s.repeat_index.record(repeat_key, &entry.hash);
     if let Some(a) = action_id {
         // The row's own charge, read back from what was committed (the same reading the startup
         // replay makes), applied once per key by the settle — now, or on the next decision.
@@ -4377,6 +4552,10 @@ async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult 
         "actionId": action_id.map(|a| a.to_string()),
         "correlationKey": correlation_key,
         "updatedTrust": settled.map(|(_, t)| trust_state_json(&t)).unwrap_or(Value::Null),
+        // Additive (verdict-as-feedback). `doorsStripped` counts doors the gate offered on an
+        // invariant verdict, which the record does not carry.
+        "feedback": feedback.to_value(),
+        "doorsStripped": doors_stripped,
     }))
 }
 
@@ -31719,6 +31898,8 @@ mod decision_witness_tests {
         let (aid, verdict) = ruled_action(&state, "codex", "rm -rf /home/user/data").await;
         assert_eq!(verdict["decision"], json!("deny"), "the verdict never depends on the append");
         assert_eq!(verdict["decisionEntryHash"], Value::Null, "no committed row: {verdict}");
+        assert_eq!(verdict["feedbackRecorded"], json!(false),
+            "a failed append records no feedback: {verdict}");
         assert_eq!(sink_lines(&sink), before, "no committed decision row, no reputation movement");
         conn.execute_batch("DROP TRIGGER fail_decision;").unwrap();
 
@@ -33686,4 +33867,369 @@ mod existence_first_tests {
 
 
 
+}
+#[cfg(test)]
+mod verdict_feedback_tests {
+    //! The verdict as feedback, on the wire and on the chain: `serves` round-trips from
+    //! `begin_action` to the verdict, an identical act is answered by reference (`repeat_of`),
+    //! and an invariant verdict carries no doors whatever the gate offered.
+    use super::inbox_tests::{open_state, seeded_home};
+    use super::*;
+
+    const DENY_CMD: &str = "rm -rf /home/user/data";
+
+    async fn safety_state(dir: &tempfile::TempDir) -> SharedState {
+        let state = open_state(dir);
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine =
+                crate::policy::PolicyEngine::new(crate::policy::get_preset("safety").unwrap().config);
+        }
+        state
+    }
+
+    async fn session(state: &SharedState, plugin_id: &str) -> String {
+        tool_connect(state, &json!({"plugin_id": plugin_id, "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn rule(state: &SharedState, sid: &str, cmd: &str, serves: Option<&str>) -> Value {
+        let mut args = json!({"tool_name": "Bash", "target": cmd,
+                              "parameters": {"command": cmd}, "session_id": sid});
+        if let Some(q) = serves {
+            args["serves"] = json!(q);
+        }
+        let b = tool_begin_action(state, &args).await.unwrap();
+        let aid = b["actionId"].as_str().unwrap().to_string();
+        tool_query_policy(state, &json!({"action_id": aid})).await.unwrap()
+    }
+
+    async fn row(state: &SharedState, hash: &str) -> Value {
+        let s = state.lock().await;
+        s.recent_chain(500)
+            .into_iter()
+            .find(|e| e.hash == hash)
+            .expect("row on chain")
+            .event_data
+    }
+
+    #[tokio::test]
+    async fn serves_round_trips_from_begin_action_to_the_verdict_and_its_row() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let sid = session(&state, "codex").await;
+
+        let b = tool_begin_action(&state, &json!({"tool_name": "Read", "target": "a.md",
+            "session_id": sid, "serves": "q000042"})).await.unwrap();
+        assert_eq!(b["serves"], json!("q000042"));
+
+        let q = rule(&state, &sid, DENY_CMD, Some("q000042")).await;
+        assert_eq!(q["decision"], json!("deny"), "precondition: {q}");
+        assert_eq!(q["feedback"]["serves"], json!("q000042"));
+        assert_eq!(q["feedback"]["level"], json!("act"));
+        let r = row(&state, q["decisionEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["feedback"]["serves"], json!("q000042"), "the witnessed row carries it");
+        // Every pre-existing reply field is still there.
+        for k in ["decision", "reason", "guidance", "ruleId", "policyId", "enforced", "status"] {
+            assert!(q.get(k).is_some(), "{k} missing from {q}");
+        }
+
+        // Unstated reads as "unknown", never a guess; allows carry feedback too.
+        let q = rule(&state, &sid, "ls", None).await;
+        assert_eq!(q["decision"], json!("allow"));
+        assert_eq!(q["feedback"]["serves"], json!("unknown"));
+        assert_eq!(q["feedback"]["doors"], json!([]));
+
+        // A serves that was SENT and is unusable is refused, not dropped.
+        let bad = tool_begin_action(&state, &json!({"tool_name": "Read", "target": "a.md",
+            "session_id": sid, "serves": 42})).await.unwrap();
+        assert_eq!(bad["_hestia_error"]["code"], json!("hestia.begin_action_arg"), "{bad}");
+    }
+
+    #[tokio::test]
+    async fn an_identical_act_is_answered_by_reference_to_the_first_verdict() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let sid = session(&state, "kimi-code").await;
+
+        let first = rule(&state, &sid, DENY_CMD, None).await;
+        assert_eq!(first["decision"], json!("deny"));
+        assert_eq!(first["feedback"]["repeat_of"], Value::Null, "nothing earlier: {first}");
+        assert_eq!(first["feedback"]["doors"].as_array().unwrap().len(), 3, "an act-level deny offers doors");
+        let first_hash = first["decisionEntryHash"].as_str().unwrap().to_string();
+
+        let second = rule(&state, &sid, DENY_CMD, None).await;
+        assert_eq!(second["feedback"]["repeat_of"], json!(first_hash), "{second}");
+        let third = rule(&state, &sid, DENY_CMD, None).await;
+        assert_eq!(third["feedback"]["repeat_of"], json!(first_hash), "always the FIRST verdict");
+        let r = row(&state, third["decisionEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["feedback"]["repeat_of"], json!(first_hash), "on the chain too");
+
+        // A different act, or the same act by a different member, is not a repeat.
+        let other = rule(&state, &sid, "rm -rf /home/user/other", None).await;
+        assert_eq!(other["feedback"]["repeat_of"], Value::Null);
+        let sid2 = session(&state, "gemini").await;
+        let theirs = rule(&state, &sid2, DENY_CMD, None).await;
+        assert_eq!(theirs["feedback"]["repeat_of"], Value::Null);
+
+        // The index is a projection of the witness record: rebuilt after a restart.
+        drop(state);
+        let reopened = safety_state(&dir).await;
+        let sid = session(&reopened, "kimi-code").await;
+        let after = rule(&reopened, &sid, DENY_CMD, None).await;
+        assert_eq!(after["feedback"]["repeat_of"], json!(first_hash), "rehydrated: {after}");
+    }
+
+    fn witnessed(rule_id: &str) -> Value {
+        json!({
+            "plugin_id": "codex", "decision": "deny", "adjudicator": "plugin-gate:codex",
+            "reason": "r", "rule_id": rule_id, "tool_name": "Read", "target": "/home/x/.ssh/id",
+            "attempted": "Read -> /home/x/.ssh/id", "serves": "q7",
+        })
+    }
+
+    #[tokio::test]
+    async fn caller_stated_premise_and_effects_are_labelled_on_receipt_and_row() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        let plain = tool_witness_decision(&state, &args).await.unwrap();
+        assert!(plain["feedback"].get("stated_by").is_none(), "nothing stated, nothing labelled: {plain}");
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["premise_check"] = json!({"status": "holds", "evidence": ["seen"]});
+        let out = tool_witness_decision(&state, &args).await.unwrap();
+        assert_eq!(out["feedback"]["stated_by"], json!("caller"), "{out}");
+        let recorded = row(&state, out["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(recorded["feedback"]["stated_by"], json!("caller"));
+    }
+
+    #[tokio::test]
+    async fn retry_feedback_never_claims_unwitnessed_new_fields_under_an_old_hash() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["level"] = json!("act");
+        args["serves"] = json!("q7");
+        args["premise_check"] = json!({"status": "holds", "evidence": ["first"]});
+        let first = tool_witness_decision(&state, &args).await.unwrap();
+        assert_eq!(first["recorded"], json!("appended"), "{first}");
+        let hash = first["witnessEntryHash"].as_str().unwrap().to_string();
+        let recorded = row(&state, &hash).await;
+        assert_eq!(first["feedback"], recorded["feedback"]);
+
+        args["level"] = json!("goal");
+        args["serves"] = json!("q8");
+        args["premise_check"] = json!({"status": "refuted", "evidence": ["second"]});
+        let check = |again: Value| {
+            // Refusal is also safe: a retry with different evidence need not
+            // be accepted as an idempotent replay.
+            if again.get("_hestia_error").is_some_and(|v| !v.is_null()) {
+                return;
+            }
+            assert_eq!(again["recorded"], json!("existing"), "{again}");
+            assert_eq!(again["witnessEntryHash"], json!(&hash), "{again}");
+            assert!(again["feedback"].is_null() || again["feedback"] == recorded["feedback"],
+                "an old witness hash must not attest newly supplied feedback: {again}");
+        };
+        check(tool_witness_decision(&state, &args).await.unwrap());
+        drop(state);
+        let reopened = safety_state(&dir).await;
+        check(tool_witness_decision(&reopened, &args).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn witnessed_long_attempts_do_not_share_a_repeat_key() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let prefix = "x".repeat(ATTEMPTED_MAX + 20);
+        let mut first_args = witnessed("mrh.path");
+        first_args["action_id"] = json!(Uuid::new_v4().to_string());
+        first_args["attempted"] = json!(prefix.clone() + "first");
+        let first = tool_witness_decision(&state, &first_args).await.unwrap();
+
+        let mut second_args = witnessed("mrh.path");
+        second_args["action_id"] = json!(Uuid::new_v4().to_string());
+        second_args["attempted"] = json!(prefix + "second");
+        let second = tool_witness_decision(&state, &second_args).await.unwrap();
+        assert_ne!(first["feedback"]["act"], second["feedback"]["act"],
+            "different long attempts must not share a digest");
+        assert_eq!(second["feedback"]["repeat_of"], Value::Null,
+            "a shared capped prefix is not a repeated act: {second}");
+    }
+
+    #[tokio::test]
+    async fn query_feedback_recorded_tracks_committed_feedback() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let sid = session(&state, "codex").await;
+
+        let allow = rule(&state, &sid, "ls", None).await;
+        assert_eq!(allow["decision"], json!("allow"), "precondition: {allow}");
+        assert_eq!(allow["decisionEntryHash"], Value::Null, "{allow}");
+        assert_eq!(allow["feedbackRecorded"], json!(false),
+            "an allow writes no decision row or feedback: {allow}");
+
+        let begun = tool_begin_action(&state, &json!({"tool_name": "Bash", "target": DENY_CMD,
+            "parameters": {"command": DENY_CMD}, "session_id": sid})).await.unwrap();
+        let action_id = begun["actionId"].as_str().unwrap().to_string();
+        let first = tool_query_policy(&state, &json!({"action_id": action_id})).await.unwrap();
+        assert_eq!(first["decision"], json!("deny"), "precondition: {first}");
+        assert_eq!(first["feedbackRecorded"], json!(true), "successful append: {first}");
+        let recorded = row(&state, first["decisionEntryHash"].as_str().unwrap()).await;
+        assert_eq!(first["feedback"], recorded["feedback"], "{first}");
+
+        let replay = tool_query_policy(&state, &json!({"action_id": action_id})).await.unwrap();
+        assert_eq!(replay["decisionEntryHash"], first["decisionEntryHash"], "{replay}");
+        assert_eq!(replay["feedback"], recorded["feedback"], "{replay}");
+        assert_eq!(replay["feedbackRecorded"], json!(true),
+            "the current evaluation matches the committed row: {replay}");
+    }
+
+    #[tokio::test]
+    async fn witness_first_query_returns_the_committed_feedback() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let sid = session(&state, "codex").await;
+        let begun = tool_begin_action(&state, &json!({"tool_name": "Bash", "target": DENY_CMD,
+            "parameters": {"command": DENY_CMD}, "session_id": sid, "serves": "q7"})).await.unwrap();
+        let action_id = begun["actionId"].as_str().unwrap().to_string();
+        let mut args = witnessed("mrh.path");
+        args["action_id"] = json!(action_id);
+        args["target"] = json!(DENY_CMD);
+        args["attempted"] = json!(DENY_CMD);
+        args["level"] = json!("goal");
+        args["premise_check"] = json!({"status": "refuted", "evidence": ["witnessed-premise"]});
+        let first = tool_witness_decision(&state, &args).await.unwrap();
+        assert_eq!(first["recorded"], json!("appended"), "{first}");
+
+        let query = tool_query_policy(&state, &json!({"action_id": action_id})).await.unwrap();
+        assert_eq!(query["decisionEntryHash"], first["witnessEntryHash"], "{query}");
+        let recorded = row(&state, first["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(query["feedback"], recorded["feedback"], "{query}");
+        assert_eq!(query["feedback"], first["feedback"], "{query}");
+        assert_eq!(query["feedbackRecorded"], json!(false),
+            "the current act-level evaluation was not recorded over the goal-level row: {query}");
+    }
+
+    #[tokio::test]
+    async fn witnessed_core_digest_change_is_not_a_repeat_after_rehydrate() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let mut first_args = witnessed("mrh.path");
+        first_args["action_id"] = json!(Uuid::new_v4().to_string());
+        first_args["core_digest"] = json!("a".repeat(64));
+        let first = tool_witness_decision(&state, &first_args).await.unwrap();
+        assert_eq!(first["recorded"], json!("appended"), "{first}");
+        let first_hash = first["witnessEntryHash"].clone();
+        drop(state);
+
+        let reopened = safety_state(&dir).await;
+        let mut same_args = witnessed("mrh.path");
+        same_args["action_id"] = json!(Uuid::new_v4().to_string());
+        same_args["core_digest"] = json!("a".repeat(64));
+        let same = tool_witness_decision(&reopened, &same_args).await.unwrap();
+        assert_eq!(same["feedback"]["repeat_of"], first_hash,
+            "the same gate generation is a repeat after replay: {same}");
+
+        let mut changed_args = witnessed("mrh.path");
+        changed_args["action_id"] = json!(Uuid::new_v4().to_string());
+        changed_args["core_digest"] = json!("b".repeat(64));
+        let changed = tool_witness_decision(&reopened, &changed_args).await.unwrap();
+        assert_eq!(changed["feedback"]["repeat_of"], Value::Null,
+            "a different gate generation is not the same law: {changed}");
+    }
+
+    #[tokio::test]
+    async fn a_real_gate_self_access_deny_offers_only_the_governance_escalation() {
+        let dir = seeded_home().0;
+        let state = open_state(&dir);
+        let mut law = crate::policy::get_preset("safety").unwrap().config;
+        law.rules.insert(0, crate::policy::PolicyRule {
+            id: "gate.self_access".into(),
+            name: "synthetic governance-write rule".into(),
+            priority: -1,
+            decision: crate::policy::PolicyDecision::Deny,
+            reason: None,
+            r#match: crate::policy::PolicyMatch {
+                target_patterns: Some(vec!["*pre_tool_use.py*".into()]),
+                ..Default::default()
+            },
+        });
+        *state.lock().await.policy_engine = crate::policy::PolicyEngine::new(law);
+        let sid = session(&state, "codex").await;
+        let query = rule(&state, &sid, "cp /nonexistent/x.py plugins/codex/hooks/pre_tool_use.py", None).await;
+        assert_eq!(query["decision"], json!("deny"), "precondition: {query}");
+        assert_eq!(query["ruleId"], json!("gate.self_access"), "{query}");
+        assert_eq!(query["feedback"]["level"], json!("law"), "{query}");
+        let doors = query["feedback"]["doors"].as_array().unwrap();
+        assert_eq!(doors.len(), 1, "{query}");
+        assert_eq!(doors[0]["kind"], "escalate");
+        assert_eq!(doors[0]["tool"], "hestia_gate_escalation_open");
+    }
+
+    #[tokio::test]
+    async fn an_invariant_witnessed_verdict_carries_no_doors_whatever_was_offered() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let mut args = witnessed("egress.secret");
+        // The gate states `act` and offers doors: the rule is invariant, so neither survives.
+        args["level"] = json!("act");
+        args["doors"] = json!([{"kind": "appeal", "tool": "hestia_appeal"}, {"kind": "wait"}]);
+        let out = tool_witness_decision(&state, &args).await.unwrap();
+        assert!(out.get("_hestia_error").is_none(), "{out}");
+        assert_eq!(out["feedback"]["level"], json!("invariant"));
+        assert_eq!(out["feedback"]["doors"], json!([]));
+        assert_eq!(out["doorsStripped"], json!(2));
+        assert_eq!(out["feedback"]["serves"], json!("q7"));
+        let r = row(&state, out["witnessEntryHash"].as_str().unwrap()).await;
+        assert_eq!(r["feedback"]["level"], json!("invariant"));
+        assert_eq!(r["feedback"]["doors"], json!([]), "the record never carries an invariant door");
+
+        // An act-level rule keeps the doors it was offered, and a stated premise check and
+        // effects pass through untouched.
+        let mut args = witnessed("mrh.path");
+        args["doors"] = json!([{"kind": "request_scope", "tool": "hestia_request_scope"}]);
+        args["level"] = json!("goal");
+        args["premise_check"] = json!({"status": "refuted", "evidence": ["abc"], "goal_effect": "achieved"});
+        args["effects"] = json!({"reputation": {"delta": 0.0}});
+        let out = tool_witness_decision(&state, &args).await.unwrap();
+        assert_eq!(out["feedback"]["level"], json!("goal"));
+        assert_eq!(out["feedback"]["doors"].as_array().unwrap().len(), 1);
+        assert_eq!(out["doorsStripped"], json!(0));
+        assert_eq!(out["feedback"]["premise_check"]["status"], json!("refuted"));
+        assert_eq!(out["feedback"]["effects"]["reputation"]["delta"], json!(0.0));
+
+        // The identical witnessed act is answered by reference.
+        let again = tool_witness_decision(&state, &args).await.unwrap();
+        assert_eq!(again["feedback"]["repeat_of"], out["witnessEntryHash"]);
+
+        // An unusable stated field is refused, never dropped.
+        let mut bad = witnessed("mrh.path");
+        bad["level"] = json!("wall");
+        let out = tool_witness_decision(&state, &bad).await.unwrap();
+        assert_eq!(out["_hestia_error"]["data"]["arg"], json!("level"), "{out}");
+    }
+
+    /// A caller that sends none of the new keys gets every old receipt field, unchanged, plus an
+    /// act-level `feedback` with serves "unknown".
+    #[tokio::test]
+    async fn a_witness_without_the_new_keys_still_works() {
+        let dir = seeded_home().0;
+        let state = safety_state(&dir).await;
+        let mut args = witnessed("mrh.path");
+        args.as_object_mut().unwrap().remove("serves");
+        let out = tool_witness_decision(&state, &args).await.unwrap();
+        for k in ["witnessEntryHash", "eventType", "decision", "recorded", "charged"] {
+            assert!(out.get(k).is_some(), "{k} missing from {out}");
+        }
+        assert_eq!(out["feedback"]["level"], json!("act"));
+        assert_eq!(out["feedback"]["serves"], json!("unknown"));
+    }
 }
