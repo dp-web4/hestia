@@ -122,6 +122,7 @@ class RegistrationResolverTests(unittest.TestCase):
             r["targets"],
             [
                 {
+                    "event": None,
                     "path": str(missing),
                     "basename": "dead.py",
                     "exists": False,
@@ -205,6 +206,37 @@ class RegistrationResolverTests(unittest.TestCase):
         r = rr.resolve_registration(e, self.home)
         self.assertEqual(r["state"], "ok")
         self.assertEqual([x["path"] for x in r["targets"]], [str(hook)])
+
+    def test_json_targets_keep_their_hook_events(self):
+        gate = self.touch("hooks/gate.py")
+        witness = self.touch("hooks/witness.py")
+        rel = [".claude", "settings.json"]
+        e = self.expects(path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"hooks": {
+            "PreToolUse": [{"hooks": [{"command": f"python3 {gate}"}]}],
+            "PostToolUse": [{"hooks": [{"command": f"python3 {witness}"}]}],
+        }}), encoding="utf-8")
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["events_seen"], ["PostToolUse", "PreToolUse"])
+        self.assertEqual([t["event"] for t in r["targets"]], ["PreToolUse", "PostToolUse"])
+
+    def test_flat_toml_targets_keep_their_hook_events(self):
+        gate = self.touch("hooks/gate.py")
+        witness = self.touch("hooks/witness.py")
+        rel = [".kimi-code", "config.toml"]
+        e = self.expects(member="kimi", reader="toml-hook-commands", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True)
+        p.write_text(
+            f'[[hooks]]\nevent = "PreToolUse"\ncommand = "python3 {gate}"\n'
+            f'[[hooks]]\nevent = "PostToolUse"\ncommand = "python3 {witness}"\n',
+            encoding="utf-8",
+        )
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["events_seen"], ["PostToolUse", "PreToolUse"])
+        self.assertEqual([t["event"] for t in r["targets"]], ["PreToolUse", "PostToolUse"])
 
     def test_malformed_toml_command_assignment_is_unparseable(self):
         rel = [".codex", "config.toml"]

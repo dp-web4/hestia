@@ -183,6 +183,76 @@ check("A17i dirty-only checkout is a finding via its own field (policy: keep)",
 check("A18 WSL detected on this box (else the abstention path is dead code here)",
       fm.is_wsl() in (True, False) and isinstance(fm.is_wsl(), bool))
 
+# A19: gate_surface consumes the canonical resolver and preserves audit semantics.
+def manifest_case(commands):
+    tmp = tempfile.TemporaryDirectory()
+    root = os.path.join(tmp.name, "root")
+    home = os.path.join(root, "home")
+    repo = os.path.join(root, "repo")
+    inst = os.path.join(home, "installed")
+    os.makedirs(inst)
+    config = os.path.join(home, ".claude", "settings.json")
+    os.makedirs(os.path.dirname(config))
+    for i, command in enumerate(commands):
+        for token in ("one/", "two/", "missing/", "outside/"):
+            if token in command:
+                leaf = command.split(token, 1)[1].split()[0]
+                base = home if token == "outside/" else inst
+                target = os.path.join(base, token + leaf)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                if token != "missing/":
+                    with open(target, "w", encoding="utf-8") as fixture:
+                        fixture.write("# hook\n")
+                commands[i] = command.replace(token + leaf, target, 1)
+    with open(config, "w", encoding="utf-8") as fh:
+        json.dump({"hooks": {"PreToolUse": [{"hooks": [{"command": c} for c in commands]}]}}, fh)
+    plugin = os.path.join(repo, "plugins", "claude-code")
+    os.makedirs(plugin)
+    with open(os.path.join(plugin, "expects.json"), "w", encoding="utf-8") as fh:
+        json.dump({"install": {"registration": {
+            "path": [".claude", "settings.json"], "reader": "json-hook-commands"}}}, fh)
+    fm.HOME, fm.REPO = home, repo
+    return tmp, inst, config
+
+
+old_home, old_repo = fm.HOME, fm.REPO
+try:
+    tmp, inst, _ = manifest_case(["python3 /env/prefix/gate.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19a interpreter-prefixed registration resolves", gate == "ENFORCING BUT UNAUDITED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case(["custom-wrapper relative-hook.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19b partial classification is UNDETERMINED", gate == "UNDETERMINED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case(["python3 one/pre_tool_use.py", "python3 two/pre_tool_use.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19c duplicate basenames keep full-path identity",
+          "one/pre_tool_use.py" in evidence and "two/pre_tool_use.py" in evidence, evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case(["python3 missing/dead.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19d dead registered hook remains a finding", "kind=missing" in evidence, evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case(["python3 outside/hook.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19e present hook outside compared dirs is ENFORCING BUT UNAUDITED",
+          gate == "ENFORCING BUT UNAUDITED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, config = manifest_case([])
+    os.unlink(config)
+    os.mkdir(config)
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19f permission/read failure is not NOT FOUND", gate == "UNDETERMINED", evidence)
+    tmp.cleanup()
+finally:
+    fm.HOME, fm.REPO = old_home, old_repo
+
 # --- B. smoke (the real tool, this repo) -------------------------------------
 
 r = subprocess.run([sys.executable, TOOL, "--probe", ""], capture_output=True, text=True, timeout=120)
