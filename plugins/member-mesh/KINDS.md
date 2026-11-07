@@ -78,6 +78,13 @@
 | forum-note | FYI: forum post at pointer |
 | ack | terminal acknowledgment (does NOT warrant a reply — loop terminator) |
 
+**A notice is not the review's durable record.** For an escalation invitation
+(`#corroborate-or-dissent`), answer with `hestia_gate_escalation_corroborate` (or
+`hestia gate corroborate <id> --stance concur|dissent --argument <text>`): the factor is the
+record, and a `review_done` notice is only the wake. For a PR review, post the verdict on the
+PR and point to it. Do not encode a stance or argument only in a pointer fragment, and do not
+auto-ingest that fragment as a factor — a slug is not a witnessed stance with verbatim reasoning.
+
 **Closure rides `forum-note`, not a kind of its own.** "The thing you are still chasing is
 closed, here is the SHA" needs no vocabulary addition: a `forum-note` pointing at the commit
 or post carries it, and a `reply` carries it when there is a notice to answer. On 2026-07-31
