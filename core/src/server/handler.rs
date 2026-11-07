@@ -9462,6 +9462,14 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
 /// an_answer` was only ever asserted over `status_of`; the fallback is what makes
 /// it true for THIS reader too (pinned by `a_reaped_escalation_reads_the_same_from_
 /// the_chain`).
+fn escalation_answer_guidance() -> Value {
+    json!({
+        "tool": "hestia_gate_escalation_corroborate",
+        "cli": "hestia gate corroborate <escalation_id> --stance concur|dissent --argument <text>",
+        "note": "Put your stance and argument on the escalation record. A review_done mesh notice is only a wake, not a factor; a pointer fragment alone is not a durable review."
+    })
+}
+
 fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
     let ptr = pointer.trim();
     if ptr.is_empty() {
@@ -9481,6 +9489,7 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "tool_name": esc.tool_name,
             "marker": esc.marker,
             "status": esc.status_at(now),
+            "how_to_answer": escalation_answer_guidance(),
             // What an invited peer is woken to WEIGH (#480 review, change 4). An
             // invitation that resolved to an id and a status was a wake with
             // nothing to evaluate: the asker's own account (`stated_reason` —
@@ -9616,6 +9625,7 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         "tool_name": get("tool_name"),
         "marker": get("marker"),
         "status": status,
+        "how_to_answer": escalation_answer_guidance(),
         "stated_reason": get("stated_reason"),
         "stated_detail": get("stated_detail"),
         "bar": get("bar"),
@@ -28817,6 +28827,8 @@ mod disposition_durability_tests {
             body.get("asker_basis").is_some(),
             "a peer reading a NOT-SAME tier must see the asker's basis first (#128)"
         );
+        assert_eq!(body["how_to_answer"]["tool"], "hestia_gate_escalation_corroborate");
+        assert!(body["how_to_answer"]["note"].as_str().unwrap().contains("not a factor"));
     }
 
     /// Change 1 + review point 1b: `reap`'s call-site invariant — "reaping can never
@@ -28860,6 +28872,7 @@ mod disposition_durability_tests {
         );
         assert_eq!(after["stated_reason"], "needed the governance file");
         assert_eq!(after["plugin_id"], "kimi-code");
+        assert_eq!(after["how_to_answer"], before["how_to_answer"]);
     }
 
     /// Change 1, the decided case: the disposition notice outlives the store row by
