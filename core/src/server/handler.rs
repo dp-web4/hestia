@@ -18997,6 +18997,117 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_reaped_lapsed_withdrawal_reports_expiry_not_an_unknown_id() {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({"plugin_id": "kimi-code", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code", "session_id": session,
+                "tool_name": "Edit", "marker": "law_inject.py",
+                "act": "Edit -> law_inject.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let expires_at = shared.lock().await.gate_escalations.get(&id).unwrap().expires_at;
+        {
+            let mut s = shared.lock().await;
+            assert_eq!(record_newly_lapsed(&mut s, expires_at + 1), 1);
+            s.gate_escalations.reap(
+                expires_at + crate::server::gate_escalation::REAP_KEEP_SECS,
+                crate::server::gate_escalation::REAP_KEEP_SECS,
+            );
+            assert!(s.gate_escalations.get(&id).is_none());
+        }
+
+        let err = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({"escalation_id": id, "approve": false, "session_id": session}),
+        )
+        .await
+        .expect_err("a lapsed ask cannot be withdrawn again");
+        assert!(err.to_string().contains("expired"), "{err}");
+        assert!(!err.to_string().contains("unknown ids"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_reaped_decided_corroboration_reports_the_prior_ruling() {
+        let (_dir, shared) = make_shared_state();
+        let mut sessions = std::collections::HashMap::new();
+        for plugin in ["codex", "kimi-code"] {
+            sessions.insert(
+                plugin,
+                tool_connect(&shared, &json!({"plugin_id": plugin, "host_agent": "h"}))
+                    .await
+                    .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let opened = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex", "session_id": sessions["codex"],
+                "tool_name": "Edit", "marker": "law_inject.py",
+                "act": "Edit -> law_inject.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let mut s = shared.lock().await;
+        let now = crate::server::gate_escalation::now_secs();
+        s.gate_escalations
+            .decide(
+                &id,
+                true,
+                "operator",
+                "role:constellation:sovereign",
+                crate::server::gate_escalation::Channel::OperatorSession,
+                None,
+                Some("approved"),
+                now,
+            )
+            .expect("approve");
+        let factors = s.gate_escalations.get(&id).unwrap().factors.clone();
+        s.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "status": "approved",
+                "decided_by": "operator", "decided_at": now, "factors_present": factors,
+            }),
+        )
+        .unwrap();
+        s.gate_escalations.reap(
+            now + 2 * crate::server::gate_escalation::REAP_KEEP_SECS,
+            crate::server::gate_escalation::REAP_KEEP_SECS,
+        );
+        assert!(s.gate_escalations.get(&id).is_none());
+        drop(s);
+
+        let err = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": id, "session_id": sessions["kimi-code"],
+                "stance": "concur", "argument": "late evidence",
+            }),
+        )
+        .await
+        .expect_err("a decided row cannot take a new factor");
+        assert!(err.to_string().contains("operator"), "{err}");
+        assert!(err.to_string().contains("decided"), "{err}");
+        assert!(!err.to_string().contains("unknown ids"), "{err}");
+    }
+
     /// The positive control for the binding above, and the more important half of it: the fix
     /// must close the hole WITHOUT killing the feature. A guard that makes every invitation
     /// vanish would pass the test above while deleting the only production writer on the peer
@@ -27552,6 +27663,27 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
     }))
 }
 
+fn escalation_miss_reason(s: &super::state::ServerState, escalation_id: &str) -> String {
+    let body = resolve_escalation_pointer(s, escalation_id);
+    if let Some(message) = body.pointer("/_hestia_error/message").and_then(Value::as_str) {
+        return message.to_string();
+    }
+    match body["status"].as_str().unwrap_or("") {
+        "expired" => format!("escalation {escalation_id} expired; the write was already refused"),
+        "approved" | "denied" => {
+            let by = body["decided_by"].as_str().unwrap_or("an unrecorded decider");
+            let at = body["decided_at"]
+                .as_u64()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "an unrecorded time".into());
+            format!(
+                "escalation {escalation_id} was already decided by {by} at {at}; decisions are single-shot"
+            )
+        }
+        _ => format!("escalation {escalation_id} is no longer open; the write stays refused"),
+    }
+}
+
 async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> ToolResult {
     use crate::arbiter::{eligibility_for, AppealParties, Disposition, Eligibility};
     use crate::server::gate_escalation::{now_secs, Channel};
@@ -27580,9 +27712,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
     };
 
     let Some(esc) = s.gate_escalations.get(&escalation_id).cloned() else {
-        return Err(anyhow::anyhow!(
-            "no such escalation — unknown ids are denies, not retries"
-        ));
+        return Err(anyhow::anyhow!(escalation_miss_reason(&s, &escalation_id)));
     };
 
     // NOT-SAME, server-side, reusing the appeal arbiter's own rules rather than a second
@@ -27927,9 +28057,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     };
 
     let Some(esc) = s.gate_escalations.get(&escalation_id).cloned() else {
-        return Err(anyhow::anyhow!(
-            "no such escalation — unknown ids are denies, not retries"
-        ));
+        return Err(anyhow::anyhow!(escalation_miss_reason(&s, &escalation_id)));
     };
 
     // NOT-SAME, same arbiter rules: a member may not corroborate its own ask, and the
