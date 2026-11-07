@@ -1019,8 +1019,9 @@
   .policy-btn:hover { background: var(--accent); color: var(--bg); }
   /* A scoped label must not look like the society label — the whole failure was not being able
      to tell which one you were reading. */
-  .policy-btn-scoped { background: var(--warning); color: var(--bg); border-color: var(--warning); }
-  .policy-btn-scoped:hover { background: var(--warning); color: var(--bg); filter: brightness(1.15); }
+  .policy-btn-scoped, .policy-btn-loosened { background: var(--warning); color: var(--bg); border-color: var(--warning); }
+  .policy-btn-scoped:hover, .policy-btn-loosened:hover { background: var(--warning); color: var(--bg); filter: brightness(1.15); }
+  .policy-state.policy-btn-loosened, .view-chip-state.policy-btn-loosened { color: var(--warning); font-weight: 700; }
   /* modal */
   .modal[hidden] { display: none; }
   .modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-start; justify-content: center; padding: 5vh 1rem; }
@@ -3046,6 +3047,10 @@
     `;
   }
 
+  function policyIsLoosened(pol) {
+    return !!pol && (pol.preset === 'permissive' || !pol.enforce);
+  }
+
   function renderFeed(entries) {
     const root = $('feed');
     const title = $('feed-title');
@@ -3110,6 +3115,8 @@
     // of its states is not a status surface; the operator has to already know the answer to read
     // it correctly, which is the opposite of what it is for.
     if (polBtn) {
+      if (policyIsLoosened(pol)) polBtn.classList.add('policy-btn-loosened');
+      else polBtn.classList.remove('policy-btn-loosened');
       const grants = lastData?.instance_grants ?? [];
       const target = selectedOrch || null;
       const grant = target ? grants.find(g => g.plugin_id === target) : null;
