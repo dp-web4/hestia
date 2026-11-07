@@ -8488,6 +8488,17 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
     let lapsed = s.gate_escalations.newly_lapsed(now);
     let mut recorded = 0;
     for esc in lapsed {
+        let (lapse_kind, note) = if esc.stored_status() == crate::server::gate_escalation::Status::Approved {
+            (
+                "approved_unclaimed",
+                "the claim window passed with the approval unspent",
+            )
+        } else {
+            (
+                "undecided",
+                "the deadline passed with no decision; see factors_present for what was on the record when it did",
+            )
+        };
         let entry = s.append_chain(
             "gate_escalation_expired",
             json!({
@@ -8505,7 +8516,10 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
                 "marker": esc.marker,
                 "opened_at": esc.opened_at,
                 "expires_at": esc.expires_at,
+                "decided_at": esc.decided_at,
+                "consumed_at": esc.consumed_at,
                 "lapsed_at": now,
+                "lapse_kind": lapse_kind,
                 // The criterion this row died under. The `opened` event has always
                 // recorded it; the expiry did not, so answering "which bar lapses?"
                 // required joining every expiry back to its open — which is how the
@@ -8536,8 +8550,7 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
                 // Facts about this row, no clause that can rot. The evidence fields
                 // above carry what the retired prose was gesturing at, in a form a
                 // reader can recompute instead of trust.
-                "note": "the deadline passed with no decision; see factors_present \
-                         for what was on the record when it did",
+                "note": note,
             }),
         );
         match entry {
@@ -29885,6 +29898,52 @@ mod disposition_durability_tests {
                 "the store marker dedups the append within a daemon lifetime"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_approved_unclaimed_permit_gets_a_terminal_expiry_and_disposition() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let real_now = now_secs();
+        let mut s = state.lock().await;
+        let id = witness_open(&mut s, "kimi-code", None, real_now - 100, 3600);
+        s.gate_escalations
+            .decide(
+                &id,
+                true,
+                "operator",
+                "role:constellation:sovereign",
+                crate::server::gate_escalation::Channel::OperatorSession,
+                None,
+                Some("approved"),
+                real_now - 50,
+            )
+            .expect("approve");
+
+        assert_eq!(record_newly_lapsed(&mut s, real_now + 700), 1);
+        let expired = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_expired")
+            .expect("an unclaimed approval must reach a terminal expiry row");
+        assert_eq!(
+            expired.event_data.get("lapse_kind").and_then(Value::as_str),
+            Some("approved_unclaimed")
+        );
+        assert_eq!(
+            expired.event_data.get("decided_at").and_then(Value::as_u64),
+            Some(real_now - 50)
+        );
+        assert_eq!(expired.event_data.get("consumed_at"), Some(&Value::Null));
+        assert!(expired.event_data.get("note").and_then(Value::as_str)
+            .is_some_and(|note| note.contains("unspent")));
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        assert!(mail.iter().any(|notice| {
+            notice.kind == "disposition"
+                && notice.pointer_uri.as_deref()
+                    == Some(format!("hestia://escalation/{id}#lapsed").as_str())
+        }));
+        assert_eq!(record_newly_lapsed(&mut s, real_now + 700), 0);
     }
 
     /// #499: the expiry row must carry its BAR and the EVIDENCE present when the
