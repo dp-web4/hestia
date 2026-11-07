@@ -618,9 +618,61 @@ fn hestia_tools() -> Vec<Tool> {
                 },
             }),
         ),
-        t(
+        t_args(
             "hestia_witness_decision",
-            "Witness an externally-adjudicated plugin-gate allow/warn/deny (chain + gate-risk trust; allow charges nothing)",
+            "Witness an externally-adjudicated plugin-gate allow/warn/deny (chain + gate-risk trust; allow charges nothing). The schema is the whole top-level contract: unknown arguments are refused by name rather than silently discarded",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["plugin_id", "decision", "adjudicator"],
+                "properties": {
+                    "plugin_id": {"type": "string"},
+                    "decision": {"type": "string", "enum": ["allow", "warn", "deny"]},
+                    "adjudicator": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "tool_name": {"type": "string"},
+                    "target": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."},
+                    "payload_sha256": {"type": "string"},
+                    "verdict_available": {"type": "boolean", "description": "False means the gate could not judge; records infrastructure, not member conduct."},
+                    "rule_id": {"type": "string"},
+                    "attempted": {"type": "string", "description": "Bounded, redacted summary of the act."},
+                    "role": {"type": "string"},
+                    "action_id": {"type": "string", "format": "uuid"},
+                    "correlation_key": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,200}$"},
+                    "core_digest": {"type": "string", "maxLength": 128},
+                    "level": {"type": "string", "enum": ["act", "goal", "law", "invariant"]},
+                    "doors": {
+                        "type": "array", "maxItems": 16,
+                        "items": {
+                            "type": "object",
+                            "required": ["kind"],
+                            "properties": {
+                                "kind": {"type": "string"},
+                                "tool": {"type": "string"},
+                                "to": {"type": "string"}
+                            }
+                        }
+                    },
+                    "premise_check": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string", "enum": ["refuted", "holds", "unknown"]},
+                            "evidence": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 512}},
+                            "goal_effect": {"type": "string", "enum": ["abandon", "achieved", "rescope"]}
+                        }
+                    },
+                    "effects": {
+                        "type": "object",
+                        "properties": {
+                            "reputation": true,
+                            "scope_change": true
+                        }
+                    },
+                    "serves": {"type": "string", "maxLength": 200}
+                }
+            }),
         ),
         t(
             "hestia_query_policy",
@@ -4232,8 +4284,47 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
     }))
 }
 
+const WITNESS_DECISION_ACCEPTED_KEYS: &[&str] = &[
+    "plugin_id",
+    "decision",
+    "adjudicator",
+    "reason",
+    "tool_name",
+    "target",
+    "session_id",
+    "sessionId",
+    "payload_sha256",
+    "verdict_available",
+    "rule_id",
+    "attempted",
+    "role",
+    "action_id",
+    "correlation_key",
+    "core_digest",
+    "level",
+    "doors",
+    "premise_check",
+    "effects",
+    "serves",
+];
+
 async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
     use super::decision_witness::{bounded_core_digest, Verdict};
+    let mut unknown: Vec<&str> = args
+        .as_object()
+        .into_iter()
+        .flat_map(|obj| obj.keys())
+        .map(String::as_str)
+        .filter(|key| !WITNESS_DECISION_ACCEPTED_KEYS.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        return Ok(hestia_error_envelope(
+            "hestia.witness_decision_unknown_arg",
+            "unknown argument(s) refused rather than silently discarded",
+            Some(json!({"unknownKeys": unknown})),
+        ));
+    }
     let plugin_id = require_string(args, "plugin_id")?;
     let decision = require_string(args, "decision")?;
     // ONE decision witness for every verdict (one-gate stage A). `allow` was refused here until
@@ -31820,6 +31911,63 @@ mod decision_witness_tests {
             "verdict_available": true,
             "attempted": "Write -> /tmp/x",
         })
+    }
+
+    #[tokio::test]
+    async fn the_witness_decision_schema_and_runtime_are_one_contract() {
+        let tools = hestia_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "hestia_witness_decision")
+            .expect("witness_decision must be advertised");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let mut advertised: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("witness_decision must advertise its properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        advertised.sort_unstable();
+        let mut honoured = WITNESS_DECISION_ACCEPTED_KEYS.to_vec();
+        honoured.sort_unstable();
+        assert_eq!(advertised, honoured, "schema and runtime have drifted");
+        assert_eq!(schema["additionalProperties"], false, "{schema}");
+        assert_eq!(schema["required"], json!(["plugin_id", "decision", "adjudicator"]));
+
+        let (_d, state) = state_with_safety().await;
+        let mut args = witness_args("codex", "allow");
+        args["session_id"] = json!("host-session");
+        args["sessionId"] = json!("host-session");
+        args["payload_sha256"] = json!("a".repeat(64));
+        args["role"] = json!(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["correlation_key"] = json!("toolu_01ABC");
+        args["core_digest"] = json!("b".repeat(64));
+        args["level"] = json!("act");
+        args["doors"] = json!([{"kind": "appeal", "tool": "hestia_appeal", "to": "operator"}]);
+        args["premise_check"] = json!({"status": "unknown", "evidence": ["h"], "goal_effect": "rescope"});
+        args["effects"] = json!({"reputation": {}, "scope_change": {}});
+        args["serves"] = json!("q000042");
+        let out = tool_witness_decision(&state, &args).await.unwrap();
+        assert!(out.get("_hestia_error").is_none(), "every advertised key must work: {out}");
+        let rows_before = rows_of(&state, "policy_decision").await.len()
+            + rows_of(&state, "policy_allow").await.len();
+
+        args["coreDigest"] = args["core_digest"].clone();
+        args["verdictAvailable"] = json!(true);
+        let refused = tool_witness_decision(&state, &args).await.unwrap();
+        assert_eq!(
+            refused["_hestia_error"]["code"],
+            json!("hestia.witness_decision_unknown_arg"),
+            "{refused}"
+        );
+        assert_eq!(
+            refused["_hestia_error"]["data"]["unknownKeys"],
+            json!(["coreDigest", "verdictAvailable"])
+        );
+        let rows_after = rows_of(&state, "policy_decision").await.len()
+            + rows_of(&state, "policy_allow").await.len();
+        assert_eq!(rows_after, rows_before, "an unknown key must not append a witness row");
     }
 
     #[tokio::test]

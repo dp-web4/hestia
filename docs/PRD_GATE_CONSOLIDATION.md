@@ -203,15 +203,14 @@ actually did**, not as proposals. Re-measured at `9a7f45b`; each verdict names i
    that instrument, not a second one.
 
    **SENT is not PERSISTED, and the distinction is the whole lesson of this PRD applied to itself**
-   (GPT audit, 2026-08-14). The shim half is deployed and does send the digest; the daemon half does not
-   keep it. `tool_witness_decision` parses a fixed argument list under `additionalProperties: true`, so the
-   wire `core_digest` is **accepted and silently dropped** at the boundary — filed as **#419**, which also
-   records that the same door never reads `verdict_available`. Until #419 lands, the digest survives only on
-   the per-shim fallback diagnostic log (i.e. precisely when the daemon is *unreachable*), which is inverted
-   from intent. So the honest statement of §7.2(7)'s status is: **declared and executable and deployed on the
-   producing side; not yet observable on the witness chain.** Anyone reading this section as "deployed
-   generation is attested end-to-end" would be reading a claim one boundary wider than the evidence — the
-   exact `shipped ≠ in force` failure the train exists to make impossible to state by accident.
+   (GPT audit, 2026-08-14). Current daemon source reads and persists both `core_digest` and
+   `verdict_available`; those two repairs closed the data-loss half of **#419**. The remaining acceptance
+   item was the boundary's permissive argument contract: `tool_witness_decision` advertised
+   `additionalProperties: true` and accepted undeclared keys without reading them. The #419 change gives the
+   door one explicit top-level schema and a matching runtime allowlist, so a misspelled key is refused by
+   name instead of vanishing. Producing-side and witness-chain support are therefore both present in source;
+   whether a particular installed daemon carries them remains a separate deployment-vintage question, never
+   something to infer from the repository alone.
 
 2. **Witness-path parity (nomad's criterion 11) — STILL OPEN, and now measured rather than anecdotal.**
    Sprint E unified the **deny** recorder across harnesses, and `witness_decision_unified()` in
