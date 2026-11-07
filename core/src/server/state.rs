@@ -1248,18 +1248,15 @@ impl ServerState {
     /// Mark a plugin_id as synthetic and persist. Idempotent on membership;
     /// `Ok(true)` if this call added a new entry.
     ///
-    /// The persist is fail-closed and NOT guarded by novelty — the write-side
-    /// mirror of the corrupt-doc load rule. A best-effort save that failed
-    /// silently left the exclusion in memory only: durable member labels
-    /// would mint for this plugin after the next restart, and a novelty
-    /// guard meant no later re-join ever retried the write. The write is
-    /// retried up to `max_attempts` times (law-settable via the vault policy,
-    /// default 3 — see `VaultPolicyState::synthetic_persist_attempts`); if every
-    /// attempt fails the error reaches the caller (which must refuse the
-    /// request), the in-memory entry still stands so THIS run keeps the
-    /// exclusion, and the next declaring join retries the persist again.
+    /// The persist is fail-closed. A member already present was loaded from the vault or
+    /// persisted by an earlier call, so re-marking it writes nothing. If every attempt to
+    /// persist a NEW member fails, this call's insertion is rolled back: in-set therefore
+    /// always implies persisted, and the next connect must retry instead of being admitted.
     pub fn mark_synthetic(&mut self, plugin_id: &str, max_attempts: u32) -> anyhow::Result<bool> {
         let added = self.synthetic_plugins.insert(plugin_id.to_string());
+        if !added {
+            return Ok(false);
+        }
         let attempts = max_attempts.max(1);
         let mut last_err = None;
         for _ in 0..attempts {
@@ -1274,6 +1271,7 @@ impl ServerState {
                 Err(e) => last_err = Some(e),
             }
         }
+        self.synthetic_plugins.remove(plugin_id);
         Err(last_err
             .expect("attempts >= 1 so the loop ran at least once")
             .context(format!(
@@ -3124,6 +3122,30 @@ mod tests {
         assert!(state.is_synthetic("conformance-runner-py"));
         assert!(!state.is_synthetic("claude-code"));
         assert_eq!(state.synthetic_plugins.len(), 2);
+    }
+
+    #[test]
+    fn synthetic_mark_writes_once_and_rolls_back_a_failed_insert() {
+        let dir = TempDir::new().unwrap();
+        let vault_path = dir.path().join("v.enc");
+        let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
+        let mut state = ServerState::open(vault, dir.path(), "p").unwrap();
+        assert!(state.mark_synthetic("repeat-seat", 3).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let before = std::fs::metadata(&vault_path).unwrap().modified().unwrap();
+        for _ in 0..5 {
+            assert!(!state.mark_synthetic("repeat-seat", 3).unwrap());
+        }
+        let after = std::fs::metadata(&vault_path).unwrap().modified().unwrap();
+        assert_eq!(after, before, "an already-persisted id must not re-encrypt the vault");
+
+        state.vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("injected save failure".into())));
+        let err = state.mark_synthetic("retry-seat", 2).expect_err("save must fail");
+        assert!(format!("{err:#}").contains("injected save failure"), "{err:#}");
+        assert!(!state.is_synthetic("retry-seat"), "the failed insert was not rolled back");
+        state.vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        assert!(state.mark_synthetic("retry-seat", 1).unwrap(), "the next connect retries");
+        assert!(state.is_synthetic("retry-seat"));
     }
 
     #[test]
