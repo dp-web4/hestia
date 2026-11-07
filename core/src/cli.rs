@@ -215,6 +215,13 @@ enum GateCmd {
         json: bool,
     },
 
+    /// List unruled appeals, oldest first, with designation and your eligibility
+    Appeals {
+        /// Emit the daemon's `{ "open": [...] }` response as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show one escalation's current state (unknown and expired are the same answer)
     Poll {
         /// Escalation id from the deny text
@@ -1209,6 +1216,9 @@ pub fn run() -> AnyResult<()> {
                 // added `--wait` to poll. They are orthogonal flags on different verbs.
                 GateCmd::Pending { json } => {
                     gate_cli::pending(&endpoint, asserted_id, &role, json)
+                }
+                GateCmd::Appeals { json } => {
+                    gate_cli::appeals(&endpoint, asserted_id, &role, json)
                 }
                 GateCmd::Poll { escalation_id, wait } => {
                     gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role, wait)
