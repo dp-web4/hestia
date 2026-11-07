@@ -858,7 +858,11 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // never the host id alone); a miss falls through to the locked path, which re-checks.
     if let Some(hsid) = host_session_id.as_deref() {
         let published = state.published();
-        if let Some(existing) = published.sessions.find_reuse(&plugin_id, hsid) {
+        if let Some(existing) = published.sessions.find_reuse(&plugin_id, hsid).filter(|existing| {
+            existing.last_seen()
+                >= Utc::now()
+                    - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS)
+        }) {
             existing.touch();
             if let Some(capabilities) = gate_capabilities.as_ref() {
                 published.gate_capabilities.insert(plugin_id.clone(), capabilities.clone());
@@ -879,6 +883,7 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     }
 
     let mut s = state.lock().await;
+    s.reap_stale_sessions(Utc::now());
 
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
     // (fresh MCP connection per hook subprocess), so without this each tool call mints a distinct
@@ -8917,10 +8922,18 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         let explicit = rest
             .strip_prefix("?session_id=")
             .and_then(|v| Uuid::parse_str(v.trim()).ok());
+        let now = Utc::now();
         let resolved = match explicit {
-            Some(u) => s.sessions.get(&u).cloned(),
+            Some(u) => s
+                .sessions
+                .get(&u)
+                .filter(|session| s.session_is_live(session, now))
+                .cloned(),
             None => {
-                let mut it = s.sessions.values();
+                let mut it = s
+                    .sessions
+                    .values()
+                    .filter(|session| s.session_is_live(session, now));
                 match (it.next(), it.next()) {
                     (Some(only), None) => Some(only.clone()), // exactly one session: unambiguous
                     (None, _) => None,                        // no sessions connected
@@ -8954,7 +8967,12 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         // audit missed it — the two-caller discipline caught it). So siblings exposes ONLY
         // coordination-safe metadata and REDACTS the bearer fields. `session/own` still returns the full
         // session: you may hold your OWN capability, never a peer's.
-        let mut sessions: Vec<&Session> = s.sessions.values().collect();
+        let now = Utc::now();
+        let mut sessions: Vec<&Session> = s
+            .sessions
+            .values()
+            .filter(|session| s.session_is_live(session, now))
+            .collect();
         // Liveness includes lock-free reuse bumps (stage 2), which land in the directory.
         sessions.sort_by_key(|sess| s.sessions.last_seen(sess));
         let safe: Vec<Value> = sessions
@@ -14978,6 +14996,118 @@ mod tests {
             body.contains(&a.to_string()) && !body.contains("ambiguous_caller"),
             "explicit session_id resolves the caller: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stale_reuse_is_replaced_instead_of_refreshed_forever() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "stale-host"}),
+        )
+        .await
+        .unwrap();
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let first_uuid = Uuid::parse_str(&first_id).unwrap();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+        let (map_seen, directory_seen) = {
+            let s = shared.lock().await;
+            let session = s.sessions.get(&first_uuid).unwrap();
+            (
+                s.sessions.last_seen(session),
+                s.sessions.directory().get(&first_uuid).unwrap().last_seen(),
+            )
+        };
+        let stale_before = Utc::now()
+            - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS);
+        assert!(
+            map_seen < stale_before && directory_seen < stale_before,
+            "map and published directory must both be stale: map={map_seen}, directory={directory_seen}"
+        );
+
+        let second = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "stale-host"}),
+        )
+        .await
+        .unwrap();
+        let second_id = second["sessionId"].as_str().unwrap();
+        assert_ne!(second_id, first_id, "stale transport is replaced, not refreshed");
+        assert_eq!(shared.lock().await.sessions.len(), 1, "the old session was reaped");
+        let old = read_resource_body(
+            &shared,
+            &format!("hestia://session/own?session_id={first_id}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(old, "null", "an explicitly named stale session is not live: {old}");
+        let siblings = read_resource_body(&shared, "hestia://session/siblings").await.unwrap();
+        let view: Value = serde_json::from_str(&siblings).unwrap();
+        assert_eq!(view["count"], 1, "{view}");
+        assert_eq!(view["sessions"][0]["host_session_id"], "stale-host", "{view}");
+    }
+
+    #[tokio::test]
+    async fn liveness_retains_inflight_actions_and_filters_the_single_session_fallback() {
+        let (_dir, shared) = make_shared_state();
+        let (stale, fresh, acting) = {
+            let mut s = shared.lock().await;
+            let ids = (
+                add_session(&mut s, "stale-drop"),
+                add_session(&mut s, "fresh-live"),
+                add_session(&mut s, "stale-action"),
+            );
+            for id in [ids.0, ids.2] {
+                let mut session = s.sessions.remove(&id).unwrap();
+                session.connected_at = Utc::now()
+                    - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+                s.sessions.insert(id, session);
+            }
+            let action_id = Uuid::new_v4();
+            s.actions.insert(
+                action_id,
+                InFlightAction {
+                    action_id,
+                    session_id: ids.2,
+                    tool_name: "Edit".into(),
+                    target: Some("/tmp/work".into()),
+                    parameters: None,
+                    intent: None,
+                    host_session_id: None,
+                    serves: None,
+                    started_at: Utc::now(),
+                    chain_position: 0,
+                },
+            );
+            ids
+        };
+
+        let removed = shared.lock().await.reap_stale_sessions(Utc::now());
+        assert_eq!(removed, 1, "only the idle stale session is removed");
+        {
+            let s = shared.lock().await;
+            assert!(!s.sessions.contains_key(&stale));
+            assert!(s.sessions.contains_key(&fresh));
+            assert!(s.sessions.contains_key(&acting), "an in-flight action retains its session");
+        }
+        let siblings = read_resource_body(&shared, "hestia://session/siblings").await.unwrap();
+        assert!(!siblings.contains("stale-drop"), "{siblings}");
+        assert!(siblings.contains("fresh-live") && siblings.contains("stale-action"), "{siblings}");
+        let own = read_resource_body(&shared, "hestia://session/own").await.unwrap();
+        assert!(own.contains("ambiguous_caller"), "two live sessions stay ambiguous: {own}");
+
+        shared.lock().await.actions.clear();
+        let removed = shared.lock().await.reap_stale_sessions(Utc::now());
+        assert_eq!(removed, 1, "the action session becomes removable when its work closes");
+        let own = read_resource_body(&shared, "hestia://session/own").await.unwrap();
+        assert!(own.contains(&fresh.to_string()), "the sole live session resolves: {own}");
+        assert!(!own.contains("ambiguous_caller"), "{own}");
     }
 
     /// The read side of local coordination: siblings lists every connected session (heterogeneous by
