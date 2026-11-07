@@ -24265,11 +24265,15 @@ fn rerooted_in_reach(s: &crate::server::state::ServerState, plugin_id: &str, roo
         if !(real == root_real || real.starts_with(&root_real)) {
             return None;
         }
+        // `real` is canonicalized, so the grants it is judged against must be too:
+        // `has_scope_grant_for`/`effective_modes` compare the stored (lexical) grant paths, and on
+        // macOS a grant under /var or /tmp is stored as /var/... while its targets resolve to
+        // /private/var/..., so every hint there was withheld (McNugget, hestia #304 triage).
+        // `read_admitted_nearest` canonicalizes the roots, and it is the nearest-grant rule that
+        // `space_of` already uses; the union of every covering grant would let a wide `r` admit a
+        // read inside a nearer `w`-only node (Nova on #1415, regression 3).
         let real_s = real.to_string_lossy().to_string();
-        let read = crate::server::grant_modes::Modes::READ;
-        let admitted = s.has_scope_grant_for(plugin_id, &real_s, read)
-            || s.standing_scope.effective_modes(plugin_id, &real_s, now).is_some_and(|m| m.includes(read));
-        admitted.then_some(cand)
+        read_admitted_nearest(s, plugin_id, &real_s, now).then_some(cand)
     })
 }
 
@@ -33602,6 +33606,36 @@ mod existence_first_tests {
             "path": doubled.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
         let want = format!("Did you mean {root}/hestia/gate.py?");
         assert!(r["detail"].as_str().unwrap().contains(&want), "{r}");
+    }
+
+    /// A grant stored through a symlink still draws the hint. On macOS every tempdir is one
+    /// (/var -> /private/var), so this file's hint tests failed there on every run while Linux CI
+    /// was green: the candidate was judged in its canonical form against the grant's stored one.
+    /// Pinned here with an explicit link so the case holds on every platform.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grant_stored_through_a_symlink_still_draws_the_hint() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("real/governance/hestia")).unwrap();
+        std::fs::write(ws.join("real/governance/hestia/gate.py"), "x").unwrap();
+        std::os::unix::fs::symlink(ws.join("real"), ws.join("linked")).unwrap();
+        let root = ws.join("linked/governance").to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::READ,
+        });
+        let doubled = ws.join("linked/hestia/governance/hestia/gate.py");
+        let before = pending(&state).await;
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": doubled.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        assert_eq!(r["status"], "not_filed", "{r}");
+        let want = format!("Did you mean {root}/hestia/gate.py?");
+        assert!(r["detail"].as_str().unwrap().contains(&want), "{r}");
+        assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
     }
 
     #[tokio::test]
