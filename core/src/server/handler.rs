@@ -402,7 +402,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_appeal",
-            "Dispute a deny that landed on YOU, through the witnessed channel instead of rephrasing around it. Requires the deny's chain hash and a stated reason; routes the appeal to a not-same arbiter if this machine knows one. Scores appeal-filed 0.85 immediately, 1.0 only if an arbiter upholds it",
+            "Dispute a deny that landed on YOU, through the witnessed channel instead of rephrasing around it. Requires the deny's chain hash and a stated reason; routes the appeal to a not-same arbiter if this machine knows one. The filing response echoes appealed_act, rule_name and decided_at so you can check your premise against the recorded act immediately. Scores appeal-filed 0.85 immediately, 1.0 only if an arbiter upholds it",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -3738,6 +3738,9 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({
         "witnessEntryHash": entry.hash,
         "deny_hash": deny_hash,
+        "appealed_act": appealed_act(deny),
+        "rule_name": deny.event_data.get("rule_name").cloned().unwrap_or(Value::Null),
+        "decided_at": deny.timestamp,
         "dispatched": dispatched,
         // Say plainly when nobody can rule. Silence here would read as "dispatched".
         "note": match (&picked, &dispatched) {
@@ -20552,6 +20555,7 @@ mod open_appeals_tests {
                 "adjudicator": "hestia-gate",
                 "attempted": attempted,
                 "reason": "safety preset",
+                "rule_name": "safety-preset",
             }),
         )
         .unwrap()
@@ -20569,6 +20573,19 @@ mod open_appeals_tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_filed_appeal_echoes_the_recorded_act_to_the_appellant() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "kimi-code"]);
+        let attempted = r#"python3 -c 'import json; json.dump({"ok": true}, open("/tmp/wk/result.json", "w"))'"#;
+        let deny = append_deny(&shared, "claude-code", attempted).await;
+        let filed = file_appeal(&shared, ids[0], &deny).await;
+
+        assert!(filed.get("_hestia_error").is_none(), "appeal should file: {filed}");
+        assert_eq!(filed["appealed_act"], attempted);
+        assert_eq!(filed["rule_name"], "safety-preset");
+        assert!(filed["decided_at"].as_str().is_some_and(|at| !at.is_empty()));
     }
 
     /// THE JOIN. An appeal appears until someone rules it, and then it does not.
