@@ -352,25 +352,40 @@ fn hestia_tools() -> Vec<Tool> {
     /// empty schema, from two different sessions, by a caller that had no prompt to
     /// include the one field that carries the payload.
     ///
-    /// Deliberately narrow: only `hestia_member_notify` and
-    /// `hestia_gate_escalation_corroborate` are declared here. Doing the whole surface
-    /// is the right end state and a much larger change — every tool's real argument set
-    /// would have to be read off its handler and kept in sync, and getting one wrong
-    /// ADVERTISES a lie, which is worse than advertising nothing.
-    /// `additionalProperties` stays `true` for member_notify, so its schema only ever
-    /// adds information and cannot refuse a call the handler would have accepted. The
-    /// corroborate door is the exception BOTH ways: its handler refuses unknown keys by
-    /// name, so its schema says `additionalProperties: false` — anything else would
-    /// advertise keys the runtime refuses — and the two are pinned to each other by
-    /// `the_advertised_corroborate_schema_and_the_runtime_are_one_contract`.
+    /// Declare only the handler's complete honoured argument set: an omitted accepted key
+    /// makes the contract undiscoverable, while an invented key advertises a lie.
+    /// `additionalProperties` is false exactly when the handler rejects unknown keys;
+    /// strict surfaces pin the runtime allowlist and advertised property set to each other.
     fn t_args(name: &'static str, description: &'static str, schema: Value) -> Tool {
         Tool::new(name, description, schema_of(schema))
     }
 
     vec![
-        t(
+        t_args(
             "hestia_connect",
             "Establish a plugin session and receive a Soft LCT",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["plugin_id", "host_agent"],
+                "properties": {
+                    "plugin_id": {"type": "string", "minLength": 1, "pattern": "^[^/]+$", "description": "Your member id. A slash is reserved for routed peer/member addresses."},
+                    "host_agent": {"type": "string", "minLength": 1, "description": "The host application establishing this session."},
+                    "plugin_version": {"type": "string", "description": "Optional plugin version."},
+                    "host_agent_version": {"type": "string", "description": "Optional host application version."},
+                    "host_session_id": {"type": "string", "description": "Stable host session id used to reuse the live Hestia session for the same member."},
+                    "requested_role": {"type": "string", "description": "Optional requested role; the response reports the normalized assigned role."},
+                    "role": {"type": "string", "description": "Constellation role to declare. The response reports whether the declaration survived normalization."},
+                    "role_basis": {"type": "string", "description": "Optional provenance for the role declaration, captured when the session is minted."},
+                    "gate_capabilities": {"type": "array", "items": {"type": "string"}, "description": "Optional gate capabilities understood by this caller."},
+                    "projection_sha256": {"type": "string", "description": "Optional digest of the rendered policy projection this caller loaded."},
+                    "synthetic": {"type": "boolean", "description": "Declare a synthetic test member. The exclusion must persist before connect succeeds."},
+                    "protocol_version": {"type": "integer", "description": "Protocol version the SDK was built against. Accepted for SDK compatibility; the response reports the daemon's version."},
+                    "session_id": {"type": "string", "description": "Optional existing session id added by generic SDK stamping; connect does not use it to establish identity."},
+                    "sessionId": {"type": "string", "description": "Camel-case compatibility spelling of session_id."},
+                    "instance_name": {"type": "string", "description": "Legacy caller diagnostic label, accepted for compatibility; the handler does not read it."}
+                }
+            }),
         ),
         t("hestia_begin_action", "Begin tracking an R6/R7 action. Optional `serves`: the goal or question id the act is for; its verdict's `feedback.serves` carries it (\"unknown\" when unstated)"),
         t(
@@ -385,9 +400,21 @@ fn hestia_tools() -> Vec<Tool> {
             "hestia_witness_adjudication",
             "Adjudicate a witnessed Result on one V3 axis (not-the-actor; veracity = daemon-computed calibration over an explicit claim)",
         ),
-        t(
+        t_args(
             "hestia_appeal",
             "Dispute a deny that landed on YOU, through the witnessed channel instead of rephrasing around it. Requires the deny's chain hash and a stated reason; routes the appeal to a not-same arbiter if this machine knows one. Scores appeal-filed 0.85 immediately, 1.0 only if an arbiter upholds it",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["deny_hash", "reason"],
+                "anyOf": [{"required": ["session_id"]}, {"required": ["sessionId"]}],
+                "properties": {
+                    "deny_hash": {"type": "string", "minLength": 1, "description": "Chain hash (or unambiguous hash prefix) of your own recorded policy_decision deny or gate_self_access refusal. An escalation id is not a deny hash."},
+                    "reason": {"type": "string", "minLength": 12, "description": "Why this refusal was wrong, at least 12 non-whitespace characters."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect. Required for attribution."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
+                }
+            }),
         ),
         t(
             "hestia_arbitrate_appeal",
@@ -520,7 +547,7 @@ fn hestia_tools() -> Vec<Tool> {
                 }
             }),
         ),
-        t(
+        t_args(
             "hestia_gate_escalation_claim",
             "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
              already pending from you, the answer carries THAT escalation_id with `coalesced: true` \
@@ -531,6 +558,32 @@ fn hestia_tools() -> Vec<Tool> {
              the marker, the act and every target, highest wins, so they can raise the bar and \
              never lower it; omitted, pricing is unchanged. An approval granted under a LOWER \
              bar than this act now prices is not spent for it",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["plugin_id", "tool_name", "marker"],
+                "properties": {
+                    "plugin_id": {"type": "string", "minLength": 1, "description": "Your member id. If session_id resolves, it must name the same member."},
+                    "tool_name": {"type": "string", "minLength": 1, "description": "The tool whose governance write is being claimed or escalated."},
+                    "marker": {"type": "string", "minLength": 1, "description": "The governance marker that refused the write."},
+                    "role": {"type": "string", "description": "Optional constellation role declared by the gate."},
+                    "answers_deny": {"type": "string", "description": "Chain hash of the deny being escalated, when available."},
+                    "reason": {"type": "string", "description": "Your rationale. Legacy gate callers also use this as the act when act is omitted."},
+                    "act": {"type": "string", "description": "Exact act to claim or escalate. When both act and reason are present, act identifies the operation and reason carries the rationale."},
+                    "resolved_targets": {"type": "array", "items": {"type": "string"}, "description": "Every write-position path resolved by the gate."},
+                    "resolved_target": {"type": "string", "description": "Single-target compatibility spelling, joined with resolved_targets."},
+                    "also_resolved": {"type": "array", "items": {"type": "string"}, "description": "Additional resolved targets, joined with resolved_targets and resolved_target."},
+                    "payload_sha256": {"type": "string", "description": "Optional digest of the exact bytes to be written."},
+                    "detail": {"type": "string", "description": "Optional detail about the attempted act."},
+                    "request_key": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Stable sha256 request key used to recover an uncertain claim-or-open outcome."},
+                    "invocation_key": {"type": "string", "description": "The tool invocation's correlation key, used to distinguish retries from repeats."},
+                    "supersession": {"type": "string", "enum": ["hard_stop"], "description": "Declare hard_stop only when the hook stops a superseded invocation in every rollout mode."},
+                    "host_session_id": {"type": "string", "description": "Host wake correlation. A proven session's value is authoritative; a contradictory assertion is refused."},
+                    "gate_path": {"type": "string", "description": "Optional realpath of the hook making this claim."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect. Optional for version-skew compatibility, but recommended for attributed review."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
+                }
+            }),
         ),
         t_args(
             "hestia_gate_escalation_lookup",
@@ -747,6 +800,7 @@ fn make_resource_template(uri_template: &str, name: &str, description: &str) -> 
 type ToolResult = Result<Value, anyhow::Error>;
 
 pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
+    reject_unknown_keys(args, CONNECT_ACCEPTED_KEYS, "hestia_connect")?;
     let plugin_id = require_string(args, "plugin_id")?;
     // `/` is the routed-address separator (r6-routing branch 2: `peer/member`), so a
     // member id containing one makes the address form AMBIGUOUS at its own parse site.
@@ -3344,6 +3398,7 @@ fn appealed_act(e: &crate::storage::chain::ChainEntry) -> Value {
 
 /// File an appeal against a deny that landed on you.
 async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
+    reject_unknown_keys(args, APPEAL_ACCEPTED_KEYS, "hestia_appeal")?;
     let deny_hash = require_string(args, "deny_hash")?;
     let reason = require_string(args, "reason")?;
     if reason.trim().len() < 12 {
@@ -9823,6 +9878,64 @@ fn hestia_error_envelope(code: &str, message: &str, data: Option<Value>) -> Valu
             "data": data.unwrap_or(json!({})),
         }
     })
+}
+
+const CONNECT_ACCEPTED_KEYS: &[&str] = &[
+    "plugin_id",
+    "host_agent",
+    "plugin_version",
+    "host_agent_version",
+    "host_session_id",
+    "requested_role",
+    "role",
+    "role_basis",
+    "gate_capabilities",
+    "projection_sha256",
+    "synthetic",
+    "protocol_version",
+    "session_id",
+    "sessionId",
+    "instance_name",
+];
+const APPEAL_ACCEPTED_KEYS: &[&str] = &["deny_hash", "reason", "session_id", "sessionId"];
+const ESCALATION_CLAIM_ACCEPTED_KEYS: &[&str] = &[
+    "plugin_id",
+    "tool_name",
+    "marker",
+    "role",
+    "answers_deny",
+    "reason",
+    "act",
+    "resolved_targets",
+    "resolved_target",
+    "also_resolved",
+    "payload_sha256",
+    "detail",
+    "request_key",
+    "invocation_key",
+    "supersession",
+    "host_session_id",
+    "gate_path",
+    "session_id",
+    "sessionId",
+];
+
+fn reject_unknown_keys(args: &Value, accepted: &[&str], tool: &str) -> Result<(), anyhow::Error> {
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !accepted.contains(key))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{tool}: unknown argument key(s): {}; accepted keys are: {}",
+                unknown.join(", "),
+                accepted.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn require_string(args: &Value, key: &str) -> Result<String, anyhow::Error> {
@@ -19735,6 +19848,99 @@ mod tests {
         assert!(format!("{err}").contains("argument"), "{err}");
     }
 
+    #[tokio::test]
+    async fn appeal_connect_and_claim_schemas_match_runtime_vocabulary() {
+        let cases = [
+            (
+                "hestia_connect",
+                CONNECT_ACCEPTED_KEYS,
+                &["plugin_id", "host_agent"][..],
+            ),
+            (
+                "hestia_appeal",
+                APPEAL_ACCEPTED_KEYS,
+                &["deny_hash", "reason"][..],
+            ),
+            (
+                "hestia_gate_escalation_claim",
+                ESCALATION_CLAIM_ACCEPTED_KEYS,
+                &["plugin_id", "tool_name", "marker"][..],
+            ),
+        ];
+        let tools = hestia_tools();
+        for (name, accepted, required) in cases {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("the tool must be advertised");
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            let mut advertised: Vec<&str> = schema["properties"]
+                .as_object()
+                .expect("arguments must be discoverable")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            advertised.sort_unstable();
+            let mut honoured = accepted.to_vec();
+            honoured.sort_unstable();
+            assert_eq!(advertised, honoured, "{name}: schema/runtime drift");
+            assert_eq!(schema["additionalProperties"], false, "{schema}");
+            assert_eq!(schema["required"], json!(required), "{schema}");
+        }
+
+        let (_dir, state) = make_shared_state();
+        let connected = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "schema-probe",
+                "host_agent": "schema-test",
+                "instance_name": "legacy-diagnostic-label",
+                "protocol_version": 1,
+                "session_id": "generic-sdk-stamp",
+                "synthetic": true,
+            }),
+        )
+        .await
+        .expect("documented SDK and legacy connect fields must remain accepted");
+        assert!(connected["sessionId"].is_string(), "{connected}");
+
+        let sessions_before = state.lock().await.sessions.len();
+        let err = tool_connect(
+            &state,
+            &json!({"plugin_id": "schema-probe", "host_agnet": "misspelled"}),
+        )
+        .await
+        .expect_err("an unknown connect key must refuse before session creation");
+        assert!(format!("{err}").contains("host_agnet"), "{err}");
+        assert_eq!(state.lock().await.sessions.len(), sessions_before);
+
+        let err = tool_appeal(
+            &state,
+            &json!({
+                "deny_hash": "a".repeat(64),
+                "chain_hash": "a".repeat(64),
+                "reason": "the misspelled key must not be discarded",
+            }),
+        )
+        .await
+        .expect_err("an unknown appeal key must refuse before attribution or chain access");
+        assert!(format!("{err}").contains("chain_hash"), "{err}");
+
+        let err = tool_gate_escalation_claim(
+            &state,
+            &json!({
+                "plugin_id": "schema-probe",
+                "tool_name": "Edit",
+                "marker": "plugins/_shared",
+                "act": "Edit -> /tmp/example",
+                "session": "misspelled",
+            }),
+        )
+        .await
+        .expect_err("an unknown claim key must refuse before claim-or-open");
+        assert!(format!("{err}").contains("session"), "{err}");
+    }
+
     /// The drift guard review 4940109239 asked for: the ADVERTISED schema and the HONOURED
     /// runtime are pinned to each other through `CORROBORATE_ACCEPTED_KEYS`, so this test
     /// fails if either side changes without the other. Three assertions carry it:
@@ -26291,6 +26497,11 @@ cannot be reclaimed again.",
 async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::{now_secs, DEFAULT_TTL_SECS};
 
+    reject_unknown_keys(
+        args,
+        ESCALATION_CLAIM_ACCEPTED_KEYS,
+        "hestia_gate_escalation_claim",
+    )?;
     let plugin_id = require_string(args, "plugin_id")?;
     let tool_name = require_string(args, "tool_name")?;
     let marker = require_string(args, "marker")?;
