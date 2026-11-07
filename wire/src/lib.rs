@@ -155,6 +155,42 @@ pub fn canonical_act_digest_preimage(f: &ActDigestV1Fields<'_>) -> Vec<u8> {
     out
 }
 
+/// Domain separator for a provenance-only observation of a foreign chain (#328).
+pub const CROSS_CHAIN_CHECKPOINT_DOMAIN: &str = "hestia:cross-chain-checkpoint:v1";
+
+/// The semantic record an observer signs. Position and chain identity remain separate so
+/// competing observations at one height stay legible; no trust or transitivity is implied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossChainCheckpointV1Fields<'a> {
+    pub foreign_chain_id: &'a str,
+    pub foreign_position: &'a str,
+    pub foreign_head_hash: &'a str,
+    pub foreign_genesis_hash: Option<&'a str>,
+    pub observed_at: &'a str,
+    pub observer_lct: &'a str,
+    pub observer_authority: &'a str,
+}
+
+/// Exact bytes for a cross-chain checkpoint digest. An absent genesis hash is an empty field.
+pub fn canonical_cross_chain_checkpoint_preimage(f: &CrossChainCheckpointV1Fields<'_>) -> Vec<u8> {
+    let fields = [
+        ("foreign_chain_id", f.foreign_chain_id),
+        ("foreign_position", f.foreign_position),
+        ("foreign_head_hash", f.foreign_head_hash),
+        ("foreign_genesis_hash", f.foreign_genesis_hash.unwrap_or("")),
+        ("observed_at", f.observed_at),
+        ("observer_lct", f.observer_lct),
+        ("observer_authority", f.observer_authority),
+    ];
+    let mut out = format!("{CROSS_CHAIN_CHECKPOINT_DOMAIN}\n").into_bytes();
+    for (name, value) in fields {
+        out.extend_from_slice(format!("{name}:{}\n", value.len()).as_bytes());
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
 /// Domain separator for the v1 chain-witness signature over one witness-chain row (#339, B2).
 ///
 /// A row's legacy `hash` covers `prev_hash || timestamp || event_type || event_data` and
@@ -334,6 +370,60 @@ mod tests {
             canonical_act_digest_preimage(&b),
             "moving bytes across semantic fields must change the preimage"
         );
+    }
+
+    fn sample_checkpoint() -> CrossChainCheckpointV1Fields<'static> {
+        CrossChainCheckpointV1Fields {
+            foreign_chain_id: "foreign-chain:alpha",
+            foreign_position: "42",
+            foreign_head_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            foreign_genesis_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            observed_at: "2026-08-11T03:43:35Z",
+            observer_lct: "lct:web4:mb32:bobserver",
+            observer_authority: "role:constellation:member",
+        }
+    }
+
+    #[test]
+    fn the_cross_chain_checkpoint_golden_vector_is_language_independent() {
+        assert_eq!(
+            sha256_hex(&canonical_cross_chain_checkpoint_preimage(&sample_checkpoint())),
+            "9661ea98b1d347e5eea2928b11c5b696a776cc12715ad6324d020c88baccd677",
+        );
+    }
+
+    #[test]
+    fn competing_checkpoint_heads_remain_distinct_and_boundary_safe() {
+        let a = CrossChainCheckpointV1Fields {
+            foreign_head_hash: &"c".repeat(64),
+            ..sample_checkpoint()
+        };
+        let b = CrossChainCheckpointV1Fields {
+            foreign_head_hash: &"d".repeat(64),
+            ..sample_checkpoint()
+        };
+        assert_ne!(
+            canonical_cross_chain_checkpoint_preimage(&a),
+            canonical_cross_chain_checkpoint_preimage(&b),
+            "competing heads at one position must remain separately legible"
+        );
+        let x = CrossChainCheckpointV1Fields {
+            foreign_chain_id: "xy",
+            foreign_head_hash: "z",
+            ..sample_checkpoint()
+        };
+        let y = CrossChainCheckpointV1Fields {
+            foreign_chain_id: "x",
+            foreign_head_hash: "yz",
+            ..sample_checkpoint()
+        };
+        assert_ne!(
+            canonical_cross_chain_checkpoint_preimage(&x),
+            canonical_cross_chain_checkpoint_preimage(&y),
+            "length delimiters prevent field-boundary shifting"
+        );
+        assert_ne!(CROSS_CHAIN_CHECKPOINT_DOMAIN, ACT_DIGEST_DOMAIN);
+        assert_ne!(CROSS_CHAIN_CHECKPOINT_DOMAIN, CHAIN_SIGNATURE_DOMAIN);
     }
 
     fn sample_chain_sig() -> ChainSignatureV1Fields<'static> {

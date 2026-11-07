@@ -17,6 +17,7 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -119,6 +120,7 @@ impl ServerHandler for HestiaServer {
             "hestia_gate_arbitrate_escalation" => tool_gate_arbitrate_escalation(&self.state, &args).await,
             "hestia_scope_arbitrate" => tool_scope_arbitrate(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
+            "hestia_cross_chain_checkpoint" => tool_cross_chain_checkpoint(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
             "hestia_vault_get" => tool_vault_get(&self.state, &args).await,
@@ -671,6 +673,25 @@ fn hestia_tools() -> Vec<Tool> {
                         }
                     },
                     "serves": {"type": "string", "maxLength": 200}
+                }
+            }),
+        ),
+        t_args(
+            "hestia_cross_chain_checkpoint",
+            "Record a signed, provenance-only observation of a foreign chain at an exact position and head. Observer identity and authority are derived from your live session. Competing heads remain distinct; no trust or transitivity is computed.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["foreign_chain_id", "foreign_position", "foreign_head_hash"],
+                "anyOf": [{"required": ["session_id"]}, {"required": ["sessionId"]}],
+                "properties": {
+                    "foreign_chain_id": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Stable foreign chain identity, not a URL."},
+                    "foreign_position": {"type": "integer", "minimum": 0, "description": "Foreign sequence height or chain position."},
+                    "foreign_head_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Exact 64-hex head at that position."},
+                    "foreign_genesis_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Optional genesis hash binding chain identity."},
+                    "observed_at": {"type": "string", "format": "date-time", "description": "Optional RFC3339 observation time; defaults to the daemon's current time."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
                 }
             }),
         ),
@@ -4307,6 +4328,113 @@ const WITNESS_DECISION_ACCEPTED_KEYS: &[&str] = &[
     "effects",
     "serves",
 ];
+
+async fn tool_cross_chain_checkpoint(state: &SharedState, args: &Value) -> ToolResult {
+    const ACCEPTED: &[&str] = &[
+        "foreign_chain_id",
+        "foreign_position",
+        "foreign_head_hash",
+        "foreign_genesis_hash",
+        "observed_at",
+        "session_id",
+        "sessionId",
+    ];
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !ACCEPTED.contains(key))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(anyhow::anyhow!(
+                "hestia_cross_chain_checkpoint: unknown argument key(s): {}",
+                unknown.join(", ")
+            ));
+        }
+    }
+    let foreign_chain_id = require_string(args, "foreign_chain_id")?;
+    if foreign_chain_id.trim().is_empty()
+        || foreign_chain_id.len() > 256
+        || foreign_chain_id.chars().any(char::is_control)
+    {
+        return Err(anyhow::anyhow!(
+            "foreign_chain_id must be 1-256 bytes with no control characters"
+        ));
+    }
+    let foreign_position = args
+        .get("foreign_position")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid 'foreign_position' argument"))?;
+    let valid_hash = |value: &str| {
+        value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    };
+    let foreign_head_hash = require_string(args, "foreign_head_hash")?;
+    if !valid_hash(&foreign_head_hash) {
+        return Err(anyhow::anyhow!("foreign_head_hash must be 64 lowercase hex characters"));
+    }
+    let foreign_genesis_hash = optional_string(args, "foreign_genesis_hash");
+    if let Some(hash) = &foreign_genesis_hash {
+        if !valid_hash(hash) {
+            return Err(anyhow::anyhow!("foreign_genesis_hash must be 64 lowercase hex characters"));
+        }
+    }
+    let observed_at = optional_string(args, "observed_at")
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    chrono::DateTime::parse_from_rfc3339(&observed_at)
+        .map_err(|e| anyhow::anyhow!("observed_at must be RFC3339: {e}"))?;
+    let session_id_arg = optional_session_id(args);
+
+    let mut s = state.lock().await;
+    let Some(caller) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.cross_chain_checkpoint_unattributed",
+            "recording a cross-chain observation requires your own live session_id; the observer's identity is derived, never asserted",
+            None,
+        ));
+    };
+    let Some(observer_lct) = s.member_lct(&caller.plugin_id) else {
+        return Ok(hestia_error_envelope(
+            "hestia.cross_chain_checkpoint_observer_unknown",
+            "the live session has no stable member LCT, so no observer identity can be recorded",
+            None,
+        ));
+    };
+    let observer_authority = caller.role_lct;
+    let position = foreign_position.to_string();
+    let preimage = hestia_wire::canonical_cross_chain_checkpoint_preimage(
+        &hestia_wire::CrossChainCheckpointV1Fields {
+            foreign_chain_id: &foreign_chain_id,
+            foreign_position: &position,
+            foreign_head_hash: &foreign_head_hash,
+            foreign_genesis_hash: foreign_genesis_hash.as_deref(),
+            observed_at: &observed_at,
+            observer_lct: &observer_lct,
+            observer_authority: &observer_authority,
+        },
+    );
+    let checkpoint_digest = hex::encode(Sha256::digest(&preimage));
+    let entry = s.append_chain(
+        "cross_chain_checkpoint_v1",
+        json!({
+            "foreign_chain_id": foreign_chain_id,
+            "foreign_position": foreign_position,
+            "foreign_head_hash": foreign_head_hash,
+            "foreign_genesis_hash": foreign_genesis_hash,
+            "observed_at": observed_at,
+            "observer_lct": observer_lct,
+            "observer_authority": observer_authority,
+            "checkpoint_digest": checkpoint_digest,
+        }),
+    )?;
+    Ok(json!({
+        "recorded": true,
+        "provenance_only": true,
+        "witnessEntryHash": entry.hash,
+        "checkpointDigest": checkpoint_digest,
+        "observer_lct": observer_lct,
+        "observer_authority": observer_authority,
+    }))
+}
 
 async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
     use super::decision_witness::{bounded_core_digest, Verdict};
@@ -15163,6 +15291,97 @@ mod tests {
     /// GUESS the caller. Single session resolves unambiguously; a second concurrent session makes
     /// an id-less read fail-closed (not "return the newest") so a claims layer can't be built on
     /// confident misattribution; an explicit `?session_id=` resolves the true caller.
+    #[tokio::test]
+    async fn cross_chain_checkpoints_are_signed_provenance_and_preserve_competing_heads() {
+        let (_dir, shared) = make_shared_state();
+        let chain_before = shared.lock().await.chain_len();
+        let unattributed = tool_cross_chain_checkpoint(
+            &shared,
+            &json!({
+                "foreign_chain_id": "foreign-chain:alpha",
+                "foreign_position": 42,
+                "foreign_head_hash": "a".repeat(64),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unattributed["_hestia_error"]["code"],
+            "hestia.cross_chain_checkpoint_unattributed"
+        );
+        assert_eq!(shared.lock().await.chain_len(), chain_before, "no unattributed row");
+
+        let connected = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "checkpoint-member",
+                "host_agent": "checkpoint-test",
+                "synthetic": false,
+            }),
+        )
+        .await
+        .unwrap();
+        let session_id = connected["sessionId"].as_str().unwrap();
+        for head in ["a", "c"] {
+            let response = tool_cross_chain_checkpoint(
+                &shared,
+                &json!({
+                    "foreign_chain_id": "foreign-chain:alpha",
+                    "foreign_position": 42,
+                    "foreign_head_hash": head.repeat(64),
+                    "foreign_genesis_hash": "b".repeat(64),
+                    "observed_at": "2026-08-11T03:43:35Z",
+                    "session_id": session_id,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["provenance_only"], true, "{response}");
+            assert!(response.get("trust").is_none(), "no derived trust value: {response}");
+        }
+
+        let s = shared.lock().await;
+        let rows = s.recent_chain(2);
+        assert_eq!(rows.len(), 2, "both competing checkpoints remain");
+        assert_eq!(rows[0].event_data["foreign_head_hash"], "c".repeat(64));
+        assert_eq!(rows[1].event_data["foreign_head_hash"], "a".repeat(64));
+        let chain_id = s.chain_store.chain_id().unwrap();
+        for row in rows {
+            assert_eq!(row.event_type, "cross_chain_checkpoint_v1");
+            assert_eq!(row.event_data["foreign_position"], 42);
+            assert_eq!(row.event_data["observer_authority"], "role:constellation:member");
+            let preimage = hestia_wire::canonical_cross_chain_checkpoint_preimage(
+                &hestia_wire::CrossChainCheckpointV1Fields {
+                    foreign_chain_id: "foreign-chain:alpha",
+                    foreign_position: "42",
+                    foreign_head_hash: row.event_data["foreign_head_hash"].as_str().unwrap(),
+                    foreign_genesis_hash: Some(&"b".repeat(64)),
+                    observed_at: "2026-08-11T03:43:35Z",
+                    observer_lct: row.event_data["observer_lct"].as_str().unwrap(),
+                    observer_authority: "role:constellation:member",
+                },
+            );
+            assert_eq!(
+                row.event_data["checkpoint_digest"],
+                hex::encode(Sha256::digest(&preimage)),
+                "an independent reader reproduces the semantic digest from the record"
+            );
+            let signature = s
+                .chain_store
+                .signature_for(row.chain_position)
+                .unwrap()
+                .expect("the checkpoint is signed");
+            crate::storage::chain::verify_row_signature(
+                &chain_id,
+                row.chain_position,
+                &row.hash,
+                &row.signer_lct,
+                &signature,
+            )
+            .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn session_own_fails_closed_under_concurrency_never_guesses_the_newest() {
         let (_dir, shared) = make_shared_state();
