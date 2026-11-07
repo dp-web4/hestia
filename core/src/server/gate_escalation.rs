@@ -840,6 +840,10 @@ pub struct Factor {
     /// factor written before this existed reads as "not an invocation", which is what it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation: Option<Invocation>,
+    /// True only when the permit was already spent. Late evidence remains commentary,
+    /// never something that could have informed the decision. Older factors default false.
+    #[serde(default)]
+    pub post_claim: bool,
 }
 
 /// Where an invoked factor came from. `by` on the `Factor` names the filler's durable
@@ -3614,6 +3618,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             dissent: false,
             argument: None,
             invocation: None,
+            post_claim: false,
             at: now,
         });
         Ok(esc.clone())
@@ -3646,6 +3651,8 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
     /// A late factor still cannot dress up a ruling — `bar_met` is unmoved by it (see
     /// `a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could`) — so the protection
     /// the deleted sentence claimed comes from the PREDICATE, not from refusing the peer.
+    /// A factor created after `consumed_at` is explicitly `post_claim`, so preserved late
+    /// commentary cannot be misread as evidence that informed the already-spent ruling.
     ///
     /// The deleted sentence said the opposite ("it freezes the moment a decision lands").
     /// It outlived the 2026-08-06 cutover by 25 days and was filed twice (#510, and codex's
@@ -3694,6 +3701,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                 .map(|a| a.trim().to_string())
                 .filter(|a| !a.is_empty()),
             invocation: None,
+            post_claim: esc.consumed_at.is_some(),
             at: now,
         });
         Ok(esc.clone())
@@ -3757,6 +3765,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                 model: invocation.model.trim().to_string(),
                 prompt_digest: invocation.prompt_digest.trim().to_string(),
             }),
+            post_claim: false,
             at: now,
         });
         Ok(esc.clone())
