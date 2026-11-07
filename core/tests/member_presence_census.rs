@@ -764,7 +764,11 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // (2) Compared to decide control flow? No. The derived LCT is serialised into the witness
     // record and read by nothing; the retirement store keys on the `plugin_id` STRING, and the
     // refusals (retired-id grant, not-retired reinstate) compare that string. Naming.
-    ("server/http.rs::agent_retire", &[
+    // #1467 moves the existing retirement body into `agent_retire_inner` so the
+    // legacy and conditional routes share it. Both still pass the URL id unchanged;
+    // the derived LCT is recorded as attribution and is not compared for a verdict.
+    // This census update does not resolve the conditional route's ABA or witnessing HOLDs.
+    ("server/http.rs::agent_retire_inner", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
     ("server/http.rs::agent_reinstate", &[
