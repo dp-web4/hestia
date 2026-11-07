@@ -62,7 +62,7 @@ ESC_EVENTS = {
     "gate_escalation_corroborated",
     "gate_escalation_claimed",
 }
-TERMINAL_EVENTS = {"gate_escalation_decided", "gate_escalation_expired", "gate_escalation_withdrawn"}
+from escalation_outcomes import TERMINAL_EVENTS
 GENESIS_SENTINEL = "0" * 64
 
 # The three cue families. A candidate statement conjoins one term from each.
