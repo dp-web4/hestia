@@ -2605,6 +2605,33 @@ impl EscalationStore {
                                            stated_reason, stated_detail, None, now, ttl_secs)
     }
 
+    /// The pending escalation an ask for this act would FOLD into, if one exists: the twin
+    /// `open_or_coalesce_with_payload` hands back instead of minting. Read-only, so the claim
+    /// door can tell "already asked, still pending" (answer with that id) from "never asked"
+    /// (record the refusal and open nothing) before anything is minted.
+    pub fn coalesce_target(
+        &self,
+        plugin_id: &str,
+        marker: &str,
+        act: Option<&str>,
+        resolved_targets: &[String],
+        binding: Option<&PayloadBinding>,
+        now: u64,
+    ) -> Option<&Escalation> {
+        let a = act.map(str::trim).filter(|v| !v.is_empty())?;
+        let digest = Self::act_digest_of(a);
+        // A FOLD MUST NOT LOWER THE PRICE. The twin was priced from what ITS ask carried; an
+        // ask for the same act that prices HIGHER (a resolved target the first ask lacked —
+        // an old hook then a new one, across an upgrade) is not folded into the weaker row,
+        // or coalescing would be the one path on which the target could not strengthen.
+        let (asked_bar, _) = price(
+            marker.trim(), Some(a),
+            &normalize_resolved_targets(resolved_targets.iter().map(String::as_str)));
+        self.pending_twin_bound(
+            plugin_id.trim(), marker.trim(), &digest,
+            binding.and_then(|b| b.sha256.as_deref()), now, asked_bar)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn open_or_coalesce_with_payload(
         &mut self,
@@ -2620,21 +2647,8 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Opened, OpenError> {
-        if let Some(a) = act.map(str::trim).filter(|v| !v.is_empty()) {
-            let digest = Self::act_digest_of(a);
-            // A FOLD MUST NOT LOWER THE PRICE. The twin was priced from what ITS ask carried; an
-            // ask for the same act that prices HIGHER (a resolved target the first ask lacked —
-            // an old hook then a new one, across an upgrade) is not folded into the weaker row,
-            // or coalescing would be the one path on which the target could not strengthen.
-            let (asked_bar, _) = price(
-                marker.trim(), Some(a),
-                &normalize_resolved_targets(resolved_targets.iter().map(String::as_str)));
-            if let Some(twin) = self.pending_twin_bound(
-                plugin_id.trim(), marker.trim(), &digest,
-                binding.and_then(|b| b.sha256.as_deref()), now, asked_bar)
-            {
-                return Ok(Opened::Coalesced(twin.clone()));
-            }
+        if let Some(twin) = self.coalesce_target(plugin_id, marker, act, resolved_targets, binding, now) {
+            return Ok(Opened::Coalesced(twin.clone()));
         }
         self.open_with_payload(plugin_id, role, tool_name, marker, act, resolved_targets,
                                stated_reason, stated_detail, binding, now, ttl_secs)

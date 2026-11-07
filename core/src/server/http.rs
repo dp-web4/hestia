@@ -12724,7 +12724,7 @@ mod disposition_tests {
 
     async fn claim(state: &SharedState, member: &str, path: &str, act: &str, spend: bool)
         -> serde_json::Value {
-        crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+        crate::server::handler::claim_and_escalate(state, &serde_json::json!({
             "plugin_id": member, "path": path, "rule": "mrh.command", "tool_name": "Bash",
             "act": act, "act_digest": digest_of(act), "spend": spend,
             "host_session_id": "sess-under-test",
@@ -12733,7 +12733,7 @@ mod disposition_tests {
 
     async fn batch(state: &SharedState, member: &str, op: &str, op_key: &str, paths: &[&str],
                    act: &str) -> serde_json::Value {
-        crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+        crate::server::handler::claim_and_escalate(state, &serde_json::json!({
             "plugin_id": member, "op": op, "op_key": op_key, "paths": paths,
             "act_digest": digest_of(act),
         })).await.expect("batch answers")
@@ -12756,21 +12756,21 @@ mod disposition_tests {
     #[tokio::test]
     async fn scope_claim_requires_a_complete_act_digest_and_binds_to_it() {
         let (_dir, state) = test_state().await;
-        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let r = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.command",
             "tool_name": "Write", "act": "Write -> /etc/review-probe"})).await.unwrap();
         assert_eq!(r["_hestia_error"]["code"], "hestia.scope_claim_act_digest_required", "{r}");
         assert!(state.lock().await.scope_requests.is_empty(), "nothing opened without a digest");
         // Same display summary, different complete act (Write contents): distinct digests.
         let summary = "Write -> /etc/review-probe";
-        let id = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let id = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
             "tool_name": "Write", "act": summary, "act_digest": digest_of("content: one"),
             "spend": false})).await.unwrap()["request_id"].as_str().unwrap().to_string();
         assert_eq!(decide(&state, serde_json::json!({
             "request_id": &id, "granted": true, "reason": "one write", "once": true})).await.0,
             StatusCode::OK);
-        let other = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let other = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
             "tool_name": "Write", "act": summary, "act_digest": digest_of("content: two"),
             "spend": true})).await.unwrap();
@@ -12792,7 +12792,7 @@ mod disposition_tests {
     /// Open a gate request as a PROVEN asker (session) and return (id, invited peers, response).
     async fn proven_claim(state: &SharedState, member: &str, sid: &str, path: &str)
         -> (String, Vec<String>, serde_json::Value) {
-        let r = crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+        let r = crate::server::handler::claim_and_escalate(state, &serde_json::json!({
             "plugin_id": member, "session_id": sid, "path": path, "rule": "mrh.command",
             "tool_name": "Bash", "act": format!("cat {path}"), "act_digest": digest_of(&format!("cat {path}")),
             "spend": false,
@@ -13280,7 +13280,7 @@ mod disposition_tests {
         let p = f.to_str().unwrap().to_string();
         // A READ, refused standing: the refusal records `r`.
         let act = format!("Read {p}");
-        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let r = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
             "act": &act, "act_digest": digest_of(&act), "spend": false,
             "host_session_id": "sess-under-test"})).await.unwrap();
@@ -13299,7 +13299,7 @@ mod disposition_tests {
                 "a w-only grant must not lift a refused read");
         assert_eq!(lifted_rows(&state).await, rows, "no lift row for a lift that did not happen");
         // The refused read is still answered from the record, not re-asked.
-        let again = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let again = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
             "act": &act, "act_digest": digest_of(&act), "spend": false,
             "host_session_id": "sess-under-test"})).await.unwrap();
@@ -13519,6 +13519,103 @@ mod disposition_tests {
         assert_eq!(opened.len(), 1, "one chain row for one ask");
         assert_eq!(opened[0].event_data["origin"], "gate_deny");
         assert!(!s.has_scope_grant("kimi-code", "/outside/mail/profile.ini"), "asking is not receiving");
+    }
+
+    // ---- dp, 2026-11-05: "don't do gate-generated scope requests to the operator. instead,
+    // deny with option to escalate. if the agent really needs it, they can escalate as a
+    // deliberate act." ----
+
+    fn gate_claim_args(member: &str, path: &str, act: &str) -> serde_json::Value {
+        serde_json::json!({
+            "plugin_id": member, "path": path, "rule": "mrh.command", "tool_name": "Bash",
+            "act": act, "act_digest": digest_of(act), "spend": false,
+            "host_session_id": "sess-under-test",
+        })
+    }
+
+    /// The gate's claim alone opens NOTHING: no request, no chain row, nobody invited. It
+    /// records the refusal and names the deliberate way forward; a re-issue keeps the same id.
+    #[tokio::test]
+    async fn scope_claim_alone_opens_nothing_and_names_the_escalation() {
+        let (_dir, state) = test_state().await;
+        let args = gate_claim_args("claude-code", "/srv/probe/apt", "grep -n apt /srv/probe/apt");
+        let a = crate::server::handler::tool_scope_claim(&state, &args).await.unwrap();
+        assert_eq!(a["verdict"], "not_asked", "{a}");
+        assert_eq!(a["permits"], false);
+        let rid = a["refusal_id"].as_str().expect("a refusal id").to_string();
+        assert!(rid.starts_with("refusal-"), "{rid}");
+        let detail = a["detail"].as_str().unwrap();
+        assert!(detail.contains("nothing was sent to the operator or to any peer"), "{detail}");
+        assert!(a["escalate"]["cli"].as_str().unwrap()
+                    .contains(&format!("hestia scope escalate {rid} --as claude-code")), "{a}");
+        let b = crate::server::handler::tool_scope_claim(&state, &args).await.unwrap();
+        assert_eq!(b["refusal_id"], rid.as_str(), "a re-issue keeps the same refusal id");
+        let s = state.lock().await;
+        assert!(s.scope_requests.is_empty(), "the gate opened nothing");
+        assert!(!s.recent_chain(20).iter().any(|e| e.event_type == "scope_requested"),
+                "no ask was recorded, because nobody asked");
+        assert_eq!(s.gate_refusals[&rid].origin.reissues, 1);
+    }
+
+    /// The member's deliberate escalation opens the request: its own reason first, the gate's
+    /// record of the act beside it, linked to the refusal, decided as before (peers, operator
+    /// override). The refusal is consumed: escalating it again finds nothing.
+    #[tokio::test]
+    async fn scope_escalate_opens_with_the_members_reason_and_the_gates_act() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "kimi-code").await;
+        let mut args = gate_claim_args("kimi-code", "/srv/data/report.csv", "cat /srv/data/report.csv");
+        args["session_id"] = serde_json::json!(sid);
+        let a = crate::server::handler::tool_scope_claim(&state, &args).await.unwrap();
+        let rid = a["refusal_id"].as_str().unwrap().to_string();
+        let why = "summarising last week's report for the operator; this is the source file";
+        let e = crate::server::handler::tool_scope_escalate(&state, &serde_json::json!({
+            "plugin_id": "kimi-code", "session_id": sid, "refusal_id": rid, "reason": why,
+        })).await.unwrap();
+        assert_eq!(e["verdict"], "opened", "{e}");
+        assert_eq!(e["escalated_from"], rid.as_str());
+        let id = e["request_id"].as_str().unwrap().to_string();
+        {
+            let s = state.lock().await;
+            let r = &s.scope_requests[&id];
+            assert!(r.reason.starts_with(why), "the member's words lead: {}", r.reason);
+            assert!(r.reason.contains("act: cat /srv/data/report.csv"), "{}", r.reason);
+            let g = r.ext.gate.as_ref().unwrap();
+            assert_eq!(g.member_reason.as_deref(), Some(why));
+            assert_eq!(g.escalated_from.as_deref(), Some(rid.as_str()));
+            assert_eq!(g.act_digest, digest_of("cat /srv/data/report.csv"),
+                       "a one-time approval still binds to exactly the refused act");
+            assert_eq!(g.asker_basis, crate::arbiter::AskerBasis::Session);
+            let row = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_requested").unwrap();
+            assert_eq!(row.event_data["origin"], "gate_deny");
+            assert_eq!(row.event_data["member_reason"], why);
+            assert!(!s.gate_refusals.contains_key(&rid), "the refusal is consumed");
+        }
+        let again = crate::server::handler::tool_scope_escalate(&state, &serde_json::json!({
+            "plugin_id": "kimi-code", "session_id": sid, "refusal_id": rid, "reason": why,
+        })).await.unwrap();
+        assert_eq!(again["_hestia_error"]["code"], "hestia.scope_refusal_unknown", "{again}");
+    }
+
+    /// Only the refused member escalates its refusal; a thin reason opens nothing; an unknown
+    /// id says how to get a fresh one.
+    #[tokio::test]
+    async fn scope_escalate_refuses_another_member_a_thin_reason_and_an_unknown_id() {
+        let (_dir, state) = test_state().await;
+        let a = crate::server::handler::tool_scope_claim(
+            &state, &gate_claim_args("codex", "/srv/x", "cat /srv/x")).await.unwrap();
+        let rid = a["refusal_id"].as_str().unwrap().to_string();
+        let esc = |member: &str, id: &str, reason: &str| serde_json::json!({
+            "plugin_id": member, "refusal_id": id, "reason": reason});
+        let other = crate::server::handler::tool_scope_escalate(
+            &state, &esc("kimi-code", &rid, "I would like to read that file please")).await.unwrap();
+        assert_eq!(other["_hestia_error"]["code"], "hestia.scope_escalate_not_yours", "{other}");
+        let thin = crate::server::handler::tool_scope_escalate(&state, &esc("codex", &rid, "need it")).await.unwrap();
+        assert_eq!(thin["_hestia_error"]["code"], "hestia.scope_escalate_reason_thin", "{thin}");
+        let unknown = crate::server::handler::tool_scope_escalate(
+            &state, &esc("codex", "refusal-000000000000", "reading the config to fix the build")).await.unwrap();
+        assert_eq!(unknown["_hestia_error"]["code"], "hestia.scope_refusal_unknown", "{unknown}");
+        assert!(state.lock().await.scope_requests.is_empty(), "none of these opened anything");
     }
 
     /// ONE-TIME: spent only by the act that was refused, once, and never served as policy.

@@ -324,7 +324,13 @@ fn print_scope_requests(r: &Value) {
         );
         if q.get("origin").and_then(Value::as_str) == Some("gate_deny") {
             let reissues = q.get("reissues").and_then(Value::as_u64).unwrap_or(0);
-            println!("      opened by the gate ({}); re-issued {reissues}x", s("rule"));
+            match q.get("member_reason").and_then(Value::as_str) {
+                Some(why) => {
+                    println!("      escalated by the member from a gate refusal ({})", s("rule"));
+                    println!("      reason: {why}");
+                }
+                None => println!("      opened by the gate ({}); re-issued {reissues}x", s("rule")),
+            }
             println!("      act: {}", s("act"));
             let peers: Vec<&str> = q.get("invited_peers").and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
@@ -381,6 +387,30 @@ pub fn scope_pending(endpoint: &str, asserted_id: Option<String>, role: &str, js
 /// `hestia scope decide <id> --as <seat> --once|--session|--standing|--refuse` — a NOT-SAME
 /// peer rules a gate-opened scope request (dp, 2026-10-05). The daemon resolves the seat from
 /// this session and refuses the asker, an unproven asker's request, and an unrecognised seat.
+/// `hestia scope escalate` — turn one recorded gate refusal into a scope request, deliberately,
+/// with the member's own reason (dp, 2026-11-05). Adds no authority: the daemon checks the
+/// refusal is this member's and opens exactly what `hestia_scope_escalate` would.
+pub fn scope_escalate(endpoint: &str, as_member: &str, refusal_id: &str, reason: &str) -> Result<()> {
+    let mut m = Mcp::connect(endpoint)?;
+    let (sid, who) = open_session(&mut m, as_member, "role:constellation:member")?;
+    banner(&who);
+    let r = m.tool("hestia_scope_escalate", json!({"session_id": sid, "plugin_id": as_member,
+                                                   "refusal_id": refusal_id, "reason": reason}))?;
+    println!("{}", serde_json::to_string_pretty(&r).context("encoding the escalation")?);
+    Ok(())
+}
+
+/// `hestia gate escalate` — the member's deliberate escalation of one governance-write refusal.
+pub fn gate_escalate(endpoint: &str, as_member: &str, role: &str, refusal_id: &str, reason: &str) -> Result<()> {
+    let mut m = Mcp::connect(endpoint)?;
+    let (sid, who) = open_session(&mut m, as_member, role)?;
+    banner(&who);
+    let r = m.tool("hestia_gate_escalation_escalate", json!({"session_id": sid, "plugin_id": as_member,
+                                                             "refusal_id": refusal_id, "reason": reason}))?;
+    println!("{}", serde_json::to_string_pretty(&r).context("encoding the escalation")?);
+    Ok(())
+}
+
 pub fn scope_peer_decide(endpoint: &str, as_member: &str, request_id: &str, decision: &str,
                          grant_path: Option<String>, recursive: bool, modes: Option<String>,
                          reason: &str) -> Result<()> {

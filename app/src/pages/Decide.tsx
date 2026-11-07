@@ -231,13 +231,23 @@ function ScopeRequestCard({
         )}
         {fromGate ? (
           <>
-            {/* A GATE-OPENED request is a refused act, not an ask: the act is what is being
-                ruled on, and it is never presented as the member's reason. */}
+            {/* The act is the gate's record of what was refused. Since 2026-11-05 only a member's
+                deliberate escalation opens one, with its own reason; older rows were opened by
+                the gate and carry none. */}
+            {req.member_reason && (
+              <>
+                <dt>member's reason</dt>
+                <dd data-scope-member-reason>{req.member_reason}</dd>
+              </>
+            )}
             <dt>refused act</dt>
             <dd className="pre" data-scope-act>
               {req.act}
               <div className="muted">
-                {req.rule} · {req.tool} · opened by the gate; the member stated no reason
+                {req.rule} · {req.tool} ·{" "}
+                {req.member_reason
+                  ? "escalated by the member from a gate refusal"
+                  : "opened by the gate; the member stated no reason"}
                 {(req.reissues ?? 0) > 0 ? ` · re-issued ${req.reissues}×` : ""}
               </div>
             </dd>
