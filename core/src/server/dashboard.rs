@@ -10,12 +10,13 @@ use std::sync::Arc;
 
 use super::state::ServerState;
 use crate::storage::SqliteChainStore;
+use crate::storage::chain::{ROUTINE_CHAIN_MAX, ROUTINE_CHAIN_PAGE};
 use web4_trust_core::EntityTrust;
 
 /// Dashboard reads are display-grade projections, never authority. Keep their
 /// chain window bounded and, more importantly, read it without holding the
 /// authoritative [`ServerState`] lock (see [`DashboardChainProjection`]).
-const STATS_WINDOW: u64 = 2_000;
+const STATS_WINDOW: u64 = ROUTINE_CHAIN_PAGE;
 
 /// The slow, blocking half of a dashboard snapshot: the chain reads.
 ///
@@ -41,6 +42,7 @@ pub(crate) struct DashboardChainProjection {
     stats_read_error: Option<String>,
     recent: Arc<Vec<RecentEntry>>,
     recent_read_error: Option<String>,
+    recent_before_position: Option<u64>,
 }
 
 /// Derive whatever the trust cache has due (never-derived grains; grains an event has
@@ -67,31 +69,33 @@ impl DashboardChainProjection {
         // so the UI renders unavailable rather than fabricating a quiet fleet.
         // Each scan projects only what its consumer declares: derivation gets
         // its pruned ChainEntry, while stats/feed keep RecentEntry scalars.
-        let (stats_window, stats_read_error) =
-            match chain_store.scan_recent(None, None, STATS_WINDOW, |r| Some(flatten_row(r))) {
-                Ok(v) => (v, None),
-                Err(e) => {
-                    tracing::error!("dashboard stats chain read failed: {e}");
-                    (Vec::new(), Some(e.to_string()))
-                }
-            };
+        let (stats_window, stats_read_error) = match chain_store.scan_recent_page(
+            None, None, None, STATS_WINDOW, |r| Some(flatten_row(r)),
+        ) {
+            Ok(p) => (p.rows, None),
+            Err(e) => {
+                tracing::error!("dashboard stats chain read failed: {e}");
+                (Vec::new(), Some(e.to_string()))
+            }
+        };
         let cutoff = window_cutoff.map(|c| c.to_rfc3339());
-        let (recent, recent_read_error) =
-            match chain_store.scan_recent(cutoff.as_deref(), None, recent_cap, |r| {
-                Some(flatten_row(r))
-            }) {
-                Ok(v) => (v, None),
-                Err(e) => {
-                    tracing::error!("dashboard recent-feed chain read failed: {e}");
-                    (Vec::new(), Some(e.to_string()))
-                }
-            };
+        let recent_cap = recent_cap.min(ROUTINE_CHAIN_MAX);
+        let (recent, recent_before_position, recent_read_error) = match chain_store.scan_recent_page(
+            cutoff.as_deref(), None, None, recent_cap, |r| Some(flatten_row(r)),
+        ) {
+            Ok(p) => (p.rows, p.before_position, None),
+            Err(e) => {
+                tracing::error!("dashboard recent-feed chain read failed: {e}");
+                (Vec::new(), None, Some(e.to_string()))
+            }
+        };
 
         Self {
             stats_window: Arc::new(stats_window),
             stats_read_error,
             recent: Arc::new(recent),
             recent_read_error,
+            recent_before_position,
         }
     }
 }
@@ -297,6 +301,9 @@ pub struct ReadBasis {
     /// Rows considered, when bounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<u64>,
+    /// Exclusive cursor for older rows in the selected timeframe, when more exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_position: Option<u64>,
     /// True only when the answer rests on the whole chain.
     pub complete: bool,
     /// What a relying party should know before accepting this as sufficient.
@@ -310,6 +317,7 @@ impl Default for ReadBasis {
         Self {
             mode: "unstated".into(),
             window: None,
+            before_position: None,
             complete: false,
             note: "basis not declared; treat as compressed and escalate if certainty is required".into(),
         }
@@ -1192,6 +1200,7 @@ impl ServerState {
             stats_read_error,
             recent,
             recent_read_error,
+            recent_before_position,
         } = projection;
 
         let mut total = 0u64;
@@ -1966,6 +1975,7 @@ impl ServerState {
             basis: ReadBasis {
                 mode: "windowed-projection".into(),
                 window: Some(STATS_WINDOW),
+                before_position: recent_before_position,
                 complete: false,
                 note: format!(
                     "counts and trust derive from the most recent {STATS_WINDOW} chain rows, \
