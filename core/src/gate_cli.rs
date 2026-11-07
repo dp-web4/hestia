@@ -306,6 +306,71 @@ pub fn pending(
     Ok(())
 }
 
+fn appeals_json(r: &Value) -> Result<String> {
+    serde_json::to_string(r).context("encoding open appeals as JSON")
+}
+
+/// `hestia gate appeals` — the discovery surface for work any admissible member may rule.
+pub fn appeals(
+    endpoint: &str,
+    asserted_id: Option<String>,
+    role: &str,
+    json_output: bool,
+) -> Result<()> {
+    let asserted = asserted_id.unwrap_or_else(|| DEFAULT_ASSERTED_ID.to_string());
+    let mut m = Mcp::connect(endpoint)?;
+    let (sid, who) = open_session(&mut m, &asserted, role)?;
+    banner(&who);
+    let r = m.tool("hestia_open_appeals", json!({"session_id": sid}))?;
+
+    if json_output {
+        println!("{}", appeals_json(&r)?);
+        return Ok(());
+    }
+    let count = r.get("count").and_then(Value::as_u64).unwrap_or(0);
+    if count == 0 {
+        println!("no open appeals");
+    } else {
+        println!(
+            "{:<64} {:<16} {:<9} {:<10} {:<16}",
+            "DENY_HASH", "APPELLANT", "MAY_RULE", "AGE_SECS", "DESIGNATED"
+        );
+        if let Some(list) = r.get("open").and_then(Value::as_array) {
+            for e in list {
+                let s = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("-").to_string();
+                let may = match e.get("you_may_rule") {
+                    Some(Value::Bool(b)) => b.to_string(),
+                    _ => "null".to_string(),
+                };
+                let designated = e
+                    .pointer("/routing/routed_to")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                println!(
+                    "{:<64} {:<16} {:<9} {:<10} {:<16}",
+                    s("deny_hash"),
+                    s("appellant"),
+                    may,
+                    e.get("age_seconds").and_then(Value::as_u64).unwrap_or(0),
+                    designated,
+                );
+                if let Some(reason) = e.get("reason").and_then(Value::as_str) {
+                    if !reason.trim().is_empty() {
+                        println!("    why: {reason}");
+                    }
+                }
+            }
+        }
+    }
+    if let Some(note) = r.get("note").and_then(Value::as_str) {
+        println!("\nnote: {note}");
+    }
+    if let Some(caveat) = r.pointer("/scope/caveat").and_then(Value::as_str) {
+        println!("caveat: {caveat}");
+    }
+    Ok(())
+}
+
 /// One line per pending scope request, plus — for a request the GATE opened on a refusal
 /// (2026-10-05) — the rule and the refused act on their own line: that act is what the
 /// operator rules on, and an id + path row cannot carry it.
@@ -790,6 +855,25 @@ mod tests {
         let reparsed: Value = serde_json::from_str(&rendered).expect("JSON output reparses");
         assert_eq!(reparsed, daemon, "the CLI must not reinterpret the daemon response");
         assert!(reparsed["pending"].is_array(), "the fold requires a pending array");
+    }
+
+    #[test]
+    fn appeals_json_preserves_the_daemon_response_shape() {
+        let daemon = json!({
+            "open": [{
+                "deny_hash": "abc123",
+                "appellant": "member-a",
+                "you_may_rule": true,
+                "routing": {"routed_to": "member-b"},
+            }],
+            "count": 1,
+            "you": {"plugin_id": "member-b", "role": "role:constellation:member"},
+            "scope": {"window_saturated": false, "caveat": "the whole chain fits"},
+        });
+        let rendered = appeals_json(&daemon).expect("appeal response serializes");
+        let reparsed: Value = serde_json::from_str(&rendered).expect("JSON output reparses");
+        assert_eq!(reparsed, daemon, "the CLI must not reinterpret the daemon response");
+        assert!(reparsed["open"].is_array(), "the queue requires an open array");
     }
 
     /// Connect answers `sessionId`; the gate tools want `session_id`. Reading back the key
