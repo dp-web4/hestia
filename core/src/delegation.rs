@@ -385,7 +385,7 @@ pub fn check_actions(
     Ok(unvalidated)
 }
 
-/// Parse a role name string into a SocietyRole.
+/// Parse a standard role name without minting a custom role for an unknown spelling.
 pub fn parse_role(s: &str) -> Result<SocietyRole> {
     match s.to_lowercase().as_str() {
         "sovereign" => Ok(SocietyRole::Sovereign),
@@ -397,8 +397,19 @@ pub fn parse_role(s: &str) -> Result<SocietyRole> {
         "citizen" => Ok(SocietyRole::Citizen),
         "witness" => Ok(SocietyRole::Witness),
         "auditor" => Ok(SocietyRole::Auditor),
-        other => Ok(SocietyRole::Custom(other.to_string())),
+        _ => anyhow::bail!(
+            "unknown role '{s}'; use custom_role() to create a custom role explicitly"
+        ),
     }
+}
+
+/// Construct a custom role explicitly, preserving the identity's case.
+pub fn custom_role(name: &str) -> Result<SocietyRole> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("custom role name cannot be empty");
+    }
+    Ok(SocietyRole::Custom(name.to_string()))
 }
 
 /// The delegator every delegation on this box is signed by: THE OPERATOR'S OWN KEY.
@@ -444,6 +455,24 @@ mod tests {
     use super::*;
 
     // ---- #952: the first enforcement point, and the cases that would bite ----
+
+    #[test]
+    fn parse_role_rejects_a_typo_instead_of_minting_a_custom_role() {
+        assert!(parse_role("sovereignn").is_err());
+    }
+
+    #[test]
+    fn custom_role_preserves_case() {
+        assert_eq!(
+            custom_role(" Git-Manager ").unwrap(),
+            SocietyRole::Custom("Git-Manager".to_string())
+        );
+    }
+
+    #[test]
+    fn custom_role_rejects_an_empty_name() {
+        assert!(custom_role(" \t").is_err());
+    }
 
     fn store_with(actions: Vec<&str>) -> (DelegationStore, Uuid) {
         let kp = KeyPair::generate();
