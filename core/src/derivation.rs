@@ -109,8 +109,8 @@ const BASELINE_MAX: f64 = 0.75;
 /// dp, 2026-08-23: "codex interactive-dev reads high on 2 actions." Two causes met there.
 /// The EMA opens at 0.5 and two observations of 0.85 land at 0.754, clearing the 0.70
 /// `high` threshold — a confident number with two data points behind it. And the
-/// observations were not even the grain's own: a role-less adjudication credits every
-/// grain the member has (`a_role_less_adjudication_credits_every_grain`).
+/// observations were not even the grain's own: before #580, a role-less adjudication
+/// credited every grain the member had.
 ///
 /// This gate is deliberately NARROW. It applies only when volume is known AND below the
 /// floor, so `derive()` without volume — every pre-existing test, and any caller that
@@ -969,7 +969,9 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
     for e in entries.iter().filter(|e| {
         e.event_type == "adjudication"
             && is_member(entry_str(e, "subject_plugin_id"))
-            && entry_str(e, "subject_role").map_or(true, |r| r == role_lct)
+            && entry_str(e, "subject_role")
+                .map_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE, |r| r)
+                == role_lct
     }) {
         let Some(score) = e.event_data.get("score").and_then(Value::as_f64) else {
             continue; // deferred: witnessed but right-censored
@@ -1206,11 +1208,11 @@ mod tests {
             1,
             0,
             "adjudication",
-            json!({"subject_plugin_id": "codex", "axis": "validity", "score": 0.9}),
+            json!({"subject_plugin_id": "codex", "subject_role": role,
+                   "axis": "validity", "score": 0.9}),
         )];
 
-        // Arm A — the grain codex/interactive-dev actually is: 2 acts, one thin
-        // observation (which is not even its own — see the role-less pin above).
+        // Arm A — the grain codex/interactive-dev actually is: 2 acts, one thin observation.
         let thin = derive_with_volume(
             "codex",
             role,
@@ -1219,7 +1221,7 @@ mod tests {
         );
         assert_eq!(
             thin.level, "unmeasured",
-            "2 actions and a single borrowed observation is not a HIGH — it is not \
+            "2 actions and a single observation is not a HIGH — it is not \
              anything, and saying so is the honest answer"
         );
 
@@ -1246,22 +1248,12 @@ mod tests {
         derive_with_volume("codex", role, w, None).level
     }
 
-    /// A ROLE-LESS ADJUDICATION CREDITS EVERY GRAIN THE MEMBER HAS.
-    ///
-    /// `subject_role` is matched with `map_or(true, ...)`, so an adjudication that omits
-    /// it counts for each role separately. Surfaced 2026-08-23 when the window fix brought
-    /// codex's 2026-07-27 adjudications back into reach: `codex/interactive-dev` — 2
-    /// actions, no adjudications of its own — rendered HIGH on evidence belonging to
-    /// `member` and `reviewer`.
-    ///
-    /// Pinned as an OPEN DEFECT (hestia#580), not fixed here: making the match strict
-    /// would drop real evidence for grains whose adjudications legitimately carry no role,
-    /// and which error to prefer is a governance decision about what a role-less
-    /// adjudication MEANS. This goes red the moment the semantics change.
+    /// Legacy role-less adjudications use the same default grain as the adjudication writer:
+    /// their evidence is retained once, without leaking into sibling roles.
     #[test]
-    fn a_role_less_adjudication_credits_every_grain() {
-        let mk = |role: &str| {
-            let w = vec![entry(
+    fn a_role_less_adjudication_credits_only_the_default_grain() {
+        let observations = |role: &str| {
+            let window = vec![entry(
                 1,
                 0,
                 "adjudication",
@@ -1270,19 +1262,13 @@ mod tests {
                     "axis": "validity",
                     "score": 0.9,
                     "adjudicator": "dp"
-                    // NOTE: no `subject_role`
                 }),
             )];
-            derive("codex", role, &w).validity.observations
+            derive("codex", role, &window).validity.observations
         };
-        let a = mk("role:constellation:interactive-dev");
-        let b = mk("role:constellation:member");
-        assert_eq!(a, b, "same role-less adjudication counted for both grains");
-        assert!(
-            a > 0,
-            "OPEN-DEFECT PIN has gone RED, which is the intended end state: a role-less \
-             adjudication no longer credits an arbitrary grain. Close the finding."
-        );
+        assert_eq!(observations(crate::reputation::DEFAULT_CONSTELLATION_ROLE), 1);
+        assert_eq!(observations("role:constellation:interactive-dev"), 0);
+        assert_eq!(observations("role:constellation:reviewer"), 0);
     }
 
     /// VOLUME NEVER SCORES WITHOUT GOVERNED COVERAGE — the safety property.
