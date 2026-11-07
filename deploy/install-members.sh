@@ -630,6 +630,31 @@ print((json.load(open(sys.argv[1])).get("install") or {}).get("mesh_member") or 
         fi
         member_files_json="$member_files_json{\"file\":\"$name\",\"path\":\"$target\",\"sha256\":\"$src_hash\"},"
       done
+      # THE CLI ON PATH (#1503). session-mesh-inbox.sh tells the member what to run next: drain, ack, read
+      # KINDS.md. Spelled `python3 $mesh_dir/hestia-mesh.py`, that act names the install dir under
+      # $HESTIA_HOME, which no member grant reaches, so every drain was refused and opened an operator
+      # scope request. A link in the user's bin dir lets the hook name the CLI bare (`hestia-mesh drain`,
+      # `hestia-mesh kinds`): the program a stage runs, not a path it reaches. The hook names it only when
+      # the hestia-mesh on PATH carries these exact bytes, so a missing or foreign link costs nothing but
+      # the old spelling. Never replaces a regular file, or a link to anything but a hestia-mesh.py.
+      mesh_bin="$HOME/.local/bin"; mesh_link="$mesh_bin/hestia-mesh"; mesh_cli="$mesh_dir/hestia-mesh.py"
+      if [ -e "$mesh_link" ] && [ ! -L "$mesh_link" ]; then
+        log "  skip  hestia-mesh on PATH — $mesh_link is a regular file, not hestia's link; the hook keeps the path form"
+      elif [ -L "$mesh_link" ] && [ "$(basename "$(readlink "$mesh_link")")" != "hestia-mesh.py" ]; then
+        log "  skip  hestia-mesh on PATH — $mesh_link links to $(readlink "$mesh_link"), not a hestia-mesh.py"
+      elif [ -L "$mesh_link" ] && [ "$(readlink "$mesh_link")" = "$mesh_cli" ]; then
+        log "  ok    hestia-mesh -> $mesh_cli (already linked)"
+      elif [ "$DRY_RUN" = "1" ]; then
+        log "  would link $mesh_link -> $mesh_cli"
+      else
+        [ -d "$mesh_bin" ] || mkdir -p -m 0755 "$mesh_bin"
+        ln -sfn "$mesh_cli" "$mesh_link"
+        log "  linked $mesh_link -> $mesh_cli"
+      fi
+      case ":$PATH:" in
+        *":$mesh_bin:"*) : ;;
+        *) log "  note  $mesh_bin is not on this PATH; a seat whose PATH lacks it keeps the path form (and its scope requests)" ;;
+      esac
     fi
   fi
 
