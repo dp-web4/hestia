@@ -101,6 +101,117 @@ pub fn chain_id_for_genesis(genesis_hash: &str) -> String {
     format!("{CHAIN_ID_PREFIX}{genesis_hash}")
 }
 
+const META_SUBJECTS_BACKFILLED_THROUGH: &str = "subjects_backfilled_through";
+
+fn derivation_subjects(event_data: &serde_json::Value) -> Vec<String> {
+    let mut subjects = Vec::new();
+    let mut push = |value: Option<&serde_json::Value>| {
+        if let Some(id) = value.and_then(serde_json::Value::as_str).filter(|id| !id.is_empty()) {
+            if !subjects.iter().any(|subject| subject == id) {
+                subjects.push(id.to_string());
+            }
+        }
+    };
+    for key in ["plugin_id", "subject_plugin_id"] {
+        push(event_data.get(key));
+        push(event_data.get("data").and_then(|data| data.get(key)));
+    }
+    push(event_data.get("requested_by").and_then(|who| who.get("plugin_id")));
+    push(event_data
+        .get("data")
+        .and_then(|data| data.get("requested_by"))
+        .and_then(|who| who.get("plugin_id")));
+    subjects
+}
+
+fn index_chain_subjects(
+    tx: &rusqlite::Transaction<'_>,
+    chain_position: u64,
+    event_type: &str,
+    event_data: &serde_json::Value,
+) -> Result<()> {
+    if !crate::derivation::DERIVATION_EVENT_TYPES.contains(&event_type) {
+        return Ok(());
+    }
+    for plugin_id in derivation_subjects(event_data) {
+        tx.execute(
+            "INSERT OR IGNORE INTO chain_subjects (chain_position, plugin_id) VALUES (?1, ?2)",
+            params![chain_position as i64, plugin_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_chain_subjects(conn: &Connection) -> Result<()> {
+    let backfilled_through = conn
+        .query_row(
+            "SELECT value FROM chain_meta WHERE key = ?1",
+            params![META_SUBJECTS_BACKFILLED_THROUGH],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(-1);
+    let latest = conn.query_row(
+        "SELECT COALESCE(MAX(chain_position), -1) FROM chain_entries",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if latest <= backfilled_through {
+        return Ok(());
+    }
+
+    let placeholders = vec!["?"; crate::derivation::DERIVATION_EVENT_TYPES.len()].join(",");
+    let sql = format!(
+        "SELECT chain_position, event_type, event_data FROM chain_entries
+         WHERE chain_position > ? AND chain_position <= ? AND event_type IN ({placeholders})
+         ORDER BY chain_position LIMIT 1000"
+    );
+    let mut through = backfilled_through;
+    loop {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(through), Box::new(latest)];
+        binds.extend(
+            crate::derivation::DERIVATION_EVENT_TYPES
+                .iter()
+                .map(|event_type| Box::new(event_type.to_string()) as Box<dyn rusqlite::ToSql>),
+        );
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut rows = stmt.query(refs.as_slice())?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next()? {
+            pending.push((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ));
+        }
+        drop(rows);
+        drop(stmt);
+        let Some(last_position) = pending.last().map(|row| row.0) else { break };
+
+        let tx = conn.unchecked_transaction()?;
+        for (chain_position, event_type, event_json) in pending {
+            let event_data: serde_json::Value = serde_json::from_str(&event_json)
+                .with_context(|| format!("parsing chain row {chain_position} for subject backfill"))?;
+            index_chain_subjects(&tx, chain_position, &event_type, &event_data)?;
+        }
+        tx.execute(
+            "INSERT INTO chain_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_SUBJECTS_BACKFILLED_THROUGH, last_position.to_string()],
+        )?;
+        tx.commit()?;
+        through = last_position as i64;
+    }
+    conn.execute(
+        "INSERT INTO chain_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![META_SUBJECTS_BACKFILLED_THROUGH, latest.to_string()],
+    )?;
+    Ok(())
+}
+
 /// The chain witness: who attests a row's ordering and inclusion (decision 0014 §6.1's
 /// chain-witness role, distinct from an actor signature over an act).
 ///
@@ -634,6 +745,14 @@ impl SqliteChainStore {
              CREATE INDEX IF NOT EXISTS idx_chain_event_type ON chain_entries(event_type);
              CREATE INDEX IF NOT EXISTS idx_chain_timestamp  ON chain_entries(timestamp);
 
+             CREATE TABLE IF NOT EXISTS chain_subjects (
+                chain_position INTEGER NOT NULL,
+                plugin_id      TEXT NOT NULL,
+                PRIMARY KEY (chain_position, plugin_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_chain_subject_member_position
+                 ON chain_subjects(plugin_id, chain_position);
+
              -- Idempotency metadata is deliberately OUTSIDE the hashed witness row.
              -- The mapping commits in the same transaction as its row, but changing
              -- this retry index cannot alter what the witness chain says happened.
@@ -663,6 +782,7 @@ impl SqliteChainStore {
                 value TEXT NOT NULL
              );",
         )?;
+        backfill_chain_subjects(&conn)?;
         let genesis: Option<String> = conn
             .query_row(
                 "SELECT hash FROM chain_entries ORDER BY chain_position ASC LIMIT 1",
@@ -1059,6 +1179,7 @@ impl SqliteChainStore {
                 timestamp.to_rfc3339(),
             ],
         )?;
+        index_chain_subjects(&tx, chain_position, event_type, &event_data)?;
         if let Some(key) = event_key {
             tx.execute(
                 "INSERT INTO chain_event_keys (event_key, chain_position, entry_hash)
@@ -1357,6 +1478,69 @@ impl SqliteChainStore {
             };
             if let Some(v) = project(row_ref) {
                 out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Read derivation rows addressed to any of `subject_plugin_ids`, plus the global
+    /// records that can change how those rows are interpreted.
+    pub fn scan_subjects_recent<T>(
+        &self,
+        subject_plugin_ids: &[&str],
+        cutoff_rfc3339: Option<&str>,
+        event_types: &[&str],
+        limit: u64,
+        mut project: impl FnMut(ChainRowRef<'_>) -> Option<T>,
+    ) -> Result<Vec<T>> {
+        if subject_plugin_ids.is_empty() || event_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.observed(&self.read_conn)?;
+        let type_placeholders = vec!["?"; event_types.len()].join(",");
+        let subject_placeholders = vec!["?"; subject_plugin_ids.len()].join(",");
+        let mut sql = format!(
+            "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
+                    e.signer_lct, e.timestamp
+               FROM chain_entries e
+              WHERE e.event_type IN ({type_placeholders})
+                AND (e.chain_position IN (
+                        SELECT chain_position FROM chain_subjects
+                         WHERE plugin_id IN ({subject_placeholders})
+                    )
+                    OR e.event_type IN ('identity_alias', 'amnesty', 'exoneration'))"
+        );
+        if cutoff_rfc3339.is_some() {
+            sql.push_str(" AND e.timestamp >= ?");
+        }
+        sql.push_str(" ORDER BY e.chain_position DESC LIMIT ?");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for event_type in event_types {
+            binds.push(Box::new(event_type.to_string()));
+        }
+        for plugin_id in subject_plugin_ids {
+            binds.push(Box::new(plugin_id.to_string()));
+        }
+        if let Some(cutoff) = cutoff_rfc3339 {
+            binds.push(Box::new(cutoff.to_string()));
+        }
+        binds.push(Box::new(limit as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut rows = stmt.query(refs.as_slice())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let row_ref = ChainRowRef {
+                chain_position: row.get::<_, i64>(0)? as u64,
+                hash: row.get_ref(1)?.as_str()?,
+                prev_hash: row.get_ref(2)?.as_str()?,
+                event_type: row.get_ref(3)?.as_str()?,
+                event_data: row.get_ref(4)?.as_str()?,
+                signer_lct: row.get_ref(5)?.as_str()?,
+                timestamp: row.get_ref(6)?.as_str()?,
+            };
+            if let Some(value) = project(row_ref) {
+                out.push(value);
             }
         }
         Ok(out)
@@ -2488,6 +2672,51 @@ mod tests {
 
         // An empty type list asks for nothing — same rule as read_recent_by_types.
         assert!(store.scan_recent(None, Some(&[]), 10, |_| Some(())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn subject_index_reads_member_rows_and_global_interpretation_events() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let signer = "lct:test";
+        store.append("policy_decision", json!({"plugin_id": "alpha"}), signer).unwrap();
+        store.append("outcome", json!({"data": {"plugin_id": "beta"}}), signer).unwrap();
+        store.append("adjudication", json!({"data": {"subject_plugin_id": "alpha"}}), signer).unwrap();
+        store.append("scope_attestation", json!({"data": {"requested_by": {"plugin_id": "requester"}}}), signer).unwrap();
+        store.append("policy_decision", json!({"requested_by": {"plugin_id": "requester"}}), signer).unwrap();
+        store.append("amnesty", json!({"data": {"class": "deny"}}), signer).unwrap();
+        store.append("exoneration", json!({"data": {"deny_hash": "abc"}}), signer).unwrap();
+        store.append("identity_alias", json!({"alias": "old-alpha", "alias_of": "alpha"}), signer).unwrap();
+        store.append("unrelated", json!({"plugin_id": "alpha"}), signer).unwrap();
+
+        let positions = |store: &SqliteChainStore, plugin_id: &str| {
+            store.scan_subjects_recent(
+                &[plugin_id],
+                None,
+                crate::derivation::DERIVATION_EVENT_TYPES,
+                100,
+                |row| Some(row.chain_position),
+            )
+            .unwrap()
+        };
+        assert_eq!(positions(&store, "alpha"), vec![7, 6, 5, 2, 0]);
+        assert_eq!(positions(&store, "beta"), vec![7, 6, 5, 1]);
+        assert_eq!(positions(&store, "requester"), vec![7, 6, 5, 4, 3]);
+        assert_eq!(derivation_subjects(&json!({
+            "plugin_id": "alpha",
+            "data": {"plugin_id": "alpha", "subject_plugin_id": "nested"},
+            "requested_by": {"plugin_id": "author"}
+        })), vec!["alpha", "nested", "author"]);
+
+        store.conn.lock().unwrap().execute_batch(
+            "DELETE FROM chain_subjects;
+             DELETE FROM chain_meta WHERE key = 'subjects_backfilled_through';",
+        ).unwrap();
+        drop(store);
+        let reopened = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        assert_eq!(positions(&reopened, "alpha"), vec![7, 6, 5, 2, 0]);
+        assert_eq!(positions(&reopened, "requester"), vec![7, 6, 5, 4, 3]);
     }
 
     /// A dashboard projection is allowed to be slow; it is not allowed to

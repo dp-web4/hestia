@@ -343,6 +343,57 @@ pub fn scan_window_with(
     out
 }
 
+/// The same derivation window, bounded by the member and its witnessed aliases rather than
+/// by unrelated traffic elsewhere on the chain.
+pub fn scan_subject_window(
+    chain_store: &crate::storage::chain::SqliteChainStore,
+    plugin_id: &str,
+) -> Vec<ChainEntry> {
+    scan_subject_window_with(chain_store, plugin_id, DERIVATION_HOT_SCAN, DERIVATION_GOVERNANCE_SCAN)
+}
+
+pub fn scan_subject_window_with(
+    chain_store: &crate::storage::chain::SqliteChainStore,
+    plugin_id: &str,
+    hot_scan: u64,
+    governance_scan: u64,
+) -> Vec<ChainEntry> {
+    let mut aliases = match chain_store.scan_recent(
+        None,
+        Some(&[IDENTITY_ALIAS_EVENT]),
+        ALIAS_SCAN,
+        project_row,
+    ) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("derivation alias chain read failed: {e}");
+            Vec::new()
+        }
+    };
+    let alias_refs: Vec<&ChainEntry> = aliases.iter().collect();
+    let identities = aliased_identities(plugin_id, &alias_refs);
+    let subject_ids: Vec<&str> = identities.iter().map(String::as_str).collect();
+    let scan = |types: &[&str], limit: u64, label: &str| -> Vec<ChainEntry> {
+        match chain_store.scan_subjects_recent(&subject_ids, None, types, limit, project_row) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!("derivation {label} subject read failed: {e}");
+                Vec::new()
+            }
+        }
+    };
+    let mut out = scan(
+        DERIVATION_GOVERNANCE_EVENT_TYPES,
+        governance_scan,
+        "governance",
+    );
+    out.extend(scan(DERIVATION_HOT_EVENT_TYPES, hot_scan, "outcome"));
+    out.append(&mut aliases);
+    out.sort_by(|a, b| b.chain_position.cmp(&a.chain_position));
+    out.dedup_by_key(|e| e.chain_position);
+    out
+}
+
 /// How many alias records a read takes: a FINITE BOUND, not "all of them".
 ///
 /// Said plainly because the prose around this repair says "no window", and that means no
@@ -1423,6 +1474,79 @@ mod tests {
         let mut desc = positions.clone();
         desc.sort_by(|a, b| b.cmp(a));
         assert_eq!(positions, desc, "merged window must stay chain_position DESC");
+    }
+
+    #[test]
+    fn a_subject_window_excludes_other_members_floods() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        for plugin_id in ["kimi-code", "kimi-code"] {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": plugin_id, "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+        for _ in 0..40 {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": "codex", "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+
+        let old = store.scan_recent(
+            None,
+            Some(DERIVATION_GOVERNANCE_EVENT_TYPES),
+            2,
+            project_row,
+        ).unwrap();
+        assert!(old.iter().all(|event| {
+            event.event_data.get("plugin_id").and_then(Value::as_str) == Some("codex")
+        }), "control: the peer flood must fill the global read");
+
+        let subject = scan_subject_window_with(&store, "kimi-code", 2, 2);
+        assert_eq!(subject.len(), 2);
+        assert!(subject.iter().all(|event| {
+            event.event_data.get("plugin_id").and_then(Value::as_str) == Some("kimi-code")
+        }));
+    }
+
+    #[test]
+    fn a_subject_window_preserves_alias_and_global_invalidation_evidence() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        store.append(
+            IDENTITY_ALIAS_EVENT,
+            json!({"alias": "kimi-cli", "alias_of": "kimi-code"}),
+            "lct:test",
+        ).unwrap();
+        let deny = store.append(
+            "policy_decision",
+            json!({"plugin_id": "kimi-cli", "decision": "deny", "enforced": true}),
+            "lct:test",
+        ).unwrap();
+        store.append(
+            "amnesty",
+            json!({"data": {"class": "deny", "before_position": 0}}),
+            "lct:test",
+        ).unwrap();
+        store.append(
+            "exoneration",
+            json!({"requested_by": {"plugin_id": "codex"}, "data": {"deny_hash": deny.hash}}),
+            "lct:test",
+        ).unwrap();
+
+        let window = scan_subject_window_with(&store, "kimi-code", 10, 10);
+        for event_type in ["identity_alias", "amnesty", "exoneration"] {
+            assert!(window.iter().any(|event| event.event_type == event_type));
+        }
+        let derived = derive_evidence("kimi-code", "role:constellation:member", &window);
+        assert_eq!(derived.temperament.observations, 0);
+        assert_eq!(derived.temperament.evidence.len(), 1);
+        assert!(derived.temperament.evidence[0].contribution.contains("EXCLUDED — exonerated"));
     }
 
     /// A merge the operator performed must STAY performed (agent-lifecycle PRD R6).
