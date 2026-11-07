@@ -1136,6 +1136,12 @@ enum VaultCmd {
         #[arg(long = "present-to")]
         present_to: Vec<String>,
 
+        /// Semantic presentation audience mode: `fixed` (the one verifier named at issuance) or
+        /// `any-of` (a presentation-time choice among the recorded verifiers). Required for
+        /// multiple verifiers; cardinality does not decide this.
+        #[arg(long = "present-audience")]
+        present_audience: Option<String>,
+
         /// What a presentation discloses: `nothing`, `derived` (a value derived from the secret,
         /// never the secret — the default when --present-to is given), or `full` (the secret
         /// itself; a bearer presented directly).
@@ -1241,11 +1247,12 @@ pub fn run() -> AnyResult<()> {
                 allowed_consumers,
                 consumer_only,
                 present_to,
+                present_audience,
                 present_disclose,
                 present_max_uses,
             } => cmd_vault_add(
                 &home, &name, scope, tag, allowed_consumers, consumer_only,
-                present_to, present_disclose, present_max_uses,
+                present_to, present_audience, present_disclose, present_max_uses,
             ),
             VaultCmd::Remove { name } => cmd_vault_remove(&home, &name),
         },
@@ -1772,6 +1779,7 @@ fn cmd_vault_add(
     allowed_consumers: Vec<String>,
     consumer_only: bool,
     present_to: Vec<String>,
+    present_audience: Option<String>,
     present_disclose: Option<String>,
     present_max_uses: Option<u32>,
 ) -> AnyResult<()> {
@@ -1779,12 +1787,10 @@ fn cmd_vault_add(
 
     // §7.1 axis 1 — release rule, recorded at issuance. `--consumer-only` is the default rule;
     // `--consumer x` records an explicit holder set; neither leaves the legacy list to decide.
-    let release = if consumer_only {
+    let release = if consumer_only || allowed_consumers.is_empty() {
         Some(ReleaseRule::ConsumerOnly)
-    } else if !allowed_consumers.is_empty() {
-        Some(ReleaseRule::Holders { principals: allowed_consumers.clone() })
     } else {
-        None
+        Some(ReleaseRule::Holders { principals: allowed_consumers.clone() })
     };
 
     // §7.1 axis 2 — presentation rule. Built ONLY when --present-to is given; otherwise it stays
@@ -1799,10 +1805,23 @@ fn cmd_vault_add(
         }
         None
     } else {
-        let audience = if present_to.len() == 1 {
-            PresentationAudience::Fixed { verifier: present_to[0].clone() }
-        } else {
-            PresentationAudience::AnyOf { verifiers: present_to.clone() }
+        let audience = match present_audience.as_deref() {
+            Some("fixed") => {
+                if present_to.len() != 1 {
+                    anyhow::bail!("--present-audience fixed requires exactly one --present-to")
+                }
+                PresentationAudience::Fixed { verifier: present_to[0].clone() }
+            }
+            Some("any-of") => PresentationAudience::AnyOf { verifiers: present_to.clone() },
+            Some(other) => anyhow::bail!(
+                "--present-audience must be fixed|any-of, got '{other}'"
+            ),
+            None if present_to.len() == 1 => {
+                PresentationAudience::Fixed { verifier: present_to[0].clone() }
+            }
+            None => anyhow::bail!(
+                "multiple verifiers require --present-audience fixed|any-of; cardinality does not choose the audience mode"
+            ),
         };
         let disclose = match present_disclose.as_deref() {
             None | Some("derived") => Disclosure::Derived, // sensible default for a presentable
