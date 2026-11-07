@@ -78,6 +78,31 @@ impl ChainRowRef<'_> {
     pub fn project<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
         serde_json::from_str(self.event_data).ok()
     }
+
+    /// Materialize a full entry only for a caller that genuinely needs every field.
+    pub fn to_entry(&self) -> Result<ChainEntry> {
+        Ok(ChainEntry {
+            hash: self.hash.to_string(),
+            prev_hash: self.prev_hash.to_string(),
+            timestamp: DateTime::parse_from_rfc3339(self.timestamp)?.with_timezone(&Utc),
+            event_type: self.event_type.to_string(),
+            event_data: serde_json::from_str(self.event_data)?,
+            signer_lct: self.signer_lct.to_string(),
+            chain_position: self.chain_position,
+        })
+    }
+}
+
+pub const ROUTINE_CHAIN_PAGE: u64 = 500;
+pub const ROUTINE_CHAIN_MAX: u64 = 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainScanPage<T> {
+    pub rows: Vec<T>,
+    /// Exclusive cursor for the next older page; `None` means this page reached the floor.
+    pub before_position: Option<u64>,
+    /// Selected chain rows examined, before projection. Never exceeds `ROUTINE_CHAIN_MAX`.
+    pub scanned: u64,
 }
 
 // ------------------------------------------------------------------ B2 signed witness (#339)
@@ -1362,6 +1387,86 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// One bounded backward page over a timeframe and optional event-type set (#488).
+    /// The timestamp predicate uses `idx_chain_timestamp`; `before_position` is exclusive.
+    /// Continuation is measured from selected rows, before projection, so dropping every
+    /// projected row cannot make older matches look absent.
+    pub fn scan_recent_page<T>(
+        &self,
+        cutoff_rfc3339: Option<&str>,
+        event_types: Option<&[&str]>,
+        before_position: Option<u64>,
+        limit: u64,
+        mut project: impl FnMut(ChainRowRef<'_>) -> Option<T>,
+    ) -> Result<ChainScanPage<T>> {
+        if matches!(event_types, Some(t) if t.is_empty()) {
+            return Ok(ChainScanPage { rows: Vec::new(), before_position: None, scanned: 0 });
+        }
+        let limit = limit.clamp(1, ROUTINE_CHAIN_MAX);
+        let conn = self.observed(&self.read_conn)?;
+        let mut where_parts: Vec<String> = Vec::new();
+        if let Some(types) = event_types {
+            where_parts.push(format!("event_type IN ({})", vec!["?"; types.len()].join(",")));
+        }
+        if cutoff_rfc3339.is_some() {
+            where_parts.push("timestamp >= ?".to_string());
+        }
+        where_parts.push("chain_position < ?".to_string());
+        let from_sql = if cutoff_rfc3339.is_some() {
+            "chain_entries INDEXED BY idx_chain_timestamp"
+        } else {
+            "chain_entries"
+        };
+        let sql = format!(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM {from_sql} WHERE {}
+             ORDER BY chain_position DESC LIMIT ?",
+            where_parts.join(" AND ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(types) = event_types {
+            for t in types {
+                binds.push(Box::new(t.to_string()));
+            }
+        }
+        if let Some(c) = cutoff_rfc3339 {
+            binds.push(Box::new(c.to_string()));
+        }
+        let before = before_position.unwrap_or(u64::MAX);
+        binds.push(Box::new(i64::try_from(before).unwrap_or(i64::MAX)));
+        binds.push(Box::new((limit + 1) as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+
+        let mut rows = stmt.query(refs.as_slice())?;
+        let mut out = Vec::new();
+        let mut scanned = 0u64;
+        let mut oldest_scanned = None;
+        let mut continuation = None;
+        while let Some(row) = rows.next()? {
+            let position = row.get::<_, i64>(0)? as u64;
+            if scanned == limit {
+                continuation = oldest_scanned;
+                break;
+            }
+            scanned += 1;
+            oldest_scanned = Some(position);
+            let row_ref = ChainRowRef {
+                chain_position: position,
+                hash: row.get_ref(1)?.as_str()?,
+                prev_hash: row.get_ref(2)?.as_str()?,
+                event_type: row.get_ref(3)?.as_str()?,
+                event_data: row.get_ref(4)?.as_str()?,
+                signer_lct: row.get_ref(5)?.as_str()?,
+                timestamp: row.get_ref(6)?.as_str()?,
+            };
+            if let Some(v) = project(row_ref) {
+                out.push(v);
+            }
+        }
+        Ok(ChainScanPage { rows: out, before_position: continuation, scanned })
+    }
+
     pub fn read_recent_by_types(
         &self,
         cutoff_rfc3339: Option<&str>,
@@ -2488,6 +2593,65 @@ mod tests {
 
         // An empty type list asks for nothing — same rule as read_recent_by_types.
         assert!(store.scan_recent(None, Some(&[]), 10, |_| Some(())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn timeframe_pages_are_capped_projected_and_cursor_complete_488() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        for i in 0..1_005 {
+            store.append(
+                if i % 2 == 0 { "outcome" } else { "policy_decision" },
+                json!({"n": i}), "lct:test",
+            ).unwrap();
+        }
+        let cutoff = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        store.conn.lock().unwrap().execute(
+            "UPDATE chain_entries SET timestamp = '2000-01-01T00:00:00Z' WHERE chain_position = 0",
+            [],
+        ).unwrap();
+
+        let mut before = None;
+        let mut positions = Vec::new();
+        let mut scans = Vec::new();
+        for _ in 0..3 {
+            let page = store.scan_recent_page(
+                Some(&cutoff), None, before, ROUTINE_CHAIN_PAGE,
+                |row| Some(row.chain_position),
+            ).unwrap();
+            scans.push(page.scanned);
+            before = page.before_position;
+            positions.extend(page.rows);
+            if before.is_none() {
+                break;
+            }
+        }
+        let expected: Vec<u64> = store.read_recent(2_000).unwrap().into_iter()
+            .filter(|entry| entry.timestamp.to_rfc3339() >= cutoff)
+            .map(|entry| entry.chain_position)
+            .collect();
+        assert_eq!(scans, [500, 500, expected.len() as u64 - 1_000]);
+        assert_eq!(positions, expected);
+        assert_eq!(before, None, "the cutoff floor was reached without another page");
+
+        let capped = store.scan_recent_page(
+            Some(&cutoff), None, None, 5_000, |_| Some(()),
+        ).unwrap();
+        assert_eq!(capped.scanned, ROUTINE_CHAIN_MAX);
+        assert_eq!(capped.before_position, Some(expected[999]));
+
+        let dropped = store.scan_recent_page(
+            Some(&cutoff), Some(&["outcome"]), None, 7, |_| None::<()>,
+        ).unwrap();
+        assert!(dropped.rows.is_empty());
+        assert_eq!(dropped.scanned, 7);
+        assert!(dropped.before_position.is_some(),
+                "projection must not hide continuation of the selected rows");
+
+        let empty = store.scan_recent_page(
+            Some(&cutoff), Some(&[]), None, ROUTINE_CHAIN_PAGE, |_| Some(()),
+        ).unwrap();
+        assert_eq!(empty, ChainScanPage { rows: Vec::new(), before_position: None, scanned: 0 });
     }
 
     /// A dashboard projection is allowed to be slow; it is not allowed to
