@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 1376119071502b7b14aa18456c6a33006c25d60533eccfab294936f45056519a  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: dfb4ff4ac958a32bec763900a933f139e25ab9fffd3d8e4ce72428ed06e1ff21  (published ground truth; manifest: hooks-gt)
 """hestia-mesh — member-mesh CLI for a local hestia member (Kimi's send/receive surface).
 
 Usage:
@@ -121,7 +121,9 @@ if not PLUGIN:
         "  This CLI speaks AS a member: every act it sends is witnessed under that identity.\n"
         "  Guessing would file your work in another member's trust record.\n"
         "  Set it to your own member id, e.g.:  HESTIA_MESH_PLUGIN=claude-code "
-        + " ".join([os.path.basename(sys.argv[0])] + sys.argv[1:]) + "\n"
+        # HESTIA_MESH_PROG: `hestia mesh` runs this file as `python3 -c`, where argv[0] is "-c" (#1503).
+        + " ".join([os.environ.get("HESTIA_MESH_PROG") or os.path.basename(sys.argv[0])] + sys.argv[1:])
+        + "\n"
     )
     sys.exit(2)
 # Derived from the identity above, so it cannot drift to a different member than PLUGIN.

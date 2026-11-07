@@ -120,7 +120,9 @@ if not PLUGIN:
         "  This CLI speaks AS a member: every act it sends is witnessed under that identity.\n"
         "  Guessing would file your work in another member's trust record.\n"
         "  Set it to your own member id, e.g.:  HESTIA_MESH_PLUGIN=claude-code "
-        + " ".join([os.path.basename(sys.argv[0])] + sys.argv[1:]) + "\n"
+        # HESTIA_MESH_PROG: `hestia mesh` runs this file as `python3 -c`, where argv[0] is "-c" (#1503).
+        + " ".join([os.environ.get("HESTIA_MESH_PROG") or os.path.basename(sys.argv[0])] + sys.argv[1:])
+        + "\n"
     )
     sys.exit(2)
 # Derived from the identity above, so it cannot drift to a different member than PLUGIN.
