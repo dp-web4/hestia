@@ -5041,6 +5041,17 @@ fn open_witnessed_chain(
     Ok(chain)
 }
 
+fn chain_verify_snapshot_dir() -> AnyResult<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("hestia-chain-verify-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().context("creating private snapshot dir")
+}
+
 fn cmd_chain_verify(home: &std::path::Path) -> AnyResult<()> {
     let (vault, passphrase) = open_vault_with_passphrase(home)?;
     let key = hestia::storage::storage_key(home, &passphrase)
@@ -5048,10 +5059,7 @@ fn cmd_chain_verify(home: &std::path::Path) -> AnyResult<()> {
     // An exclusively created, owner-only directory (Codex review of #1322): never adopt a
     // predictable pre-existing path, which a planted symlink could point at the live chain.
     // Dropping `tmp` removes only the directory this call created.
-    let tmp = tempfile::Builder::new()
-        .prefix("hestia-chain-verify-")
-        .tempdir()
-        .context("creating private snapshot dir")?;
+    let tmp = chain_verify_snapshot_dir()?;
     let copy = tmp.path().join("witness.db");
     let v = (|| -> AnyResult<hestia::storage::ChainVerification> {
         hestia::storage::SqliteChainStore::backup_encrypted(home.join("witness.db"), &copy, key)
@@ -5074,6 +5082,26 @@ fn cmd_chain_verify(home: &std::path::Path) -> AnyResult<()> {
         v.signatures_authentic()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod chain_verify_snapshot_tests {
+    #[test]
+    fn snapshot_directory_is_private_exclusive_and_cleaned_up() {
+        let first = super::chain_verify_snapshot_dir().unwrap();
+        let second = super::chain_verify_snapshot_dir().unwrap();
+        assert_ne!(first.path(), second.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(first.path()).unwrap().permissions().mode() & 0o077, 0);
+        }
+        let owned = first.path().to_path_buf();
+        std::fs::write(owned.join("synthetic-sidecar"), b"test").unwrap();
+        drop(first);
+        assert!(!owned.exists());
+        assert!(second.path().exists());
+    }
 }
 
 fn cmd_receiver_drain(home: &std::path::Path, parent: Option<&str>) -> AnyResult<()> {
