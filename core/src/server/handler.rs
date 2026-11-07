@@ -16211,10 +16211,12 @@ mod tests {
             second["invitations"].as_array().map(Vec::is_empty).unwrap_or(false),
             "nobody is woken twice for one ask: {second}"
         );
-        // The keys a pre-#668 hook reads off a refusal are all still there.
-        for key in ["how_to_decide", "retry_within_secs", "expires_at", "witnessEntryHash"] {
+        // The keys a pre-#668 hook reads off a refusal are all still there; the retired
+        // open-time retry countdown is not a hook contract and must stay absent.
+        for key in ["how_to_decide", "expires_at", "witnessEntryHash"] {
             assert!(!second[key].is_null(), "hook-read key `{key}` missing: {second}");
         }
+        assert!(second.get("retry_within_secs").is_none(), "{second}");
         assert!(second["how_to_decide"].as_str().unwrap().contains(&id));
 
         // A superset of the command is a different act (8791447f vs 50f8d3a1, same day).
@@ -23601,7 +23603,6 @@ fn coalesced_response(
     entry_hash: &str,
     now: u64,
 ) -> Value {
-    use crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS;
     let remaining = twin.expires_at.saturating_sub(now);
     json!({
         "claimed": false,
@@ -23612,7 +23613,6 @@ fn coalesced_response(
         "bar": twin.bar,
         "expires_at": twin.expires_at,
         "decide_within_secs": remaining,
-        "retry_within_secs": remaining + APPROVAL_CLAIM_WINDOW_SECS,
         "witnessEntryHash": entry_hash,
         "invited_peers": twin.invited_peers,
         // Nothing was sent: the invitation went out with the first open.
@@ -26279,7 +26279,7 @@ cannot be reclaimed again.",
 }
 
 async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolResult {
-    use crate::server::gate_escalation::{now_secs, APPROVAL_CLAIM_WINDOW_SECS, DEFAULT_TTL_SECS};
+    use crate::server::gate_escalation::{now_secs, DEFAULT_TTL_SECS};
 
     let plugin_id = require_string(args, "plugin_id")?;
     let tool_name = require_string(args, "tool_name")?;
@@ -26852,7 +26852,6 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
                 "escalation_id": esc.id,
                 "expires_at": esc.expires_at,
                 "decide_within_secs": DEFAULT_TTL_SECS,
-                "retry_within_secs": DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS,
                 "decided_awaiting_claim": decided_awaiting_claim,
                 "witnessEntryHash": entry.hash,
                 // Told to the ASKER too, not only written to the chain — the same asymmetry
@@ -27086,9 +27085,9 @@ async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> To
         // window`, and since dd3f1b1 THIS CALL sets `observed_at` for the asking session's own
         // grants, so the one response that re-anchors a grant was advertising the anchor it
         // had just moved (GPT review, 2026-09-29). The per-row `pre_migration_horizon_basis`
-        // says which arm each row is on; this is the rule that produces it. Still not a single
-        // number at open time, which is why the open path's `retry_within_secs` is a supremum
-        // presented as a point (`core/tests/claim_horizon_is_never_rendered.rs`, PINs 1/2).
+        // says which arm each row is on; this is the rule that produces it. No single claim
+        // deadline exists at open time, so the open path no longer presents a relative retry
+        // countdown as though one were already known (`claim_horizon_is_never_rendered.rs`).
         "claim_window_secs": crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
         "claim_window_anchor": "observed_at_else_decided_at",
         "claim_window_model": PRE_MIGRATION_HORIZON_MODEL,
