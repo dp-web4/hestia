@@ -319,7 +319,8 @@ impl Default for ReadBasis {
 /// Deployment identity as observed by the daemon.
 ///
 /// `HESTIA_CURRENT_BUILD_FILE` points at a small supervisor-owned JSON manifest,
-/// for example `{ "build_id": "v0.3.0-12-ge720d0a" }` — the exact
+/// defaulting to `current-build.json` under the server home, for example
+/// `{ "build_id": "v0.3.0-12-ge720d0a" }` — the exact
 /// `git describe --tags --match 'v[0-9]*'` provenance string the deployed binary reports in
 /// `hestia --version` (see docs/DASHBOARD.md; a short hash never matches).
 /// Missing or unreadable authority is
@@ -596,6 +597,21 @@ pub(crate) fn same_deployed_build(manifest_build: &str, manifest_head_sha: Optio
     man.starts_with(run) || run.starts_with(man)
 }
 
+pub(super) fn deployment_authority_path(home: &Path) -> std::path::PathBuf {
+    deployment_authority_path_from(
+        std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
+            .as_deref()
+            .map(Path::new),
+        home,
+    )
+}
+
+fn deployment_authority_path_from(configured: Option<&Path>, home: &Path) -> std::path::PathBuf {
+    configured
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| home.join("current-build.json"))
+}
+
 fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
     let running_build = env!("HESTIA_GIT_VERSION").to_string();
     let Some(path) = path else {
@@ -806,11 +822,8 @@ fn last_deploy_cycle(log_path: &Path) -> Option<DeployCycle> {
 }
 
 fn deployment_health(state: &ServerState) -> DeploymentHealth {
-    let mut health = deployment_health_from_path(
-        std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
-            .as_deref()
-            .map(Path::new),
-    );
+    let authority = deployment_authority_path(&state.home);
+    let mut health = deployment_health_from_path(Some(&authority));
     const CAPABILITY: &str = "society-floor:v1";
     let mut capable_members = Vec::new();
     let mut unknown_members = Vec::new();
@@ -855,8 +868,7 @@ fn deployment_health(state: &ServerState) -> DeploymentHealth {
             .into(),
     };
     health.auto_update = auto_update_state().into();
-    let home = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
-        .and_then(|p| Path::new(&p).parent().map(Path::to_path_buf));
+    let home = authority.parent().map(Path::to_path_buf);
     health.last_cycle = home.as_ref().and_then(|d| last_deploy_cycle(&d.join("deploy.log")));
     health.check = home
         .as_ref()
@@ -2082,6 +2094,20 @@ mod tests {
         assert_eq!(s.society.chain_length, 0);
         assert!(s.trust.is_empty());
         assert!(s.recent.is_empty());
+    }
+
+    #[test]
+    fn deployment_authority_defaults_to_the_server_home() {
+        let home = Path::new("/state/hestia");
+        assert_eq!(
+            deployment_authority_path_from(None, home),
+            home.join("current-build.json")
+        );
+        let configured = Path::new("/supervisor/build.json");
+        assert_eq!(
+            deployment_authority_path_from(Some(configured), home),
+            configured
+        );
     }
 
     #[test]
