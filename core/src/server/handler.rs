@@ -486,7 +486,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_gate_escalation_corroborate",
-            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. TIMING — a DECIDED escalation STILL TAKES YOUR FACTOR. The guard here is expiry, not the ruling: an approved or denied row accepts evidence indefinitely (the ruling stands and cannot reopen, and your factor cannot change `bar_met` — what it buys is the record, which is what the invitation was for), while only a LAPSED, never-decided row refuses with `Expired`. Do not skip filing because the row already reads approved or denied; that belief is fleet-wide, false, and this sentence is here because the seats holding it each re-derived it from documentation rather than from the door. This schema is the WHOLE contract: arguments outside it are refused by name, not discarded",
+            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. TIMING — a DECIDED escalation STILL TAKES YOUR FACTOR. The guard here is expiry, not the ruling: an approved or denied row accepts evidence indefinitely (the ruling stands and cannot reopen, and your factor cannot change `bar_met` — what it buys is the record, which is what the invitation was for), while only a LAPSED, never-decided row refuses with `Expired`. A factor whose permit was already spent is marked post_claim:true on the factor, chain event and response, so late commentary cannot masquerade as input that informed the ruling. Do not skip filing because the row already reads approved or denied; that belief is fleet-wide, false, and this sentence is here because the seats holding it each re-derived it from documentation rather than from the door. This schema is the WHOLE contract: arguments outside it are refused by name, not discarded",
             json!({
                 "type": "object",
                 // False, truthfully: the handler refuses unknown keys by name, so the
@@ -19466,6 +19466,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn post_claim_corroboration_is_preserved_but_marked_as_commentary() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &esc_id,
+                    true,
+                    "dp",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::LocalCli,
+                    None,
+                    Some("approved"),
+                    crate::server::gate_escalation::now_secs(),
+                )
+                .unwrap();
+        }
+        let asker = tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "tool_name": "Bash",
+                "marker": "witness.py",
+                "reason": "Bash -> witness.py",
+                "session_id": asker,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], true, "setup must spend the permit: {claimed}");
+
+        let response = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": "concur",
+                "argument": "late review: sound, but this could not inform the spent ruling",
+            }),
+        )
+        .await
+        .expect("late evidence remains recordable");
+        assert_eq!(response["post_claim"], true, "{response}");
+        let factor = response["factors_present"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["by"] == "codex")
+            .expect("the late peer factor");
+        assert_eq!(factor["post_claim"], true, "{factor}");
+
+        let s = shared.lock().await;
+        let event = s
+            .chain_store
+            .read_recent(30)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_corroborated")
+            .expect("late factor is witnessed");
+        assert_eq!(event.event_data["post_claim"], true, "{event:?}");
+    }
+
     /// #1058: the corroborate row names the corroborator's WAKE, not only its seat. The
     /// door refuses without a proven live session, so the key is in hand at write time; before
     /// this the row dropped it, and tying a factor to the transcript that produced it meant a
@@ -27618,6 +27687,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     // The state of the evidence set AFTER this factor — so a reader never has
                     // to reconstruct accumulation order from separate entries.
                     "factors_present": updated.factors,
+                    "post_claim": updated.consumed_at.is_some(),
                     "bar": updated.bar,
                     "bar_met_if_decided_now": updated.bar_met(),
                 }),
@@ -27633,6 +27703,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                 "dissent": dissent,
                 "argument": argument,
                 "factors_present": updated.factors,
+                "post_claim": updated.consumed_at.is_some(),
                 "bar": updated.bar,
                 "bar_met_if_decided_now": updated.bar_met(),
                 "witnessEntryHash": entry.ok().map(|e| e.hash),
