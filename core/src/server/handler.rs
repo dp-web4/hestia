@@ -391,7 +391,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_arbitrate_appeal",
-            "Rule on another member's filed appeal (NOT-SAME, enforced: never your own appeal, never a deny your own gate issued). Requires an explicit upheld:true/false and stated reasoning; records the independence of the arbiter so a reader can weigh the ruling",
+            "Rule on another member's filed appeal (NOT-SAME, enforced: never your own appeal, never a deny your own gate issued). Requires an explicit upheld:true/false and stated reasoning; records the independence of the arbiter so a reader can weigh the ruling. Upheld also records an operator-addressed law_amendment_proposed linked to the appeal and current law; it proposes only and never changes enforcement automatically",
         ),
         t(
             "hestia_my_appeals",
@@ -3821,6 +3821,63 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         }),
     )?;
 
+    let mut amendment_proposal = None;
+    let mut amendment_error = None;
+    if upheld {
+        let deny = window.iter().find(|e| e.hash == deny_hash);
+        let rule_id = deny
+            .and_then(|e| {
+                e.event_data
+                    .get("rule_id")
+                    .or_else(|| e.event_data.get("rule_name"))
+                    .or_else(|| e.event_data.get("reason"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("unspecified");
+        let affected_tool = deny
+            .and_then(|e| e.event_data.get("tool_name").and_then(Value::as_str))
+            .unwrap_or("unspecified");
+        let proposal_id = format!("amendment-{}", &entry.hash[..16]);
+        let current_law = json!({
+            "policy_generation": state.published().policy_generation(),
+            "society_policy_hash": s.policy_engine.content_hash(),
+        });
+        match s.append_chain(
+            "law_amendment_proposed",
+            json!({
+                "proposal_id": proposal_id,
+                "parent_appeal_ids": [appeal.hash],
+                "parent_adjudication": entry.hash,
+                "about_deny_hash": deny_hash,
+                "status": "proposed",
+                "addressed_to": "operator",
+                "rule_id": rule_id,
+                "affected_classes": [{"rule_id": rule_id, "tool_name": affected_tool}],
+                "defect": rationale,
+                "proposed_change": rationale,
+                "reviewers": [{"plugin_id": arbiter.plugin_id, "role_lct": arbiter.role_lct,
+                               "independence": independence}],
+                "current_law": current_law,
+                "ratification": Value::Null,
+                "deployment": {"automatic": false, "receipts": []},
+                "note": "an upheld appeal proposes; it does not amend. The operator remains the final composer."
+            }),
+        ) {
+            Ok(proposal) => {
+                amendment_proposal = Some(json!({
+                    "proposal_id": proposal_id,
+                    "witnessEntryHash": proposal.hash,
+                    "status": "proposed",
+                    "addressed_to": "operator",
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "upheld appeal recorded but amendment proposal failed");
+                amendment_error = Some(e.to_string());
+            }
+        }
+    }
+
     // #459: the ruling's RETURN EDGE. The appeal had an outbound wake (the arbiter
     // was asked to rule) and no way back — until this, a ruled appeal read exactly
     // like an open one to the member who filed it, and the petitioner had to poll
@@ -3842,11 +3899,20 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         "about_deny_hash": deny_hash,
         "upheld": upheld,
         "independence": independence,
+        "amendment_proposal": amendment_proposal,
+        "amendment_error": amendment_error,
         "effect": if upheld {
-            "the appellant's conduct on this deny now scores appeal-upheld 1.0"
+            if let Some(proposal) = &amendment_proposal {
+                format!("the appellant's conduct now scores appeal-upheld 1.0; amendment proposal {} awaits operator ratification, with enforcement unchanged",
+                        proposal["proposal_id"].as_str().unwrap_or(""))
+            } else if let Some(error) = &amendment_error {
+                format!("the appellant's conduct now scores appeal-upheld 1.0, but the amendment proposal could not be recorded: {error}")
+            } else {
+                "the appellant's conduct on this deny now scores appeal-upheld 1.0".to_string()
+            }
         } else {
             "the deny stands; the appellant keeps appeal-filed 0.85 for having disputed it \
-             through the witnessed channel rather than routing around"
+             through the witnessed channel rather than routing around".to_string()
         },
     }))
 }
@@ -21291,6 +21357,7 @@ mod appeal_tests {
                 "filing must be recognised as an appeal, not read as plain compliance: {:?}",
                 filed_d.temperament.evidence[0].contribution);
 
+        let law_before = state.published().policy_generation();
         let ruled = tool_arbitrate_appeal(&state, &json!({
             "deny_hash": deny_hash, "session_id": arbiter_sid.to_string(), "upheld": true,
             "rationale": "the rule targets chaining, not the delete; the deny was over-broad",
@@ -21298,6 +21365,23 @@ mod appeal_tests {
         assert_eq!(ruled.get("upheld").and_then(Value::as_bool), Some(true), "{ruled}");
 
         let window = { state.lock().await.recent_chain(500) };
+        let proposal = window
+            .iter()
+            .find(|e| e.event_type == "law_amendment_proposed")
+            .expect("an upheld appeal must leave an operator-addressed amendment proposal");
+        assert_eq!(proposal.event_data["parent_adjudication"], ruled["witnessEntryHash"]);
+        assert_eq!(proposal.event_data["rule_id"], "test");
+        assert_eq!(proposal.event_data["status"], "proposed");
+        assert_eq!(proposal.event_data["addressed_to"], "operator");
+        assert!(proposal.event_data["proposed_change"]
+            .as_str().unwrap().contains("chaining"));
+        assert!(proposal.event_data["current_law"]["policy_generation"]
+            .as_str().unwrap().starts_with("policy:sha256:"));
+        assert!(proposal.event_data["ratification"].is_null());
+        assert_eq!(proposal.event_data["deployment"]["automatic"], false);
+        assert_eq!(state.published().policy_generation(), law_before,
+                   "a proposal is not a law amendment: enforcement must not move");
+
         let d = crate::derivation::derive("claude-code", APPELLANT_ROLE, &window);
         let score = d.temperament.score.expect("measured");
         assert!(d.temperament.evidence[0].contribution.contains("appeal-upheld"),
