@@ -851,9 +851,10 @@ PY
 mv "$tmp" "$AUTHORITY"
 log "authority written: $AUTHORITY (build_id=$build_id)"
 log ""
-log "The daemon reads this via HESTIA_CURRENT_BUILD_FILE. If the dashboard still says"
-log "'deployment authority is not configured', the INSTALLED unit is missing that"
-log "Environment= line — deploy/templates/hestia.service carries it, so the unit is stale."
+log "The daemon defaults to current-build.json under its server home;"
+log "HESTIA_CURRENT_BUILD_FILE overrides that default. If the dashboard reports"
+log "unknown deployment authority, compare the daemon's server home with the"
+log "HESTIA_HOME used by this installer ($HESTIA_HOME)."
 
 # --------------------------------------------------------------------------------
 # CERTIFY THE INSTALLED GATES AGAINST THE VAULT — or say plainly that we did not.
