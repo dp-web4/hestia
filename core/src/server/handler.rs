@@ -579,14 +579,33 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t("hestia_vault_get", "Request a credential from the vault"),
         t("hestia_vault_set", "Store a credential in the vault"),
-        t(
+        t_args(
             "hestia_query_history",
-            "Query the witness chain. filter.hash = DEREFERENCE one entry by its hash (or an \
-             abbreviation of at least ~8 hex chars) anywhere on the chain — this is how you follow \
-             a pointer you were handed: a mesh notice's hestia://adjudication/<hash>, an appeal's \
-             deny_hash, a ruling cited in your operating law. Without it, filter.limit/tool_name \
-             return only the recent tail, so an older entry reads as absent rather than out of \
-             window",
+            "Query the witness chain. filter.hash dereferences one entry anywhere. Other filters run in SQL BEFORE the 500-row cap: tool_name, plugin_id, event_type/eventType/type. Page backward with before_position/before/cursor/max_position (exclusive), or offset. hasMore and next_before_position describe the filtered set; requested_limit and capped make a clamp visible",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "filter": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "hash": {"type": "string", "description": "Whole chain entry hash or unique prefix"},
+                            "limit": {"type": "integer", "minimum": 0, "default": 50, "maximum": 500},
+                            "tool_name": {"type": "string"},
+                            "plugin_id": {"type": "string"},
+                            "event_type": {"type": "string"},
+                            "eventType": {"type": "string"},
+                            "type": {"type": "string"},
+                            "before_position": {"type": "integer", "minimum": 0},
+                            "before": {"type": "integer", "minimum": 0},
+                            "cursor": {"type": "integer", "minimum": 0},
+                            "max_position": {"type": "integer", "minimum": 0},
+                            "offset": {"type": "integer", "minimum": 0}
+                        }
+                    }
+                }
+            }),
         ),
         t(
             "hestia_request_witness",
@@ -2418,7 +2437,10 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
 ///
 /// Refuse rather than echo. An echo of the effective limit still lets a caller who
 /// does not read the echo walk away with 50.
-const QUERY_FILTER_KEYS: [&str; 3] = ["limit", "hash", "tool_name"];
+const QUERY_FILTER_KEYS: [&str; 12] = [
+    "limit", "hash", "tool_name", "plugin_id", "event_type", "eventType", "type",
+    "before_position", "before", "cursor", "max_position", "offset",
+];
 
 async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
     let misplaced: Vec<&str> = QUERY_FILTER_KEYS
@@ -2447,7 +2469,24 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
         ));
     }
 
+    let misplaced_top: Vec<&str> = args.as_object().into_iter().flat_map(|o| o.keys())
+        .map(String::as_str).filter(|k| *k != "filter").collect();
+    if !misplaced_top.is_empty() {
+        return Ok(hestia_error_envelope(
+            "hestia.query_filter_unknown_key",
+            "every query_history argument belongs inside `filter`; no filter was applied",
+            Some(json!({"unknownKeys": misplaced_top, "honoured": QUERY_FILTER_KEYS})),
+        ));
+    }
+
     let filter = args.get("filter").cloned().unwrap_or(Value::Null);
+    if !filter.is_null() && !filter.is_object() {
+        return Ok(hestia_error_envelope(
+            "hestia.query_filter_unknown_key",
+            "`filter` must be an object; no filter was applied",
+            Some(json!({"honoured": QUERY_FILTER_KEYS})),
+        ));
+    }
 
     // The other half of the same wrong answer. The guard above catches a KNOWN key in the
     // wrong PLACE; this one catches an unknown key in the right place, and both produce the
@@ -2472,14 +2511,11 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
             return Ok(hestia_error_envelope(
                 "hestia.query_filter_unknown_key",
                 &format!(
-                    "{named} is not a filter this chain can honour: the chain is indexed by \
-                     hash and read newest-first, so there is nothing to select an \
-                     escalation_id, request_id or plugin_id on. Served as sent it would be \
-                     DROPPED and you would get an unfiltered window over the tail that looks \
-                     exactly like a filtered answer — so it is refused. To reach a record by \
-                     id use its pointer resource (hestia://escalation/<id>, hestia://scope/<id>, \
-                     hestia://appeal/<hash>), which scans for it; to reach one by chain hash \
-                     use filter.hash, which short-circuits the window."
+                    "{named} is not a filter this chain can honour; no filter was applied. \
+                     The honoured vocabulary is the inputSchema's filter property set, not a \
+                     key guessed from another tool. To reach a record by id use its pointer \
+                     resource (hestia://escalation/<id>, hestia://scope/<id>, \
+                     hestia://appeal/<hash>); to reach one by chain hash use filter.hash."
                 ),
                 Some(json!({
                     "unknownKeys": unknown,
@@ -2491,12 +2527,36 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
         }
     }
 
-    let limit = filter
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(50)
-        .min(500) as usize;
+    let requested_limit = filter.get("limit").and_then(Value::as_u64).unwrap_or(50);
+    let limit = requested_limit.min(500);
     let tool_filter = filter.get("tool_name").and_then(Value::as_str);
+    let member_filter = filter.get("plugin_id").and_then(Value::as_str);
+    let mut event_filter = None;
+    for key in ["event_type", "eventType", "type"] {
+        if let Some(value) = filter.get(key).and_then(Value::as_str) {
+            if event_filter.is_some_and(|existing| existing != value) {
+                return Ok(hestia_error_envelope(
+                    "hestia.query_filter_cursor_conflict",
+                    "event_type, eventType and type are aliases; give one value, not conflicting ones",
+                    Some(json!({"honoured": QUERY_FILTER_KEYS})),
+                ));
+            }
+            event_filter = Some(value);
+        }
+    }
+    let mut before_position = None;
+    for key in ["before_position", "before", "cursor", "max_position"] {
+        if let Some(value) = filter.get(key).and_then(Value::as_u64) {
+            if before_position.is_some_and(|existing| existing != value) {
+                return Ok(hestia_error_envelope(
+                    "hestia.query_filter_cursor_conflict",
+                    "before_position, before, cursor and max_position are aliases; give one position",
+                    Some(json!({"honoured": QUERY_FILTER_KEYS})),
+                ));
+            }
+            before_position = Some(value);
+        }
+    }
 
     let s = state.lock().await;
 
@@ -2513,39 +2573,39 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
     {
         return Ok(resolve_chain_pointer(&s, ptr, None));
     }
-
-    let mut entries = Vec::new();
-    for e in s.recent_chain(limit as u64) {
-        if let Some(tname) = tool_filter {
-            let in_event = e
-                .event_data
-                .get("tool_name")
-                .and_then(Value::as_str)
-                .map(|t| t == tname)
-                .unwrap_or(false);
-            if !in_event {
-                continue;
-            }
+    if let Some(offset) = filter.get("offset").and_then(Value::as_u64) {
+        let computed = s.chain_len().saturating_sub(offset);
+        if before_position.is_some_and(|existing| existing != computed) {
+            return Ok(hestia_error_envelope(
+                "hestia.query_filter_cursor_conflict",
+                "offset and an exclusive before-position describe different pages; use only one",
+                Some(json!({"honoured": QUERY_FILTER_KEYS})),
+            ));
         }
-        entries.push(json!({
-            "hash": e.hash,
-            "prevHash": e.prev_hash,
-            "timestamp": e.timestamp.to_rfc3339(),
-            "eventType": e.event_type,
-            "eventData": e.event_data,
-            "signerLct": e.signer_lct,
-            "chainPosition": e.chain_position,
-        }));
+        before_position = Some(computed);
     }
-    // `hasMore` was the literal `false` on every response, truncated or not, which made it
-    // worse than absent: a caller who DID read it was told the window was complete. It now
-    // reports whether the chain continues below the window that was served. With a
-    // `tool_name` filter that is a statement about the SCAN window, not the match set —
-    // entries below the window were never examined. `limit` is echoed because the 500 cap
-    // silently shortens a deeper request, and the served depth is how a caller tells a
-    // clamp from an exhausted chain.
-    let has_more = s.chain_len() > limit as u64;
-    Ok(json!({"entries": entries, "hasMore": has_more, "limit": limit}))
+    let event_types = event_filter.map(|event| vec![event]);
+    let page = s.chain_store.scan_history_before(
+        before_position, event_types.as_deref(), tool_filter, member_filter, limit,
+    ).map_err(|e| anyhow::anyhow!("query history: {e}"))?;
+    let entries: Vec<Value> = page.entries.into_iter().map(|e| json!({
+        "hash": e.hash,
+        "prevHash": e.prev_hash,
+        "timestamp": e.timestamp.to_rfc3339(),
+        "eventType": e.event_type,
+        "eventData": e.event_data,
+        "signerLct": e.signer_lct,
+        "chainPosition": e.chain_position,
+    })).collect();
+    Ok(json!({
+        "entries": entries,
+        "hasMore": page.before_position.is_some(),
+        "next_before_position": page.before_position,
+        "limit": limit,
+        "requested_limit": requested_limit,
+        "capped": requested_limit > 500,
+        "scanned": page.scanned,
+    }))
 }
 
 /// Event types the daemon itself writes. `request_witness` must not be able to
@@ -22354,7 +22414,13 @@ mod appeal_tests {
             .await
             .unwrap();
 
-        for key in ["escalation_id", "request_id", "plugin_id", "event_type"] {
+        let member = tool_query_history(&state, &json!({
+            "filter": {"plugin_id": "not-the-member", "limit": 5}
+        })).await.unwrap();
+        assert!(member.get("_hestia_error").is_none(), "plugin_id is now honoured: {member}");
+        assert_eq!(member["entries"].as_array().unwrap().len(), 0);
+
+        for key in ["escalation_id", "request_id", "until", "start"] {
             let served = tool_query_history(&state, &json!({"filter": {key: "x", "limit": 5}}))
                 .await
                 .unwrap();
@@ -22449,6 +22515,79 @@ mod appeal_tests {
             Some(false),
             "a window deeper than the chain has nothing below it: {whole}"
         );
+    }
+
+    #[test]
+    fn the_query_history_schema_names_the_honoured_filter_contract() {
+        let tool = hestia_tools().into_iter()
+            .find(|t| t.name == "hestia_query_history")
+            .expect("query_history must be advertised");
+        assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+        let filter = &tool.input_schema["properties"]["filter"];
+        assert_eq!(filter["additionalProperties"], json!(false));
+        let properties = filter["properties"].as_object().unwrap();
+        for key in QUERY_FILTER_KEYS {
+            assert!(properties.contains_key(key), "schema omits `{key}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn query_history_filters_before_the_cap_and_pages_the_filtered_set_497() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let s = state.lock().await;
+            for i in 0..600 {
+                s.append_chain("outcome", json!({
+                    "tool_name": if i < 550 { "Bash" } else { "Read" },
+                    "plugin_id": if i % 2 == 0 { "kimi-code" } else { "codex" },
+                    "success": true
+                })).unwrap();
+            }
+            s.append_chain("member_notice", json!({"from_plugin_id": "mesh-actor"})).unwrap();
+        }
+
+        let first = tool_query_history(&state, &json!({
+            "filter": {"tool_name": "Bash", "limit": 500}
+        })).await.unwrap();
+        assert_eq!(first["entries"].as_array().unwrap().len(), 500);
+        assert!(first["entries"].as_array().unwrap().iter()
+            .all(|e| e["eventData"]["tool_name"] == "Bash"));
+        assert_eq!(first["hasMore"], json!(true));
+        assert_eq!(first["limit"], json!(500));
+        let cursor = first["next_before_position"].as_u64().expect("a second Bash page");
+
+        let second = tool_query_history(&state, &json!({
+            "filter": {"tool_name": "Bash", "limit": 500, "before_position": cursor}
+        })).await.unwrap();
+        assert_eq!(second["entries"].as_array().unwrap().len(), 50);
+        assert_eq!(second["hasMore"], json!(false));
+        assert_eq!(second["next_before_position"], serde_json::Value::Null);
+
+        let notices = tool_query_history(&state, &json!({
+            "filter": {"eventType": "member_notice", "plugin_id": "mesh-actor"}
+        })).await.unwrap();
+        assert_eq!(notices["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(notices["entries"][0]["eventData"]["from_plugin_id"], "mesh-actor");
+        assert_eq!(notices["hasMore"], json!(false));
+
+        let combined = tool_query_history(&state, &json!({
+            "filter": {"event_type": "outcome", "plugin_id": "kimi-code", "tool_name": "Bash", "limit": 500}
+        })).await.unwrap();
+        assert_eq!(combined["entries"].as_array().unwrap().len(), 275);
+
+        let capped = tool_query_history(&state, &json!({"filter": {"limit": 2_000}})).await.unwrap();
+        assert_eq!(capped["limit"], json!(500));
+        assert_eq!(capped["requested_limit"], json!(2_000));
+        assert_eq!(capped["capped"], json!(true));
+
+        let expected: Vec<_> = state.lock().await.recent_chain(2_000);
+        let offset = tool_query_history(&state, &json!({"filter": {"offset": 500, "limit": 500}})).await.unwrap();
+        assert_eq!(offset["entries"].as_array().unwrap().len(), expected.len() - 500);
+        assert_eq!(offset["entries"][0]["hash"], expected[500].hash);
+
+        let unknown = tool_query_history(&state, &json!({"filter": {"until": 1}})).await.unwrap();
+        assert_eq!(unknown["_hestia_error"]["code"], "hestia.query_filter_unknown_key");
     }
 
     /// The law cites rulings by an eight-character prefix ("adjudication 62cfdffe"). That
