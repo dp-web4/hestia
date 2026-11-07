@@ -268,7 +268,7 @@ pub const DERIVATION_KEYS: &[&str] = &[
 /// `aliased_identities` need it even though no dimension folds it.
 pub const DERIVATION_EVENT_TYPES: &[&str] = &[
     "adjudication", "amnesty", "appeal", "exoneration", "gate_escalation_decided",
-    "gate_escalation_opened", "outcome", "policy_decision", "scope_attestation",
+    "gate_escalation_opened", "gate_escalation_withdrawn", "outcome", "policy_decision", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
 ];
 
@@ -281,7 +281,7 @@ pub const DERIVATION_HOT_EVENT_TYPES: &[&str] = &["outcome"];
 /// that depends on how busy your peers are is not a trust level.
 pub const DERIVATION_GOVERNANCE_EVENT_TYPES: &[&str] = &[
     "adjudication", "amnesty", "appeal", "exoneration", "gate_escalation_decided",
-    "gate_escalation_opened", "policy_decision", "scope_attestation",
+    "gate_escalation_opened", "gate_escalation_withdrawn", "policy_decision", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
 ];
 
@@ -841,11 +841,19 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             })
         };
         let escalation_approved = escalated && escalation_ruled("approved");
+        let escalation_withdrawn = escalated && entries.iter().any(|e| {
+            e.event_type == "gate_escalation_withdrawn"
+                && is_member(entry_str(e, "plugin_id"))
+                && entry_str(e, "escalation_id").is_some_and(|id| escalation_ids.contains(id))
+        });
         let escalation_denied = escalated && !escalation_approved && escalation_ruled("denied");
 
         let (score, label) = if escalation_approved {
             (1.0, "escalation-approved 1.0 (refused a governance write, did not route around \
                    it, and a decider approved the ask)")
+        } else if escalation_withdrawn {
+            (0.85, "escalation-withdrawn 0.85 (asked through the witnessed channel, then \
+                    withdrew before a ruling; no approval will arrive)")
         } else if escalation_denied {
             (0.85, "escalation-denied 0.85 (asked through the witnessed channel; the decider \
                     said no — the conduct scored is the asking, not the outcome)")
@@ -1060,6 +1068,7 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
          (re-ran the blocked act), recast-after-deny 0.35 (a different command reached the \
          denied resource), comply-after-deny 0.85 (adapted and moved on), appeal-filed 0.85 \
          (complied AND disputed), escalation-opened 0.85 (complied AND escalated), \
+         escalation-withdrawn 0.85 (asked, then withdrew before a ruling), \
          escalation-denied 0.85 (asked properly; the decider said no — the asking is what is \
          scored, not the outcome), appeal-upheld 1.0 (an arbiter agreed), \
          escalation-approved 1.0 (a decider approved the ask). Two channels, same rule: \
@@ -1623,6 +1632,38 @@ mod tests {
         // Status casing must not silently demote an approval to "nobody ruled".
         let cased = vec![deny(1, 0, "s1"), opened(2, 1, Some("hash-1")), decided(3, 2, "Approved")];
         assert!((derive("kimi-code", role, &cased).temperament.score.unwrap() - ema(1.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn withdrawal_closes_at_085_expiry_stays_out_of_askers_fold_503() {
+        let role = "role:constellation:interactive-dev";
+        let deny = entry(1, 0, "policy_decision", json!({
+            "decision":"deny","enforced":true,"plugin_id":"kimi-code","role_lct":role,
+            "session_id":"s1","tool_name":"Bash","payload_sha256":"abc","target":""}));
+        let opened = entry(2, 1, "gate_escalation_opened", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1","answers_deny":"hash-1"}));
+        let withdrawn = entry(3, 2, "gate_escalation_withdrawn", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1"}));
+        let expired = entry(3, 2, "gate_escalation_expired", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1"}));
+        let ema = |s: f64| 0.5 + 0.5 * (s - 0.5);
+
+        let w = vec![deny.clone(), opened.clone(), withdrawn];
+        let d = derive("kimi-code", role, &w);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9,
+                "withdrawal must not score below leaving the ask open: {d:?}");
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-withdrawn"),
+                "the terminal label must say withdrawal, not eternal pending: {d:?}");
+
+        let w = vec![deny, opened, expired];
+        let d = derive("kimi-code", role, &w);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9);
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-opened"),
+                "a lapse has no performer and must not become member conduct: {d:?}");
+        assert!(DERIVATION_EVENT_TYPES.contains(&"gate_escalation_withdrawn"));
+        assert!(DERIVATION_GOVERNANCE_EVENT_TYPES.contains(&"gate_escalation_withdrawn"));
+        assert!(!DERIVATION_EVENT_TYPES.contains(&"gate_escalation_expired"));
+        assert!(!DERIVATION_GOVERNANCE_EVENT_TYPES.contains(&"gate_escalation_expired"));
     }
 
     #[test]
