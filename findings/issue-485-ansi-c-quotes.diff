@@ -1,0 +1,199 @@
+diff --git a/plugins/_shared/hestia_governance_closure.py b/plugins/_shared/hestia_governance_closure.py
+index 43e3e11b..cfb4acb2 100755
+--- a/plugins/_shared/hestia_governance_closure.py
++++ b/plugins/_shared/hestia_governance_closure.py
+@@ -591,6 +591,7 @@ def default_closure() -> Closure:
+ # it on the same command line (so `cd plugins/<m>/hooks && echo x > GATE` resolves into the
+ # closure). Everything else is OUT OF GRAMMAR and its write set is undecidable:
+ #   * a substitution/variable in a WRITE position (`> $VAR`, `> $(cmd)`, `cp x $DEST`);
++#   * an unquoted ANSI-C `$'` opener, whose quote boundaries shlex does not model (#485);
+ #   * a shell block / conditional governing the command (`if`/`while`/`for`/`case`/`{ }`/
+ #     subshell) — control flow can hide or gate a write;
+ #   * `bash -c` / `sh -c` / `eval` — the write happens inside an opaque string;
+@@ -809,14 +810,53 @@ def _join_eff(eff: str, target: str) -> str:
+     return os.path.normpath(os.path.join(eff, target))
+ 
+ 
++def _has_unquoted_ansi_c_quote(cmd: str) -> bool:
++    """Whether Bash sees an ANSI-C `$'` opener outside single/double quotes.
++
++    shlex has no ANSI-C quote state: inside `$'…'`, `\'` is a literal apostrophe rather than
++    the close/open sequence shlex sees. Rejecting the opener before shlex runs keeps their
++    token boundaries from silently diverging (#485). A dollar reached through backslash, or
++    inside an ordinary quoted string, is not this construct.
++    """
++    quote, i = None, 0
++    while i < len(cmd):
++        c = cmd[i]
++        if quote == "'":
++            if c == "'":
++                quote = None
++        elif quote == '"':
++            if c == "\\":
++                i += 2
++                continue
++            if c == '"':
++                quote = None
++        else:
++            if c == "\\":
++                i += 2
++                continue
++            if c == "$" and cmd.startswith("$'", i):
++                return True
++            if c in ("'", '"'):
++                quote = c
++        i += 1
++    return False
++
++
++def _raw_vocab_tokens(command: str) -> list:
++    """Conservative vocabulary tokens when shlex cannot agree with Bash's quote model."""
++    return [t for t in re.split(r"[\s();<>|&]+", command) if t]
++
++
+ def _vocab_tokens(command: str) -> list:
+     """Every token to scan for closure vocabulary on the out-of-grammar path — the outer
+     tokens PLUS the re-tokenized contents of any `-c`/`eval` string operand, so a bare
+     closure filename named inside an opaque string is still visible to the scan."""
++    if _has_unquoted_ansi_c_quote(command):
++        return _raw_vocab_tokens(command)
+     try:
+         toks = _tokenize(command)
+     except Exception:
+-        return command.split()
++        return _raw_vocab_tokens(command)
+     out = [t for t in toks if not _is_punct(t)]
+     for i, t in enumerate(toks):
+         base = os.path.basename(t) if isinstance(t, str) else ""
+@@ -828,7 +868,7 @@ def _vocab_tokens(command: str) -> list:
+                     try:
+                         out.extend(_tokenize(s))
+                     except Exception:
+-                        out.append(s)
++                        out.extend(_raw_vocab_tokens(s))
+                 break
+     return out
+ 
+@@ -848,14 +888,12 @@ def _tokenize(cmd: str) -> list:
+       from `#` to end of LINE, and the `;` sits on that line, so the comment swallowed the
+       separator and the write with it. No newline was needed for that one.
+ 
+-    ONE QUOTE MODEL, DELIBERATELY. The obvious repair is to pre-split the raw text on
+-    unquoted newlines, and the caller's `_command_lines` does exactly that — correctly, with
+-    its own hand-written quote walk. Porting that walk here would put TWO quote models in one
+-    classifier, and the day they disagree about where a quote ends is the day the disagreement
+-    is a bypass (that is #485's class, and the caller's own docstring warns of it in those
+-    words). So the newline is handed to shlex instead: removed from `whitespace`, added to
+-    `punctuation_chars`. shlex keeps deciding what is quoted, and a QUOTED newline stays data
+-    inside its token exactly as before — verified, not assumed.
++    ONE TOKENIZATION QUOTE MODEL, DELIBERATELY. The newline is handed to shlex (removed from
++    `whitespace`, added to `punctuation_chars`) rather than pre-split by a second parser, so a
++    quoted newline stays data inside its token. The ANSI-C preflight is narrower: it recognizes
++    only the unsupported `$'` opener and refuses it before shlex runs; it never finds the close
++    or emits tokens. Accepted input still has exactly one tokenization quote model, while the
++    measured NM2/NM2b desynchronization is out of grammar instead of silently mis-tokenized.
+ 
+     COMMENTS ARE NOT STRIPPED, and that is a considered fail-closed trade. Dropping tokens
+     from a `#` to the next newline would be the faithful bash rule, but after tokenization a
+@@ -868,6 +906,8 @@ def _tokenize(cmd: str) -> list:
+     That is a false POSITIVE, it fails closed, and it is the direction this module prefers.
+     `a#b` is unaffected: shlex keeps a mid-word `#` attached, so it never opens anything.
+     """
++    if _has_unquoted_ansi_c_quote(cmd):
++        raise _OutOfGrammar()
+     lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT_CHARS)
+     lex.whitespace_split = True
+     # Newline must not be whitespace, or it is consumed before it can be punctuation.
+@@ -876,8 +916,8 @@ def _tokenize(cmd: str) -> list:
+     lex.commenters = ""
+     out = []
+     for tok in lex:
+-        # Only runs shlex ITSELF resolved to unquoted punctuation are re-split, so shlex
+-        # remains the sole quote model: a quoted word is never re-examined here.
++        # Only runs shlex ITSELF resolved to unquoted punctuation are re-split, so accepted
++        # input keeps shlex's quote model: a quoted word is never re-examined here.
+         out.extend(_split_operator_run(tok) if _is_punct(tok) else [tok])
+     return out
+ 
+diff --git a/plugins/_shared/shell_grammar_test.py b/plugins/_shared/shell_grammar_test.py
+index 1aad8677..e635f1cb 100755
+--- a/plugins/_shared/shell_grammar_test.py
++++ b/plugins/_shared/shell_grammar_test.py
+@@ -80,6 +80,13 @@ with open(os.path.join(BENIGN_DIR, "benign.patch"), "w", encoding="utf-8") as _f
+               + "@@ -1 +1 @@" + chr(10) + "-x" + chr(10) + "+y" + chr(10))
+ 
+ 
++# #485: Bash's ANSI-C `$'…'` quote treats `\'` as a literal apostrophe; shlex does not.
++# Both commands write before Bash reports the later unmatched quote. NM2b deliberately has
++# no heredoc operator, so a delimiter-only repair cannot close the class.
++NM2 = "printf %s $'it\\'s <<EOF'\nprintf x > " + SHARED_DIR + "/" + CORE + "\nEOF'"
++NM2B = "printf %s $'it\\'s'\nprintf x > " + SHARED_DIR + "/" + CORE + "\n:'"
++
++
+ CASES = [
+     # --- substitution / variable in a WRITE position ---
+     ("subst_redirect_var__closure",
+@@ -200,6 +207,20 @@ CASES = [
+      f"echo 'a > {HOOKS}/{HOOK}'", "not-write", None),
+     ("heredoc_body_names_gate__not_write",
+      f"cat <<EOF > /tmp/notes.md\nsee {HOOKS}/{HOOK}\nEOF", "not-write", None),
++
++    # --- ANSI-C quoting is undecidable to shlex, never a license to answer none ---
++    ("ansi_c_nm2__closure", NM2, "write", OOG),
++    ("ansi_c_nm2b__closure", NM2B, "write", OOG),
++    ("ansi_c_nm2b_attached_redirect__closure",
++     NM2B.replace("> " + SHARED_DIR, ">" + SHARED_DIR), "write", OOG),
++    ("ansi_c_benign_redirect__none",
++     "printf %s $'a\\tb' > /tmp/ansi-c-notes.txt", "none", None),
++    ("double_quoted_dollar_apostrophe_is_literal",
++     f"grep -n \"$'\" {SHARED_DIR}/{CORE}", "not-write", None),
++    ("single_quoted_dollar_is_literal",
++     f"grep -n '$' {SHARED_DIR}/{CORE}", "not-write", None),
++    ("escaped_dollar_is_not_an_ansi_c_quote",
++     f"grep -n \\$'deny' {SHARED_DIR}/{CORE}", "not-write", None),
+ ]
+ 
+ 
+@@ -270,6 +291,9 @@ _DIFF_CASES = [
+     ("cd_then_relative", f"cd plugins/kimi/hooks && echo x > {HOOK}", True),
+     ("redirect_benign", "echo hi > docs/readme.md", False),
+     ("cp_benign", "cp src.txt docs/notes.txt", False),
++    ("ansi_c_nm2", NM2, True),
++    ("ansi_c_nm2b_without_heredoc", NM2B, True),
++    ("ansi_c_benign", "printf %s $'a\\tb' > docs/ansi-c.txt", False),
+ ]
+ 
+ 
+@@ -540,9 +564,32 @@ def test_block_and_its_unblocked_body_agree():
+     check("block_and_body_agree", not failures, "\n  ".join(failures))
+ 
+ 
++def test_ansi_c_fallback_false_positive_cost_485():
++    """The conservative fallback refuses these two reads; their plain forms stay reads.
++
++    This pins 2/2 visible false positives so later parser work must deliberately narrow the
++    cost. The original independent traffic scan measured 31 unquoted-$' commands in 68,288
++    Bash calls (0.045%), with zero unclassifiable commands, on one seat.
++    """
++    ansi_reads = [
++        f"grep -n $'deny' {SHARED_DIR}/{CORE}",
++        f"sed -n $'1,2p' {SHARED_DIR}/{CORE}",
++    ]
++    plain_reads = [
++        f"grep -n deny {SHARED_DIR}/{CORE}",
++        f"sed -n '1,2p' {SHARED_DIR}/{CORE}",
++    ]
++    false_positives = [cmd for cmd in ansi_reads if cls(cmd).classification == "write"]
++    check("ansi_c_fallback_cost_is_measured", len(false_positives) == 2, false_positives)
++    for cmd in plain_reads:
++        v = cls(cmd)
++        check("plain_read_control", v.classification == "read", f"{cmd}: {v}")
++
++
+ ALL = [
+     test_explicit_all_grammar_cases,
+     test_differential_against_real_shell,
++    test_ansi_c_fallback_false_positive_cost_485,
+     test_block_and_its_unblocked_body_agree,
+     test_a_write_through_a_loop_variable_stays_refused,
+ ]
