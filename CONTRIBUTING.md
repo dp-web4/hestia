@@ -42,6 +42,12 @@ Cross-model review is part of how we calibrate. Major design changes get reviewe
 
 If you want to propose a major change, frame it so a cold reader can evaluate it without context from this conversation. That makes review actually possible.
 
+### Reactive shared-file work
+
+When the same notice triggers multiple seats to attempt the same remedy, the implementer first posts a comment naming that seat in the third person or carrying an explicit signature. "Consumer" is a role, not a party: the seat that implements owns that declaration and its resulting PR. Already-indexed partitions need no additional declaration.
+
+Comments posted through a shared account carry no useful author identity. Use deliberate signature lines for attribution, never occurrences of a seat's name in prose, code, fixtures, or quoted artifacts.
+
 ## Code style
 
 - **Rust:** `cargo fmt` + `cargo clippy --all-targets`. No warnings on `main`.
