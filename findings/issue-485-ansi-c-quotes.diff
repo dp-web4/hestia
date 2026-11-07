@@ -1,5 +1,5 @@
 diff --git a/plugins/_shared/hestia_governance_closure.py b/plugins/_shared/hestia_governance_closure.py
-index 43e3e11b..cfb4acb2 100755
+index 43e3e11b..88091ba5 100755
 --- a/plugins/_shared/hestia_governance_closure.py
 +++ b/plugins/_shared/hestia_governance_closure.py
 @@ -591,6 +591,7 @@ def default_closure() -> Closure:
@@ -10,7 +10,7 @@ index 43e3e11b..cfb4acb2 100755
  #   * a shell block / conditional governing the command (`if`/`while`/`for`/`case`/`{ }`/
  #     subshell) — control flow can hide or gate a write;
  #   * `bash -c` / `sh -c` / `eval` — the write happens inside an opaque string;
-@@ -809,14 +810,53 @@ def _join_eff(eff: str, target: str) -> str:
+@@ -809,14 +810,66 @@ def _join_eff(eff: str, target: str) -> str:
      return os.path.normpath(os.path.join(eff, target))
  
  
@@ -47,8 +47,21 @@ index 43e3e11b..cfb4acb2 100755
 +
 +
 +def _raw_vocab_tokens(command: str) -> list:
-+    """Conservative vocabulary tokens when shlex cannot agree with Bash's quote model."""
-+    return [t for t in re.split(r"[\s();<>|&]+", command) if t]
++    """Conservative vocabulary tokens when shlex cannot agree with Bash's quote model.
++
++    Keep each raw spelling, but also try it with quote syntax erased. This is not a second
++    tokenizer: it only widens the vocabulary candidates for an already-undecidable command.
++    In particular, `$'plugins/_shared/core.py'` must not hide its path from Closure.match.
++    """
++    out = []
++    for token in re.split(r"[\s();<>|&]+", command):
++        if not token:
++            continue
++        out.append(token)
++        quote_erased = re.sub(r"\$?['\"]", "", token)
++        if quote_erased and quote_erased != token:
++            out.append(quote_erased)
++    return out
 +
 +
  def _vocab_tokens(command: str) -> list:
@@ -65,7 +78,7 @@ index 43e3e11b..cfb4acb2 100755
      out = [t for t in toks if not _is_punct(t)]
      for i, t in enumerate(toks):
          base = os.path.basename(t) if isinstance(t, str) else ""
-@@ -828,7 +868,7 @@ def _vocab_tokens(command: str) -> list:
+@@ -828,7 +881,7 @@ def _vocab_tokens(command: str) -> list:
                      try:
                          out.extend(_tokenize(s))
                      except Exception:
@@ -74,7 +87,7 @@ index 43e3e11b..cfb4acb2 100755
                  break
      return out
  
-@@ -848,14 +888,12 @@ def _tokenize(cmd: str) -> list:
+@@ -848,14 +901,12 @@ def _tokenize(cmd: str) -> list:
        from `#` to end of LINE, and the `;` sits on that line, so the comment swallowed the
        separator and the write with it. No newline was needed for that one.
  
@@ -95,7 +108,7 @@ index 43e3e11b..cfb4acb2 100755
  
      COMMENTS ARE NOT STRIPPED, and that is a considered fail-closed trade. Dropping tokens
      from a `#` to the next newline would be the faithful bash rule, but after tokenization a
-@@ -868,6 +906,8 @@ def _tokenize(cmd: str) -> list:
+@@ -868,6 +919,8 @@ def _tokenize(cmd: str) -> list:
      That is a false POSITIVE, it fails closed, and it is the direction this module prefers.
      `a#b` is unaffected: shlex keeps a mid-word `#` attached, so it never opens anything.
      """
@@ -104,7 +117,7 @@ index 43e3e11b..cfb4acb2 100755
      lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT_CHARS)
      lex.whitespace_split = True
      # Newline must not be whitespace, or it is consumed before it can be punctuation.
-@@ -876,8 +916,8 @@ def _tokenize(cmd: str) -> list:
+@@ -876,8 +929,8 @@ def _tokenize(cmd: str) -> list:
      lex.commenters = ""
      out = []
      for tok in lex:
@@ -116,7 +129,7 @@ index 43e3e11b..cfb4acb2 100755
      return out
  
 diff --git a/plugins/_shared/shell_grammar_test.py b/plugins/_shared/shell_grammar_test.py
-index 1aad8677..e635f1cb 100755
+index 1aad8677..1ae0c7a9 100755
 --- a/plugins/_shared/shell_grammar_test.py
 +++ b/plugins/_shared/shell_grammar_test.py
 @@ -80,6 +80,13 @@ with open(os.path.join(BENIGN_DIR, "benign.patch"), "w", encoding="utf-8") as _f
@@ -133,7 +146,7 @@ index 1aad8677..e635f1cb 100755
  CASES = [
      # --- substitution / variable in a WRITE position ---
      ("subst_redirect_var__closure",
-@@ -200,6 +207,20 @@ CASES = [
+@@ -200,6 +207,26 @@ CASES = [
       f"echo 'a > {HOOKS}/{HOOK}'", "not-write", None),
      ("heredoc_body_names_gate__not_write",
       f"cat <<EOF > /tmp/notes.md\nsee {HOOKS}/{HOOK}\nEOF", "not-write", None),
@@ -143,6 +156,12 @@ index 1aad8677..e635f1cb 100755
 +    ("ansi_c_nm2b__closure", NM2B, "write", OOG),
 +    ("ansi_c_nm2b_attached_redirect__closure",
 +     NM2B.replace("> " + SHARED_DIR, ">" + SHARED_DIR), "write", OOG),
++    ("ansi_c_quoted_redirect_target__closure",
++     "printf x > $'" + SHARED_DIR + "/hestia_governance_" + "closure.py'", "write", OOG),
++    ("ansi_c_concatenated_target__closure",
++     "printf x > $'plugins'/_shared/hestia_governance_" + "closure.py", "write", OOG),
++    ("ansi_c_plus_ordinary_quoted_target__closure",
++     "printf %s $'x' > '" + SHARED_DIR + "/" + CORE + "'", "write", OOG),
 +    ("ansi_c_benign_redirect__none",
 +     "printf %s $'a\\tb' > /tmp/ansi-c-notes.txt", "none", None),
 +    ("double_quoted_dollar_apostrophe_is_literal",
@@ -154,17 +173,19 @@ index 1aad8677..e635f1cb 100755
  ]
  
  
-@@ -270,6 +291,9 @@ _DIFF_CASES = [
+@@ -270,6 +297,11 @@ _DIFF_CASES = [
      ("cd_then_relative", f"cd plugins/kimi/hooks && echo x > {HOOK}", True),
      ("redirect_benign", "echo hi > docs/readme.md", False),
      ("cp_benign", "cp src.txt docs/notes.txt", False),
 +    ("ansi_c_nm2", NM2, True),
 +    ("ansi_c_nm2b_without_heredoc", NM2B, True),
++    ("ansi_c_quoted_redirect_target",
++     "printf x > $'" + SHARED_DIR + "/hestia_governance_" + "closure.py'", True),
 +    ("ansi_c_benign", "printf %s $'a\\tb' > docs/ansi-c.txt", False),
  ]
  
  
-@@ -540,9 +564,32 @@ def test_block_and_its_unblocked_body_agree():
+@@ -540,9 +572,32 @@ def test_block_and_its_unblocked_body_agree():
      check("block_and_body_agree", not failures, "\n  ".join(failures))
  
  
