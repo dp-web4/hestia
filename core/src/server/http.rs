@@ -9173,36 +9173,41 @@ async fn governance_ledger(
         _ => Some(now_dt - chrono::Duration::days(30)),
     };
     let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
-    // The cap counts ADMIN ACTS, not chain entries — `read_recent_by_types` filters in SQL — so a
-    // wide range costs what its answer costs. Scanning the whole chain to discard member traffic
-    // would put the heaviest read in the daemon behind a UI panel.
-    const LEDGER_CAP: u64 = 5_000;
-
-    let (raw, read_error) = match chain.read_recent_by_types(
+    // A routine page is at most 500 selected admin acts by default, never more than 1,000.
+    // `before_position` makes older history an explicit follow-up rather than a 5,000-row read.
+    let chain_limit = q.limit.unwrap_or(crate::storage::chain::ROUTINE_CHAIN_PAGE)
+        .min(crate::storage::chain::ROUTINE_CHAIN_MAX);
+    let mut projection_error = None;
+    let scan = chain.scan_recent_page(
         cutoff_str.as_deref(),
-        gl::GOVERNANCE_EVENTS,
-        LEDGER_CAP,
-    ) {
-        Ok(v) => (v, None),
+        Some(gl::GOVERNANCE_EVENTS),
+        q.before_position,
+        chain_limit,
+        |row| match row.to_entry() {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                projection_error = Some(e.to_string());
+                None
+            }
+        },
+    );
+    let (raw, scanned, before_position, truncated, read_error) = match scan {
+        Ok(p) => {
+            let truncated = p.before_position.is_some();
+            (p.rows, p.scanned, p.before_position, truncated, projection_error)
+        }
         Err(e) => {
             tracing::error!("governance ledger chain read failed: {e}");
-            (Vec::new(), Some(e.to_string()))
+            (Vec::new(), 0, None, false, Some(e.to_string()))
         }
     };
-    let scanned = raw.len() as u64;
-    // The window FILLED. There may be older admin acts this page cannot see, and a reader must be
-    // told rather than shown a short list that looks complete.
-    let truncated = scanned >= LEDGER_CAP;
 
     let now = crate::server::gate_escalation::now_secs();
     let rows = gl::project(&raw, now);
-    let mut page = gl::page(
-        rows,
-        q.status.as_deref().unwrap_or("all"),
-        q.limit.unwrap_or(500).min(2_000) as usize,
-    );
+    let mut page = gl::page(rows, q.status.as_deref().unwrap_or("all"), chain_limit as usize);
     page.truncated = truncated;
     page.scanned = scanned;
+    page.before_position = before_position;
     page.read_error = read_error;
     Json(page)
 }
@@ -9214,6 +9219,8 @@ struct LedgerQuery {
     /// day | week | month (default) | all
     range: Option<String>,
     limit: Option<u64>,
+    /// Exclusive chain cursor returned by the previous page.
+    before_position: Option<u64>,
 }
 
 /// `POST /api/operator/gate-escalation` {id, approve, reason?} — the STRONG decision channel for
@@ -14369,9 +14376,8 @@ mod tests {
     ///   the fix — because nobody was awake to steal the woken waiters.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn governance_ledger_read_does_not_hold_the_state_lock() {
-        // ~77MB of event_data in total: the read costs ~2s on the 2026-08 WSL
-        // dev box. ROWS stays well under LEDGER_CAP (5000) so every seeded act
-        // is scanned; the per-row pad is what the fetch + parse pays for.
+        // ~77MB of event_data in total: the first page costs ~2s on the 2026-08 WSL
+        // dev box. ROWS crosses the hard page cap, so the cursor is exercised too.
         const ROWS: usize = 1_200;
         const PAD: usize = 65_536;
 
@@ -14400,6 +14406,7 @@ mod tests {
                             status: None,
                             range: Some("all".into()),
                             limit: Some(2_000),
+                            before_position: None,
                         }),
                     )
                     .await
@@ -14409,9 +14416,8 @@ mod tests {
             (handle, started_rx)
         };
 
-        // Calibrate: one full ledger read — and check the answer while at it:
-        // every seeded admin act, no read error (the lock change must not
-        // change the ledger's semantics).
+        // Calibrate one page, then follow its cursor: every seeded admin act is returned,
+        // no page exceeds the hard cap, and no read error is hidden.
         let t = std::time::Instant::now();
         let (h, started) = spawn_handler(&state);
         started.await.unwrap();
@@ -14422,9 +14428,27 @@ mod tests {
             .await
             .unwrap();
         let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(page["scanned"].as_u64(), Some(ROWS as u64));
-        assert_eq!(page["rows"].as_array().map(Vec::len), Some(ROWS));
+        assert_eq!(page["scanned"].as_u64(), Some(1_000));
+        assert_eq!(page["rows"].as_array().map(Vec::len), Some(1_000));
+        assert_eq!(page["truncated"].as_bool(), Some(true));
         assert!(page.get("read_error").is_none());
+        let cursor = page["before_position"].as_u64().expect("an older page");
+        let resp = governance_ledger(
+            State(state.clone()),
+            Query(LedgerQuery {
+                status: None,
+                range: Some("all".into()),
+                limit: Some(2_000),
+                before_position: Some(cursor),
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let older: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(older["scanned"].as_u64(), Some((ROWS - 1_000) as u64));
+        assert_eq!(older["rows"].as_array().map(Vec::len), Some(ROWS - 1_000));
+        assert_eq!(older["before_position"], serde_json::Value::Null);
+        assert!(older.get("read_error").is_none());
 
         // The spinners: keep every other worker awake and stealing, so the
         // woken waiter below is polled promptly (see the doc comment).
