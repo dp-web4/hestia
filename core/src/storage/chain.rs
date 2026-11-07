@@ -1599,6 +1599,49 @@ impl SqliteChainStore {
     /// "ambiguous" or a wrong single hit. Empty would also conflate
     /// *you typed garbage* with *no such entry*, which is the distinction the
     /// caller most needs.
+    /// The newest act timestamp for one member, without materializing a chain window (#488).
+    /// This is the liveness projection: the actor may be flat or nested by adjudicator shape.
+    pub fn latest_actor_act(&self, plugin_id: &str) -> Result<Option<String>> {
+        let conn = self.observed(&self.read_conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT timestamp FROM chain_entries
+             WHERE event_type IN ('outcome', 'policy_decision', 'adjudication', 'appeal')
+               AND (json_extract(event_data, '$.plugin_id') = ?1
+                    OR json_extract(event_data, '$.adjudicator') = ?1
+                    OR json_extract(event_data, '$.adjudicated_by.plugin_id') = ?1)
+             ORDER BY chain_position DESC LIMIT 1",
+        )?;
+        Ok(stmt.query_row(params![plugin_id], |row| row.get(0)).optional()?)
+    }
+
+    /// Unruled appeals in the position window, newest first (#488). The anti-join
+    /// projects only the open queue rather than parsing every appeal and ruling.
+    pub fn open_appeal_rows(&self, window: u64) -> Result<Vec<ChainEntry>> {
+        let conn = self.observed(&self.read_conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT a.chain_position, a.hash, a.prev_hash, a.event_type,
+                    a.event_data, a.signer_lct, a.timestamp
+             FROM chain_entries a
+             WHERE a.event_type = 'appeal'
+               AND a.chain_position > (SELECT COALESCE(MAX(chain_position), 0) - ?1 FROM chain_entries)
+               AND NOT EXISTS (
+                   SELECT 1 FROM chain_entries j
+                   WHERE j.event_type = 'adjudication'
+                     AND json_extract(j.event_data, '$.about_deny_hash') =
+                         json_extract(a.event_data, '$.deny_hash')
+               )
+             ORDER BY a.chain_position DESC",
+        )?;
+        let rows = stmt.query_map(params![window as i64], |row| {
+            row_to_entry(row)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
     /// Every `appeal` and `adjudication` row about one deny, with no recency window (#164).
     ///
     /// `ptr` is a deny hash or an appeal entry hash, whole or as a prefix of at least 8 hex
@@ -2652,6 +2695,28 @@ mod tests {
             Some(&cutoff), Some(&[]), None, ROUTINE_CHAIN_PAGE, |_| Some(()),
         ).unwrap();
         assert_eq!(empty, ChainScanPage { rows: Vec::new(), before_position: None, scanned: 0 });
+    }
+
+    #[test]
+    fn appeal_queue_and_liveness_use_projections_not_a_tail_materialization_488() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        store.append("appeal", json!({"deny_hash": "a", "plugin_id": "kimi-code"}), "lct:test").unwrap();
+        store.append("outcome", json!({"plugin_id": "kimi-code", "success": true}), "lct:test").unwrap();
+        store.append("adjudication", json!({"about_deny_hash": "a", "adjudicator": "codex"}), "lct:test").unwrap();
+        store.append("appeal", json!({"deny_hash": "b", "plugin_id": "gemini"}), "lct:test").unwrap();
+        store.append("adjudication", json!({"about_deny_hash": "other", "adjudicated_by": {"plugin_id": "kimi-code"}}), "lct:test").unwrap();
+
+        let open = store.open_appeal_rows(20_000).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].event_data["deny_hash"], "b");
+        assert_eq!(open[0].event_data["plugin_id"], "gemini");
+        assert!(store.open_appeal_rows(0).unwrap().is_empty());
+
+        let latest = store.latest_actor_act("kimi-code").unwrap().unwrap();
+        let expected = store.read_recent(1).unwrap()[0].timestamp.to_rfc3339();
+        assert_eq!(latest, expected, "the nested adjudicator is an actor act");
+        assert_eq!(store.latest_actor_act("nobody").unwrap(), None);
     }
 
     /// A dashboard projection is allowed to be slow; it is not allowed to

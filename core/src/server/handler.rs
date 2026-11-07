@@ -3359,6 +3359,22 @@ fn actor_liveness(window: &[crate::storage::chain::ChainEntry], plugin_id: &str)
     }
 }
 
+/// Production liveness without a 20,000-entry tail (#488): one indexed latest-act lookup.
+fn actor_liveness_on_chain(
+    store: &crate::storage::chain::SqliteChainStore,
+    plugin_id: &str,
+) -> crate::arbiter::Liveness {
+    let newest = store.latest_actor_act(plugin_id).ok().flatten()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+        .map(|t| t.with_timezone(&Utc));
+    let now = Utc::now();
+    match newest {
+        Some(t) if (now - t).num_minutes() <= 60 => crate::arbiter::Liveness::Live,
+        Some(t) if (now - t).num_hours() <= 24 => crate::arbiter::Liveness::Dormant,
+        _ => crate::arbiter::Liveness::Unknown,
+    }
+}
+
 /// The refusal shapes an appeal may be filed against. A constant because the refusal message
 /// quotes it — a member told "not a deny" with no list has to guess which door it wanted.
 const APPEALABLE_EVENT_TYPES: [&str; 2] = ["policy_decision", "gate_self_access"];
@@ -3480,8 +3496,7 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // ANOTHER member's deny would let one member move another's grain.
     // The window stays for LIVENESS below, where recency is the question being asked. It is
     // not how the deny is found: #164 took the window off every appeal READ for this exact
-    // reason, and left it on the door that FILES one.
-    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+    // reason, and #488 projects each candidate's latest act instead of materializing the tail.
     // RESOLVE THE POINTER OVER THE WHOLE CHAIN, not over a tail (#610).
     //
     // Measured 2026-09-18, and this is the failure that is worth stating: cbp-being tried to
@@ -3665,7 +3680,7 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     // Reachability is resolved per candidate and fed to routing — an arbiter that cannot
     // read the appeal supplies no independence in practice, so it must not win a tie.
     let with_liveness: Vec<(&str, crate::arbiter::Liveness)> =
-        pool.iter().map(|id| (id.as_str(), actor_liveness(&window, id))).collect();
+        pool.iter().map(|id| (id.as_str(), actor_liveness_on_chain(&s.chain_store, id))).collect();
     let picked = crate::arbiter::select_arbiter(
         &appellant.plugin_id,
         // Resolved from the session just above — the left operand is proven (#128).
@@ -3791,10 +3806,12 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         ));
     };
 
-    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
-    let Some(appeal) = window.iter().find(|e| {
+    let chain_len = s.chain_len();
+    let appeals = s.chain_store.appeal_rows_for_pointer(&deny_hash).unwrap_or_default();
+    let Some(appeal) = appeals.iter().rev().find(|e| {
         e.event_type == "appeal"
             && e.event_data.get("deny_hash").and_then(Value::as_str) == Some(deny_hash.as_str())
+            && e.chain_position + APPEAL_CHAIN_WINDOW >= chain_len
     }) else {
         return Ok(hestia_error_envelope(
             "hestia.arbitration_no_appeal",
@@ -3885,7 +3902,7 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         }
     };
 
-    if window.iter().any(|e| {
+    if appeals.iter().any(|e| {
         e.event_type == "adjudication"
             && e.event_data.get("about_deny_hash").and_then(Value::as_str)
                 == Some(deny_hash.as_str())
@@ -4108,17 +4125,11 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
     // "no eligibility concerns".
     let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
 
-    let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
-    let head_position = window.first().map(|e| e.chain_position).unwrap_or(0);
-
-    // The join, in one pass: appeals minus adjudications, keyed on the hash both sides
-    // already agree on (`deny_hash` / `about_deny_hash`). This is not new data — every
-    // byte was on the chain the whole time. It is the join, at the ruling path's depth.
-    let ruled: std::collections::HashSet<&str> = window
-        .iter()
-        .filter(|e| e.event_type == "adjudication")
-        .filter_map(|e| e.event_data.get("about_deny_hash").and_then(Value::as_str))
-        .collect();
+    // The anti-join runs in SQL: only unruled appeals are materialized (#488), while the
+    // position window and the ruling path's predicate stay identical.
+    let chain_len = s.chain_len();
+    let window = s.chain_store.open_appeal_rows(APPEAL_CHAIN_WINDOW).unwrap_or_default();
+    let head_position = chain_len.saturating_sub(1);
 
     let mut open: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -4128,9 +4139,6 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
         let Some(deny_hash) = e.event_data.get("deny_hash").and_then(Value::as_str) else {
             continue;
         };
-        if ruled.contains(deny_hash) {
-            continue;
-        }
         // One deny, one queue entry. `tool_arbitrate_appeal` rules per `deny_hash`, so a
         // re-filing against the same deny is one unit of work, not two — listing it twice
         // would make the second entry unrulable the instant the first is ruled.
@@ -4252,7 +4260,7 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
     // older than the tail are BOTH invisible here and unrulable there, and this count
     // cannot say how many. Reporting the saturation is the difference between a bounded
     // answer and a wrong one.
-    let window_saturated = window.len() as u64 >= APPEAL_CHAIN_WINDOW;
+    let window_saturated = chain_len >= APPEAL_CHAIN_WINDOW;
 
     Ok(json!({
         "open": open,
@@ -4270,8 +4278,9 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
         },
         "scope": {
             "chain_window": APPEAL_CHAIN_WINDOW,
-            "entries_searched": window.len(),
-            "chain_length": s.chain_len(),
+            "open_rows_read": window.len(),
+            "query": "SQL anti-join over appeal/adjudication entries; no 20,000-entry tail materialization",
+            "chain_length": chain_len,
             "window_saturated": window_saturated,
             "caveat": if window_saturated {
                 "the window is FULL, so appeals older than the searched tail are invisible here \
@@ -23800,9 +23809,7 @@ fn resolve_invitation(
         // Liveness is read from the member's own ACTS, never from its mailbox: a watcher
         // queues notices under a member's id whether or not the member ever woke, so a
         // mailbox signal would let the doorbell certify the member. Same window as the appeal
-        // router so both routing receipts on this daemon are cut from the same depth of
-        // evidence.
-        let window = s.recent_chain(APPEAL_CHAIN_WINDOW);
+        // router so both routing receipts use the same indexed latest-act projection (#488).
         // TWO readings of one row, because two different questions are asked of it. `reachable`
         // (ever seen) orders the pool — a queueing preference, where dormant still deserves a
         // slot. `reader_for_this_ask` (seen within THIS escalation's own TTL) is what gets
@@ -23863,7 +23870,7 @@ fn resolve_invitation(
             .filter(|id| !s.retired_members.is_retired(id))
             .filter(|id| !s.member_registry.is_filler(id))
             .map(|id| {
-                let l = actor_liveness(&window, &id);
+                let l = actor_liveness_on_chain(&s.chain_store, &id);
                 let reachable = has_mailbox_reader(&s.inbox_store, &id);
                 let reader_for_this_ask =
                     has_mailbox_reader_within(&s.inbox_store, &id, ttl_secs, now);
