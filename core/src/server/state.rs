@@ -906,6 +906,49 @@ pub enum StandingGrantFailure {
     },
 }
 
+#[cfg(unix)]
+fn protect_operator_key(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn protect_operator_key(path: &Path) -> Result<()> {
+    let username = match std::env::var("USERNAME") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            let _ = std::fs::remove_file(path);
+            anyhow::bail!("USERNAME is unavailable; deleting unprotected operator.key")
+        }
+    };
+    match std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{username}:M"))
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            let _ = std::fs::remove_file(path);
+            anyhow::bail!("icacls could not restrict operator.key to the current user ({status}); deleting it")
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(path);
+            Err(anyhow::anyhow!("could not run icacls for operator.key: {error}; deleting it"))
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn protect_operator_key(path: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(path);
+    anyhow::bail!("operator.key has no private-permission implementation on this platform; deleting it")
+}
+
 impl ServerState {
     /// Open all persistent stores rooted at `home` and prepare server state.
     /// `passphrase` is the vault passphrase — used to derive the storage key
@@ -1297,7 +1340,6 @@ impl ServerState {
         if self.vault.policy().operator_access_bootstrapped() {
             return Ok(None); // window shut — no re-entry
         }
-        use std::os::unix::fs::PermissionsExt;
         let kp = web4_core::crypto::KeyPair::generate();
         let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
         // Self-contained credential the operator loads into their client: the
@@ -1330,9 +1372,7 @@ impl ServerState {
             serde_json::to_vec_pretty(&cred).unwrap_or_default(),
         )
         .map_err(|e| anyhow::anyhow!("writing operator.key: {e}"))?;
-        let mut perms = std::fs::metadata(&key_path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&key_path, perms)?;
+        protect_operator_key(&key_path)?;
 
         let mut policy = self.vault.policy().clone();
         policy.operator_access.push(crate::vault::OperatorIdentity {
@@ -1344,9 +1384,15 @@ impl ServerState {
             .set_policy(policy)
             .map_err(|e| anyhow::anyhow!("persisting bootstrapped operator: {e}"))?;
 
+        #[cfg(unix)]
+        let protection = "0600";
+        #[cfg(windows)]
+        let protection = "current-user ACL";
+        #[cfg(not(any(unix, windows)))]
+        let protection = "private";
         eprintln!(
             "[hestia] OPERATOR BOOTSTRAP: minted genesis operator {lct_id}\n\
-             [hestia]   private key written to {} (0600) — load it into your operator client;\n\
+             [hestia]   private key written to {} ({protection}) — load it into your operator client;\n\
              [hestia]   the bootstrap window is now SHUT (add further operators via law).",
             key_path.display()
         );
