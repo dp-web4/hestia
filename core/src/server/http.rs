@@ -7968,13 +7968,21 @@ const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];
 fn agent_acts_since(s: &crate::server::state::ServerState, plugin_id: &str, cutoff: &str) -> Result<usize, String> {
     let want = plugin_id.trim().to_string();
     s.chain_store
-        .scan_recent(Some(cutoff), Some(AGENT_ACT_EVENTS), 50_000, |row| {
+        .scan_recent_page(Some(cutoff), Some(AGENT_ACT_EVENTS), None,
+                          crate::storage::chain::ROUTINE_CHAIN_MAX, |row| {
             serde_json::from_str::<serde_json::Value>(row.event_data)
                 .ok()
                 .and_then(|v| v.get("plugin_id").and_then(|p| p.as_str()).map(str::to_string))
         })
-        .map(|ids| ids.into_iter().filter(|id| *id == want).count())
         .map_err(|e| e.to_string())
+        .and_then(|page| {
+            if page.before_position.is_some() {
+                Err(format!("more than {} recent acts; this member is LIVE but the exact count is unmeasurable",
+                            crate::storage::chain::ROUTINE_CHAIN_MAX))
+            } else {
+                Ok(page.rows.into_iter().filter(|id| *id == want).count())
+            }
+        })
 }
 
 /// PURE: what the retire guard says, given what it could measure. `Err` (unmeasurable) is a
@@ -9064,22 +9072,27 @@ struct ChainQuery {
     /// a count-first window makes filtered views shrink as other signers
     /// churn (the filtered-window illusion).
     range: Option<String>,
+    /// Exclusive chain cursor returned by the previous page.
+    before_position: Option<u64>,
 }
 
 async fn chain_query(
     State(state): State<SharedState>,
     Query(q): Query<ChainQuery>,
 ) -> impl IntoResponse {
-    let s = state.lock().await;
+    let chain = {
+        let s = state.lock().await;
+        std::sync::Arc::clone(&s.chain_store)
+    };
     let now = chrono::Utc::now();
     let (cutoff, default_cap) = match q.range.as_deref() {
-        Some("hour") => (Some(now - chrono::Duration::hours(1)), 2_000),
-        Some("day") => (Some(now - chrono::Duration::days(1)), 5_000),
-        Some("week") => (Some(now - chrono::Duration::weeks(1)), 10_000),
-        Some("all") => (None, 10_000),
+        Some("hour") => (Some(now - chrono::Duration::hours(1)), crate::storage::chain::ROUTINE_CHAIN_PAGE),
+        Some("day") => (Some(now - chrono::Duration::days(1)), crate::storage::chain::ROUTINE_CHAIN_PAGE),
+        Some("week") => (Some(now - chrono::Duration::weeks(1)), crate::storage::chain::ROUTINE_CHAIN_PAGE),
+        Some("all") => (None, crate::storage::chain::ROUTINE_CHAIN_PAGE),
         _ => (None, 50), // legacy: no range → old count-window behavior
     };
-    let limit = q.limit.unwrap_or(default_cap);
+    let limit = q.limit.unwrap_or(default_cap).min(crate::storage::chain::ROUTINE_CHAIN_MAX);
     let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
     // A FAILED read must not render as an EMPTY chain. This is the third site of the defect fixed
     // in the dashboard snapshot on 2026-08-01 (stats) and 2026-08-02 (#190, the recent feed): a
@@ -9098,28 +9111,29 @@ async fn chain_query(
     // because it is a substring match on a projected field, which SQL cannot do for us
     // without reaching into the JSON.
     let type_filter: Option<Vec<&str>> = q.event_type.as_deref().map(|t| vec![t]);
-    let (entries, read_error) =
-        match s
-            .chain_store
-            .scan_recent(cutoff_str.as_deref(), type_filter.as_deref(), limit, |r| {
-                let e = super::dashboard::flatten_row(r);
-                if let Some(ref tf) = q.tool {
-                    match e.tool_name {
-                        Some(ref tn) if tn.contains(tf.as_str()) => {}
-                        // A row with no tool_name cannot match a tool filter. Dropping it
-                        // here is the same verdict the old post-filter reached.
-                        _ => return None,
-                    }
+    let (entries, before_position, read_error) = match chain.scan_recent_page(
+        cutoff_str.as_deref(), type_filter.as_deref(), q.before_position, limit, |r| {
+            let e = super::dashboard::flatten_row(r);
+            if let Some(ref tf) = q.tool {
+                match e.tool_name {
+                    Some(ref tn) if tn.contains(tf.as_str()) => {}
+                    // A row with no tool_name cannot match a tool filter. Dropping it
+                    // here is the same verdict the old post-filter reached.
+                    _ => return None,
                 }
-                Some(e)
-            }) {
-            Ok(v) => (v, None),
-            Err(e) => {
-                tracing::error!("chain query read failed: {e}");
-                (Vec::new(), Some(e.to_string()))
             }
-        };
-    Json(serde_json::json!({ "entries": entries, "read_error": read_error }))
+            Some(e)
+        },
+    ) {
+        Ok(p) => (p.rows, p.before_position, None),
+        Err(e) => {
+            tracing::error!("chain query read failed: {e}");
+            (Vec::new(), None, Some(e.to_string()))
+        }
+    };
+    Json(serde_json::json!({
+        "entries": entries, "before_position": before_position, "read_error": read_error
+    }))
 }
 
 /// `GET /api/governance/ledger?status=&range=&limit=` — the operator's ledger of ADMIN acts.
@@ -11817,6 +11831,25 @@ mod disposition_tests {
         assert!(retire_guard(&Ok(3), true).is_none());
     }
 
+    #[tokio::test]
+    async fn activity_beyond_the_routine_page_is_unmeasurable_not_truncated_488() {
+        let (_dir, state) = test_state().await;
+        {
+            let s = state.lock().await;
+            for _ in 0..=crate::storage::chain::ROUTINE_CHAIN_MAX {
+                s.append_chain("outcome", serde_json::json!({
+                    "plugin_id": "kimi-code", "success": true
+                })).unwrap();
+            }
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let s = state.lock().await;
+        let err = agent_acts_since(&s, "kimi-code", &cutoff).unwrap_err();
+        assert!(err.contains("unmeasurable"), "{err}");
+        let refusal = retire_guard(&Err(err), false).expect("overflow must fail closed");
+        assert_eq!(refusal["unmeasurable"], serde_json::json!(true));
+    }
+
     /// cbp, finding 5: `retired_member_connected` was documented and did not exist.
     #[tokio::test]
     async fn a_retired_id_that_connects_is_witnessed_not_hidden() {
@@ -14374,6 +14407,60 @@ mod tests {
     ///   order as wakeup latency); (b) amplifying with K queued readers
     ///   serialized the readers themselves on one worker — K x read even with
     ///   the fix — because nobody was awake to steal the woken waiters.
+    #[tokio::test]
+    async fn chain_query_returns_bounded_pages_and_continuation_488() {
+        let (_dir, state) = make_shared_state();
+        {
+            let s = state.lock().await;
+            for i in 0..1_005 {
+                s.append_chain("policy_edit", serde_json::json!({
+                    "change": "add_rule", "rule_id": format!("r{i}")
+                })).unwrap();
+            }
+        }
+        let expected = state.lock().await.chain_len() as usize;
+        let resp = chain_query(
+            State(state.clone()),
+            Query(ChainQuery {
+                range: Some("all".into()), limit: Some(500), ..Default::default()
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first["entries"].as_array().map(Vec::len), Some(500));
+        assert!(first["read_error"].is_null());
+        let cursor = first["before_position"].as_u64().expect("older rows");
+
+        let resp = chain_query(
+            State(state.clone()),
+            Query(ChainQuery {
+                range: Some("all".into()), limit: Some(500), before_position: Some(cursor),
+                ..Default::default()
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["entries"].as_array().map(Vec::len), Some(500));
+        let cursor = second["before_position"].as_u64().expect("the final page");
+        assert!(second["read_error"].is_null());
+
+        let resp = chain_query(
+            State(state.clone()),
+            Query(ChainQuery {
+                range: Some("all".into()), limit: Some(500), before_position: Some(cursor),
+                ..Default::default()
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let third: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(third["entries"].as_array().map(Vec::len), Some(expected - 1_000));
+        assert_eq!(third["before_position"], serde_json::Value::Null);
+        assert!(third["read_error"].is_null());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn governance_ledger_read_does_not_hold_the_state_lock() {
         // ~77MB of event_data in total: the first page costs ~2s on the 2026-08 WSL
