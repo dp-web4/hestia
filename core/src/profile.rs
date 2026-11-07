@@ -36,6 +36,14 @@ pub enum Platform {
     Substack,
     Signal,
     Phone,
+    Slack,
+    Discord,
+    Matrix,
+    Telegram,
+    Meetup,
+    Luma,
+    Eventbrite,
+    Zoom,
     Custom(String),
 }
 
@@ -53,6 +61,14 @@ impl Platform {
             Platform::Substack => "substack",
             Platform::Signal => "signal",
             Platform::Phone => "phone",
+            Platform::Slack => "slack",
+            Platform::Discord => "discord",
+            Platform::Matrix => "matrix",
+            Platform::Telegram => "telegram",
+            Platform::Meetup => "meetup",
+            Platform::Luma => "luma",
+            Platform::Eventbrite => "eventbrite",
+            Platform::Zoom => "zoom",
             Platform::Custom(s) => s,
         }
     }
@@ -78,6 +94,14 @@ pub fn parse_platform(s: &str) -> Platform {
         "substack" => Platform::Substack,
         "signal" => Platform::Signal,
         "phone" | "tel" => Platform::Phone,
+        "slack" => Platform::Slack,
+        "discord" => Platform::Discord,
+        "matrix" => Platform::Matrix,
+        "telegram" => Platform::Telegram,
+        "meetup" => Platform::Meetup,
+        "luma" => Platform::Luma,
+        "eventbrite" => Platform::Eventbrite,
+        "zoom" => Platform::Zoom,
         other => Platform::Custom(other.to_string()),
     }
 }
@@ -132,6 +156,22 @@ pub enum Verification {
     Attested { by: Uuid },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileOwner {
+    Member,
+    Community(Uuid),
+    Group(Uuid),
+    Role(Uuid),
+    Event(Uuid),
+}
+
+impl Default for ProfileOwner {
+    fn default() -> Self {
+        Self::Member
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfileLink {
     pub id: Uuid,
@@ -141,6 +181,14 @@ pub struct ProfileLink {
     pub visibility: Visibility,
     pub verification: Verification,
     pub added_at: DateTime<Utc>,
+    #[serde(default)]
+    pub owner: ProfileOwner,
+    #[serde(default)]
+    pub verification_evidence: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 
 impl ProfileLink {
@@ -153,12 +201,64 @@ impl ProfileLink {
             visibility,
             verification: Verification::Claimed,
             added_at: Utc::now(),
+            owner: ProfileOwner::Member,
+            verification_evidence: None,
+            expires_at: None,
+            revoked_at: None,
         }
     }
 
     pub fn with_label(mut self, label: &str) -> Self {
         self.label = Some(label.to_string());
         self
+    }
+
+    pub fn with_owner(mut self, owner: ProfileOwner) -> Self {
+        self.owner = owner;
+        self
+    }
+
+    pub fn with_self_verification(mut self, evidence: &str) -> anyhow::Result<Self> {
+        let evidence = evidence.trim();
+        if evidence.is_empty() {
+            anyhow::bail!("self-verification requires an evidence reference");
+        }
+        self.verification = Verification::SelfVerified;
+        self.verification_evidence = Some(evidence.to_string());
+        Ok(self)
+    }
+
+    pub fn with_attestation(mut self, by: Uuid, evidence: &str) -> anyhow::Result<Self> {
+        let evidence = evidence.trim();
+        if evidence.is_empty() {
+            anyhow::bail!("attestation requires an evidence reference");
+        }
+        self.verification = Verification::Attested { by };
+        self.verification_evidence = Some(evidence.to_string());
+        Ok(self)
+    }
+
+    pub fn with_expiry(mut self, expires_at: DateTime<Utc>) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    pub fn revoke(&mut self, at: DateTime<Utc>) {
+        self.revoked_at = Some(at);
+    }
+
+    pub fn is_current(&self, now: DateTime<Utc>) -> bool {
+        self.revoked_at.is_none() && self.expires_at.map_or(true, |expiry| expiry > now)
+    }
+
+    pub fn verification_is_evidenced(&self) -> bool {
+        match self.verification {
+            Verification::Claimed => true,
+            Verification::SelfVerified | Verification::Attested { .. } => self
+                .verification_evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.trim().is_empty()),
+        }
     }
 }
 
@@ -192,19 +292,26 @@ impl ProfileStore {
         self.links.len() < len
     }
 
-    /// Links visible at a given tier — returns everything the caller is allowed to see.
+    /// Current, evidenced links visible at a given tier.
     pub fn links_for_tier(&self, tier: &Visibility) -> Vec<&ProfileLink> {
+        let now = Utc::now();
         self.links
             .iter()
-            .filter(|l| l.visibility.permits(tier))
+            .filter(|l| l.is_current(now) && l.verification_is_evidenced() && l.visibility.permits(tier))
             .collect()
     }
 
     /// Professional links only (GitHub, LinkedIn, Website) at a given tier.
     pub fn professional_links(&self, tier: &Visibility) -> Vec<&ProfileLink> {
+        let now = Utc::now();
         self.links
             .iter()
-            .filter(|l| l.platform.is_professional() && l.visibility.permits(tier))
+            .filter(|l| {
+                l.is_current(now)
+                    && l.verification_is_evidenced()
+                    && l.platform.is_professional()
+                    && l.visibility.permits(tier)
+            })
             .collect()
     }
 
@@ -230,6 +337,11 @@ impl ProfileStore {
         fields
     }
 
+    /// Non-lossy member-tier links for Hub projection (#563).
+    pub fn hub_links(&self) -> Vec<PresentedLink> {
+        self.present(&Visibility::Member).links
+    }
+
     /// Build a presentation for a specific context — what to share with a hub or peer.
     pub fn present(&self, tier: &Visibility) -> ProfilePresentation {
         ProfilePresentation {
@@ -243,13 +355,19 @@ impl ProfileStore {
                     url: l.url.clone(),
                     label: l.label.clone(),
                     verified: !matches!(l.verification, Verification::Claimed),
+                    owner: l.owner.clone(),
+                    visibility: l.visibility.clone(),
+                    verification: l.verification.clone(),
+                    verification_evidence: l.verification_evidence.clone(),
+                    expires_at: l.expires_at,
+                    revoked_at: l.revoked_at,
                 })
                 .collect(),
         }
     }
 }
 
-/// What gets shared with a hub or peer — no internal IDs, no visibility metadata.
+/// Tier-correct external projection with ownership, verification, and lifecycle intact.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfilePresentation {
     pub display_name: Option<String>,
@@ -263,6 +381,12 @@ pub struct PresentedLink {
     pub url: String,
     pub label: Option<String>,
     pub verified: bool,
+    pub owner: ProfileOwner,
+    pub visibility: Visibility,
+    pub verification: Verification,
+    pub verification_evidence: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -425,6 +549,112 @@ mod tests {
         );
         assert!(!f.contains_key("email"));
         assert!(!f.contains_key("phone"));
+    }
+
+    #[test]
+    fn community_platforms_have_stable_names() {
+        for (name, expected) in [
+            ("slack", "slack"),
+            ("discord", "discord"),
+            ("matrix", "matrix"),
+            ("telegram", "telegram"),
+            ("meetup", "meetup"),
+            ("luma", "luma"),
+            ("eventbrite", "eventbrite"),
+            ("zoom", "zoom"),
+        ] {
+            assert_eq!(parse_platform(name).as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn hub_links_preserve_multiplicity_ownership_verification_and_tiers() {
+        let community = Uuid::new_v4();
+        let attester = Uuid::new_v4();
+        let mut store = ProfileStore::default();
+        store.add_link(
+            ProfileLink::new(Platform::Slack, "https://chat.example/general", Visibility::Public)
+                .with_owner(ProfileOwner::Community(community))
+                .with_label("General")
+                .with_self_verification("chain:self-proof")
+                .unwrap(),
+        );
+        store.add_link(
+            ProfileLink::new(Platform::Slack, "https://chat.example/members", Visibility::Member)
+                .with_owner(ProfileOwner::Role(Uuid::new_v4()))
+                .with_label("Members")
+                .with_attestation(attester, "chain:attestation")
+                .unwrap(),
+        );
+        store.add_link(ProfileLink::new(
+            Platform::Email,
+            "private@example.invalid",
+            Visibility::Trusted,
+        ));
+
+        let links = store.hub_links();
+        assert_eq!(links.len(), 2, "same-platform links must not collapse");
+        assert_eq!(links[0].label.as_deref(), Some("General"));
+        assert_eq!(links[0].owner, ProfileOwner::Community(community));
+        assert_eq!(links[0].visibility, Visibility::Public);
+        assert!(matches!(links[0].verification, Verification::SelfVerified));
+        assert_eq!(links[0].verification_evidence.as_deref(), Some("chain:self-proof"));
+        assert_eq!(links[1].visibility, Visibility::Member);
+        assert!(matches!(links[1].verification, Verification::Attested { by } if by == attester));
+        assert_eq!(links[1].verification_evidence.as_deref(), Some("chain:attestation"));
+        assert!(links.iter().all(|link| link.platform == "slack"));
+    }
+
+    #[test]
+    fn naked_verification_and_stale_links_do_not_project() {
+        let mut naked = ProfileLink::new(Platform::Matrix, "https://chat.example/naked", Visibility::Public);
+        naked.verification = Verification::SelfVerified;
+        let mut store = ProfileStore {
+            display_name: None,
+            bio: None,
+            links: vec![naked],
+        };
+        assert!(store.hub_links().is_empty());
+        assert!(ProfileLink::new(Platform::Zoom, "https://meet.example/self", Visibility::Public)
+            .with_self_verification(" ")
+            .is_err());
+
+        let now = Utc::now();
+        let mut expiring = ProfileLink::new(Platform::Zoom, "https://meet.example/self", Visibility::Public)
+            .with_self_verification("chain:self-proof")
+            .unwrap()
+            .with_expiry(now - chrono::Duration::seconds(1));
+        store.links = vec![expiring.clone()];
+        assert!(store.hub_links().is_empty());
+        expiring.expires_at = Some(now + chrono::Duration::hours(1));
+        store.links = vec![expiring.clone()];
+        assert_eq!(store.hub_links().len(), 1);
+        expiring.revoke(now);
+        store.links = vec![expiring];
+        assert!(store.hub_links().is_empty());
+    }
+
+    #[test]
+    fn legacy_links_without_new_fields_remain_readable() {
+        let legacy = serde_json::json!({
+            "display_name": null,
+            "bio": null,
+            "links": [{
+                "id": Uuid::nil(),
+                "platform": "slack",
+                "url": "https://chat.example/legacy",
+                "label": null,
+                "visibility": "public",
+                "verification": "claimed",
+                "added_at": "2026-01-01T00:00:00Z"
+            }]
+        });
+        let store: ProfileStore = serde_json::from_value(legacy).unwrap();
+        let links = store.hub_links();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].owner, ProfileOwner::Member);
+        assert_eq!(links[0].visibility, Visibility::Public);
+        assert_eq!(links[0].verification_evidence, None);
     }
 
     #[test]
