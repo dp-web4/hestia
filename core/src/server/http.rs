@@ -725,10 +725,8 @@ fn deployment_update_trigger_for(os: &str, uid: Option<&str>) -> Option<Deployme
     }
 }
 
-fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, String, Option<String>), String> {
-    let manifest_path = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| "deployment update unavailable: HESTIA_CURRENT_BUILD_FILE is not configured".to_string())?;
+fn deployment_update_authority(home: &std::path::Path) -> std::result::Result<(std::path::PathBuf, String, Option<String>), String> {
+    let manifest_path = super::dashboard::deployment_authority_path(home);
     let raw = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("deployment update unavailable: cannot read deployment authority: {e}"))?;
     let manifest: serde_json::Value = serde_json::from_str(&raw)
@@ -851,12 +849,13 @@ async fn operator_deployment_update(
 ) -> impl IntoResponse {
     let request_id = uuid::Uuid::new_v4().to_string();
     let now = super::state::unix_now();
-    let (operator, provenance) = {
+    let (operator, provenance, server_home) = {
         let s = state.lock().await;
-        current_operator_context(&s, &headers, now)
+        let (operator, provenance) = current_operator_context(&s, &headers, now);
+        (operator, provenance, s.home.clone())
     };
 
-    let (home, authority_build, authority_head_sha) = match deployment_update_authority() {
+    let (home, authority_build, authority_head_sha) = match deployment_update_authority(&server_home) {
         Ok(value) => value,
         Err(error) => {
             return (
@@ -1129,11 +1128,12 @@ async fn operator_deployment_check(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let now = super::state::unix_now();
-    let (operator, provenance) = {
+    let (operator, provenance, server_home) = {
         let s = state.lock().await;
-        current_operator_context(&s, &headers, now)
+        let (operator, provenance) = current_operator_context(&s, &headers, now);
+        (operator, provenance, s.home.clone())
     };
-    let home = match deployment_update_authority() {
+    let home = match deployment_update_authority(&server_home) {
         Ok((home, _, _)) => home,
         Err(error) => {
             return (
@@ -8377,7 +8377,7 @@ pub(crate) fn gate_paths_from(inv: &serde_json::Value) -> Vec<(String, String)> 
 }
 
 /// The deployment authority's own record of what it installed, per file, read from
-/// `HESTIA_CURRENT_BUILD_FILE` (written by `deploy/install-members.sh` on full success).
+/// `HESTIA_CURRENT_BUILD_FILE` or the server home's `current-build.json`.
 ///
 /// This is the evidence an operator ratifies AGAINST. The ratify handler's own doc says
 /// "nothing here can tell a good build from a bad one; the operator must ratify from a
@@ -8412,9 +8412,8 @@ fn deployed_gate_digests_from(path: &std::path::Path) -> Option<serde_json::Valu
     }))
 }
 
-fn deployed_gate_digests() -> Option<serde_json::Value> {
-    let p = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")?;
-    deployed_gate_digests_from(std::path::Path::new(&p))
+fn deployed_gate_digests(home: &std::path::Path) -> Option<serde_json::Value> {
+    deployed_gate_digests_from(&super::dashboard::deployment_authority_path(home))
 }
 
 /// Ratifying is the approve direction of the most consequential decision on a box — it
@@ -8896,7 +8895,7 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
     // The daemon hashes every discovered gate itself — an unratified gate included, which
     // `verify` does not hash — so an operator can see which bytes a ratify would bless.
     let current_digests = hash_gate_paths(wired.iter());
-    let deployed = deployed_gate_digests();
+    let deployed = deployed_gate_digests(&s.home);
     let verdicts = crate::vault::gate_integrity::verify(&exp, &wired);
     let findings = verdicts.iter().filter(|v| v.is_finding()).count();
     let (rows, bulk) = annotate_gate_verdicts(&verdicts, &discovered, &declaring, &current_digests, deployed.as_ref());
@@ -8980,7 +8979,7 @@ async fn gates_ratify(
     // The same `{path: sha256|null}` map verify shows as evidence.current, recomputed here,
     // under the lock, from the bytes this handler is about to record.
     let current = hash_gate_paths(discovered.iter().map(|(_, p)| p));
-    let deployed = deployed_gate_digests();
+    let deployed = deployed_gate_digests(&s.home);
     let previous = s.vault.gate_expectations();
     let plan = match plan_ratification(&body, &reason, &discovered, &current, deployed.as_ref(),
                                        &previous, chrono::Utc::now()) {
