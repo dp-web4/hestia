@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 1f9a167c9793a1a416307b346b1013b343b421135675a5302a8b9deb60615e94  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: e83d19773950b2eae83d7c75e4455298993f5350750d2410af9a1df3351f35ed  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -24,7 +24,8 @@ A tool call is a governance write only if a WRITE-POSITION argument resolves int
   * Bash: parsed write positions only — redirect targets (>, >>, &>, >|), tee arguments,
     cp/install/rsync DESTINATION (mv: EVERY operand — the source is destroyed too), sed -i
     file args, chmod/chown/chgrp/truncate/ln -sf targets, rm/unlink/rmdir/shred targets,
-    dd of=, touch targets, git checkout -- / git restore / git clean pathspecs.
+    dd of=, touch targets, git checkout -- / git restore / git clean / git rm pathspecs
+    (git rm --dry-run/-n writes nothing).
 A command that merely NAMES a closure file in a read position (grep pattern, find -name, cat
 source, cp SOURCE, ls) is classified "read" — allowed, witnessed by the caller. Payload text
 (Write `content`, Edit `old_string`/`new_string`, heredoc bodies) is NEVER a haystack: a
@@ -1522,6 +1523,13 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
             if "--" in rest:
                 return rest[rest.index("--") + 1:]
             return []
+        if sub == "rm":
+            if "--dry-run" in rest or "-n" in rest:
+                return []
+            if any(a == "--pathspec-from-file" or a.startswith("--pathspec-from-file=")
+                   for a in rest):
+                raise _OpaqueWriter()
+            return _positionals(rest)
         if sub == "restore":
             return _positionals(rest, opts_with_value=("-s", "--source"))
         if sub == "clean":
