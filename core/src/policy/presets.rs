@@ -37,17 +37,17 @@ fn safety_rules() -> Vec<PolicyRule> {
             decision: PolicyDecision::Allow,
             reason: Some(
                 "git rm is PERMITTED when it stands alone and uses only explicit recoverable or \
-                 non-destructive flags: -q/--quiet, -r, --cached, --dry-run/-n, \
-                 --ignore-unmatch, or --sparse. Forced forms, chaining, and unlisted flag \
-                 combinations still hit the destructive-command deny. Without --force, git \
-                 refuses to remove files with uncommitted changes."
+                 non-destructive flags: -q/--quiet, --cached, --dry-run/-n, --ignore-unmatch, \
+                 or --sparse. Recursive, forced, chained, and unlisted flag combinations still \
+                 hit the destructive-command deny. Without --force, git refuses to remove \
+                 files with uncommitted changes."
                     .into(),
             ),
             r#match: PolicyMatch {
                 tools: Some(vec!["Bash".into(), "Shell".into()]),
                 command_patterns: Some(vec![concat!(
                     r"^\s*git\s+rm\s+",
-                    r"((-q|--quiet|-r|--cached|--dry-run|-n|--ignore-unmatch|--sparse)\s+)+",
+                    r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)\s+)+",
                     r"[^\s;&|`$()-][^\s;&|`$()]*(\s+[^\s;&|`$()-][^\s;&|`$()]*)*\s*$"
                 )
                 .into()]),
@@ -777,7 +777,6 @@ mod tests {
             for cmd in [
                 "git rm -q core/tests/old.rs",
                 "git rm --cached --dry-run tools/old.py",
-                "git rm -r --cached tests/fixtures",
                 "git rm -n core/tests/old.rs",
                 "git rm --ignore-unmatch --sparse -q core/tests/old.rs",
             ] {
@@ -792,6 +791,9 @@ mod tests {
             for cmd in [
                 "git rm -f core/tests/old.rs",
                 "git rm -rf tests/fixtures",
+                "git rm -r --cached tests/fixtures",
+                "git rm -r plugins",
+                "git rm -r .",
                 "git rm -fq core/tests/old.rs",
                 "git rm --force core/tests/old.rs",
                 "git rm -q core/tests/old.rs --force",

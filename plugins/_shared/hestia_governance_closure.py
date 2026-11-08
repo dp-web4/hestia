@@ -23,7 +23,8 @@ A tool call is a governance write only if a WRITE-POSITION argument resolves int
   * Bash: parsed write positions only — redirect targets (>, >>, &>, >|), tee arguments,
     cp/install/rsync DESTINATION (mv: EVERY operand — the source is destroyed too), sed -i
     file args, chmod/chown/chgrp/truncate/ln -sf targets, rm/unlink/rmdir/shred targets,
-    dd of=, touch targets, git checkout -- / git restore / git clean pathspecs.
+    dd of=, touch targets, git checkout -- / git restore / git clean / git rm pathspecs
+    (git rm --dry-run/-n writes nothing).
 A command that merely NAMES a closure file in a read position (grep pattern, find -name, cat
 source, cp SOURCE, ls) is classified "read" — allowed, witnessed by the caller. Payload text
 (Write `content`, Edit `old_string`/`new_string`, heredoc bodies) is NEVER a haystack: a
@@ -1521,6 +1522,13 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
             if "--" in rest:
                 return rest[rest.index("--") + 1:]
             return []
+        if sub == "rm":
+            if "--dry-run" in rest or "-n" in rest:
+                return []
+            if any(a == "--pathspec-from-file" or a.startswith("--pathspec-from-file=")
+                   for a in rest):
+                raise _OpaqueWriter()
+            return _positionals(rest)
         if sub == "restore":
             return _positionals(rest, opts_with_value=("-s", "--source"))
         if sub == "clean":
