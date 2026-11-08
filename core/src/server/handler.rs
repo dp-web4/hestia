@@ -686,7 +686,7 @@ fn hestia_tools() -> Vec<Tool> {
         t("hestia_vault_set", "Store a credential in the vault"),
         t_args(
             "hestia_query_history",
-            "Query the witness chain. filter.hash dereferences one entry anywhere. Other filters run in SQL BEFORE the 500-row cap: tool_name, plugin_id, event_type/eventType/type. Page backward with before_position/before/cursor/max_position (exclusive), or offset. hasMore and next_before_position describe the filtered set; requested_limit and capped make a clamp visible",
+            "Query the witness chain. filter.hash dereferences one entry anywhere. Other filters run in SQL BEFORE the 500-row cap: tool_name, plugin_id, event_type/eventType/type. Page backward with before_position/before/cursor/max_position (exclusive), or offset. hasMore and next_before_position describe the filtered set; requested_limit and capped make a clamp visible. Optional session_id/sessionId transport attribution stays outside filter",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -708,7 +708,9 @@ fn hestia_tools() -> Vec<Tool> {
                             "max_position": {"type": "integer", "minimum": 0},
                             "offset": {"type": "integer", "minimum": 0}
                         }
-                    }
+                    },
+                    "session_id": {"type": "string", "description": "Optional transport attribution from an SDK client; not a history filter."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; not a history filter."}
                 }
             }),
         ),
@@ -2576,12 +2578,18 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
     }
 
     let misplaced_top: Vec<&str> = args.as_object().into_iter().flat_map(|o| o.keys())
-        .map(String::as_str).filter(|k| *k != "filter").collect();
+        .map(String::as_str)
+        .filter(|k| !matches!(*k, "filter" | "session_id" | "sessionId"))
+        .collect();
     if !misplaced_top.is_empty() {
         return Ok(hestia_error_envelope(
             "hestia.query_filter_unknown_key",
-            "every query_history argument belongs inside `filter`; no filter was applied",
-            Some(json!({"unknownKeys": misplaced_top, "honoured": QUERY_FILTER_KEYS})),
+            "query filters belong inside `filter`; only session_id/sessionId may appear beside it; no filter was applied",
+            Some(json!({
+                "unknownKeys": misplaced_top,
+                "honoured": QUERY_FILTER_KEYS,
+                "transportKeys": ["session_id", "sessionId"]
+            })),
         ));
     }
 
@@ -23012,12 +23020,46 @@ mod appeal_tests {
             .find(|t| t.name == "hestia_query_history")
             .expect("query_history must be advertised");
         assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+        let outer = tool.input_schema["properties"].as_object().unwrap();
+        assert!(outer.contains_key("session_id"));
+        assert!(outer.contains_key("sessionId"));
         let filter = &tool.input_schema["properties"]["filter"];
         assert_eq!(filter["additionalProperties"], json!(false));
         let properties = filter["properties"].as_object().unwrap();
         for key in QUERY_FILTER_KEYS {
             assert!(properties.contains_key(key), "schema omits `{key}`");
         }
+    }
+
+    #[tokio::test]
+    async fn query_history_admits_sdk_session_stamps_without_relaxing_filter_guards() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let s = state.lock().await;
+            for i in 0..4 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+        }
+
+        for key in ["session_id", "sessionId"] {
+            let bare = tool_query_history(&state, &json!({key: "sdk-session"})).await.unwrap();
+            assert!(bare.get("_hestia_error").is_none(), "SDK-shaped bare call: {bare}");
+            let filtered = tool_query_history(&state, &json!({
+                key: "sdk-session", "filter": {"limit": 3}
+            })).await.unwrap();
+            assert!(filtered.get("_hestia_error").is_none(), "SDK-shaped filtered call: {filtered}");
+            assert_eq!(filtered["entries"].as_array().unwrap().len(), 3);
+        }
+
+        let refused = tool_query_history(&state, &json!({
+            "session_id": "sdk-session", "unexpected": true
+        })).await.unwrap();
+        assert_eq!(
+            refused["_hestia_error"]["data"]["unknownKeys"],
+            json!(["unexpected"]),
+            "the transport exception must not admit other outer keys: {refused}"
+        );
     }
 
     #[tokio::test]
