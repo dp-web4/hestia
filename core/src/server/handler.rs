@@ -8488,15 +8488,18 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
     let lapsed = s.gate_escalations.newly_lapsed(now);
     let mut recorded = 0;
     for esc in lapsed {
-        let (lapse_kind, note) = if esc.stored_status() == crate::server::gate_escalation::Status::Approved {
+        let stored_status = esc.stored_status();
+        let (lapse_kind, note, expiry_scope) = if stored_status == crate::server::gate_escalation::Status::Approved {
             (
                 "approved_unclaimed",
                 "the claim window passed with the approval unspent",
+                "unclaimed_permit",
             )
         } else {
             (
                 "undecided",
                 "the deadline passed with no decision; see factors_present for what was on the record when it did",
+                "undecided_petition",
             )
         };
         let entry = s.append_chain(
@@ -8520,6 +8523,14 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
                 "consumed_at": esc.consumed_at,
                 "lapsed_at": now,
                 "lapse_kind": lapse_kind,
+                "decision_status": match stored_status {
+                    crate::server::gate_escalation::Status::Approved => "approved",
+                    crate::server::gate_escalation::Status::Denied => "denied",
+                    crate::server::gate_escalation::Status::Pending => "pending",
+                    crate::server::gate_escalation::Status::Expired => "expired",
+                },
+                "decision_final": stored_status != crate::server::gate_escalation::Status::Pending,
+                "expiry_scope": expiry_scope,
                 // The criterion this row died under. The `opened` event has always
                 // recorded it; the expiry did not, so answering "which bar lapses?"
                 // required joining every expiry back to its open — which is how the
@@ -30071,18 +30082,14 @@ mod disposition_durability_tests {
         );
     }
 
-    /// A decided escalation is not Pending in the store, so the recorder never
-    /// lapses it — settled is settled, whichever direction it settled.
+    /// A refusal has no permit to expire. An approval is final too, but its unspent
+    /// authorization can expire; the expiry record must not describe that as a reversal.
     #[tokio::test]
-    async fn the_lapse_recorder_never_lapses_a_settled_escalation() {
+    async fn a_refusal_never_lapses_while_an_unclaimed_permit_expires_without_reversing_approval() {
         let (_dir, state) = test_state().await;
         let real_now = now_secs();
         let mut s = state.lock().await;
-        for approve in [true, false] {
-            // Opened three hours ago on a one-hour TTL, decided thirty minutes in
-            // — BEFORE the deadline, because `decide` rightly refuses an expired
-            // row. So the row is clock-expired AND settled: exactly the case where
-            // the stored-status check must dominate the clock check.
+        let mut open_and_decide = |approve| {
             let opened_at = real_now - 3 * 3600;
             let esc = s
                 .gate_escalations
@@ -30101,16 +30108,26 @@ mod disposition_durability_tests {
                     opened_at + 1800,
                 )
                 .unwrap();
-        }
-        assert_eq!(
-            record_newly_lapsed(&mut s, real_now),
-            0,
-            "a settled escalation cannot lapse"
-        );
-        assert!(s
-            .recent_chain(20)
-            .into_iter()
-            .all(|e| e.event_type != "gate_escalation_expired"));
+            id
+        };
+        let denied = open_and_decide(false);
+        let approved = open_and_decide(true);
+        drop(open_and_decide);
+
+        assert_eq!(record_newly_lapsed(&mut s, real_now), 1);
+        let rows = s.recent_chain(20);
+        assert!(rows.iter().all(|e| {
+            e.event_type != "gate_escalation_expired"
+                || e.event_data.get("escalation_id").and_then(Value::as_str) != Some(denied.as_str())
+        }));
+        let expired = rows.iter().find(|e| {
+            e.event_type == "gate_escalation_expired"
+                && e.event_data.get("escalation_id").and_then(Value::as_str) == Some(approved.as_str())
+        }).expect("the approved permit, not its decision, expires");
+        assert_eq!(expired.event_data.get("decision_status").and_then(Value::as_str), Some("approved"));
+        assert_eq!(expired.event_data.get("decision_final").and_then(Value::as_bool), Some(true));
+        assert_eq!(expired.event_data.get("expiry_scope").and_then(Value::as_str), Some("unclaimed_permit"));
+        assert_eq!(record_newly_lapsed(&mut s, real_now), 0, "permit expiry is idempotent");
     }
 
     /// Change 5's mechanical half, carried forward to the projector: an
