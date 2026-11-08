@@ -951,19 +951,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_redirect_is_not_followed_to_another_origin() {
-        use std::io::Write;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let response = b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            stream.write_all(response).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "http://127.0.0.1:1")],
+            )
         });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
         let error = HubClient::new()
             .discover(&format!("http://{addr}"))
             .await
             .expect_err("redirect must be refused, not followed");
+        server.abort();
         assert!(format!("{error:#}").contains("302"), "{error:#}");
     }
 
