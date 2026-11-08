@@ -405,7 +405,7 @@ $VINTAGE
 # 2026-09-02). The host's own short name, overridable for a seat whose hostname is not its
 # fleet name.
 FIRE_HOST="${HESTIA_FIRE_HOST:-$(hostname -s 2>/dev/null || echo unknown)}"
-BUDGET=$("$HERE_DIR/mesh-timeout.sh" 6 python3 "$HERE_DIR/mesh-budget.py" "$MEMBER" 2>/dev/null || true)
+BUDGET=$("$HERE_DIR/with-member-lock.sh" "$MEMBER" "$HERE_DIR/mesh-timeout.sh" 6 python3 "$HERE_DIR/mesh-budget.py" "$MEMBER" 2>/dev/null || true)
 BUDGET_BLOCK=""
 [ -n "$BUDGET" ] && BUDGET_BLOCK="
 $BUDGET"

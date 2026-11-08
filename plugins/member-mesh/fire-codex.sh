@@ -385,7 +385,7 @@ VINTAGE_BLOCK=""
 [ -n "$VINTAGE" ] && VINTAGE_BLOCK="
 $VINTAGE
 "
-BUDGET=$("$HERE_DIR/mesh-timeout.sh" 6 python3 "$HERE_DIR/mesh-budget.py" "$MEMBER" 2>/dev/null || true)
+BUDGET=$("$HERE_DIR/with-member-lock.sh" "$MEMBER" "$HERE_DIR/mesh-timeout.sh" 6 python3 "$HERE_DIR/mesh-budget.py" "$MEMBER" 2>/dev/null || true)
 BUDGET_BLOCK=""
 [ -n "$BUDGET" ] && BUDGET_BLOCK="
 $BUDGET"
