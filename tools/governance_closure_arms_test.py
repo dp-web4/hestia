@@ -518,6 +518,19 @@ def test_pin_a_write_position_substitution_names_a_revspec_to_the_human():
           f"still see a redirect whose DESTINATION is the marker; got {real_write}")
 
 
+def test_git_rm_options_end_at_double_dash():
+    check("dash_n_is_a_path_after_terminator",
+          g._command_write_targets(["git", "rm", "-q", "--", "-n"]) == ["-n"])
+    check("pathspec_option_name_is_a_path_after_terminator",
+          g._command_write_targets(["git", "rm", "-q", "--", "--pathspec-from-file"])
+          == ["--pathspec-from-file"])
+    check("dry_run_name_is_a_path_after_terminator",
+          g._command_write_targets(["git", "rm", "-q", "--", "--dry-run"])
+          == ["--dry-run"])
+    check("dry_run_before_terminator_writes_nothing",
+          g._command_write_targets(["git", "rm", "--dry-run", "-n"]) == [])
+
+
 def test_every_case_in_this_file_is_in_ALL():
     """An explicit ALL satisfies tools/ci_selfexec_test.py, which refuses a `def test_*`
     that no Name node references — reflection over globals() is invisible to a static
@@ -549,6 +562,7 @@ ALL = [
     test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body,
     test_pin_a_brace_group_with_a_read_only_body_is_refused,
     test_pin_a_write_position_substitution_names_a_revspec_to_the_human,
+    test_git_rm_options_end_at_double_dash,
     test_every_case_in_this_file_is_in_ALL,
 ]
 

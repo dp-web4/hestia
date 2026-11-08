@@ -45,12 +45,21 @@ fn safety_rules() -> Vec<PolicyRule> {
             ),
             r#match: PolicyMatch {
                 tools: Some(vec!["Bash".into(), "Shell".into()]),
-                command_patterns: Some(vec![concat!(
-                    r"^\s*git\s+rm\s+",
-                    r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)\s+)+",
-                    r"[^\s;&|`$()-][^\s;&|`$()]*(\s+[^\s;&|`$()-][^\s;&|`$()]*)*\s*$"
-                )
-                .into()]),
+                command_patterns: Some(vec![
+                    concat!(
+                        r"^\s*git\s+rm\s+",
+                        r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)\s+)+",
+                        r"[^\s;&|`$()-][^\s;&|`$()]*(\s+[^\s;&|`$()-][^\s;&|`$()]*)*\s*$"
+                    )
+                    .into(),
+                    concat!(
+                        r"^\s*git\s+rm\s+",
+                        r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)\s+)+",
+                        r"--\s+",
+                        r"[^\n;&|`$()]+$"
+                    )
+                    .into(),
+                ]),
                 command_patterns_are_regex: true,
                 ..Default::default()
             },
@@ -778,10 +787,17 @@ mod tests {
                 "git rm -q core/tests/old.rs",
                 "git rm --cached --dry-run tools/old.py",
                 "git rm -n core/tests/old.rs",
+                "git rm -q -- -n",
                 "git rm --ignore-unmatch --sparse -q core/tests/old.rs",
             ] {
                 let v = judge(cmd);
-                assert_eq!(v.decision, PolicyDecision::Allow, "{tool_name}: {cmd}");
+                assert_eq!(
+                    v.decision,
+                    PolicyDecision::Allow,
+                    "{tool_name}: {cmd} got {:?} from {:?}",
+                    v.decision,
+                    v.rule_id
+                );
                 assert_eq!(
                     v.rule_id.as_deref(),
                     Some("allow-version-controlled-file-delete"),
@@ -789,6 +805,7 @@ mod tests {
                 );
             }
             for cmd in [
+                "git rm -- -n",
                 "git rm -f core/tests/old.rs",
                 "git rm -rf tests/fixtures",
                 "git rm -r --cached tests/fixtures",
