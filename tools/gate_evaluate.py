@@ -18,8 +18,14 @@ with every mechanism call that WRITES replaced by a recorder:
 
 and the wire is belted: any request other than the MCP handshake and the three tools the snapshot read uses
 (dry-run connect, operating_law, scope_status) raises, so a new write path in the gate fails this
-loudly instead of acting. The snapshot is the member's own, fetched through the hook's uncached
-path. A separate dry-run connect RPC makes a legacy daemon refuse before it can mint a session.
+loudly instead of acting.
+
+THE SNAPSHOT IS THE SESSION THE GATE WOULD REUSE. The hook's connect becomes the daemon's read-only
+`hestia_connect_dry_run`, which returns the member's EXISTING session for (member, --session) with
+the role it was minted with, or refuses when there is none. The law and scope reads then go out on
+that session through the daemon's ordinary resolved-session checks: no synthetic identity, nothing
+counted as an unbound read. A daemon without the RPC answers "unknown tool", never a mutating
+connect. With no live session the answer is an `error` naming why, not a guess.
 
 THE BOUNDARY (dp chose #1450 option (a), 2026-11-03): the answer is scoped to the CLAIMED
 member and session. The claim is not authenticated — proof of caller ownership is #824 (and
@@ -82,7 +88,7 @@ def seat_harness(shim_path):
 def _dry(mechanism, gate, snapshot=None):
     """Replace every writing mechanism call for the duration; yield the recorder."""
     rec = {"closure_write": None, "closure_read": None, "scope": None, "society_asked": False,
-           "final": None, "refused_calls": []}
+           "final": None, "refused_calls": [], "evaluated_as": None, "snapshot_error": None}
     saved = {}
 
     def put(mod, name, fn):
@@ -154,7 +160,7 @@ def _dry(mechanism, gate, snapshot=None):
     real_urlopen = urllib.request.urlopen
 
     def urlopen(req, *a, **kw):
-        name = None
+        name, body = None, {}
         try:
             body = json.loads(getattr(req, "data", None) or b"{}")
             method = body.get("method")
@@ -164,65 +170,78 @@ def _dry(mechanism, gate, snapshot=None):
                 name = method
         except Exception:  # noqa: BLE001 — an unreadable request is not a read
             name = None
-        arguments = (body.get("params") or {}).get("arguments") or {}
-        if name in ("hestia_operating_law", "hestia_scope_status") and arguments.get("dry_run") is not True:
-            rec["refused_calls"].append(name + " without dry_run")
-            raise SideEffectRefused(name + " without dry_run")
+        arguments = (((body.get("params") or {}).get("arguments") or {})
+                     if isinstance(body, dict) else {})
+        # The law and scope reads ride the session the dry-run connect FOUND, and no other: an
+        # absent or different session would be an unbound read (counted against the step C rollout
+        # signal) or someone else's, so it is refused before it is sent.
+        if (name in ("hestia_operating_law", "hestia_scope_status")
+                and (not found.get("session") or arguments.get("session_id") != found["session"])):
+            rec["refused_calls"].append(name + " without the found session")
+            raise SideEffectRefused(name + " without the found session")
         if name not in READ_TOOLS and name not in ("initialize", "notifications/initialized"):
             rec["refused_calls"].append(name or "<unreadable request>")
             raise SideEffectRefused(str(name))
         return real_urlopen(req, *a, **kw)
 
+    # THE SNAPSHOT IS THE SESSION THE GATE WOULD REUSE (#1490 review). A real connect for a known
+    # (member, host session) reuses that session and keeps the role it was MINTED with, whatever
+    # HESTIA_ROLE says now; the law and grants follow that role. So the connect becomes the
+    # daemon's read-only `hestia_connect_dry_run`, which returns that same session or refuses
+    # (no live session: a real connect would mint one, and there is nothing to evaluate as), and
+    # the law and scope reads go out unchanged on the session it found, through the daemon's
+    # ordinary resolved-session checks. A daemon without the RPC answers "unknown tool", never a
+    # mutating connect.
     real_call_tool = mechanism._McpHttp.call_tool
-    snapshot_identity = {}
+    found = {}
 
     def call_tool(client, name, arguments):
         if name == "hestia_connect":
-            snapshot_identity.clear()
-            snapshot_identity.update({
-                "plugin_id": arguments.get("plugin_id"),
-                "role": arguments.get("role"),
-            })
+            found.clear()
+            found["member"] = arguments.get("plugin_id")
             name = "hestia_connect_dry_run"
-        elif name in ("hestia_operating_law", "hestia_scope_status"):
-            if not snapshot_identity.get("plugin_id"):
-                raise SideEffectRefused(name + " before dry-run connect")
-            arguments = dict(arguments)
-            arguments["dry_run"] = True
-            arguments["plugin_id"] = snapshot_identity["plugin_id"]
-            if snapshot_identity.get("role"):
-                arguments["role"] = snapshot_identity["role"]
         reply = real_call_tool(client, name, arguments)
         payload = mechanism._unwrap_tool_result(reply)
         problem = None
-        if name == "hestia_connect_dry_run":
-            expected = "dry-run:" + str(snapshot_identity["plugin_id"])
-            if (payload.get("dryRun") is not True
-                    or payload.get("dryRunSnapshotContract") != 1
-                    or payload.get("sessionId") != expected):
-                problem = "dry-run snapshot contract unavailable"
+        if not isinstance(payload, dict):
+            problem = f"{name}: unreadable reply"
+        elif "_hestia_error" in payload:
+            err = payload.get("_hestia_error") or {}
+            problem = f"{name}: {err.get('code', '?')}: {err.get('message', '')}".rstrip(": ")
+        elif name == "hestia_connect_dry_run":
+            if (payload.get("dryRun") is not True or payload.get("dryRunSnapshotContract") != 2
+                    or not isinstance(payload.get("sessionId"), str)
+                    or not isinstance(payload.get("constellationRole"), str)):
+                problem = "hestia_connect_dry_run: the daemon does not offer the dry-run contract (v2)"
+            else:
+                found["session"] = payload["sessionId"]
+                found["role"] = payload["constellationRole"]
+                rec["evaluated_as"] = {"session": found["session"], "role": found["role"],
+                                       "declared_role_honored": payload.get("roleDeclarationHonored")}
         elif name == "hestia_operating_law":
             identity = payload.get("identity") or {}
-            if ("_hestia_error" in payload
-                    or identity.get("plugin_id") != snapshot_identity["plugin_id"]
-                    or not isinstance(identity.get("role"), str)
+            if (identity.get("plugin_id") != found.get("member")
+                    or identity.get("role") != found.get("role")
                     or not isinstance(payload.get("law_hash"), str)
                     or "operator_grant" not in payload):
-                problem = "dry-run operating law unavailable or incomplete"
+                problem = "hestia_operating_law: law unavailable, incomplete or not the found session's"
         elif name == "hestia_scope_status":
-            if ("_hestia_error" in payload
-                    or payload.get("dryRun") is not True
-                    or payload.get("plugin_id") != snapshot_identity["plugin_id"]
-                    or payload.get("caller_bound") is not False
-                    or not isinstance(payload.get("unbound_reads_since_start"), int)):
-                problem = "dry-run scope status unavailable or incomplete"
+            if (payload.get("plugin_id") != found.get("member")
+                    or payload.get("caller_bound") is not True):
+                problem = "hestia_scope_status: not a bound read for the found session"
         if problem:
-            rec["refused_calls"].append(problem)
+            rec["snapshot_error"] = problem
             raise SideEffectRefused(problem)
         return reply
 
+    # A failed snapshot is telemetry in the real gate (a gate-unavailable record in the seat's
+    # home). Here it is part of the answer, and nothing is written.
+    def snapshot_unavailable(plugin_id, detail, cause="unknown"):
+        rec["snapshot_error"] = rec["snapshot_error"] or f"{detail} ({cause})"
+
     try:
         put(mechanism._McpHttp, "call_tool", call_tool)
+        put(mechanism, "_snapshot_unavailable", snapshot_unavailable)
         put(mechanism, "claim_self_write", claim_self_write)
         put(mechanism, "witness_gate_self", witness_gate_self)
         put(mechanism, "claim_scope", claim_scope)
@@ -302,7 +321,9 @@ def evaluate(tool, tool_input, *, member="claude-code", host_agent=None, cwd=Non
         registered_checked = True
     with _dry(mechanism, gate, snapshot=snapshot) as rec:
         d = gate.decide(event, profile, rollout=rollout, **kw)
-    if rec["refused_calls"]:
+    # Not "no evaluated_as": an act the closure decides never reaches the snapshot, and its
+    # answer stands without one.
+    if rec["refused_calls"] or rec["snapshot_error"]:
         answer = "error"
     elif d.blocks:
         answer = "would_deny"
@@ -328,6 +349,12 @@ def evaluate(tool, tool_input, *, member="claude-code", host_agent=None, cwd=Non
         "boundary": ("answer scoped to the CLAIMED member; the claim is not authenticated "
                      "(#824). Nothing was filed, opened, witnessed or recorded."),
         "member": member,
+        # The session and role the snapshot was read as: the one the gate would reuse, with the
+        # role it was minted with (not necessarily the one HESTIA_ROLE declares now).
+        "evaluated_as": rec["evaluated_as"],
+        # Why there is no answer when there is none: no live session to evaluate as, a daemon
+        # without the dry-run contract, or a law/scope read that was not the found session's.
+        "snapshot_error": rec["snapshot_error"],
     }
 
 
