@@ -353,25 +353,40 @@ fn hestia_tools() -> Vec<Tool> {
     /// empty schema, from two different sessions, by a caller that had no prompt to
     /// include the one field that carries the payload.
     ///
-    /// Deliberately narrow: only `hestia_member_notify` and
-    /// `hestia_gate_escalation_corroborate` are declared here. Doing the whole surface
-    /// is the right end state and a much larger change — every tool's real argument set
-    /// would have to be read off its handler and kept in sync, and getting one wrong
-    /// ADVERTISES a lie, which is worse than advertising nothing.
-    /// `additionalProperties` stays `true` for member_notify, so its schema only ever
-    /// adds information and cannot refuse a call the handler would have accepted. The
-    /// corroborate door is the exception BOTH ways: its handler refuses unknown keys by
-    /// name, so its schema says `additionalProperties: false` — anything else would
-    /// advertise keys the runtime refuses — and the two are pinned to each other by
-    /// `the_advertised_corroborate_schema_and_the_runtime_are_one_contract`.
+    /// Declare only the handler's complete honoured argument set: an omitted accepted key
+    /// makes the contract undiscoverable, while an invented key advertises a lie.
+    /// `additionalProperties` is false exactly when the handler rejects unknown keys;
+    /// strict surfaces pin the runtime allowlist and advertised property set to each other.
     fn t_args(name: &'static str, description: &'static str, schema: Value) -> Tool {
         Tool::new(name, description, schema_of(schema))
     }
 
     vec![
-        t(
+        t_args(
             "hestia_connect",
             "Establish a plugin session and receive a Soft LCT",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["plugin_id", "host_agent"],
+                "properties": {
+                    "plugin_id": {"type": "string", "minLength": 1, "pattern": "^[^/]+$", "description": "Your member id. A slash is reserved for routed peer/member addresses."},
+                    "host_agent": {"type": "string", "minLength": 1, "description": "The host application establishing this session."},
+                    "plugin_version": {"type": "string", "description": "Optional plugin version."},
+                    "host_agent_version": {"type": "string", "description": "Optional host application version."},
+                    "host_session_id": {"type": "string", "description": "Stable host session id used to reuse the live Hestia session for the same member."},
+                    "requested_role": {"type": "string", "description": "Optional requested role; the response reports the normalized assigned role."},
+                    "role": {"type": "string", "description": "Constellation role to declare. The response reports whether the declaration survived normalization."},
+                    "role_basis": {"type": "string", "description": "Optional provenance for the role declaration, captured when the session is minted."},
+                    "gate_capabilities": {"type": "array", "items": {"type": "string"}, "description": "Optional gate capabilities understood by this caller."},
+                    "projection_sha256": {"type": "string", "description": "Optional digest of the rendered policy projection this caller loaded."},
+                    "synthetic": {"type": "boolean", "description": "Declare a synthetic test member. The exclusion must persist before connect succeeds."},
+                    "protocol_version": {"type": "integer", "description": "Protocol version the SDK was built against. Accepted for SDK compatibility; the response reports the daemon's version."},
+                    "session_id": {"type": "string", "description": "Optional existing session id added by generic SDK stamping; connect does not use it to establish identity."},
+                    "sessionId": {"type": "string", "description": "Camel-case compatibility spelling of session_id."},
+                    "instance_name": {"type": "string", "description": "Legacy caller diagnostic label, accepted for compatibility; the handler does not read it."}
+                }
+            }),
         ),
         t(
             "hestia_connect_dry_run",
@@ -390,9 +405,21 @@ fn hestia_tools() -> Vec<Tool> {
             "hestia_witness_adjudication",
             "Adjudicate a witnessed Result on one V3 axis (not-the-actor; veracity = daemon-computed calibration over an explicit claim)",
         ),
-        t(
+        t_args(
             "hestia_appeal",
-            "Dispute a deny that landed on YOU, through the witnessed channel instead of rephrasing around it. Requires the deny's chain hash and a stated reason; routes the appeal to a not-same arbiter if this machine knows one. Scores appeal-filed 0.85 immediately, 1.0 only if an arbiter upholds it",
+            "Dispute a deny that landed on YOU, through the witnessed channel instead of rephrasing around it. Requires the deny's chain hash and a stated reason; routes the appeal to a not-same arbiter if this machine knows one. The filing response echoes appealed_act, rule_name and decided_at so you can check your premise against the recorded act immediately. Scores appeal-filed 0.85 immediately, 1.0 only if an arbiter upholds it",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["deny_hash", "reason"],
+                "anyOf": [{"required": ["session_id"]}, {"required": ["sessionId"]}],
+                "properties": {
+                    "deny_hash": {"type": "string", "minLength": 1, "description": "Chain hash (or unambiguous hash prefix) of your own recorded policy_decision deny or gate_self_access refusal. An escalation id is not a deny hash."},
+                    "reason": {"type": "string", "minLength": 12, "description": "Why this refusal was wrong, at least 12 non-whitespace characters."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect. Required for attribution."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
+                }
+            }),
         ),
         t(
             "hestia_arbitrate_appeal",
@@ -491,7 +518,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_gate_escalation_corroborate",
-            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. TIMING — a DECIDED escalation STILL TAKES YOUR FACTOR. The guard here is expiry, not the ruling: an approved or denied row accepts evidence indefinitely (the ruling stands and cannot reopen, and your factor cannot change `bar_met` — what it buys is the record, which is what the invitation was for), while only a LAPSED, never-decided row refuses with `Expired`. Do not skip filing because the row already reads approved or denied; that belief is fleet-wide, false, and this sentence is here because the seats holding it each re-derived it from documentation rather than from the door. This schema is the WHOLE contract: arguments outside it are refused by name, not discarded",
+            "Add your evidence to ANOTHER member's governance-write escalation WITHOUT deciding it (NOT-SAME enforced). Your STANCE is required and explicit — 'concur' or 'dissent' — because an unstated stance used to default to concurrence and recorded one peer's dissent as agreement (#367, escalation 99417cc). A dissent must carry its argument; it is evidence surfaced to the decider, NEVER a veto — the sovereign decision stands regardless. Approval is not first-answer-wins: your factor joins the set, the operator or arbiter decides later, and the stated bar is evaluated over the whole set. A factor permits nothing by itself; it is witnessed separately so it cannot be laundered into a ruling. TIMING — a DECIDED escalation STILL TAKES YOUR FACTOR. The guard here is expiry, not the ruling: an approved or denied row accepts evidence indefinitely (the ruling stands and cannot reopen, and your factor cannot change `bar_met` — what it buys is the record, which is what the invitation was for), while only a LAPSED, never-decided row refuses with `Expired`. A factor whose permit was already spent is marked post_claim:true on the factor, chain event and response, so late commentary cannot masquerade as input that informed the ruling. Do not skip filing because the row already reads approved or denied; that belief is fleet-wide, false, and this sentence is here because the seats holding it each re-derived it from documentation rather than from the door. This schema is the WHOLE contract: arguments outside it are refused by name, not discarded",
             json!({
                 "type": "object",
                 // False, truthfully: the handler refuses unknown keys by name, so the
@@ -525,7 +552,7 @@ fn hestia_tools() -> Vec<Tool> {
                 }
             }),
         ),
-        t(
+        t_args(
             "hestia_gate_escalation_claim",
             "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
              already pending from you, the answer carries THAT escalation_id with `coalesced: true` \
@@ -536,6 +563,32 @@ fn hestia_tools() -> Vec<Tool> {
              the marker, the act and every target, highest wins, so they can raise the bar and \
              never lower it; omitted, pricing is unchanged. An approval granted under a LOWER \
              bar than this act now prices is not spent for it",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["plugin_id", "tool_name", "marker"],
+                "properties": {
+                    "plugin_id": {"type": "string", "minLength": 1, "description": "Your member id. If session_id resolves, it must name the same member."},
+                    "tool_name": {"type": "string", "minLength": 1, "description": "The tool whose governance write is being claimed or escalated."},
+                    "marker": {"type": "string", "minLength": 1, "description": "The governance marker that refused the write."},
+                    "role": {"type": "string", "description": "Optional constellation role declared by the gate."},
+                    "answers_deny": {"type": "string", "description": "Chain hash of the deny being escalated, when available."},
+                    "reason": {"type": "string", "description": "Your rationale. Legacy gate callers also use this as the act when act is omitted."},
+                    "act": {"type": "string", "description": "Exact act to claim or escalate. When both act and reason are present, act identifies the operation and reason carries the rationale."},
+                    "resolved_targets": {"type": "array", "items": {"type": "string"}, "description": "Every write-position path resolved by the gate."},
+                    "resolved_target": {"type": "string", "description": "Single-target compatibility spelling, joined with resolved_targets."},
+                    "also_resolved": {"type": "array", "items": {"type": "string"}, "description": "Additional resolved targets, joined with resolved_targets and resolved_target."},
+                    "payload_sha256": {"type": "string", "description": "Optional digest of the exact bytes to be written."},
+                    "detail": {"type": "string", "description": "Optional detail about the attempted act."},
+                    "request_key": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Stable sha256 request key used to recover an uncertain claim-or-open outcome."},
+                    "invocation_key": {"type": "string", "description": "The tool invocation's correlation key, used to distinguish retries from repeats."},
+                    "supersession": {"type": "string", "enum": ["hard_stop"], "description": "Declare hard_stop only when the hook stops a superseded invocation in every rollout mode."},
+                    "host_session_id": {"type": "string", "description": "Host wake correlation. A proven session's value is authoritative; a contradictory assertion is refused."},
+                    "gate_path": {"type": "string", "description": "Optional realpath of the hook making this claim."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect. Optional for version-skew compatibility, but recommended for attributed review."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
+                }
+            }),
         ),
         t_args(
             "hestia_gate_escalation_lookup",
@@ -570,9 +623,61 @@ fn hestia_tools() -> Vec<Tool> {
                 },
             }),
         ),
-        t(
+        t_args(
             "hestia_witness_decision",
-            "Witness an externally-adjudicated plugin-gate allow/warn/deny (chain + gate-risk trust; allow charges nothing)",
+            "Witness an externally-adjudicated plugin-gate allow/warn/deny (chain + gate-risk trust; allow charges nothing). The schema is the whole top-level contract: unknown arguments are refused by name rather than silently discarded",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["plugin_id", "decision", "adjudicator"],
+                "properties": {
+                    "plugin_id": {"type": "string"},
+                    "decision": {"type": "string", "enum": ["allow", "warn", "deny"]},
+                    "adjudicator": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "tool_name": {"type": "string"},
+                    "target": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."},
+                    "payload_sha256": {"type": "string"},
+                    "verdict_available": {"type": "boolean", "description": "False means the gate could not judge; records infrastructure, not member conduct."},
+                    "rule_id": {"type": "string"},
+                    "attempted": {"type": "string", "description": "Bounded, redacted summary of the act."},
+                    "role": {"type": "string"},
+                    "action_id": {"type": "string", "format": "uuid"},
+                    "correlation_key": {"type": "string", "pattern": "^[A-Za-z0-9_.-]{1,200}$"},
+                    "core_digest": {"type": "string", "maxLength": 128},
+                    "level": {"type": "string", "enum": ["act", "goal", "law", "invariant"]},
+                    "doors": {
+                        "type": "array", "maxItems": 16,
+                        "items": {
+                            "type": "object",
+                            "required": ["kind"],
+                            "properties": {
+                                "kind": {"type": "string"},
+                                "tool": {"type": "string"},
+                                "to": {"type": "string"}
+                            }
+                        }
+                    },
+                    "premise_check": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string", "enum": ["refuted", "holds", "unknown"]},
+                            "evidence": {"type": "array", "maxItems": 32, "items": {"type": "string", "maxLength": 512}},
+                            "goal_effect": {"type": "string", "enum": ["abandon", "achieved", "rescope"]}
+                        }
+                    },
+                    "effects": {
+                        "type": "object",
+                        "properties": {
+                            "reputation": true,
+                            "scope_change": true
+                        }
+                    },
+                    "serves": {"type": "string", "maxLength": 200}
+                }
+            }),
         ),
         t(
             "hestia_query_policy",
@@ -784,6 +889,7 @@ async fn tool_connect_dry_run(_state: &SharedState, args: &Value) -> ToolResult 
 }
 
 pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
+    reject_unknown_keys(args, CONNECT_ACCEPTED_KEYS, "hestia_connect")?;
     let plugin_id = require_string(args, "plugin_id")?;
     // `/` is the routed-address separator (r6-routing branch 2: `peer/member`), so a
     // member id containing one makes the address form AMBIGUOUS at its own parse site.
@@ -3387,6 +3493,7 @@ fn appealed_act(e: &crate::storage::chain::ChainEntry) -> Value {
 
 /// File an appeal against a deny that landed on you.
 async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
+    reject_unknown_keys(args, APPEAL_ACCEPTED_KEYS, "hestia_appeal")?;
     let deny_hash = require_string(args, "deny_hash")?;
     let reason = require_string(args, "reason")?;
     if reason.trim().len() < 12 {
@@ -3674,6 +3781,9 @@ async fn tool_appeal(state: &SharedState, args: &Value) -> ToolResult {
     Ok(json!({
         "witnessEntryHash": entry.hash,
         "deny_hash": deny_hash,
+        "appealed_act": appealed_act(deny),
+        "rule_name": deny.event_data.get("rule_name").cloned().unwrap_or(Value::Null),
+        "decided_at": deny.timestamp,
         "dispatched": dispatched,
         // Say plainly when nobody can rule. Silence here would read as "dispatched".
         "note": match (&picked, &dispatched) {
@@ -4220,8 +4330,47 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
     }))
 }
 
+const WITNESS_DECISION_ACCEPTED_KEYS: &[&str] = &[
+    "plugin_id",
+    "decision",
+    "adjudicator",
+    "reason",
+    "tool_name",
+    "target",
+    "session_id",
+    "sessionId",
+    "payload_sha256",
+    "verdict_available",
+    "rule_id",
+    "attempted",
+    "role",
+    "action_id",
+    "correlation_key",
+    "core_digest",
+    "level",
+    "doors",
+    "premise_check",
+    "effects",
+    "serves",
+];
+
 async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
     use super::decision_witness::{bounded_core_digest, Verdict};
+    let mut unknown: Vec<&str> = args
+        .as_object()
+        .into_iter()
+        .flat_map(|obj| obj.keys())
+        .map(String::as_str)
+        .filter(|key| !WITNESS_DECISION_ACCEPTED_KEYS.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        return Ok(hestia_error_envelope(
+            "hestia.witness_decision_unknown_arg",
+            "unknown argument(s) refused rather than silently discarded",
+            Some(json!({"unknownKeys": unknown})),
+        ));
+    }
     let plugin_id = require_string(args, "plugin_id")?;
     let decision = require_string(args, "decision")?;
     // ONE decision witness for every verdict (one-gate stage A). `allow` was refused here until
@@ -8385,6 +8534,20 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
     let lapsed = s.gate_escalations.newly_lapsed(now);
     let mut recorded = 0;
     for esc in lapsed {
+        let stored_status = esc.stored_status();
+        let (lapse_kind, note, expiry_scope) = if stored_status == crate::server::gate_escalation::Status::Approved {
+            (
+                "approved_unclaimed",
+                "the claim window passed with the approval unspent",
+                "unclaimed_permit",
+            )
+        } else {
+            (
+                "undecided",
+                "the deadline passed with no decision; see factors_present for what was on the record when it did",
+                "undecided_petition",
+            )
+        };
         let entry = s.append_chain(
             "gate_escalation_expired",
             json!({
@@ -8402,7 +8565,18 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
                 "marker": esc.marker,
                 "opened_at": esc.opened_at,
                 "expires_at": esc.expires_at,
+                "decided_at": esc.decided_at,
+                "consumed_at": esc.consumed_at,
                 "lapsed_at": now,
+                "lapse_kind": lapse_kind,
+                "decision_status": match stored_status {
+                    crate::server::gate_escalation::Status::Approved => "approved",
+                    crate::server::gate_escalation::Status::Denied => "denied",
+                    crate::server::gate_escalation::Status::Pending => "pending",
+                    crate::server::gate_escalation::Status::Expired => "expired",
+                },
+                "decision_final": stored_status != crate::server::gate_escalation::Status::Pending,
+                "expiry_scope": expiry_scope,
                 // The criterion this row died under. The `opened` event has always
                 // recorded it; the expiry did not, so answering "which bar lapses?"
                 // required joining every expiry back to its open — which is how the
@@ -8433,8 +8607,7 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
                 // Facts about this row, no clause that can rot. The evidence fields
                 // above carry what the retired prose was gesturing at, in a form a
                 // reader can recompute instead of trust.
-                "note": "the deadline passed with no decision; see factors_present \
-                         for what was on the record when it did",
+                "note": note,
             }),
         );
         match entry {
@@ -9505,6 +9678,14 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
 /// an_answer` was only ever asserted over `status_of`; the fallback is what makes
 /// it true for THIS reader too (pinned by `a_reaped_escalation_reads_the_same_from_
 /// the_chain`).
+fn escalation_answer_guidance() -> Value {
+    json!({
+        "tool": "hestia_gate_escalation_corroborate",
+        "cli": "hestia gate corroborate <escalation_id> --stance concur|dissent --argument <text>",
+        "note": "Put your stance and argument on the escalation record. A review_done mesh notice is only a wake, not a factor; a pointer fragment alone is not a durable review."
+    })
+}
+
 fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> Value {
     let ptr = pointer.trim();
     if ptr.is_empty() {
@@ -9524,6 +9705,7 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "tool_name": esc.tool_name,
             "marker": esc.marker,
             "status": esc.status_at(now),
+            "how_to_answer": escalation_answer_guidance(),
             // What an invited peer is woken to WEIGH (#480 review, change 4). An
             // invitation that resolved to an id and a status was a wake with
             // nothing to evaluate: the asker's own account (`stated_reason` —
@@ -9659,6 +9841,7 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
         "tool_name": get("tool_name"),
         "marker": get("marker"),
         "status": status,
+        "how_to_answer": escalation_answer_guidance(),
         "stated_reason": get("stated_reason"),
         "stated_detail": get("stated_detail"),
         "bar": get("bar"),
@@ -9856,6 +10039,64 @@ fn hestia_error_envelope(code: &str, message: &str, data: Option<Value>) -> Valu
             "data": data.unwrap_or(json!({})),
         }
     })
+}
+
+const CONNECT_ACCEPTED_KEYS: &[&str] = &[
+    "plugin_id",
+    "host_agent",
+    "plugin_version",
+    "host_agent_version",
+    "host_session_id",
+    "requested_role",
+    "role",
+    "role_basis",
+    "gate_capabilities",
+    "projection_sha256",
+    "synthetic",
+    "protocol_version",
+    "session_id",
+    "sessionId",
+    "instance_name",
+];
+const APPEAL_ACCEPTED_KEYS: &[&str] = &["deny_hash", "reason", "session_id", "sessionId"];
+const ESCALATION_CLAIM_ACCEPTED_KEYS: &[&str] = &[
+    "plugin_id",
+    "tool_name",
+    "marker",
+    "role",
+    "answers_deny",
+    "reason",
+    "act",
+    "resolved_targets",
+    "resolved_target",
+    "also_resolved",
+    "payload_sha256",
+    "detail",
+    "request_key",
+    "invocation_key",
+    "supersession",
+    "host_session_id",
+    "gate_path",
+    "session_id",
+    "sessionId",
+];
+
+fn reject_unknown_keys(args: &Value, accepted: &[&str], tool: &str) -> Result<(), anyhow::Error> {
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !accepted.contains(key))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{tool}: unknown argument key(s): {}; accepted keys are: {}",
+                unknown.join(", "),
+                accepted.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn require_string(args: &Value, key: &str) -> Result<String, anyhow::Error> {
@@ -16344,10 +16585,12 @@ mod tests {
             second["invitations"].as_array().map(Vec::is_empty).unwrap_or(false),
             "nobody is woken twice for one ask: {second}"
         );
-        // The keys a pre-#668 hook reads off a refusal are all still there.
-        for key in ["how_to_decide", "retry_within_secs", "expires_at", "witnessEntryHash"] {
+        // The keys a pre-#668 hook reads off a refusal are all still there; the retired
+        // open-time retry countdown is not a hook contract and must stay absent.
+        for key in ["how_to_decide", "expires_at", "witnessEntryHash"] {
             assert!(!second[key].is_null(), "hook-read key `{key}` missing: {second}");
         }
+        assert!(second.get("retry_within_secs").is_none(), "{second}");
         assert!(second["how_to_decide"].as_str().unwrap().contains(&id));
 
         // A superset of the command is a different act (8791447f vs 50f8d3a1, same day).
@@ -18914,6 +19157,117 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_reaped_lapsed_withdrawal_reports_expiry_not_an_unknown_id() {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({"plugin_id": "kimi-code", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code", "session_id": session,
+                "tool_name": "Edit", "marker": "law_inject.py",
+                "act": "Edit -> law_inject.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let expires_at = shared.lock().await.gate_escalations.get(&id).unwrap().expires_at;
+        {
+            let mut s = shared.lock().await;
+            assert_eq!(record_newly_lapsed(&mut s, expires_at + 1), 1);
+            s.gate_escalations.reap(
+                expires_at + crate::server::gate_escalation::REAP_KEEP_SECS,
+                crate::server::gate_escalation::REAP_KEEP_SECS,
+            );
+            assert!(s.gate_escalations.get(&id).is_none());
+        }
+
+        let err = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({"escalation_id": id, "approve": false, "session_id": session}),
+        )
+        .await
+        .expect_err("a lapsed ask cannot be withdrawn again");
+        assert!(err.to_string().contains("expired"), "{err}");
+        assert!(!err.to_string().contains("unknown ids"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_reaped_decided_corroboration_reports_the_prior_ruling() {
+        let (_dir, shared) = make_shared_state();
+        let mut sessions = std::collections::HashMap::new();
+        for plugin in ["codex", "kimi-code"] {
+            sessions.insert(
+                plugin,
+                tool_connect(&shared, &json!({"plugin_id": plugin, "host_agent": "h"}))
+                    .await
+                    .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let opened = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "codex", "session_id": sessions["codex"],
+                "tool_name": "Edit", "marker": "law_inject.py",
+                "act": "Edit -> law_inject.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let mut s = shared.lock().await;
+        let now = crate::server::gate_escalation::now_secs();
+        s.gate_escalations
+            .decide(
+                &id,
+                true,
+                "operator",
+                "role:constellation:sovereign",
+                crate::server::gate_escalation::Channel::OperatorSession,
+                None,
+                Some("approved"),
+                now,
+            )
+            .expect("approve");
+        let factors = s.gate_escalations.get(&id).unwrap().factors.clone();
+        s.append_chain(
+            "gate_escalation_decided",
+            json!({
+                "escalation_id": id, "plugin_id": "codex", "status": "approved",
+                "decided_by": "operator", "decided_at": now, "factors_present": factors,
+            }),
+        )
+        .unwrap();
+        s.gate_escalations.reap(
+            now + 2 * crate::server::gate_escalation::REAP_KEEP_SECS,
+            crate::server::gate_escalation::REAP_KEEP_SECS,
+        );
+        assert!(s.gate_escalations.get(&id).is_none());
+        drop(s);
+
+        let err = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": id, "session_id": sessions["kimi-code"],
+                "stance": "concur", "argument": "late evidence",
+            }),
+        )
+        .await
+        .expect_err("a decided row cannot take a new factor");
+        assert!(err.to_string().contains("operator"), "{err}");
+        assert!(err.to_string().contains("decided"), "{err}");
+        assert!(!err.to_string().contains("unknown ids"), "{err}");
+    }
+
     /// The positive control for the binding above, and the more important half of it: the fix
     /// must close the hole WITHOUT killing the feature. A guard that makes every invitation
     /// vanish would pass the test above while deleting the only production writer on the peer
@@ -19599,6 +19953,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn post_claim_corroboration_is_preserved_but_marked_as_commentary() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &esc_id,
+                    true,
+                    "dp",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::LocalCli,
+                    None,
+                    Some("approved"),
+                    crate::server::gate_escalation::now_secs(),
+                )
+                .unwrap();
+        }
+        let asker = tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let claimed = tool_gate_escalation_claim(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code",
+                "tool_name": "Bash",
+                "marker": "witness.py",
+                "reason": "Bash -> witness.py",
+                "session_id": asker,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], true, "setup must spend the permit: {claimed}");
+
+        let response = tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": codex_sid,
+                "stance": "concur",
+                "argument": "late review: sound, but this could not inform the spent ruling",
+            }),
+        )
+        .await
+        .expect("late evidence remains recordable");
+        assert_eq!(response["post_claim"], true, "{response}");
+        let factor = response["factors_present"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["by"] == "codex")
+            .expect("the late peer factor");
+        assert_eq!(factor["post_claim"], true, "{factor}");
+
+        let s = shared.lock().await;
+        let event = s
+            .chain_store
+            .read_recent(30)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_corroborated")
+            .expect("late factor is witnessed");
+        assert_eq!(event.event_data["post_claim"], true, "{event:?}");
+    }
+
     /// #1058: the corroborate row names the corroborator's WAKE, not only its seat. The
     /// door refuses without a proven live session, so the key is in hand at write time; before
     /// this the row dropped it, and tying a factor to the transcript that produced it meant a
@@ -19785,6 +20208,99 @@ mod tests {
         .await
         .expect_err("a dissent must carry its argument");
         assert!(format!("{err}").contains("argument"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn appeal_connect_and_claim_schemas_match_runtime_vocabulary() {
+        let cases = [
+            (
+                "hestia_connect",
+                CONNECT_ACCEPTED_KEYS,
+                &["plugin_id", "host_agent"][..],
+            ),
+            (
+                "hestia_appeal",
+                APPEAL_ACCEPTED_KEYS,
+                &["deny_hash", "reason"][..],
+            ),
+            (
+                "hestia_gate_escalation_claim",
+                ESCALATION_CLAIM_ACCEPTED_KEYS,
+                &["plugin_id", "tool_name", "marker"][..],
+            ),
+        ];
+        let tools = hestia_tools();
+        for (name, accepted, required) in cases {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("the tool must be advertised");
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            let mut advertised: Vec<&str> = schema["properties"]
+                .as_object()
+                .expect("arguments must be discoverable")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            advertised.sort_unstable();
+            let mut honoured = accepted.to_vec();
+            honoured.sort_unstable();
+            assert_eq!(advertised, honoured, "{name}: schema/runtime drift");
+            assert_eq!(schema["additionalProperties"], false, "{schema}");
+            assert_eq!(schema["required"], json!(required), "{schema}");
+        }
+
+        let (_dir, state) = make_shared_state();
+        let connected = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "schema-probe",
+                "host_agent": "schema-test",
+                "instance_name": "legacy-diagnostic-label",
+                "protocol_version": 1,
+                "session_id": "generic-sdk-stamp",
+                "synthetic": true,
+            }),
+        )
+        .await
+        .expect("documented SDK and legacy connect fields must remain accepted");
+        assert!(connected["sessionId"].is_string(), "{connected}");
+
+        let sessions_before = state.lock().await.sessions.len();
+        let err = tool_connect(
+            &state,
+            &json!({"plugin_id": "schema-probe", "host_agnet": "misspelled"}),
+        )
+        .await
+        .expect_err("an unknown connect key must refuse before session creation");
+        assert!(format!("{err}").contains("host_agnet"), "{err}");
+        assert_eq!(state.lock().await.sessions.len(), sessions_before);
+
+        let err = tool_appeal(
+            &state,
+            &json!({
+                "deny_hash": "a".repeat(64),
+                "chain_hash": "a".repeat(64),
+                "reason": "the misspelled key must not be discarded",
+            }),
+        )
+        .await
+        .expect_err("an unknown appeal key must refuse before attribution or chain access");
+        assert!(format!("{err}").contains("chain_hash"), "{err}");
+
+        let err = tool_gate_escalation_claim(
+            &state,
+            &json!({
+                "plugin_id": "schema-probe",
+                "tool_name": "Edit",
+                "marker": "plugins/_shared",
+                "act": "Edit -> /tmp/example",
+                "session": "misspelled",
+            }),
+        )
+        .await
+        .expect_err("an unknown claim key must refuse before claim-or-open");
+        assert!(format!("{err}").contains("session"), "{err}");
     }
 
     /// The drift guard review 4940109239 asked for: the ADVERTISED schema and the HONOURED
@@ -20196,6 +20712,7 @@ mod open_appeals_tests {
                 "adjudicator": "hestia-gate",
                 "attempted": attempted,
                 "reason": "safety preset",
+                "rule_name": "safety-preset",
             }),
         )
         .unwrap()
@@ -20213,6 +20730,19 @@ mod open_appeals_tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_filed_appeal_echoes_the_recorded_act_to_the_appellant() {
+        let (_d, shared, ids) = state_with_members(&["claude-code", "kimi-code"]);
+        let attempted = r#"python3 -c 'import json; json.dump({"ok": true}, open("/tmp/wk/result.json", "w"))'"#;
+        let deny = append_deny(&shared, "claude-code", attempted).await;
+        let filed = file_appeal(&shared, ids[0], &deny).await;
+
+        assert!(filed.get("_hestia_error").is_none(), "appeal should file: {filed}");
+        assert_eq!(filed["appealed_act"], attempted);
+        assert_eq!(filed["rule_name"], "safety-preset");
+        assert!(filed["decided_at"].as_str().is_some_and(|at| !at.is_empty()));
     }
 
     /// THE JOIN. An appeal appears until someone rules it, and then it does not.
@@ -23665,7 +24195,6 @@ fn coalesced_response(
     entry_hash: &str,
     now: u64,
 ) -> Value {
-    use crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS;
     let remaining = twin.expires_at.saturating_sub(now);
     json!({
         "claimed": false,
@@ -23676,7 +24205,6 @@ fn coalesced_response(
         "bar": twin.bar,
         "expires_at": twin.expires_at,
         "decide_within_secs": remaining,
-        "retry_within_secs": remaining + APPROVAL_CLAIM_WINDOW_SECS,
         "witnessEntryHash": entry_hash,
         "invited_peers": twin.invited_peers,
         // Nothing was sent: the invitation went out with the first open.
@@ -24398,11 +24926,15 @@ fn rerooted_in_reach(s: &crate::server::state::ServerState, plugin_id: &str, roo
         if !(real == root_real || real.starts_with(&root_real)) {
             return None;
         }
+        // `real` is canonicalized, so the grants it is judged against must be too:
+        // `has_scope_grant_for`/`effective_modes` compare the stored (lexical) grant paths, and on
+        // macOS a grant under /var or /tmp is stored as /var/... while its targets resolve to
+        // /private/var/..., so every hint there was withheld (McNugget, hestia #304 triage).
+        // `read_admitted_nearest` canonicalizes the roots, and it is the nearest-grant rule that
+        // `space_of` already uses; the union of every covering grant would let a wide `r` admit a
+        // read inside a nearer `w`-only node (Nova on #1415, regression 3).
         let real_s = real.to_string_lossy().to_string();
-        let read = crate::server::grant_modes::Modes::READ;
-        let admitted = s.has_scope_grant_for(plugin_id, &real_s, read)
-            || s.standing_scope.effective_modes(plugin_id, &real_s, now).is_some_and(|m| m.includes(read));
-        admitted.then_some(cand)
+        read_admitted_nearest(s, plugin_id, &real_s, now).then_some(cand)
     })
 }
 
@@ -26353,8 +26885,13 @@ cannot be reclaimed again.",
 }
 
 async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolResult {
-    use crate::server::gate_escalation::{now_secs, APPROVAL_CLAIM_WINDOW_SECS, DEFAULT_TTL_SECS};
+    use crate::server::gate_escalation::{now_secs, DEFAULT_TTL_SECS};
 
+    reject_unknown_keys(
+        args,
+        ESCALATION_CLAIM_ACCEPTED_KEYS,
+        "hestia_gate_escalation_claim",
+    )?;
     let plugin_id = require_string(args, "plugin_id")?;
     let tool_name = require_string(args, "tool_name")?;
     let marker = require_string(args, "marker")?;
@@ -26926,7 +27463,6 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
                 "escalation_id": esc.id,
                 "expires_at": esc.expires_at,
                 "decide_within_secs": DEFAULT_TTL_SECS,
-                "retry_within_secs": DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS,
                 "decided_awaiting_claim": decided_awaiting_claim,
                 "witnessEntryHash": entry.hash,
                 // Told to the ASKER too, not only written to the chain — the same asymmetry
@@ -27160,9 +27696,9 @@ async fn tool_gate_escalation_claimable(state: &SharedState, args: &Value) -> To
         // window`, and since dd3f1b1 THIS CALL sets `observed_at` for the asking session's own
         // grants, so the one response that re-anchors a grant was advertising the anchor it
         // had just moved (GPT review, 2026-09-29). The per-row `pre_migration_horizon_basis`
-        // says which arm each row is on; this is the rule that produces it. Still not a single
-        // number at open time, which is why the open path's `retry_within_secs` is a supremum
-        // presented as a point (`core/tests/claim_horizon_is_never_rendered.rs`, PINs 1/2).
+        // says which arm each row is on; this is the rule that produces it. No single claim
+        // deadline exists at open time, so the open path no longer presents a relative retry
+        // countdown as though one were already known (`claim_horizon_is_never_rendered.rs`).
         "claim_window_secs": crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS,
         "claim_window_anchor": "observed_at_else_decided_at",
         "claim_window_model": PRE_MIGRATION_HORIZON_MODEL,
@@ -27315,6 +27851,27 @@ async fn tool_gate_pending_escalations(state: &SharedState, args: &Value) -> Too
     }))
 }
 
+fn escalation_miss_reason(s: &super::state::ServerState, escalation_id: &str) -> String {
+    let body = resolve_escalation_pointer(s, escalation_id);
+    if let Some(message) = body.pointer("/_hestia_error/message").and_then(Value::as_str) {
+        return message.to_string();
+    }
+    match body["status"].as_str().unwrap_or("") {
+        "expired" => format!("escalation {escalation_id} expired; the write was already refused"),
+        "approved" | "denied" => {
+            let by = body["decided_by"].as_str().unwrap_or("an unrecorded decider");
+            let at = body["decided_at"]
+                .as_u64()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "an unrecorded time".into());
+            format!(
+                "escalation {escalation_id} was already decided by {by} at {at}; decisions are single-shot"
+            )
+        }
+        _ => format!("escalation {escalation_id} is no longer open; the write stays refused"),
+    }
+}
+
 async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> ToolResult {
     use crate::arbiter::{eligibility_for, AppealParties, Disposition, Eligibility};
     use crate::server::gate_escalation::{now_secs, Channel};
@@ -27343,9 +27900,7 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
     };
 
     let Some(esc) = s.gate_escalations.get(&escalation_id).cloned() else {
-        return Err(anyhow::anyhow!(
-            "no such escalation — unknown ids are denies, not retries"
-        ));
+        return Err(anyhow::anyhow!(escalation_miss_reason(&s, &escalation_id)));
     };
 
     // NOT-SAME, server-side, reusing the appeal arbiter's own rules rather than a second
@@ -27690,9 +28245,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
     };
 
     let Some(esc) = s.gate_escalations.get(&escalation_id).cloned() else {
-        return Err(anyhow::anyhow!(
-            "no such escalation — unknown ids are denies, not retries"
-        ));
+        return Err(anyhow::anyhow!(escalation_miss_reason(&s, &escalation_id)));
     };
 
     // NOT-SAME, same arbiter rules: a member may not corroborate its own ask, and the
@@ -27765,6 +28318,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     // The state of the evidence set AFTER this factor — so a reader never has
                     // to reconstruct accumulation order from separate entries.
                     "factors_present": updated.factors,
+                    "post_claim": updated.consumed_at.is_some(),
                     "bar": updated.bar,
                     "bar_met_if_decided_now": updated.bar_met(),
                 }),
@@ -27780,6 +28334,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                 "dissent": dissent,
                 "argument": argument,
                 "factors_present": updated.factors,
+                "post_claim": updated.consumed_at.is_some(),
                 "bar": updated.bar,
                 "bar_met_if_decided_now": updated.bar_met(),
                 "witnessEntryHash": entry.ok().map(|e| e.hash),
@@ -28890,6 +29445,8 @@ mod disposition_durability_tests {
             body.get("asker_basis").is_some(),
             "a peer reading a NOT-SAME tier must see the asker's basis first (#128)"
         );
+        assert_eq!(body["how_to_answer"]["tool"], "hestia_gate_escalation_corroborate");
+        assert!(body["how_to_answer"]["note"].as_str().unwrap().contains("not a factor"));
     }
 
     /// Change 1 + review point 1b: `reap`'s call-site invariant — "reaping can never
@@ -28933,6 +29490,7 @@ mod disposition_durability_tests {
         );
         assert_eq!(after["stated_reason"], "needed the governance file");
         assert_eq!(after["plugin_id"], "kimi-code");
+        assert_eq!(after["how_to_answer"], before["how_to_answer"]);
     }
 
     /// Change 1, the decided case: the disposition notice outlives the store row by
@@ -29517,6 +30075,52 @@ mod disposition_durability_tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_approved_unclaimed_permit_gets_a_terminal_expiry_and_disposition() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let real_now = now_secs();
+        let mut s = state.lock().await;
+        let id = witness_open(&mut s, "kimi-code", None, real_now - 100, 3600);
+        s.gate_escalations
+            .decide(
+                &id,
+                true,
+                "operator",
+                "role:constellation:sovereign",
+                crate::server::gate_escalation::Channel::OperatorSession,
+                None,
+                Some("approved"),
+                real_now - 50,
+            )
+            .expect("approve");
+
+        assert_eq!(record_newly_lapsed(&mut s, real_now + 700), 1);
+        let expired = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "gate_escalation_expired")
+            .expect("an unclaimed approval must reach a terminal expiry row");
+        assert_eq!(
+            expired.event_data.get("lapse_kind").and_then(Value::as_str),
+            Some("approved_unclaimed")
+        );
+        assert_eq!(
+            expired.event_data.get("decided_at").and_then(Value::as_u64),
+            Some(real_now - 50)
+        );
+        assert_eq!(expired.event_data.get("consumed_at"), Some(&Value::Null));
+        assert!(expired.event_data.get("note").and_then(Value::as_str)
+            .is_some_and(|note| note.contains("unspent")));
+        let mail = s.inbox_store.drain_member("kimi-code").unwrap();
+        assert!(mail.iter().any(|notice| {
+            notice.kind == "disposition"
+                && notice.pointer_uri.as_deref()
+                    == Some(format!("hestia://escalation/{id}#lapsed").as_str())
+        }));
+        assert_eq!(record_newly_lapsed(&mut s, real_now + 700), 0);
+    }
+
     /// #499: the expiry row must carry its BAR and the EVIDENCE present when the
     /// clock won, and must not carry a claim that varies after it is written.
     ///
@@ -29642,18 +30246,14 @@ mod disposition_durability_tests {
         );
     }
 
-    /// A decided escalation is not Pending in the store, so the recorder never
-    /// lapses it — settled is settled, whichever direction it settled.
+    /// A refusal has no permit to expire. An approval is final too, but its unspent
+    /// authorization can expire; the expiry record must not describe that as a reversal.
     #[tokio::test]
-    async fn the_lapse_recorder_never_lapses_a_settled_escalation() {
+    async fn a_refusal_never_lapses_while_an_unclaimed_permit_expires_without_reversing_approval() {
         let (_dir, state) = test_state().await;
         let real_now = now_secs();
         let mut s = state.lock().await;
-        for approve in [true, false] {
-            // Opened three hours ago on a one-hour TTL, decided thirty minutes in
-            // — BEFORE the deadline, because `decide` rightly refuses an expired
-            // row. So the row is clock-expired AND settled: exactly the case where
-            // the stored-status check must dominate the clock check.
+        let mut open_and_decide = |approve| {
             let opened_at = real_now - 3 * 3600;
             let esc = s
                 .gate_escalations
@@ -29672,16 +30272,26 @@ mod disposition_durability_tests {
                     opened_at + 1800,
                 )
                 .unwrap();
-        }
-        assert_eq!(
-            record_newly_lapsed(&mut s, real_now),
-            0,
-            "a settled escalation cannot lapse"
-        );
-        assert!(s
-            .recent_chain(20)
-            .into_iter()
-            .all(|e| e.event_type != "gate_escalation_expired"));
+            id
+        };
+        let denied = open_and_decide(false);
+        let approved = open_and_decide(true);
+        drop(open_and_decide);
+
+        assert_eq!(record_newly_lapsed(&mut s, real_now), 1);
+        let rows = s.recent_chain(20);
+        assert!(rows.iter().all(|e| {
+            e.event_type != "gate_escalation_expired"
+                || e.event_data.get("escalation_id").and_then(Value::as_str) != Some(denied.as_str())
+        }));
+        let expired = rows.iter().find(|e| {
+            e.event_type == "gate_escalation_expired"
+                && e.event_data.get("escalation_id").and_then(Value::as_str) == Some(approved.as_str())
+        }).expect("the approved permit, not its decision, expires");
+        assert_eq!(expired.event_data.get("decision_status").and_then(Value::as_str), Some("approved"));
+        assert_eq!(expired.event_data.get("decision_final").and_then(Value::as_bool), Some(true));
+        assert_eq!(expired.event_data.get("expiry_scope").and_then(Value::as_str), Some("unclaimed_permit"));
+        assert_eq!(record_newly_lapsed(&mut s, real_now), 0, "permit expiry is idempotent");
     }
 
     /// Change 5's mechanical half, carried forward to the projector: an
@@ -31669,6 +32279,63 @@ mod decision_witness_tests {
             "verdict_available": true,
             "attempted": "Write -> /tmp/x",
         })
+    }
+
+    #[tokio::test]
+    async fn the_witness_decision_schema_and_runtime_are_one_contract() {
+        let tools = hestia_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "hestia_witness_decision")
+            .expect("witness_decision must be advertised");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let mut advertised: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("witness_decision must advertise its properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        advertised.sort_unstable();
+        let mut honoured = WITNESS_DECISION_ACCEPTED_KEYS.to_vec();
+        honoured.sort_unstable();
+        assert_eq!(advertised, honoured, "schema and runtime have drifted");
+        assert_eq!(schema["additionalProperties"], false, "{schema}");
+        assert_eq!(schema["required"], json!(["plugin_id", "decision", "adjudicator"]));
+
+        let (_d, state) = state_with_safety().await;
+        let mut args = witness_args("codex", "allow");
+        args["session_id"] = json!("host-session");
+        args["sessionId"] = json!("host-session");
+        args["payload_sha256"] = json!("a".repeat(64));
+        args["role"] = json!(crate::reputation::DEFAULT_CONSTELLATION_ROLE);
+        args["action_id"] = json!(Uuid::new_v4().to_string());
+        args["correlation_key"] = json!("toolu_01ABC");
+        args["core_digest"] = json!("b".repeat(64));
+        args["level"] = json!("act");
+        args["doors"] = json!([{"kind": "appeal", "tool": "hestia_appeal", "to": "operator"}]);
+        args["premise_check"] = json!({"status": "unknown", "evidence": ["h"], "goal_effect": "rescope"});
+        args["effects"] = json!({"reputation": {}, "scope_change": {}});
+        args["serves"] = json!("q000042");
+        let out = tool_witness_decision(&state, &args).await.unwrap();
+        assert!(out.get("_hestia_error").is_none(), "every advertised key must work: {out}");
+        let rows_before = rows_of(&state, "policy_decision").await.len()
+            + rows_of(&state, "policy_allow").await.len();
+
+        args["coreDigest"] = args["core_digest"].clone();
+        args["verdictAvailable"] = json!(true);
+        let refused = tool_witness_decision(&state, &args).await.unwrap();
+        assert_eq!(
+            refused["_hestia_error"]["code"],
+            json!("hestia.witness_decision_unknown_arg"),
+            "{refused}"
+        );
+        assert_eq!(
+            refused["_hestia_error"]["data"]["unknownKeys"],
+            json!(["coreDigest", "verdictAvailable"])
+        );
+        let rows_after = rows_of(&state, "policy_decision").await.len()
+            + rows_of(&state, "policy_allow").await.len();
+        assert_eq!(rows_after, rows_before, "an unknown key must not append a witness row");
     }
 
     #[tokio::test]
@@ -33749,6 +34416,36 @@ mod existence_first_tests {
             "path": doubled.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
         let want = format!("Did you mean {root}/hestia/gate.py?");
         assert!(r["detail"].as_str().unwrap().contains(&want), "{r}");
+    }
+
+    /// A grant stored through a symlink still draws the hint. On macOS every tempdir is one
+    /// (/var -> /private/var), so this file's hint tests failed there on every run while Linux CI
+    /// was green: the candidate was judged in its canonical form against the grant's stored one.
+    /// Pinned here with an explicit link so the case holds on every platform.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grant_stored_through_a_symlink_still_draws_the_hint() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let ws = dir.path();
+        std::fs::create_dir_all(ws.join("real/governance/hestia")).unwrap();
+        std::fs::write(ws.join("real/governance/hestia/gate.py"), "x").unwrap();
+        std::os::unix::fs::symlink(ws.join("real"), ws.join("linked")).unwrap();
+        let root = ws.join("linked/governance").to_str().unwrap().to_string();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.clone(), granted_at: 0, granted_by: "operator".into(),
+            reason: "snapshot".into(), expires_at: None, request_id: None, recursive: true,
+            modes: crate::server::grant_modes::Modes::READ,
+        });
+        let doubled = ws.join("linked/hestia/governance/hestia/gate.py");
+        let before = pending(&state).await;
+        let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
+            "path": doubled.to_str().unwrap(), "reason": "to read the gate scoring model"})).await.unwrap();
+        assert_eq!(r["status"], "not_filed", "{r}");
+        let want = format!("Did you mean {root}/hestia/gate.py?");
+        assert!(r["detail"].as_str().unwrap().contains(&want), "{r}");
+        assert_eq!(pending(&state).await, before, "nothing reaches the operator's queue");
     }
 
     #[tokio::test]

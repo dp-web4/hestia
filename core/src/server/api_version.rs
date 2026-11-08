@@ -12,7 +12,14 @@
 //! It takes no lock, so it answers even while the state lock is contended.
 
 use axum::Json;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+static PROCESS_STARTED_AT: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
+
+pub fn mark_process_started() {
+    PROCESS_STARTED_AT.get_or_init(Utc::now);
+}
 
 /// The handshake body. Field names are the contract the app parses; adding a field is
 /// additive, renaming or removing one is an `OPERATOR_API_COMPAT` bump.
@@ -24,6 +31,8 @@ pub struct VersionInfo {
     pub build_id: String,
     /// See [`hestia_wire::OPERATOR_API_COMPAT`].
     pub api_compat: u32,
+    /// When this process started, once the HTTP server has actually mounted the route.
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 pub fn version_info() -> VersionInfo {
@@ -31,6 +40,7 @@ pub fn version_info() -> VersionInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         build_id: env!("HESTIA_GIT_VERSION").to_string(),
         api_compat: hestia_wire::OPERATOR_API_COMPAT,
+        started_at: PROCESS_STARTED_AT.get().cloned(),
     }
 }
 
@@ -58,12 +68,14 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_shape_is_exactly_three_named_fields() {
+    fn the_wire_shape_has_four_named_fields() {
+        mark_process_started();
         let json = serde_json::to_value(version_info()).unwrap();
         let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["api_compat", "build_id", "version"]);
+        assert_eq!(keys, ["api_compat", "build_id", "started_at", "version"]);
         assert!(json["api_compat"].is_u64());
+        assert!(json["started_at"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
     #[tokio::test]

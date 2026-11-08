@@ -1019,8 +1019,9 @@
   .policy-btn:hover { background: var(--accent); color: var(--bg); }
   /* A scoped label must not look like the society label — the whole failure was not being able
      to tell which one you were reading. */
-  .policy-btn-scoped { background: var(--warning); color: var(--bg); border-color: var(--warning); }
-  .policy-btn-scoped:hover { background: var(--warning); color: var(--bg); filter: brightness(1.15); }
+  .policy-btn-scoped, .policy-btn-loosened { background: var(--warning); color: var(--bg); border-color: var(--warning); }
+  .policy-btn-scoped:hover, .policy-btn-loosened:hover { background: var(--warning); color: var(--bg); filter: brightness(1.15); }
+  .policy-state.policy-btn-loosened, .view-chip-state.policy-btn-loosened { color: var(--warning); font-weight: 700; }
   /* modal */
   .modal[hidden] { display: none; }
   .modal { position: fixed; inset: 0; z-index: 50; display: flex; align-items: flex-start; justify-content: center; padding: 5vh 1rem; }
@@ -2253,11 +2254,12 @@
     ungovernable:   'installed, no hestia adapter exists yet',
     governed:       'installed, wired, and the wiring resolves',
     dormant_plugin: 'adapter ready; this harness is not installed here',
+    windows_host:   'installed on the Windows host; this WSL seat cannot gate it',
     unprovisioned_being: 'a being is here, but no launcher this inventory can read runs it as a member',
     unknown:        'the inventory could not establish this member\'s coverage',
   };
-  const GOV_SEVERITY = { miswired: 'red', partial: 'amber', ungoverned: 'amber', ungovernable: 'amber', unprovisioned_being: 'amber', unknown: 'amber', governed: 'green', dormant_plugin: 'grey' };
-  const GOV_LABEL = { miswired: 'MISWIRED — fails open', partial: 'partial — not enforced', ungoverned: 'not wired', ungovernable: 'no adapter yet', unprovisioned_being: 'being not provisioned', unknown: 'coverage unknown', governed: 'governed', dormant_plugin: 'not installed here' };
+  const GOV_SEVERITY = { miswired: 'red', partial: 'amber', ungoverned: 'amber', ungovernable: 'amber', unprovisioned_being: 'amber', windows_host: 'amber', unknown: 'amber', governed: 'green', dormant_plugin: 'grey' };
+  const GOV_LABEL = { miswired: 'MISWIRED — fails open', partial: 'partial — not enforced', ungoverned: 'not wired', ungovernable: 'no adapter yet', unprovisioned_being: 'being not provisioned', windows_host: 'on Windows host — not gated', unknown: 'coverage unknown', governed: 'governed', dormant_plugin: 'not installed here' };
   let govByAgent = {};   // plugin_id -> coverage state, from /api/agents
   async function loadGovernance() {
     try {
@@ -3045,6 +3047,10 @@
     `;
   }
 
+  function policyIsLoosened(pol) {
+    return !!pol && (pol.preset === 'permissive' || !pol.enforce);
+  }
+
   function renderFeed(entries) {
     const root = $('feed');
     const title = $('feed-title');
@@ -3109,6 +3115,8 @@
     // of its states is not a status surface; the operator has to already know the answer to read
     // it correctly, which is the opposite of what it is for.
     if (polBtn) {
+      if (policyIsLoosened(pol)) polBtn.classList.add('policy-btn-loosened');
+      else polBtn.classList.remove('policy-btn-loosened');
       const grants = lastData?.instance_grants ?? [];
       const target = selectedOrch || null;
       const grant = target ? grants.find(g => g.plugin_id === target) : null;
@@ -5289,6 +5297,11 @@
     // no plugin exists" would send the operator to build an adapter nobody needs.
     { key: 'unprovisioned_being', tone: 'amber', title: 'A being’s daemon is here, and nothing launches it as a member',
       remedy: 'Cognition may be running; nothing acts under governance. Provision it: mint its identity on this host, join, have the operator admit it, then install the heartbeat unit that starts its gateway with --member <machine>-being.' },
+    // hestia#1495: found through a WSL drive mount (e.g. codex.exe). It is here and acting on this
+    // machine, so it is not "not installed"; and its Windows config is not this seat's, so a
+    // register button would mint a member nothing gates.
+    { key: 'windows_host', tone: 'amber', title: 'Installed on the Windows host — this WSL seat cannot govern it',
+      remedy: 'The Windows copy reads its own Windows config, and hestia does not wire Windows-side hooks yet. The goal is one hestia governing both sides (hestia#1495). Interim workaround: install the same harness inside WSL (for Codex: npm i -g @openai/codex), then rescan: it will appear as ungoverned with a register button.' },
     { key: 'miswired_3p', tone: 'amber', title: "A third party's gate is dead",
       remedy: 'Not hestia’s gate and not ours to rewrite, but the harness is failing open on it.' },
     { key: 'governed', tone: 'green', title: 'Governed', remedy: '' },
@@ -5348,12 +5361,18 @@
     const placed = new Set();
     const groups = [];
     for (const g of DISCOVER_GROUPS) {
-      const ids = g.key === 'unknown' ? unknownIds : listed(g.key).filter(id => !isUnknown.has(id));
+      const ids = g.key === 'unknown' ? unknownIds
+        : g.key === 'windows_host' ? listed(g.key)
+        : listed(g.key).filter(id => !isUnknown.has(id));
       if (!ids.length) continue;
       ids.forEach(id => placed.add(id));
-      groups.push({ key: g.key, tone: g.tone, title: g.title, remedy: g.remedy,
+      const dualInstall = g.key === 'windows_host' && ids.some(id => byAgent[id] && byAgent[id].installed);
+      const remedy = dualInstall
+        ? 'The Windows copy remains a separate, ungated installation. Linux is already installed here, so another WSL install is not the remedy; wire the Windows-side gate before treating this row as covered.'
+        : g.remedy;
+      groups.push({ key: g.key, tone: g.tone, title: g.title, remedy,
                     rows: ids.map(id => {
-                      const row = discoverRow(id, byAgent[id]);
+                      const row = discoverRow(id, byAgent[id], g.key);
                       if (g.key === 'unknown') row.alsoFiledUnder = DISCOVER_GROUPS.map(o => o.key)
                         .filter(k => k !== 'unknown' && listed(k).includes(id));
                       return row;
@@ -5445,7 +5464,7 @@
     };
   }
 
-  function discoverRow(id, d) {
+  function discoverRow(id, d, groupKey) {
     const x = d || {};
     const a = x.atlas || {};
     // Undefined is not false. A descriptor that does not say how the harness fails must not
@@ -5456,7 +5475,9 @@
       governanceId: x.member || x.plugin || '',
       name: a.harness || id,
       installed: !!x.installed,
-      executable: x.executable || '',
+      executable: groupKey === 'windows_host'
+        ? (x.windows_host_executable || '')
+        : (x.executable || ''),
       configs: Array.isArray(x.configs_read) ? x.configs_read.length : 0,
       failure,
       blocking: Array.isArray(a.blocking_events) ? a.blocking_events : [],
@@ -5470,8 +5491,8 @@
       // INSTALLED HERE, and nothing less (dp, 2026-09-27): the atlas knows harnesses this machine
       // does not have, and registering one mints a member for something absent. The route refuses
       // it too (register_refusal_not_here); the button just does not offer it.
-      registerable: x.installed === true && !x.governed && (!!(x.plugin && String(x.plugin).trim())
-                                    || x.kind === 'being' || a.kind === 'being'),
+      registerable: groupKey !== 'windows_host' && x.installed === true && !x.governed
+        && (!!(x.plugin && String(x.plugin).trim()) || x.kind === 'being' || a.kind === 'being'),
       // The inventory's own words for what it could not determine about THIS agent.
       // Provenance only (atlas SCHEMA.md): shown, and nothing here decides on it.
       being: x.kind === 'being' || a.kind === 'being',

@@ -595,6 +595,38 @@ def real_executable(names: list[str], roots: list[str]) -> str | None:
     return None
 
 
+# A HARNESS INSTALLED ON THE WINDOWS HOST OF A WSL SEAT (TL-Dell, 2026-11-04, hestia#1495).
+# WSL interop puts Windows PATH entries on the Linux PATH as /mnt/<drive>/..., so the Windows
+# Codex installer's `codex.exe` sits in `search_roots()` -- but `real_executable` asks for the
+# bare name `codex` and misses it. The report then said "not installed here", Discover offered
+# no next step, and an agent that can read and write this machine's files was reported absent.
+#
+# It is NOT `installed` either: a Windows codex.exe reads %USERPROFILE%\.codex, not this seat's
+# ~/.codex, and could not run the Linux hook lines hestia renders. Registering it here would
+# mint a member nothing gates. So it gets its own state and its own remedy.
+WINDOWS_HOST_SUFFIXES = (".exe", ".cmd", ".bat")
+WSL_DRIVE_ROOT = "/mnt/"   # where WSL mounts Windows drives; a module constant so tests can move it
+
+
+def windows_host_executable(names: list[str], roots: list[str]) -> str | None:
+    """A Windows-side executable for one of `names`, reached through a WSL drive mount.
+
+    Only roots under WSL_DRIVE_ROOT are considered, so a Linux box never matches. No X_OK test: drvfs
+    exec bits depend on mount options and say nothing about whether Windows can run the file."""
+    for name in names:
+        for d in roots:
+            if not d.startswith(WSL_DRIVE_ROOT):
+                continue
+            for suffix in WINDOWS_HOST_SUFFIXES:
+                p = Path(d) / (name + suffix)
+                try:
+                    if p.is_file():
+                        return str(p)
+                except OSError:
+                    continue
+    return None
+
+
 # ---- hook targets ----------------------------------------------------------------
 # The old version scanned config TEXT for whitespace-delimited tokens starting with "/",
 # then kept only those containing "hestia". Three filters, each of which alone hides a
@@ -1609,6 +1641,7 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
         return inspect_being(atlas_id, roots, atlas)
     exes, dirnames, plugin_dir = names_for(atlas_id)
     exe = real_executable(exes, roots)
+    host_exe = windows_host_executable(exes, roots)
     homes = [HOME / d for d in dirnames if (HOME / d).is_dir()]
     plugin_available = registry().has(plugin_dir)
     declared = expects(plugin_dir)
@@ -1625,6 +1658,9 @@ def inspect(atlas_id: str, roots: list[str]) -> dict:
         # #2: installation is evidenced by an executable, not by a config dir.
         "installed": exe is not None,
         "executable": exe,
+        # Set only when `installed` is false: the harness is on the Windows host (see
+        # windows_host_executable). Its own gap, never `dormant_plugin`.
+        "windows_host_executable": host_exe,
         "config_dirs": [str(h) for h in homes],
         # From the atlas descriptor, not inferred here: whether this harness can block at
         # all, on which events, and above all whether it FAILS OPEN. Empty when the atlas is
@@ -1880,7 +1916,8 @@ def status_of(gaps: dict, unknowns: list) -> str:
         return "MISWIRED"
     if gaps["partial"]:
         return "PARTIAL"
-    if gaps["ungoverned"] or gaps["ungovernable"] or gaps.get("unprovisioned_being"):
+    if (gaps["ungoverned"] or gaps["ungovernable"] or gaps.get("unprovisioned_being")
+            or gaps.get("windows_host")):
         return "UNGOVERNED_PRESENT"
     return "UNKNOWN" if unknowns else "OK"
 
@@ -1889,7 +1926,8 @@ def classify(recs: list[dict]) -> dict:
     """The gaps, each with its own remedy. This is the actionable part."""
     gaps: dict[str, list[str]] = {
         "miswired": [], "miswired_3p": [], "partial": [], "ungoverned": [],
-        "ungovernable": [], "dormant_plugin": [], "unknown": [], "unprovisioned_being": []}
+        "ungovernable": [], "dormant_plugin": [], "unknown": [], "unprovisioned_being": [],
+        "windows_host": []}
     for r in recs:
         if r["unknown"]:
             gaps["unknown"].append(r["agent"])
@@ -1913,6 +1951,10 @@ def classify(recs: list[dict]) -> dict:
         elif r["installed"] and not r["governed"]:
             key = "ungoverned" if r["plugin_available"] else "ungovernable"
             gaps[key].append(r["agent"])
+        if r.get("windows_host_executable"):
+            # An independent Windows presence remains a gap even when a Linux executable is also
+            # installed and governed: that other copy cannot be gated by this seat's Linux hooks.
+            gaps["windows_host"].append(r["agent"])
         elif r["plugin_available"] and not r["installed"]:
             gaps["dormant_plugin"].append(r["agent"])
     return gaps
@@ -1922,7 +1964,7 @@ def classify(recs: list[dict]) -> dict:
 # letting LATER buckets overwrite earlier ones, so a member that was miswired AND carried any
 # `unknown` note rendered amber ("no adapter yet"), never red.
 MEMBER_STATE_ORDER = ["miswired", "partial", "ungoverned", "ungovernable", "unprovisioned_being",
-                      "unknown", "dormant_plugin", "governed"]
+                      "windows_host", "unknown", "dormant_plugin", "governed"]
 
 
 def member_states(recs: list[dict]) -> dict[str, str]:
@@ -1940,6 +1982,8 @@ def member_states(recs: list[dict]) -> dict[str, str]:
             st = "miswired"
         elif r.get("installed") and r.get("partial"):
             st = "partial"
+        elif r.get("windows_host_executable"):
+            st = "windows_host"
         elif r.get("installed") and not r.get("governed"):
             st = "ungoverned" if r.get("plugin_available") else "ungovernable"
         elif r.get("installed") and r.get("unknown"):
