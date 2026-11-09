@@ -1248,27 +1248,48 @@ mod tests {
         derive_with_volume("codex", role, w, None).level
     }
 
-    /// Legacy role-less adjudications use the same default grain as the adjudication writer:
-    /// their evidence is retained once, without leaking into sibling roles.
+    /// Frozen pre/post vector: two legacy omitted-role rows and one explicit reviewer row.
+    /// Each omitted row is retained once; the explicit row never leaks into a sibling grain.
     #[test]
     fn a_role_less_adjudication_credits_only_the_default_grain() {
-        let observations = |role: &str| {
-            let window = vec![entry(
-                1,
-                0,
-                "adjudication",
-                json!({
-                    "subject_plugin_id": "codex",
-                    "axis": "validity",
-                    "score": 0.9,
-                    "adjudicator": "dp"
-                }),
-            )];
-            derive("codex", role, &window).validity.observations
+        let default = crate::reputation::DEFAULT_CONSTELLATION_ROLE;
+        let interactive = "role:constellation:interactive-dev";
+        let reviewer = "role:constellation:reviewer";
+        let window = vec![
+            entry(1, 0, "adjudication", json!({
+                "subject_plugin_id": "codex", "axis": "validity", "score": 0.9,
+                "ref": "frozen:omitted-a", "adjudicator": "dp"
+            })),
+            entry(2, 0, "adjudication", json!({
+                "subject_plugin_id": "codex", "subject_role": reviewer,
+                "axis": "validity", "score": 0.8, "ref": "frozen:explicit-reviewer",
+                "adjudicator": "dp"
+            })),
+            entry(3, 0, "adjudication", json!({
+                "subject_plugin_id": "codex", "axis": "validity", "score": 0.7,
+                "ref": "frozen:omitted-b", "adjudicator": "dp"
+            })),
+            entry(4, 0, "adjudication", json!({
+                "subject_plugin_id": "codex", "axis": "validity", "verdict": "deferred",
+                "ref": "frozen:deferred", "adjudicator": "dp"
+            })),
+        ];
+        let legacy_observations = |role: &str| {
+            window
+                .iter()
+                .filter(|e| {
+                    e.event_type == "adjudication"
+                        && entry_str(e, "subject_plugin_id") == Some("codex")
+                        && entry_str(e, "subject_role").map_or(true, |r| r == role)
+                        && e.event_data.get("score").and_then(Value::as_f64).is_some()
+                })
+                .count() as u64
         };
-        assert_eq!(observations(crate::reputation::DEFAULT_CONSTELLATION_ROLE), 1);
-        assert_eq!(observations("role:constellation:interactive-dev"), 0);
-        assert_eq!(observations("role:constellation:reviewer"), 0);
+        for (role, before, after) in [(default, 2, 2), (interactive, 2, 0), (reviewer, 3, 1)] {
+            assert_eq!(legacy_observations(role), before, "pre-change count for {role}");
+            assert_eq!(derive("codex", role, &window).validity.observations, after,
+                       "post-change count for {role}");
+        }
     }
 
     /// VOLUME NEVER SCORES WITHOUT GOVERNED COVERAGE — the safety property.
