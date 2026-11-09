@@ -238,6 +238,142 @@ class RegistrationResolverTests(unittest.TestCase):
         self.assertEqual(r["events_seen"], ["PostToolUse", "PreToolUse"])
         self.assertEqual([t["event"] for t in r["targets"]], ["PreToolUse", "PostToolUse"])
 
+    def test_real_vendor_registration_shapes_keep_event_identity(self):
+        gate = self.touch("hooks/gate.py")
+        nested_gate = self.touch("hooks/nested/gate.py")
+        witness = self.touch("hooks/witness.py")
+        start = self.touch("hooks/start.sh")
+        cases = [
+            (
+                "claude-code", [".claude", "settings.json"], "json-hook-commands",
+                {"hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Bash", "hooks": [
+                            {"type": "command", "command": f"python3 {gate}"}]},
+                        {"matcher": "Read", "hooks": [
+                            {"type": "command", "command": f"python3 {nested_gate}"}]},
+                    ],
+                    "PostToolUse": [{"matcher": "*", "hooks": [
+                        {"type": "command", "command": f"python3 {witness}"}]}],
+                    "SessionStart": [{"hooks": [
+                        {"type": "command", "command": f"bash {start}"}]}],
+                }},
+                "PreToolUse", "PostToolUse",
+            ),
+            (
+                "codex", [".codex", "config.toml"], "toml-hook-commands",
+                f'''[features]
+codex_hooks = true
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "python3 {gate}"
+
+[[hooks.PreToolUse]]
+matcher = "shell"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "python3 {nested_gate}"
+
+[[hooks.PostToolUse]]
+matcher = ".*"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "python3 {witness}"
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "bash {start}"
+''',
+                "PreToolUse", "PostToolUse",
+            ),
+            (
+                "kimi", [".kimi-code", "config.toml"], "toml-hook-commands",
+                f'''[[hooks]]
+event = "PreToolUse"
+command = "HESTIA_HOME=/tmp/hestia python3 {gate}"
+timeout = 15
+
+[[hooks]]
+event = "PreToolUse"
+command = "python3 {nested_gate}"
+timeout = 15
+
+[[hooks]]
+event = "PostToolUse"
+command = "python3 {witness}"
+timeout = 10
+
+[[hooks]]
+event = "SessionStart"
+command = "bash {start}"
+timeout = 15
+''',
+                "PreToolUse", "PostToolUse",
+            ),
+            (
+                "gemini", [".gemini", "settings.json"], "json-hook-commands",
+                {"hooks": {
+                    "BeforeTool": [
+                        {"matcher": "run_shell_command", "hooks": [
+                            {"type": "command", "command": f"python3 {gate}"}]},
+                        {"matcher": "read_file", "hooks": [
+                            {"type": "command", "command": f"python3 {nested_gate}"}]},
+                    ],
+                    "AfterTool": [{"matcher": "*", "hooks": [
+                        {"type": "command", "command": f"python3 {witness}"}]}],
+                    "SessionStart": [{"hooks": [
+                        {"type": "command", "command": f"bash {start}"}]}],
+                }},
+                "BeforeTool", "AfterTool",
+            ),
+        ]
+        for member, rel, reader, document, gate_event, witness_event in cases:
+            with self.subTest(member=member):
+                e = self.expects(member=member, reader=reader, path=rel)
+                p = self.home.joinpath(*rel)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(
+                    json.dumps(document) if isinstance(document, dict) else document,
+                    encoding="utf-8",
+                )
+                r = rr.resolve_registration(e, self.home)
+                self.assertEqual(r["state"], "ok")
+                self.assertTrue(r["complete"])
+                self.assertEqual(r["commands_seen"], 4)
+                self.assertEqual(
+                    r["events_seen"], sorted({gate_event, witness_event, "SessionStart"})
+                )
+                self.assertEqual(
+                    [(t["event"], t["path"]) for t in r["targets"]],
+                    [(gate_event, str(gate)), (gate_event, str(nested_gate)),
+                     (witness_event, str(witness)), ("SessionStart", str(start))],
+                )
+
+    def test_shared_hook_path_keeps_distinct_event_registrations(self):
+        shared = self.touch("hooks/shared.py")
+        rel = [".claude", "settings.json"]
+        e = self.expects(path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True)
+        group = [{"hooks": [{"type": "command", "command": f"python3 {shared}"}]}]
+        p.write_text(json.dumps({"hooks": {
+            "PostToolUse": group,
+            "PreToolUse": group,
+        }}), encoding="utf-8")
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(
+            [(t["event"], t["path"]) for t in r["targets"]],
+            [("PostToolUse", str(shared)), ("PreToolUse", str(shared))],
+        )
+
     def test_malformed_toml_command_assignment_is_unparseable(self):
         rel = [".codex", "config.toml"]
         e = self.expects(member="codex", reader="toml-hook-commands", path=rel)

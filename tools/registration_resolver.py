@@ -82,13 +82,15 @@ def _commands_from_toml_text(text: str) -> list[tuple[str | None, str]]:
     out: list[tuple[str | None, str]] = []
     event = None
     for raw in text.splitlines():
-        table = re.match(r"^\s*\[\[([^\]]+)\]\s*$", raw)
+        table = re.match(r"^\s*\[\[([^\]]+)\]\]\s*$", raw)
         if table:
             name = table.group(1)
             if name == "hooks":
                 event = "unparsed"
             elif name.startswith("hooks."):
                 suffix = name[len("hooks."):]
+                if suffix.endswith(".hooks"):
+                    suffix = suffix[:-len(".hooks")]
                 if suffix != "hooks":
                     event = suffix
             else:
@@ -306,7 +308,7 @@ def resolve_registration(
         targets: list[dict[str, Any]] = []
         discarded: list[dict[str, str]] = []
         unclassified: list[dict[str, str]] = []
-        seen: set[str] = set()
+        seen: set[tuple[str | None, str]] = set()
         for event, command in commands:
             target, why = _command_target(command)
             if target is None:
@@ -318,9 +320,10 @@ def resolve_registration(
                     {"event": event, "path": target, "reason": "existing directory is not a hook artifact"}
                 )
                 continue
-            if target in seen:
+            identity = (event, target)
+            if identity in seen:
                 continue
-            seen.add(target)
+            seen.add(identity)
             targets.append(
                 {
                     "event": event,
@@ -346,6 +349,7 @@ def resolve_registration(
         expects=str(expects),
         reader=reader,
         registration_path=str(registration),
+        gate_events=manifest.get("gate") or [],
         commands_seen=len(commands),
         events_seen=sorted({event for event, _ in commands if event is not None}),
         complete=(len(unclassified) == 0),

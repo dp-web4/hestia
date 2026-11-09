@@ -72,14 +72,14 @@ MEMBERS = {  # member -> (installed hooks dir under $HOME, plugins/ dir name)
     "codex":       (".codex/hooks",     "codex"),
     "gemini":      (".gemini/hooks",    "gemini"),
 }
-GATE_EVENT = "PreToolUse"          # the enforcing hook; everything else is witness
+GATE_EVENT = "PreToolUse"          # fallback when expects.json does not declare its gate event
 
 
 def gate_surface(member, inst_dir):
     """Resolve a member's GATE through the canonical registration resolver.
 
     ENFORCING BUT UNAUDITED is explicit when a present registered hook is outside the compared
-    install dir. Partial classification is UNDETERMINED, never an empty registration.
+    install dir. Partial or unreadable classification is UNDETERMINED, never a healthy gate.
     """
     expects = os.path.join(REPO, "plugins", MEMBERS[member][1], "expects.json")
     resolved = rr.resolve_registration(expects, HOME)
@@ -97,24 +97,28 @@ def gate_surface(member, inst_dir):
             return "provisioned-but-UNGOVERNED", "no registration is declared"
         return "not-provisioned", "no registration contract or member dir"
 
-    gate_targets = [t for t in resolved["targets"] if t.get("event") == GATE_EVENT]
+    if not resolved["complete"]:
+        return "UNDETERMINED", "registration is only partially classified; gate targets are not exhaustive"
+    gate_events = resolved.get("gate_events") or [GATE_EVENT]
+    gate_label = ",".join(gate_events)
+    gate_targets = [t for t in resolved["targets"] if t.get("event") in gate_events]
     if not gate_targets:
-        if not resolved["complete"]:
-            return "UNDETERMINED", "registration is only partially classified; no gate target is proven"
         return ("provisioned-but-UNGOVERNED",
-                f"registered events {resolved['events_seen']} contain no {GATE_EVENT}")
+                f"registered events {resolved['events_seen']} contain no {gate_label}")
 
     paths = [t["path"] for t in gate_targets]
+    if any(t["kind"] == "unreadable" for t in gate_targets):
+        return "UNDETERMINED", f"{gate_label} -> {paths} includes an unreadable registered hook"
     repo_prefix = os.path.abspath(REPO) + os.sep
     working = next((p for p in paths if os.path.abspath(p).startswith(repo_prefix)), None)
     if working:
         return ("gated-from-a-working-tree",
-                f"{GATE_EVENT} -> {os.path.relpath(working, REPO)} (in checkout; only as current as its branch)")
+                f"{gate_label} -> {os.path.relpath(working, REPO)} (in checkout; only as current as its branch)")
 
     install_prefix = os.path.abspath(inst_dir) + os.sep
     outside = [p for p in paths if not os.path.abspath(p).startswith(install_prefix)]
     kinds = ",".join(sorted({t["kind"] for t in gate_targets}))
-    evidence = f"{GATE_EVENT} -> {paths} (kind={kinds})"
+    evidence = f"{gate_label} -> {paths} (kind={kinds})"
     if outside:
         return "ENFORCING BUT UNAUDITED", f"{evidence}; outside compared dir {inst_dir}"
     return "gated-at-canonical-path", evidence
