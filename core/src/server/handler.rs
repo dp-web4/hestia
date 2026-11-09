@@ -94,6 +94,7 @@ impl ServerHandler for HestiaServer {
         let reports_shared_state = reports_shared_state(name.as_str());
         let scoped = super::state_lock::with_label(lock_label, async { match name.as_str() {
             "hestia_connect" => tool_connect(&self.state, &args).await,
+            "hestia_connect_dry_run" => tool_connect_dry_run(&self.state, &args).await,
             "hestia_begin_action" => tool_begin_action(&self.state, &args).await,
             "hestia_record_outcome" => tool_record_outcome(&self.state, &args).await,
             "hestia_record_reversal" => tool_record_reversal(&self.state, &args).await,
@@ -388,6 +389,10 @@ fn hestia_tools() -> Vec<Tool> {
                     "instance_name": {"type": "string", "description": "Legacy caller diagnostic label, accepted for compatibility; the handler does not read it."}
                 }
             }),
+        ),
+        t(
+            "hestia_connect_dry_run",
+            "Loopback-only, read-only connect for a gate dry run: returns the EXISTING session for (plugin_id, host_session_id), as minted, or an error when there is none or the listener is non-loopback. Mints, touches and records nothing",
         ),
         t("hestia_begin_action", "Begin tracking an R6/R7 action. Optional `serves`: the goal or question id the act is for; its verdict's `feedback.serves` carries it (\"unknown\" when unstated)"),
         t(
@@ -892,6 +897,79 @@ fn make_resource_template(uri_template: &str, name: &str, description: &str) -> 
 // =========================================================================
 
 type ToolResult = Result<Value, anyhow::Error>;
+
+/// The connect a gate dry run (#1450 `evaluate`) makes: the REUSE arm of `tool_connect`, read
+/// and nothing else. It answers only for a session that already exists under the same
+/// `(plugin_id, host_session_id)` key real connect reuses, and returns that session as minted:
+/// its real id and the role it was minted with, because a reused session keeps that role
+/// whatever this call declares (Guard A). The law and scope reads that follow then go through
+/// their ordinary resolved-session checks — no synthetic identity, so no second door.
+///
+/// Nothing mutates: no liveness touch, no capability report, no session, member, projection or
+/// chain row. With no such session there is no live answer to dry-run — a real connect would
+/// mint one, with whatever role the caller declares — so this says so instead of guessing.
+///
+/// It is a separate RPC, not a `dry_run` flag on `hestia_connect`, so a daemon that predates it
+/// answers "unknown tool" rather than performing an ordinary, mutating connect.
+async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
+    if !state.lock().await.allow_connect_dry_run {
+        return Ok(hestia_error_envelope(
+            "hestia.connect_dry_run_unavailable",
+            "the dry-run session lookup is available only on a loopback listener: it returns an \
+             existing daemon session id, and caller ownership is not established (#824). No \
+             session id or soft LCT is returned on a non-loopback listener",
+            None,
+        ));
+    }
+    let plugin_id = require_string(args, "plugin_id")?;
+    require_string(args, "host_agent")?;
+    let Some(host_session_id) = optional_string(args, "host_session_id") else {
+        return Ok(hestia_error_envelope(
+            "hestia.connect_dry_run_no_host_session",
+            "a dry run evaluates as an existing session, found by (plugin_id, host_session_id); \
+             without a host_session_id a real connect would mint a new session, and there is \
+             nothing to evaluate as",
+            Some(json!({ "plugin_id": plugin_id })),
+        ));
+    };
+    let declared_role = optional_string(args, "role").unwrap_or_default();
+    // The published directory first, as real connect does; on a miss the locked state, which
+    // real connect also re-checks. Both are reads.
+    let found = match state.published().sessions.find_reuse(&plugin_id, &host_session_id) {
+        Some(id) => Some((id.session_id, id.soft_lct.clone(), id.assigned_role.clone(),
+                          id.constellation_role.clone(), id.role_basis.clone())),
+        None => {
+            let s = state.lock().await;
+            s.sessions
+                .find_reuse_id(&plugin_id, &host_session_id)
+                .and_then(|id| s.sessions.get(&id))
+                .map(|e| (e.session_id, e.soft_lct.clone(), e.assigned_role.clone(),
+                          e.constellation_role.clone(), e.role_basis.clone()))
+        }
+    };
+    let Some((session_id, soft_lct, assigned_role, constellation_role, role_basis)) = found else {
+        return Ok(hestia_error_envelope(
+            "hestia.connect_dry_run_no_session",
+            "no live session for this (plugin_id, host_session_id): a real connect would mint \
+             one with the role it declares, so parity with the gate cannot be determined. \
+             Evaluate as a session the member already holds.",
+            Some(json!({ "plugin_id": plugin_id })),
+        ));
+    };
+    Ok(json!({
+        "sessionId": session_id,
+        "softLct": soft_lct,
+        "assignedRole": assigned_role,
+        "constellationRole": constellation_role,
+        "roleDeclarationHonored": !declared_role.is_empty() && declared_role == constellation_role,
+        "roleBasis": role_basis,
+        "gateCapabilityReportAccepted": false,
+        "protocolVersion": 1,
+        "reused": true,
+        "dryRun": true,
+        "dryRunSnapshotContract": 2,
+    }))
+}
 
 pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResult {
     reject_unknown_keys(args, CONNECT_ACCEPTED_KEYS, "hestia_connect")?;
@@ -1443,6 +1521,9 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
     // `resolve_attributed_caller` parses, looks up, and returns None on any failure — the
     // correct primitive, already in this file, thirty lines from the surface that needed
     // it. The error contract is now "a caller was attributed", not "an id was supplied".
+    //
+    // A gate dry run (#1450 evaluate) reads through this same check: hestia_connect_dry_run
+    // hands it the member's EXISTING session, never a synthetic id, so there is no second door.
     let Some(who) = p.resolve(optional_session_id(args).as_deref())
     else {
         return Ok(hestia_error_envelope(
@@ -16089,6 +16170,195 @@ mod tests {
         );
     }
 
+    /// #1450 evaluate: with no live session there is nothing to dry-run, so the answer is an
+    /// explicit error, and asking mutates nothing. Arms: a first-seen member, a retired member,
+    /// and a call with no host_session_id at all (a real connect would mint for each).
+    #[tokio::test]
+    async fn connect_dry_run_without_a_live_session_refuses_and_mutates_nothing() {
+        let (_dir, shared) = make_shared_state();
+        shared.lock().await.retired_members.retire(crate::server::retirement::RetiredMember {
+            plugin_id: "retired".into(),
+            retired_at: crate::server::gate_escalation::now_secs(),
+            reason: "dry-run control".into(),
+            evidence_ref: "test".into(),
+            revoked_paths: vec![],
+            was_active: false,
+            retired_by: "lct:web4:operator:test".into(),
+        });
+        let chain_before = shared.lock().await.chain_len();
+
+        for id in ["first-seen", "retired"] {
+            let out = tool_connect_dry_run(&shared, &json!({
+                "plugin_id": id, "host_agent": "test", "host_session_id": "hs-dry",
+                "gate_capabilities": ["escalation-review:v1"],
+                "projection_sha256": "a".repeat(64),
+            })).await.unwrap();
+            assert_eq!(out["_hestia_error"]["code"], "hestia.connect_dry_run_no_session", "{id}");
+            assert!(out.get("sessionId").is_none(), "{id}: no session id of any kind");
+        }
+        let out = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "first-seen", "host_agent": "test",
+        })).await.unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.connect_dry_run_no_host_session");
+
+        let s = shared.lock().await;
+        assert_eq!(s.chain_len(), chain_before, "no witness row, including a retired id");
+        assert_eq!(s.sessions.len(), 0, "no session was registered");
+        assert_eq!(s.member_registry.len(), 0, "no first-seen member was minted");
+        assert!(s.gate_capabilities.get("first-seen").is_none(), "no capability report");
+        assert!(s.gate_capabilities.get("retired").is_none(), "no retired-id capability report");
+        assert!(s.seat_live.is_empty(), "no projection observation was accepted");
+        assert_eq!(s.retired_members.retired.len(), 1, "the pre-existing retirement is unchanged");
+    }
+
+    /// #1450 evaluate, reviewer's parity control: a host session MINTED as `member`, evaluated
+    /// while the caller now declares `interactive-dev`, with a DIFFERENT operator grant on each
+    /// role. The real gate's reuse keeps the minted role (Guard A), so the dry run must read the
+    /// member-role law and grant — the same law hash a real reuse-connect's session reads — and
+    /// it must not touch the session's liveness or capability report while doing so.
+    #[tokio::test]
+    async fn connect_dry_run_evaluates_as_the_minted_session_role_not_the_declared_one() {
+        let (_dir, shared) = make_shared_state();
+        let minted = "role:constellation:member";
+        let declared = "role:constellation:interactive-dev";
+        for (role, preset) in [(minted, "strict"), (declared, "permissive")] {
+            shared.lock().await.instance_grants.insert(
+                ("m".into(), role.into()),
+                crate::server::state::InstanceGrant {
+                    preset: preset.into(),
+                    granted_by: "operator".into(),
+                    granted_at: 0,
+                    reason: "dry-run parity control".into(),
+                    expires_at: None,
+                },
+            );
+        }
+        let real = tool_connect(&shared, &json!({
+            "plugin_id": "m", "host_agent": "test", "host_session_id": "hs-1", "role": minted,
+            "gate_capabilities": ["escalation-review:v1"],
+        })).await.unwrap();
+        let sid = real["sessionId"].as_str().unwrap().to_string();
+        let (caps_before, chain_before) = {
+            let s = shared.lock().await;
+            (s.gate_capabilities.get("m"), s.chain_len())
+        };
+
+        let dry = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "m", "host_agent": "test", "host_session_id": "hs-1", "role": declared,
+            "gate_capabilities": ["something-else:v9"],
+        })).await.unwrap();
+        assert_eq!(dry["dryRun"], true);
+        assert_eq!(dry["dryRunSnapshotContract"], 2);
+        assert_eq!(dry["sessionId"], sid, "the existing session, not a synthetic id");
+        assert_eq!(dry["constellationRole"], minted, "the minted role, not the declared one");
+        assert_eq!(dry["roleDeclarationHonored"], false);
+
+        let dry_law = tool_operating_law(&shared, &json!({"session_id": sid})).await.unwrap();
+        assert_eq!(dry_law["identity"]["role"], minted);
+        assert_eq!(dry_law["operator_grant"]["preset"], "strict", "the minted role's grant");
+        let reuse = tool_connect(&shared, &json!({
+            "plugin_id": "m", "host_agent": "test", "host_session_id": "hs-1", "role": declared,
+        })).await.unwrap();
+        let gate_law = tool_operating_law(&shared, &json!({"session_id": reuse["sessionId"]}))
+            .await.unwrap();
+        assert_eq!(dry_law["law_hash"], gate_law["law_hash"], "the law the real gate reads");
+
+        let counter = std::sync::atomic::AtomicU64::new(7);
+        let scope = tool_scope_status_with_counter(&shared, &json!({
+            "plugin_id": "m", "session_id": sid,
+        }), &counter).await.unwrap();
+        assert_eq!(scope["caller_bound"], true, "a resolved session, so a bound read");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 7, "the rollout signal is untouched");
+
+        let s = shared.lock().await;
+        assert_eq!(s.sessions.len(), 1);
+        assert_eq!(s.gate_capabilities.get("m"), caps_before, "the dry run reported no capabilities");
+        assert_eq!(s.chain_len(), chain_before);
+    }
+
+    /// The dry run touches no liveness: only the real reuse-connect above moves `last_seen`, so
+    /// a dry run alone must leave it exactly where it was.
+    #[tokio::test]
+    async fn connect_dry_run_does_not_bump_liveness() {
+        let (_dir, shared) = make_shared_state();
+        let real = tool_connect(&shared, &json!({
+            "plugin_id": "m", "host_agent": "test", "host_session_id": "hs-1",
+        })).await.unwrap();
+        let id = uuid::Uuid::parse_str(real["sessionId"].as_str().unwrap()).unwrap();
+        let before = { let s = shared.lock().await; s.sessions.last_seen(s.sessions.get(&id).unwrap()) };
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let dry = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "m", "host_agent": "test", "host_session_id": "hs-1",
+        })).await.unwrap();
+        assert_eq!(dry["sessionId"], real["sessionId"]);
+        let s = shared.lock().await;
+        assert_eq!(s.sessions.last_seen(s.sessions.get(&id).unwrap()), before);
+    }
+
+    #[tokio::test]
+    async fn non_loopback_dry_run_does_not_disclose_an_existing_session() {
+        let (_dir, shared) = make_shared_state();
+        let victim = tool_connect(&shared, &json!({
+            "plugin_id": "victim", "host_agent": "test", "host_session_id": "hs-v",
+        })).await.unwrap();
+        assert!(victim["sessionId"].is_string(), "setup must mint the target session");
+        let chain_before = shared.lock().await.chain_len();
+        shared.lock().await.allow_connect_dry_run = false;
+
+        let second_client = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "victim", "host_agent": "test", "host_session_id": "hs-v",
+        })).await.unwrap();
+        assert_eq!(
+            second_client["_hestia_error"]["code"],
+            "hestia.connect_dry_run_unavailable"
+        );
+        assert!(second_client.get("sessionId").is_none(), "{second_client}");
+        assert!(second_client.get("softLct").is_none(), "{second_client}");
+        assert_ne!(second_client.get("sessionId"), victim.get("sessionId"));
+        let s = shared.lock().await;
+        assert_eq!(s.sessions.len(), 1, "the lookup created no session");
+        assert_eq!(s.chain_len(), chain_before, "the refusal recorded nothing");
+    }
+
+    /// The reviewer's attribution controls: no fabricated or cross-member dry-run read gets past
+    /// the ordinary resolved-session boundary. The predictable `dry-run:<member>` spelling the
+    /// first contract accepted is just an unresolvable id now, and the dry-run connect's reuse
+    /// lookup is keyed on the CLAIMED member (Guard C), so naming a victim's host session
+    /// under another label finds nothing.
+    #[tokio::test]
+    async fn dry_run_reads_cannot_be_fabricated_or_cross_members() {
+        let (_dir, shared) = make_shared_state();
+        let victim = tool_connect(&shared, &json!({
+            "plugin_id": "victim", "host_agent": "test", "host_session_id": "hs-v",
+        })).await.unwrap();
+
+        let law = tool_operating_law(&shared, &json!({
+            "session_id": "dry-run:victim", "dry_run": true, "plugin_id": "victim",
+            "role": "role:constellation:interactive-dev",
+        })).await.unwrap();
+        assert_eq!(law["_hestia_error"]["code"], "hestia.operating_law_unattributed");
+        assert!(law.get("identity").is_none(), "no composed law for a fabricated id");
+
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let scope = tool_scope_status_with_counter(&shared, &json!({
+            "plugin_id": "victim", "session_id": "dry-run:victim", "dry_run": true,
+        }), &counter).await.unwrap();
+        assert_eq!(scope["caller_bound"], false, "an unresolvable id is an unbound read");
+        assert!(scope.get("dryRun").is_none(), "no dry-run spelling is recognized");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1, "and it is counted");
+
+        let cross = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "attacker", "host_agent": "test", "host_session_id": "hs-v",
+        })).await.unwrap();
+        assert_eq!(cross["_hestia_error"]["code"], "hestia.connect_dry_run_no_session");
+        assert_ne!(cross.get("sessionId"), victim.get("sessionId"));
+
+        let wrong = tool_scope_status_with_counter(&shared, &json!({
+            "plugin_id": "attacker", "session_id": victim["sessionId"],
+        }), &counter).await;
+        assert!(wrong.is_err(), "a session that resolves to another member is refused");
+    }
+
     /// Spec §7.8.2 "deliver only to that authenticated LCT" + RWOA O-clause:
     /// a law-denied caller must NOT drain — and the deny leaves the mailbox
     /// bit-identical (the gate dominates the consume).
@@ -25859,6 +26129,14 @@ fn with_modes(mut row: Value, modes: crate::server::grant_modes::Modes) -> Value
 static UNBOUND_SCOPE_STATUS_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
+    tool_scope_status_with_counter(state, args, &UNBOUND_SCOPE_STATUS_READS).await
+}
+
+async fn tool_scope_status_with_counter(
+    state: &SharedState,
+    args: &Value,
+    unbound_counter: &std::sync::atomic::AtomicU64,
+) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
 
     let plugin_id = require_string(args, "plugin_id")?;
@@ -25875,6 +26153,7 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
     // or unresolvable session is still served, as before, because the gate itself fetched its snapshot
     // without one until step A: refusing it would deny every governed act on every machine running an
     // older hook ("no snapshot, no permit"). Those reads are marked and counted; step C refuses them.
+    // A gate dry run (#1450 evaluate) sends the member's EXISTING session, so it is bound and uncounted.
     let caller_bound = match args.get("session_id").and_then(|v| v.as_str()) {
         Some(sid) => match s.resolve(Some(sid)) {
             Some(who) if who.plugin_id == plugin_id => true,
@@ -25891,9 +26170,9 @@ async fn tool_scope_status(state: &SharedState, args: &Value) -> ToolResult {
         None => false,
     };
     let unbound_reads = if caller_bound {
-        UNBOUND_SCOPE_STATUS_READS.load(std::sync::atomic::Ordering::Relaxed)
+        unbound_counter.load(std::sync::atomic::Ordering::Relaxed)
     } else {
-        UNBOUND_SCOPE_STATUS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+        unbound_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     };
 
     // THE HONOR HORIZON IS BOUNDED BY WHAT IT COVERS (GPT review of #431, blocker 3). A
