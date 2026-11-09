@@ -30,6 +30,40 @@ const BLOCK_DEVICE: &str = r"/dev/(sd[a-z]|nvme\d+n\d+|vd[a-z]|hd[a-z]|mmcblk\d+
 
 fn safety_rules() -> Vec<PolicyRule> {
     vec![
+        PolicyRule {
+            id: "allow-version-controlled-file-delete".into(),
+            name: "Allow git rm with recoverable or non-destructive flags".into(),
+            priority: 0,
+            decision: PolicyDecision::Allow,
+            reason: Some(
+                "git rm is PERMITTED when it stands alone and uses only explicit recoverable or \
+                 non-destructive flags: -q/--quiet, --cached, --dry-run/-n, --ignore-unmatch, \
+                 or --sparse. Recursive, forced, chained, redirected, quoted, escaped, and \
+                 unlisted flag combinations still hit the destructive-command deny. Without \
+                 --force, git refuses to remove files with uncommitted changes."
+                    .into(),
+            ),
+            r#match: PolicyMatch {
+                tools: Some(vec!["Bash".into(), "Shell".into()]),
+                command_patterns: Some(vec![
+                    concat!(
+                        r"^[ \t]*git[ \t]+rm[ \t]+",
+                        r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)[ \t]+)+",
+                        r#"[^\s;&|`$()<>\\'"-][^\s;&|`$()<>\\'"]*([ \t]+[^\s;&|`$()<>\\'"-][^\s;&|`$()<>\\'"]*)*[ \t]*$"#
+                    )
+                    .into(),
+                    concat!(
+                        r"^[ \t]*git[ \t]+rm[ \t]+",
+                        r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)[ \t]+)+",
+                        r"--[ \t]+",
+                        r#"[^\n\r;&|`$()<>\\'"]+$"#
+                    )
+                    .into(),
+                ]),
+                command_patterns_are_regex: true,
+                ..Default::default()
+            },
+        },
         // Whitelist: allow `rm` (incl. -rf) when EVERY target is an absolute
         // path under a whitelisted scratch root (/tmp). Priority 0 so it wins
         // over the destructive-deny (priority 1) via first-match. Guards:
@@ -395,11 +429,9 @@ mod tests {
     }
 
     #[test]
-    fn safety_has_six_rules() {
-        // Was seven; the stale `warn-git-push-no-pat` rule was removed 2026-07-18
-        // (PAT auth deprecated — SSH `git push` just works).
+    fn safety_has_seven_rules() {
         let p = get_preset("safety").unwrap();
-        assert_eq!(p.config.rules.len(), 6);
+        assert_eq!(p.config.rules.len(), 7);
         assert!(p.config.enforce);
         assert_eq!(p.config.default_policy, PolicyDecision::Allow);
     }
@@ -734,6 +766,83 @@ mod tests {
                 "`{cmd}` contains no delete verb and must not be denied (matched {:?})",
                 v.rule_id
             );
+        }
+    }
+
+    #[test]
+    fn git_rm_allows_only_enumerated_safe_flag_forms() {
+        use crate::policy::{PolicyAction, PolicyEngine};
+
+        let e = PolicyEngine::new(get_preset("safety").unwrap().config);
+        for tool_name in ["Bash", "Shell"] {
+            let judge = |cmd: &str| {
+                e.evaluate(&PolicyAction {
+                    tool_name,
+                    category: "command",
+                    target: Some(cmd),
+                    full_command: Some(cmd),
+                })
+            };
+            for cmd in [
+                "git rm -q core/tests/old.rs",
+                "git rm --cached --dry-run tools/old.py",
+                "git rm -n core/tests/old.rs",
+                "git rm -q -- -n",
+                "git rm -q -- core/tests/old.rs",
+                "git rm --ignore-unmatch --sparse -q core/tests/old.rs",
+            ] {
+                let v = judge(cmd);
+                assert_eq!(
+                    v.decision,
+                    PolicyDecision::Allow,
+                    "{tool_name}: {cmd} got {:?} from {:?}",
+                    v.decision,
+                    v.rule_id
+                );
+                assert_eq!(
+                    v.rule_id.as_deref(),
+                    Some("allow-version-controlled-file-delete"),
+                    "{tool_name}: {cmd}"
+                );
+            }
+            for cmd in [
+                "git rm -- -n",
+                "git rm -f core/tests/old.rs",
+                "git rm -rf tests/fixtures",
+                "git rm -r --cached tests/fixtures",
+                "git rm -r plugins",
+                "git rm -r .",
+                "git rm -fq core/tests/old.rs",
+                "git rm --force core/tests/old.rs",
+                "git rm -q core/tests/old.rs --force",
+                "git rm -q core/tests/old.rs && git commit -m cleanup",
+                "git rm -q core/tests/old.rs > /tmp/git-rm-output",
+                "git rm -q -- core/tests/old.rs > /tmp/git-rm-output",
+                "git rm -q -- core/tests/old.rs < /tmp/git-rm-input",
+                "git rm --cached -- core/tests/old.rs >> /tmp/git-rm-output",
+                "git rm -q -- core/tests/old.rs >(cat)",
+                "git rm -q \"core/tests/old.rs\"",
+                "git rm -q 'core/tests/old.rs'",
+                "git rm -q core/tests/old\\ rs",
+                "git rm -q core/tests/old.rs\r",
+                "git rm -q -- core/tests/old.rs\r",
+                "git -C core rm -q tests/old.rs",
+                "sudo git rm -q core/tests/old.rs",
+            ] {
+                let v = judge(cmd);
+                assert_eq!(
+                    v.decision,
+                    PolicyDecision::Deny,
+                    "{tool_name}: {cmd} must retain the destructive deny, got {:?} from {:?}",
+                    v.decision,
+                    v.rule_id
+                );
+                assert_eq!(
+                    v.rule_id.as_deref(),
+                    Some("deny-destructive-commands"),
+                    "{tool_name}: {cmd}"
+                );
+            }
         }
     }
 

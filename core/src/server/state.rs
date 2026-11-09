@@ -955,6 +955,50 @@ fn protect_operator_key(path: &Path) -> Result<()> {
     anyhow::bail!("operator.key has no private-permission implementation on this platform; deleting it")
 }
 
+fn warm_configured_members(
+    vault: &mut Vault,
+    registry: &mut crate::member_registry::MemberRegistry,
+    synthetic: &HashSet<String>,
+    home: &Path,
+    sovereign_lct_id: &str,
+    sovereign_anchor: &str,
+) {
+    let seats = home.join("seats");
+    let mut paths = match std::fs::read_dir(&seats) {
+        Ok(entries) => entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect::<Vec<_>>(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!("[hestia] WARNING: configured-member warm-up could not read {}: {e}", seats.display());
+            Vec::new()
+        }
+    };
+    paths.sort();
+    let before = registry.len();
+    for path in paths {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("env") {
+            continue;
+        }
+        let Some(plugin_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if plugin_id.starts_with('_') {
+            continue;
+        }
+        crate::member_registry::ensure_member(
+            vault,
+            registry,
+            plugin_id,
+            synthetic.contains(plugin_id),
+            sovereign_lct_id,
+            sovereign_anchor,
+        );
+    }
+    let minted = registry.len().saturating_sub(before);
+    if minted > 0 {
+        eprintln!("[hestia] warmed {minted} configured member LCT(s) at startup (#423)");
+    }
+}
+
 impl ServerState {
     /// Open all persistent stores rooted at `home` and prepare server state.
     /// `passphrase` is the vault passphrase — used to derive the storage key
@@ -1067,7 +1111,7 @@ impl ServerState {
             &sovereign.lct_id(),
         );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
-        let member_registry = crate::member_registry::load_members(&vault);
+        let mut member_registry = crate::member_registry::load_members(&vault);
         let retired_members = crate::server::retirement::load(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
@@ -1113,6 +1157,16 @@ impl ServerState {
                 "synthetic-plugin set unreadable — failing closed instead of treating it as empty",
             )?
         };
+        // Pay every configured member's first-LCT mint here, before the first request can take
+        // the state lock. Unknown future members still use ensure_member on first connect.
+        warm_configured_members(
+            &mut vault,
+            &mut member_registry,
+            &synthetic_plugins,
+            home,
+            &sovereign.lct_id(),
+            &sovereign_lct,
+        );
 
         // Standing scope grants (durable loosenings — POLICY_SCOPE_ASYMMETRY row 3).
         // Present-but-unparseable must abort startup like the synthetic set: collapsing a
@@ -1297,18 +1351,15 @@ impl ServerState {
     /// Mark a plugin_id as synthetic and persist. Idempotent on membership;
     /// `Ok(true)` if this call added a new entry.
     ///
-    /// The persist is fail-closed and NOT guarded by novelty — the write-side
-    /// mirror of the corrupt-doc load rule. A best-effort save that failed
-    /// silently left the exclusion in memory only: durable member labels
-    /// would mint for this plugin after the next restart, and a novelty
-    /// guard meant no later re-join ever retried the write. The write is
-    /// retried up to `max_attempts` times (law-settable via the vault policy,
-    /// default 3 — see `VaultPolicyState::synthetic_persist_attempts`); if every
-    /// attempt fails the error reaches the caller (which must refuse the
-    /// request), the in-memory entry still stands so THIS run keeps the
-    /// exclusion, and the next declaring join retries the persist again.
+    /// The persist is fail-closed. A member already present was loaded from the vault or
+    /// persisted by an earlier call, so re-marking it writes nothing. If every attempt to
+    /// persist a NEW member fails, this call's insertion is rolled back: in-set therefore
+    /// always implies persisted, and the next connect must retry instead of being admitted.
     pub fn mark_synthetic(&mut self, plugin_id: &str, max_attempts: u32) -> anyhow::Result<bool> {
         let added = self.synthetic_plugins.insert(plugin_id.to_string());
+        if !added {
+            return Ok(false);
+        }
         let attempts = max_attempts.max(1);
         let mut last_err = None;
         for _ in 0..attempts {
@@ -1323,6 +1374,7 @@ impl ServerState {
                 Err(e) => last_err = Some(e),
             }
         }
+        self.synthetic_plugins.remove(plugin_id);
         Err(last_err
             .expect("attempts >= 1 so the loop ran at least once")
             .context(format!(
@@ -2662,6 +2714,31 @@ mod tests {
         (dir, state)
     }
 
+    #[test]
+    fn startup_warms_configured_member_lcts_before_any_connect() {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let mut initial = ServerState::open(vault, dir.path(), "p").unwrap();
+        initial.mark_synthetic("synthetic-seat", 1).unwrap();
+        drop(initial);
+        let seats = dir.path().join("seats");
+        std::fs::create_dir(&seats).unwrap();
+        for name in ["alpha-seat", "beta-seat", "_shared", "synthetic-seat"] {
+            std::fs::write(seats.join(format!("{name}.env")), "# fixture\n").unwrap();
+        }
+        std::fs::write(seats.join("not-a-seat.txt"), "# fixture\n").unwrap();
+
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
+        let alpha = state.member_registry.get("alpha-seat").expect("alpha minted at startup");
+        let beta = state.member_registry.get("beta-seat").expect("beta minted at startup");
+        assert!(alpha.lct_id().starts_with("lct:web4:mb32:"));
+        assert!(beta.lct_id().starts_with("lct:web4:mb32:"));
+        assert!(state.member_registry.get("_shared").is_none());
+        assert!(state.member_registry.get("synthetic-seat").is_none());
+        assert!(state.member_registry.get("not-a-seat").is_none());
+    }
+
     /// B2 (#339): the daemon's chain rows are witnessed by the Society key, name the real
     /// key-derived sovereign LCT rather than the placeholder anchor, and bind the published
     /// policy generation — which moves when the law does.
@@ -3289,6 +3366,30 @@ mod tests {
         assert!(state.is_synthetic("conformance-runner-py"));
         assert!(!state.is_synthetic("claude-code"));
         assert_eq!(state.synthetic_plugins.len(), 2);
+    }
+
+    #[test]
+    fn synthetic_mark_writes_once_and_rolls_back_a_failed_insert() {
+        let dir = TempDir::new().unwrap();
+        let vault_path = dir.path().join("v.enc");
+        let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
+        let mut state = ServerState::open(vault, dir.path(), "p").unwrap();
+        assert!(state.mark_synthetic("repeat-seat", 3).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let before = std::fs::metadata(&vault_path).unwrap().modified().unwrap();
+        for _ in 0..5 {
+            assert!(!state.mark_synthetic("repeat-seat", 3).unwrap());
+        }
+        let after = std::fs::metadata(&vault_path).unwrap().modified().unwrap();
+        assert_eq!(after, before, "an already-persisted id must not re-encrypt the vault");
+
+        state.vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("injected save failure".into())));
+        let err = state.mark_synthetic("retry-seat", 2).expect_err("save must fail");
+        assert!(format!("{err:#}").contains("injected save failure"), "{err:#}");
+        assert!(!state.is_synthetic("retry-seat"), "the failed insert was not rolled back");
+        state.vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        assert!(state.mark_synthetic("retry-seat", 1).unwrap(), "the next connect retries");
+        assert!(state.is_synthetic("retry-seat"));
     }
 
     #[test]

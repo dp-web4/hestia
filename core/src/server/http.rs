@@ -1691,6 +1691,7 @@ pub async fn serve_with_callback(
     bind: &str,
     callback_keypair: Option<web4_core::crypto::KeyPair>,
 ) -> Result<()> {
+    super::api_version::mark_process_started();
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parsing bind address '{}'", bind))?;
@@ -2085,7 +2086,7 @@ pub async fn serve_with_callback(
         // an operator establishes a session; issuing a challenge grants nothing).
         .route("/api/operator/challenge", post(operator_challenge))
         .route("/api/operator/session", post(operator_session))
-        // The app/daemon handshake (web4#904): {version, build_id, api_compat}. Open for the
+        // The app/daemon handshake (web4#904): {version, build_id, api_compat, started_at}. Open for the
         // same reason as the challenge — the app must learn whether it speaks this daemon's
         // API before it can sign in — and it reveals only what `hestia --version` prints.
         // Lock-free; see server/api_version.rs.
