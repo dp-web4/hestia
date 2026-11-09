@@ -462,6 +462,22 @@ mod tests {
     }
 
     #[test]
+    fn documented_standard_roles_and_aliases_parse_but_other_names_fail_closed() {
+        for name in [
+            "sovereign", "law_oracle", "policy_entity", "treasurer", "administrator",
+            "archivist", "citizen", "witness", "auditor",
+        ] {
+            assert!(parse_role(name).is_ok(), "documented standard role rejected: {name}");
+        }
+        for alias in ["laworacle", "law-oracle", "policyentity", "policy-entity", "admin"] {
+            assert!(parse_role(alias).is_ok(), "existing alias rejected: {alias}");
+        }
+        assert!(parse_role("SoVeReIgN").is_ok(), "standard-role case normalization regressed");
+        assert!(parse_role("git-manager").is_err(), "custom names must be explicit");
+        assert_eq!(custom_role("git-manager").unwrap(), SocietyRole::Custom("git-manager".into()));
+    }
+
+    #[test]
     fn custom_role_preserves_case() {
         assert_eq!(
             custom_role(" Git-Manager ").unwrap(),
