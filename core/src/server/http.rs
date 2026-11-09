@@ -726,7 +726,20 @@ fn deployment_update_trigger_for(os: &str, uid: Option<&str>) -> Option<Deployme
 }
 
 fn deployment_update_authority(home: &std::path::Path) -> std::result::Result<(std::path::PathBuf, String, Option<String>), String> {
-    let manifest_path = super::dashboard::deployment_authority_path(home);
+    deployment_update_authority_from(
+        std::env::var_os("HESTIA_CURRENT_BUILD_FILE").as_deref().map(std::path::Path::new),
+        home,
+    )
+}
+
+fn deployment_update_authority_from(
+    configured: Option<&std::path::Path>,
+    home: &std::path::Path,
+) -> std::result::Result<(std::path::PathBuf, String, Option<String>), String> {
+    let manifest_path = super::dashboard::deployment_authority_path_from(configured, home);
+    if let Some(error) = super::dashboard::deployment_authority_file_error(&manifest_path) {
+        return Err(format!("deployment update unavailable: {error}"));
+    }
     let raw = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("deployment update unavailable: cannot read deployment authority: {e}"))?;
     let manifest: serde_json::Value = serde_json::from_str(&raw)
@@ -872,7 +885,7 @@ async fn operator_deployment_update(
     // daemon never fetches, so only the supervisor knows. With the timer off, this request is
     // the box's only way to find out, so it is not short-circuited here ("check for updates").
     // The supervisor syncs, compares, and logs CURRENT without building when nothing moved.
-    let locally_current = super::dashboard::same_deployed_build(
+    let locally_current = crate::server::dashboard::same_deployed_build(
         &authority_build,
         authority_head_sha.as_deref(),
         env!("HESTIA_GIT_VERSION"),
@@ -1655,6 +1668,42 @@ mod deployment_update_tests {
     #[test]
     fn unsupported_platform_has_no_shell_fallback() {
         assert_eq!(deployment_update_trigger_for("windows", None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_update_authority_is_fail_visible_and_home_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_home = dir.path().join("server");
+        let install_home = dir.path().join("install");
+        std::fs::create_dir_all(&server_home).unwrap();
+        std::fs::create_dir_all(&install_home).unwrap();
+        let running = env!("HESTIA_GIT_VERSION");
+        std::fs::write(server_home.join("current-build.json"), r#"{"build_id":"wrong-home-build"}"#).unwrap();
+        let install_manifest = install_home.join("current-build.json");
+        std::fs::write(&install_manifest, format!(r#"{{"build_id":"{running}"}}"#)).unwrap();
+
+        let (home, build, _) = deployment_update_authority_from(None, &server_home).unwrap();
+        assert_eq!(home, server_home);
+        assert_eq!(build, "wrong-home-build");
+        assert!(!crate::server::dashboard::same_deployed_build(&build, None, running));
+        let (home, build, _) = deployment_update_authority_from(Some(&install_manifest), &server_home).unwrap();
+        assert_eq!(home, install_home);
+        assert_eq!(build, running);
+        assert!(crate::server::dashboard::same_deployed_build(&build, None, running));
+
+        for partial in ["{", "{}"] {
+            std::fs::write(&install_manifest, partial).unwrap();
+            assert!(deployment_update_authority_from(Some(&install_manifest), &server_home).is_err());
+        }
+        let linked_home = dir.path().join("linked");
+        std::fs::create_dir_all(&linked_home).unwrap();
+        let linked_manifest = linked_home.join("current-build.json");
+        std::os::unix::fs::symlink(&install_manifest, &linked_manifest).unwrap();
+        let error = deployment_update_authority_from(None, &linked_home).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(!linked_home.join("deploy-update.request").exists(),
+                "invalid authority must not create an update request");
     }
 
     #[test]

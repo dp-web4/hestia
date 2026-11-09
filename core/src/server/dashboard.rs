@@ -606,10 +606,21 @@ pub(super) fn deployment_authority_path(home: &Path) -> std::path::PathBuf {
     )
 }
 
-fn deployment_authority_path_from(configured: Option<&Path>, home: &Path) -> std::path::PathBuf {
+pub(super) fn deployment_authority_path_from(configured: Option<&Path>, home: &Path) -> std::path::PathBuf {
     configured
         .map(Path::to_path_buf)
         .unwrap_or_else(|| home.join("current-build.json"))
+}
+
+pub(super) fn deployment_authority_file_error(path: &Path) -> Option<String> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return Some("deployment authority must not be a symlink".into());
+    }
+    if !metadata.is_file() {
+        return Some("deployment authority must be a regular file".into());
+    }
+    None
 }
 
 fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
@@ -631,6 +642,23 @@ fn deployment_health_from_path(path: Option<&Path>) -> DeploymentHealth {
             check_capable: false,
         };
     };
+    if let Some(error) = deployment_authority_file_error(path) {
+        return DeploymentHealth {
+            state: "unknown".into(),
+            running_build,
+            current_build: None,
+            note: error.clone(),
+            update_capable: false,
+            update_state: "unavailable".into(),
+            update_request_id: None,
+            update_note: Some(error),
+            gate_engine: GateEngineHealth::default(),
+            auto_update: String::new(),
+            last_cycle: None,
+            check: None,
+            check_capable: false,
+        };
+    }
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) => {
@@ -2131,6 +2159,48 @@ mod tests {
         let current = deployment_health_from_path(Some(&manifest));
         assert_eq!(current.state, "current");
         assert_eq!(current.current_build.as_deref(), Some(running));
+    }
+
+    #[test]
+    fn deployment_health_does_not_conflate_wrong_home_and_explicit_override() {
+        let dir = TempDir::new().unwrap();
+        let server_home = dir.path().join("server");
+        let install_home = dir.path().join("install");
+        std::fs::create_dir_all(&server_home).unwrap();
+        std::fs::create_dir_all(&install_home).unwrap();
+        let running = env!("HESTIA_GIT_VERSION");
+        std::fs::write(server_home.join("current-build.json"), r#"{"build_id":"wrong-home-build"}"#).unwrap();
+        let install_manifest = install_home.join("current-build.json");
+        std::fs::write(&install_manifest, format!(r#"{{"build_id":"{running}"}}"#)).unwrap();
+
+        let server_path = deployment_authority_path_from(None, &server_home);
+        assert_eq!(server_path, server_home.join("current-build.json"));
+        assert_eq!(deployment_health_from_path(Some(&server_path)).state, "stale");
+        let override_path = deployment_authority_path_from(Some(&install_manifest), &server_home);
+        assert_eq!(override_path, install_manifest);
+        assert_eq!(deployment_health_from_path(Some(&override_path)).state, "current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_health_rejects_partial_and_symlinked_authority() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing.json");
+        assert_eq!(deployment_health_from_path(Some(&missing)).state, "unknown");
+
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, "{").unwrap();
+        assert_eq!(deployment_health_from_path(Some(&manifest)).state, "unknown");
+        std::fs::write(&manifest, "{}").unwrap();
+        assert_eq!(deployment_health_from_path(Some(&manifest)).state, "unknown");
+
+        std::fs::write(&manifest, format!(r#"{{"build_id":"{}"}}"#, env!("HESTIA_GIT_VERSION"))).unwrap();
+        let linked = dir.path().join("linked.json");
+        std::os::unix::fs::symlink(&manifest, &linked).unwrap();
+        let health = deployment_health_from_path(Some(&linked));
+        assert_eq!(health.state, "unknown");
+        assert!(health.note.contains("symlink"));
+        assert!(!health.update_capable);
     }
 
     #[test]
