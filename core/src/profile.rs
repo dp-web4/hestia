@@ -260,6 +260,13 @@ impl ProfileLink {
                 .is_some_and(|evidence| !evidence.trim().is_empty()),
         }
     }
+
+    fn projection_is_safe(&self, tier: &Visibility) -> bool {
+        self.visibility.permits(tier)
+            && (!matches!(tier, Visibility::Member)
+                || !matches!(self.visibility, Visibility::Member)
+                || matches!(self.owner, ProfileOwner::Member))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -292,12 +299,14 @@ impl ProfileStore {
         self.links.len() < len
     }
 
-    /// Current, evidenced links visible at a given tier.
+    /// Current, evidenced links safe to project at a given tier. Legacy claimed links remain
+    /// visible; self-/attester-verified links with missing evidence do not. A foreign-owned
+    /// member-only link stays hidden because this API has no shared-membership proof.
     pub fn links_for_tier(&self, tier: &Visibility) -> Vec<&ProfileLink> {
         let now = Utc::now();
         self.links
             .iter()
-            .filter(|l| l.is_current(now) && l.verification_is_evidenced() && l.visibility.permits(tier))
+            .filter(|l| l.is_current(now) && l.verification_is_evidenced() && l.projection_is_safe(tier))
             .collect()
     }
 
@@ -310,7 +319,7 @@ impl ProfileStore {
                 l.is_current(now)
                     && l.verification_is_evidenced()
                     && l.platform.is_professional()
-                    && l.visibility.permits(tier)
+                    && l.projection_is_safe(tier)
             })
             .collect()
     }
@@ -581,9 +590,14 @@ mod tests {
         );
         store.add_link(
             ProfileLink::new(Platform::Slack, "https://chat.example/members", Visibility::Member)
-                .with_owner(ProfileOwner::Role(Uuid::new_v4()))
                 .with_label("Members")
                 .with_attestation(attester, "chain:attestation")
+                .unwrap(),
+        );
+        store.add_link(
+            ProfileLink::new(Platform::Slack, "https://chat.example/foreign-members", Visibility::Member)
+                .with_owner(ProfileOwner::Role(Uuid::new_v4()))
+                .with_attestation(attester, "chain:foreign-attestation")
                 .unwrap(),
         );
         store.add_link(ProfileLink::new(
@@ -602,7 +616,12 @@ mod tests {
         assert_eq!(links[1].visibility, Visibility::Member);
         assert!(matches!(links[1].verification, Verification::Attested { by } if by == attester));
         assert_eq!(links[1].verification_evidence.as_deref(), Some("chain:attestation"));
+        assert_eq!(links[1].owner, ProfileOwner::Member);
         assert!(links.iter().all(|link| link.platform == "slack"));
+        assert!(links.iter().all(|link| link.url != "https://chat.example/foreign-members"));
+        assert!(store.hub_fields().values().all(|url| url != "https://chat.example/foreign-members"));
+        assert_eq!(store.present(&Visibility::Private).links.len(), 4,
+                   "external projection restrictions must not erase local/private access");
     }
 
     #[test]
@@ -655,6 +674,56 @@ mod tests {
         assert_eq!(links[0].owner, ProfileOwner::Member);
         assert_eq!(links[0].visibility, Visibility::Public);
         assert_eq!(links[0].verification_evidence, None);
+    }
+
+    #[test]
+    fn legacy_serialized_verification_without_evidence_is_hidden_not_projected() {
+        let legacy = serde_json::json!({
+            "display_name": null,
+            "bio": null,
+            "links": [
+                {
+                    "id": Uuid::nil(),
+                    "platform": "slack",
+                    "url": "https://chat.example/self-naked",
+                    "label": null,
+                    "visibility": "public",
+                    "verification": "self_verified",
+                    "added_at": "2026-01-01T00:00:00Z"
+                },
+                {
+                    "id": Uuid::new_v4(),
+                    "platform": "zoom",
+                    "url": "https://meet.example/attested-naked",
+                    "label": null,
+                    "visibility": "member",
+                    "verification": {"attested": {"by": Uuid::new_v4()}},
+                    "added_at": "2026-01-01T00:00:00Z"
+                }
+            ]
+        });
+        let store: ProfileStore = serde_json::from_value(legacy).unwrap();
+        assert!(store.links.iter().all(|link| !link.verification_is_evidenced()));
+        assert!(store.hub_links().is_empty());
+        assert!(store.hub_fields().is_empty(), "the legacy flattened projection must not leak naked endpoints");
+    }
+
+    #[test]
+    fn lifecycle_boundaries_are_exact() {
+        let now = Utc::now();
+        let mut link = ProfileLink::new(Platform::Zoom, "https://meet.example/boundary", Visibility::Public)
+            .with_expiry(now);
+        assert!(!link.is_current(now), "expiry at this instant is no longer current");
+        link.expires_at = Some(now - chrono::Duration::nanoseconds(1));
+        assert!(!link.is_current(now), "one nanosecond before expiry is already expired");
+        link.expires_at = Some(now + chrono::Duration::nanoseconds(1));
+        assert!(link.is_current(now), "one nanosecond after expiry is still current");
+        link.expires_at = None;
+        assert!(link.is_current(now));
+        link.revoke(now);
+        assert!(!link.is_current(now), "revocation at this instant is no longer current");
+        link.revoked_at = Some(now - chrono::Duration::nanoseconds(1));
+        assert!(!link.is_current(now), "an earlier revocation is also not current");
     }
 
     #[test]
