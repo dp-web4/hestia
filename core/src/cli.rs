@@ -1770,6 +1770,61 @@ fn cmd_vault_get(home: &std::path::Path, name: &str) -> AnyResult<()> {
     Ok(())
 }
 
+fn vault_rules_for_add(
+    consumer_only: bool,
+    allowed_consumers: &[String],
+    present_to: &[String],
+    present_audience: Option<&str>,
+    present_disclose: Option<&str>,
+    present_max_uses: Option<u32>,
+) -> AnyResult<(hestia::vault::rules::ReleaseRule, Option<hestia::vault::rules::PresentationRule>)> {
+    use hestia::vault::rules::{Disclosure, PresentationAudience, PresentationRule, ReleaseRule};
+
+    let release = if consumer_only || allowed_consumers.is_empty() {
+        ReleaseRule::ConsumerOnly
+    } else {
+        ReleaseRule::Holders { principals: allowed_consumers.to_vec() }
+    };
+    let presentation = if present_to.is_empty() {
+        if present_disclose.is_some() || present_max_uses.is_some() {
+            anyhow::bail!(
+                "--present-disclose / --present-max-uses require --present-to; without a stated \
+                 audience the presentation rule stays unrecorded (presenting escalates to you)"
+            );
+        }
+        None
+    } else {
+        let audience = match present_audience {
+            Some("fixed") => {
+                if present_to.len() != 1 {
+                    anyhow::bail!("--present-audience fixed requires exactly one --present-to")
+                }
+                PresentationAudience::Fixed { verifier: present_to[0].clone() }
+            }
+            Some("any-of") => PresentationAudience::AnyOf { verifiers: present_to.to_vec() },
+            Some(other) => anyhow::bail!(
+                "--present-audience must be fixed|any-of, got '{other}'"
+            ),
+            None if present_to.len() == 1 => {
+                PresentationAudience::Fixed { verifier: present_to[0].clone() }
+            }
+            None => anyhow::bail!(
+                "multiple verifiers require --present-audience fixed|any-of; cardinality does not choose the audience mode"
+            ),
+        };
+        let disclose = match present_disclose {
+            None | Some("derived") => Disclosure::Derived,
+            Some("nothing") => Disclosure::Nothing,
+            Some("full") => Disclosure::FullSecret,
+            Some(other) => anyhow::bail!(
+                "--present-disclose must be nothing|derived|full, got '{other}'"
+            ),
+        };
+        Some(PresentationRule { audience, disclose, max_uses: present_max_uses })
+    };
+    Ok((release, presentation))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_vault_add(
     home: &std::path::Path,
@@ -1783,56 +1838,14 @@ fn cmd_vault_add(
     present_disclose: Option<String>,
     present_max_uses: Option<u32>,
 ) -> AnyResult<()> {
-    use hestia::vault::rules::{Disclosure, PresentationAudience, PresentationRule, ReleaseRule};
-
-    // §7.1 axis 1 — release rule, recorded at issuance. `--consumer-only` is the default rule;
-    // `--consumer x` records an explicit holder set; neither leaves the legacy list to decide.
-    let release = if consumer_only || allowed_consumers.is_empty() {
-        Some(ReleaseRule::ConsumerOnly)
-    } else {
-        Some(ReleaseRule::Holders { principals: allowed_consumers.clone() })
-    };
-
-    // §7.1 axis 2 — presentation rule. Built ONLY when --present-to is given; otherwise it stays
-    // unrecorded, which means "escalate on presentation", which is the safe default we do not
-    // silently overwrite.
-    let presentation = if present_to.is_empty() {
-        if present_disclose.is_some() || present_max_uses.is_some() {
-            anyhow::bail!(
-                "--present-disclose / --present-max-uses require --present-to; without a stated \
-                 audience the presentation rule stays unrecorded (presenting escalates to you)"
-            );
-        }
-        None
-    } else {
-        let audience = match present_audience.as_deref() {
-            Some("fixed") => {
-                if present_to.len() != 1 {
-                    anyhow::bail!("--present-audience fixed requires exactly one --present-to")
-                }
-                PresentationAudience::Fixed { verifier: present_to[0].clone() }
-            }
-            Some("any-of") => PresentationAudience::AnyOf { verifiers: present_to.clone() },
-            Some(other) => anyhow::bail!(
-                "--present-audience must be fixed|any-of, got '{other}'"
-            ),
-            None if present_to.len() == 1 => {
-                PresentationAudience::Fixed { verifier: present_to[0].clone() }
-            }
-            None => anyhow::bail!(
-                "multiple verifiers require --present-audience fixed|any-of; cardinality does not choose the audience mode"
-            ),
-        };
-        let disclose = match present_disclose.as_deref() {
-            None | Some("derived") => Disclosure::Derived, // sensible default for a presentable
-            Some("nothing") => Disclosure::Nothing,
-            Some("full") => Disclosure::FullSecret,
-            Some(other) => anyhow::bail!(
-                "--present-disclose must be nothing|derived|full, got '{other}'"
-            ),
-        };
-        Some(PresentationRule { audience, disclose, max_uses: present_max_uses })
-    };
+    let (release, presentation) = vault_rules_for_add(
+        consumer_only,
+        &allowed_consumers,
+        &present_to,
+        present_audience.as_deref(),
+        present_disclose.as_deref(),
+        present_max_uses,
+    )?;
 
     let mut vault = open_vault(home)?;
     let secret = prompt_secret()?;
@@ -1840,9 +1853,7 @@ fn cmd_vault_add(
         .with_scope(scope)
         .with_tags(tag)
         .with_consumers(allowed_consumers);
-    if let Some(r) = release {
-        entry = entry.with_release_rule(r);
-    }
+    entry = entry.with_release_rule(release);
     if let Some(p) = presentation {
         entry = entry.with_presentation_rule(p);
     }
@@ -1859,6 +1870,59 @@ fn cmd_vault_add(
         if recorded_present { "recorded" } else { "UNRECORDED — presenting escalates to you (§7.1)" }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod vault_add_tests {
+    use super::*;
+    use hestia::vault::rules::{PresentationAudience, ReleaseRule};
+
+    #[test]
+    fn no_explicit_consumer_or_presenter_stays_closed_and_unrecorded() {
+        let (release, presentation) = vault_rules_for_add(false, &[], &[], None, None, None).unwrap();
+        assert_eq!(release, ReleaseRule::ConsumerOnly);
+        assert!(presentation.is_none(), "an unstated presenter escalates rather than publishing");
+        let entry = VaultEntry::new("k", "s")
+            .with_release_rule(release)
+            .with_consumers(Vec::new());
+        assert!(!entry.allows("claude-code"));
+        assert!(!entry.allows("kimi-code"), "the new default cannot become more permissive");
+    }
+
+    #[test]
+    fn explicit_consumers_keep_their_exact_legacy_release_outcome() {
+        let consumers = vec!["claude-code".to_string()];
+        let (release, presentation) = vault_rules_for_add(false, &consumers, &[], None, None, None).unwrap();
+        assert_eq!(release, ReleaseRule::Holders { principals: consumers.clone() });
+        assert!(presentation.is_none());
+        let entry = VaultEntry::new("k", "s")
+            .with_release_rule(release)
+            .with_consumers(consumers);
+        assert!(entry.allows("claude-code"));
+        assert!(!entry.allows("kimi-code"));
+    }
+
+    #[test]
+    fn audience_mode_is_explicit_and_capped_fixed_is_not_self_sufficient() {
+        let verifiers = vec!["hub-a".to_string(), "hub-b".to_string()];
+        assert!(vault_rules_for_add(false, &[], &verifiers, None, None, None).is_err());
+        let (_, any_of) = vault_rules_for_add(
+            false, &[], &verifiers, Some("any-of"), None, None,
+        ).unwrap();
+        let any_of = any_of.unwrap();
+        assert!(matches!(any_of.audience, PresentationAudience::AnyOf { .. }));
+        assert!(!any_of.is_self_sufficient());
+
+        let verifier = vec!["github.com".to_string()];
+        let (_, capped) = vault_rules_for_add(
+            false, &[], &verifier, Some("fixed"), None, Some(1),
+        ).unwrap();
+        assert!(!capped.unwrap().is_self_sufficient());
+        let (_, uncapped) = vault_rules_for_add(
+            false, &[], &verifier, Some("fixed"), None, None,
+        ).unwrap();
+        assert!(uncapped.unwrap().is_self_sufficient());
+    }
 }
 
 fn cmd_vault_remove(home: &std::path::Path, name: &str) -> AnyResult<()> {
