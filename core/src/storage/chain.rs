@@ -51,6 +51,14 @@ pub struct ChainEntry {
     pub chain_position: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryPage {
+    pub entries: Vec<ChainEntry>,
+    /// Exclusive cursor for the next older page; `None` means the filtered floor was reached.
+    pub before_position: Option<u64>,
+    pub scanned: u64,
+}
+
 /// One chain row, borrowed for the lifetime of a [`SqliteChainStore::scan_recent`]
 /// projection callback.
 ///
@@ -1642,6 +1650,81 @@ impl SqliteChainStore {
             out.push(row??);
         }
         Ok(out)
+    }
+
+    /// One backward page of member-readable history (#497). All filters apply in SQL,
+    /// before the cap, so `hasMore` describes the filtered set rather than the raw tail.
+    pub fn scan_history_before(
+        &self,
+        before_position: Option<u64>,
+        event_types: Option<&[&str]>,
+        tool_name: Option<&str>,
+        plugin_id: Option<&str>,
+        limit: u64,
+    ) -> Result<HistoryPage> {
+        if matches!(event_types, Some(types) if types.is_empty()) {
+            return Ok(HistoryPage { entries: Vec::new(), before_position: None, scanned: 0 });
+        }
+        let limit = limit.clamp(1, 500);
+        let conn = self.observed(&self.read_conn)?;
+        let mut where_parts = vec!["chain_position < ?".to_string()];
+        if let Some(types) = event_types {
+            where_parts.push(format!("event_type IN ({})", vec!["?"; types.len()].join(",")));
+        }
+        if tool_name.is_some() {
+            where_parts.push("json_extract(event_data, '$.tool_name') = ?".to_string());
+        }
+        if plugin_id.is_some() {
+            where_parts.push(
+                "COALESCE(json_extract(event_data, '$.plugin_id'),
+                          json_extract(event_data, '$.from_plugin_id'),
+                          json_extract(event_data, '$.requested_by.plugin_id')) = ?".to_string(),
+            );
+        }
+        let from_sql = if event_types.is_some() {
+            "chain_entries INDEXED BY idx_chain_event_type"
+        } else {
+            "chain_entries"
+        };
+        let sql = format!(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM {from_sql} WHERE {}
+             ORDER BY chain_position DESC LIMIT ?",
+            where_parts.join(" AND ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let before = before_position.unwrap_or(u64::MAX);
+        binds.push(Box::new(i64::try_from(before).unwrap_or(i64::MAX)));
+        if let Some(types) = event_types {
+            for event_type in types {
+                binds.push(Box::new(event_type.to_string()));
+            }
+        }
+        if let Some(tool) = tool_name {
+            binds.push(Box::new(tool.to_string()));
+        }
+        if let Some(member) = plugin_id {
+            binds.push(Box::new(member.to_string()));
+        }
+        binds.push(Box::new((limit + 1) as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut rows = stmt.query_map(refs.as_slice(), row_to_entry)?;
+        let mut entries = Vec::new();
+        let mut oldest_scanned = None;
+        let mut scanned = 0u64;
+        let mut continuation = None;
+        while let Some(row) = rows.next() {
+            if scanned == limit {
+                continuation = oldest_scanned;
+                break;
+            }
+            let entry = row??;
+            scanned += 1;
+            oldest_scanned = Some(entry.chain_position);
+            entries.push(entry);
+        }
+        Ok(HistoryPage { entries, before_position: continuation, scanned })
     }
 
     /// Every `appeal` and `adjudication` row about one deny, with no recency window (#164).

@@ -17,6 +17,7 @@ use rmcp::{
     service::{RequestContext, RoleServer},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -119,6 +120,7 @@ impl ServerHandler for HestiaServer {
             "hestia_gate_arbitrate_escalation" => tool_gate_arbitrate_escalation(&self.state, &args).await,
             "hestia_scope_arbitrate" => tool_scope_arbitrate(&self.state, &args).await,
             "hestia_witness_decision" => tool_witness_decision(&self.state, &args).await,
+            "hestia_cross_chain_checkpoint" => tool_cross_chain_checkpoint(&self.state, &args).await,
             "hestia_query_policy" => tool_query_policy(&self.state, &args).await,
             "hestia_operating_law" => tool_operating_law(&self.state, &args).await,
             "hestia_vault_get" => tool_vault_get(&self.state, &args).await,
@@ -418,7 +420,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_arbitrate_appeal",
-            "Rule on another member's filed appeal (NOT-SAME, enforced: never your own appeal, never a deny your own gate issued). Requires an explicit upheld:true/false and stated reasoning; records the independence of the arbiter so a reader can weigh the ruling",
+            "Rule on another member's filed appeal (NOT-SAME, enforced: never your own appeal, never a deny your own gate issued). Requires an explicit upheld:true/false and stated reasoning; records the independence of the arbiter so a reader can weigh the ruling. Upheld also records an operator-addressed law_amendment_proposed linked to the appeal and current law; it proposes only and never changes enforcement automatically",
         ),
         t(
             "hestia_my_appeals",
@@ -674,6 +676,25 @@ fn hestia_tools() -> Vec<Tool> {
                 }
             }),
         ),
+        t_args(
+            "hestia_cross_chain_checkpoint",
+            "Record a signed, provenance-only observation of a foreign chain at an exact position and head. Observer identity and authority are derived from your live session. Competing heads remain distinct; no trust or transitivity is computed.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["foreign_chain_id", "foreign_position", "foreign_head_hash"],
+                "anyOf": [{"required": ["session_id"]}, {"required": ["sessionId"]}],
+                "properties": {
+                    "foreign_chain_id": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Stable foreign chain identity, not a URL."},
+                    "foreign_position": {"type": "integer", "minimum": 0, "description": "Foreign sequence height or chain position."},
+                    "foreign_head_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Exact 64-hex head at that position."},
+                    "foreign_genesis_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Optional genesis hash binding chain identity."},
+                    "observed_at": {"type": "string", "format": "date-time", "description": "Optional RFC3339 observation time; defaults to the daemon's current time."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
+                }
+            }),
+        ),
         t(
             "hestia_query_policy",
             "Query the user's policy for a decision",
@@ -684,14 +705,35 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t("hestia_vault_get", "Request a credential from the vault"),
         t("hestia_vault_set", "Store a credential in the vault"),
-        t(
+        t_args(
             "hestia_query_history",
-            "Query the witness chain. filter.hash = DEREFERENCE one entry by its hash (or an \
-             abbreviation of at least ~8 hex chars) anywhere on the chain — this is how you follow \
-             a pointer you were handed: a mesh notice's hestia://adjudication/<hash>, an appeal's \
-             deny_hash, a ruling cited in your operating law. Without it, filter.limit/tool_name \
-             return only the recent tail, so an older entry reads as absent rather than out of \
-             window",
+            "Query the witness chain. filter.hash dereferences one entry anywhere and ignores page filters. Other filters run in SQL BEFORE the 500-row cap: tool_name, plugin_id, event_type/eventType/type. Page backward with before_position/before/cursor/max_position (exclusive), or offset. Page limit must be at least 1. hasMore and next_before_position describe the filtered set; requested_limit and capped make a clamp visible. Optional session_id/sessionId transport attribution stays outside filter",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "filter": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "hash": {"type": "string", "description": "Whole chain entry hash or unique prefix"},
+                            "limit": {"type": "integer", "minimum": 1, "default": 50, "maximum": 500},
+                            "tool_name": {"type": "string"},
+                            "plugin_id": {"type": "string"},
+                            "event_type": {"type": "string"},
+                            "eventType": {"type": "string"},
+                            "type": {"type": "string"},
+                            "before_position": {"type": "integer", "minimum": 0},
+                            "before": {"type": "integer", "minimum": 0},
+                            "cursor": {"type": "integer", "minimum": 0},
+                            "max_position": {"type": "integer", "minimum": 0},
+                            "offset": {"type": "integer", "minimum": 0}
+                        }
+                    },
+                    "session_id": {"type": "string", "description": "Optional transport attribution from an SDK client; not a history filter."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; not a history filter."}
+                }
+            }),
         ),
         t(
             "hestia_request_witness",
@@ -2524,7 +2566,10 @@ async fn tool_vault_set(state: &SharedState, args: &Value) -> ToolResult {
 ///
 /// Refuse rather than echo. An echo of the effective limit still lets a caller who
 /// does not read the echo walk away with 50.
-const QUERY_FILTER_KEYS: [&str; 3] = ["limit", "hash", "tool_name"];
+const QUERY_FILTER_KEYS: [&str; 12] = [
+    "limit", "hash", "tool_name", "plugin_id", "event_type", "eventType", "type",
+    "before_position", "before", "cursor", "max_position", "offset",
+];
 
 async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
     let misplaced: Vec<&str> = QUERY_FILTER_KEYS
@@ -2553,7 +2598,30 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
         ));
     }
 
+    let misplaced_top: Vec<&str> = args.as_object().into_iter().flat_map(|o| o.keys())
+        .map(String::as_str)
+        .filter(|k| !matches!(*k, "filter" | "session_id" | "sessionId"))
+        .collect();
+    if !misplaced_top.is_empty() {
+        return Ok(hestia_error_envelope(
+            "hestia.query_filter_unknown_key",
+            "query filters belong inside `filter`; only session_id/sessionId may appear beside it; no filter was applied",
+            Some(json!({
+                "unknownKeys": misplaced_top,
+                "honoured": QUERY_FILTER_KEYS,
+                "transportKeys": ["session_id", "sessionId"]
+            })),
+        ));
+    }
+
     let filter = args.get("filter").cloned().unwrap_or(Value::Null);
+    if !filter.is_null() && !filter.is_object() {
+        return Ok(hestia_error_envelope(
+            "hestia.query_filter_unknown_key",
+            "`filter` must be an object; no filter was applied",
+            Some(json!({"honoured": QUERY_FILTER_KEYS})),
+        ));
+    }
 
     // The other half of the same wrong answer. The guard above catches a KNOWN key in the
     // wrong PLACE; this one catches an unknown key in the right place, and both produce the
@@ -2578,14 +2646,11 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
             return Ok(hestia_error_envelope(
                 "hestia.query_filter_unknown_key",
                 &format!(
-                    "{named} is not a filter this chain can honour: the chain is indexed by \
-                     hash and read newest-first, so there is nothing to select an \
-                     escalation_id, request_id or plugin_id on. Served as sent it would be \
-                     DROPPED and you would get an unfiltered window over the tail that looks \
-                     exactly like a filtered answer — so it is refused. To reach a record by \
-                     id use its pointer resource (hestia://escalation/<id>, hestia://scope/<id>, \
-                     hestia://appeal/<hash>), which scans for it; to reach one by chain hash \
-                     use filter.hash, which short-circuits the window."
+                    "{named} is not a filter this chain can honour; no filter was applied. \
+                     The honoured vocabulary is the inputSchema's filter property set, not a \
+                     key guessed from another tool. To reach a record by id use its pointer \
+                     resource (hestia://escalation/<id>, hestia://scope/<id>, \
+                     hestia://appeal/<hash>); to reach one by chain hash use filter.hash."
                 ),
                 Some(json!({
                     "unknownKeys": unknown,
@@ -2597,12 +2662,36 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
         }
     }
 
-    let limit = filter
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(50)
-        .min(500) as usize;
+    let requested_limit = filter.get("limit").and_then(Value::as_u64).unwrap_or(50);
+    let limit = requested_limit.min(500);
     let tool_filter = filter.get("tool_name").and_then(Value::as_str);
+    let member_filter = filter.get("plugin_id").and_then(Value::as_str);
+    let mut event_filter = None;
+    for key in ["event_type", "eventType", "type"] {
+        if let Some(value) = filter.get(key).and_then(Value::as_str) {
+            if event_filter.is_some_and(|existing| existing != value) {
+                return Ok(hestia_error_envelope(
+                    "hestia.query_filter_cursor_conflict",
+                    "event_type, eventType and type are aliases; give one value, not conflicting ones",
+                    Some(json!({"honoured": QUERY_FILTER_KEYS})),
+                ));
+            }
+            event_filter = Some(value);
+        }
+    }
+    let mut before_position = None;
+    for key in ["before_position", "before", "cursor", "max_position"] {
+        if let Some(value) = filter.get(key).and_then(Value::as_u64) {
+            if before_position.is_some_and(|existing| existing != value) {
+                return Ok(hestia_error_envelope(
+                    "hestia.query_filter_cursor_conflict",
+                    "before_position, before, cursor and max_position are aliases; give one position",
+                    Some(json!({"honoured": QUERY_FILTER_KEYS})),
+                ));
+            }
+            before_position = Some(value);
+        }
+    }
 
     let s = state.lock().await;
 
@@ -2619,39 +2708,47 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
     {
         return Ok(resolve_chain_pointer(&s, ptr, None));
     }
-
-    let mut entries = Vec::new();
-    for e in s.recent_chain(limit as u64) {
-        if let Some(tname) = tool_filter {
-            let in_event = e
-                .event_data
-                .get("tool_name")
-                .and_then(Value::as_str)
-                .map(|t| t == tname)
-                .unwrap_or(false);
-            if !in_event {
-                continue;
-            }
-        }
-        entries.push(json!({
-            "hash": e.hash,
-            "prevHash": e.prev_hash,
-            "timestamp": e.timestamp.to_rfc3339(),
-            "eventType": e.event_type,
-            "eventData": e.event_data,
-            "signerLct": e.signer_lct,
-            "chainPosition": e.chain_position,
-        }));
+    if requested_limit == 0 {
+        return Ok(hestia_error_envelope(
+            "hestia.query_filter_limit",
+            "page queries require filter.limit >= 1; zero does not define a page or continuation. \
+             filter.hash is a pointer lookup and ignores page filters",
+            Some(json!({"requested_limit": requested_limit, "minimum": 1})),
+        ));
     }
-    // `hasMore` was the literal `false` on every response, truncated or not, which made it
-    // worse than absent: a caller who DID read it was told the window was complete. It now
-    // reports whether the chain continues below the window that was served. With a
-    // `tool_name` filter that is a statement about the SCAN window, not the match set —
-    // entries below the window were never examined. `limit` is echoed because the 500 cap
-    // silently shortens a deeper request, and the served depth is how a caller tells a
-    // clamp from an exhausted chain.
-    let has_more = s.chain_len() > limit as u64;
-    Ok(json!({"entries": entries, "hasMore": has_more, "limit": limit}))
+    if let Some(offset) = filter.get("offset").and_then(Value::as_u64) {
+        let computed = s.chain_len().saturating_sub(offset);
+        if before_position.is_some_and(|existing| existing != computed) {
+            return Ok(hestia_error_envelope(
+                "hestia.query_filter_cursor_conflict",
+                "offset and an exclusive before-position describe different pages; use only one",
+                Some(json!({"honoured": QUERY_FILTER_KEYS})),
+            ));
+        }
+        before_position = Some(computed);
+    }
+    let event_types = event_filter.map(|event| vec![event]);
+    let page = s.chain_store.scan_history_before(
+        before_position, event_types.as_deref(), tool_filter, member_filter, limit,
+    ).map_err(|e| anyhow::anyhow!("query history: {e}"))?;
+    let entries: Vec<Value> = page.entries.into_iter().map(|e| json!({
+        "hash": e.hash,
+        "prevHash": e.prev_hash,
+        "timestamp": e.timestamp.to_rfc3339(),
+        "eventType": e.event_type,
+        "eventData": e.event_data,
+        "signerLct": e.signer_lct,
+        "chainPosition": e.chain_position,
+    })).collect();
+    Ok(json!({
+        "entries": entries,
+        "hasMore": page.before_position.is_some(),
+        "next_before_position": page.before_position,
+        "limit": limit,
+        "requested_limit": requested_limit,
+        "capped": requested_limit > 500,
+        "scanned": page.scanned,
+    }))
 }
 
 /// Event types the daemon itself writes. `request_witness` must not be able to
@@ -3823,6 +3920,23 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
             ));
         }
     };
+    let deny = if upheld {
+        match s.chain_store.read_by_hash(&deny_hash) {
+            Ok(row) => row,
+            Err(e) => {
+                return Ok(hestia_error_envelope(
+                    "hestia.arbitration_unavailable",
+                    &format!(
+                        "recorded act evidence for {deny_hash} is unavailable: {e}. No ruling was \
+                         recorded; the evidence state is UNKNOWN"
+                    ),
+                    Some(json!({"status": "UNKNOWN", "deny_hash": deny_hash})),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let Some(appeal) = appeals.iter().rev().find(|e| {
         e.event_type == "appeal"
             && e.event_data.get("deny_hash").and_then(Value::as_str) == Some(deny_hash.as_str())
@@ -3960,6 +4074,64 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         }),
     )?;
 
+    let mut amendment_proposal = None;
+    let mut amendment_error = None;
+    if upheld {
+        let rule_id = deny
+            .as_ref()
+            .and_then(|e| {
+                e.event_data
+                    .get("rule_id")
+                    .or_else(|| e.event_data.get("rule_name"))
+                    .or_else(|| e.event_data.get("reason"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("unspecified");
+        let affected_tool = deny
+            .as_ref()
+            .and_then(|e| e.event_data.get("tool_name").and_then(Value::as_str))
+            .unwrap_or("unspecified");
+        let proposal_id = format!("amendment-{}", &entry.hash[..16]);
+        let current_law = json!({
+            "policy_generation": state.published().policy_generation(),
+            "society_policy_hash": s.policy_engine.content_hash(),
+        });
+        match s.append_chain(
+            "law_amendment_proposed",
+            json!({
+                "proposal_id": proposal_id,
+                "parent_appeal_ids": [appeal.hash],
+                "parent_adjudication": entry.hash,
+                "about_deny_hash": deny_hash,
+                "status": "proposed",
+                "addressed_to": "operator",
+                "rule_id": rule_id,
+                "affected_classes": [{"rule_id": rule_id, "tool_name": affected_tool}],
+                "defect": rationale,
+                "proposed_change": rationale,
+                "reviewers": [{"plugin_id": arbiter.plugin_id, "role_lct": arbiter.role_lct,
+                               "independence": independence}],
+                "current_law": current_law,
+                "ratification": Value::Null,
+                "deployment": {"automatic": false, "receipts": []},
+                "note": "an upheld appeal proposes; it does not amend. The operator remains the final composer."
+            }),
+        ) {
+            Ok(proposal) => {
+                amendment_proposal = Some(json!({
+                    "proposal_id": proposal_id,
+                    "witnessEntryHash": proposal.hash,
+                    "status": "proposed",
+                    "addressed_to": "operator",
+                }));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "upheld appeal recorded but amendment proposal failed");
+                amendment_error = Some(e.to_string());
+            }
+        }
+    }
+
     // #459: the ruling's RETURN EDGE. The appeal had an outbound wake (the arbiter
     // was asked to rule) and no way back — until this, a ruled appeal read exactly
     // like an open one to the member who filed it, and the petitioner had to poll
@@ -3981,11 +4153,20 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         "about_deny_hash": deny_hash,
         "upheld": upheld,
         "independence": independence,
+        "amendment_proposal": amendment_proposal,
+        "amendment_error": amendment_error,
         "effect": if upheld {
-            "the appellant's conduct on this deny now scores appeal-upheld 1.0"
+            if let Some(proposal) = &amendment_proposal {
+                format!("the appellant's conduct now scores appeal-upheld 1.0; amendment proposal {} awaits operator ratification, with enforcement unchanged",
+                        proposal["proposal_id"].as_str().unwrap_or(""))
+            } else if let Some(error) = &amendment_error {
+                format!("the appellant's conduct now scores appeal-upheld 1.0, but the amendment proposal could not be recorded: {error}")
+            } else {
+                "the appellant's conduct on this deny now scores appeal-upheld 1.0".to_string()
+            }
         } else {
             "the deny stands; the appellant keeps appeal-filed 0.85 for having disputed it \
-             through the witnessed channel rather than routing around"
+             through the witnessed channel rather than routing around".to_string()
         },
     }))
 }
@@ -4343,6 +4524,113 @@ const WITNESS_DECISION_ACCEPTED_KEYS: &[&str] = &[
     "effects",
     "serves",
 ];
+
+async fn tool_cross_chain_checkpoint(state: &SharedState, args: &Value) -> ToolResult {
+    const ACCEPTED: &[&str] = &[
+        "foreign_chain_id",
+        "foreign_position",
+        "foreign_head_hash",
+        "foreign_genesis_hash",
+        "observed_at",
+        "session_id",
+        "sessionId",
+    ];
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !ACCEPTED.contains(key))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(anyhow::anyhow!(
+                "hestia_cross_chain_checkpoint: unknown argument key(s): {}",
+                unknown.join(", ")
+            ));
+        }
+    }
+    let foreign_chain_id = require_string(args, "foreign_chain_id")?;
+    if foreign_chain_id.trim().is_empty()
+        || foreign_chain_id.len() > 256
+        || foreign_chain_id.chars().any(char::is_control)
+    {
+        return Err(anyhow::anyhow!(
+            "foreign_chain_id must be 1-256 bytes with no control characters"
+        ));
+    }
+    let foreign_position = args
+        .get("foreign_position")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("missing or invalid 'foreign_position' argument"))?;
+    let valid_hash = |value: &str| {
+        value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    };
+    let foreign_head_hash = require_string(args, "foreign_head_hash")?;
+    if !valid_hash(&foreign_head_hash) {
+        return Err(anyhow::anyhow!("foreign_head_hash must be 64 lowercase hex characters"));
+    }
+    let foreign_genesis_hash = optional_string(args, "foreign_genesis_hash");
+    if let Some(hash) = &foreign_genesis_hash {
+        if !valid_hash(hash) {
+            return Err(anyhow::anyhow!("foreign_genesis_hash must be 64 lowercase hex characters"));
+        }
+    }
+    let observed_at = optional_string(args, "observed_at")
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    chrono::DateTime::parse_from_rfc3339(&observed_at)
+        .map_err(|e| anyhow::anyhow!("observed_at must be RFC3339: {e}"))?;
+    let session_id_arg = optional_session_id(args);
+
+    let mut s = state.lock().await;
+    let Some(caller) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.cross_chain_checkpoint_unattributed",
+            "recording a cross-chain observation requires your own live session_id; the observer's identity is derived, never asserted",
+            None,
+        ));
+    };
+    let Some(observer_lct) = s.member_lct(&caller.plugin_id) else {
+        return Ok(hestia_error_envelope(
+            "hestia.cross_chain_checkpoint_observer_unknown",
+            "the live session has no stable member LCT, so no observer identity can be recorded",
+            None,
+        ));
+    };
+    let observer_authority = caller.role_lct;
+    let position = foreign_position.to_string();
+    let preimage = hestia_wire::canonical_cross_chain_checkpoint_preimage(
+        &hestia_wire::CrossChainCheckpointV1Fields {
+            foreign_chain_id: &foreign_chain_id,
+            foreign_position: &position,
+            foreign_head_hash: &foreign_head_hash,
+            foreign_genesis_hash: foreign_genesis_hash.as_deref(),
+            observed_at: &observed_at,
+            observer_lct: &observer_lct,
+            observer_authority: &observer_authority,
+        },
+    );
+    let checkpoint_digest = hex::encode(Sha256::digest(&preimage));
+    let entry = s.append_chain(
+        "cross_chain_checkpoint_v1",
+        json!({
+            "foreign_chain_id": foreign_chain_id,
+            "foreign_position": foreign_position,
+            "foreign_head_hash": foreign_head_hash,
+            "foreign_genesis_hash": foreign_genesis_hash,
+            "observed_at": observed_at,
+            "observer_lct": observer_lct,
+            "observer_authority": observer_authority,
+            "checkpoint_digest": checkpoint_digest,
+        }),
+    )?;
+    Ok(json!({
+        "recorded": true,
+        "provenance_only": true,
+        "witnessEntryHash": entry.hash,
+        "checkpointDigest": checkpoint_digest,
+        "observer_lct": observer_lct,
+        "observer_authority": observer_authority,
+    }))
+}
 
 async fn tool_witness_decision(state: &SharedState, args: &Value) -> ToolResult {
     use super::decision_witness::{bounded_core_digest, Verdict};
@@ -15224,6 +15512,97 @@ mod tests {
     /// an id-less read fail-closed (not "return the newest") so a claims layer can't be built on
     /// confident misattribution; an explicit `?session_id=` resolves the true caller.
     #[tokio::test]
+    async fn cross_chain_checkpoints_are_signed_provenance_and_preserve_competing_heads() {
+        let (_dir, shared) = make_shared_state();
+        let chain_before = shared.lock().await.chain_len();
+        let unattributed = tool_cross_chain_checkpoint(
+            &shared,
+            &json!({
+                "foreign_chain_id": "foreign-chain:alpha",
+                "foreign_position": 42,
+                "foreign_head_hash": "a".repeat(64),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unattributed["_hestia_error"]["code"],
+            "hestia.cross_chain_checkpoint_unattributed"
+        );
+        assert_eq!(shared.lock().await.chain_len(), chain_before, "no unattributed row");
+
+        let connected = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "checkpoint-member",
+                "host_agent": "checkpoint-test",
+                "synthetic": false,
+            }),
+        )
+        .await
+        .unwrap();
+        let session_id = connected["sessionId"].as_str().unwrap();
+        for head in ["a", "c"] {
+            let response = tool_cross_chain_checkpoint(
+                &shared,
+                &json!({
+                    "foreign_chain_id": "foreign-chain:alpha",
+                    "foreign_position": 42,
+                    "foreign_head_hash": head.repeat(64),
+                    "foreign_genesis_hash": "b".repeat(64),
+                    "observed_at": "2026-08-11T03:43:35Z",
+                    "session_id": session_id,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["provenance_only"], true, "{response}");
+            assert!(response.get("trust").is_none(), "no derived trust value: {response}");
+        }
+
+        let s = shared.lock().await;
+        let rows = s.recent_chain(2);
+        assert_eq!(rows.len(), 2, "both competing checkpoints remain");
+        assert_eq!(rows[0].event_data["foreign_head_hash"], "c".repeat(64));
+        assert_eq!(rows[1].event_data["foreign_head_hash"], "a".repeat(64));
+        let chain_id = s.chain_store.chain_id().unwrap();
+        for row in rows {
+            assert_eq!(row.event_type, "cross_chain_checkpoint_v1");
+            assert_eq!(row.event_data["foreign_position"], 42);
+            assert_eq!(row.event_data["observer_authority"], "role:constellation:member");
+            let preimage = hestia_wire::canonical_cross_chain_checkpoint_preimage(
+                &hestia_wire::CrossChainCheckpointV1Fields {
+                    foreign_chain_id: "foreign-chain:alpha",
+                    foreign_position: "42",
+                    foreign_head_hash: row.event_data["foreign_head_hash"].as_str().unwrap(),
+                    foreign_genesis_hash: Some(&"b".repeat(64)),
+                    observed_at: "2026-08-11T03:43:35Z",
+                    observer_lct: row.event_data["observer_lct"].as_str().unwrap(),
+                    observer_authority: "role:constellation:member",
+                },
+            );
+            assert_eq!(
+                row.event_data["checkpoint_digest"],
+                hex::encode(Sha256::digest(&preimage)),
+                "an independent reader reproduces the semantic digest from the record"
+            );
+            let signature = s
+                .chain_store
+                .signature_for(row.chain_position)
+                .unwrap()
+                .expect("the checkpoint is signed");
+            crate::storage::chain::verify_row_signature(
+                &chain_id,
+                row.chain_position,
+                &row.hash,
+                &row.signer_lct,
+                &signature,
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn session_own_fails_closed_under_concurrency_never_guesses_the_newest() {
         let (_dir, shared) = make_shared_state();
         let a = {
@@ -21899,6 +22278,14 @@ mod appeal_tests {
                 "filing must be recognised as an appeal, not read as plain compliance: {:?}",
                 filed_d.temperament.evidence[0].contribution);
 
+        let law_before = state.published().policy_generation();
+        let society_hash_before = {
+            let s = state.lock().await;
+            s.policy_engine.content_hash().to_string()
+        };
+        let operating_law_before = tool_operating_law(&state, &json!({
+            "session_id": arbiter_sid.to_string()
+        })).await.unwrap();
         let ruled = tool_arbitrate_appeal(&state, &json!({
             "deny_hash": deny_hash, "session_id": arbiter_sid.to_string(), "upheld": true,
             "rationale": "the rule targets chaining, not the delete; the deny was over-broad",
@@ -21906,7 +22293,45 @@ mod appeal_tests {
         assert_eq!(ruled.get("upheld").and_then(Value::as_bool), Some(true), "{ruled}");
 
         let window = { state.lock().await.recent_chain(500) };
-        let d = crate::derivation::derive("claude-code", APPELLANT_ROLE, &window);
+        let proposal = window
+            .iter()
+            .find(|e| e.event_type == "law_amendment_proposed")
+            .expect("an upheld appeal must leave an operator-addressed amendment proposal");
+        let appeal = window.iter().find(|e| e.event_type == "appeal").unwrap();
+        assert_eq!(proposal.event_data["parent_appeal_ids"][0], appeal.hash);
+        assert_eq!(proposal.event_data["parent_adjudication"], ruled["witnessEntryHash"]);
+        assert_eq!(proposal.event_data["about_deny_hash"], deny_hash);
+        assert_eq!(proposal.event_data["rule_id"], "test");
+        assert_eq!(proposal.event_data["affected_classes"][0]["tool_name"], "Bash");
+        assert_eq!(proposal.event_data["status"], "proposed");
+        assert_eq!(proposal.event_data["addressed_to"], "operator");
+        assert_eq!(proposal.event_data["reviewers"][0]["independence"], ruled["independence"]);
+        assert!(proposal.event_data["proposed_change"]
+            .as_str().unwrap().contains("chaining"));
+        assert_eq!(proposal.event_data["current_law"]["policy_generation"].as_str(),
+                   Some(law_before.as_str()));
+        assert_eq!(proposal.event_data["current_law"]["society_policy_hash"].as_str(),
+                   Some(society_hash_before.as_str()));
+        assert!(proposal.event_data["ratification"].is_null());
+        assert_eq!(proposal.event_data["deployment"]["automatic"], false);
+
+        let replay = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": arbiter_sid.to_string(), "upheld": true,
+            "rationale": "the rule targets chaining, not the delete; the deny was over-broad",
+        })).await.unwrap();
+        assert_eq!(replay["_hestia_error"]["code"], "hestia.arbitration_already_ruled");
+        let replay_window = { state.lock().await.recent_chain(500) };
+        assert_eq!(replay_window.iter().filter(|e| e.event_type == "adjudication").count(), 1);
+        assert_eq!(replay_window.iter().filter(|e| e.event_type == "law_amendment_proposed").count(), 1);
+        assert_eq!(state.published().policy_generation(), law_before,
+                   "a proposal is not a law amendment: enforcement must not move");
+        assert_eq!(state.lock().await.policy_engine.content_hash(), society_hash_before.as_str());
+        let operating_law_after = tool_operating_law(&state, &json!({
+            "session_id": arbiter_sid.to_string()
+        })).await.unwrap();
+        assert_eq!(operating_law_after["law_hash"], operating_law_before["law_hash"]);
+
+        let d = crate::derivation::derive("claude-code", APPELLANT_ROLE, &replay_window);
         let score = d.temperament.score.expect("measured");
         assert!(d.temperament.evidence[0].contribution.contains("appeal-upheld"),
                 "the ruling did not reach the derivation — if this says appeal-filed, the \
@@ -21915,6 +22340,57 @@ mod appeal_tests {
         assert!(score > filed_score,
                 "upholding an appeal must pay MORE than filing it ({filed_score} -> {score}), \
                  otherwise there is no reason for an arbiter to exist");
+    }
+
+    #[tokio::test]
+    async fn a_failed_amendment_proposal_is_explicit_and_leaves_law_unchanged() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let appellant_sid = seat(&state, "claude-code").await;
+        let arbiter_sid = seat(&state, "codex").await;
+        let deny_hash = seat_deny(&state, "claude-code", appellant_sid, "hestia-gate").await;
+        let filed = tool_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": appellant_sid.to_string(),
+            "reason": "the matched text was data rather than an executable act",
+        })).await.unwrap();
+        assert!(filed.get("_hestia_error").is_none(), "setup appeal: {filed}");
+        let law_before = state.published().policy_generation();
+        let society_hash_before = {
+            let s = state.lock().await;
+            s.policy_engine.content_hash().to_string()
+        };
+        let operating_law_before = tool_operating_law(&state, &json!({
+            "session_id": arbiter_sid.to_string()
+        })).await.unwrap();
+
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_law_amendment_proposal BEFORE INSERT ON chain_entries
+             WHEN NEW.event_type = 'law_amendment_proposed'
+             BEGIN SELECT RAISE(FAIL, 'injected proposal failure'); END;",
+        ).unwrap();
+
+        let ruled = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": deny_hash, "session_id": arbiter_sid.to_string(), "upheld": true,
+            "rationale": "the deny read data as an act, so the appeal should be upheld",
+        })).await.unwrap();
+        assert_eq!(ruled["upheld"], true);
+        assert!(ruled["witnessEntryHash"].is_string(), "the ruling must remain recorded: {ruled}");
+        assert!(ruled["amendment_proposal"].is_null(), "{ruled}");
+        assert!(ruled["amendment_error"].as_str().unwrap().contains("injected proposal failure"));
+        assert!(ruled["effect"].as_str().unwrap().contains("could not be recorded"));
+
+        let window = { state.lock().await.recent_chain(500) };
+        assert_eq!(window.iter().filter(|e| e.event_type == "adjudication").count(), 1);
+        assert_eq!(window.iter().filter(|e| e.event_type == "law_amendment_proposed").count(), 0);
+        assert_eq!(state.published().policy_generation(), law_before);
+        assert_eq!(state.lock().await.policy_engine.content_hash(), society_hash_before.as_str());
+        let operating_law_after = tool_operating_law(&state, &json!({
+            "session_id": arbiter_sid.to_string()
+        })).await.unwrap();
+        assert_eq!(operating_law_after["law_hash"], operating_law_before["law_hash"]);
     }
 
     /// A refused governance write, recorded by THE REAL WRITER, not hand-authored.
@@ -22895,6 +23371,14 @@ mod appeal_tests {
             .await
             .unwrap();
         assert_eq!(by_hash["entry"]["hash"].as_str(), Some(hash.as_str()), "{by_hash}");
+        let zero_limit = tool_query_history(&state, &json!({"filter": {"hash": hash, "limit": 0}}))
+            .await
+            .unwrap();
+        assert_eq!(
+            zero_limit["entry"]["hash"].as_str(),
+            Some(hash.as_str()),
+            "a pointer lookup is not a zero-sized page query: {zero_limit}"
+        );
     }
 
     /// Every test above passes `{"filter": {...}}`, which is why the bare shape survived: the
@@ -22962,7 +23446,13 @@ mod appeal_tests {
             .await
             .unwrap();
 
-        for key in ["escalation_id", "request_id", "plugin_id", "event_type"] {
+        let member = tool_query_history(&state, &json!({
+            "filter": {"plugin_id": "not-the-member", "limit": 5}
+        })).await.unwrap();
+        assert!(member.get("_hestia_error").is_none(), "plugin_id is now honoured: {member}");
+        assert_eq!(member["entries"].as_array().unwrap().len(), 0);
+
+        for key in ["escalation_id", "request_id", "until", "start"] {
             let served = tool_query_history(&state, &json!({"filter": {key: "x", "limit": 5}}))
                 .await
                 .unwrap();
@@ -23057,6 +23547,119 @@ mod appeal_tests {
             Some(false),
             "a window deeper than the chain has nothing below it: {whole}"
         );
+    }
+
+    #[test]
+    fn the_query_history_schema_names_the_honoured_filter_contract() {
+        let tool = hestia_tools().into_iter()
+            .find(|t| t.name == "hestia_query_history")
+            .expect("query_history must be advertised");
+        assert_eq!(tool.input_schema["additionalProperties"], json!(false));
+        let outer = tool.input_schema["properties"].as_object().unwrap();
+        assert!(outer.contains_key("session_id"));
+        assert!(outer.contains_key("sessionId"));
+        let filter = &tool.input_schema["properties"]["filter"];
+        assert_eq!(filter["additionalProperties"], json!(false));
+        assert_eq!(filter["properties"]["limit"]["minimum"], json!(1));
+        let properties = filter["properties"].as_object().unwrap();
+        for key in QUERY_FILTER_KEYS {
+            assert!(properties.contains_key(key), "schema omits `{key}`");
+        }
+    }
+
+    #[tokio::test]
+    async fn query_history_admits_sdk_session_stamps_without_relaxing_filter_guards() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let s = state.lock().await;
+            for i in 0..4 {
+                s.append_chain("outcome", json!({"filler": i})).unwrap();
+            }
+        }
+
+        for key in ["session_id", "sessionId"] {
+            let bare = tool_query_history(&state, &json!({key: "sdk-session"})).await.unwrap();
+            assert!(bare.get("_hestia_error").is_none(), "SDK-shaped bare call: {bare}");
+            let filtered = tool_query_history(&state, &json!({
+                key: "sdk-session", "filter": {"limit": 3}
+            })).await.unwrap();
+            assert!(filtered.get("_hestia_error").is_none(), "SDK-shaped filtered call: {filtered}");
+            assert_eq!(filtered["entries"].as_array().unwrap().len(), 3);
+        }
+
+        let refused = tool_query_history(&state, &json!({
+            "session_id": "sdk-session", "unexpected": true
+        })).await.unwrap();
+        assert_eq!(
+            refused["_hestia_error"]["data"]["unknownKeys"],
+            json!(["unexpected"]),
+            "the transport exception must not admit other outer keys: {refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_history_filters_before_the_cap_and_pages_the_filtered_set_497() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        {
+            let s = state.lock().await;
+            for i in 0..600 {
+                s.append_chain("outcome", json!({
+                    "tool_name": if i < 550 { "Bash" } else { "Read" },
+                    "plugin_id": if i % 2 == 0 { "kimi-code" } else { "codex" },
+                    "success": true
+                })).unwrap();
+            }
+            s.append_chain("member_notice", json!({"from_plugin_id": "mesh-actor"})).unwrap();
+        }
+
+        let first = tool_query_history(&state, &json!({
+            "filter": {"tool_name": "Bash", "limit": 500}
+        })).await.unwrap();
+        assert_eq!(first["entries"].as_array().unwrap().len(), 500);
+        assert!(first["entries"].as_array().unwrap().iter()
+            .all(|e| e["eventData"]["tool_name"] == "Bash"));
+        assert_eq!(first["hasMore"], json!(true));
+        assert_eq!(first["limit"], json!(500));
+        let cursor = first["next_before_position"].as_u64().expect("a second Bash page");
+
+        let second = tool_query_history(&state, &json!({
+            "filter": {"tool_name": "Bash", "limit": 500, "before_position": cursor}
+        })).await.unwrap();
+        assert_eq!(second["entries"].as_array().unwrap().len(), 50);
+        assert_eq!(second["hasMore"], json!(false));
+        assert_eq!(second["next_before_position"], serde_json::Value::Null);
+
+        let notices = tool_query_history(&state, &json!({
+            "filter": {"eventType": "member_notice", "plugin_id": "mesh-actor"}
+        })).await.unwrap();
+        assert_eq!(notices["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(notices["entries"][0]["eventData"]["from_plugin_id"], "mesh-actor");
+        assert_eq!(notices["hasMore"], json!(false));
+
+        let combined = tool_query_history(&state, &json!({
+            "filter": {"event_type": "outcome", "plugin_id": "kimi-code", "tool_name": "Bash", "limit": 500}
+        })).await.unwrap();
+        assert_eq!(combined["entries"].as_array().unwrap().len(), 275);
+
+        let capped = tool_query_history(&state, &json!({"filter": {"limit": 2_000}})).await.unwrap();
+        assert_eq!(capped["limit"], json!(500));
+        assert_eq!(capped["requested_limit"], json!(2_000));
+        assert_eq!(capped["capped"], json!(true));
+
+        let zero = tool_query_history(&state, &json!({"filter": {"limit": 0}})).await.unwrap();
+        assert_eq!(zero["_hestia_error"]["code"], "hestia.query_filter_limit");
+        assert_eq!(zero["_hestia_error"]["data"]["requested_limit"], json!(0));
+        assert!(zero.get("entries").is_none(), "zero must not return one row: {zero}");
+
+        let expected: Vec<_> = state.lock().await.recent_chain(2_000);
+        let offset = tool_query_history(&state, &json!({"filter": {"offset": 500, "limit": 500}})).await.unwrap();
+        assert_eq!(offset["entries"].as_array().unwrap().len(), expected.len() - 500);
+        assert_eq!(offset["entries"][0]["hash"], expected[500].hash);
+
+        let unknown = tool_query_history(&state, &json!({"filter": {"until": 1}})).await.unwrap();
+        assert_eq!(unknown["_hestia_error"]["code"], "hestia.query_filter_unknown_key");
     }
 
     /// The law cites rulings by an eight-character prefix ("adjudication 62cfdffe"). That
