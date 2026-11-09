@@ -3179,6 +3179,26 @@ mod tests {
                 "another account or shared group has no grant: {acl}");
     }
 
+    #[cfg(windows)]
+    fn assert_effective_access(path: &Path) {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tools/windows_acl_effective_probe.ps1");
+        let command = format!("& '{}' -Path '{}'", script.display(), path.display());
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "effective access probe failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
     #[test]
     fn operator_bootstrap_is_bounded_and_no_reentry() {
         #[cfg(windows)]
@@ -3203,6 +3223,8 @@ mod tests {
         }
         #[cfg(windows)]
         assert_current_user_acl(&operator_key_acl(&key));
+        #[cfg(windows)]
+        assert_effective_access(&key);
         let cred: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&key).unwrap()).unwrap();
         assert_eq!(cred["lct_id"], first.clone().unwrap());
@@ -3218,6 +3240,8 @@ mod tests {
         assert_eq!(state.vault.policy().operator_access.len(), 1);
         #[cfg(windows)]
         assert_current_user_acl(&operator_key_acl(&key));
+        #[cfg(windows)]
+        assert_effective_access(&key);
     }
 
     #[cfg(windows)]
@@ -3231,6 +3255,8 @@ mod tests {
         std::fs::write(&key, b"second").unwrap();
         assert_eq!(std::fs::read(&key).unwrap(), b"second");
         assert_current_user_acl(&operator_key_acl(&key));
+        #[cfg(windows)]
+        assert_effective_access(&key);
 
         protect_operator_key(&key).unwrap();
         let acl = operator_key_acl(&key);
@@ -3241,6 +3267,19 @@ mod tests {
             .filter(|line| line.contains("(M)") && line.to_lowercase().contains(&username))
             .count();
         assert_eq!(modify_grants, 1, "reapplication does not duplicate grants: {acl}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_operator_key_accepts_account_names_with_spaces() {
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("operator.key");
+        std::fs::write(&key, b"spaced account").unwrap();
+        protect_operator_key_with_username(&key, Some(r"NT AUTHORITY\NETWORK SERVICE")).unwrap();
+        let acl = operator_key_acl(&key);
+        assert!(acl.to_lowercase().contains("network service") && acl.contains("(M)"),
+                "the spaced account name was granted modify access: {acl}");
+        assert!(!acl.lines().any(|line| line.contains("(I)")), "inherited grants removed: {acl}");
     }
 
     #[cfg(windows)]
@@ -3279,6 +3318,8 @@ mod tests {
         assert!(first.is_some(), "restoring the account permits a clean retry");
         assert!(key.exists());
         assert_current_user_acl(&operator_key_acl(&key));
+        #[cfg(windows)]
+        assert_effective_access(&key);
         assert!(state.bootstrap_operator_if_genesis().unwrap().is_none());
     }
 

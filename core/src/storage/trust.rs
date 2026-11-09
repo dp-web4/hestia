@@ -338,9 +338,15 @@ impl TrustStore {
             let sealed = crypto::seal(&self.dk(), &json).context("sealing trust baseline")?;
             write_durable(&dir.join(name), &sealed)?;
         }
-        std::fs::File::open(&self.base_dir)
-            .and_then(|d| d.sync_all())
-            .with_context(|| format!("syncing {}", self.base_dir.display()))
+        #[cfg(unix)]
+        {
+            std::fs::File::open(&self.base_dir)
+                .and_then(|d| d.sync_all())
+                .with_context(|| format!("syncing {}", self.base_dir.display()))?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Ok(())
     }
 
     /// A migrated home's baseline must read in full: an entity whose cache is lost would otherwise
@@ -537,8 +543,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// [`write_atomic`] made durable: the data, then the rename (the directory), are fsynced. For the
-/// write-once epoch only — the cache files stay unsynced by design.
+/// [`write_atomic`] made durable: the data, then the rename (the directory on Unix), are fsynced.
+/// For the write-once epoch only — the cache files stay unsynced by design.
 fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("tmp");
@@ -548,9 +554,12 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
     if let Some(dir) = path.parent() {
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .with_context(|| format!("syncing {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .with_context(|| format!("syncing {}", dir.display()))?;
+        }
     }
     Ok(())
 }
