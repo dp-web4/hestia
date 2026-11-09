@@ -1427,7 +1427,8 @@ impl SqliteInboxStore {
     }
 
     /// Claim one queued notice for a proven daemon session. Only the recipient may claim it;
-    /// a different session's unexpired lease is a conflict, not an overwrite.
+    /// a different session's unexpired lease is a conflict, not an overwrite. The lease coordinates
+    /// consumption; it does not authenticate the member beyond the existing session resolution.
     pub fn claim_member_notice(
         &self,
         id: u64,
@@ -3779,6 +3780,154 @@ mod tests {
                 .claim_member_notice(id, "kimi-code", owner, 60)
                 .unwrap(),
             MemberNoticeClaimOutcome::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn concurrent_claim_drain_and_expiry_reclaim_have_one_winner_and_one_drain() {
+        let (_tmp, store) = fresh();
+        let store = std::sync::Arc::new(store);
+        let id = store
+            .enqueue_member(
+                "kimi-code",
+                "claude-code",
+                "role:constellation:interactive-dev",
+                "review_request",
+                Some("forum/race.md#thread=t"),
+                "hash-race",
+                None,
+            )
+            .unwrap();
+        let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for session in [owner, bystander] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                (session, store.claim_member_notice(id, "kimi-code", session, 60))
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let claimed = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. }))
+        }).count();
+        let conflicts = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. }))
+        }).count();
+        assert_eq!((claimed, conflicts), (1, 1), "one live claim, one conflict: {outcomes:?}");
+        let winner = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. })).then_some(*session)
+        }).unwrap();
+        let loser = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. })).then_some(*session)
+        }).unwrap();
+        assert!(store.drain_member_for_session("kimi-code", loser).unwrap().is_empty());
+        let (drained_at, claimed_by): (Option<String>, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT drained_at, claimed_by_session FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(drained_at, None, "the losing session did not mark a live claim drained");
+        assert_eq!(claimed_by, Some(winner.to_string()));
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(), id as i64],
+            )
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for session in [owner, bystander] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                (session, store.claim_member_notice(id, "kimi-code", session, 60))
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let claimed = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. }))
+        }).count();
+        let conflicts = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. }))
+        }).count();
+        assert_eq!((claimed, conflicts), (1, 1), "expiry permits one successor, not two: {outcomes:?}");
+        let winner = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. })).then_some(*session)
+        }).unwrap();
+        let loser = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. })).then_some(*session)
+        }).unwrap();
+        assert_eq!(store.drain_member_for_session("kimi-code", winner).unwrap().len(), 1);
+        assert!(store.drain_member_for_session("kimi-code", loser).unwrap().is_empty());
+        assert!(matches!(
+            store.claim_member_notice(id, "kimi-code", loser, 60).unwrap(),
+            MemberNoticeClaimOutcome::AlreadyDrained
+        ));
+    }
+
+    #[test]
+    fn a_live_claim_survives_restart_and_prelease_drain_contract_is_explicit() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("inbox.db");
+        let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+        let id = {
+            let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+            let id = store
+                .enqueue_member(
+                    "kimi-code",
+                    "claude-code",
+                    "role:constellation:interactive-dev",
+                    "review_request",
+                    Some("forum/restart.md#thread=t"),
+                    "hash-restart",
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(
+                store.claim_member_notice(id, "kimi-code", owner, 60),
+                Ok(MemberNoticeClaimOutcome::Claimed { .. })
+            ));
+            id
+        };
+
+        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+        assert!(store.drain_member_for_session("kimi-code", bystander).unwrap().is_empty());
+        let (drained_at, claimed_by): (Option<String>, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT drained_at, claimed_by_session FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(drained_at, None, "restart did not leak a bystander drain");
+        assert_eq!(claimed_by, Some(owner.to_string()));
+
+        // Pre-lease store callers retain the old drain behavior deliberately. Production uses
+        // drain_member_for_session; a lease coordinates work, never strengthens member identity.
+        assert_eq!(store.drain_member("kimi-code").unwrap().len(), 1);
+        assert!(matches!(
+            store.claim_member_notice(id, "kimi-code", owner, 60),
+            Ok(MemberNoticeClaimOutcome::AlreadyDrained)
         ));
     }
 
