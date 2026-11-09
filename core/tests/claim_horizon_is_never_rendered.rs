@@ -52,16 +52,15 @@
 //! (kimi-code notice 2632). A peer had to compute the enforcing horizon by hand and deliver
 //! it out-of-band, because no surface of the system that enforces it will say it.
 //!
-//! WHAT THIS FILE IS. Four OPEN-DEFECT PINS, in the hole-J shape: each asserts the
-//! CURRENT WRONG BEHAVIOUR, so each is green while the defect stands and goes RED the moment
-//! it is fixed. A red here is the intended end state, and the failure message says so.
+//! WHAT THIS FILE IS. Historical defect pins, in the hole-J shape: each preserves the
+//! measured defect and, once paid, inverts to a regression assertion. A turned-over pin
+//! keeps its history in place; none are deleted, because the specimen is the durable part.
 //!
 //! TURNOVER LEDGER, so a reader can tell a pin that is still WAITING from one that has been
-//! PAID. A turned-over pin keeps its history in place and inverts its assertion; none are
-//! deleted, because the specimen is the durable part.
+//! PAID.
 //!
-//!   PIN 1        — OPEN.        `retry_within_secs` still emits the supremum at open time.
-//!   PIN 2        — OPEN.        the emitting site still has no decided-anchored deadline.
+//!   PIN 1        — TURNED OVER. `retry_within_secs` is gone from fresh opens.
+//!   PIN 2        — TURNED OVER. the emitting site no longer presents an open-time deadline.
 //!   PIN 4(a)-(c) — TURNED OVER #518/#528. `permits_write` reads `is_claimable(now)` and
 //!                                the poll renders `claim_window_secs_remaining`.
 //!   PIN 4(d)     — TURNED OVER #611, 2026-08-26. The note is produced by
@@ -93,12 +92,12 @@ const T0: u64 = 1_800_000_000;
 /// pin: a fix at the emitting site would have left the arithmetic — and therefore the pin —
 /// untouched and green, reporting an open defect that had been closed. A derived constant
 /// needs its PRODUCER, not a re-derivation that happens to agree today.
-const ADVERTISED_RETRY_EXPR: &str =
+const RETIRED_RETRY_EXPR: &str =
     r#""retry_within_secs": DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS,"#;
 
 /// The expression `tool_gate_escalation_poll` puts on the wire as `permits_write` AFTER #518.
 ///
-/// Producer-bound for the same reason `ADVERTISED_RETRY_EXPR` is: a re-derivation here would
+/// Producer-bound for the same reason `RETIRED_RETRY_EXPR` is: a re-derivation here would
 /// stay green through a change at the emitting site. Inherited from
 /// `permits_write_outlives_the_claim_horizon.rs`, where it named the pre-#518 expression.
 const POLL_PERMITS_WRITE_EXPR: &str =
@@ -213,9 +212,9 @@ fn the_advertised_retry_deadline_is_attainable_in_no_history() {
     // arithmetic about a number nobody emits.
     let body = production_body("server/handler.rs", "tool_gate_escalation_claim");
     assert!(
-        body.contains(ADVERTISED_RETRY_EXPR),
-        "OPEN-DEFECT PIN 1 has gone RED, which is the intended end state. \
-         `tool_gate_escalation_claim` no longer emits `{ADVERTISED_RETRY_EXPR}`. Check the \
+        !body.contains(RETIRED_RETRY_EXPR),
+        "REGRESSION PIN 1: the retired retry countdown returned. \
+         `tool_gate_escalation_claim` still emits `{RETIRED_RETRY_EXPR}`. Check the \
          remedy did NOT simply substitute APPROVAL_CLAIM_WINDOW_SECS, which is equally wrong \
          at open time (`decided_at` is still None there); the honest answer names the ANCHOR \
          — the retry clock starts at the DECISION — rather than any constant."
@@ -289,9 +288,9 @@ fn the_over_report_grows_as_the_decision_gets_faster() {
     // Same producer binding as PIN 1: the magnitudes below are about an emitted number.
     let body = production_body("server/handler.rs", "tool_gate_escalation_claim");
     assert!(
-        body.contains(ADVERTISED_RETRY_EXPR),
-        "OPEN-DEFECT PIN 2 has gone RED, which is the intended end state: the emitting site \
-         no longer carries `{ADVERTISED_RETRY_EXPR}`."
+        !body.contains(RETIRED_RETRY_EXPR),
+        "REGRESSION PIN 2: the retired open-time deadline returned; the emitting site \
+         still carries `{RETIRED_RETRY_EXPR}`."
     );
     let advertised_retry_secs = DEFAULT_TTL_SECS + APPROVAL_CLAIM_WINDOW_SECS;
 
@@ -316,7 +315,7 @@ fn the_over_report_grows_as_the_decision_gets_faster() {
     for w in rows.windows(2) {
         assert!(
             w[0].1 > w[1].1,
-            "OPEN-DEFECT PIN 2 has gone RED, which is the intended end state. The advertised \
+            "REGRESSION PIN 2 has gone RED, which is the intended end state. The advertised \
              retry deadline no longer over-reports in inverse proportion to decision latency \
              (grant +{}s over-reported {}s; grant +{}s over-reported {}s).",
             w[0].0,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 79db46f592c5b9f3d32260485578d6c0c8603f75ec12130beedee5573da4d1ce  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: dfb4ff4ac958a32bec763900a933f139e25ab9fffd3d8e4ce72428ed06e1ff21  (published ground truth; manifest: hooks-gt)
 """hestia-mesh — member-mesh CLI for a local hestia member (Kimi's send/receive surface).
 
 Usage:
@@ -7,6 +7,7 @@ Usage:
   hestia-mesh.py drain                                   # consume-once drain (act on results!)
   hestia-mesh.py send <to_plugin_id> <kind> <pointer_uri> [re_notice_id] [--operation-id ID]
   hestia-mesh.py unanswered [older_than_secs]            # what has no bound response
+  hestia-mesh.py kinds [term]                            # KINDS.md, or its sections naming term
 
 Env: HESTIA_ENDPOINT (default http://127.0.0.1:7711/mcp),
      HESTIA_MESH_TIMEOUT (seconds, default 30 — the daemon serializes all members),
@@ -73,6 +74,46 @@ TIMEOUT = float(os.environ.get("HESTIA_MESH_TIMEOUT", "30"))
 #
 # So: refuse. An unattributable notice is recoverable; a misattributed one is not, because
 # nothing downstream can tell it from a true one. Fail closed on identity.
+def kinds(argv):
+    """Print the KINDS.md installed beside this file: whole, or only the sections naming a term.
+
+    #1503: the wake hook told every member to "act per KINDS.md", and the only copy a member had
+    was the installed one under $HESTIA_HOME/deploy, which no member grant reaches, so reading it
+    opened an operator scope request each time. Through this command the member reads it as
+    `hestia-mesh kinds`, with no path in the act. realpath, because ~/.local/bin/hestia-mesh is a
+    link to this file and KINDS.md sits beside the target, not the link.
+
+    It runs before the identity guard below on purpose: it reads one local file, opens no session
+    and sends nothing, so there is no act to attribute."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "KINDS.md")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError as e:
+        sys.stderr.write(f"hestia-mesh: cannot read {path}: {e}\n")
+        return 1
+    term = " ".join(argv).strip().lower()
+    if not term:
+        sys.stdout.write(text)
+        return 0
+    sections, cur = [], []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("#") and cur:
+            sections.append("".join(cur))
+            cur = []
+        cur.append(line)
+    if cur:
+        sections.append("".join(cur))
+    hits = [sec for sec in sections if term in sec.lower()]
+    if not hits:
+        sys.stderr.write(f"hestia-mesh: no KINDS.md section mentions {term!r}\n")
+        return 1
+    sys.stdout.write("\n".join(h.rstrip("\n") + "\n" for h in hits))
+    return 0
+
+
+if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "kinds":
+    sys.exit(kinds(sys.argv[2:]))
+
 PLUGIN = os.environ.get("HESTIA_MESH_PLUGIN", "").strip()
 if not PLUGIN:
     sys.stderr.write(
@@ -80,7 +121,9 @@ if not PLUGIN:
         "  This CLI speaks AS a member: every act it sends is witnessed under that identity.\n"
         "  Guessing would file your work in another member's trust record.\n"
         "  Set it to your own member id, e.g.:  HESTIA_MESH_PLUGIN=claude-code "
-        + " ".join([os.path.basename(sys.argv[0])] + sys.argv[1:]) + "\n"
+        # HESTIA_MESH_PROG: `hestia mesh` runs this file as `python3 -c`, where argv[0] is "-c" (#1503).
+        + " ".join([os.environ.get("HESTIA_MESH_PROG") or os.path.basename(sys.argv[0])] + sys.argv[1:])
+        + "\n"
     )
     sys.exit(2)
 # Derived from the identity above, so it cannot drift to a different member than PLUGIN.
