@@ -233,7 +233,7 @@ impl PolicyPublication {
     /// Resolve a caller-supplied session id. FAIL-CLOSED like `resolve_attributed_caller`.
     pub fn resolve(&self, session_id: Option<&str>) -> Option<CallerIdent> {
         let uuid = Uuid::parse_str(session_id?).ok()?;
-        let id = self.sessions.get(&uuid)?;
+        let id = self.sessions.resolve_live(&uuid, Utc::now())?;
         Some(CallerIdent {
             session_uuid: uuid,
             plugin_id: id.plugin_id.clone(),
@@ -349,6 +349,7 @@ struct DirInner {
     by_id: HashMap<Uuid, Arc<SessionIdent>>,
     /// The reuse key: (claimed member, host session id) — never the host id alone (Guard C).
     by_reuse_key: HashMap<(String, String), Uuid>,
+    in_flight: HashMap<Uuid, usize>,
 }
 
 #[derive(Default)]
@@ -360,10 +361,41 @@ impl SessionDirectory {
     pub fn get(&self, id: &Uuid) -> Option<Arc<SessionIdent>> {
         self.inner.read().unwrap_or_else(|p| p.into_inner()).by_id.get(id).cloned()
     }
-    pub fn find_reuse(&self, plugin_id: &str, host_session_id: &str) -> Option<Arc<SessionIdent>> {
+    fn is_live(g: &DirInner, id: &Uuid, ident: &SessionIdent, now: DateTime<Utc>) -> bool {
+        g.in_flight.get(id).copied().unwrap_or(0) > 0
+            || ident.last_seen()
+                >= now - chrono::Duration::seconds(super::state::MEMBER_SESSION_IDLE_TTL_SECS)
+    }
+    pub fn resolve_live(&self, id: &Uuid, now: DateTime<Utc>) -> Option<Arc<SessionIdent>> {
+        let g = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let ident = g.by_id.get(id)?;
+        Self::is_live(&g, id, ident, now).then(|| ident.clone())
+    }
+    pub fn find_reuse_live(
+        &self,
+        plugin_id: &str,
+        host_session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Arc<SessionIdent>> {
         let g = self.inner.read().unwrap_or_else(|p| p.into_inner());
         let id = g.by_reuse_key.get(&(plugin_id.to_string(), host_session_id.to_string()))?;
-        g.by_id.get(id).cloned()
+        let ident = g.by_id.get(id)?;
+        Self::is_live(&g, id, ident, now).then(|| ident.clone())
+    }
+    pub fn action_started(&self, id: Uuid) {
+        let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if g.by_id.contains_key(&id) {
+            *g.in_flight.entry(id).or_default() += 1;
+        }
+    }
+    pub fn action_finished(&self, id: Uuid) {
+        let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = g.in_flight.get_mut(&id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                g.in_flight.remove(&id);
+            }
+        }
     }
     fn apply(&self, ops: Vec<DirOp>) {
         let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
