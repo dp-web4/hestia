@@ -1333,8 +1333,14 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/handler.rs::tool_connect", &[
         "crate::member_registry::ensure_member(",
     ]),
+    // Startup preloading is a producer, not an authorization decision. It mints only the
+    // durable LCT that the member's first connect would mint later; synthetic and shared
+    // pseudo-seat exclusions stay explicit, and no session, role or grant is created.
+    ("server/state.rs::warm_configured_members", &[
+        "crate::member_registry::ensure_member(",
+    ]),
     ("server/state.rs::open", &[
-        "let member_registry = crate::member_registry::load_members(&vault);",
+        "let mut member_registry = crate::member_registry::load_members(&vault);",
     ]),
 ];
 
