@@ -11543,6 +11543,49 @@ mod accountability_tests {
     }
 
     #[tokio::test]
+    async fn adjudication_without_role_lands_on_the_default_grain() {
+        let (_dir, state) = test_state().await;
+        let caller = tool_connect(
+            &state,
+            &json!({"plugin_id":"claude-code","host_agent":"t",
+                    "role":"role:constellation:interactive-dev"}),
+        )
+        .await
+        .unwrap();
+        let default_role = crate::reputation::DEFAULT_CONSTELLATION_ROLE;
+        let sibling_role = "role:constellation:reviewer";
+        let (default_before, sibling_before) = {
+            let s = state.lock().await;
+            (
+                s.adjudicated_for_role("worker-agent", default_role).validity(),
+                s.adjudicated_for_role("worker-agent", sibling_role).validity(),
+            )
+        };
+        let out = tool_witness_adjudication(
+            &state,
+            &json!({"subject_plugin_id":"worker-agent",
+                    "axis":"validity","verdict":"upheld","method":"review",
+                    "ref":"pr:web4#100","session_id":caller["sessionId"]}),
+        )
+        .await
+        .unwrap();
+        assert!(out.get("_hestia_error").is_none(), "{out}");
+
+        let s = state.lock().await;
+        let event = s
+            .recent_chain(5)
+            .into_iter()
+            .find(|entry| entry.event_type == "adjudication")
+            .expect("adjudication witnessed");
+        assert_eq!(event.event_data["subject_role"], default_role);
+        assert!(s.adjudicated_for_role("worker-agent", default_role).validity() > default_before);
+        assert_eq!(
+            s.adjudicated_for_role("worker-agent", sibling_role).validity(),
+            sibling_before
+        );
+    }
+
+    #[tokio::test]
     async fn veracity_is_daemon_computed_calibration_over_the_explicit_claim() {
         let (_dir, state) = test_state().await;
         let me = tool_connect(
