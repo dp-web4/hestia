@@ -136,9 +136,11 @@ def source_contract() -> None:
     # sabotage that mattered.
     check("the route refuses without reason and ref", "reason and ref are required" in RS)
     check("the guard's scan is RESTRICTED to the agent's own act types",
-          "scan_recent(Some(cutoff), Some(AGENT_ACT_EVENTS), 50_000" in RS)
+          "scan_recent_page(Some(cutoff), Some(AGENT_ACT_EVENTS), None," in RS)
     check("...the types the operator's own act count is built from",
           'const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];' in RS)
+    check("a bounded page cannot silently truncate retirement activity",
+          "page.before_position.is_some()" in RS and "ROUTINE_CHAIN_MAX" in RS)
     # The guard must not fail open (cbp, PR #1100, finding 4): unmeasurable is a refusal.
     check("an unreadable chain is Err, never zero", "-> Result<usize, String> {" in RS and ".map_err(|e| e.to_string())" in RS)
     check("...and the guard names it", '"unmeasurable": true' in RS)
