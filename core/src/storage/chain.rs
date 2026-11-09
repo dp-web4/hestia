@@ -1616,6 +1616,7 @@ impl SqliteChainStore {
 
     /// Unruled appeals in the position window, newest first (#488). The anti-join
     /// projects only the open queue rather than parsing every appeal and ruling.
+    /// Only a later adjudication closes an appeal; an earlier ruling must not hide a new one.
     pub fn open_appeal_rows(&self, window: u64) -> Result<Vec<ChainEntry>> {
         let conn = self.observed(&self.read_conn)?;
         let mut stmt = conn.prepare(
@@ -1627,6 +1628,7 @@ impl SqliteChainStore {
                AND NOT EXISTS (
                    SELECT 1 FROM chain_entries j
                    WHERE j.event_type = 'adjudication'
+                     AND j.chain_position > a.chain_position
                      AND json_extract(j.event_data, '$.about_deny_hash') =
                          json_extract(a.event_data, '$.deny_hash')
                )
@@ -2717,6 +2719,24 @@ mod tests {
         let expected = store.read_recent(1).unwrap()[0].timestamp.to_rfc3339();
         assert_eq!(latest, expected, "the nested adjudicator is an actor act");
         assert_eq!(store.latest_actor_act("nobody").unwrap(), None);
+
+        let later = store.append(
+            "appeal",
+            json!({"deny_hash": "a", "plugin_id": "kimi-code", "reason": "new evidence"}),
+            "lct:test",
+        ).unwrap();
+        let open = store.open_appeal_rows(20_000).unwrap();
+        assert_eq!(open.len(), 2, "the older ruling must not hide the later appeal");
+        assert!(open.iter().any(|e| e.hash == later.hash));
+
+        store.append(
+            "adjudication",
+            json!({"about_deny_hash": "a", "adjudicator": "codex"}),
+            "lct:test",
+        ).unwrap();
+        let open = store.open_appeal_rows(20_000).unwrap();
+        assert_eq!(open.len(), 1, "a later ruling closes the later appeal too");
+        assert_eq!(open[0].event_data["deny_hash"], "b");
     }
 
     /// A dashboard projection is allowed to be slow; it is not allowed to

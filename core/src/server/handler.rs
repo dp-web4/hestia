@@ -3807,7 +3807,19 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
     };
 
     let chain_len = s.chain_len();
-    let appeals = s.chain_store.appeal_rows_for_pointer(&deny_hash).unwrap_or_default();
+    let appeals = match s.chain_store.appeal_rows_for_pointer(&deny_hash) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Ok(hestia_error_envelope(
+                "hestia.arbitration_unavailable",
+                &format!(
+                    "appeal evidence for {deny_hash} is unavailable: {e}. No ruling was recorded; \
+                     the evidence state is UNKNOWN, not an absent appeal"
+                ),
+                Some(json!({"status": "UNKNOWN", "deny_hash": deny_hash})),
+            ));
+        }
+    };
     let Some(appeal) = appeals.iter().rev().find(|e| {
         e.event_type == "appeal"
             && e.event_data.get("deny_hash").and_then(Value::as_str) == Some(deny_hash.as_str())
@@ -4126,9 +4138,21 @@ async fn tool_open_appeals(state: &SharedState, args: &Value) -> ToolResult {
     let caller = resolve_attributed_caller(&s, session_id_arg.as_deref());
 
     // The anti-join runs in SQL: only unruled appeals are materialized (#488), while the
-    // position window and the ruling path's predicate stay identical.
+    // position window and the ruling path's predicate stay identical. A failed read is not
+    // an empty queue: no count is emitted when the authoritative evidence is unavailable.
     let chain_len = s.chain_len();
-    let window = s.chain_store.open_appeal_rows(APPEAL_CHAIN_WINDOW).unwrap_or_default();
+    let window = match s.chain_store.open_appeal_rows(APPEAL_CHAIN_WINDOW) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return Ok(hestia_error_envelope(
+                "hestia.open_appeals_unavailable",
+                &format!(
+                    "the open-appeal queue is unavailable: {e}. Its state is UNKNOWN, not empty"
+                ),
+                Some(json!({"status": "UNKNOWN", "chain_window": APPEAL_CHAIN_WINDOW})),
+            ));
+        }
+    };
     let head_position = chain_len.saturating_sub(1);
 
     let mut open: Vec<Value> = Vec::new();
@@ -20580,6 +20604,14 @@ mod open_appeals_tests {
         .unwrap()
     }
 
+    fn inject_chain_read_failure(dir: &TempDir) {
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        conn.pragma_update(None, "key", hex::encode(key)).unwrap();
+        conn.execute_batch("ALTER TABLE chain_entries RENAME TO chain_entries_before_fault")
+            .unwrap();
+    }
+
     /// THE JOIN. An appeal appears until someone rules it, and then it does not.
     ///
     /// This is the whole queue in one assertion, and the state it distinguishes is the one
@@ -20621,6 +20653,43 @@ mod open_appeals_tests {
             .await
             .unwrap();
         assert_eq!(after["count"], 0, "a ruled appeal must leave the queue: {after}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_queue_read_is_unknown_not_an_empty_queue() {
+        let (dir, shared, ids) = state_with_members(&["claude-code", "kimi-code"]);
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        let filed = file_appeal(&shared, ids[0], &deny).await;
+        assert!(filed.get("_hestia_error").is_none(), "setup appeal: {filed}");
+        let before = tool_open_appeals(&shared, &json!({})).await.unwrap();
+        assert_eq!(before["count"], 1, "setup must prove an appeal is available: {before}");
+
+        inject_chain_read_failure(&dir);
+        let out = tool_open_appeals(&shared, &json!({})).await.unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.open_appeals_unavailable");
+        assert_eq!(out["_hestia_error"]["data"]["status"], "UNKNOWN");
+        assert!(out.get("open").is_none() && out.get("count").is_none(), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_arbitration_read_is_unavailable_and_records_no_ruling() {
+        let (dir, shared, ids) = state_with_members(&["claude-code", "kimi-code"]);
+        let deny = append_deny(&shared, "claude-code", "ls /tmp").await;
+        let filed = file_appeal(&shared, ids[0], &deny).await;
+        assert!(filed.get("_hestia_error").is_none(), "setup appeal: {filed}");
+        let before = shared.lock().await.chain_len();
+
+        inject_chain_read_failure(&dir);
+        let out = tool_arbitrate_appeal(&shared, &json!({
+            "deny_hash": deny,
+            "upheld": true,
+            "rationale": "this verdict must not land while its evidence is unreadable",
+            "session_id": ids[1].to_string(),
+        })).await.unwrap();
+        assert_eq!(out["_hestia_error"]["code"], "hestia.arbitration_unavailable");
+        assert_eq!(out["_hestia_error"]["data"]["status"], "UNKNOWN");
+        assert!(out.get("witnessEntryHash").is_none(), "{out}");
+        assert_eq!(shared.lock().await.chain_len(), before, "no ruling was appended");
     }
 
     /// THE HASH THE QUEUE HANDS BACK IS THE HASH THE RULING TOOL ACCEPTS.
