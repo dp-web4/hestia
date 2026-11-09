@@ -2719,6 +2719,136 @@ mod tests {
         assert_eq!(positions(&reopened, "requester"), vec![7, 6, 5, 4, 3]);
     }
 
+    #[test]
+    fn subject_backfill_resumes_after_batch_failure_without_loss_or_duplicates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        for i in 0..1_002u64 {
+            let member = format!("member-{}", i % 3);
+            let data = if i % 101 == 0 {
+                json!({
+                    "plugin_id": member,
+                    "data": {"plugin_id": member, "subject_plugin_id": format!("alias-{i}")},
+                    "requested_by": {"plugin_id": format!("author-{}", i % 2)}
+                })
+            } else {
+                json!({"plugin_id": member})
+            };
+            store.append("policy_decision", data, "lct:test").unwrap();
+        }
+        let expected: std::collections::BTreeSet<(u64, String)> = store
+            .read_recent(1_002)
+            .unwrap()
+            .iter()
+            .flat_map(|entry| {
+                let position = entry.chain_position;
+                derivation_subjects(&entry.event_data)
+                    .into_iter()
+                    .map(move |plugin_id| (position, plugin_id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let expected_partial: std::collections::BTreeSet<(u64, String)> = expected
+            .iter()
+            .filter(|(position, _)| *position < 1_000)
+            .cloned()
+            .collect();
+        drop(store);
+        tamper(&path,
+            "DELETE FROM chain_subjects;
+             DELETE FROM chain_meta WHERE key = 'subjects_backfilled_through';
+             CREATE TRIGGER fail_second_subject_batch BEFORE INSERT ON chain_subjects
+             WHEN NEW.chain_position = 1000
+             BEGIN SELECT RAISE(ABORT, 'injected second batch failure'); END;");
+
+        let failed = SqliteChainStore::open(&path, TEST_KEY);
+        let error = failed.err().expect("the second backfill batch must fail");
+        assert!(format!("{error:#}").contains("injected second batch failure"), "{error:#}");
+        let conn = raw(&path);
+        let through: String = conn.query_row(
+            "SELECT value FROM chain_meta WHERE key = 'subjects_backfilled_through'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(through, "999", "only the first complete batch may advance the watermark");
+        let (count, oldest, newest): (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), MIN(chain_position), MAX(chain_position) FROM chain_subjects",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(count, expected_partial.len() as i64);
+        assert_eq!((oldest, newest), (0, 999), "the partial index is exactly positions 0..999");
+        let leaked: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chain_subjects WHERE chain_position >= 1000",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(leaked, 0, "the failed second batch must roll back all of its mappings");
+        drop(conn);
+
+        tamper(&path, "DROP TRIGGER fail_second_subject_batch;");
+        let reopened = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let through: String = raw(&path).query_row(
+            "SELECT value FROM chain_meta WHERE key = 'subjects_backfilled_through'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(through, "1001", "restart resumes after the committed first batch");
+        let conn = raw(&path);
+        let mut stmt = conn
+            .prepare("SELECT chain_position, plugin_id FROM chain_subjects")
+            .unwrap();
+        let actual: std::collections::BTreeSet<(u64, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(actual, expected, "resume must lose nothing and duplicate nothing");
+
+        let appended = reopened.append(
+            "policy_decision",
+            json!({"data": {"plugin_id": "new-member"}}),
+            "lct:test",
+        ).unwrap();
+        assert_eq!(appended.chain_position, 1_002);
+        let indexed: i64 = raw(&path).query_row(
+            "SELECT COUNT(*) FROM chain_subjects WHERE chain_position = 1002 AND plugin_id = 'new-member'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(indexed, 1, "ordinary appends keep indexing after recovery");
+    }
+
+    #[test]
+    fn append_rolls_back_the_chain_row_when_subject_indexing_fails() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        store.append("policy_decision", json!({"plugin_id": "seed"}), "lct:test").unwrap();
+        store.conn.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_subject_index BEFORE INSERT ON chain_subjects
+             WHEN NEW.plugin_id = 'boom'
+             BEGIN SELECT RAISE(ABORT, 'injected subject index failure'); END;",
+        ).unwrap();
+
+        let failed = store.append("policy_decision", json!({"plugin_id": "boom"}), "lct:test");
+        assert!(failed.is_err(), "the subject-index failure must reach the append caller");
+        assert_eq!(store.len().unwrap(), 1, "the cached length must not move");
+        let (entries, subjects): (i64, i64) = raw(&path).query_row(
+            "SELECT (SELECT COUNT(*) FROM chain_entries), (SELECT COUNT(*) FROM chain_subjects)",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((entries, subjects), (1, 1), "the failed row and its index must roll back together");
+
+        tamper(&path, "DROP TRIGGER fail_subject_index;");
+        let recovered = store.append("policy_decision", json!({"plugin_id": "boom"}), "lct:test").unwrap();
+        assert_eq!(recovered.chain_position, 1);
+        assert_eq!(store.len().unwrap(), 2);
+        let indexed: i64 = raw(&path).query_row(
+            "SELECT COUNT(*) FROM chain_subjects WHERE chain_position = 1 AND plugin_id = 'boom'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(indexed, 1);
+    }
+
     /// A dashboard projection is allowed to be slow; it is not allowed to
     /// become part of governance-write finality. Hold a live SELECT snapshot
     /// open inside the projection callback and prove an append commits before

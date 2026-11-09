@@ -1549,6 +1549,123 @@ mod tests {
         assert!(derived.temperament.evidence[0].contribution.contains("EXCLUDED — exonerated"));
     }
 
+    #[test]
+    fn subject_window_matches_global_fold_on_frozen_multi_member_corpus() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, [7u8; 32]).unwrap();
+        let tamper = |sql: &str| {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "key", hex::encode([7u8; 32])).unwrap();
+            conn.execute_batch(sql)
+        };
+        let append = |event_type: &str, data: serde_json::Value| {
+            store.append(event_type, data, "lct:test").unwrap()
+        };
+        append(IDENTITY_ALIAS_EVENT, json!({"alias": "kimi-cli", "alias_of": "kimi-code"}));
+        let deny = append("policy_decision", json!({
+            "plugin_id": "kimi-cli", "decision": "deny", "enforced": true,
+            "session_id": "s-kimi", "tool_name": "Bash", "target": "/tmp/x",
+            "payload_sha256": "p1", "attempted": "Bash: x"
+        }));
+        append("outcome", json!({
+            "plugin_id": "kimi-cli", "success": true, "session_id": "s-kimi",
+            "tool_name": "Bash", "target": "/tmp/x", "payload_sha256": "p1"
+        }));
+        append("appeal", json!({
+            "plugin_id": "kimi-code", "deny_hash": deny.hash.clone(), "reason": "data, not act"
+        }));
+        append("adjudication", json!({
+            "subject_plugin_id": "kimi-code", "subject_role": "role:constellation:member",
+            "about_deny_hash": deny.hash.clone(), "upheld": true,
+            "adjudicator": "codex", "rationale": "the deny confused data with execution",
+            "axis": "validity", "verdict": "upheld", "score": 1.0, "method": "peer-review"
+        }));
+        let other_deny = append("policy_decision", json!({
+            "plugin_id": "codex", "decision": "deny", "enforced": true,
+            "session_id": "s-codex", "tool_name": "Read", "target": "/tmp/y"
+        }));
+        append("outcome", json!({
+            "plugin_id": "codex", "success": true, "session_id": "s-codex",
+            "tool_name": "Read", "target": "/tmp/y"
+        }));
+        append("scope_attestation", json!({
+            "data": {"plugin_id": "kimi-code", "requested_by": {"plugin_id": "kimi-code"},
+                     "attested_by": "hestia-gate", "allows": 4, "denies": 0, "score": 1.0}
+        }));
+        append("scope_attestation", json!({
+            "requested_by": {"plugin_id": "codex"},
+            "data": {"plugin_id": "codex", "subject_plugin_id": "kimi-code",
+                     "attested_by": "plugin-gate:codex", "allows": 2, "denies": 1, "score": 0.85}
+        }));
+        append("amnesty", json!({"data": {"class": "deny", "before_position": 0}}));
+        append("exoneration", json!({
+            "requested_by": {"plugin_id": "kimi-code"},
+            "data": {"deny_hash": other_deny.hash.clone(), "ref": "frozen-corpus-proof"}
+        }));
+        append("unrelated", json!({"plugin_id": "kimi-code", "ignored": true}));
+        append("policy_decision", json!({
+            "plugin_id": "kimi-code", "decision": "allow",
+            "data": {"plugin_id": "codex", "subject_plugin_id": "kimi-code"},
+            "requested_by": {"plugin_id": "claude-code"}
+        }));
+        append(IDENTITY_ALIAS_EVENT, json!({"alias": "kimi-cli", "alias_of": "kimi-code"}));
+        append("outcome", json!({"data": {"plugin_id": "kimi-code", "success": true}}));
+        append("policy_decision", json!({"plugin_id": "claude-code", "decision": "allow"}));
+
+        let normalize = |plugin_id: &str, role_lct: &str, window: &[ChainEntry]| {
+            let mut value = serde_json::to_value(derive_evidence(plugin_id, role_lct, window)).unwrap();
+            value.as_object_mut().unwrap().remove("generated_at");
+            value
+        };
+        let assert_parity = |store: &SqliteChainStore| {
+            let global = scan_window_with(store, 1_000, 1_000);
+            for (plugin_id, role) in [
+                ("kimi-code", "role:constellation:member"),
+                ("kimi-code", "role:constellation:interactive-dev"),
+                ("kimi-cli", "role:constellation:member"),
+                ("codex", "role:constellation:member"),
+                ("claude-code", "role:constellation:member"),
+            ] {
+                let subject = scan_subject_window_with(store, plugin_id, 1_000, 1_000);
+                assert_eq!(
+                    normalize(plugin_id, role, &global),
+                    normalize(plugin_id, role, &subject),
+                    "subject/global derivation mismatch for {plugin_id} / {role}"
+                );
+                assert_eq!(
+                    alias_target(plugin_id, &global),
+                    alias_target(plugin_id, &subject),
+                    "alias mismatch for {plugin_id}"
+                );
+            }
+        };
+        assert_parity(&store);
+
+        // Position, not timestamp order, is the backfill contract. Both reads must see the
+        // same evidence even when the fixture's timestamps are deliberately out of order.
+        tamper(
+            "UPDATE chain_entries SET timestamp = '2027-01-01T00:00:00Z' WHERE chain_position = 1;
+             UPDATE chain_entries SET timestamp = '2026-01-01T00:00:00Z' WHERE chain_position = 2;",
+        ).unwrap();
+        assert_parity(&store);
+
+        // Force a complete restart rebuild and prove it does not duplicate or lose evidence.
+        tamper(
+            "DELETE FROM chain_subjects;
+             DELETE FROM chain_meta WHERE key = 'subjects_backfilled_through';",
+        ).unwrap();
+        drop(store);
+        let store = SqliteChainStore::open(&path, [7u8; 32]).unwrap();
+        assert_parity(&store);
+
+        let window = scan_window_with(&store, 1_000, 1_000);
+        let derived = derive_evidence("kimi-code", "role:constellation:member", &window);
+        assert!(derived.temperament.observations > 0, "the frozen corpus must exercise conduct");
+        assert!(derived.validity.observations > 0, "the frozen corpus must exercise adjudication");
+    }
+
     /// A merge the operator performed must STAY performed (agent-lifecycle PRD R6).
     ///
     /// The alias rode in the governance budget, which it shares with `policy_decision` -- one
