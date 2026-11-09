@@ -1992,6 +1992,9 @@ fn resolve_attributed_caller(
 /// The row carries BOTH names: one carrying only the asserted name cannot be told apart from
 /// an ordinary open. The session is recorded as an 8-char prefix — evidence that a session was
 /// presented and resolved, without keeping a live capability in a broadly-readable chain.
+/// Correlate retries of one refused ask without inventing an act identity. Distinct acts may
+/// share this key: chain hashes and exact act digests, never this correlation key, distinguish
+/// them. It is evidence only and confers no authority, coalescing, or deduplication by itself.
 fn escalation_attempt_key(plugin_id: &str, marker: &str, session_id: Option<&str>) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
@@ -17479,6 +17482,42 @@ mod tests {
                 .contains(&session_of["claude-code"])),
             "no row may carry the full session id"
         );
+    }
+
+    #[tokio::test]
+    async fn distinct_acts_sharing_an_attempt_key_keep_distinct_chain_identities() {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "h", "host_session_id": "hs-acts",
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        for tool_name in ["Edit", "Write"] {
+            let error = tool_gate_escalation_claim(&shared, &json!({
+                "plugin_id": "codex", "session_id": session,
+                "tool_name": tool_name, "marker": "pre_tool_use.py",
+            })).await.expect_err("the mismatched asker must be refused");
+            assert!(error.to_string().contains("asker mismatch"), "{error}");
+        }
+
+        let rows: Vec<_> = shared.lock().await.recent_chain(20)
+            .into_iter()
+            .filter(|e| e.event_type == "gate_escalation_refused")
+            .collect();
+        assert_eq!(rows.len(), 2, "distinct acts must not be deduplicated");
+        let attempt_keys: std::collections::HashSet<_> = rows.iter()
+            .map(|e| e.event_data["attempt_key"].as_str().unwrap())
+            .collect();
+        assert_eq!(attempt_keys.len(), 1, "the correlation key groups retries, not act identities");
+        let chain_hashes: std::collections::HashSet<_> = rows.iter().map(|e| &e.hash).collect();
+        assert_eq!(chain_hashes.len(), 2, "chain identity remains exact per act");
+        let tool_names: std::collections::HashSet<_> = rows.iter()
+            .map(|e| e.event_data["tool_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(tool_names.len(), 2, "the different act classes remain distinguishable");
+        let s = shared.lock().await;
+        assert!(s.recent_chain(20).iter().all(|e| {
+            !matches!(e.event_type.as_str(),
+                "gate_escalation_opened" | "gate_escalation_coalesced" | "gate_escalation_claimed")
+        }), "the correlation key confers no authority, coalescing, or spend");
     }
 
     /// Open + sovereign-approve, the setup half of the claim-joinability test below —

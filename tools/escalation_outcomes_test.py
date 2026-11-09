@@ -30,4 +30,24 @@ assert terminal_escalation_ids([
 assert terminal_escalation_ids([event("gate_escalation_expired")]) == {"esc-1"}
 assert terminal_escalation_ids([event("gate_escalation_withdrawn")]) == {"esc-1"}
 
-print("OK — terminal set, claim exclusion, and corroboration exclusion")
+lifecycle = [
+    event("gate_escalation_opened"),
+    event("gate_escalation_coalesced"),
+    event("gate_escalation_corroborated"),
+    event("gate_escalation_claimed"),
+    event("gate_escalation_decided"),
+    event("gate_escalation_claimed"),
+    event("gate_escalation_expired"),
+    event("gate_escalation_withdrawn"),
+]
+assert terminal_escalation_ids(lifecycle) == {"esc-1"}, \
+    "one escalation counts once across coalesced/claimed/decided/expired/withdrawn rows"
+assert terminal_escalation_ids(lifecycle + lifecycle) == {"esc-1"}, \
+    "replayed evidence cannot inflate the terminal count"
+
+legacy = {"eventType": "gate_escalation_decided",
+          "eventData": {"escalation_id": "esc-legacy", "status": "approved"}}
+assert terminal_escalation_ids([legacy]) == {"esc-legacy"}, \
+    "pre-attempt-key chain rows remain valid census inputs"
+
+print("OK — terminal set, claim exclusion, corroboration exclusion, single-count lifecycle, and legacy rows")
