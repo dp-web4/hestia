@@ -172,6 +172,9 @@ def main() -> int:
     out, asked = run("Read", {"file_path": inside}, ws)
     check("in_scope_read_allows", out["answer"] == "would_allow", out)
     check("society_reported_unchecked", out["society"].startswith("unchecked"), out)
+    check("would_allow_is_local_conditional",
+          out["boundary"].startswith("LOCAL/CONDITIONAL would_allow")
+          and "society unchecked" in out["boundary"], out)
     check("in_scope_read_asked_only_reads", set(asked) <= reads, asked)
 
     outside = os.path.join(ws, "private", "ledger.txt")

@@ -29,11 +29,13 @@ connect. With no live session the answer is an `error` naming why, not a guess.
 
 THE BOUNDARY (dp chose #1450 option (a), 2026-11-03): the answer is scoped to the CLAIMED
 member and session. The claim is not authenticated — proof of caller ownership is #824 (and
-#954 under it). Do not expose this off-host before #824.
+#954 under it). The dry-run reuse lookup returns the existing daemon session id and soft LCT,
+so the daemon admits it only on a loopback listener; a non-loopback listener refuses it without
+disclosing either value. Do not expose the ordinary member surface off-host before #824.
 
 What v0 does NOT answer: society law (above), and anything the daemon decides at claim time
-(an approved one-time scope grant, a closure approval). A `would_allow` here means "local law
-and the closure permit it; society law was not asked".
+(an approved one-time scope grant, a closure approval). `would_allow` is LOCAL/CONDITIONAL:
+local law and the closure permit it; society law was not asked.
 
 Usage:
     python3 tools/gate_evaluate.py --member claude-code --tool Bash --input '{"command":"ls /etc"}'
@@ -346,8 +348,10 @@ def evaluate(tool, tool_input, *, member="claude-code", host_agent=None, cwd=Non
         "closure": ("write" if rec["closure_write"] else "read" if rec["closure_read"] else "none"),
         "registered_surface": "checked" if registered_checked else "not checked (no --shim)",
         "refused_side_effects": rec["refused_calls"],
-        "boundary": ("answer scoped to the CLAIMED member; the claim is not authenticated "
-                     "(#824). Nothing was filed, opened, witnessed or recorded."),
+        "boundary": (("LOCAL/CONDITIONAL would_allow: local law and closure only; society unchecked. "
+                       if rec["society_asked"] else "Local answer. ")
+                     + "Dry-run session lookup is loopback-only; the claimed member is not "
+                       "authenticated (#824). Nothing was filed, opened, witnessed or recorded."),
         "member": member,
         # The session and role the snapshot was read as: the one the gate would reuse, with the
         # role it was minted with (not necessarily the one HESTIA_ROLE declares now).

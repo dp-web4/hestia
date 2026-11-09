@@ -1695,6 +1695,9 @@ pub async fn serve_with_callback(
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parsing bind address '{}'", bind))?;
+    // The dry-run reuse lookup returns an existing daemon session id. Without caller
+    // ownership proof (#824), it must not become an oracle on a non-loopback listener.
+    state.lock().await.allow_connect_dry_run = addr.ip().is_loopback();
 
     // Bounded operator bootstrap (RWOA genesis window): on a fresh vault this
     // mints the first operator so the gated surface isn't a permanent lockout;

@@ -390,7 +390,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_connect_dry_run",
-            "Read-only connect for a gate dry run: returns the EXISTING session for (plugin_id, host_session_id), as minted, or an error when there is none. Mints, touches and records nothing",
+            "Loopback-only, read-only connect for a gate dry run: returns the EXISTING session for (plugin_id, host_session_id), as minted, or an error when there is none or the listener is non-loopback. Mints, touches and records nothing",
         ),
         t("hestia_begin_action", "Begin tracking an R6/R7 action. Optional `serves`: the goal or question id the act is for; its verdict's `feedback.serves` carries it (\"unknown\" when unstated)"),
         t(
@@ -870,6 +870,15 @@ type ToolResult = Result<Value, anyhow::Error>;
 /// It is a separate RPC, not a `dry_run` flag on `hestia_connect`, so a daemon that predates it
 /// answers "unknown tool" rather than performing an ordinary, mutating connect.
 async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
+    if !state.lock().await.allow_connect_dry_run {
+        return Ok(hestia_error_envelope(
+            "hestia.connect_dry_run_unavailable",
+            "the dry-run session lookup is available only on a loopback listener: it returns an \
+             existing daemon session id, and caller ownership is not established (#824). No \
+             session id or soft LCT is returned on a non-loopback listener",
+            None,
+        ));
+    }
     let plugin_id = require_string(args, "plugin_id")?;
     require_string(args, "host_agent")?;
     let Some(host_session_id) = optional_string(args, "host_session_id") else {
@@ -15872,6 +15881,31 @@ mod tests {
         assert_eq!(dry["sessionId"], real["sessionId"]);
         let s = shared.lock().await;
         assert_eq!(s.sessions.last_seen(s.sessions.get(&id).unwrap()), before);
+    }
+
+    #[tokio::test]
+    async fn non_loopback_dry_run_does_not_disclose_an_existing_session() {
+        let (_dir, shared) = make_shared_state();
+        let victim = tool_connect(&shared, &json!({
+            "plugin_id": "victim", "host_agent": "test", "host_session_id": "hs-v",
+        })).await.unwrap();
+        assert!(victim["sessionId"].is_string(), "setup must mint the target session");
+        let chain_before = shared.lock().await.chain_len();
+        shared.lock().await.allow_connect_dry_run = false;
+
+        let second_client = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "victim", "host_agent": "test", "host_session_id": "hs-v",
+        })).await.unwrap();
+        assert_eq!(
+            second_client["_hestia_error"]["code"],
+            "hestia.connect_dry_run_unavailable"
+        );
+        assert!(second_client.get("sessionId").is_none(), "{second_client}");
+        assert!(second_client.get("softLct").is_none(), "{second_client}");
+        assert_ne!(second_client.get("sessionId"), victim.get("sessionId"));
+        let s = shared.lock().await;
+        assert_eq!(s.sessions.len(), 1, "the lookup created no session");
+        assert_eq!(s.chain_len(), chain_before, "the refusal recorded nothing");
     }
 
     /// The reviewer's attribution controls: no fabricated or cross-member dry-run read gets past

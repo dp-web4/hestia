@@ -546,6 +546,9 @@ pub struct ServerState {
     pub scope_tally: std::collections::HashMap<(String, String), (u64, u64)>,
     pub vault: Vault,
     pub sessions: crate::server::published::Sessions,
+    /// The dry-run session lookup returns a real bearer id for a claimed member/host pair,
+    /// so it is admitted only when the HTTP listener is loopback. Off-host ownership is #824.
+    pub allow_connect_dry_run: bool,
     pub actions: HashMap<Uuid, InFlightAction>,
     /// BEHIND AN `Arc` SO A HEAVY READ NEED NOT HOLD THE GLOBAL STATE LOCK.
     ///
@@ -1200,6 +1203,8 @@ impl ServerState {
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: crate::server::published::Sessions::default(),
+            // In-process/IPC handlers are local; the HTTP bind may narrow this before serving.
+            allow_connect_dry_run: true,
             actions: HashMap::new(),
             // Rebuilt from the chain + settle record, so a late witness for an action from before
             // this restart finds its row and its charge state (one-gate stage A). Evaluated
