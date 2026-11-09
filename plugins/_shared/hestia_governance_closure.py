@@ -1522,12 +1522,13 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
             if "--" in rest:
                 return rest[rest.index("--") + 1:]
             return []
-        if sub == "rm":
+        if sub in ("rm", "mv"):
             options_end = rest.index("--") if "--" in rest else len(rest)
             if "--dry-run" in rest[:options_end] or "-n" in rest[:options_end]:
                 return []
-            if any(a == "--pathspec-from-file" or a.startswith("--pathspec-from-file=")
-                   for a in rest[:options_end]):
+            if sub == "rm" and any(
+                    a == "--pathspec-from-file" or a.startswith("--pathspec-from-file=")
+                    for a in rest[:options_end]):
                 raise _OpaqueWriter()
             return _positionals(rest)
         if sub == "restore":
