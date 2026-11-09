@@ -7732,9 +7732,9 @@ async fn agent_register(
 // member's registry LCT (`agent_key_for_lct`), never typed -- the same rule as register.
 
 /// The nine society roles a delegation may carry, spelled as `parse_role` accepts them. A
-/// closed set, offered as a picker: `parse_role` maps any other string to `Custom(..)`, which
-/// is a free-text role by another name, and this surface takes no free-text identity of any
-/// kind. tools/delegation_panel_contract_test.py pins the picker to this list.
+/// closed set, offered as a picker: `parse_role` rejects every other string, so this surface
+/// takes no free-text role identity. tools/delegation_panel_contract_test.py pins the picker to
+/// this list.
 pub const DELEGATION_ROLES: &[&str] = &[
     "sovereign", "law_oracle", "policy_entity", "treasurer", "administrator",
     "archivist", "citizen", "witness", "auditor",
