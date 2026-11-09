@@ -38,25 +38,25 @@ fn safety_rules() -> Vec<PolicyRule> {
             reason: Some(
                 "git rm is PERMITTED when it stands alone and uses only explicit recoverable or \
                  non-destructive flags: -q/--quiet, --cached, --dry-run/-n, --ignore-unmatch, \
-                 or --sparse. Recursive, forced, chained, and unlisted flag combinations still \
-                 hit the destructive-command deny. Without --force, git refuses to remove \
-                 files with uncommitted changes."
+                 or --sparse. Recursive, forced, chained, redirected, quoted, escaped, and \
+                 unlisted flag combinations still hit the destructive-command deny. Without \
+                 --force, git refuses to remove files with uncommitted changes."
                     .into(),
             ),
             r#match: PolicyMatch {
                 tools: Some(vec!["Bash".into(), "Shell".into()]),
                 command_patterns: Some(vec![
                     concat!(
-                        r"^\s*git\s+rm\s+",
-                        r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)\s+)+",
-                        r"[^\s;&|`$()-][^\s;&|`$()]*(\s+[^\s;&|`$()-][^\s;&|`$()]*)*\s*$"
+                        r"^[ \t]*git[ \t]+rm[ \t]+",
+                        r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)[ \t]+)+",
+                        r#"[^\s;&|`$()<>\\'"-][^\s;&|`$()<>\\'"]*([ \t]+[^\s;&|`$()<>\\'"-][^\s;&|`$()<>\\'"]*)*[ \t]*$"#
                     )
                     .into(),
                     concat!(
-                        r"^\s*git\s+rm\s+",
-                        r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)\s+)+",
-                        r"--\s+",
-                        r"[^\n;&|`$()]+$"
+                        r"^[ \t]*git[ \t]+rm[ \t]+",
+                        r"((-q|--quiet|--cached|--dry-run|-n|--ignore-unmatch|--sparse)[ \t]+)+",
+                        r"--[ \t]+",
+                        r#"[^\n\r;&|`$()<>\\'"]+$"#
                     )
                     .into(),
                 ]),
@@ -788,6 +788,7 @@ mod tests {
                 "git rm --cached --dry-run tools/old.py",
                 "git rm -n core/tests/old.rs",
                 "git rm -q -- -n",
+                "git rm -q -- core/tests/old.rs",
                 "git rm --ignore-unmatch --sparse -q core/tests/old.rs",
             ] {
                 let v = judge(cmd);
@@ -815,6 +816,16 @@ mod tests {
                 "git rm --force core/tests/old.rs",
                 "git rm -q core/tests/old.rs --force",
                 "git rm -q core/tests/old.rs && git commit -m cleanup",
+                "git rm -q core/tests/old.rs > /tmp/git-rm-output",
+                "git rm -q -- core/tests/old.rs > /tmp/git-rm-output",
+                "git rm -q -- core/tests/old.rs < /tmp/git-rm-input",
+                "git rm --cached -- core/tests/old.rs >> /tmp/git-rm-output",
+                "git rm -q -- core/tests/old.rs >(cat)",
+                "git rm -q \"core/tests/old.rs\"",
+                "git rm -q 'core/tests/old.rs'",
+                "git rm -q core/tests/old\\ rs",
+                "git rm -q core/tests/old.rs\r",
+                "git rm -q -- core/tests/old.rs\r",
                 "git -C core rm -q tests/old.rs",
                 "sudo git rm -q core/tests/old.rs",
             ] {
