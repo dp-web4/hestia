@@ -686,7 +686,7 @@ fn hestia_tools() -> Vec<Tool> {
         t("hestia_vault_set", "Store a credential in the vault"),
         t_args(
             "hestia_query_history",
-            "Query the witness chain. filter.hash dereferences one entry anywhere. Other filters run in SQL BEFORE the 500-row cap: tool_name, plugin_id, event_type/eventType/type. Page backward with before_position/before/cursor/max_position (exclusive), or offset. hasMore and next_before_position describe the filtered set; requested_limit and capped make a clamp visible. Optional session_id/sessionId transport attribution stays outside filter",
+            "Query the witness chain. filter.hash dereferences one entry anywhere and ignores page filters. Other filters run in SQL BEFORE the 500-row cap: tool_name, plugin_id, event_type/eventType/type. Page backward with before_position/before/cursor/max_position (exclusive), or offset. Page limit must be at least 1. hasMore and next_before_position describe the filtered set; requested_limit and capped make a clamp visible. Optional session_id/sessionId transport attribution stays outside filter",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -696,7 +696,7 @@ fn hestia_tools() -> Vec<Tool> {
                         "additionalProperties": false,
                         "properties": {
                             "hash": {"type": "string", "description": "Whole chain entry hash or unique prefix"},
-                            "limit": {"type": "integer", "minimum": 0, "default": 50, "maximum": 500},
+                            "limit": {"type": "integer", "minimum": 1, "default": 50, "maximum": 500},
                             "tool_name": {"type": "string"},
                             "plugin_id": {"type": "string"},
                             "event_type": {"type": "string"},
@@ -2686,6 +2686,14 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
         .filter(|h| !h.trim().is_empty())
     {
         return Ok(resolve_chain_pointer(&s, ptr, None));
+    }
+    if requested_limit == 0 {
+        return Ok(hestia_error_envelope(
+            "hestia.query_filter_limit",
+            "page queries require filter.limit >= 1; zero does not define a page or continuation. \
+             filter.hash is a pointer lookup and ignores page filters",
+            Some(json!({"requested_limit": requested_limit, "minimum": 1})),
+        ));
     }
     if let Some(offset) = filter.get("offset").and_then(Value::as_u64) {
         let computed = s.chain_len().saturating_sub(offset);
@@ -22844,6 +22852,14 @@ mod appeal_tests {
             .await
             .unwrap();
         assert_eq!(by_hash["entry"]["hash"].as_str(), Some(hash.as_str()), "{by_hash}");
+        let zero_limit = tool_query_history(&state, &json!({"filter": {"hash": hash, "limit": 0}}))
+            .await
+            .unwrap();
+        assert_eq!(
+            zero_limit["entry"]["hash"].as_str(),
+            Some(hash.as_str()),
+            "a pointer lookup is not a zero-sized page query: {zero_limit}"
+        );
     }
 
     /// Every test above passes `{"filter": {...}}`, which is why the bare shape survived: the
@@ -23025,6 +23041,7 @@ mod appeal_tests {
         assert!(outer.contains_key("sessionId"));
         let filter = &tool.input_schema["properties"]["filter"];
         assert_eq!(filter["additionalProperties"], json!(false));
+        assert_eq!(filter["properties"]["limit"]["minimum"], json!(1));
         let properties = filter["properties"].as_object().unwrap();
         for key in QUERY_FILTER_KEYS {
             assert!(properties.contains_key(key), "schema omits `{key}`");
@@ -23111,6 +23128,11 @@ mod appeal_tests {
         assert_eq!(capped["limit"], json!(500));
         assert_eq!(capped["requested_limit"], json!(2_000));
         assert_eq!(capped["capped"], json!(true));
+
+        let zero = tool_query_history(&state, &json!({"filter": {"limit": 0}})).await.unwrap();
+        assert_eq!(zero["_hestia_error"]["code"], "hestia.query_filter_limit");
+        assert_eq!(zero["_hestia_error"]["data"]["requested_limit"], json!(0));
+        assert!(zero.get("entries").is_none(), "zero must not return one row: {zero}");
 
         let expected: Vec<_> = state.lock().await.recent_chain(2_000);
         let offset = tool_query_history(&state, &json!({"filter": {"offset": 500, "limit": 500}})).await.unwrap();
