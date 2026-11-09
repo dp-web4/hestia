@@ -916,9 +916,9 @@ fn protect_operator_key(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn protect_operator_key(path: &Path) -> Result<()> {
-    let username = match std::env::var("USERNAME") {
-        Ok(value) if !value.trim().is_empty() => value,
+fn protect_operator_key_with_username(path: &Path, username: Option<&str>) -> Result<()> {
+    let username = match username {
+        Some(value) if !value.trim().is_empty() => value,
         _ => {
             let _ = std::fs::remove_file(path);
             anyhow::bail!("USERNAME is unavailable; deleting unprotected operator.key")
@@ -941,6 +941,12 @@ fn protect_operator_key(path: &Path) -> Result<()> {
             Err(anyhow::anyhow!("could not run icacls for operator.key: {error}; deleting it"))
         }
     }
+}
+
+#[cfg(windows)]
+fn protect_operator_key(path: &Path) -> Result<()> {
+    let username = std::env::var("USERNAME").ok();
+    protect_operator_key_with_username(path, username.as_deref())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3059,8 +3065,47 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    static USERNAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    struct UsernameRestore(Option<String>);
+
+    #[cfg(windows)]
+    impl Drop for UsernameRestore {
+        fn drop(&mut self) {
+            if let Some(value) = self.0.take() {
+                std::env::set_var("USERNAME", value);
+            } else {
+                std::env::remove_var("USERNAME");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn operator_key_acl(path: &Path) -> String {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "icacls read failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[cfg(windows)]
+    fn assert_current_user_acl(acl: &str) {
+        let username = std::env::var("USERNAME").unwrap().to_lowercase();
+        let lower = acl.to_lowercase();
+        assert!(lower.contains(&username) && acl.contains("(M)"), "current user modify grant: {acl}");
+        assert!(!acl.lines().any(|line| line.contains("(I)")), "inherited grants removed: {acl}");
+        assert!(!lower.contains("network service") && !lower.contains("builtin\\users"),
+                "another account or shared group has no grant: {acl}");
+    }
+
     #[test]
     fn operator_bootstrap_is_bounded_and_no_reentry() {
+        #[cfg(windows)]
+        let _username_lock = USERNAME_LOCK.lock().unwrap();
         let (_dir, mut state) = make_state();
         // genesis: empty operator_access → mints exactly one operator
         assert!(!state.vault.policy().operator_access_bootstrapped());
@@ -3068,15 +3113,19 @@ mod tests {
         assert!(first.is_some(), "genesis mints an operator");
         assert!(state.vault.policy().operator_access_bootstrapped());
         assert_eq!(state.vault.policy().operator_access.len(), 1);
-        // the credential was written 0600 for the operator to load, and is a
-        // valid {lct_id, secret_key_hex} the client can sign with
+        // the credential is private to the operator and is a valid client signing identity
         let key = state.home.join("operator.key");
         assert!(key.exists());
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        assert_current_user_acl(&operator_key_acl(&key));
         let cred: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&key).unwrap()).unwrap();
         assert_eq!(cred["lct_id"], first.clone().unwrap());
@@ -3084,6 +3133,76 @@ mod tests {
         // window shut: re-run is a no-op (no re-entry, no second operator)
         assert!(state.bootstrap_operator_if_genesis().unwrap().is_none());
         assert_eq!(state.vault.policy().operator_access.len(), 1);
+
+        drop(state);
+        let vault = Vault::open(_dir.path().join("v.enc"), "p".into()).unwrap();
+        let mut state = ServerState::open(vault, _dir.path(), "p").unwrap();
+        assert!(state.bootstrap_operator_if_genesis().unwrap().is_none());
+        assert_eq!(state.vault.policy().operator_access.len(), 1);
+        #[cfg(windows)]
+        assert_current_user_acl(&operator_key_acl(&key));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_operator_key_acl_is_idempotent_and_allows_the_current_user() {
+        let _username_lock = USERNAME_LOCK.lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("operator.key");
+        std::fs::write(&key, b"first").unwrap();
+        protect_operator_key(&key).unwrap();
+        std::fs::write(&key, b"second").unwrap();
+        assert_eq!(std::fs::read(&key).unwrap(), b"second");
+        assert_current_user_acl(&operator_key_acl(&key));
+
+        protect_operator_key(&key).unwrap();
+        let acl = operator_key_acl(&key);
+        assert_current_user_acl(&acl);
+        let username = std::env::var("USERNAME").unwrap().to_lowercase();
+        let modify_grants = acl
+            .lines()
+            .filter(|line| line.contains("(M)") && line.to_lowercase().contains(&username))
+            .count();
+        assert_eq!(modify_grants, 1, "reapplication does not duplicate grants: {acl}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_operator_key_failures_leave_no_unprotected_file() {
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("operator.key");
+        for username in [None, Some("   "), Some("hestia missing user with spaces")] {
+            std::fs::write(&key, b"unprotected").unwrap();
+            let error = protect_operator_key_with_username(&key, username)
+                .expect_err("missing or invalid usernames must fail closed");
+            assert!(error.to_string().contains("deleting"), "{error}");
+            assert!(!key.exists(), "the unprotected key was removed for {username:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_operator_bootstrap_failure_deletes_the_key_and_allows_retry() {
+        let _username_lock = USERNAME_LOCK.lock().unwrap();
+        let previous = std::env::var("USERNAME").ok();
+        std::env::set_var("USERNAME", "hestia missing user with spaces");
+        let restore = UsernameRestore(previous);
+        let (_dir, mut state) = make_state();
+        let key = state.home.join("operator.key");
+
+        let error = state
+            .bootstrap_operator_if_genesis()
+            .expect_err("an invalid account must fail the bootstrap");
+        assert!(error.to_string().contains("deleting"), "{error}");
+        assert!(!key.exists(), "no unprotected key survives the failed bootstrap");
+        assert!(!state.vault.policy().operator_access_bootstrapped());
+
+        drop(restore);
+        let first = state.bootstrap_operator_if_genesis().unwrap();
+        assert!(first.is_some(), "restoring the account permits a clean retry");
+        assert!(key.exists());
+        assert_current_user_acl(&operator_key_acl(&key));
+        assert!(state.bootstrap_operator_if_genesis().unwrap().is_none());
     }
 
     #[test]
