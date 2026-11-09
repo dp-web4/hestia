@@ -848,6 +848,11 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         });
         let escalation_denied = escalated && !escalation_approved && escalation_ruled("denied");
 
+        // #503's peer-reviewed scoring convention (2026-08-25): withdrawal closes at the SAME
+        // 0.85 as an open or denied ask, preserving credit for using the witnessed channel.
+        // It must not cost more than leaving a zombie ask, and no peer ruling justifies 1.0.
+        // Terminal precedence is approved, then withdrawn, then denied, then merely opened;
+        // expiry has no performer and stays outside the asker's fold.
         let (score, label) = if escalation_approved {
             (1.0, "escalation-approved 1.0 (refused a governance write, did not route around \
                    it, and a decider approved the ask)")
@@ -1664,6 +1669,56 @@ mod tests {
         assert!(DERIVATION_GOVERNANCE_EVENT_TYPES.contains(&"gate_escalation_withdrawn"));
         assert!(!DERIVATION_EVENT_TYPES.contains(&"gate_escalation_expired"));
         assert!(!DERIVATION_GOVERNANCE_EVENT_TYPES.contains(&"gate_escalation_expired"));
+    }
+
+    #[test]
+    fn terminal_precedence_is_approved_then_withdrawn_then_denied_in_any_order_503() {
+        let role = "role:constellation:interactive-dev";
+        let deny = entry(1, 0, "policy_decision", json!({
+            "decision":"deny","enforced":true,"plugin_id":"kimi-code","role_lct":role,
+            "session_id":"s1","tool_name":"Bash","payload_sha256":"abc","target":""}));
+        let opened = entry(2, 1, "gate_escalation_opened", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1","answers_deny":"hash-1"}));
+        let withdrawn = entry(3, 2, "gate_escalation_withdrawn", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1"}));
+        let approved = entry(4, 3, "gate_escalation_decided", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1","status":"approved"}));
+        let denied = entry(4, 3, "gate_escalation_decided", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1","status":"denied"}));
+        let expired = entry(5, 4, "gate_escalation_expired", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1"}));
+        let ema = |s: f64| 0.5 + 0.5 * (s - 0.5);
+
+        for rows in [
+            vec![deny.clone(), opened.clone(), approved.clone(), withdrawn.clone()],
+            vec![deny.clone(), opened.clone(), withdrawn.clone(), approved.clone()],
+        ] {
+            let d = derive("kimi-code", role, &rows);
+            assert!((d.temperament.score.unwrap() - ema(1.0)).abs() < 1e-9,
+                    "approval dominates withdrawal: {d:?}");
+            assert!(d.temperament.evidence[0].contribution.starts_with("escalation-approved"));
+        }
+        for rows in [
+            vec![deny.clone(), opened.clone(), denied.clone(), withdrawn.clone()],
+            vec![deny.clone(), opened.clone(), withdrawn.clone(), denied.clone()],
+        ] {
+            let d = derive("kimi-code", role, &rows);
+            assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9, "{d:?}");
+            assert!(d.temperament.evidence[0].contribution.starts_with("escalation-withdrawn"),
+                    "withdrawal precedes a denied ruling, regardless of chain order: {d:?}");
+        }
+
+        let d = derive("kimi-code", role, &[deny.clone(), opened.clone(), denied]);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9);
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-denied"));
+        let d = derive("kimi-code", role, &[deny.clone(), opened.clone()]);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9);
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-opened"));
+        let d = derive("kimi-code", role, &[deny, opened, expired]);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9);
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-opened"));
+        assert!(d.temperament.evidence.iter().all(|e| e.event_type != "gate_escalation_expired"),
+                "an unperformed expiry must not become member conduct: {d:?}");
     }
 
     #[test]
