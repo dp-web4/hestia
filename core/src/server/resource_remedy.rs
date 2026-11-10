@@ -178,9 +178,9 @@ pub fn rehydrate(
             tracing::warn!(error = %e, "could not rebuild open remedy requests from the chain");
             let now = crate::server::gate_escalation::now_secs();
             open.insert(
-                "rehydrate/remedy-requests".to_string(),
+                REHYDRATE_KEY.to_string(),
                 RemedyRequest {
-                    key: "rehydrate/remedy-requests".into(),
+                    key: REHYDRATE_KEY.into(),
                     resource_id: "hestia".into(),
                     floor_id: "remedy-rehydration".into(),
                     measures: "open remedy requests rebuilt from the chain at startup".into(),
@@ -331,4 +331,18 @@ pub fn health_pass(s: &mut super::state::ServerState, now: u64) {
         crate::policy::resource_probes::stuck_probes(crate::policy::resource_probes::STUCK_AFTER);
     let answered = crate::policy::resource_probes::answered_probes();
     note_stuck(s, &stuck, &answered, "hestia-health", now);
+    // History that could not be rebuilt at startup is retried here, so the health entry that
+    // stands in for it has a way to clear (kimi-code on #1551) other than another restart.
+    if s.remedy_requests.contains_key(REHYDRATE_KEY) {
+        let rebuilt = rehydrate(&s.chain_store);
+        if !rebuilt.contains_key(REHYDRATE_KEY) {
+            s.remedy_requests.remove(REHYDRATE_KEY);
+            for (k, v) in rebuilt {
+                s.remedy_requests.entry(k).or_insert(v);
+            }
+        }
+    }
 }
+
+/// The health entry that stands in for remedy history the daemon could not read.
+pub const REHYDRATE_KEY: &str = "rehydrate/remedy-requests";

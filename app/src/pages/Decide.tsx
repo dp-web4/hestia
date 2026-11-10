@@ -417,13 +417,24 @@ export function Decide() {
           <p>
             <strong>{r.remedy}</strong>
           </p>
-          <p className="muted">
-            {r.measures} is {r.reading === null ? "unknown" : r.reading.toLocaleString()},{" "}
-            {r.min !== null ? `below ${r.min.toLocaleString()}` : `above ${(r.max ?? 0).toLocaleString()}`}{" "}
-            ({r.resource_id}/{r.floor_id}, {r.mode}). {r.acts_met} act{r.acts_met === 1 ? "" : "s"} met
-            it since {new Date(r.opened_at * 1000).toLocaleString()}; last: {r.last_member}. It closes
-            by itself when a later reading recovers.
-          </p>
+          {r.mode === "health" ? (
+            // Not a floor: a probe that stopped answering, or remedy history the daemon could not
+            // rebuild. No reading, no bound, no promise that a reading will close it (kimi-code
+            // on #1551).
+            <p className="muted">
+              Hestia health ({r.resource_id}/{r.floor_id}): {r.measures}. Open since{" "}
+              {new Date(r.opened_at * 1000).toLocaleString()}. It clears when the daemon sees the
+              condition end.
+            </p>
+          ) : (
+            <p className="muted">
+              {r.measures} is {r.reading === null ? "unknown" : r.reading.toLocaleString()},{" "}
+              {r.min !== null ? `below ${r.min.toLocaleString()}` : `above ${(r.max ?? 0).toLocaleString()}`}{" "}
+              ({r.resource_id}/{r.floor_id}, {r.mode}). {r.acts_met} act{r.acts_met === 1 ? "" : "s"} met
+              it since {new Date(r.opened_at * 1000).toLocaleString()}; last: {r.last_member}. It closes
+              by itself when a later reading recovers.
+            </p>
+          )}
         </article>
       ))}
 

@@ -4173,6 +4173,10 @@
     const now = Date.now() / 1000;
     const fmt = v => (v === null || v === undefined) ? 'unknown' : Number(v).toLocaleString();
     $('remedy-banner-text').textContent = open.map(r => {
+      const age0 = escFmtAge(Math.max(0, Math.floor(now - (Number(r.opened_at) || now))));
+      // A health entry (stuck probe, unrebuilt history) has no reading and no bound.
+      if (r.mode === 'health') return `Hestia health (${r.resource_id}/${r.floor_id}): ${r.remedy}. `
+        + `${r.measures}; open ${age0}.`;
       const bound = r.min !== null && r.min !== undefined ? `below ${fmt(r.min)}` : `above ${fmt(r.max)}`;
       const age = escFmtAge(Math.max(0, Math.floor(now - (Number(r.opened_at) || now))));
       return `Remedy needed (${r.resource_id}, ${r.mode}): ${r.remedy}. ${r.measures} is ${fmt(r.reading)}, `

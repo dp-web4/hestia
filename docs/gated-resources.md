@@ -10,7 +10,7 @@ The gate answers from live readings (metabolic proprioception, at community leve
 
 | Field | Meaning |
 |---|---|
-| `consumers` | The acts that consume the resource. These use the same match fields as a rule's `match`, except `rate_limit`, which is refused because under a limit a rule skips firing, and an affordability check must never become optional. For a shell act they are matched against **each command the line would run**, after looking through `&&`/`;`/`|` segments, wrappers (`env`, `nice`, `timeout`, `xargs`, …), `sh -c` scripts and `$( … )` substitutions. Each command's text starts with its basename, so anchor patterns with `^` (`^cargo\s+build`). A pattern anchored that way matches the command and not a mention of it in an `echo`, a commit message or a `grep`. |
+| `consumers` | The acts that consume the resource. These use the same match fields as a rule's `match`, except `rate_limit`, which is refused because under a limit a rule skips firing, and an affordability check must never become optional. For a shell act they are matched against **each command the line would run** (see [What the text check sees](#what-the-text-check-sees)). Each command's text starts with its basename, so anchor patterns with `^` (`^cargo\s+build`). A pattern anchored that way matches the command and not a mention of it in an `echo`, a commit message or a `grep`. |
 | `floors` | Conditions on live probes. `disk_free` (MB), `disk_free_permille` (tenths of a percent), `mem_available` (MB) and `process_running` (count). An act is unaffordable while a reading is **at or below** `min` (at the floor the price is unbounded) or above `max`. |
 | `comfortable` | The reading at or above which the price is the base price. Between `min` and `comfortable` the price surges as `(comfortable - min) / (reading - min)`. At the floor it is unbounded. |
 | `pricing.base_milli_atp` | The price of one act at comfortable readings. |
@@ -21,6 +21,16 @@ The gate answers from live readings (metabolic proprioception, at community leve
 | `mode` | `observe` or `enforce`. |
 
 Probes run off the gate's workers, under a 400 ms deadline, and are cached for 5 s. A call that finds a probe already in flight waits for that reading, within its own deadline. Two acts a millisecond apart therefore see the same reading. A reading that cannot be taken in time (for example a hung Windows drive bridge) is *unknown*. It refuses only where `on_unknown` is `refuse`, and it is always recorded.
+
+## What the text check sees
+
+The gate reads text, so it recognises a stated grammar and claims nothing beyond it.
+
+- **Read exactly:** `&&`/`;`/`|` segments, `VAR=value` prefixes, backslash escapes, shell keywords and `!` (`if …; then cargo build`), `$( … )` and backtick substitutions to depth 3, `sh`/`bash`/… `-c` (alone or in a cluster such as `-lc`), `eval`, and the wrappers `env`, `nice`, `ionice`, `nohup`, `setsid`, `time`, `timeout`, `stdbuf`, `command`, `builtin`, `exec`, `xargs`, `sudo`, `doas`, `chrt`, `taskset`, `unbuffer`, `flock`, `su`, `runuser` and `script`. Each wrapper has its own option table, so the command it runs is found exactly and its arguments are never mistaken for one: `env echo cargo build` runs `echo`.
+- **Unreadable, so over-matched:** an option a wrapper's table does not know, nesting deeper than 3, an unterminated substitution, inline interpreter code (`python3 -c`, `perl -e`, `ruby -e`, `node -e`), and `watch`/`parallel`. The line is flattened to words and a consumer that matches **any word-suffix** counts, not routed. False positives land here, on rare lines, and not on ordinary ones.
+- **Not visible to any text check:** a script file (`bash build.sh`, `python3 x.py`, `source`), a Makefile, and a shell function or alias defined elsewhere. These are gaps, not holes the parser will be grown to close; each new parsing rule widens the parser's own surface (#1551 review rounds 1–3). The place that sees every spelling is the runner, at the moment of spending: [slice 1b](#not-yet).
+
+A society that declares no resources pays no parsing cost: the line is read only when a resource is declared.
 
 ## What the gate does
 
@@ -44,7 +54,7 @@ Probes run off the gate's workers, under a 400 ms deadline, and are cached for 5
   - It closes, witnessed as `resource_remedy_cleared`, at the first later reading that meets the floor.
   - Contention, such as a critical process running, refuses or would refuse an act, but pages nobody: it passes by itself.
 
-Open remedy requests are rebuilt from the chain when the daemon starts, so a daemon that crashes while the disk is short comes back still asking. A probe that stops answering for two minutes (a hung filesystem or Windows drive bridge) opens a `health` remedy request of its own and clears when the probe answers. A probe this platform cannot read at all (`/proc` on macOS) reads `unsupported`, distinct from `unknown`, and `set-resource` refuses a declaration that uses one.
+Open remedy requests are rebuilt from the chain when the daemon starts, so a daemon that crashes while the disk is short comes back still asking. If that history cannot be read, a `health` entry stands in for it, and the periodic health pass retries the read and clears the entry once it succeeds. A probe that stops answering for two minutes (a hung filesystem or Windows drive bridge) opens a `health` remedy request of its own and clears when the probe answers. A probe this platform cannot read at all (`/proc` on macOS) reads `unsupported`, distinct from `unknown`, and `set-resource` refuses a declaration that uses one.
 
 Resources are published in `hestia_operating_law`, so members read what binds them before they meet it. A society without resources publishes exactly the law, and the hashes, it did before.
 
@@ -60,6 +70,7 @@ As with rules, a running daemon picks the change up on restart.
 
 ## Not yet
 
+- **The runner checks the floors itself** (slice 1b). `cargo-serial` asks the daemon to assess the act when it takes the lock, so every spelling that reaches the runner gets the same answer at exec time. The gate's text check remains the routing nudge and the observer.
 - **Settlement.** The R6 Result is not yet recorded: no measured consumption (wall time, the change in free disk, peak memory) and no ATP discharged to ADP. The R6 record and the price are written now so that settlement has something to settle.
 - **Member ATP balances.** Until they exist, only a floor (an unbounded price) refuses.
 - **The lease service** (#1548 slice 2). This covers session-bound leases, atomic acquire, TTL with quarantine, and `hestia resource run`. Until then the runner (`cargo-serial`) holds the lock.

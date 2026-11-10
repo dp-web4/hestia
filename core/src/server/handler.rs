@@ -12324,6 +12324,36 @@ mod accountability_tests {
     }
 
     #[tokio::test]
+    async fn the_health_pass_retries_unrebuilt_history_and_clears_its_stand_in() {
+        // kimi-code on #1551 at f5a8cfe3: the stand-in had no way to clear but a restart.
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        gate_bash(&state, &sid, "cargo-serial build").await; // opens cargo/scratch on the chain
+        let mut s = state.lock().await;
+        s.remedy_requests.clear();
+        let key = crate::server::resource_remedy::REHYDRATE_KEY.to_string();
+        let stand_in = crate::server::resource_remedy::RemedyRequest {
+            key: key.clone(),
+            resource_id: "hestia".into(),
+            floor_id: "remedy-rehydration".into(),
+            measures: "m".into(),
+            min: None,
+            max: None,
+            reading: None,
+            remedy: "r".into(),
+            mode: "health".into(),
+            opened_at: 1,
+            last_seen_at: 1,
+            acts_met: 0,
+            last_member: "hestia".into(),
+            opened_entry: None,
+        };
+        s.remedy_requests.insert(key.clone(), stand_in);
+        crate::server::resource_remedy::health_pass(&mut s, 1000);
+        assert!(!s.remedy_requests.contains_key(&key), "rebuilt, so the stand-in clears");
+        assert!(s.remedy_requests.contains_key("cargo/scratch"), "and what it stood in for is back");
+    }
+
+    #[tokio::test]
     async fn an_unwitnessed_clear_leaves_the_request_open() {
         let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
         gate_bash(&state, &sid, "cargo-serial build").await;

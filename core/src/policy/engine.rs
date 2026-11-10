@@ -123,8 +123,13 @@ impl PolicyEngine {
     /// ([`super::resources::invocations`]: segments, wrappers, `sh -c`, substitutions), and the
     /// act is routed only if every consuming invocation is itself the runner. A mention of the
     /// runner elsewhere in the line does not route a consumer (codex/kimi-code/NOVA on #1551).
-    /// A line that cannot be parsed with confidence is matched as a whole and, if it consumes,
-    /// counts as NOT routed: the relation could not be established, so it fails closed.
+    /// A line that cannot be read exactly is matched by [`super::resources::fallback_texts`]
+    /// (every word-suffix, over-matching on purpose) and, if it consumes, counts as NOT routed:
+    /// the relation could not be established, so it fails closed.
+    ///
+    /// What no text check can see is out of scope and documented: a script file, a Makefile, a
+    /// shell function or alias defined elsewhere. The runner is where every spelling that does
+    /// reach it gets the same answer (#1548 slice 1b).
     ///
     /// Consumers match with the rule matcher minus `rate_limit` (refused when the resource is
     /// declared). `inert_content_skipped` is not reported from here: it marks what the RULE
@@ -139,11 +144,30 @@ impl PolicyEngine {
                 m.rate_limit.is_none() && self.rule_matches(a, m, &mut unused)
             })
         };
+        // Nothing declared, nothing to parse: members of a society without resources pay no
+        // parsing cost on any act (codex on #1551).
+        if self.config.resources.is_empty() {
+            return Vec::new();
+        }
         let is_shell = matches!(action.tool_name, "Bash" | "Shell");
         let cmd = action.full_command.or(action.target);
         let invocations = match (is_shell, cmd) {
-            (true, Some(c)) => Some(super::resources::invocations(c)),
+            (true, Some(c)) => Some(
+                super::resources::invocations(c)
+                    .ok_or_else(|| super::resources::fallback_texts(c)),
+            ),
             _ => None,
+        };
+        let consumes_text = |r: &super::resources::GatedResource, text: &str| {
+            consumes(
+                r,
+                &PolicyAction {
+                    tool_name: action.tool_name,
+                    category: action.category,
+                    target: Some(text),
+                    full_command: Some(text),
+                },
+            )
         };
         let mut out = Vec::new();
         for r in &self.config.resources {
@@ -154,25 +178,15 @@ impl PolicyEngine {
                         out.push((r, None));
                     }
                 }
-                // A command line the parser could not read with confidence: fail closed.
-                Some(None) => {
-                    if consumes(r, action) {
+                // A command line that could not be read exactly: over-match, fail closed.
+                Some(Err(texts)) => {
+                    if consumes(r, action) || texts.iter().any(|t| consumes_text(r, t)) {
                         out.push((r, r.runner.as_ref().map(|_| false)));
                     }
                 }
-                Some(Some(invs)) => {
-                    let consuming: Vec<_> = invs
-                        .iter()
-                        .filter(|inv| {
-                            let a = PolicyAction {
-                                tool_name: action.tool_name,
-                                category: action.category,
-                                target: Some(&inv.text),
-                                full_command: Some(&inv.text),
-                            };
-                            consumes(r, &a)
-                        })
-                        .collect();
+                Some(Ok(invs)) => {
+                    let consuming: Vec<_> =
+                        invs.iter().filter(|inv| consumes_text(r, &inv.text)).collect();
                     if consuming.is_empty() {
                         continue;
                     }

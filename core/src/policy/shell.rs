@@ -652,6 +652,11 @@ fn flush_word(
     *word_quoted = false;
 }
 
+/// `NAME=value`: a variable assignment, not a command word.
+pub(crate) fn is_assignment_word(word: &str) -> bool {
+    is_assignment(word)
+}
+
 fn is_assignment(word: &str) -> bool {
     let Some(eq) = word.find('=') else { return false };
     if eq == 0 {

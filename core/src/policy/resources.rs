@@ -359,18 +359,191 @@ pub struct Invocation {
     pub text: String,
 }
 
-/// Commands that run another command named in their arguments. Looked through, so
-/// `nice -n 10 cargo build` is an invocation of `cargo`. Shell keywords and `!` that prefix a
-/// command (`if …; then cargo build`, `! cargo test`) are looked through the same way.
-const WRAPPERS: &[&str] = &[
-    "env", "nice", "ionice", "nohup", "time", "timeout", "stdbuf", "command", "builtin", "exec",
-    "xargs", "sudo", "doas", "chrt", "taskset", "setsid", "unbuffer", "flock", "!", "then", "do",
-    "else", "elif", "if", "while", "until", "{",
+/// How a command that runs another command lays out its own arguments, so that the command it
+/// runs is found exactly (#1551, third review round). The earlier "every later word is a
+/// candidate" rule was exponential on repeated wrappers and invented consumers from mentions
+/// (`env echo cargo build`, `if grep -q cargo build.log`). An option this table does not know
+/// makes the line UNREADABLE, not guessed at: [`invocations`] returns `None` and the caller
+/// falls back to [`fallback_texts`], which over-matches.
+struct WrapperSpec {
+    name: &'static str,
+    /// Short options that take a value (`-u dp`, or attached `-udp`).
+    short_values: &'static str,
+    /// Short options that take no value.
+    short_flags: &'static str,
+    /// Long options that take a value (`--signal TERM` or `--signal=TERM`).
+    long_values: &'static [&'static str],
+    /// Long options that take no value.
+    long_flags: &'static [&'static str],
+    /// Positional words before the command (`timeout DURATION cmd`, `flock FILE cmd`).
+    positionals: usize,
+    /// `NAME=value` words before the command are assignments (`env`, `sudo`).
+    assignments: bool,
+    /// An option whose value is itself a command line (`env -S`, `su -c`), short and long.
+    script_option: Option<(char, &'static str)>,
+}
+
+const fn spec(name: &'static str) -> WrapperSpec {
+    WrapperSpec {
+        name,
+        short_values: "",
+        short_flags: "",
+        long_values: &[],
+        long_flags: &[],
+        positionals: 0,
+        assignments: false,
+        script_option: None,
+    }
+}
+
+const WRAPPERS: &[WrapperSpec] = &[
+    WrapperSpec {
+        short_values: "uCS",
+        short_flags: "i0v",
+        long_values: &["unset", "chdir", "split-string"],
+        long_flags: &["ignore-environment", "null", "debug"],
+        assignments: true,
+        script_option: Some(('S', "split-string")),
+        ..spec("env")
+    },
+    WrapperSpec { short_values: "n", long_values: &["adjustment"], ..spec("nice") },
+    WrapperSpec {
+        short_values: "cnpPu",
+        short_flags: "t",
+        long_values: &["class", "classdata", "pid", "pgid", "uid"],
+        long_flags: &["ignore"],
+        ..spec("ionice")
+    },
+    spec("nohup"),
+    WrapperSpec { short_flags: "cfw", long_flags: &["ctty", "fork", "wait"], ..spec("setsid") },
+    WrapperSpec {
+        short_values: "fo",
+        short_flags: "pvaq",
+        long_values: &["format", "output"],
+        long_flags: &["portability", "verbose", "append", "quiet"],
+        ..spec("time")
+    },
+    WrapperSpec {
+        short_values: "sk",
+        short_flags: "v",
+        long_values: &["signal", "kill-after"],
+        long_flags: &["preserve-status", "foreground", "verbose"],
+        positionals: 1,
+        ..spec("timeout")
+    },
+    WrapperSpec {
+        short_values: "ioe",
+        long_values: &["input", "output", "error"],
+        ..spec("stdbuf")
+    },
+    WrapperSpec { short_flags: "pvV", ..spec("command") },
+    spec("builtin"),
+    WrapperSpec { short_values: "a", short_flags: "cl", ..spec("exec") },
+    WrapperSpec {
+        short_values: "ILnPdEsa",
+        short_flags: "0rtpxiel",
+        long_values: &["max-args", "max-procs", "delimiter", "arg-file", "max-lines", "max-chars"],
+        long_flags: &[
+            "null", "no-run-if-empty", "verbose", "interactive", "exit", "replace", "eof",
+            "open-tty", "show-limits",
+        ],
+        ..spec("xargs")
+    },
+    WrapperSpec {
+        short_values: "ugCDhprtUTR",
+        short_flags: "EHnSbiksKlvPAB",
+        long_values: &[
+            "user", "group", "close-from", "chdir", "host", "prompt", "role", "type",
+            "other-user", "command-timeout", "chroot",
+        ],
+        long_flags: &[
+            "preserve-env", "set-home", "non-interactive", "stdin", "background", "login",
+            "reset-timestamp", "shell", "remove-timestamp", "list", "validate",
+            "preserve-groups", "askpass", "bell",
+        ],
+        assignments: true,
+        ..spec("sudo")
+    },
+    WrapperSpec { short_values: "uC", short_flags: "nsL", ..spec("doas") },
+    WrapperSpec {
+        short_values: "TPD",
+        short_flags: "abdefimoprRv",
+        long_values: &["sched-runtime", "sched-period", "sched-deadline"],
+        long_flags: &[
+            "all-tasks", "batch", "deadline", "ext", "fifo", "idle", "max", "other", "pid", "rr",
+            "reset-on-fork", "verbose",
+        ],
+        positionals: 1,
+        ..spec("chrt")
+    },
+    WrapperSpec {
+        short_flags: "acp",
+        long_flags: &["all-tasks", "cpu-list", "pid"],
+        positionals: 1,
+        ..spec("taskset")
+    },
+    WrapperSpec { short_flags: "p", ..spec("unbuffer") },
+    // `flock FILE cmd…` or `flock FILE -c 'cmd'` (util-linux reads `-c` after the file).
+    WrapperSpec {
+        short_values: "wE",
+        short_flags: "sexnouF",
+        long_values: &["timeout", "conflict-exit-code"],
+        long_flags: &["shared", "exclusive", "nonblock", "nb", "close", "unlock", "no-fork", "verbose"],
+        positionals: 1,
+        script_option: Some(('c', "command")),
+        ..spec("flock")
+    },
+    // `su -c 'cmd' user`, `runuser -u user -- cmd`, `script -c 'cmd' file`.
+    WrapperSpec {
+        short_values: "gGsw",
+        short_flags: "lfmpP",
+        long_values: &["group", "supp-group", "shell", "whitelist-environment"],
+        long_flags: &["login", "fast", "preserve-environment", "pty"],
+        script_option: Some(('c', "command")),
+        positionals: usize::MAX,
+        ..spec("su")
+    },
+    WrapperSpec {
+        short_values: "ugGsw",
+        short_flags: "lfmpP",
+        long_values: &["user", "group", "supp-group", "shell", "whitelist-environment"],
+        long_flags: &["login", "fast", "preserve-environment", "pty"],
+        script_option: Some(('c', "command")),
+        ..spec("runuser")
+    },
+    WrapperSpec {
+        short_values: "EIOTB",
+        short_flags: "aefqk",
+        long_values: &["echo", "log-in", "log-out", "log-timing", "log-io", "logging-format"],
+        long_flags: &["append", "return", "flush", "force", "quiet", "log-keys"],
+        script_option: Some(('c', "command")),
+        positionals: usize::MAX,
+        ..spec("script")
+    },
 ];
 
+/// Shell keywords and `!` that prefix a command (`if …; then cargo build`, `! cargo test`): the
+/// next word is the command. Exactly one word is skipped, never a guess at more.
+const KEYWORDS: &[&str] = &["!", "then", "do", "else", "elif", "if", "while", "until", "{"];
+
 /// Shells whose `-c` argument (alone or in a flag cluster: `-lc`, `-ec`, `-xc`) is a command
-/// line of its own.
+/// line of its own. A shell given a script FILE is opaque (documented gap).
 const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "fish"];
+
+/// Interpreters that run inline code from a flag (`python3 -c`, `perl -e`), and commands whose
+/// arguments are a command line in a grammar not parsed here (`watch`, `parallel`). The text
+/// may well run a consumer, so the line counts as unreadable and the over-matching fallback
+/// decides. Without the flag (`python3 script.py`) they are ordinary commands: what a script
+/// file runs is invisible to any text check (documented gap).
+const INLINE_INTERPRETERS: &[(&str, &[&str])] = &[
+    ("python", &["-c"]),
+    ("python3", &["-c"]),
+    ("perl", &["-e", "-E"]),
+    ("ruby", &["-e"]),
+    ("node", &["-e", "-p", "--eval", "--print"]),
+    ("watch", &[]),
+    ("parallel", &[]),
+];
 
 /// A word as the shell would run it: backslash escapes removed (`c\argo` runs `cargo`).
 fn unescape(word: &str) -> String {
@@ -426,49 +599,181 @@ fn substitutions(cmd: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Every command `cmd` would run: each simple command (looking through wrappers), each `sh -c`
-/// script, and each substitution, to a bounded depth. `None` when any part cannot be parsed with
-/// confidence: the caller must then fail closed.
-pub fn invocations(cmd: &str) -> Option<Vec<Invocation>> {
-    fn push_from(words: &[String], depth: u8, out: &mut Vec<Invocation>) -> Option<()> {
-        let Some(first) = words.first() else {
-            return Some(());
+/// What follows a wrapper's own arguments.
+enum AfterWrapper<'a> {
+    /// The command it runs (possibly empty: `sudo -v` runs nothing).
+    Command(&'a [String]),
+    /// A command line given as an option value (`env -S '…'`, `su -c '…'`, `flock f -c '…'`).
+    Script(&'a str),
+}
+
+/// Reads `words` (the wrapper first) by `spec`. `None` for anything the spec does not describe.
+fn after_wrapper<'a>(spec: &WrapperSpec, words: &'a [String]) -> Option<AfterWrapper<'a>> {
+    let mut i = 1;
+    let mut positionals = 0;
+    loop {
+        let Some(w) = words.get(i) else {
+            return Some(AfterWrapper::Command(&words[i.min(words.len())..]));
         };
-        let head = basename(first);
-        if WRAPPERS.contains(&head.as_str()) {
-            // A wrapper's options may take separate values (`timeout -s KILL 30 cmd`,
-            // `sudo -u dp cmd`, `env -u VAR cmd`), and a table of which do will always miss one
-            // (codex, kimi-code, claude-code on #1551). So every word after the wrapper that is
-            // not itself an option is a CANDIDATE command: whichever candidate a consumer
-            // matches is the command that runs. A wrong candidate can only add a match, never
-            // hide one, so this errs toward assessing.
-            for i in 1..words.len() {
-                if !words[i].starts_with('-') {
-                    push_from(&words[i..], depth, out)?;
+        if w == "--" {
+            i += 1;
+            break;
+        }
+        if w == "-" {
+            // `env -`: the same as `-i`.
+            i += 1;
+            continue;
+        }
+        if let Some(long) = w.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long, false),
+            };
+            if spec.script_option.is_some_and(|(_, l)| l == name) {
+                return if attached {
+                    Some(AfterWrapper::Script(w.split_once('=')?.1))
+                } else {
+                    words.get(i + 1).map(|s| AfterWrapper::Script(s))
+                };
+            }
+            if spec.long_values.contains(&name) {
+                i += if attached { 1 } else { 2 };
+            } else if spec.long_flags.contains(&name) {
+                i += 1;
+            } else {
+                return None;
+            }
+            continue;
+        }
+        if w.len() > 1 && w.starts_with('-') && positionals < spec.positionals.max(1) {
+            // `nice -10 cmd`: a numeric niceness.
+            if w[1..].chars().all(|c| c.is_ascii_digit()) {
+                i += 1;
+                continue;
+            }
+            let cluster: Vec<char> = w[1..].chars().collect();
+            let mut next = i + 1;
+            for (k, c) in cluster.iter().enumerate() {
+                if spec.script_option.is_some_and(|(s, _)| s == *c) {
+                    let rest: String = cluster[k + 1..].iter().collect();
+                    return if rest.is_empty() {
+                        words.get(i + 1).map(|s| AfterWrapper::Script(s))
+                    } else {
+                        // Attached: borrow from the word itself.
+                        Some(AfterWrapper::Script(&w[w.len() - rest.len()..]))
+                    };
+                }
+                if spec.short_values.contains(*c) {
+                    if k + 1 == cluster.len() {
+                        next = i + 2; // the value is the next word
+                    }
+                    break; // otherwise the rest of the cluster is the value
+                }
+                if !spec.short_flags.contains(*c) {
+                    return None;
                 }
             }
-            return Some(());
+            i = next;
+            continue;
         }
-        if SHELLS.contains(&head.as_str()) {
-            // `-c` alone or in a short-flag cluster (`-lc`, `-ec`): the next non-option word is
-            // a command line. A shell given a script file is opaque (documented limitation).
-            let cluster = |w: &str| {
-                w.starts_with('-')
-                    && !w.starts_with("--")
-                    && w[1..].chars().all(|c| c.is_ascii_alphabetic())
-                    && w.contains('c')
-            };
-            if let Some(pos) = words.iter().position(|w| cluster(w)) {
-                let script = words[pos + 1..].iter().find(|w| !w.starts_with('-'))?;
-                walk(script, depth + 1, out)?;
+        if spec.assignments && positionals == 0 && super::shell::is_assignment_word(w) {
+            i += 1;
+            continue;
+        }
+        if positionals < spec.positionals && spec.positionals != usize::MAX {
+            positionals += 1;
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if spec.positionals == usize::MAX {
+        // `su`, `script`: what remains are a user or a log file, not a command, and options may
+        // follow them (`su dp -c '…'`). Without `-c` they start a shell, which runs nothing
+        // visible here.
+        if let Some((s, l)) = spec.script_option {
+            let (short, long) = (format!("-{s}"), format!("--{l}"));
+            for (k, w) in words.iter().enumerate().skip(i) {
+                if *w == short || *w == long {
+                    return words.get(k + 1).map(|s| AfterWrapper::Script(s));
+                }
+                if let Some(v) = w.strip_prefix(&format!("{long}=")) {
+                    return Some(AfterWrapper::Script(v));
+                }
             }
         }
+        return Some(AfterWrapper::Command(&[]));
+    }
+    // `flock FILE -c '…'`: util-linux reads `-c` after the file.
+    if let (Some((s, l)), Some(w)) = (spec.script_option, words.get(i)) {
+        if spec.positionals > 0 && (w == &format!("-{s}") || w == &format!("--{l}")) {
+            return words.get(i + 1).map(|s| AfterWrapper::Script(s));
+        }
+    }
+    Some(AfterWrapper::Command(&words[i.min(words.len())..]))
+}
+
+/// Every command `cmd` would run: each simple command (looking through wrappers and keywords),
+/// each `sh -c`/`eval`/`su -c` script, and each substitution, to a bounded depth. `None` when any
+/// part cannot be read exactly (an unknown wrapper option, inline interpreter code, nesting past
+/// the depth bound, an unterminated substitution): the caller then uses [`fallback_texts`].
+///
+/// Linear in the number of words: each wrapper is read once and its command continues the same
+/// loop (codex on #1551: candidate expansion was 2ⁿ in repeated wrappers).
+pub fn invocations(cmd: &str) -> Option<Vec<Invocation>> {
+    fn emit(words: &[String], out: &mut Vec<Invocation>) {
+        let head = basename(&words[0]);
         let text = std::iter::once(head.clone())
             .chain(words[1..].iter().cloned())
             .collect::<Vec<_>>()
             .join(" ");
         out.push(Invocation { head, text });
-        Some(())
+    }
+    fn push_from(mut words: &[String], depth: u8, out: &mut Vec<Invocation>) -> Option<()> {
+        loop {
+            let Some(first) = words.first() else {
+                return Some(());
+            };
+            let head = basename(first);
+            if KEYWORDS.contains(&head.as_str()) {
+                words = &words[1..];
+                continue;
+            }
+            if let Some(spec) = WRAPPERS.iter().find(|s| s.name == head) {
+                // The wrapper itself is not emitted: only the command it runs consumes, and a
+                // wrapper's text must not be what a runner check sees.
+                match after_wrapper(spec, words)? {
+                    AfterWrapper::Command(rest) => {
+                        words = rest;
+                        continue;
+                    }
+                    AfterWrapper::Script(script) => return walk(script, depth + 1, out),
+                }
+            }
+            if let Some((_, flags)) = INLINE_INTERPRETERS.iter().find(|(n, _)| *n == head) {
+                if flags.is_empty() || words[1..].iter().any(|w| flags.contains(&w.as_str())) {
+                    return None;
+                }
+            }
+            if head == "eval" {
+                return walk(&words[1..].join(" "), depth + 1, out);
+            }
+            if SHELLS.contains(&head.as_str()) {
+                let cluster = |w: &str| {
+                    w.len() > 1
+                        && w.starts_with('-')
+                        && !w.starts_with("--")
+                        && w[1..].chars().all(|c| c.is_ascii_alphabetic())
+                        && w.contains('c')
+                };
+                if let Some(pos) = words.iter().position(|w| cluster(w)) {
+                    let script = words[pos + 1..].iter().find(|w| !w.starts_with('-'))?;
+                    walk(script, depth + 1, out)?;
+                }
+            }
+            emit(words, out);
+            return Some(());
+        }
     }
     fn walk(cmd: &str, depth: u8, out: &mut Vec<Invocation>) -> Option<()> {
         if depth > 3 {
@@ -491,6 +796,39 @@ pub fn invocations(cmd: &str) -> Option<Vec<Invocation>> {
     let mut out = Vec::new();
     walk(cmd, 0, &mut out)?;
     Some(out)
+}
+
+/// For a line [`invocations`] could not read: every word-suffix of the line, quotes and shell
+/// punctuation flattened to spaces and escapes removed, each cut to 256 characters. A consumer
+/// that matches any of them counts, NOT routed. This over-matches on purpose: it is used only
+/// where exact reading failed, so its false positives land where lines are rare (codex on
+/// #1551), and it finds `cargo build` four substitutions deep, inside `python3 -c "…"`, or
+/// behind an unterminated `$(`. At most 2048 suffixes are produced.
+pub fn fallback_texts(cmd: &str) -> Vec<String> {
+    let flat: String = unescape(cmd)
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || "_./+=:@%~-".contains(c) {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let words: Vec<&str> = flat.split_whitespace().collect();
+    (0..words.len().min(2048))
+        .map(|i| {
+            let mut s = basename(words[i]);
+            for w in &words[i + 1..] {
+                if s.len() >= 256 {
+                    break;
+                }
+                s.push(' ');
+                s.push_str(w);
+            }
+            s
+        })
+        .collect()
 }
 
 /// Reads probes. The daemon's implementation samples the live machine with a deadline; tests
@@ -1060,6 +1398,88 @@ mod tests {
         ] {
             assert_eq!(routed(&r, cmd), Some(Some(true)), "{cmd}");
         }
+    }
+
+    #[test]
+    fn third_round_forms_are_assessed() {
+        // codex and kimi-code on #1551 at f5a8cfe3, and the mesh seat's list of inline forms.
+        let r = cargo_resource(ResourceMode::Enforce);
+        for cmd in [
+            // Past the depth bound, and unparseable shapes in front of a consumer: the
+            // fallback scan finds them.
+            "echo $(echo $(echo $(echo $(cargo build))))",
+            "echo $(true ; cargo build",
+            "echo ` ; cargo build",
+            // eval runs its arguments as shell.
+            "eval cargo build",
+            "bash -lc 'eval cargo check'",
+            // Command lines given as option values.
+            "su -c 'cargo build' dp",
+            "su dp -c 'cargo build'",
+            "runuser -u dp -- cargo test",
+            "script -q -c 'cargo test' /dev/null",
+            "flock /tmp/cargo.lock -c 'cargo build'",
+            "env -S 'cargo build'",
+            // Inline interpreter code and command-line-taking tools not parsed here.
+            "python3 -c \"import os; os.system('cargo build')\"",
+            "python3 -c 'import subprocess; subprocess.run([\"cargo\", \"test\"])'",
+            "watch -n 5 cargo test",
+            // An option no wrapper spec knows: unreadable, so the fallback decides.
+            "timeout --frobnicate 30 cargo build",
+            // Spellings the exact grammar reads.
+            "nice -10 cargo build",
+            "env - cargo build",
+            "flock /tmp/cargo.lock cargo build",
+            "sudo RUST_LOG=debug cargo test",
+        ] {
+            assert_eq!(routed(&r, cmd), Some(Some(false)), "{cmd}");
+        }
+        for cmd in [
+            "eval cargo-serial build",
+            "flock /tmp/x.lock cargo-serial build",
+            "su dp -c 'cargo-serial test'",
+        ] {
+            assert_eq!(routed(&r, cmd), Some(Some(true)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_wrapper_names_its_command_exactly() {
+        // codex on #1551 at f5a8cfe3: candidate expansion turned arguments into commands.
+        let r = cargo_resource(ResourceMode::Enforce);
+        for cmd in [
+            "env echo cargo build",
+            "if grep -q cargo build.log; then echo ok; fi",
+            "for t in a b; do echo cargo test; done",
+            "timeout 30 grep cargo build.log",
+            "sudo -u dp echo cargo build",
+            // An interpreter without inline code runs a file: nothing in the text runs cargo.
+            "python3 track.py note IP-1 'ran cargo build'",
+        ] {
+            assert_eq!(routed(&r, cmd), None, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn repeated_wrappers_are_linear() {
+        // codex on #1551 at f5a8cfe3: 2^n invocations for n leading wrappers.
+        let line = format!("{}cargo build", "env ".repeat(400));
+        let t = std::time::Instant::now();
+        let inv = invocations(&line).expect("readable");
+        assert_eq!(inv.len(), 1, "the command, read once through 400 wrappers");
+        assert_eq!(inv.last().unwrap().head, "cargo");
+        let line = format!("{}true", "if ".repeat(400));
+        assert_eq!(invocations(&line).unwrap().len(), 1);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_society_without_resources_parses_nothing() {
+        let cfg = crate::policy::get_preset("safety").unwrap().config;
+        assert!(cfg.resources.is_empty());
+        let engine = crate::policy::PolicyEngine::new(cfg);
+        let line = format!("{}cargo build", "env ".repeat(5000));
+        assert!(engine.matching_resources(&bash(&line)).is_empty());
     }
 
     #[test]
