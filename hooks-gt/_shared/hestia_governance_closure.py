@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 418e294b4ca5f591b40c09c7e482cbdc9414aa3bd54891901fe3987e38ed8d4e  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -24,8 +24,8 @@ A tool call is a governance write only if a WRITE-POSITION argument resolves int
   * Bash: parsed write positions only — redirect targets (>, >>, &>, >|), tee arguments,
     cp/install/rsync DESTINATION (mv: EVERY operand — the source is destroyed too), sed -i
     file args, chmod/chown/chgrp/truncate/ln -sf targets, rm/unlink/rmdir/shred targets,
-    dd of=, touch targets, git checkout -- / git restore / git clean / git rm pathspecs
-    (git rm --dry-run/-n writes nothing).
+    dd of=, touch targets, git checkout -- / git restore / git clean / git rm / git mv
+    pathspecs (git rm/mv --dry-run/-n writes nothing).
 A command that merely NAMES a closure file in a read position (grep pattern, find -name, cat
 source, cp SOURCE, ls) is classified "read" — allowed, witnessed by the caller. Payload text
 (Write `content`, Edit `old_string`/`new_string`, heredoc bodies) is NEVER a haystack: a

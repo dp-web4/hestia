@@ -23,8 +23,8 @@ A tool call is a governance write only if a WRITE-POSITION argument resolves int
   * Bash: parsed write positions only — redirect targets (>, >>, &>, >|), tee arguments,
     cp/install/rsync DESTINATION (mv: EVERY operand — the source is destroyed too), sed -i
     file args, chmod/chown/chgrp/truncate/ln -sf targets, rm/unlink/rmdir/shred targets,
-    dd of=, touch targets, git checkout -- / git restore / git clean / git rm pathspecs
-    (git rm --dry-run/-n writes nothing).
+    dd of=, touch targets, git checkout -- / git restore / git clean / git rm / git mv
+    pathspecs (git rm/mv --dry-run/-n writes nothing).
 A command that merely NAMES a closure file in a read position (grep pattern, find -name, cat
 source, cp SOURCE, ls) is classified "read" — allowed, witnessed by the caller. Payload text
 (Write `content`, Edit `old_string`/`new_string`, heredoc bodies) is NEVER a haystack: a
