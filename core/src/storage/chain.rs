@@ -25,7 +25,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -501,10 +501,9 @@ fn migrate_plaintext_to_encrypted(path: &Path, key_hex: &str) -> Result<()> {
 }
 
 /// Refuse a snapshot destination that is, or would replace, the source database or one of its
-/// SQLite side files, however it is spelled (Codex review of #1322). `backup_encrypted` deletes
-/// an existing destination before it opens the source, so a lexical comparison is not enough:
-/// a parent-directory symlink, a symlinked destination, or a hard link would make that delete
-/// unlink the live chain. Every check runs before any destructive step.
+/// SQLite side files, however it is spelled (Codex review of #1322). A lexical comparison is
+/// not enough: a parent-directory symlink, a symlinked destination, or a hard link may alias
+/// the live chain.
 fn refuse_snapshot_alias(source: &Path, destination: &Path) -> Result<()> {
     let source_real = std::fs::canonicalize(source)
         .with_context(|| format!("resolving chain snapshot source {}", source.display()))?;
@@ -549,6 +548,33 @@ fn refuse_snapshot_alias(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+// A stale journal or WAL at the destination can be associated with a different
+// database. This check is defense in depth, not a lock against a concurrent
+// actor: callers must supply a fresh path in a privately owned directory.
+fn refuse_snapshot_sidecars(destination: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut path = destination.as_os_str().to_os_string();
+        path.push(suffix);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => anyhow::bail!("chain snapshot destination has an existing SQLite sidecar"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e).context("checking chain snapshot destination sidecar"),
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_staging_dir(parent: &Path) -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".hestia-snapshot-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(parent).context("creating private chain snapshot staging directory")
+}
+
 impl SqliteChainStore {
     /// Copy one consistent encrypted chain snapshot while its live daemon may
     /// continue appending in WAL mode.
@@ -556,15 +582,27 @@ impl SqliteChainStore {
     /// A raw copy of only `witness.db` is not a snapshot once committed frames
     /// may still live in `witness.db-wal`. SQLite's online backup API reads one
     /// transactionally consistent view across both and re-encrypts it through a
-    /// separately keyed destination connection. The destination is replaced,
-    /// matching `std::fs::copy` semantics used by the callers this supersedes.
+    /// separately keyed destination connection. The destination must not exist,
+    /// and callers must provide a fresh path in a privately owned directory.
+    /// This avoids replacing an open database and sharing its journal or WAL.
     pub fn backup_encrypted(
         source_path: impl AsRef<Path>,
         destination_path: impl AsRef<Path>,
         key: [u8; 32],
     ) -> Result<()> {
-        let source_path = source_path.as_ref();
-        let destination_path = destination_path.as_ref();
+        Self::backup_encrypted_after_alias_check(
+            source_path.as_ref(), destination_path.as_ref(), key, || {},
+        )
+    }
+
+    // The callback allows tests to exercise a filesystem change immediately
+    // after path validation; normal callers always pass a no-op.
+    fn backup_encrypted_after_alias_check<F: FnOnce()>(
+        source_path: &Path,
+        destination_path: &Path,
+        key: [u8; 32],
+        after_alias_check: F,
+    ) -> Result<()> {
         anyhow::ensure!(
             source_path != destination_path,
             "chain snapshot destination must differ from its source"
@@ -575,18 +613,16 @@ impl SqliteChainStore {
             })?;
         }
         refuse_snapshot_alias(source_path, destination_path)?;
-        if destination_path.exists() {
-            std::fs::remove_file(destination_path).with_context(|| {
-                format!(
-                    "removing prior chain snapshot {}",
-                    destination_path.display()
-                )
-            })?;
-        }
-
+        refuse_snapshot_sidecars(destination_path)?;
+        after_alias_check();
+        // The alias check and open are separate operations. Do not recreate a
+        // source removed between them, and do not replace a destination if
+        // the source cannot be opened.
         let key_hex = hex::encode(key);
-        let source = Connection::open(source_path)
-            .with_context(|| format!("opening chain snapshot source {}", source_path.display()))?;
+        let source = Connection::open_with_flags(
+            source_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ).with_context(|| format!("opening chain snapshot source {}", source_path.display()))?;
         source
             .pragma_update(None, "key", &key_hex)
             .with_context(|| "keying chain snapshot source")?;
@@ -594,10 +630,19 @@ impl SqliteChainStore {
             .pragma_update(None, "query_only", true)
             .with_context(|| "making chain snapshot source query-only")?;
 
-        let mut destination = Connection::open(destination_path).with_context(|| {
+        // Build in a private directory on the destination filesystem. A failed
+        // open, key check, or backup must not destroy the previous snapshot.
+        let parent = match destination_path.parent() {
+            Some(path) if !path.as_os_str().is_empty() => path,
+            _ => Path::new("."),
+        };
+        let staging_dir = snapshot_staging_dir(parent)?;
+        let staged = tempfile::NamedTempFile::new_in(staging_dir.path())
+            .context("creating private chain snapshot staging file")?;
+        let mut destination = Connection::open(staged.path()).with_context(|| {
             format!(
-                "opening chain snapshot destination {}",
-                destination_path.display()
+                "opening staged chain snapshot for {}",
+                destination_path.display(),
             )
         })?;
         destination
@@ -608,6 +653,17 @@ impl SqliteChainStore {
         backup
             .run_to_completion(256, std::time::Duration::from_millis(10), None)
             .with_context(|| "copying encrypted chain snapshot")?;
+        drop(backup);
+        destination.close().map_err(|(_, error)| error)
+            .context("closing staged chain snapshot")?;
+        staged.as_file().sync_all().context("syncing staged chain snapshot")?;
+        // This is a second check, not a guarantee against uncooperative path
+        // replacement between the check and rename.
+        refuse_snapshot_alias(source_path, destination_path)?;
+        refuse_snapshot_sidecars(destination_path)?;
+        staged.persist_noclobber(destination_path)
+            .map_err(|error| error.error)
+            .context("publishing staged chain snapshot")?;
         Ok(())
     }
 
@@ -2873,6 +2929,174 @@ mod tests {
             .expect("a display snapshot must not delay a witness append")
             .expect("concurrent witness append succeeds");
         assert_eq!(store.len().unwrap(), 2);
+    }
+
+    #[test]
+    fn online_backup_never_creates_a_missing_source() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("missing.db");
+        let snapshot_path = dir.path().join("snapshot.db");
+
+        let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY);
+        assert!(!source_path.exists(), "a read-only snapshot must not create its source");
+        assert!(result.is_err(), "a missing source must not produce an empty snapshot");
+    }
+
+    #[test]
+    fn snapshot_staging_directory_is_owner_only_and_removed_on_drop() {
+        let parent = TempDir::new().unwrap();
+        let staging = snapshot_staging_dir(parent.path()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(staging.path()).unwrap().permissions().mode() & 0o077, 0);
+        }
+        let owned = staging.path().to_path_buf();
+        drop(staging);
+        assert!(!owned.exists());
+    }
+
+    #[test]
+    fn missing_backup_source_does_not_remove_existing_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("missing.db");
+        let snapshot_path = dir.path().join("existing.db");
+        std::fs::write(&snapshot_path, b"keep existing destination").unwrap();
+        let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY);
+        assert!(result.is_err());
+        assert!(!source_path.exists());
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination");
+    }
+
+    #[test]
+    fn failed_backup_with_wrong_key_preserves_existing_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let snapshot_path = dir.path().join("existing.db");
+        let store = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        store.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+        drop(store);
+        std::fs::write(&snapshot_path, b"keep existing destination").unwrap();
+
+        let result = SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, [9u8; 32]);
+        assert!(result.is_err(), "the wrong key must fail the backup");
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination",
+                   "a failed backup must not replace its destination");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".hestia-snapshot-")
+        }), "a failed backup must clean up its staging directory");
+    }
+
+    #[test]
+    fn successful_backup_creates_fresh_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let snapshot_path = dir.path().join("existing.db");
+        let store = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        store.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+        SqliteChainStore::backup_encrypted(&source_path, &snapshot_path, TEST_KEY).unwrap();
+        let snapshot = SqliteChainStore::open(&snapshot_path, TEST_KEY).unwrap();
+        assert_eq!(snapshot.read_recent(10).unwrap()[0].event_type, "synthetic");
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".hestia-snapshot-")
+        }), "a successful backup must clean up its staging directory");
+    }
+
+    #[test]
+    fn backup_never_replaces_an_existing_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let destination_path = dir.path().join("destination.db");
+        let source = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        source.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+        std::fs::write(&destination_path, b"old snapshot").unwrap();
+        assert!(SqliteChainStore::backup_encrypted(&source_path, &destination_path, TEST_KEY).is_err());
+        assert_eq!(std::fs::read(&destination_path).unwrap(), b"old snapshot");
+    }
+
+    #[test]
+    fn backup_refuses_an_orphaned_destination_sidecar() {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let dir = TempDir::new().unwrap();
+            let source_path = dir.path().join("source.db");
+            let destination_path = dir.path().join("destination.db");
+            let store = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+            store.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+            let sidecar = dir.path().join(format!("destination.db{suffix}"));
+            std::fs::write(&sidecar, b"old sidecar").unwrap();
+            assert!(SqliteChainStore::backup_encrypted(&source_path, &destination_path, TEST_KEY).is_err());
+            assert!(!destination_path.exists());
+            assert_eq!(std::fs::read(sidecar).unwrap(), b"old sidecar");
+        }
+    }
+
+    #[test]
+    fn backup_does_not_replace_destination_created_after_validation() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let destination_path = dir.path().join("destination.db");
+        let source = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        source.append("synthetic", json!({"n": 1}), "test-signer").unwrap();
+        let result = SqliteChainStore::backup_encrypted_after_alias_check(
+            &source_path, &destination_path, TEST_KEY,
+            || std::fs::write(&destination_path, b"concurrent destination").unwrap(),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination_path).unwrap(), b"concurrent destination");
+    }
+
+    #[test]
+    fn snapshot_refuses_to_replace_a_destination_with_an_open_writer() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let destination_path = dir.path().join("destination.db");
+        let source = SqliteChainStore::open(&source_path, TEST_KEY).unwrap();
+        source.append("source-event", json!({"n": 1}), "test-signer").unwrap();
+        let destination = SqliteChainStore::open(&destination_path, TEST_KEY).unwrap();
+        destination.append("destination-event", json!({"n": 2}), "test-signer").unwrap();
+
+        let result = SqliteChainStore::backup_encrypted(&source_path, &destination_path, TEST_KEY);
+        if result.is_ok() {
+            if let Err(error) = SqliteChainStore::open(&destination_path, TEST_KEY) {
+                panic!("snapshot reported success, but destination cannot be reopened: {error:#}");
+            }
+        }
+        assert!(result.is_err(), "replacing an open SQLite database risks reusing its WAL: {result:?}");
+        assert_eq!(destination.read_recent(10).unwrap()[0].event_type, "destination-event");
+    }
+
+    #[test]
+    fn snapshot_source_removed_after_check_is_not_recreated() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let snapshot_path = dir.path().join("existing.db");
+        drop(SqliteChainStore::open(&source_path, TEST_KEY).unwrap());
+        std::fs::write(&snapshot_path, b"keep existing destination").unwrap();
+
+        let result = SqliteChainStore::backup_encrypted_after_alias_check(
+            &source_path, &snapshot_path, TEST_KEY,
+            || std::fs::remove_file(&source_path).unwrap(),
+        );
+
+        assert!(!source_path.exists(), "a removed source must not be recreated");
+        assert!(result.is_err(), "a removed source cannot produce a snapshot");
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination");
+    }
+
+    #[test]
+    fn snapshot_source_removed_after_check_preserves_destination() {
+        let dir = TempDir::new().unwrap();
+        let source_path = dir.path().join("source.db");
+        let snapshot_path = dir.path().join("existing.db");
+        drop(SqliteChainStore::open(&source_path, TEST_KEY).unwrap());
+        std::fs::write(&snapshot_path, b"keep existing destination").unwrap();
+
+        let _result = SqliteChainStore::backup_encrypted_after_alias_check(
+            &source_path, &snapshot_path, TEST_KEY,
+            || std::fs::remove_file(&source_path).unwrap(),
+        );
+
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), b"keep existing destination");
     }
 
     #[test]
