@@ -119,6 +119,13 @@ impl PolicyEngine {
     /// resource's runner. Matching only: no probe is read here, so this is cheap enough to run
     /// on every act and the caller samples only when something matched.
     ///
+    /// For a shell act the consumers are matched against EACH COMMAND THE LINE WOULD RUN
+    /// ([`super::resources::invocations`]: segments, wrappers, `sh -c`, substitutions), and the
+    /// act is routed only if every consuming invocation is itself the runner. A mention of the
+    /// runner elsewhere in the line does not route a consumer (codex/kimi-code/NOVA on #1551).
+    /// A line that cannot be parsed with confidence is matched as a whole and, if it consumes,
+    /// counts as NOT routed: the relation could not be established, so it fails closed.
+    ///
     /// Consumers match with the rule matcher minus `rate_limit` (refused when the resource is
     /// declared). `inert_content_skipped` is not reported from here: it marks what the RULE
     /// evaluation declined to read, and this pass decides no verdict.
@@ -126,17 +133,58 @@ impl PolicyEngine {
         &self,
         action: &PolicyAction<'_>,
     ) -> Vec<(&super::resources::GatedResource, Option<bool>)> {
-        let mut unused = false;
-        self.config
-            .resources
-            .iter()
-            .filter(|r| {
-                r.consumers
-                    .iter()
-                    .any(|m| m.rate_limit.is_none() && self.rule_matches(action, m, &mut unused))
+        let consumes = |r: &super::resources::GatedResource, a: &PolicyAction<'_>| {
+            r.consumers.iter().any(|m| {
+                let mut unused = false;
+                m.rate_limit.is_none() && self.rule_matches(a, m, &mut unused)
             })
-            .map(|r| (r, r.routed(action)))
-            .collect()
+        };
+        let is_shell = matches!(action.tool_name, "Bash" | "Shell");
+        let cmd = action.full_command.or(action.target);
+        let invocations = match (is_shell, cmd) {
+            (true, Some(c)) => Some(super::resources::invocations(c)),
+            _ => None,
+        };
+        let mut out = Vec::new();
+        for r in &self.config.resources {
+            match &invocations {
+                // Not a command: match the act as a whole. Runners are a command notion.
+                None => {
+                    if consumes(r, action) {
+                        out.push((r, None));
+                    }
+                }
+                // A command line the parser could not read with confidence: fail closed.
+                Some(None) => {
+                    if consumes(r, action) {
+                        out.push((r, r.runner.as_ref().map(|_| false)));
+                    }
+                }
+                Some(Some(invs)) => {
+                    let consuming: Vec<_> = invs
+                        .iter()
+                        .filter(|inv| {
+                            let a = PolicyAction {
+                                tool_name: action.tool_name,
+                                category: action.category,
+                                target: Some(&inv.text),
+                                full_command: Some(&inv.text),
+                            };
+                            consumes(r, &a)
+                        })
+                        .collect();
+                    if consuming.is_empty() {
+                        continue;
+                    }
+                    let routed = r
+                        .runner
+                        .as_ref()
+                        .map(|_| consuming.iter().all(|inv| r.is_runner(&inv.head)));
+                    out.push((r, routed));
+                }
+            }
+        }
+        out
     }
 
     fn rule_matches(

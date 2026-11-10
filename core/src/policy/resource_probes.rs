@@ -1,18 +1,22 @@
 //! Live readings for gated resources (#1548): the community's body sense.
 //!
-//! THE GATE MUST NEVER WAIT ON A PROBE. A probe of `/mnt/c` on WSL goes through the Windows
+//! THE GATE MUST NEVER WAIT LONG ON A PROBE. A probe of `/mnt/c` on WSL goes through the Windows
 //! drive bridge, and that bridge has hung for days before (cbp, 2026-11-08: interop relays stuck
-//! in `accept` for 46 hours). So every reading runs on its own thread with a deadline, a reading
-//! that misses the deadline is `None` (unknown, which never refuses), and a probe still in flight
-//! from an earlier call is not started again: it reads as unknown until it returns, so a hung
-//! bridge costs one parked thread, not one per gate call.
+//! in `accept` for 46 hours). So every reading runs on its own thread, a call waits at most
+//! [`DEADLINE`] for the readings it needs, and a reading that misses the deadline is `None`
+//! (unknown; what that means is the resource's `on_unknown`). A probe already in flight is not
+//! started again, so a hung bridge costs one parked thread, not one per gate call.
+//!
+//! CONCURRENT CALLS SHARE ONE READING (codex and kimi-code on #1551). A call that finds a probe in
+//! flight WAITS for that reading, within its own deadline, instead of reading unknown at once;
+//! otherwise a second act arriving a millisecond after the first would pass an enforced floor on
+//! "unknown" while the first act's reading came back short.
 //!
 //! Readings are cached briefly. Many acts arrive within a second of each other and the machine's
 //! free disk does not change meaningfully in that time.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::resources::{Probe, Sampler};
@@ -20,7 +24,7 @@ use super::resources::{Probe, Sampler};
 /// How long a reading is reused.
 const CACHE_FOR: Duration = Duration::from_secs(5);
 /// How long the gate waits for a reading before treating it as unknown.
-const DEADLINE: Duration = Duration::from_millis(400);
+pub const DEADLINE: Duration = Duration::from_millis(400);
 
 /// A probe in flight longer than this is reported as stuck: a health reading in its own right
 /// (cbp, 2026-11-08: the drive bridge hung for 46 hours and nothing said so).
@@ -61,57 +65,67 @@ fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| Mutex::new(Cache::default()))
 }
 
+/// Signalled whenever a probe thread stores a reading.
+fn landed() -> &'static Condvar {
+    static LANDED: OnceLock<Condvar> = OnceLock::new();
+    LANDED.get_or_init(Condvar::new)
+}
+
+fn fresh(c: &Cache, p: &Probe) -> Option<Option<u64>> {
+    c.readings
+        .get(p)
+        .filter(|(at, _)| at.elapsed() < CACHE_FOR)
+        .map(|(_, v)| *v)
+}
+
 /// The daemon's sampler: reads the live machine.
 pub struct LiveSampler;
 
 impl LiveSampler {
-    /// Read every probe, each within the deadline. Probes run concurrently, so a call costs at
-    /// most one deadline however many probes it names.
+    /// Read every probe within one [`DEADLINE`]. Probes run concurrently, and a probe another
+    /// call already started is waited for rather than skipped.
     pub fn sample_all(probes: &[Probe]) -> HashMap<Probe, Option<u64>> {
-        let mut out = HashMap::new();
-        let mut pending = Vec::new();
-        {
-            let mut c = cache().lock().unwrap_or_else(|p| p.into_inner());
-            for p in probes {
-                if let Some((at, v)) = c.readings.get(p) {
-                    if at.elapsed() < CACHE_FOR {
-                        out.insert(p.clone(), *v);
-                        continue;
-                    }
-                }
-                if !supported(p) {
-                    out.insert(p.clone(), None);
-                    continue;
-                }
-                if c.in_flight.contains_key(p) {
-                    out.insert(p.clone(), None);
-                    continue;
-                }
-                c.in_flight.insert(p.clone(), Instant::now());
-                pending.push(p.clone());
-            }
-        }
-        let receivers: Vec<(Probe, mpsc::Receiver<Option<u64>>)> = pending
-            .into_iter()
-            .map(|p| {
-                let (tx, rx) = mpsc::channel();
-                let probe = p.clone();
-                std::thread::spawn(move || {
-                    let v = read(&probe);
-                    let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
-                    c.in_flight.remove(&probe);
-                    c.readings.insert(probe, (Instant::now(), v));
-                    let _ = tx.send(v);
-                });
-                (p, rx)
-            })
-            .collect();
         let deadline = Instant::now() + DEADLINE;
-        for (p, rx) in receivers {
-            let left = deadline.saturating_duration_since(Instant::now());
-            out.insert(p, rx.recv_timeout(left).ok().flatten());
+        let mut c = cache().lock().unwrap_or_else(|p| p.into_inner());
+        for p in probes {
+            if !supported(p) || fresh(&c, p).is_some() || c.in_flight.contains_key(p) {
+                continue;
+            }
+            c.in_flight.insert(p.clone(), Instant::now());
+            let probe = p.clone();
+            std::thread::spawn(move || {
+                let v = read(&probe);
+                let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+                c.in_flight.remove(&probe);
+                c.readings.insert(probe, (Instant::now(), v));
+                drop(c);
+                landed().notify_all();
+            });
         }
-        out
+        loop {
+            let waiting = probes
+                .iter()
+                .any(|p| supported(p) && fresh(&c, p).is_none());
+            let now = Instant::now();
+            if !waiting || now >= deadline {
+                break;
+            }
+            c = landed()
+                .wait_timeout(c, deadline - now)
+                .map(|(g, _)| g)
+                .unwrap_or_else(|e| e.into_inner().0);
+        }
+        probes
+            .iter()
+            .map(|p| {
+                let v = if supported(p) {
+                    fresh(&c, p).flatten()
+                } else {
+                    None
+                };
+                (p.clone(), v)
+            })
+            .collect()
     }
 }
 
@@ -124,8 +138,24 @@ impl Sampler for LiveSampler {
     }
 }
 
+/// Test seam: a probe that answers `value` after `delay`, so overlapping calls and slow probes
+/// can be exercised deterministically.
+#[cfg(test)]
+fn scripted() -> &'static Mutex<HashMap<Probe, (Duration, Option<u64>)>> {
+    static S: OnceLock<Mutex<HashMap<Probe, (Duration, Option<u64>)>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Take one reading, blocking. Only ever called on a probe thread.
 fn read(probe: &Probe) -> Option<u64> {
+    #[cfg(test)]
+    {
+        let script = scripted().lock().unwrap().get(probe).copied();
+        if let Some((delay, value)) = script {
+            std::thread::sleep(delay);
+            return value;
+        }
+    }
     match probe {
         Probe::DiskFree { path } => disk_free_mb(path),
         Probe::DiskFreePermille { path } => disk_free_permille(path),
@@ -241,6 +271,53 @@ mod tests {
         let disk = Probe::DiskFree { path: "/".into() };
         assert_eq!(supported(&disk), cfg!(unix));
         assert_eq!(supported(&Probe::MemAvailable), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn an_overlapping_call_waits_for_the_reading_in_flight() {
+        // Call A starts a 150 ms reading that comes back SHORT; call B arrives 30 ms later.
+        // B must see A's reading, not "unknown" (codex/kimi-code finding 2 on #1551).
+        let probe = Probe::ProcessRunning {
+            pattern: "overlap-test-probe-41aa".into(),
+        };
+        scripted()
+            .lock()
+            .unwrap()
+            .insert(probe.clone(), (Duration::from_millis(150), Some(7)));
+        let a = {
+            let p = probe.clone();
+            std::thread::spawn(move || LiveSampler::sample_all(std::slice::from_ref(&p)))
+        };
+        std::thread::sleep(Duration::from_millis(30));
+        let b = LiveSampler::sample_all(std::slice::from_ref(&probe));
+        let a = a.join().unwrap();
+        assert_eq!(a[&probe], Some(7));
+        assert_eq!(
+            b[&probe],
+            Some(7),
+            "the overlapping call must share the reading"
+        );
+        scripted().lock().unwrap().remove(&probe);
+    }
+
+    #[test]
+    fn a_reading_slower_than_the_deadline_is_unknown_and_not_restarted() {
+        let probe = Probe::ProcessRunning {
+            pattern: "slow-test-probe-93bd".into(),
+        };
+        scripted()
+            .lock()
+            .unwrap()
+            .insert(probe.clone(), (DEADLINE * 3, Some(1)));
+        let started = Instant::now();
+        let r = LiveSampler::sample_all(std::slice::from_ref(&probe));
+        assert_eq!(r[&probe], None);
+        assert!(
+            started.elapsed() < DEADLINE * 2,
+            "the gate waited past its deadline"
+        );
+        assert!(cache().lock().unwrap().in_flight.contains_key(&probe));
+        scripted().lock().unwrap().remove(&probe);
     }
 
     #[test]

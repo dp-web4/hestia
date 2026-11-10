@@ -36,8 +36,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::matchers::target_matches;
-use super::types::{MatchScope, PolicyAction, PolicyDecision, PolicyEvaluation, PolicyMatch};
+use super::types::{PolicyDecision, PolicyEvaluation, PolicyMatch};
 
 /// Observe (record what the gate would do) or enforce (refuse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -97,8 +96,9 @@ impl Probe {
     }
 }
 
-/// A condition on one live reading. The act is unaffordable while the reading is below `min` or
-/// above `max`. Between `min` and `comfortable` the price surges.
+/// A condition on one live reading. The act is unaffordable while the reading is AT OR BELOW
+/// `min` (at the floor the price is unbounded) or above `max`. Between `min` and `comfortable`
+/// the price surges.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Floor {
     pub id: String,
@@ -119,15 +119,30 @@ pub struct Pricing {
     pub base_milli_atp: u64,
 }
 
-/// The sanctioned way to run a consumer of this resource (e.g. `cargo-serial`). An act that
-/// matches a consumer but does not invoke the runner at an executable position is refused for
-/// routing: the runner is where serialisation, cleaning and priority are applied.
+/// The sanctioned way to run a consumer of this resource (e.g. `cargo-serial`). Every invocation
+/// that consumes the resource must BE a runner invocation: the runner has to be the command that
+/// runs, not a word found elsewhere in the line (`cargo-serial check && cargo test` runs the
+/// second build unserialised; codex, kimi-code and NOVA on #1551). The runner is where
+/// serialisation, cleaning and priority are applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Runner {
     /// Shown in refusal text, e.g. `/home/dp/ai-workspace/scripts/cargo-serial <cargo args>`.
     pub usage: String,
-    /// Regex over the command's executable positions that recognises the runner.
+    /// Regex over the invoked command's basename (after wrappers such as `env`, `nice` and
+    /// `timeout` are looked through), e.g. `^cargo-serial$`.
     pub pattern: String,
+}
+
+/// What a lost reading means in enforce mode. There is no default: NOVA's review of #1551 is
+/// right that an unknown reading must not impersonate affordability, and equally a hung probe
+/// should not silently stop all work. The operator chooses, per resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnUnknown {
+    /// An unread floor does not refuse (the reading is recorded as unknown).
+    Allow,
+    /// An unread floor refuses, like a failed one.
+    Refuse,
 }
 
 /// One gated resource, declared in local law.
@@ -152,6 +167,9 @@ pub struct GatedResource {
     /// What the operator is asked to fix when a floor fails, e.g. "free or add disk on C:".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remedy: Option<String>,
+    /// What an unread floor means. Required in enforce mode when floors are declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_unknown: Option<OnUnknown>,
 }
 
 impl GatedResource {
@@ -230,6 +248,17 @@ impl GatedResource {
             regex::Regex::new(&r.pattern)
                 .map_err(|e| format!("resource `{}` runner pattern: {e}", self.id))?;
         }
+        if self.mode == ResourceMode::Enforce
+            && !self.floors.is_empty()
+            && self.on_unknown.is_none()
+        {
+            return Err(format!(
+                "resource `{}` is enforced but does not say what an unread floor means: set \
+                 on_unknown to \"allow\" or \"refuse\" (a lost reading must be a decision, not \
+                 a default)",
+                self.id
+            ));
+        }
         Ok(())
     }
 
@@ -241,11 +270,9 @@ impl GatedResource {
             .floors
             .iter()
             .map(|f| match (f.min, f.max) {
-                (Some(m), _) => format!(
-                    "{} at least {}",
-                    f.probe.describe(),
-                    fmt_reading(&f.probe, m)
-                ),
+                (Some(m), _) => {
+                    format!("{} above {}", f.probe.describe(), fmt_reading(&f.probe, m))
+                }
                 (None, Some(m)) => format!(
                     "{} at most {}",
                     f.probe.describe(),
@@ -260,8 +287,22 @@ impl GatedResource {
                 conds.join(", ")
             ));
         }
+        s.push_str(&format!(
+            "Consumed by: {}. Matched on each command the line runs (through wrappers, `sh -c` \
+             and substitutions), not on what a script it starts goes on to do. ",
+            self.consumers_text()
+        ));
         if let Some(r) = &self.runner {
-            s.push_str(&format!("Run consumers through: {}. ", r.usage));
+            s.push_str(&format!(
+                "Run consumers through: {} (recognised as a command matching `{}`). ",
+                r.usage, r.pattern
+            ));
+        }
+        if let Some(u) = self.on_unknown {
+            s.push_str(match u {
+                OnUnknown::Allow => "An unread floor does not refuse. ",
+                OnUnknown::Refuse => "An unread floor refuses. ",
+            });
         }
         if let Some(p) = &self.pricing {
             s.push_str(&format!(
@@ -293,18 +334,130 @@ impl GatedResource {
         out
     }
 
-    /// Did the act invoke the runner at an executable position? `None` when no runner is
-    /// declared. Text that merely mentions the runner (an echo, a quoted string) does not count.
-    pub fn routed(&self, action: &PolicyAction<'_>) -> Option<bool> {
-        let runner = self.runner.as_ref()?;
-        let cmd = action.full_command.or(action.target).unwrap_or("");
-        let positions = super::shell::project(cmd, MatchScope::ExecutablePositions);
-        Some(target_matches(
-            &positions,
-            std::slice::from_ref(&runner.pattern),
-            true,
-        ))
+    /// The consumers as published text: what a member reads to know which acts this governs.
+    pub fn consumers_text(&self) -> String {
+        self.consumers
+            .iter()
+            .map(|c| serde_json::to_string(c).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" or ")
     }
+
+    /// Is `head` (an invoked command's basename) this resource's runner?
+    pub fn is_runner(&self, head: &str) -> bool {
+        self.runner
+            .as_ref()
+            .is_some_and(|r| regex::Regex::new(&r.pattern).is_ok_and(|re| re.is_match(head)))
+    }
+}
+
+/// One command a shell line would run, after looking through wrappers: its basename and the text
+/// consumers are matched against (`<basename> <args…>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    pub head: String,
+    pub text: String,
+}
+
+/// Commands that run another command named in their arguments. Looked through, so
+/// `nice -n 10 cargo build` is an invocation of `cargo`.
+const WRAPPERS: &[&str] = &[
+    "env", "nice", "ionice", "nohup", "time", "timeout", "stdbuf", "command", "exec", "xargs",
+    "sudo", "chrt", "taskset",
+];
+
+/// Shells whose `-c` argument is a command line of its own.
+const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh"];
+
+fn skippable_wrapper_arg(a: &str) -> bool {
+    a.starts_with('-')
+        || (a.contains('=') && !a.starts_with('='))
+        || a.trim_end_matches(['s', 'm', 'h', 'd'])
+            .parse::<f64>()
+            .is_ok()
+}
+
+/// The bodies of `$( … )` and backtick substitutions in `cmd`, outermost first. Each is a command
+/// line that runs, so it is searched for consumers like the line itself.
+fn substitutions(cmd: &str) -> Option<Vec<String>> {
+    let ch: Vec<char> = cmd.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < ch.len() {
+        if ch[i] == '$' && ch.get(i + 1) == Some(&'(') {
+            let mut depth = 1;
+            let mut j = i + 2;
+            while j < ch.len() && depth > 0 {
+                match ch[j] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return None;
+            }
+            out.push(ch[i + 2..j - 1].iter().collect());
+            i = j;
+        } else if ch[i] == '`' {
+            let end = ch[i + 1..].iter().position(|&c| c == '`')? + i + 1;
+            out.push(ch[i + 1..end].iter().collect());
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Every command `cmd` would run: each simple command (looking through wrappers), each `sh -c`
+/// script, and each substitution, to a bounded depth. `None` when any part cannot be parsed with
+/// confidence: the caller must then fail closed.
+pub fn invocations(cmd: &str) -> Option<Vec<Invocation>> {
+    fn walk(cmd: &str, depth: u8, out: &mut Vec<Invocation>) -> Option<()> {
+        if depth > 3 {
+            return None;
+        }
+        for sub in substitutions(cmd)? {
+            walk(&sub, depth + 1, out)?;
+        }
+        for sc in super::shell::simple_commands(cmd)? {
+            let mut words: Vec<String> = sc.head.into_iter().chain(sc.args).collect();
+            // Look through wrappers to the command they run.
+            loop {
+                let Some(first) = words.first() else { break };
+                let base = first.rsplit('/').next().unwrap_or(first).to_string();
+                if !WRAPPERS.contains(&base.as_str()) {
+                    break;
+                }
+                let rest: Vec<String> = words[1..]
+                    .iter()
+                    .skip_while(|a| skippable_wrapper_arg(a))
+                    .cloned()
+                    .collect();
+                words = rest;
+            }
+            let Some(first) = words.first() else { continue };
+            let head = first.rsplit('/').next().unwrap_or(first).to_string();
+            if SHELLS.contains(&head.as_str()) {
+                if let Some(pos) = words.iter().position(|w| w == "-c") {
+                    if let Some(script) = words.get(pos + 1) {
+                        walk(script, depth + 1, out)?;
+                    }
+                }
+            }
+            let text = std::iter::once(head.clone())
+                .chain(words[1..].iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push(Invocation { head, text });
+        }
+        Some(())
+    }
+    let mut out = Vec::new();
+    walk(cmd, 0, &mut out)?;
+    Some(out)
 }
 
 /// Reads probes. The daemon's implementation samples the live machine with a deadline; tests
@@ -326,10 +479,11 @@ pub enum FloorStatus {
     Ok,
     /// Below `min` or above `max`: the act is unaffordable.
     Short,
-    /// The reading could not be taken. Never refuses; recorded so the gap is countable.
+    /// The reading could not be taken. Refuses only where the resource says `on_unknown:
+    /// refuse`; always recorded, so the gap is countable.
     Unknown,
-    /// This platform cannot read the probe at all. Never refuses; distinct from `Unknown` so a
-    /// declaration that can never bite is visible as such.
+    /// This platform cannot read the probe at all. Treated as `Unknown` for `on_unknown`; kept
+    /// distinct so a declaration that can never bite is visible as such.
     Unsupported,
 }
 
@@ -355,7 +509,7 @@ impl FloorReading {
     /// by itself and calls for a later run, not a remedy.
     pub fn is_scarce(&self) -> bool {
         self.status == FloorStatus::Short
-            && matches!((self.reading, self.min), (Some(v), Some(m)) if v < m)
+            && matches!((self.reading, self.min), (Some(v), Some(m)) if v <= m)
     }
 }
 
@@ -410,7 +564,9 @@ impl Assessment {
         }
         if self.short_floors().next().is_some() {
             if let Some(r) = &self.remedy {
-                s.push_str(&format!(" A remedy request has gone to the operator: {r}."));
+                s.push_str(&format!(
+                    " The operator is asked for a remedy on the dashboard (not pushed): {r}."
+                ));
             }
         }
         s
@@ -519,15 +675,38 @@ pub fn assess(resource: &GatedResource, routed: Option<bool>, sampler: &dyn Samp
         } else {
             None
         };
+        let refuse_unread = resource.on_unknown == Some(OnUnknown::Refuse);
         let (status, contrib) = match reading {
-            None if !platform_reads => (FloorStatus::Unsupported, Some(1000)),
-            None => (FloorStatus::Unknown, Some(1000)),
+            None => {
+                let status = if platform_reads {
+                    FloorStatus::Unknown
+                } else {
+                    FloorStatus::Unsupported
+                };
+                if refuse_unread {
+                    reasons.push(format!(
+                        "{} could not be read ({}), and this resource refuses on an unread \
+                         floor (`{}`)",
+                        f.probe.describe(),
+                        if platform_reads {
+                            "no answer in time"
+                        } else {
+                            "unsupported here"
+                        },
+                        f.id
+                    ));
+                    (status, None)
+                } else {
+                    (status, Some(1000))
+                }
+            }
             Some(v) => {
-                let below = f.min.is_some_and(|m| v < m);
+                // AT the floor is short: that is where the price is unbounded (codex/kimi #5).
+                let below = f.min.is_some_and(|m| v <= m);
                 let above = f.max.is_some_and(|m| v > m);
                 if below {
                     reasons.push(format!(
-                        "{} is {}, below the floor of {} (`{}`)",
+                        "{} is {}, at or below the floor of {} (`{}`)",
                         f.probe.describe(),
                         fmt_reading(&f.probe, v),
                         fmt_reading(&f.probe, f.min.unwrap_or(0)),
@@ -602,7 +781,10 @@ pub fn publish(resources: &[GatedResource]) -> Value {
                     "mode": r.mode.as_str(),
                     "floors": r.floors,
                     "pricing": r.pricing,
-                    "runner": r.runner.as_ref().map(|x| &x.usage),
+                    "consumers": r.consumers,
+                    "runner": r.runner,
+                    "on_unknown": r.on_unknown,
+                    "law": r.law_text(),
                     "alternatives": r.alternatives,
                     "remedy": r.remedy,
                 })
@@ -614,6 +796,7 @@ pub fn publish(resources: &[GatedResource]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::types::PolicyAction;
 
     fn cargo_resource(mode: ResourceMode) -> GatedResource {
         serde_json::from_value(json!({
@@ -623,7 +806,7 @@ mod tests {
             "consumers": [
                 {"tools": ["Bash"], "target_patterns_scope": "executable_positions",
                  "target_patterns_are_regex": true,
-                 "target_patterns": ["(^|\\s)(\\S*/)?cargo(-serial)?\\s+(\\+\\S+\\s+)?(build|b|test|t|check|c|clippy|run|r|doc|bench|nextest|install)\\b"]}
+                 "target_patterns": ["^cargo(-serial)?\\s+(\\+\\S+\\s+)?(build|b|test|t|check|c|clippy|run|r|doc|bench|nextest|install)\\b"]}
             ],
             "floors": [
                 {"id": "scratch", "probe": {"kind": "disk_free", "path": "/mnt/c"},
@@ -631,7 +814,8 @@ mod tests {
                 {"id": "memory", "probe": {"kind": "mem_available"}, "min": 4000}
             ],
             "pricing": {"base_milli_atp": 5000},
-            "runner": {"usage": "cargo-serial <cargo args>", "pattern": "(^|\\s)(\\S*/)?cargo-serial(\\s|$)"},
+            "runner": {"usage": "cargo-serial <cargo args>", "pattern": "^cargo-serial$"},
+            "on_unknown": "allow",
             "alternatives": ["a smaller job: cargo test -p <crate>", "a later run, when the reading recovers"],
             "remedy": "free or add disk on C: (compact the vhdx, clean targets)"
         }))
@@ -695,12 +879,12 @@ mod tests {
         assert_eq!(a.required_milli_atp, None);
         let text = a.negotiation();
         assert!(
-            text.contains("free disk at /mnt/c is 41000 MB, below the floor of 60000 MB"),
+            text.contains("free disk at /mnt/c is 41000 MB, at or below the floor of 60000 MB"),
             "{text}"
         );
         assert!(text.contains("a smaller job"), "{text}");
         assert!(
-            text.contains("remedy request has gone to the operator"),
+            text.contains("asked for a remedy on the dashboard (not pushed)"),
             "{text}"
         );
         assert_eq!(a.short_floors().count(), 1);
@@ -760,20 +944,67 @@ mod tests {
         );
     }
 
+    /// What the engine concludes for one command: `None` if the act consumes nothing, else
+    /// whether it was routed through the runner.
+    fn routed(r: &GatedResource, cmd: &str) -> Option<Option<bool>> {
+        let mut cfg = crate::policy::get_preset("safety").unwrap().config;
+        cfg.resources = vec![r.clone()];
+        let engine = crate::policy::PolicyEngine::new(cfg);
+        engine
+            .matching_resources(&bash(cmd))
+            .first()
+            .map(|(_, routed)| *routed)
+    }
+
     #[test]
-    fn the_runner_is_recognised_only_at_an_executable_position() {
+    fn the_runner_must_be_the_command_that_consumes() {
         let r = cargo_resource(ResourceMode::Enforce);
-        assert_eq!(r.routed(&bash("cargo test -q")), Some(false));
+        assert_eq!(routed(&r, "cargo test -q"), Some(Some(false)));
         assert_eq!(
-            r.routed(&bash("/home/dp/ai-workspace/scripts/cargo-serial test -q")),
-            Some(true)
+            routed(&r, "/home/dp/ai-workspace/scripts/cargo-serial test -q"),
+            Some(Some(true))
         );
-        assert_eq!(r.routed(&bash("cd core && cargo-serial check")), Some(true));
-        // Mentioning the runner is not running it.
         assert_eq!(
-            r.routed(&bash("echo 'use cargo-serial' && cargo build")),
-            Some(false)
+            routed(&r, "cd core && cargo-serial check"),
+            Some(Some(true))
         );
+        // Kimi's and codex's reproductions on #1551: the runner elsewhere in the line does not
+        // route the consumer that runs after it.
+        assert_eq!(
+            routed(&r, "cargo-serial check && cargo test"),
+            Some(Some(false))
+        );
+        assert_eq!(
+            routed(&r, "echo cargo-serial && cargo build"),
+            Some(Some(false))
+        );
+        assert_eq!(
+            routed(&r, "echo 'use cargo-serial' && cargo build"),
+            Some(Some(false))
+        );
+    }
+
+    #[test]
+    fn wrappers_shells_and_substitutions_are_looked_through() {
+        let r = cargo_resource(ResourceMode::Enforce);
+        assert_eq!(routed(&r, "nice -n 10 cargo-serial test"), Some(Some(true)));
+        assert_eq!(
+            routed(&r, "env CARGO_BUILD_JOBS=2 timeout 3600 cargo-serial build"),
+            Some(Some(true))
+        );
+        assert_eq!(routed(&r, "timeout 600 cargo test"), Some(Some(false)));
+        assert_eq!(routed(&r, "bash -c 'cargo build'"), Some(Some(false)));
+        assert_eq!(routed(&r, "echo $(cargo build)"), Some(Some(false)));
+        assert_eq!(routed(&r, "ls | xargs cargo check"), Some(Some(false)));
+    }
+
+    #[test]
+    fn a_mention_is_not_a_consumer() {
+        let r = cargo_resource(ResourceMode::Enforce);
+        assert_eq!(routed(&r, "echo 'cargo build'"), None);
+        assert_eq!(routed(&r, "git commit -m 'fix cargo test flake'"), None);
+        assert_eq!(routed(&r, "grep -n 'cargo test' README.md"), None);
+        assert_eq!(routed(&r, "cargo fmt"), None);
     }
 
     #[test]
@@ -781,7 +1012,7 @@ mod tests {
         let r = cargo_resource(ResourceMode::Enforce);
         let a = assess(
             &r,
-            r.routed(&bash("cargo build")),
+            routed(&r, "cargo build").unwrap(),
             &readings(Some(200_000), Some(16_000)),
         );
         assert!(a.refuses());
@@ -791,7 +1022,7 @@ mod tests {
         );
         // Routing is not a disk condition: no remedy is owed for it.
         assert_eq!(a.short_floors().count(), 0);
-        assert!(!a.negotiation().contains("remedy request"));
+        assert!(!a.negotiation().contains("remedy"));
     }
 
     #[test]
@@ -840,10 +1071,73 @@ mod tests {
         let b = assess(&r, Some(true), &m);
         assert!(b.refuses());
         assert!(
-            b.negotiation().contains("is 34‰, below the floor of 50‰"),
+            b.negotiation()
+                .contains("is 34‰, at or below the floor of 50‰"),
             "{}",
             b.negotiation()
         );
+    }
+
+    #[test]
+    fn exactly_at_the_floor_is_unaffordable() {
+        // codex/kimi-code finding 5 on #1551: reading == min allowed the act at a finite price.
+        let r = cargo_resource(ResourceMode::Enforce);
+        let a = assess(&r, Some(true), &readings(Some(60_000), Some(16_000)));
+        assert!(a.refuses(), "at the floor the price is unbounded");
+        assert_eq!(a.required_milli_atp, None);
+        assert_eq!(
+            a.short_floors().count(),
+            1,
+            "and it is scarcity, so a remedy is owed"
+        );
+        let just_above = assess(&r, Some(true), &readings(Some(60_001), Some(16_000)));
+        assert!(!just_above.refuses());
+        assert!(just_above.required_milli_atp.unwrap() > 5000 * 1000);
+    }
+
+    #[test]
+    fn an_unread_floor_refuses_only_where_the_operator_said_so() {
+        let mut r = cargo_resource(ResourceMode::Enforce);
+        assert!(!assess(&r, Some(true), &readings(None, Some(16_000))).refuses());
+        r.on_unknown = Some(OnUnknown::Refuse);
+        let a = assess(&r, Some(true), &readings(None, Some(16_000)));
+        assert!(a.refuses());
+        assert!(
+            a.negotiation()
+                .contains("could not be read (no answer in time)"),
+            "{}",
+            a.negotiation()
+        );
+        assert_eq!(
+            a.short_floors().count(),
+            0,
+            "an unread probe is not scarcity"
+        );
+    }
+
+    #[test]
+    fn enforce_mode_requires_a_decision_about_unread_floors() {
+        let mut r = cargo_resource(ResourceMode::Enforce);
+        r.on_unknown = None;
+        assert!(r.validate().unwrap_err().contains("on_unknown"));
+        r.mode = ResourceMode::Observe;
+        r.validate().unwrap();
+    }
+
+    #[test]
+    fn published_law_says_what_it_governs() {
+        let a = cargo_resource(ResourceMode::Enforce);
+        let mut b = a.clone();
+        b.consumers[0].target_patterns = Some(vec!["^make\\b".into()]);
+        let (pa, pb) = (publish(&[a.clone()]), publish(&[b]));
+        assert_ne!(
+            pa, pb,
+            "declarations differing only in consumers must publish differently"
+        );
+        assert_eq!(pa[0]["consumers"], json!(a.consumers));
+        assert_eq!(pa[0]["runner"]["pattern"], "^cargo-serial$");
+        assert!(a.law_text().contains("Consumed by:"));
+        assert!(a.law_text().contains("^cargo-serial$"));
     }
 
     #[test]

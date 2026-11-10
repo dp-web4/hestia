@@ -118,12 +118,21 @@ pub fn note(s: &mut super::state::ServerState, assessments: &[Assessment], membe
                             "first_met_by": member,
                         }),
                     );
-                    req.opened_entry = row.ok().map(|r| r.hash);
-                    s.remedy_requests.insert(key, req);
+                    // OPEN ONLY WHAT WAS WITNESSED (NOVA, kimi-code, codex on #1551). A request
+                    // whose row did not commit is not shown as open; the next act that meets the
+                    // floor tries again.
+                    match row {
+                        Ok(r) => {
+                            req.opened_entry = Some(r.hash);
+                            s.remedy_requests.insert(key, req);
+                        }
+                        Err(e) => tracing::warn!(error = %e, key = %req.key,
+                            "remedy request not witnessed; it will be retried at the next act"),
+                    }
                 }
                 FloorStatus::Ok => {
-                    if let Some(closed) = s.remedy_requests.remove(&key) {
-                        let _ = s.append_chain(
+                    if let Some(closed) = s.remedy_requests.get(&key).cloned() {
+                        let row = s.append_chain(
                             "resource_remedy_cleared",
                             json!({
                                 "key": closed.key,
@@ -136,6 +145,11 @@ pub fn note(s: &mut super::state::ServerState, assessments: &[Assessment], membe
                                 "cleared_by_reading_during_act_of": member,
                             }),
                         );
+                        // CLOSE ONLY WHAT WAS WITNESSED: a failed clear row leaves the request
+                        // open, so the chain and the dashboard never disagree about it.
+                        if row.is_ok() {
+                            s.remedy_requests.remove(&key);
+                        }
                     }
                 }
             }
@@ -258,13 +272,15 @@ pub fn note_stuck(
                 "first_met_by": member,
             }),
         );
-        req.opened_entry = row.ok().map(|r| r.hash);
-        s.remedy_requests.insert(key, req);
+        if let Ok(r) = row {
+            req.opened_entry = Some(r.hash);
+            s.remedy_requests.insert(key, req);
+        }
     }
     for probe in answered {
         let key = format!("probe/{}", probe.describe());
-        if let Some(closed) = s.remedy_requests.remove(&key) {
-            let _ = s.append_chain(
+        if let Some(closed) = s.remedy_requests.get(&key).cloned() {
+            let row = s.append_chain(
                 "resource_remedy_cleared",
                 json!({
                     "key": closed.key,
@@ -276,6 +292,9 @@ pub fn note_stuck(
                     "cleared_by_reading_during_act_of": member,
                 }),
             );
+            if row.is_ok() {
+                s.remedy_requests.remove(&key);
+            }
         }
     }
 }

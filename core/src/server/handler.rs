@@ -2044,9 +2044,12 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             })
         })
         .collect();
+    // Whether the R6 records were witnessed (NOVA on #1551): an observation that did not commit
+    // is reported as such in the reply, never presented as recorded.
+    let mut resources_witnessed: Option<bool> = None;
     if !assessments.is_empty() {
         let instance_lct = s.member_lct(&plugin_id_for_chain);
-        let _ = s.append_chain(
+        let observed = s.append_chain(
             "resource_observation",
             json!({
                 "policy_version": policy_version,
@@ -2064,6 +2067,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
                 "assessments": resource_r6,
             }),
         );
+        resources_witnessed = Some(observed.is_ok());
         let now = crate::server::gate_escalation::now_secs();
         crate::server::resource_remedy::note(&mut s, &assessments, &plugin_id_for_chain, now);
         let stuck = crate::policy::resource_probes::stuck_probes(
@@ -2303,6 +2307,9 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // readings, the price at those readings, and (when unaffordable) why and what would be
         // allowed instead. Empty when the act consumes none.
         "resources": resource_r6,
+        // true: the R6 records above committed as a `resource_observation` row; false: they did
+        // not, and exist only in this reply; null: the act consumes no gated resource.
+        "resourcesWitnessed": resources_witnessed,
     }))
 }
 
@@ -12070,10 +12077,11 @@ mod accountability_tests {
             "mode": mode,
             "consumers": [{"tools": ["Bash"], "target_patterns_scope": "executable_positions",
                            "target_patterns_are_regex": true,
-                           "target_patterns": [r"(^|\s)(\S*/)?cargo(-serial)?\s+(build|test|check)\b"]}],
+                           "target_patterns": [r"^cargo(-serial)?\s+(build|test|check)\b"]}],
             "floors": [{"id": "scratch", "probe": {"kind": "disk_free", "path": "/"}, "min": min_mb}],
             "pricing": {"base_milli_atp": 5000},
-            "runner": {"usage": "cargo-serial <cargo args>", "pattern": r"(^|\s)(\S*/)?cargo-serial(\s|$)"},
+            "runner": {"usage": "cargo-serial <cargo args>", "pattern": "^cargo-serial$"},
+            "on_unknown": "allow",
             "alternatives": ["a later run, when scratch is back above the floor"],
             "remedy": "free disk on /"
         }))
@@ -12156,9 +12164,9 @@ mod accountability_tests {
         assert_eq!(out["enforced"], true);
         assert_eq!(out["ruleId"], "resource:cargo");
         let reason = out["reason"].as_str().unwrap();
-        assert!(reason.contains("below the floor"), "{reason}");
+        assert!(reason.contains("at or below the floor"), "{reason}");
         assert!(reason.contains("a later run, when scratch is back above the floor"), "{reason}");
-        assert!(reason.contains("remedy request has gone to the operator"), "{reason}");
+        assert!(reason.contains("asked for a remedy on the dashboard (not pushed)"), "{reason}");
 
         let s = state.lock().await;
         let pd = s
@@ -12249,6 +12257,47 @@ mod accountability_tests {
         let kinds: Vec<String> = s.recent_chain(10).into_iter().map(|e| e.event_type).collect();
         assert!(kinds.iter().any(|k| k == "resource_remedy_requested"));
         assert!(kinds.iter().any(|k| k == "resource_remedy_cleared"));
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_remedy_is_not_shown_open_and_an_unwitnessed_observation_says_so() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        {
+            let mut s = state.lock().await;
+            s.chain_fault_on.insert("resource_remedy_requested".into());
+            s.chain_fault_on.insert("resource_observation".into());
+        }
+        let out = gate_bash(&state, &sid, "cargo-serial build").await;
+        assert_eq!(out["resourcesWitnessed"], false, "{out}");
+        assert!(state.lock().await.remedy_requests.is_empty(), "no row, no open request");
+        {
+            let mut s = state.lock().await;
+            s.chain_fault_on.clear();
+        }
+        let out = gate_bash(&state, &sid, "cargo-serial build").await;
+        assert_eq!(out["resourcesWitnessed"], true);
+        assert_eq!(state.lock().await.remedy_requests.len(), 1, "the next act retries and opens it");
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_clear_leaves_the_request_open() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = crate::policy::PolicyEngine::new(gated("observe", 0));
+            s.chain_fault_on.insert("resource_remedy_cleared".into());
+        }
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        assert_eq!(state.lock().await.remedy_requests.len(), 1, "chain and dashboard must agree");
+    }
+
+    #[tokio::test]
+    async fn a_runner_elsewhere_in_the_line_does_not_route_the_build_after_it() {
+        let (_dir, state, sid) = gated_session("enforce", 0).await;
+        let out = gate_bash(&state, &sid, "cargo-serial check && cargo test").await;
+        assert_eq!(out["decision"], "deny", "{out}");
+        assert!(out["reason"].as_str().unwrap().contains("does not go through its runner"));
     }
 
     #[test]
