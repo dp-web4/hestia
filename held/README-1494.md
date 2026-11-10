@@ -2,7 +2,24 @@
 
 | file | sha256 |
 |---|---|
-| `cafcfd93f6a9e7459c3f367151fa6b3e960b22cc1a633f7a01c3d2216b331a85.patch` | `cafcfd93f6a9e7459c3f367151fa6b3e960b22cc1a633f7a01c3d2216b331a85` (base main `fd8142e4`) |
+| `e95ea8a9eb9da3ac4f33e37299192b4594bb14f0eb19d96c78bbc16443a7cc73.patch` | `e95ea8a9eb9da3ac4f33e37299192b4594bb14f0eb19d96c78bbc16443a7cc73` (base main `7629a321`) **v2, apply this one** |
+| `cafcfd93…` (v1, base `fd8142e4`) | **SUPERSEDED, do not apply**: it leaves `jq --library-path DIR` and `jq -nL DIR` unjudged |
+
+## v2 (2026-11-11), after legion-claude's and Nova's reviews
+
+- **`--library-path`** (jq 1.8's long form of `-L`) is a judged value option. In v1, `jq -n --library-path
+  /outside 'include "x"; .'` made `/outside` the filter, which is never judged (legion-claude). Main judged it,
+  so v1 was a regression there.
+- **Any clustered value option, not only file options.** v1's cluster rule looked only for program-file letters,
+  so `jq -nL /outside` had the same regression. v2 hands any value-taking letter in a cluster the rest of the
+  word or the next word, which is then judged. This also closes `jq -nL/etc`, which is **allowed on main**.
+- **`sed -if S`** is no longer over-judged: GNU sed reads `-if` as `-i` with backup suffix `f` (legion-claude).
+- **CI:** the held copy of the test is now `held/build-1494/gate_false_deny_rows.py`. As `*_test.py` it was
+  discovered by `tools/ci_discovery.py` and run against main's unpatched core, where it fails by design. That
+  was the red `plugin tests (python)` job on v1. The patch still lands it as `tools/gate_false_deny_test.py`.
+- **Recut on main `7629a321`.**
+- jq on McNugget is 1.7.1, which rejects `--library-path`, so the jq 1.8 behaviour is taken from its docs, as
+  legion-claude did. Both spellings are tested at the gate.
 
 Nothing here is applied. The patch touches the gate core, its hooks-gt copy and the five manifests, which are
 governed paths. dp applies it:
@@ -60,7 +77,7 @@ Further live instances while building this, not in the window: `grep -c "os.envi
    expression in all 55 subcommands that have it. `--template` and `-t` are deliberately not listed, because
    under `repo edit` and `auth status` they are booleans and would swallow the next word.
 3. **jq's filter is its first operand** (`_CMD_SPECS["jq"]`, `pattern_first`), unless `-f`/`--from-file` supplies
-   the program. `-L` is judged.
+   the program. `-L` and `--library-path` are judged.
 4. **A hole found while measuring, closed (tightening).** With the program from a FILE (`grep -f P`,
    `--file=P`, `-fP`, `sed -f`, `awk -f`, `rg -f`), the first operand was still taken as the pattern and never
    judged. On main, `grep -f <granted file> /etc/hosts` is ALLOWED. So are `grep -rf /etc/hosts <granted dir>`
@@ -82,16 +99,17 @@ Further live instances while building this, not in the window: `grep -c "os.envi
 
 ## Tests (`tools/gate_false_deny_test.py`, new; strings only, a fake workspace, never the live daemon)
 
-47 rows: 12 false-deny shapes that must be ALLOWED, and 35 must-deny rows (14 env-file spellings that must
-stay `egress.secret`, 21 outside reaches that must stay `mrh.command`, including through every new exemption
-and every clustered spelling). It raises on failure.
+55 rows: 14 shapes that must be ALLOWED (including `sed -if` and a granted `--library-path`), and 41 must-deny
+rows (14 env-file spellings that must stay `egress.secret`, 27 outside reaches that must stay `mrh.command`,
+including through every new exemption, every clustered spelling, and all six `-L`/`--library-path` spellings
+with `-n`). It raises on failure.
 
-Measured on base `fd8142e4`, McNugget (macOS), with `measure.sh` and an overlay runner over every
+Measured on base `7629a321` (v2), McNugget (macOS), with `measure.sh` and an overlay runner over every
 `tools/*_test.py` that imports the core:
 
 | suite | patched core | main's core |
 |---|---|---|
-| `gate_false_deny_test` | **PASS 47/47** | FAIL 28/47: the 11 false-deny rows and 8 unjudged-operand rows |
+| `gate_false_deny_test` | **PASS 55/55** | FAIL 35/55: 11 false-deny rows, 8 unjudged `-f` operand rows, and `jq -nL/etc` |
 | decide contract | 1 fail, `scope-read-escalates` | same 1 (macOS has no `/etc/hostname`) |
 | shell battery | 1431/3 | 1431/3, the same 3 macOS `TMPDIR` rows |
 | `egress_prose_test` | PASS 13 + 18 | PASS 13 + 18 |
