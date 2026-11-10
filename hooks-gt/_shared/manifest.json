@@ -22,7 +22,7 @@
     },
     {
       "path": "hestia_shell_classifier.py",
-      "sha256": "b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2",
+      "sha256": "d253168c697a31c176ae23e2f7ae9956d5c85b9564fe06e6a7aa21f6c807dfc3",
       "source": "plugins/_shared/hestia_shell_classifier.py"
     },
     {
@@ -38,5 +38,5 @@
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "5ff77061d24254bb1041d7f2ca97ed5d35771f5120952edeea41cfedad5b1520"
+  "gt_version": "2c9553fd12e0961868627e7427177985282f163068bda84ce21c62efd0bd361b"
 }

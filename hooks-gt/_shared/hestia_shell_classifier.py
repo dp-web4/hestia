@@ -1,4 +1,4 @@
-# hestia-gt-sha256: b3f508899069c0b894c792838d9d43925121ec4605cc7e30df22c7d7b425bce2  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: d253168c697a31c176ae23e2f7ae9956d5c85b9564fe06e6a7aa21f6c807dfc3  (published ground truth; manifest: hooks-gt)
 """Shell read/write classification: the fleet's ONE implementation.
 
 Moved verbatim out of `plugins/claude-code/hooks/pre_tool_use.py` on 2026-08-31 under
@@ -125,13 +125,73 @@ def _git_stdin_is_data(args: list) -> bool:
         return "--stdin" in rest
     return False
 
+# Port of policy::shell::GH_INERT_SUBCOMMANDS (adjudication 87ed0c4e, kimi-code's
+# appeal of deny cf5b0c1b): `gh pr|issue create|comment|edit` with listed flags hand
+# their quoted arguments and `--body-file -` stdin to GitHub, never to an interpreter.
+# Every other gh subcommand (api, alias, extension, …) and every unlisted flag
+# (--editor, --web, …) is unknown, and unknown means scanned. (flag -> takes a value)
+_GH_COMMON = {"--body": True, "-b": True, "--body-file": True, "-F": True,
+              "--repo": True, "-R": True}
+_GH_TITLE = {"--title": True, "-t": True}
+_GH_EDIT_LISTS = {f"--{op}-{what}": True for op in ("add", "remove")
+                  for what in ("label", "assignee", "project")}
+_GH_INERT_SUBCOMMANDS = {
+    ("pr", "create"): {**_GH_COMMON, **_GH_TITLE,
+                       "--base": True, "-B": True, "--head": True, "-H": True,
+                       "--draft": False, "-d": False, "--label": True, "-l": True,
+                       "--assignee": True, "-a": True, "--reviewer": True, "-r": True,
+                       "--milestone": True, "-m": True, "--project": True, "-p": True,
+                       "--fill": False, "-f": False, "--fill-first": False,
+                       "--fill-verbose": False, "--no-maintainer-edit": False,
+                       "--dry-run": False, "--template": True, "-T": True},
+    ("pr", "comment"): {**_GH_COMMON, "--edit-last": False, "--create-if-none": False},
+    ("pr", "edit"): {**_GH_COMMON, **_GH_TITLE, **_GH_EDIT_LISTS,
+                     "--base": True, "-B": True, "--milestone": True, "-m": True,
+                     "--add-reviewer": True, "--remove-reviewer": True},
+    ("issue", "create"): {**_GH_COMMON, **_GH_TITLE,
+                          "--label": True, "-l": True, "--assignee": True, "-a": True,
+                          "--milestone": True, "-m": True, "--project": True, "-p": True,
+                          "--template": True, "-T": True},
+    ("issue", "comment"): {**_GH_COMMON, "--edit-last": False, "--create-if-none": False},
+    ("issue", "edit"): {**_GH_COMMON, **_GH_TITLE, **_GH_EDIT_LISTS,
+                        "--milestone": True, "-m": True},
+}
+
+def _gh_args_are_data(args: list) -> bool:
+    """Is this `gh` invocation one whose quoted arguments and stdin are text for
+    GitHub rather than code? Mirrors policy::shell::gh_args_are_data."""
+    if len(args) < 2:
+        return False
+    flags = _GH_INERT_SUBCOMMANDS.get((args[0], args[1]))
+    if flags is None:
+        return False
+    i = 2
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            return True
+        if not a.startswith("-") or a == "-":
+            continue
+        glued = a.startswith("--") and "=" in a
+        name = a.split("=", 1)[0] if glued else a
+        if name not in flags:
+            return False
+        if flags[name] and not glued:
+            if i >= len(args):
+                return False
+            i += 1
+    return True
+
 def _treats_content_as_data(seg: list) -> bool:
     """Condition 2: does this segment's command treat its arguments and stdin
-    as data? `git` is matched BEFORE the list, so a list entry for it would be
-    unreachable — the shadow test in test_pre_tool_use_self.py keeps that loud."""
+    as data? `git` and `gh` are matched BEFORE the list, so a list entry for
+    either would be unreachable."""
     head = seg[0]
     if head == "git":
         return _git_stdin_is_data(seg[2])
+    if head == "gh":
+        return _gh_args_are_data(seg[2])
     return head in _INERT_CONTENT_HEADS
 
 def _blank_inert_heredoc_bodies(cmd: str) -> Optional[str]:
