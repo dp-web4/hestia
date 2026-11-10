@@ -406,7 +406,11 @@ const WRAPPERS: &[WrapperSpec] = &[
         script_option: Some(('S', "split-string")),
         ..spec("env")
     },
-    WrapperSpec { short_values: "n", long_values: &["adjustment"], ..spec("nice") },
+    WrapperSpec {
+        short_values: "n",
+        long_values: &["adjustment"],
+        ..spec("nice")
+    },
     WrapperSpec {
         short_values: "cnpPu",
         short_flags: "t",
@@ -415,7 +419,11 @@ const WRAPPERS: &[WrapperSpec] = &[
         ..spec("ionice")
     },
     spec("nohup"),
-    WrapperSpec { short_flags: "cfw", long_flags: &["ctty", "fork", "wait"], ..spec("setsid") },
+    WrapperSpec {
+        short_flags: "cfw",
+        long_flags: &["ctty", "fork", "wait"],
+        ..spec("setsid")
+    },
     WrapperSpec {
         short_values: "fo",
         short_flags: "pvaq",
@@ -436,16 +444,37 @@ const WRAPPERS: &[WrapperSpec] = &[
         long_values: &["input", "output", "error"],
         ..spec("stdbuf")
     },
-    WrapperSpec { short_flags: "pvV", ..spec("command") },
+    WrapperSpec {
+        short_flags: "pvV",
+        ..spec("command")
+    },
     spec("builtin"),
-    WrapperSpec { short_values: "a", short_flags: "cl", ..spec("exec") },
+    WrapperSpec {
+        short_values: "a",
+        short_flags: "cl",
+        ..spec("exec")
+    },
     WrapperSpec {
         short_values: "ILnPdEsa",
         short_flags: "0rtpxiel",
-        long_values: &["max-args", "max-procs", "delimiter", "arg-file", "max-lines", "max-chars"],
+        long_values: &[
+            "max-args",
+            "max-procs",
+            "delimiter",
+            "arg-file",
+            "max-lines",
+            "max-chars",
+        ],
         long_flags: &[
-            "null", "no-run-if-empty", "verbose", "interactive", "exit", "replace", "eof",
-            "open-tty", "show-limits",
+            "null",
+            "no-run-if-empty",
+            "verbose",
+            "interactive",
+            "exit",
+            "replace",
+            "eof",
+            "open-tty",
+            "show-limits",
         ],
         ..spec("xargs")
     },
@@ -453,25 +482,59 @@ const WRAPPERS: &[WrapperSpec] = &[
         short_values: "ugCDhprtUTR",
         short_flags: "EHnSbiksKlvPAB",
         long_values: &[
-            "user", "group", "close-from", "chdir", "host", "prompt", "role", "type",
-            "other-user", "command-timeout", "chroot",
+            "user",
+            "group",
+            "close-from",
+            "chdir",
+            "host",
+            "prompt",
+            "role",
+            "type",
+            "other-user",
+            "command-timeout",
+            "chroot",
         ],
         long_flags: &[
-            "preserve-env", "set-home", "non-interactive", "stdin", "background", "login",
-            "reset-timestamp", "shell", "remove-timestamp", "list", "validate",
-            "preserve-groups", "askpass", "bell",
+            "preserve-env",
+            "set-home",
+            "non-interactive",
+            "stdin",
+            "background",
+            "login",
+            "reset-timestamp",
+            "shell",
+            "remove-timestamp",
+            "list",
+            "validate",
+            "preserve-groups",
+            "askpass",
+            "bell",
         ],
         assignments: true,
         ..spec("sudo")
     },
-    WrapperSpec { short_values: "uC", short_flags: "nsL", ..spec("doas") },
+    WrapperSpec {
+        short_values: "uC",
+        short_flags: "nsL",
+        ..spec("doas")
+    },
     WrapperSpec {
         short_values: "TPD",
         short_flags: "abdefimoprRv",
         long_values: &["sched-runtime", "sched-period", "sched-deadline"],
         long_flags: &[
-            "all-tasks", "batch", "deadline", "ext", "fifo", "idle", "max", "other", "pid", "rr",
-            "reset-on-fork", "verbose",
+            "all-tasks",
+            "batch",
+            "deadline",
+            "ext",
+            "fifo",
+            "idle",
+            "max",
+            "other",
+            "pid",
+            "rr",
+            "reset-on-fork",
+            "verbose",
         ],
         positionals: 1,
         ..spec("chrt")
@@ -482,13 +545,25 @@ const WRAPPERS: &[WrapperSpec] = &[
         positionals: 1,
         ..spec("taskset")
     },
-    WrapperSpec { short_flags: "p", ..spec("unbuffer") },
+    WrapperSpec {
+        short_flags: "p",
+        ..spec("unbuffer")
+    },
     // `flock FILE cmd…` or `flock FILE -c 'cmd'` (util-linux reads `-c` after the file).
     WrapperSpec {
         short_values: "wE",
         short_flags: "sexnouF",
         long_values: &["timeout", "conflict-exit-code"],
-        long_flags: &["shared", "exclusive", "nonblock", "nb", "close", "unlock", "no-fork", "verbose"],
+        long_flags: &[
+            "shared",
+            "exclusive",
+            "nonblock",
+            "nb",
+            "close",
+            "unlock",
+            "no-fork",
+            "verbose",
+        ],
         positionals: 1,
         script_option: Some(('c', "command")),
         ..spec("flock")
@@ -506,7 +581,13 @@ const WRAPPERS: &[WrapperSpec] = &[
     WrapperSpec {
         short_values: "ugGsw",
         short_flags: "lfmpP",
-        long_values: &["user", "group", "supp-group", "shell", "whitelist-environment"],
+        long_values: &[
+            "user",
+            "group",
+            "supp-group",
+            "shell",
+            "whitelist-environment",
+        ],
         long_flags: &["login", "fast", "preserve-environment", "pty"],
         script_option: Some(('c', "command")),
         ..spec("runuser")
@@ -514,7 +595,14 @@ const WRAPPERS: &[WrapperSpec] = &[
     WrapperSpec {
         short_values: "EIOTB",
         short_flags: "aefqk",
-        long_values: &["echo", "log-in", "log-out", "log-timing", "log-io", "logging-format"],
+        long_values: &[
+            "echo",
+            "log-in",
+            "log-out",
+            "log-timing",
+            "log-io",
+            "logging-format",
+        ],
         long_flags: &["append", "return", "flush", "force", "quiet", "log-keys"],
         script_option: Some(('c', "command")),
         positionals: usize::MAX,
@@ -524,7 +612,9 @@ const WRAPPERS: &[WrapperSpec] = &[
 
 /// Shell keywords and `!` that prefix a command (`if …; then cargo build`, `! cargo test`): the
 /// next word is the command. Exactly one word is skipped, never a guess at more.
-const KEYWORDS: &[&str] = &["!", "then", "do", "else", "elif", "if", "while", "until", "{"];
+const KEYWORDS: &[&str] = &[
+    "!", "then", "do", "else", "elif", "if", "while", "until", "{",
+];
 
 /// Shells whose `-c` argument (alone or in a flag cluster: `-lc`, `-ec`, `-xc`) is a command
 /// line of its own. A shell given a script FILE is opaque (documented gap).
@@ -1470,7 +1560,11 @@ mod tests {
         assert_eq!(inv.last().unwrap().head, "cargo");
         let line = format!("{}true", "if ".repeat(400));
         assert_eq!(invocations(&line).unwrap().len(), 1);
-        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
