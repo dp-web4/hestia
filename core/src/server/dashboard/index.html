@@ -1170,6 +1170,16 @@
       <button class="esc-banner-btn" id="scope-banner-btn">review</button>
     </div>
 
+    <!-- Remedy requests (#1548). Same banner shape again, because it is the same kind of notice:
+         members are being stopped (or, in observe mode, would be) and only the operator can
+         change that. Unlike the two above there is nothing to rule here: the remedy is an act on
+         the machine (free disk, stop a runaway process), so the banner states it and the
+         reading, and closes itself when a later reading recovers. -->
+    <div class="esc-banner" id="remedy-banner" hidden>
+      <span class="esc-dot"></span>
+      <span id="remedy-banner-text">…</span>
+    </div>
+
     <!-- TWO TOP-LEVEL VIEWS (dp, 2026-08-11). Everything from here to the end of .live-grid
          is the AGENTS view — local orchestrators + trust/histogram/witness-chain, i.e.
          governance of the agents on this box. The HUBS view (the outward community surface)
@@ -3405,6 +3415,7 @@
     renderStats(s, data.society, selectedOrch);
     renderEscalations(data);
     renderScopeRequests(data);
+    renderRemedyRequests(data);
     updateGovernBadge(data);
     renderGrants(data);
     // Devices renders from the snapshot, so it must be re-rendered ON THE TICK and not only
@@ -4150,17 +4161,38 @@
   // ledger's own six status counts stay in the ledger, beside the rows they describe. One
   // number, one source, one meaning; polling the chain every 2s to keep a badge warm would
   // have been the expensive way to get a worse answer.
+  // REMEDY REQUESTS (#1548): a gated resource's floor failed, so consuming acts are refused (or
+  // would be, in observe mode) until the operator fixes the machine. One line per open request:
+  // what to do, the reading against its floor, how long, how many acts met it.
+  function renderRemedyRequests(data) {
+    const open = data?.pending_remedy_requests ?? [];
+    const banner = $('remedy-banner');
+    if (!banner) return;
+    banner.hidden = open.length === 0;
+    if (!open.length) return;
+    const now = Date.now() / 1000;
+    const fmt = v => (v === null || v === undefined) ? 'unknown' : Number(v).toLocaleString();
+    $('remedy-banner-text').textContent = open.map(r => {
+      const bound = r.min !== null && r.min !== undefined ? `below ${fmt(r.min)}` : `above ${fmt(r.max)}`;
+      const age = escFmtAge(Math.max(0, Math.floor(now - (Number(r.opened_at) || now))));
+      return `Remedy needed (${r.resource_id}, ${r.mode}): ${r.remedy}. ${r.measures} is ${fmt(r.reading)}, `
+        + `${bound}; open ${age}, ${r.acts_met} act${r.acts_met === 1 ? '' : 's'} met it.`;
+    }).join('  ');
+  }
+
   function updateGovernBadge(data) {
     const badge = $('govern-chip-badge');
     if (!badge) return;
     const esc = (data?.pending_escalations ?? []).length;
     const scope = (data?.pending_scope_requests ?? []).length;
-    const n = esc + scope;
+    const remedy = (data?.pending_remedy_requests ?? []).length;
+    const n = esc + scope + remedy;
     badge.textContent = n ? String(n) : '';
     badge.hidden = !n;
     badge.title = n
-      ? `${n} awaiting your decision — ${esc} escalation${esc === 1 ? '' : 's'}, `
-        + `${scope} scope request${scope === 1 ? '' : 's'}`
+      ? `${n} awaiting you — ${esc} escalation${esc === 1 ? '' : 's'}, `
+        + `${scope} scope request${scope === 1 ? '' : 's'}, `
+        + `${remedy} remedy request${remedy === 1 ? '' : 's'}`
       : '';
   }
 

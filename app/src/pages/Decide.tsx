@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { decideGateEscalation, getDashboard, operatorStatus, ruleScopeRequest } from "../lib/tauri";
-import type { OperatorStatus, PendingEscalation, PendingScopeRequest, WriteEffect } from "../lib/types";
+import type { OperatorStatus, PendingEscalation, PendingRemedyRequest, PendingScopeRequest, WriteEffect } from "../lib/types";
 import {
   DURATION_LABEL,
   SCOPE_ONCE_ONLY_WHY,
@@ -343,6 +343,7 @@ function ScopeRequestCard({
 export function Decide() {
   const [pending, setPending] = useState<PendingEscalation[] | null>(null);
   const [scopeReqs, setScopeReqs] = useState<PendingScopeRequest[] | null>(null);
+  const [remedies, setRemedies] = useState<PendingRemedyRequest[]>([]);
   const [status, setStatus] = useState<OperatorStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [decided, setDecided] = useState<Record<string, string>>({});
@@ -354,6 +355,7 @@ export function Decide() {
       // decidable right now.
       setPending(snap.pending_escalations ?? []);
       setScopeReqs(snap.pending_scope_requests ?? []);
+      setRemedies(snap.pending_remedy_requests ?? []);
       setStatus(st);
       setError(null);
     } catch (e) {
@@ -406,7 +408,24 @@ export function Decide() {
       {pending !== null &&
         scopeReqs !== null &&
         pending.length === 0 &&
-        scopeReqs.length === 0 && <p className="muted">Nothing is waiting on you.</p>}
+        scopeReqs.length === 0 &&
+        remedies.length === 0 && <p className="muted">Nothing is waiting on you.</p>}
+
+      {remedies.length > 0 && <h2 className="queue-heading">Remedy needed</h2>}
+      {remedies.map((r) => (
+        <article className="section" key={r.key}>
+          <p>
+            <strong>{r.remedy}</strong>
+          </p>
+          <p className="muted">
+            {r.measures} is {r.reading === null ? "unknown" : r.reading.toLocaleString()},{" "}
+            {r.min !== null ? `below ${r.min.toLocaleString()}` : `above ${(r.max ?? 0).toLocaleString()}`}{" "}
+            ({r.resource_id}/{r.floor_id}, {r.mode}). {r.acts_met} act{r.acts_met === 1 ? "" : "s"} met
+            it since {new Date(r.opened_at * 1000).toLocaleString()}; last: {r.last_member}. It closes
+            by itself when a later reading recovers.
+          </p>
+        </article>
+      ))}
 
       {pending && pending.length > 0 && <h2 className="queue-heading">Stopped acts</h2>}
       {pending?.map((esc) => (

@@ -115,6 +115,30 @@ impl PolicyEngine {
         }
     }
 
+    /// The gated resources this act consumes (#1548), each with whether it went through the
+    /// resource's runner. Matching only: no probe is read here, so this is cheap enough to run
+    /// on every act and the caller samples only when something matched.
+    ///
+    /// Consumers match with the rule matcher minus `rate_limit` (refused when the resource is
+    /// declared). `inert_content_skipped` is not reported from here: it marks what the RULE
+    /// evaluation declined to read, and this pass decides no verdict.
+    pub fn matching_resources(
+        &self,
+        action: &PolicyAction<'_>,
+    ) -> Vec<(&super::resources::GatedResource, Option<bool>)> {
+        let mut unused = false;
+        self.config
+            .resources
+            .iter()
+            .filter(|r| {
+                r.consumers
+                    .iter()
+                    .any(|m| m.rate_limit.is_none() && self.rule_matches(action, m, &mut unused))
+            })
+            .map(|r| (r, r.routed(action)))
+            .collect()
+    }
+
     fn rule_matches(
         &self,
         action: &PolicyAction<'_>,
@@ -480,6 +504,7 @@ mod tests {
     #[test]
     fn category_and_target_patterns_are_anded() {
         let cfg = PolicyConfig {
+            resources: Vec::new(),
             default_policy: PolicyDecision::Allow,
             enforce: true,
             rules: vec![PolicyRule {

@@ -137,6 +137,13 @@ export interface DashboardSnapshot {
    */
   pending_scope_requests: PendingScopeRequest[];
   /**
+   * Remedy requests (#1548): a gated resource's floor failed (scratch disk, memory, a critical
+   * process), so consuming acts are refused, or would be in observe mode. Nothing to rule: the
+   * remedy is an act on the machine. Closed daemon-side by the first later reading that meets
+   * the floor. Optional so an older daemon that never sends it reads as "none".
+   */
+  pending_remedy_requests?: PendingRemedyRequest[];
+  /**
    * Ids the operator retired on this seat. Their rows stay in the data — hiding them would
    * make "show retired" impossible and would hide a retired id that is still acting.
    */
@@ -154,6 +161,24 @@ export interface DashboardSnapshot {
  * A member's ask for reach on a path. Field names mirror the daemon payload
  * (`core/src/server/dashboard.rs`) exactly.
  */
+/** One open remedy request (#1548), as `server::resource_remedy::RemedyRequest` serialises. */
+export interface PendingRemedyRequest {
+  key: string;
+  resource_id: string;
+  floor_id: string;
+  measures: string;
+  min: number | null;
+  max: number | null;
+  reading: number | null;
+  remedy: string;
+  mode: "observe" | "enforce";
+  opened_at: number;
+  last_seen_at: number;
+  acts_met: number;
+  last_member: string;
+  opened_entry: string | null;
+}
+
 export interface PendingScopeRequest {
   request_id: string;
   /** Caller-asserted, not authenticated — the same caveat as an escalation's asker. */

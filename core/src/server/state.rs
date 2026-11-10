@@ -544,6 +544,10 @@ pub struct ServerState {
     /// In memory on purpose: a restart forfeits at most one partial window, and persisting
     /// a tally would make the ATTESTATION rather than the chain the source of truth.
     pub scope_tally: std::collections::HashMap<(String, String), (u64, u64)>,
+    /// Open remedy requests to the operator (#1548), keyed `<resource>/<floor>`: a gated
+    /// resource's floor that failed at some act and has not been seen met since. See
+    /// `server::resource_remedy`. In memory; the next failing act reopens one after a restart.
+    pub remedy_requests: std::collections::BTreeMap<String, crate::server::resource_remedy::RemedyRequest>,
     pub vault: Vault,
     pub sessions: crate::server::published::Sessions,
     /// The dry-run session lookup returns a real bearer id for a claimed member/host pair,
@@ -1201,6 +1205,7 @@ impl ServerState {
             gate_findings_open: crate::server::gate_watch::rehydrate(&chain_store),
             seat_live: HashMap::new(),
             scope_tally: std::collections::HashMap::new(),
+            remedy_requests: std::collections::BTreeMap::new(),
             vault,
             sessions: crate::server::published::Sessions::default(),
             // In-process/IPC handlers are local; the HTTP bind may narrow this before serving.

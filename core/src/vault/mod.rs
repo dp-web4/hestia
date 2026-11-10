@@ -320,6 +320,30 @@ impl Vault {
         self.save()
     }
 
+    /// Add or replace (by `id`) a gated resource (#1548). Validated first: a declaration the
+    /// gate could not apply faithfully is refused here, at the operator's desk, rather than
+    /// discovered at a member's act. Sealed on success.
+    pub fn upsert_resource(&mut self, resource: crate::policy::GatedResource) -> Result<()> {
+        resource
+            .validate()
+            .map_err(CoreError::InvalidResource)?;
+        let list = &mut self.data.policy.resources;
+        match list.iter_mut().find(|r| r.id == resource.id) {
+            Some(slot) => *slot = resource,
+            None => list.push(resource),
+        }
+        self.save()
+    }
+
+    /// Remove a gated resource by id. Returns whether one was removed.
+    pub fn remove_resource(&mut self, id: &str) -> Result<bool> {
+        let before = self.data.policy.resources.len();
+        self.data.policy.resources.retain(|r| r.id != id);
+        let removed = self.data.policy.resources.len() != before;
+        self.save()?;
+        Ok(removed)
+    }
+
     /// Remove a custom rule by id. Returns whether one was removed.
     pub fn remove_custom_rule(&mut self, rule_id: &str) -> Result<bool> {
         let before = self.data.policy.custom_rules.len();

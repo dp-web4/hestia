@@ -132,6 +132,12 @@ pub struct VaultPolicyState {
     /// config) so it is inspectable and travels with the vault.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthetic_persist_max_attempts: Option<u32>,
+
+    /// Gated resources (#1548): this machine's scarce resources, declared as society law and
+    /// assessed on every act that consumes one. Machine-wide, so they live on the society layer
+    /// only. Empty and skipped when absent, so an existing vault round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<crate::policy::GatedResource>,
 }
 
 /// Default persist attempts for a synthetic-exclusion write when the vault policy
@@ -149,6 +155,7 @@ impl Default for VaultPolicyState {
             operator_access: Vec::new(),
             operator_irreversible_quorum: None,
             synthetic_persist_max_attempts: None,
+            resources: Vec::new(),
         }
     }
 }
@@ -185,6 +192,8 @@ impl VaultPolicyState {
 
         // Append custom rules
         cfg.rules.extend(self.custom_rules.iter().cloned());
+        // Gated resources are society law beside the rules (#1548).
+        cfg.resources = self.resources.clone();
         Some(cfg)
     }
 
@@ -219,6 +228,7 @@ impl VaultPolicyState {
                 (
                     role.clone(),
                     crate::policy::PolicyConfig {
+                        resources: Vec::new(),
                         default_policy: crate::policy::PolicyDecision::Allow,
                         enforce,
                         rules: rules.clone(),
@@ -238,6 +248,7 @@ impl VaultPolicyState {
                 out.insert(
                     (plugin_id.clone(), role.clone()),
                     crate::policy::PolicyConfig {
+                        resources: Vec::new(),
                         default_policy: crate::policy::PolicyDecision::Allow,
                         enforce: true,
                         rules: rules.clone(),
