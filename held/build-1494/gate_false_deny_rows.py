@@ -98,6 +98,18 @@ SCOPE_DENY = [
     ("grep -rf, outside data", "grep -rf {ws}/repo/p " + OUTSIDE),
     ("grep -nfFILE, outside data", "grep -nf{ws}/repo/p " + OUTSIDE),
     ("sed -nf, outside data", "sed -nf {ws}/repo/p.sed " + OUTSIDE),
+    # jq's library directory, every spelling (legion-claude and Nova on #1550; jq 1.8 long form)
+    ("jq -n --library-path outside", "jq -n --library-path /etc 'include \"x\"; .'"),
+    ("jq --library-path= outside", "jq -n --library-path=/etc 'include \"x\"; .'"),
+    ("jq -n -L outside", "jq -n -L /etc 'include \"x\"; .'"),
+    ("jq -L/DIR attached outside", "jq -n -L/etc 'include \"x\"; .'"),
+    ("jq -nL clustered outside", "jq -nL /etc 'include \"x\"; .'"),
+    ("jq -nL/DIR clustered attached", "jq -nL/etc 'include \"x\"; .'"),
+]
+# Shapes that must not be over-judged by the cluster rule.
+SCOPE_ALLOW += [
+    ("sed -if: `f` is -i's backup suffix", "sed -if 's/a/b/' {ws}/repo/a.json"),
+    ("jq -n --library-path granted", "jq -n --library-path {ws}/repo 'include \"x\"; .'"),
 ]
 
 

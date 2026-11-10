@@ -8,8 +8,8 @@ for which in patched main; do
   if [ "$which" = patched ]; then C=$D/core_rev.py; else C=$WT/plugins/_shared/hestia_gate_core.py; fi
   echo "===== $which core"
   echo "== new: gate_false_deny_test"
-  if [ "$which" = patched ]; then python3 "$WT/held/build-1494/gate_false_deny_test.py" "$D" | tail -1
-  else python3 "$WT/held/build-1494/gate_false_deny_test.py" /nonexistent | tail -1; fi
+  if [ "$which" = patched ]; then python3 "$WT/held/build-1494/gate_false_deny_rows.py" "$D" | tail -1
+  else python3 "$WT/held/build-1494/gate_false_deny_rows.py" /nonexistent | tail -1; fi
   echo "== decide contract"
   if [ "$which" = patched ]; then
     HESTIA_CONTRACT_REPO=$WT HESTIA_CONTRACT_OVERLAY="{\"hestia_gate_core\": \"$C\"}" timeout 900 python3 tools/one_gate_decide_contract_test.py 2>&1 | tail -2

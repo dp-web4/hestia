@@ -85,9 +85,10 @@ def forbidden_hit(token: str, low: str) -> bool:
     # edit` and `auth status` they are booleans, so the next word would be swallowed (#1314).
     "gh": {"string_opts": {"--jq", "-q"}},
     # jq's first operand is its FILTER, unless `-f`/`--from-file` supplies the program (then every
-    # operand is a file). `-L` names a library directory and is judged.
+    # operand is a file). `-L` and its jq 1.8 long form `--library-path` name a library directory
+    # and are judged (legion-claude on #1550: without the long form its DIR became the filter).
     "jq": {"pattern_first": True, "file_opts": {"-f", "--from-file"},
-           "value_opts": {"--indent", "-L"}},
+           "value_opts": {"--indent", "-L", "--library-path"}},
 }
 ''')
 
@@ -116,14 +117,18 @@ def forbidden_hit(token: str, low: str) -> bool:
     src = once(src, '''            m = _ATTACHED_OPT.match(w)
             if m:
 ''', '''            run = re.match(r"-[A-Za-z0-9]+", w) if not w.startswith("--") and len(w) > 2 else None
-            fat = next((k for k in range(1, run.end()) if "-" + w[k] in spec.get("file_opts", ())),
-                       None) if run else None
+            valued = spec.get("file_opts", set()) | spec.get("value_opts", set())
+            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued), None) if run else None
+            if fat is not None and head == "sed" and "i" in w[1:fat]:
+                fat = None          # GNU `sed -if S`: `-i` takes the rest as its backup suffix
             if fat is not None:
-                # A clustered program-file option (`grep -rf P`, `grep -nfP`, `jq -rf F`): getopt reads the letters
-                # before it as flags and hands it the rest of the word, or the next word. Every
-                # operand is then a file. A letter before it that itself takes a value only makes
-                # this judge more, never less.
-                state["pattern_given"] = True
+                # A clustered option that takes a value (`grep -rf P`, `grep -nfP`, `jq -rf F`,
+                # `jq -nL DIR`): getopt reads the letters before it as flags and hands it the rest of
+                # the word, or the next word, which is judged as that option's value always is. A
+                # program-file option also means every operand is a file. A letter before it that
+                # itself takes a value only makes this judge more, never less.
+                if "-" + w[fat] in spec.get("file_opts", ()):
+                    state["pattern_given"] = True
                 if fat == len(w) - 1:
                     state["pending"] = "-" + w[fat]
                 else:
@@ -177,7 +182,7 @@ def sections(text):
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     core_new = patch_core(blob(CORE))
-    test_new = (HERE / "gate_false_deny_test.py").read_text(encoding="utf-8")
+    test_new = (HERE / "gate_false_deny_rows.py").read_text(encoding="utf-8")
     (OUT / "core_rev.py").write_text(core_new, encoding="utf-8")
 
     sys.path.insert(0, str(WT / "tools"))
