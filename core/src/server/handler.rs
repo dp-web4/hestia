@@ -1910,6 +1910,7 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         .into_iter()
         .map(|(r, routed)| (r.clone(), routed))
         .collect();
+    let mut answered_probes: Vec<crate::policy::resources::Probe> = Vec::new();
     let assessments: Vec<crate::policy::resources::Assessment> = if gated.is_empty() {
         Vec::new()
     } else {
@@ -1926,6 +1927,11 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         })
         .await
         .unwrap_or_default();
+        answered_probes = readings
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(p, _)| p.clone())
+            .collect();
         gated
             .iter()
             .map(|(r, routed)| crate::policy::resources::assess(r, *routed, &readings))
@@ -2060,6 +2066,16 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         );
         let now = crate::server::gate_escalation::now_secs();
         crate::server::resource_remedy::note(&mut s, &assessments, &plugin_id_for_chain, now);
+        let stuck = crate::policy::resource_probes::stuck_probes(
+            crate::policy::resource_probes::STUCK_AFTER,
+        );
+        crate::server::resource_remedy::note_stuck(
+            &mut s,
+            &stuck,
+            &answered_probes,
+            &plugin_id_for_chain,
+            now,
+        );
     }
     // THE VERDICT AS FEEDBACK (`verdict_feedback`): which level of the actor's work this verdict
     // is true at, the goal it bears on, the routes left open, and whether this identical act was
@@ -12193,6 +12209,46 @@ mod accountability_tests {
         assert_eq!(out["resources"], json!([]));
         let s = state.lock().await;
         assert!(s.recent_chain(20).iter().all(|e| e.event_type != "resource_observation"));
+    }
+
+    #[tokio::test]
+    async fn an_open_remedy_request_survives_a_daemon_restart_and_a_cleared_one_does_not() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        {
+            let s = state.lock().await;
+            let rebuilt = crate::server::resource_remedy::rehydrate(&s.chain_store);
+            let r = rebuilt.get("cargo/scratch").expect("still open after a restart");
+            assert_eq!(r.remedy, "free disk on /");
+            assert_eq!(r.mode, "observe");
+            assert!(r.opened_entry.is_some());
+        }
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = crate::policy::PolicyEngine::new(gated("observe", 0));
+        }
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        let s = state.lock().await;
+        assert!(crate::server::resource_remedy::rehydrate(&s.chain_store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_stops_answering_pages_the_operator_until_it_answers() {
+        let (_dir, state) = test_state().await;
+        let probe = crate::policy::resources::Probe::DiskFree { path: "/mnt/c".into() };
+        let mut s = state.lock().await;
+        let stuck = vec![(probe.clone(), std::time::Duration::from_secs(46 * 3600))];
+        crate::server::resource_remedy::note_stuck(&mut s, &stuck, &[], "kimi-code", 100);
+        crate::server::resource_remedy::note_stuck(&mut s, &stuck, &[], "codex", 200);
+        let open = s.remedy_requests.get("probe/free disk at /mnt/c").expect("a stuck probe pages");
+        assert_eq!(open.mode, "health");
+        assert_eq!(open.acts_met, 2, "one request, counted, not one per act");
+        assert!(open.remedy.contains("has not answered for 2760 min"), "{}", open.remedy);
+        crate::server::resource_remedy::note_stuck(&mut s, &[], &[probe], "kimi-code", 300);
+        assert!(s.remedy_requests.is_empty(), "the probe answered, so the request clears");
+        let kinds: Vec<String> = s.recent_chain(10).into_iter().map(|e| e.event_type).collect();
+        assert!(kinds.iter().any(|k| k == "resource_remedy_requested"));
+        assert!(kinds.iter().any(|k| k == "resource_remedy_cleared"));
     }
 
     #[test]

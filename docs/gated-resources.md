@@ -43,6 +43,8 @@ Probes run off the gate's workers, under a 400 ms deadline, and are cached for 5
   - It closes, witnessed as `resource_remedy_cleared`, at the first later reading that meets the floor.
   - Contention, such as a critical process running, refuses or would refuse an act, but pages nobody: it passes by itself.
 
+Open remedy requests are rebuilt from the chain when the daemon starts, so a daemon that crashes while the disk is short comes back still asking. A probe that stops answering for two minutes (a hung filesystem or Windows drive bridge) opens a `health` remedy request of its own and clears when the probe answers. A probe this platform cannot read at all (`/proc` on macOS) reads `unsupported`, distinct from `unknown`, and `set-resource` refuses a declaration that uses one.
+
 Resources are published in `hestia_operating_law`, so members read what binds them before they meet it. A society without resources publishes exactly the law, and the hashes, it did before.
 
 ## Operating it

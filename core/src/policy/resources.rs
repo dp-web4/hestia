@@ -202,6 +202,15 @@ impl GatedResource {
                     self.id, f.id
                 ));
             }
+            if !super::resource_probes::supported(&f.probe) {
+                return Err(format!(
+                    "floor `{}`: this platform ({}) cannot read {}, so the floor could never \
+                     apply; declare a probe this machine can read",
+                    f.id,
+                    std::env::consts::OS,
+                    f.probe.describe()
+                ));
+            }
             if f.min.is_none() && f.max.is_none() {
                 return Err(format!("floor `{}` sets neither min nor max", f.id));
             }
@@ -319,6 +328,9 @@ pub enum FloorStatus {
     Short,
     /// The reading could not be taken. Never refuses; recorded so the gap is countable.
     Unknown,
+    /// This platform cannot read the probe at all. Never refuses; distinct from `Unknown` so a
+    /// declaration that can never bite is visible as such.
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -501,8 +513,14 @@ pub fn assess(resource: &GatedResource, routed: Option<bool>, sampler: &dyn Samp
     let mut floors = Vec::with_capacity(resource.floors.len());
     let mut surge: Option<u64> = Some(1000);
     for f in &resource.floors {
-        let reading = sampler.sample(&f.probe);
+        let platform_reads = super::resource_probes::supported(&f.probe);
+        let reading = if platform_reads {
+            sampler.sample(&f.probe)
+        } else {
+            None
+        };
         let (status, contrib) = match reading {
+            None if !platform_reads => (FloorStatus::Unsupported, Some(1000)),
             None => (FloorStatus::Unknown, Some(1000)),
             Some(v) => {
                 let below = f.min.is_some_and(|m| v < m);

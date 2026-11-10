@@ -10,7 +10,7 @@
 //! Readings are cached briefly. Many acts arrive within a second of each other and the machine's
 //! free disk does not change meaningfully in that time.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -22,10 +22,38 @@ const CACHE_FOR: Duration = Duration::from_secs(5);
 /// How long the gate waits for a reading before treating it as unknown.
 const DEADLINE: Duration = Duration::from_millis(400);
 
+/// A probe in flight longer than this is reported as stuck: a health reading in its own right
+/// (cbp, 2026-11-08: the drive bridge hung for 46 hours and nothing said so).
+pub const STUCK_AFTER: Duration = Duration::from_secs(120);
+
 #[derive(Default)]
 struct Cache {
     readings: HashMap<Probe, (Instant, Option<u64>)>,
-    in_flight: HashSet<Probe>,
+    /// Probes whose thread has not returned, with when it started.
+    in_flight: HashMap<Probe, Instant>,
+}
+
+/// Can this platform read `probe` at all? A probe it cannot read is `unsupported`, which is
+/// recorded distinctly from a reading that timed out, and refused when law is written, so a
+/// declaration is never silently inert (a macOS seat has no `/proc`).
+pub fn supported(probe: &Probe) -> bool {
+    match probe {
+        Probe::DiskFree { .. } | Probe::DiskFreePermille { .. } => cfg!(unix),
+        Probe::MemAvailable | Probe::ProcessRunning { .. } => cfg!(target_os = "linux"),
+    }
+}
+
+/// Probes in flight for at least `older_than`, with how long. A hung filesystem or drive bridge
+/// shows up here long before anything else notices.
+pub fn stuck_probes(older_than: Duration) -> Vec<(Probe, Duration)> {
+    let c = cache().lock().unwrap_or_else(|p| p.into_inner());
+    c.in_flight
+        .iter()
+        .filter_map(|(p, at)| {
+            let age = at.elapsed();
+            (age >= older_than).then(|| (p.clone(), age))
+        })
+        .collect()
 }
 
 fn cache() -> &'static Mutex<Cache> {
@@ -51,11 +79,15 @@ impl LiveSampler {
                         continue;
                     }
                 }
-                if c.in_flight.contains(p) {
+                if !supported(p) {
                     out.insert(p.clone(), None);
                     continue;
                 }
-                c.in_flight.insert(p.clone());
+                if c.in_flight.contains_key(p) {
+                    out.insert(p.clone(), None);
+                    continue;
+                }
+                c.in_flight.insert(p.clone(), Instant::now());
                 pending.push(p.clone());
             }
         }
@@ -200,8 +232,39 @@ mod tests {
         assert!(r[&disk].is_some(), "statvfs of / should read");
         assert_eq!(r[&missing], None, "an unreadable path is unknown, not zero");
         // A second call inside the cache window answers from the cache.
-        let again = LiveSampler::sample_all(&[disk.clone()]);
+        let again = LiveSampler::sample_all(std::slice::from_ref(&disk));
         assert_eq!(again[&disk], r[&disk]);
+    }
+
+    #[test]
+    fn support_is_stated_per_platform() {
+        let disk = Probe::DiskFree { path: "/".into() };
+        assert_eq!(supported(&disk), cfg!(unix));
+        assert_eq!(supported(&Probe::MemAvailable), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn a_probe_that_never_returns_is_reported_stuck() {
+        let probe = Probe::ProcessRunning {
+            pattern: "stuck-test-probe-7c1e".into(),
+        };
+        {
+            let mut c = cache().lock().unwrap();
+            c.in_flight
+                .insert(probe.clone(), Instant::now() - Duration::from_secs(300));
+        }
+        let stuck = stuck_probes(STUCK_AFTER);
+        assert!(
+            stuck
+                .iter()
+                .any(|(p, age)| p == &probe && *age >= STUCK_AFTER)
+        );
+        // A stuck probe is not started again: it reads unknown.
+        assert_eq!(
+            LiveSampler::sample_all(std::slice::from_ref(&probe))[&probe],
+            None
+        );
+        cache().lock().unwrap().in_flight.remove(&probe);
     }
 
     #[cfg(target_os = "linux")]

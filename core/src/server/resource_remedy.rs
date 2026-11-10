@@ -12,8 +12,14 @@
 //! (`pending_remedy_requests`), for the reason recorded on `pending_scope_requests`: building the
 //! decision surface is not building the notice.
 //!
-//! Held in memory. A restart forgets an open request, and the next act that meets the same failed
-//! floor opens it again, so nothing is lost but the count.
+//! Held in memory and REBUILT FROM THE CHAIN at startup ([`rehydrate`]): a requested row with no
+//! later cleared row is still open. A daemon that crashes while the disk is short comes back
+//! still asking for the remedy, rather than forgetting until the next act meets the floor.
+//!
+//! A PROBE THAT STOPS ANSWERING is a health reading too ([`note_stuck`]). On 2026-11-08 cbp's
+//! Windows drive bridge hung for 46 hours and nothing said so; a probe of `/mnt/c` stuck past
+//! [`STUCK_AFTER`](crate::policy::resource_probes::STUCK_AFTER) opens a remedy request of its own,
+//! keyed `probe/<what it measures>`, and clears when the probe answers again.
 
 use serde::Serialize;
 use serde_json::json;
@@ -34,7 +40,8 @@ pub struct RemedyRequest {
     pub reading: Option<u64>,
     /// What the operator is asked to do.
     pub remedy: String,
-    pub mode: &'static str,
+    /// `observe` or `enforce` for a floor; `health` for a stuck probe.
+    pub mode: String,
     pub opened_at: u64,
     pub last_seen_at: u64,
     /// Consuming acts that met this failed floor while the request was open (including the one
@@ -58,7 +65,7 @@ pub fn note(s: &mut super::state::ServerState, assessments: &[Assessment], membe
         for f in &a.floors {
             let key = format!("{}/{}", a.resource_id, f.floor_id);
             match f.status {
-                FloorStatus::Unknown => {}
+                FloorStatus::Unknown | FloorStatus::Unsupported => {}
                 // Contention (above a `max`, e.g. a critical process running) passes by itself:
                 // the act's door is a later run, and the operator is not paged for it.
                 FloorStatus::Short if !f.is_scarce() => {}
@@ -88,7 +95,7 @@ pub fn note(s: &mut super::state::ServerState, assessments: &[Assessment], membe
                         max: f.max,
                         reading: f.reading,
                         remedy,
-                        mode: a.mode.as_str(),
+                        mode: a.mode.as_str().to_string(),
                         opened_at: now,
                         last_seen_at: now,
                         acts_met: 1,
@@ -132,6 +139,143 @@ pub fn note(s: &mut super::state::ServerState, assessments: &[Assessment], membe
                     }
                 }
             }
+        }
+    }
+}
+
+/// The chain kinds a remedy request is made of, newest decides.
+pub const EVENT_TYPES: [&str; 2] = ["resource_remedy_requested", "resource_remedy_cleared"];
+
+/// Rebuild the open requests from the chain: for each key, the newest row decides. A request
+/// row means still open; a cleared row means closed. `acts_met` restarts at the count the row
+/// recorded (1 for the opener), so the number after a restart is a floor, not the full count.
+pub fn rehydrate(
+    chain: &crate::storage::chain::SqliteChainStore,
+) -> std::collections::BTreeMap<String, RemedyRequest> {
+    let mut open = std::collections::BTreeMap::new();
+    let mut decided = std::collections::HashSet::new();
+    let rows = match chain.read_recent_by_types(
+        None,
+        &EVENT_TYPES,
+        super::seat_config::REHYDRATE_SCAN_LIMIT,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not rebuild open remedy requests from the chain; \
+                            the next act that meets a failed floor reopens its request");
+            return open;
+        }
+    };
+    for e in rows {
+        let d = &e.event_data;
+        let Some(key) = d.get("key").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !decided.insert(key.to_string()) || e.event_type == EVENT_TYPES[1] {
+            continue;
+        }
+        let at = e.timestamp.timestamp().max(0) as u64;
+        let text = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        open.insert(
+            key.to_string(),
+            RemedyRequest {
+                key: key.to_string(),
+                resource_id: text("resource_id"),
+                floor_id: text("floor_id"),
+                measures: text("measures"),
+                min: d.get("min").and_then(|v| v.as_u64()),
+                max: d.get("max").and_then(|v| v.as_u64()),
+                reading: d.get("reading").and_then(|v| v.as_u64()),
+                remedy: text("remedy"),
+                mode: text("mode"),
+                opened_at: at,
+                last_seen_at: at,
+                acts_met: 1,
+                last_member: text("first_met_by"),
+                opened_entry: Some(e.hash.clone()),
+            },
+        );
+    }
+    open
+}
+
+/// Fold the probes that have stopped answering into the open requests: open one per stuck probe,
+/// update its age while it stays stuck, clear it once the probe has answered (it is in
+/// `answered`, the probes this act read with a value).
+pub fn note_stuck(
+    s: &mut super::state::ServerState,
+    stuck: &[(crate::policy::resources::Probe, std::time::Duration)],
+    answered: &[crate::policy::resources::Probe],
+    member: &str,
+    now: u64,
+) {
+    for (probe, age) in stuck {
+        let key = format!("probe/{}", probe.describe());
+        let secs = age.as_secs();
+        if let Some(open) = s.remedy_requests.get_mut(&key) {
+            open.reading = Some(secs);
+            open.last_seen_at = now;
+            open.acts_met += 1;
+            open.last_member = member.to_string();
+            continue;
+        }
+        let limit = crate::policy::resource_probes::STUCK_AFTER.as_secs();
+        let mut req = RemedyRequest {
+            key: key.clone(),
+            resource_id: "probe".into(),
+            floor_id: probe.describe(),
+            measures: format!("seconds the probe of {} has not answered", probe.describe()),
+            min: None,
+            max: Some(limit),
+            reading: Some(secs),
+            remedy: format!(
+                "the probe of {} has not answered for {} min: the filesystem or drive bridge \
+                 behind it may be hung (on WSL, Windows interop; a WSL restart clears it). \
+                 Until it answers, floors that read it are unknown and refuse nothing",
+                probe.describe(),
+                secs / 60
+            ),
+            mode: "health".into(),
+            opened_at: now,
+            last_seen_at: now,
+            acts_met: 1,
+            last_member: member.to_string(),
+            opened_entry: None,
+        };
+        let row = s.append_chain(
+            "resource_remedy_requested",
+            json!({
+                "addressed_to": "operator",
+                "key": req.key,
+                "resource_id": req.resource_id,
+                "floor_id": req.floor_id,
+                "measures": req.measures,
+                "reading": req.reading,
+                "min": req.min,
+                "max": req.max,
+                "remedy": req.remedy,
+                "mode": req.mode,
+                "first_met_by": member,
+            }),
+        );
+        req.opened_entry = row.ok().map(|r| r.hash);
+        s.remedy_requests.insert(key, req);
+    }
+    for probe in answered {
+        let key = format!("probe/{}", probe.describe());
+        if let Some(closed) = s.remedy_requests.remove(&key) {
+            let _ = s.append_chain(
+                "resource_remedy_cleared",
+                json!({
+                    "key": closed.key,
+                    "resource_id": closed.resource_id,
+                    "floor_id": closed.floor_id,
+                    "opened_at": closed.opened_at,
+                    "opened_entry": closed.opened_entry,
+                    "acts_met": closed.acts_met,
+                    "cleared_by_reading_during_act_of": member,
+                }),
+            );
         }
     }
 }
