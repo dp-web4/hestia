@@ -35,9 +35,10 @@
 //!    has vetted stay fully scanned. Widening the gate requires *adding* a name, which is
 //!    a reviewable act; forgetting one costs a false positive, not a hole.
 //!
-//!    ONE HEAD IS NOT A DECISION BY ITSELF: `git`. See [`git_stdin_is_data`] — for `git`
-//!    the answer depends on the argv, because `git commit -F -` and
-//!    `git -c alias.x='!sh' x` differ nowhere in the head.
+//!    TWO HEADS ARE NOT A DECISION BY THEMSELVES: `git` and `gh`. See [`git_stdin_is_data`]
+//!    and [`gh_args_are_data`] — for both the answer depends on the argv, because
+//!    `git commit -F -` and `git -c alias.x='!sh' x` differ nowhere in the head, and neither
+//!    do `gh pr create --body '…'` and `gh alias set x --shell '…'`.
 //! 3. **Nothing downstream re-interprets it.** `cat <<'X' … X | sh` has an allowlisted
 //!    head and a shell one pipe later. Inertness therefore propagates *backwards* along a
 //!    pipeline: a segment is inert only if every segment it feeds is also inert.
@@ -109,6 +110,7 @@ impl Segment {
     fn treats_content_as_data(&self) -> bool {
         match self.head.as_deref() {
             Some("git") => git_stdin_is_data(&self.args),
+            Some("gh") => gh_args_are_data(&self.args),
             Some(h) => INERT_CONTENT_HEADS.contains(&h),
             None => false,
         }
@@ -225,6 +227,110 @@ fn git_stdin_is_data(args: &[String]) -> bool {
         "hash-object" => rest.iter().any(|a| a == "--stdin"),
         _ => false,
     }
+}
+
+/// `gh` subcommands whose quoted arguments are text sent to GitHub, never code, with the
+/// flags each accepts: `(flag, takes_a_value)`. Anything not listed stops the walk.
+///
+/// WHY THIS EXISTS RATHER THAN `gh` IN [`INERT_CONTENT_HEADS`]. Adjudication `87ed0c4e…`
+/// (claude-code, on kimi-code's appeal of deny `cf5b0c1b…`, UPHELD): `gh pr create --body
+/// '…'` was denied because the single-quoted PR body mentioned `git rm --pathspec-from-file`.
+/// The body is text posted to GitHub, and the published law says quoted data does not trip
+/// the rule. But `gh` can run code (`gh alias set --shell`, `!` aliases, extension
+/// executables, `gh api` with arbitrary endpoints), so the ruling, following `a96b79c4…`,
+/// rules out the head allowlist and asks for the same argv-aware shape as `git`:
+///
+/// 1. The command must be `gh pr|issue create|comment|edit`. These are gh builtins, and gh
+///    refuses an alias that shadows a builtin, so none of them can be redefined.
+/// 2. Every flag must be one listed for that subcommand. `--editor`/`-e` (runs `$EDITOR`),
+///    `--web`/`-w` (opens a browser) and anything unrecognised are refused: unknown means
+///    scanned. Positional words (a PR or issue number, URL or branch) are allowed.
+///
+/// WHAT THIS DOES NOT CLAIM: anything about what GitHub, a webhook or a workflow does with
+/// the text afterwards. It says the command text hands its quoted arguments to no local
+/// interpreter, the only question a text matcher can answer.
+const GH_INERT_SUBCOMMANDS: &[(&str, &str, &[(&str, bool)])] = &[
+    ("pr", "create", &[
+        ("--title", true), ("-t", true), ("--body", true), ("-b", true),
+        ("--body-file", true), ("-F", true), ("--base", true), ("-B", true),
+        ("--head", true), ("-H", true), ("--draft", false), ("-d", false),
+        ("--repo", true), ("-R", true), ("--label", true), ("-l", true),
+        ("--assignee", true), ("-a", true), ("--reviewer", true), ("-r", true),
+        ("--milestone", true), ("-m", true), ("--project", true), ("-p", true),
+        ("--fill", false), ("-f", false), ("--fill-first", false), ("--fill-verbose", false),
+        ("--no-maintainer-edit", false), ("--dry-run", false),
+        ("--template", true), ("-T", true),
+    ]),
+    ("pr", "comment", &[
+        ("--body", true), ("-b", true), ("--body-file", true), ("-F", true),
+        ("--repo", true), ("-R", true), ("--edit-last", false), ("--create-if-none", false),
+    ]),
+    ("pr", "edit", &[
+        ("--title", true), ("-t", true), ("--body", true), ("-b", true),
+        ("--body-file", true), ("-F", true), ("--base", true), ("-B", true),
+        ("--repo", true), ("-R", true), ("--milestone", true), ("-m", true),
+        ("--add-label", true), ("--remove-label", true),
+        ("--add-assignee", true), ("--remove-assignee", true),
+        ("--add-reviewer", true), ("--remove-reviewer", true),
+        ("--add-project", true), ("--remove-project", true),
+    ]),
+    ("issue", "create", &[
+        ("--title", true), ("-t", true), ("--body", true), ("-b", true),
+        ("--body-file", true), ("-F", true), ("--repo", true), ("-R", true),
+        ("--label", true), ("-l", true), ("--assignee", true), ("-a", true),
+        ("--milestone", true), ("-m", true), ("--project", true), ("-p", true),
+        ("--template", true), ("-T", true),
+    ]),
+    ("issue", "comment", &[
+        ("--body", true), ("-b", true), ("--body-file", true), ("-F", true),
+        ("--repo", true), ("-R", true), ("--edit-last", false), ("--create-if-none", false),
+    ]),
+    ("issue", "edit", &[
+        ("--title", true), ("-t", true), ("--body", true), ("-b", true),
+        ("--body-file", true), ("-F", true), ("--repo", true), ("-R", true),
+        ("--milestone", true), ("-m", true),
+        ("--add-label", true), ("--remove-label", true),
+        ("--add-assignee", true), ("--remove-assignee", true),
+        ("--add-project", true), ("--remove-project", true),
+    ]),
+];
+
+/// Is this `gh` invocation one whose quoted arguments (and stdin, for `--body-file -`) are
+/// text for GitHub rather than code? See [`GH_INERT_SUBCOMMANDS`] for the shape and why.
+fn gh_args_are_data(args: &[String]) -> bool {
+    let (Some(group), Some(verb)) = (args.first(), args.get(1)) else {
+        return false;
+    };
+    let Some((_, _, flags)) = GH_INERT_SUBCOMMANDS
+        .iter()
+        .find(|(g, v, _)| g == group && v == verb)
+    else {
+        return false; // gh api, gh alias, gh extension, gh run, … : unknown means scanned
+    };
+    let mut i = 2usize;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        i += 1;
+        if a == "--" {
+            return true; // everything after is positional
+        }
+        if !a.starts_with('-') || a == "-" {
+            continue; // a number, URL or branch
+        }
+        let (name, glued) = match a.split_once('=') {
+            Some((n, _)) if a.starts_with("--") => (n, true),
+            _ => (a, false),
+        };
+        let Some(&(_, takes_value)) = flags.iter().find(|(f, _)| *f == name) else {
+            return false; // --editor, --web, or anything unlisted
+        };
+        if takes_value && !glued {
+            if args.get(i).is_none() {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    true
 }
 
 /// `-c KEY=VALUE` where KEY cannot change what git executes.
@@ -944,5 +1050,64 @@ mod tests {
         assert!(!still_visible("git commit -F - -m 'rm -rf /'"));
         // …and one token further out, it is visible again, because the shape is not vouched.
         assert!(still_visible("git bisect run 'rm -rf /'"));
+    }
+
+    // ---- `gh`: the same argv-aware shape as git ----
+    //
+    // Adjudication 87ed0c4e… (claude-code, on kimi-code's appeal of deny cf5b0c1b…, UPHELD):
+    // a PR body in single quotes is text for GitHub. `gh` stays off the head allowlist
+    // because other gh subcommands run code.
+
+    #[test]
+    fn adding_gh_to_the_head_allowlist_would_be_dead_code_so_say_so() {
+        assert!(
+            !INERT_CONTENT_HEADS.contains(&"gh"),
+            "gh in INERT_CONTENT_HEADS is unreachable — the Some(\"gh\") arm in \
+             Segment::treats_content_as_data decides first. Change gh_args_are_data."
+        );
+    }
+
+    #[test]
+    fn the_pr_body_that_started_this() {
+        // Deny cf5b0c1b… in shape, the body trimmed: the token is prose inside one
+        // single-quoted span.
+        let cmd = "gh pr create --repo dp-web4/hestia --draft --base main \
+                   --head kimi/issue-1540-git-mv-closure \
+                   --title \"closure: classify git mv operands as writes\" \
+                   --body 'Fixes #1540. Keep `git rm --pathspec-from-file` fail-closed.'";
+        assert!(still_visible_raw(cmd), "precondition: the raw text does carry the token");
+        assert!(!still_visible(cmd));
+        assert!(!still_visible("gh issue comment 12 --body 'run rm -rf / to reproduce'"));
+        assert!(!still_visible("gh pr edit 7 -R o/r --title 'x' -b 'rm -rf /'"));
+        assert!(!still_visible("gh pr comment 7 --body='rm -rf /'"));
+        assert!(!still_visible("gh pr create --body-file - <<'MSG'\nrm -rf /\nMSG"));
+    }
+
+    #[test]
+    fn gh_subcommands_that_can_run_code_stay_visible() {
+        assert!(still_visible("gh alias set rr --shell 'rm -rf /'"));
+        assert!(still_visible("gh api repos/o/r/dispatches -f 'x=rm -rf /'"));
+        assert!(still_visible("gh extension exec x 'rm -rf /'"));
+        assert!(still_visible("gh rr 'rm -rf /'"));
+        assert!(still_visible("gh pr checkout 7 'rm -rf /'"));
+    }
+
+    #[test]
+    fn gh_flags_that_hand_off_or_are_unknown_stay_visible() {
+        // --editor runs $EDITOR; --web opens a browser; anything unlisted is unknown.
+        assert!(still_visible("gh pr create --editor --body 'rm -rf /'"));
+        assert!(still_visible("gh pr create -e --body 'rm -rf /'"));
+        assert!(still_visible("gh issue create --web --body 'rm -rf /'"));
+        assert!(still_visible("gh pr create --surprise --body 'rm -rf /'"));
+        assert!(!gh_args_are_data(&["pr".into(), "create".into(), "--title".into()]),
+                "a value flag with no value is malformed: unknown means scanned");
+    }
+
+    #[test]
+    fn an_inert_gh_piped_into_a_shell_or_expanding_is_not_inert() {
+        // Condition 3: a vouched gh feeding a shell is not inert, so its quoted body is scanned.
+        assert!(still_visible("gh pr create --body 'rm -rf /' | sh"));
+        assert!(still_visible("gh pr create --body \"$(rm -rf /)\""));
+        assert!(still_visible("gh pr create --body 'x' && rm -rf /"));
     }
 }

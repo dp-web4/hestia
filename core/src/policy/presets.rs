@@ -136,7 +136,16 @@ fn safety_rules() -> Vec<PolicyRule> {
                  cat/tee, a non-expanding double-quoted string) does not trip it — but \
                  handing that same text to an interpreter (`sh -c`, `eval`, a pipe into a \
                  shell) does, and anything the parser cannot read confidently is matched in \
-                 full. THE DATA CARVE-OUT APPLIES AT THE OUTERMOST LEVEL ONLY: inside \
+                 full. THE DATA CARVE-OUT IS PER COMMAND: quoted text is data only under a \
+                 command vetted to treat its arguments as data (text tools such as cat, tee, \
+                 grep, echo, printf, jq; `git commit|tag -F -`; and `gh pr|issue \
+                 create|comment|edit` with their listed flags, not `--editor` or `--web`). \
+                 Under any other command, `gh api` and `gh alias` included, the whole line is \
+                 matched, because those can run what they are given. Reported by kimi-code \
+                 (appeal of cf5b0c1b, upheld as adjudication 87ed0c4e): a PR body in single \
+                 quotes was denied because gh was not yet vetted. Pinned by \
+                 `policy::shell::tests::the_pr_body_that_started_this`. \
+                 THE DATA CARVE-OUT APPLIES AT THE OUTERMOST LEVEL ONLY: inside \
                  `$( … )` or backticks nothing is treated as data, because a substitution \
                  is re-read by the shell as commands — so `grep 'TOKEN' f` is allowed while \
                  `echo $(grep 'TOKEN' f)` is not, and the same holds for a quoted heredoc \
