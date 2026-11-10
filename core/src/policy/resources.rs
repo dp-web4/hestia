@@ -360,21 +360,36 @@ pub struct Invocation {
 }
 
 /// Commands that run another command named in their arguments. Looked through, so
-/// `nice -n 10 cargo build` is an invocation of `cargo`.
+/// `nice -n 10 cargo build` is an invocation of `cargo`. Shell keywords and `!` that prefix a
+/// command (`if …; then cargo build`, `! cargo test`) are looked through the same way.
 const WRAPPERS: &[&str] = &[
-    "env", "nice", "ionice", "nohup", "time", "timeout", "stdbuf", "command", "exec", "xargs",
-    "sudo", "chrt", "taskset",
+    "env", "nice", "ionice", "nohup", "time", "timeout", "stdbuf", "command", "builtin", "exec",
+    "xargs", "sudo", "doas", "chrt", "taskset", "setsid", "unbuffer", "flock", "!", "then", "do",
+    "else", "elif", "if", "while", "until", "{",
 ];
 
-/// Shells whose `-c` argument is a command line of its own.
-const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh"];
+/// Shells whose `-c` argument (alone or in a flag cluster: `-lc`, `-ec`, `-xc`) is a command
+/// line of its own.
+const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "fish"];
 
-fn skippable_wrapper_arg(a: &str) -> bool {
-    a.starts_with('-')
-        || (a.contains('=') && !a.starts_with('='))
-        || a.trim_end_matches(['s', 'm', 'h', 'd'])
-            .parse::<f64>()
-            .is_ok()
+/// A word as the shell would run it: backslash escapes removed (`c\argo` runs `cargo`).
+fn unescape(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push(n);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn basename(word: &str) -> String {
+    word.rsplit('/').next().unwrap_or(word).to_string()
 }
 
 /// The bodies of `$( … )` and backtick substitutions in `cmd`, outermost first. Each is a command
@@ -415,6 +430,46 @@ fn substitutions(cmd: &str) -> Option<Vec<String>> {
 /// script, and each substitution, to a bounded depth. `None` when any part cannot be parsed with
 /// confidence: the caller must then fail closed.
 pub fn invocations(cmd: &str) -> Option<Vec<Invocation>> {
+    fn push_from(words: &[String], depth: u8, out: &mut Vec<Invocation>) -> Option<()> {
+        let Some(first) = words.first() else {
+            return Some(());
+        };
+        let head = basename(first);
+        if WRAPPERS.contains(&head.as_str()) {
+            // A wrapper's options may take separate values (`timeout -s KILL 30 cmd`,
+            // `sudo -u dp cmd`, `env -u VAR cmd`), and a table of which do will always miss one
+            // (codex, kimi-code, claude-code on #1551). So every word after the wrapper that is
+            // not itself an option is a CANDIDATE command: whichever candidate a consumer
+            // matches is the command that runs. A wrong candidate can only add a match, never
+            // hide one, so this errs toward assessing.
+            for i in 1..words.len() {
+                if !words[i].starts_with('-') {
+                    push_from(&words[i..], depth, out)?;
+                }
+            }
+            return Some(());
+        }
+        if SHELLS.contains(&head.as_str()) {
+            // `-c` alone or in a short-flag cluster (`-lc`, `-ec`): the next non-option word is
+            // a command line. A shell given a script file is opaque (documented limitation).
+            let cluster = |w: &str| {
+                w.starts_with('-')
+                    && !w.starts_with("--")
+                    && w[1..].chars().all(|c| c.is_ascii_alphabetic())
+                    && w.contains('c')
+            };
+            if let Some(pos) = words.iter().position(|w| cluster(w)) {
+                let script = words[pos + 1..].iter().find(|w| !w.starts_with('-'))?;
+                walk(script, depth + 1, out)?;
+            }
+        }
+        let text = std::iter::once(head.clone())
+            .chain(words[1..].iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push(Invocation { head, text });
+        Some(())
+    }
     fn walk(cmd: &str, depth: u8, out: &mut Vec<Invocation>) -> Option<()> {
         if depth > 3 {
             return None;
@@ -423,35 +478,13 @@ pub fn invocations(cmd: &str) -> Option<Vec<Invocation>> {
             walk(&sub, depth + 1, out)?;
         }
         for sc in super::shell::simple_commands(cmd)? {
-            let mut words: Vec<String> = sc.head.into_iter().chain(sc.args).collect();
-            // Look through wrappers to the command they run.
-            loop {
-                let Some(first) = words.first() else { break };
-                let base = first.rsplit('/').next().unwrap_or(first).to_string();
-                if !WRAPPERS.contains(&base.as_str()) {
-                    break;
-                }
-                let rest: Vec<String> = words[1..]
-                    .iter()
-                    .skip_while(|a| skippable_wrapper_arg(a))
-                    .cloned()
-                    .collect();
-                words = rest;
-            }
-            let Some(first) = words.first() else { continue };
-            let head = first.rsplit('/').next().unwrap_or(first).to_string();
-            if SHELLS.contains(&head.as_str()) {
-                if let Some(pos) = words.iter().position(|w| w == "-c") {
-                    if let Some(script) = words.get(pos + 1) {
-                        walk(script, depth + 1, out)?;
-                    }
-                }
-            }
-            let text = std::iter::once(head.clone())
-                .chain(words[1..].iter().cloned())
-                .collect::<Vec<_>>()
-                .join(" ");
-            out.push(Invocation { head, text });
+            let words: Vec<String> = sc
+                .head
+                .into_iter()
+                .chain(sc.args)
+                .map(|w| unescape(&w))
+                .collect();
+            push_from(&words, depth, out)?;
         }
         Some(())
     }
@@ -564,9 +597,10 @@ impl Assessment {
         }
         if self.short_floors().next().is_some() {
             if let Some(r) = &self.remedy {
-                s.push_str(&format!(
-                    " The operator is asked for a remedy on the dashboard (not pushed): {r}."
-                ));
+                // States the remedy, not that a request was filed: the request is opened after
+                // this text is composed and may fail to commit (codex/kimi-code on #1551). The
+                // reply's `resourcesWitnessed` and the dashboard say whether it did.
+                s.push_str(&format!(" What would fix it (the operator's to do): {r}."));
             }
         }
         s
@@ -884,7 +918,7 @@ mod tests {
         );
         assert!(text.contains("a smaller job"), "{text}");
         assert!(
-            text.contains("asked for a remedy on the dashboard (not pushed)"),
+            text.contains("What would fix it (the operator's to do)"),
             "{text}"
         );
         assert_eq!(a.short_floors().count(), 1);
@@ -996,6 +1030,36 @@ mod tests {
         assert_eq!(routed(&r, "bash -c 'cargo build'"), Some(Some(false)));
         assert_eq!(routed(&r, "echo $(cargo build)"), Some(Some(false)));
         assert_eq!(routed(&r, "ls | xargs cargo check"), Some(Some(false)));
+    }
+
+    #[test]
+    fn rereview_shell_forms_are_assessed() {
+        // kimi-code's five public-API reproductions and codex's two, on #1551 at 72fc2005: each
+        // returned no matching resource. Every one must be a consumer that is not routed.
+        let r = cargo_resource(ResourceMode::Enforce);
+        for cmd in [
+            "env -u CARGO_TERM_COLOR cargo build",
+            "timeout -s KILL 30 cargo test",
+            "timeout --signal TERM 30 cargo build",
+            "sudo -u dp cargo check",
+            "c\\argo build",
+            "! cargo test",
+            "bash -lc 'cargo build'",
+            "sh -ec 'cargo test -q'",
+            "xargs -I {} cargo build {}",
+            "stdbuf -o L cargo test",
+            "if true; then cargo build; fi",
+        ] {
+            assert_eq!(routed(&r, cmd), Some(Some(false)), "{cmd}");
+        }
+        // The same forms around the runner are routed.
+        for cmd in [
+            "timeout -s KILL 3600 cargo-serial test",
+            "sudo -u dp cargo-serial check",
+            "bash -lc 'cargo-serial build'",
+        ] {
+            assert_eq!(routed(&r, cmd), Some(Some(true)), "{cmd}");
+        }
     }
 
     #[test]

@@ -168,15 +168,37 @@ pub fn rehydrate(
 ) -> std::collections::BTreeMap<String, RemedyRequest> {
     let mut open = std::collections::BTreeMap::new();
     let mut decided = std::collections::HashSet::new();
-    let rows = match chain.read_recent_by_types(
-        None,
-        &EVENT_TYPES,
-        super::seat_config::REHYDRATE_SCAN_LIMIT,
-    ) {
+    // COMPLETE HISTORY, not a recent window (codex/kimi-code on #1551): an open request older
+    // than any window is still open, and remedy rows are few, so reading all of them is cheap.
+    let rows = match chain.read_recent_by_types(None, &EVENT_TYPES, u64::MAX) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(error = %e, "could not rebuild open remedy requests from the chain; \
-                            the next act that meets a failed floor reopens its request");
+            // INCOMPLETE RECOVERY IS VISIBLE: an empty dashboard would read as "nothing is
+            // wrong". Stand a health entry in for the requests that could not be rebuilt.
+            tracing::warn!(error = %e, "could not rebuild open remedy requests from the chain");
+            let now = crate::server::gate_escalation::now_secs();
+            open.insert(
+                "rehydrate/remedy-requests".to_string(),
+                RemedyRequest {
+                    key: "rehydrate/remedy-requests".into(),
+                    resource_id: "hestia".into(),
+                    floor_id: "remedy-rehydration".into(),
+                    measures: "open remedy requests rebuilt from the chain at startup".into(),
+                    min: None,
+                    max: None,
+                    reading: None,
+                    remedy: format!(
+                        "the daemon could not read its remedy history ({e}); requests that were \
+                         open before the restart may be missing until an act meets their floor again"
+                    ),
+                    mode: "health".into(),
+                    opened_at: now,
+                    last_seen_at: now,
+                    acts_met: 0,
+                    last_member: "hestia".into(),
+                    opened_entry: None,
+                },
+            );
             return open;
         }
     };
@@ -245,7 +267,8 @@ pub fn note_stuck(
             remedy: format!(
                 "the probe of {} has not answered for {} min: the filesystem or drive bridge \
                  behind it may be hung (on WSL, Windows interop; a WSL restart clears it). \
-                 Until it answers, floors that read it are unknown and refuse nothing",
+                 Until it answers, floors that read it are unknown, and each resource's \
+                 on_unknown decides: allow lets consuming acts through, refuse stops them",
                 probe.describe(),
                 secs / 60
             ),
@@ -297,4 +320,15 @@ pub fn note_stuck(
             }
         }
     }
+}
+
+/// The periodic health pass (kimi-code on #1551): a probe that hangs after the one gate call
+/// that started it must surface without waiting for another consuming act. Run on the daemon's
+/// reconcile tick; opens a `health` request for each stuck probe and clears it once the probe
+/// has answered.
+pub fn health_pass(s: &mut super::state::ServerState, now: u64) {
+    let stuck =
+        crate::policy::resource_probes::stuck_probes(crate::policy::resource_probes::STUCK_AFTER);
+    let answered = crate::policy::resource_probes::answered_probes();
+    note_stuck(s, &stuck, &answered, "hestia-health", now);
 }

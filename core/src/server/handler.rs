@@ -12166,7 +12166,8 @@ mod accountability_tests {
         let reason = out["reason"].as_str().unwrap();
         assert!(reason.contains("at or below the floor"), "{reason}");
         assert!(reason.contains("a later run, when scratch is back above the floor"), "{reason}");
-        assert!(reason.contains("asked for a remedy on the dashboard (not pushed)"), "{reason}");
+        assert!(reason.contains("What would fix it (the operator's to do): free disk on /"), "{reason}");
+        assert!(!reason.contains("dashboard"), "the text must not claim a request was filed: {reason}");
 
         let s = state.lock().await;
         let pd = s
@@ -12277,6 +12278,49 @@ mod accountability_tests {
         let out = gate_bash(&state, &sid, "cargo-serial build").await;
         assert_eq!(out["resourcesWitnessed"], true);
         assert_eq!(state.lock().await.remedy_requests.len(), 1, "the next act retries and opens it");
+    }
+
+    #[tokio::test]
+    async fn an_enforced_refusal_does_not_claim_a_request_whose_row_failed() {
+        let (_dir, state, sid) = gated_session("enforce", u64::MAX).await;
+        state.lock().await.chain_fault_on.insert("resource_remedy_requested".into());
+        let out = gate_bash(&state, &sid, "cargo-serial build").await;
+        assert_eq!(out["decision"], "deny");
+        let reason = out["reason"].as_str().unwrap();
+        assert!(!reason.contains("dashboard") && !reason.contains("request has"), "{reason}");
+        assert!(state.lock().await.remedy_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rehydration_reads_the_whole_history_not_a_window() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        gate_bash(&state, &sid, "cargo-serial build").await; // opens cargo/scratch
+        {
+            // Many later remedy rows for other keys, opened and cleared.
+            let s = state.lock().await;
+            for i in 0..60 {
+                let key = format!("other/{i}");
+                s.append_chain("resource_remedy_requested", json!({"key": key, "mode": "observe"})).unwrap();
+                s.append_chain("resource_remedy_cleared", json!({"key": key})).unwrap();
+            }
+            let rebuilt = crate::server::resource_remedy::rehydrate(&s.chain_store);
+            assert!(rebuilt.contains_key("cargo/scratch"), "an old open request survives");
+            assert_eq!(rebuilt.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_health_pass_reports_a_stuck_probe_without_any_gate_call() {
+        let (_dir, state) = test_state().await;
+        let probe = crate::policy::resources::Probe::DiskFree { path: "/health-pass-test-9e2".into() };
+        crate::policy::resource_probes::mark_in_flight_for_test(&probe, std::time::Duration::from_secs(600));
+        {
+            let mut s = state.lock().await;
+            crate::server::resource_remedy::health_pass(&mut s, 1000);
+            let open = s.remedy_requests.get("probe/free disk at /health-pass-test-9e2");
+            assert!(open.is_some_and(|r| r.mode == "health"), "no act happened, yet it is reported");
+        }
+        crate::policy::resource_probes::clear_in_flight_for_test(&probe);
     }
 
     #[tokio::test]

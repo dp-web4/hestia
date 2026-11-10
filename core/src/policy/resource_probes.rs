@@ -60,6 +60,17 @@ pub fn stuck_probes(older_than: Duration) -> Vec<(Probe, Duration)> {
         .collect()
 }
 
+/// Probes whose latest reading came back with a value and that are not in flight: the ones a
+/// stuck-probe request may be cleared for.
+pub fn answered_probes() -> Vec<Probe> {
+    let c = cache().lock().unwrap_or_else(|p| p.into_inner());
+    c.readings
+        .iter()
+        .filter(|(p, (_, v))| v.is_some() && !c.in_flight.contains_key(*p))
+        .map(|(p, _)| p.clone())
+        .collect()
+}
+
 fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Cache::default()))
@@ -136,6 +147,21 @@ impl Sampler for LiveSampler {
             .copied()
             .flatten()
     }
+}
+
+/// Test seam: mark `probe` as in flight since `age` ago (a hung probe without a thread).
+#[cfg(test)]
+pub(crate) fn mark_in_flight_for_test(probe: &Probe, age: Duration) {
+    cache()
+        .lock()
+        .unwrap()
+        .in_flight
+        .insert(probe.clone(), Instant::now() - age);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_in_flight_for_test(probe: &Probe) {
+    cache().lock().unwrap().in_flight.remove(probe);
 }
 
 /// Test seam: a probe that answers `value` after `delay`, so overlapping calls and slow probes

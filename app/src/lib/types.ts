@@ -171,7 +171,8 @@ export interface PendingRemedyRequest {
   max: number | null;
   reading: number | null;
   remedy: string;
-  mode: "observe" | "enforce";
+  /** `health`: a probe stopped answering, or remedy history could not be rebuilt. */
+  mode: "observe" | "enforce" | "health";
   opened_at: number;
   last_seen_at: number;
   acts_met: number;
