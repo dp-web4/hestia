@@ -183,6 +183,297 @@ check("A17i dirty-only checkout is a finding via its own field (policy: keep)",
 check("A18 WSL detected on this box (else the abstention path is dead code here)",
       fm.is_wsl() in (True, False) and isinstance(fm.is_wsl(), bool))
 
+# A19: gate_surface consumes the canonical resolver and preserves audit semantics.
+def manifest_case(commands):
+    tmp = tempfile.TemporaryDirectory()
+    root = os.path.join(tmp.name, "root")
+    home = os.path.join(root, "home")
+    repo = os.path.join(root, "repo")
+    inst = os.path.join(home, "installed")
+    os.makedirs(inst)
+    config = os.path.join(home, ".claude", "settings.json")
+    os.makedirs(os.path.dirname(config))
+    for i, command in enumerate(commands):
+        for token in ("one/", "two/", "missing/", "outside/"):
+            if token in command:
+                leaf = command.split(token, 1)[1].split()[0]
+                base = home if token == "outside/" else inst
+                target = os.path.join(base, token + leaf)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                if token != "missing/":
+                    with open(target, "w", encoding="utf-8") as fixture:
+                        fixture.write("# hook\n")
+                commands[i] = command.replace(token + leaf, target, 1)
+    with open(config, "w", encoding="utf-8") as fh:
+        json.dump({"hooks": {"PreToolUse": [{"hooks": [{"command": c} for c in commands]}]}}, fh)
+    plugin = os.path.join(repo, "plugins", "claude-code")
+    os.makedirs(plugin)
+    with open(os.path.join(plugin, "expects.json"), "w", encoding="utf-8") as fh:
+        json.dump({"install": {"registration": {
+            "path": [".claude", "settings.json"], "reader": "json-hook-commands"}}}, fh)
+    fm.HOME, fm.REPO = home, repo
+    return tmp, inst, config
+
+
+def vendor_manifest_case(member, filename, reader, text, gate_events):
+    tmp = tempfile.TemporaryDirectory()
+    root = os.path.join(tmp.name, "root", "hestia")
+    home = os.path.join(root, "home")
+    repo = os.path.join(root, "repo")
+    inst = os.path.join(home, "installed")
+    os.makedirs(inst)
+    for name in ("gate.py", "nested/gate.py", "witness.py", "start.sh"):
+        target = os.path.join(inst, name)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as fixture:
+            fixture.write("# hook\n")
+    config_dir = fm.MEMBERS[member][0].split("/")[0]
+    config = os.path.join(home, config_dir, filename)
+    os.makedirs(os.path.dirname(config))
+    with open(config, "w", encoding="utf-8") as fh:
+        fh.write(text.replace("@INST@", inst))
+    plugin = os.path.join(repo, "plugins", fm.MEMBERS[member][1])
+    os.makedirs(plugin)
+    with open(os.path.join(plugin, "expects.json"), "w", encoding="utf-8") as fh:
+        json.dump({"gate": gate_events, "install": {"registration": {
+            "path": [config_dir, filename], "reader": reader}}}, fh)
+    fm.HOME, fm.REPO = home, repo
+    return tmp, inst, config
+
+
+old_home, old_repo = fm.HOME, fm.REPO
+try:
+    tmp, inst, _ = manifest_case(["python3 /env/prefix/gate.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19a interpreter-prefixed registration resolves", gate == "ENFORCING BUT UNAUDITED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case(["custom-wrapper relative-hook.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19b partial classification is UNDETERMINED", gate == "UNDETERMINED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case(["python3 one/pre_tool_use.py", "python3 two/pre_tool_use.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19c duplicate basenames keep full-path identity",
+          "one/pre_tool_use.py" in evidence and "two/pre_tool_use.py" in evidence, evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case(["python3 missing/dead.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19d dead registered hook remains a finding", "kind=missing" in evidence, evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case(["python3 outside/hook.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19e present hook outside compared dirs is ENFORCING BUT UNAUDITED",
+          gate == "ENFORCING BUT UNAUDITED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, config = manifest_case([])
+    os.unlink(config)
+    os.mkdir(config)
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19f permission/read failure is not NOT FOUND", gate == "UNDETERMINED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, config = manifest_case([])
+    with open(config, "w", encoding="utf-8") as fh:
+        fh.write("{not-json")
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19g unparseable registration is UNDETERMINED", gate == "UNDETERMINED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case([])
+    expects = os.path.join(fm.REPO, "plugins", "claude-code", "expects.json")
+    with open(expects, "w", encoding="utf-8") as fh:
+        json.dump({"install": {"registration": {
+            "path": [".claude", "settings.json"], "reader": "future-reader"}}}, fh)
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19h unknown registration reader is UNDETERMINED", gate == "UNDETERMINED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case(["python3 outside/gate.py", "custom-wrapper relative-hook.py"])
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19i known gate plus unclassified command is UNDETERMINED",
+          gate == "UNDETERMINED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, config = manifest_case(["python3 one/witness.py"])
+    with open(config, encoding="utf-8") as fh:
+        document = json.load(fh)
+    document["hooks"] = {"PostToolUse": document["hooks"]["PreToolUse"]}
+    with open(config, "w", encoding="utf-8") as fh:
+        json.dump(document, fh)
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19j PostToolUse-only registration does not invent a PreToolUse gate",
+          gate == "provisioned-but-UNGOVERNED", evidence)
+    tmp.cleanup()
+
+    tmp, inst, config = manifest_case(["python3 one/shared.py"])
+    with open(config, encoding="utf-8") as fh:
+        document = json.load(fh)
+    pre = document["hooks"]["PreToolUse"]
+    document["hooks"] = {"PostToolUse": pre, "PreToolUse": pre}
+    with open(config, "w", encoding="utf-8") as fh:
+        json.dump(document, fh)
+    gate, evidence = fm.gate_surface("claude-code", inst)
+    check("A19k shared hook path retains its gate registration",
+          gate == "gated-at-canonical-path", evidence)
+    tmp.cleanup()
+
+    tmp, inst, _ = manifest_case([])
+    original_resolver = fm.rr.resolve_registration
+    fm.rr.resolve_registration = lambda *_args: {
+        "state": "ok", "complete": True, "events_seen": ["PreToolUse"],
+        "targets": [{"event": "PreToolUse", "path": os.path.join(inst, "gate.py"),
+                     "kind": "unreadable"}],
+    }
+    try:
+        gate, evidence = fm.gate_surface("claude-code", inst)
+    finally:
+        fm.rr.resolve_registration = original_resolver
+    check("A19l unreadable registered gate is UNDETERMINED", gate == "UNDETERMINED", evidence)
+    tmp.cleanup()
+
+    vendor_cases = [
+        (
+            "claude-code", "settings.json", "json-hook-commands", ["PreToolUse"],
+            json.dumps({"hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [
+                        {"type": "command", "command": "python3 @INST@/gate.py"}]},
+                    {"matcher": "Read", "hooks": [
+                        {"type": "command", "command": "python3 @INST@/nested/gate.py"}]},
+                ],
+                "PostToolUse": [{"matcher": "*", "hooks": [
+                    {"type": "command", "command": "python3 @INST@/witness.py"}]}],
+                "SessionStart": [{"hooks": [
+                    {"type": "command", "command": "bash @INST@/start.sh"}]}],
+            }}),
+            "gated-at-canonical-path", "gated-at-canonical-path",
+        ),
+        (
+            "codex", "config.toml", "toml-hook-commands", ["PreToolUse"],
+            '''[features]
+codex_hooks = true
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "python3 @INST@/gate.py"
+
+[[hooks.PreToolUse]]
+matcher = "shell"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "python3 @INST@/nested/gate.py"
+
+[[hooks.PostToolUse]]
+matcher = ".*"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "python3 @INST@/witness.py"
+
+[[hooks.SessionStart]]
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "bash @INST@/start.sh"
+''',
+            "provisioned-but-UNGOVERNED", "gated-at-canonical-path",
+        ),
+        (
+            "kimi-code", "config.toml", "toml-hook-commands", ["PreToolUse"],
+            '''[[hooks]]
+event = "PreToolUse"
+command = "HESTIA_HOME=/tmp/hestia python3 @INST@/gate.py"
+timeout = 15
+
+[[hooks]]
+event = "PreToolUse"
+command = "python3 @INST@/nested/gate.py"
+timeout = 15
+
+[[hooks]]
+event = "PostToolUse"
+command = "python3 @INST@/witness.py"
+timeout = 10
+
+[[hooks]]
+event = "SessionStart"
+command = "bash @INST@/start.sh"
+timeout = 15
+''',
+            "UNDETERMINED", "gated-at-canonical-path",
+        ),
+        (
+            "gemini", "settings.json", "json-hook-commands", ["BeforeTool"],
+            json.dumps({"hooks": {
+                "BeforeTool": [
+                    {"matcher": "run_shell_command", "hooks": [
+                        {"type": "command", "command": "python3 @INST@/gate.py"}]},
+                    {"matcher": "read_file", "hooks": [
+                        {"type": "command", "command": "python3 @INST@/nested/gate.py"}]},
+                ],
+                "AfterTool": [{"matcher": "*", "hooks": [
+                    {"type": "command", "command": "python3 @INST@/witness.py"}]}],
+                "SessionStart": [{"hooks": [
+                    {"type": "command", "command": "bash @INST@/start.sh"}]}],
+            }}),
+            "provisioned-but-UNGOVERNED", "gated-at-canonical-path",
+        ),
+    ]
+    for i, (member, filename, reader, events, text, legacy, current) in enumerate(vendor_cases):
+        tmp, inst, _ = vendor_manifest_case(member, filename, reader, text, events)
+        gate, evidence = fm.gate_surface(member, inst)
+        relation = "old/new parity" if legacy == current else f"expected correction from {legacy}"
+        check(f"A20{chr(97 + i)} {member} {relation}", gate == current,
+              f"legacy={legacy}; current={gate}; {evidence}")
+        tmp.cleanup()
+
+    witness_only_cases = []
+    for member, filename, reader, events, text, _legacy, _current in vendor_cases:
+        if reader == "json-hook-commands":
+            document = json.loads(text)
+            witness_event = "AfterTool" if member == "gemini" else "PostToolUse"
+            document["hooks"] = {witness_event: document["hooks"][witness_event]}
+            text = json.dumps(document)
+        elif member == "codex":
+            text = '''[[hooks.PostToolUse]]
+matcher = ".*"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "python3 @INST@/witness.py"
+'''
+        else:
+            text = '''[[hooks]]
+event = "PostToolUse"
+command = "python3 @INST@/witness.py"
+timeout = 10
+'''
+        witness_only_cases.append((member, filename, reader, events, text))
+    for i, (member, filename, reader, events, text) in enumerate(witness_only_cases):
+        tmp, inst, _ = vendor_manifest_case(member, filename, reader, text, events)
+        gate, evidence = fm.gate_surface(member, inst)
+        check(f"A21{chr(97 + i)} {member} witness-only registration is not a gate",
+              gate == "provisioned-but-UNGOVERNED", evidence)
+        tmp.cleanup()
+
+    tmp, inst, _ = vendor_manifest_case(
+        "codex", "config.toml", "toml-hook-commands",
+        '[[hooks.PreToolUse.hooks]]\ncommand = "unterminated\n', ["PreToolUse"])
+    gate, evidence = fm.gate_surface("codex", inst)
+    check("A22 malformed TOML registration is UNDETERMINED", gate == "UNDETERMINED", evidence)
+    tmp.cleanup()
+finally:
+    fm.HOME, fm.REPO = old_home, old_repo
+
 # --- B. smoke (the real tool, this repo) -------------------------------------
 
 r = subprocess.run([sys.executable, TOOL, "--probe", ""], capture_output=True, text=True, timeout=120)

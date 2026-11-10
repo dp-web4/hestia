@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 887cdc9c7024397ff2aa4541d0aae0b3036b59b0aa1c6a57d8f49dbd5b111c59  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -24,8 +24,8 @@ A tool call is a governance write only if a WRITE-POSITION argument resolves int
   * Bash: parsed write positions only — redirect targets (>, >>, &>, >|), tee arguments,
     cp/install/rsync DESTINATION (mv: EVERY operand — the source is destroyed too), sed -i
     file args, chmod/chown/chgrp/truncate/ln -sf targets, rm/unlink/rmdir/shred targets,
-    dd of=, touch targets, git checkout -- / git restore / git clean / git rm pathspecs
-    (git rm --dry-run/-n writes nothing).
+    dd of=, touch targets, git checkout -- / git restore / git clean / git rm / git mv
+    pathspecs (git rm/mv --dry-run/-n writes nothing).
 A command that merely NAMES a closure file in a read position (grep pattern, find -name, cat
 source, cp SOURCE, ls) is classified "read" — allowed, witnessed by the caller. Payload text
 (Write `content`, Edit `old_string`/`new_string`, heredoc bodies) is NEVER a haystack: a
@@ -1523,12 +1523,13 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
             if "--" in rest:
                 return rest[rest.index("--") + 1:]
             return []
-        if sub == "rm":
+        if sub in ("rm", "mv"):
             options_end = rest.index("--") if "--" in rest else len(rest)
             if "--dry-run" in rest[:options_end] or "-n" in rest[:options_end]:
                 return []
-            if any(a == "--pathspec-from-file" or a.startswith("--pathspec-from-file=")
-                   for a in rest[:options_end]):
+            if sub == "rm" and any(
+                    a == "--pathspec-from-file" or a.startswith("--pathspec-from-file=")
+                    for a in rest[:options_end]):
                 raise _OpaqueWriter()
             return _positionals(rest)
         if sub == "restore":
