@@ -243,13 +243,19 @@ impl PolicyPublication {
 
     /// The policy GENERATION a chain-witness signature binds (#339, decision 0014 §6.1):
     /// `policy:sha256:<hex>` over [`Self::canonical`], with hub law identified by its file
-    /// digest rather than a `Debug` rendering. Projection verification time is excluded;
-    /// the audit's verdict, generations, digests and divergence still bind.
+    /// digest rather than a `Debug` rendering. Only the projection audit's `verified_at` is
+    /// excluded: the first audit result moves the generation, but later timestamp-only
+    /// rechecks do not. The audit's verdict, generations, digests and divergence still bind.
+    /// Freshness remains readable through `verified_at`, not implicit in the generation.
+    ///
+    /// Scope requests bind as complete records, including pending and refused entries,
+    /// timestamps and decision reasons; this is not a live-grants-only identity.
     ///
     /// Content-addressed rather than `version`, because `version` restarts at 0 with every
     /// daemon boot: "generation 3" today and yesterday name different law, which is exactly
-    /// the cross-epoch replay the binding exists to prevent. Two epochs with byte-identical
-    /// law share a generation, and replaying between them changes nothing a reader relies on.
+    /// the cross-epoch replay the binding exists to prevent. Two epochs whose canonical
+    /// content is identical after that single exclusion share a generation, and replaying
+    /// between them changes nothing a reader relies on.
     pub fn policy_generation(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut c = self.canonical();
