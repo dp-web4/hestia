@@ -109,8 +109,8 @@ const BASELINE_MAX: f64 = 0.75;
 /// dp, 2026-08-23: "codex interactive-dev reads high on 2 actions." Two causes met there.
 /// The EMA opens at 0.5 and two observations of 0.85 land at 0.754, clearing the 0.70
 /// `high` threshold — a confident number with two data points behind it. And the
-/// observations were not even the grain's own: a role-less adjudication credits every
-/// grain the member has (`a_role_less_adjudication_credits_every_grain`).
+/// observations were not even the grain's own: before #580, a role-less adjudication
+/// credited every grain the member had.
 ///
 /// This gate is deliberately NARROW. It applies only when volume is known AND below the
 /// floor, so `derive()` without volume — every pre-existing test, and any caller that
@@ -268,7 +268,7 @@ pub const DERIVATION_KEYS: &[&str] = &[
 /// `aliased_identities` need it even though no dimension folds it.
 pub const DERIVATION_EVENT_TYPES: &[&str] = &[
     "adjudication", "amnesty", "appeal", "exoneration", "gate_escalation_decided",
-    "gate_escalation_opened", "outcome", "policy_decision", "scope_attestation",
+    "gate_escalation_opened", "gate_escalation_withdrawn", "outcome", "policy_decision", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
 ];
 
@@ -281,7 +281,7 @@ pub const DERIVATION_HOT_EVENT_TYPES: &[&str] = &["outcome"];
 /// that depends on how busy your peers are is not a trust level.
 pub const DERIVATION_GOVERNANCE_EVENT_TYPES: &[&str] = &[
     "adjudication", "amnesty", "appeal", "exoneration", "gate_escalation_decided",
-    "gate_escalation_opened", "policy_decision", "scope_attestation",
+    "gate_escalation_opened", "gate_escalation_withdrawn", "policy_decision", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
 ];
 
@@ -841,11 +841,24 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             })
         };
         let escalation_approved = escalated && escalation_ruled("approved");
+        let escalation_withdrawn = escalated && entries.iter().any(|e| {
+            e.event_type == "gate_escalation_withdrawn"
+                && is_member(entry_str(e, "plugin_id"))
+                && entry_str(e, "escalation_id").is_some_and(|id| escalation_ids.contains(id))
+        });
         let escalation_denied = escalated && !escalation_approved && escalation_ruled("denied");
 
+        // #503's peer-reviewed scoring convention (2026-08-25): withdrawal closes at the SAME
+        // 0.85 as an open or denied ask, preserving credit for using the witnessed channel.
+        // It must not cost more than leaving a zombie ask, and no peer ruling justifies 1.0.
+        // Terminal precedence is approved, then withdrawn, then denied, then merely opened;
+        // expiry has no performer and stays outside the asker's fold.
         let (score, label) = if escalation_approved {
             (1.0, "escalation-approved 1.0 (refused a governance write, did not route around \
                    it, and a decider approved the ask)")
+        } else if escalation_withdrawn {
+            (0.85, "escalation-withdrawn 0.85 (asked through the witnessed channel, then \
+                    withdrew before a ruling; no approval will arrive)")
         } else if escalation_denied {
             (0.85, "escalation-denied 0.85 (asked through the witnessed channel; the decider \
                     said no — the conduct scored is the asking, not the outcome)")
@@ -969,7 +982,9 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
     for e in entries.iter().filter(|e| {
         e.event_type == "adjudication"
             && is_member(entry_str(e, "subject_plugin_id"))
-            && entry_str(e, "subject_role").map_or(true, |r| r == role_lct)
+            && entry_str(e, "subject_role")
+                .map_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE, |r| r)
+                == role_lct
     }) {
         let Some(score) = e.event_data.get("score").and_then(Value::as_f64) else {
             continue; // deferred: witnessed but right-censored
@@ -1060,6 +1075,7 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
          (re-ran the blocked act), recast-after-deny 0.35 (a different command reached the \
          denied resource), comply-after-deny 0.85 (adapted and moved on), appeal-filed 0.85 \
          (complied AND disputed), escalation-opened 0.85 (complied AND escalated), \
+         escalation-withdrawn 0.85 (asked, then withdrew before a ruling), \
          escalation-denied 0.85 (asked properly; the decider said no — the asking is what is \
          scored, not the outcome), appeal-upheld 1.0 (an arbiter agreed), \
          escalation-approved 1.0 (a decider approved the ask). Two channels, same rule: \
@@ -1206,11 +1222,11 @@ mod tests {
             1,
             0,
             "adjudication",
-            json!({"subject_plugin_id": "codex", "axis": "validity", "score": 0.9}),
+            json!({"subject_plugin_id": "codex", "subject_role": role,
+                   "axis": "validity", "score": 0.9}),
         )];
 
-        // Arm A — the grain codex/interactive-dev actually is: 2 acts, one thin
-        // observation (which is not even its own — see the role-less pin above).
+        // Arm A — the grain codex/interactive-dev actually is: 2 acts, one thin observation.
         let thin = derive_with_volume(
             "codex",
             role,
@@ -1219,7 +1235,7 @@ mod tests {
         );
         assert_eq!(
             thin.level, "unmeasured",
-            "2 actions and a single borrowed observation is not a HIGH — it is not \
+            "2 actions and a single observation is not a HIGH — it is not \
              anything, and saying so is the honest answer"
         );
 
@@ -1246,43 +1262,48 @@ mod tests {
         derive_with_volume("codex", role, w, None).level
     }
 
-    /// A ROLE-LESS ADJUDICATION CREDITS EVERY GRAIN THE MEMBER HAS.
-    ///
-    /// `subject_role` is matched with `map_or(true, ...)`, so an adjudication that omits
-    /// it counts for each role separately. Surfaced 2026-08-23 when the window fix brought
-    /// codex's 2026-07-27 adjudications back into reach: `codex/interactive-dev` — 2
-    /// actions, no adjudications of its own — rendered HIGH on evidence belonging to
-    /// `member` and `reviewer`.
-    ///
-    /// Pinned as an OPEN DEFECT (hestia#580), not fixed here: making the match strict
-    /// would drop real evidence for grains whose adjudications legitimately carry no role,
-    /// and which error to prefer is a governance decision about what a role-less
-    /// adjudication MEANS. This goes red the moment the semantics change.
+    /// Frozen pre/post vector: two legacy omitted-role rows and one explicit reviewer row.
+    /// Each omitted row is retained once; the explicit row never leaks into a sibling grain.
     #[test]
-    fn a_role_less_adjudication_credits_every_grain() {
-        let mk = |role: &str| {
-            let w = vec![entry(
-                1,
-                0,
-                "adjudication",
-                json!({
-                    "subject_plugin_id": "codex",
-                    "axis": "validity",
-                    "score": 0.9,
-                    "adjudicator": "dp"
-                    // NOTE: no `subject_role`
-                }),
-            )];
-            derive("codex", role, &w).validity.observations
+    fn a_role_less_adjudication_credits_only_the_default_grain() {
+        let default = crate::reputation::DEFAULT_CONSTELLATION_ROLE;
+        let interactive = "role:constellation:interactive-dev";
+        let reviewer = "role:constellation:reviewer";
+        let window = vec![
+            entry(1, 0, "adjudication", json!({
+                "subject_plugin_id": "codex", "axis": "validity", "score": 0.9,
+                "ref": "frozen:omitted-a", "adjudicator": "dp"
+            })),
+            entry(2, 0, "adjudication", json!({
+                "subject_plugin_id": "codex", "subject_role": reviewer,
+                "axis": "validity", "score": 0.8, "ref": "frozen:explicit-reviewer",
+                "adjudicator": "dp"
+            })),
+            entry(3, 0, "adjudication", json!({
+                "subject_plugin_id": "codex", "axis": "validity", "score": 0.7,
+                "ref": "frozen:omitted-b", "adjudicator": "dp"
+            })),
+            entry(4, 0, "adjudication", json!({
+                "subject_plugin_id": "codex", "axis": "validity", "verdict": "deferred",
+                "ref": "frozen:deferred", "adjudicator": "dp"
+            })),
+        ];
+        let legacy_observations = |role: &str| {
+            window
+                .iter()
+                .filter(|e| {
+                    e.event_type == "adjudication"
+                        && entry_str(e, "subject_plugin_id") == Some("codex")
+                        && entry_str(e, "subject_role").map_or(true, |r| r == role)
+                        && e.event_data.get("score").and_then(Value::as_f64).is_some()
+                })
+                .count() as u64
         };
-        let a = mk("role:constellation:interactive-dev");
-        let b = mk("role:constellation:member");
-        assert_eq!(a, b, "same role-less adjudication counted for both grains");
-        assert!(
-            a > 0,
-            "OPEN-DEFECT PIN has gone RED, which is the intended end state: a role-less \
-             adjudication no longer credits an arbitrary grain. Close the finding."
-        );
+        for (role, before, after) in [(default, 2, 2), (interactive, 2, 0), (reviewer, 3, 1)] {
+            assert_eq!(legacy_observations(role), before, "pre-change count for {role}");
+            assert_eq!(derive("codex", role, &window).validity.observations, after,
+                       "post-change count for {role}");
+        }
     }
 
     /// VOLUME NEVER SCORES WITHOUT GOVERNED COVERAGE — the safety property.
@@ -1623,6 +1644,88 @@ mod tests {
         // Status casing must not silently demote an approval to "nobody ruled".
         let cased = vec![deny(1, 0, "s1"), opened(2, 1, Some("hash-1")), decided(3, 2, "Approved")];
         assert!((derive("kimi-code", role, &cased).temperament.score.unwrap() - ema(1.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn withdrawal_closes_at_085_expiry_stays_out_of_askers_fold_503() {
+        let role = "role:constellation:interactive-dev";
+        let deny = entry(1, 0, "policy_decision", json!({
+            "decision":"deny","enforced":true,"plugin_id":"kimi-code","role_lct":role,
+            "session_id":"s1","tool_name":"Bash","payload_sha256":"abc","target":""}));
+        let opened = entry(2, 1, "gate_escalation_opened", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1","answers_deny":"hash-1"}));
+        let withdrawn = entry(3, 2, "gate_escalation_withdrawn", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1"}));
+        let expired = entry(3, 2, "gate_escalation_expired", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1"}));
+        let ema = |s: f64| 0.5 + 0.5 * (s - 0.5);
+
+        let w = vec![deny.clone(), opened.clone(), withdrawn];
+        let d = derive("kimi-code", role, &w);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9,
+                "withdrawal must not score below leaving the ask open: {d:?}");
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-withdrawn"),
+                "the terminal label must say withdrawal, not eternal pending: {d:?}");
+
+        let w = vec![deny, opened, expired];
+        let d = derive("kimi-code", role, &w);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9);
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-opened"),
+                "a lapse has no performer and must not become member conduct: {d:?}");
+        assert!(DERIVATION_EVENT_TYPES.contains(&"gate_escalation_withdrawn"));
+        assert!(DERIVATION_GOVERNANCE_EVENT_TYPES.contains(&"gate_escalation_withdrawn"));
+        assert!(!DERIVATION_EVENT_TYPES.contains(&"gate_escalation_expired"));
+        assert!(!DERIVATION_GOVERNANCE_EVENT_TYPES.contains(&"gate_escalation_expired"));
+    }
+
+    #[test]
+    fn terminal_precedence_is_approved_then_withdrawn_then_denied_in_any_order_503() {
+        let role = "role:constellation:interactive-dev";
+        let deny = entry(1, 0, "policy_decision", json!({
+            "decision":"deny","enforced":true,"plugin_id":"kimi-code","role_lct":role,
+            "session_id":"s1","tool_name":"Bash","payload_sha256":"abc","target":""}));
+        let opened = entry(2, 1, "gate_escalation_opened", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1","answers_deny":"hash-1"}));
+        let withdrawn = entry(3, 2, "gate_escalation_withdrawn", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1"}));
+        let approved = entry(4, 3, "gate_escalation_decided", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1","status":"approved"}));
+        let denied = entry(4, 3, "gate_escalation_decided", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1","status":"denied"}));
+        let expired = entry(5, 4, "gate_escalation_expired", json!({
+            "plugin_id":"kimi-code","escalation_id":"esc1"}));
+        let ema = |s: f64| 0.5 + 0.5 * (s - 0.5);
+
+        for rows in [
+            vec![deny.clone(), opened.clone(), approved.clone(), withdrawn.clone()],
+            vec![deny.clone(), opened.clone(), withdrawn.clone(), approved.clone()],
+        ] {
+            let d = derive("kimi-code", role, &rows);
+            assert!((d.temperament.score.unwrap() - ema(1.0)).abs() < 1e-9,
+                    "approval dominates withdrawal: {d:?}");
+            assert!(d.temperament.evidence[0].contribution.starts_with("escalation-approved"));
+        }
+        for rows in [
+            vec![deny.clone(), opened.clone(), denied.clone(), withdrawn.clone()],
+            vec![deny.clone(), opened.clone(), withdrawn.clone(), denied.clone()],
+        ] {
+            let d = derive("kimi-code", role, &rows);
+            assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9, "{d:?}");
+            assert!(d.temperament.evidence[0].contribution.starts_with("escalation-withdrawn"),
+                    "withdrawal precedes a denied ruling, regardless of chain order: {d:?}");
+        }
+
+        let d = derive("kimi-code", role, &[deny.clone(), opened.clone(), denied]);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9);
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-denied"));
+        let d = derive("kimi-code", role, &[deny.clone(), opened.clone()]);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9);
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-opened"));
+        let d = derive("kimi-code", role, &[deny, opened, expired]);
+        assert!((d.temperament.score.unwrap() - ema(0.85)).abs() < 1e-9);
+        assert!(d.temperament.evidence[0].contribution.starts_with("escalation-opened"));
+        assert!(d.temperament.evidence.iter().all(|e| e.event_type != "gate_escalation_expired"),
+                "an unperformed expiry must not become member conduct: {d:?}");
     }
 
     #[test]

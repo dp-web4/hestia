@@ -518,6 +518,43 @@ def test_pin_a_write_position_substitution_names_a_revspec_to_the_human():
           f"still see a redirect whose DESTINATION is the marker; got {real_write}")
 
 
+def test_git_rm_options_end_at_double_dash():
+    check("dash_n_is_a_path_after_terminator",
+          g._command_write_targets(["git", "rm", "-q", "--", "-n"]) == ["-n"])
+    check("pathspec_option_name_is_a_path_after_terminator",
+          g._command_write_targets(["git", "rm", "-q", "--", "--pathspec-from-file"])
+          == ["--pathspec-from-file"])
+    check("dry_run_name_is_a_path_after_terminator",
+          g._command_write_targets(["git", "rm", "-q", "--", "--dry-run"])
+          == ["--dry-run"])
+    check("dry_run_before_terminator_writes_nothing",
+          g._command_write_targets(["git", "rm", "--dry-run", "-n"]) == [])
+
+
+def test_git_mv_moves_both_closure_operands_into_write_position():
+    source = verdict("git mv " + MARK + " /tmp/aside.py")
+    check("git_mv_source_is_write", source[0] == "write", f"got {source}")
+    check("git_mv_source_rule", source[1] == g.RULE_WRITE, f"got {source}")
+    check("git_mv_source_resource", source[2] == MARK, f"got {source}")
+
+    destination = verdict("git mv /tmp/source.py " + MARK)
+    check("git_mv_destination_is_write", destination[0] == "write", f"got {destination}")
+    check("git_mv_destination_rule", destination[1] == g.RULE_WRITE, f"got {destination}")
+    check("git_mv_destination_resource", destination[2] == MARK, f"got {destination}")
+
+    benign = cls("git mv README.md /tmp/readme.md")
+    check("git_mv_benign_is_none", benign == "none", f"got {benign}")
+    for option in ("--dry-run", "-n"):
+        dry_run = cls("git mv " + option + " " + MARK + " /tmp/aside.py")
+        check("git_mv_dry_run_is_read", dry_run == "read", f"{option}: got {dry_run}")
+        check("git_mv_dry_run_has_no_targets",
+              g._command_write_targets(["git", "mv", option, MARK, "/tmp/aside.py"]) == [])
+
+    check("git_mv_dash_n_is_a_path_after_terminator",
+          g._command_write_targets(["git", "mv", "--", "-n", "/tmp/aside.py"])
+          == ["-n", "/tmp/aside.py"])
+
+
 def test_every_case_in_this_file_is_in_ALL():
     """An explicit ALL satisfies tools/ci_selfexec_test.py, which refuses a `def test_*`
     that no Name node references — reflection over globals() is invisible to a static
@@ -549,6 +586,8 @@ ALL = [
     test_pin_a_variable_in_a_write_position_sweeps_in_a_quoted_body,
     test_pin_a_brace_group_with_a_read_only_body_is_refused,
     test_pin_a_write_position_substitution_names_a_revspec_to_the_human,
+    test_git_rm_options_end_at_double_dash,
+    test_git_mv_moves_both_closure_operands_into_write_position,
     test_every_case_in_this_file_is_in_ALL,
 ]
 

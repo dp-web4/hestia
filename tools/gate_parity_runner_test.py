@@ -78,6 +78,17 @@ def test_corpus_preserves_law_and_neutral_daemon_expectations():
     assert runner.expected_for(destructive, oracle=runner.LAW_ORACLE) == "deny:safety-preset"
     assert runner.expected_for(destructive, oracle=runner.NEUTRAL_STUB_ORACLE) == "allow"
     assert "even when SCRATCH is under /tmp" in destructive[5], destructive
+    safe = rows["destructive-git-rm-safe-flagged"]
+    assert runner.expected_for(safe, oracle=runner.LAW_ORACLE) == "allow"
+    assert runner.expected_for(safe, oracle=runner.NEUTRAL_STUB_ORACLE) == "allow"
+    for row_id in (
+        "destructive-git-rm-redirect-output",
+        "destructive-git-rm-redirect-input",
+        "destructive-git-rm-redirect-append",
+    ):
+        row = rows[row_id]
+        assert runner.expected_for(row, oracle=runner.LAW_ORACLE) == "deny:safety-preset"
+        assert runner.expected_for(row, oracle=runner.NEUTRAL_STUB_ORACLE) == "allow"
 
 
 def test_oracle_comparators_reject_opposite_verdicts():
@@ -412,7 +423,7 @@ def test_seat_env_strips_ambient_and_pins_the_stub():
 
 
 def test_corpus_is_loaded_and_unmodified_shape():
-    assert len(runner.CORPUS) == 34, len(runner.CORPUS)
+    assert len(runner.CORPUS) == 46, len(runner.CORPUS)
     for act in runner.CORPUS:
         act_id, act_class, tool, tool_input, expected, note = act
         assert isinstance(act_id, str) and tool_input is not None
