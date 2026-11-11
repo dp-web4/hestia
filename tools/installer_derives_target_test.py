@@ -52,10 +52,13 @@ def build(tmp, *, expects, registration=None, reg_name=None, files=("hook.py",))
     root = os.path.join(tmp, "repo")
     home = os.path.join(tmp, "home")
     os.makedirs(os.path.join(root, "deploy"))
+    os.makedirs(os.path.join(root, "tools"))
     os.makedirs(os.path.join(root, "plugins", "m", "hooks"))
     os.makedirs(os.path.join(root, "plugins", "_shared"))
     os.makedirs(home)
     shutil.copy(SCRIPT, os.path.join(root, "deploy", "install-members.sh"))
+    shutil.copy(os.path.join(REPO, "tools", "registration_resolver.py"),
+                os.path.join(root, "tools", "registration_resolver.py"))
     for f in files:
         with open(os.path.join(root, "plugins", "m", "hooks", f), "w") as fh:
             fh.write("# fake hook\n")
@@ -206,13 +209,117 @@ def test_governed_session_is_refused_but_dry_run_is_not():
         check("OVERRIDE" in out, "an acked override did not announce itself")
 
 
+def test_duplicate_basenames_keep_every_registered_target():
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        first = os.path.join(home, ".first", "pre_tool_use.py")
+        second = os.path.join(home, ".second", "pre_tool_use.py")
+        root, home, env = build(
+            tmp,
+            expects={
+                "dest": "~/.harness/hooks",
+                "registration": {"reader": "json-hook-commands",
+                                 "path": [".harness", "settings.json"]},
+                "files": ["hooks/pre_tool_use.py"],
+            },
+            files=("pre_tool_use.py",),
+            reg_name=os.path.join(".harness", "settings.json"),
+            registration=json.dumps({"hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": f"python3 {first}"},
+                {"type": "command", "command": f"python3 {second}"},
+            ]}]}}),
+        )
+        os.makedirs(os.path.dirname(first))
+        os.makedirs(os.path.dirname(second))
+        rc, out = run(root, env)
+        actions = [ln for ln in out.splitlines()
+                   if ln.lstrip().startswith(("would ", "ok    ", "wrote "))]
+        check(rc == 0, f"duplicate-target run exited {rc}: {out}")
+        hook_actions = [ln for ln in actions if "pre_tool_use.py" in ln]
+        check(len(hook_actions) == 2,
+              f"two full-path registrations did not produce two install actions: {actions}")
+        check(any(os.path.dirname(first) in ln for ln in actions), "first target was lost")
+        check(any(os.path.dirname(second) in ln for ln in actions), "second target was lost")
+
+
+def test_unclassified_registration_blocks_a_partial_install():
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        hook = os.path.join(home, ".harness", "pre_tool_use.py")
+        root, home, env = build(
+            tmp,
+            expects={
+                "dest": "~/.harness/hooks",
+                "registration": {"reader": "json-hook-commands",
+                                 "path": [".harness", "settings.json"]},
+                "files": ["hooks/pre_tool_use.py"],
+            },
+            files=("pre_tool_use.py",),
+            reg_name=os.path.join(".harness", "settings.json"),
+            registration=json.dumps({"hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": f"python3 {hook}"},
+                {"type": "command", "command": "unknown-wrapper --workspace /abs/directory"},
+            ]}]}}),
+        )
+        os.makedirs(os.path.dirname(hook), exist_ok=True)
+        rc, out = run(root, env)
+        actions = [ln for ln in out.splitlines()
+                   if ln.lstrip().startswith(("would ", "ok    ", "wrote "))]
+        check(rc == 0, f"incomplete-registration run exited {rc}: {out}")
+        check("unclassified commands" in out, f"incomplete registration was not named: {out}")
+        check(not actions, f"an incomplete target set still produced install actions: {actions}")
+
+
+def test_missing_resolver_is_fatal_not_an_empty_registration():
+    with tempfile.TemporaryDirectory() as tmp:
+        root, _home, env = build(tmp, expects={
+            "dest": "~/.harness/hooks",
+            "registration": {"reader": "json-hook-commands",
+                             "path": [".harness", "settings.json"]},
+            "files": ["hooks/pre_tool_use.py"],
+        })
+        os.unlink(os.path.join(root, "tools", "registration_resolver.py"))
+        rc, out = run(root, env)
+        check(rc != 0, "a missing canonical resolver exited 0")
+        check("resolver is missing" in out, f"missing resolver was not named: {out}")
+
+
+def test_resolver_crash_is_fatal_not_an_empty_registration():
+    with tempfile.TemporaryDirectory() as tmp:
+        root, _home, env = build(tmp, expects={
+            "dest": "~/.harness/hooks",
+            "registration": {"reader": "json-hook-commands",
+                             "path": [".harness", "settings.json"]},
+            "files": ["hooks/pre_tool_use.py"],
+        })
+        with open(os.path.join(root, "tools", "registration_resolver.py"), "w") as fh:
+            fh.write("raise RuntimeError('boom')\n")
+        rc, out = run(root, env)
+        check(rc != 0, "a crashing canonical resolver exited 0")
+        check("resolver failed (rc=1)" in out, f"resolver crash was not named: {out}")
+
+
+def test_not_declared_is_a_skip_not_a_resolver_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        root, home, env = build(tmp, expects={
+            "dest": "~/.nowhere/hooks",
+            "files": ["hooks/pre_tool_use.py"],
+        })
+        rc, out = run(root, env)
+        check(rc == 0, f"not-declared run exited {rc}: {out}")
+        check("declares no install.registration" in out,
+              f"not-declared was not reported distinctly: {out}")
+        check(not os.path.exists(os.path.join(home, ".nowhere")),
+              "not-declared fabricated a destination directory")
+
+
 def test_every_shipped_member_declares_a_reader_the_core_implements():
     """Guards the data half: a member added without a registration block, or with a
     reader nobody implements, must fail HERE and not on the operator's box."""
-    with open(SCRIPT, encoding="utf-8") as fh:
-        script = fh.read()
+    with open(os.path.join(REPO, "tools", "registration_resolver.py"), encoding="utf-8") as fh:
+        resolver = fh.read()
     implemented = {r for r in ("json-hook-commands", "toml-hook-commands")
-                   if f'"{r}"' in script}
+                   if f'"{r}"' in resolver}
     check(len(implemented) == 2,
           f"core no longer implements the expected readers: {implemented}")
     plugins = os.path.join(REPO, "plugins")

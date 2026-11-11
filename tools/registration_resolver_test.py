@@ -77,6 +77,63 @@ class RegistrationResolverTests(unittest.TestCase):
         self.assertEqual({x["path"] for x in r["targets"]}, {str(a), str(b)})
         self.assertTrue(r["complete"])
 
+    def test_json_bare_interpreter_uses_separate_args(self):
+        hook = self.touch("hooks/arguments.py")
+        rel = [".gemini", "settings.json"]
+        e = self.expects(member="gemini", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"mcpServers": {"example": {
+            "command": "python3", "args": ["-u", str(hook)],
+        }}}), encoding="utf-8")
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertTrue(r["complete"])
+        self.assertEqual(r["commands_seen"], 1)
+        self.assertEqual(r["targets"][0]["path"], str(hook))
+        self.assertEqual(r["targets"][0]["event"], "mcpServers")
+
+    def test_toml_bare_interpreter_uses_separate_args(self):
+        hook = self.touch("hooks/session-end.js")
+        rel = [".codex", "config.toml"]
+        e = self.expects(member="codex", reader="toml-hook-commands", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            '[[hooks.SessionEnd]]\ncommand = "node"\n'
+            f'args = [\n  "{hook}",\n]\n',
+            encoding="utf-8",
+        )
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertTrue(r["complete"])
+        self.assertEqual(r["commands_seen"], 1)
+        self.assertEqual(r["targets"][0]["path"], str(hook))
+        self.assertEqual(r["targets"][0]["event"], "SessionEnd")
+
+    def test_bare_interpreter_without_args_remains_unclassified(self):
+        rel = [".codex", "config.toml"]
+        e = self.expects(member="codex", reader="toml-hook-commands", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('[[hooks.SessionEnd]]\ncommand = "node"\n', encoding="utf-8")
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertFalse(r["complete"])
+        self.assertEqual(r["targets"], [])
+
+    def test_non_string_args_are_unparseable(self):
+        hook = self.touch("hooks/arguments.py")
+        rel = [".gemini", "settings.json"]
+        e = self.expects(member="gemini", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"mcpServers": {"example": {
+            "command": "python3", "args": [str(hook), 7],
+        }}}), encoding="utf-8")
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "unparseable")
+
     def test_node_value_option_is_unclassified_not_a_phantom_hook(self):
         module = self.touch("node/preload.js")
         script = self.touch("node/hook.js")
