@@ -1,0 +1,511 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -2280,6 +2280,15 @@
+                               "-regex", "-iregex", "-lname", "-ilname"},
+              "string_opts": {"-printf"}},
+     "git": {"string_opts": {"-m", "--message", "--grep", "--author", "--format", "--pretty", "-S", "-G"}},
++    # gh's `-q`/`--jq` takes a jq expression in every subcommand that has it: 55 of 55 in `gh help
++    # reference` (gh 2.x, McNugget, 2026-11-10). `--template` and `-t` are NOT listed: under `repo
++    # edit` and `auth status` they are booleans, so the next word would be swallowed (#1314).
++    "gh": {"string_opts": {"--jq", "-q"}},
++    # jq's first operand is its FILTER, unless `-f`/`--from-file` supplies the program (then every
++    # operand is a file). `-L` and its jq 1.8 long form `--library-path` name a library directory
++    # and are judged (legion-claude on #1550: without the long form its DIR became the filter).
++    "jq": {"pattern_first": True, "file_opts": {"-f", "--from-file"},
++           "value_opts": {"--indent", "-L", "--library-path"}},
+ }
+ _CMD_SPECS["gawk"] = _CMD_SPECS["mawk"] = _CMD_SPECS["awk"]
+ #: Heads whose `-c` value is shell code (they also disqualify the literal rule).
+@@ -2930,6 +2939,10 @@
+             if opt in spec.get("code_opts", ()):
+                 code(w)
+                 continue
++            if opt in spec.get("file_opts", ()):
++                # The program came from a file (`grep -f P`, `sed -f S`, `jq -f F`): every operand
++                # is a file. Before this the first one was taken as the pattern and never judged.
++                state["pattern_given"] = True
+             if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
+                     or opt in _string_opts(head, spec, state["subs"])) and not uglob:
+                 if opt in spec.get("pattern_opts", ()):
+@@ -2972,7 +2985,7 @@
+                 if name in spec.get("code_opts", ()):
+                     code(val)
+                     continue
+-                if name in spec.get("pattern_opts", ()):
++                if name in spec.get("pattern_opts", ()) or name in spec.get("file_opts", ()):
+                     state["pattern_given"] = True
+                 if uglob or not (name in spec.get("delim_opts", ())
+                                  or name in spec.get("pattern_opts", ())
+@@ -3003,7 +3016,7 @@
+                 if w[:2] in spec.get("code_opts", ()):
+                     code(w[2:])
+                     continue
+-                if w[:2] in spec.get("pattern_opts", ()):
++                if w[:2] in spec.get("pattern_opts", ()) or w[:2] in spec.get("file_opts", ()):
+                     state["pattern_given"] = True
+                 if uglob or not (w[:2] in spec.get("delim_opts", ())
+                                  or w[:2] in spec.get("pattern_opts", ())
+@@ -3011,6 +3024,24 @@
+                     emit(w[2:], uglob)
+                 elif w[:2] in spec.get("pattern_opts", ()):
+                     pattern(w[2:], judge=False)            # as before, plus its value recorded
++                continue
++            run = re.match(r"-[A-Za-z0-9]+", w) if not w.startswith("--") and len(w) > 2 else None
++            valued = spec.get("file_opts", set()) | spec.get("value_opts", set())
++            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued), None) if run else None
++            if fat is not None and head == "sed" and "i" in w[1:fat]:
++                fat = None          # GNU `sed -if S`: `-i` takes the rest as its backup suffix
++            if fat is not None:
++                # A clustered option that takes a value (`grep -rf P`, `grep -nfP`, `jq -rf F`,
++                # `jq -nL DIR`): getopt reads the letters before it as flags and hands it the rest of
++                # the word, or the next word, which is judged as that option's value always is. A
++                # program-file option also means every operand is a file. A letter before it that
++                # itself takes a value only makes this judge more, never less.
++                if "-" + w[fat] in spec.get("file_opts", ()):
++                    state["pattern_given"] = True
++                if fat == len(w) - 1:
++                    state["pending"] = "-" + w[fat]
++                else:
++                    emit(w[fat + 1:], uglob)
+                 continue
+             m = _ATTACHED_OPT.match(w)
+             if m:
+@@ -3608,6 +3639,22 @@
+     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
+ 
+ 
++#: The env-file token is matched as a FILE NAME, not a substring (#1494, #639). It is a hit unless it is
++#: glued inside one identifier on BOTH sides: `os.environ`, `venv.EnvBuilder` and `environ` are not the
++#: file, while `.env`, `./.env.local`, `.envrc`, `prod.env`, `app.env.bak` and a `\.env` regex still are.
++#: `process.env.X` stays a hit too: a word before and a dot after is also how a named env file reads.
++#: Measured on McNugget, 2026-11-03..10: 3 of the 4 egress.secret false denies were the glued shape.
++#: Every other token keeps the substring match.
++_ENV_FILE = re.compile(r"(?<![a-z0-9_])\.env|\.env(?![a-z0-9_])")
++
++
++def forbidden_hit(token: str, low: str) -> bool:
++    """Gate 1a's match of one forbidden token against LOWERED text."""
++    if token == ".env":
++        return _ENV_FILE.search(low) is not None
++    return token in low
++
++
+ # ── The decision ─────────────────────────────────────────────────────────────────────────
+ #: Tools whose path is only READ. The read-only floor admits these and nothing else. Each is
+ #: also a reader in the governance closure (`_READ_PATH_TOOLS`), which
+@@ -3788,7 +3835,7 @@
+     for blob in egress_blobs(event):
+         low = blob.lower()
+         for f in forbidden:
+-            if f in low:
++            if forbidden_hit(f, low):
+                 return _deny(
+                     "egress.secret",
+                     f"'{event.tool}' touches a forbidden path (secret/credential or "
+@@ -4085,7 +4132,7 @@
+     for blob in egress_blobs(event):
+         low = blob.lower()
+         for f in forbidden:
+-            if f in low:
++            if forbidden_hit(f, low):
+                 return _deny(
+                     "egress.secret",
+                     f"'{event.tool}' touches a forbidden path (secret/credential or "
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -2281,6 +2281,15 @@
+                               "-regex", "-iregex", "-lname", "-ilname"},
+              "string_opts": {"-printf"}},
+     "git": {"string_opts": {"-m", "--message", "--grep", "--author", "--format", "--pretty", "-S", "-G"}},
++    # gh's `-q`/`--jq` takes a jq expression in every subcommand that has it: 55 of 55 in `gh help
++    # reference` (gh 2.x, McNugget, 2026-11-10). `--template` and `-t` are NOT listed: under `repo
++    # edit` and `auth status` they are booleans, so the next word would be swallowed (#1314).
++    "gh": {"string_opts": {"--jq", "-q"}},
++    # jq's first operand is its FILTER, unless `-f`/`--from-file` supplies the program (then every
++    # operand is a file). `-L` and its jq 1.8 long form `--library-path` name a library directory
++    # and are judged (legion-claude on #1550: without the long form its DIR became the filter).
++    "jq": {"pattern_first": True, "file_opts": {"-f", "--from-file"},
++           "value_opts": {"--indent", "-L", "--library-path"}},
+ }
+ _CMD_SPECS["gawk"] = _CMD_SPECS["mawk"] = _CMD_SPECS["awk"]
+ #: Heads whose `-c` value is shell code (they also disqualify the literal rule).
+@@ -2931,6 +2940,10 @@
+             if opt in spec.get("code_opts", ()):
+                 code(w)
+                 continue
++            if opt in spec.get("file_opts", ()):
++                # The program came from a file (`grep -f P`, `sed -f S`, `jq -f F`): every operand
++                # is a file. Before this the first one was taken as the pattern and never judged.
++                state["pattern_given"] = True
+             if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
+                     or opt in _string_opts(head, spec, state["subs"])) and not uglob:
+                 if opt in spec.get("pattern_opts", ()):
+@@ -2973,7 +2986,7 @@
+                 if name in spec.get("code_opts", ()):
+                     code(val)
+                     continue
+-                if name in spec.get("pattern_opts", ()):
++                if name in spec.get("pattern_opts", ()) or name in spec.get("file_opts", ()):
+                     state["pattern_given"] = True
+                 if uglob or not (name in spec.get("delim_opts", ())
+                                  or name in spec.get("pattern_opts", ())
+@@ -3004,7 +3017,7 @@
+                 if w[:2] in spec.get("code_opts", ()):
+                     code(w[2:])
+                     continue
+-                if w[:2] in spec.get("pattern_opts", ()):
++                if w[:2] in spec.get("pattern_opts", ()) or w[:2] in spec.get("file_opts", ()):
+                     state["pattern_given"] = True
+                 if uglob or not (w[:2] in spec.get("delim_opts", ())
+                                  or w[:2] in spec.get("pattern_opts", ())
+@@ -3012,6 +3025,24 @@
+                     emit(w[2:], uglob)
+                 elif w[:2] in spec.get("pattern_opts", ()):
+                     pattern(w[2:], judge=False)            # as before, plus its value recorded
++                continue
++            run = re.match(r"-[A-Za-z0-9]+", w) if not w.startswith("--") and len(w) > 2 else None
++            valued = spec.get("file_opts", set()) | spec.get("value_opts", set())
++            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued), None) if run else None
++            if fat is not None and head == "sed" and "i" in w[1:fat]:
++                fat = None          # GNU `sed -if S`: `-i` takes the rest as its backup suffix
++            if fat is not None:
++                # A clustered option that takes a value (`grep -rf P`, `grep -nfP`, `jq -rf F`,
++                # `jq -nL DIR`): getopt reads the letters before it as flags and hands it the rest of
++                # the word, or the next word, which is judged as that option's value always is. A
++                # program-file option also means every operand is a file. A letter before it that
++                # itself takes a value only makes this judge more, never less.
++                if "-" + w[fat] in spec.get("file_opts", ()):
++                    state["pattern_given"] = True
++                if fat == len(w) - 1:
++                    state["pending"] = "-" + w[fat]
++                else:
++                    emit(w[fat + 1:], uglob)
+                 continue
+             m = _ATTACHED_OPT.match(w)
+             if m:
+@@ -3609,6 +3640,22 @@
+     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
+ 
+ 
++#: The env-file token is matched as a FILE NAME, not a substring (#1494, #639). It is a hit unless it is
++#: glued inside one identifier on BOTH sides: `os.environ`, `venv.EnvBuilder` and `environ` are not the
++#: file, while `.env`, `./.env.local`, `.envrc`, `prod.env`, `app.env.bak` and a `\.env` regex still are.
++#: `process.env.X` stays a hit too: a word before and a dot after is also how a named env file reads.
++#: Measured on McNugget, 2026-11-03..10: 3 of the 4 egress.secret false denies were the glued shape.
++#: Every other token keeps the substring match.
++_ENV_FILE = re.compile(r"(?<![a-z0-9_])\.env|\.env(?![a-z0-9_])")
++
++
++def forbidden_hit(token: str, low: str) -> bool:
++    """Gate 1a's match of one forbidden token against LOWERED text."""
++    if token == ".env":
++        return _ENV_FILE.search(low) is not None
++    return token in low
++
++
+ # ── The decision ─────────────────────────────────────────────────────────────────────────
+ #: Tools whose path is only READ. The read-only floor admits these and nothing else. Each is
+ #: also a reader in the governance closure (`_READ_PATH_TOOLS`), which
+@@ -3789,7 +3836,7 @@
+     for blob in egress_blobs(event):
+         low = blob.lower()
+         for f in forbidden:
+-            if f in low:
++            if forbidden_hit(f, low):
+                 return _deny(
+                     "egress.secret",
+                     f"'{event.tool}' touches a forbidden path (secret/credential or "
+@@ -4086,7 +4133,7 @@
+     for blob in egress_blobs(event):
+         low = blob.lower()
+         for f in forbidden:
+-            if f in low:
++            if forbidden_hit(f, low):
+                 return _deny(
+                     "egress.secret",
+                     f"'{event.tool}' touches a forbidden path (secret/credential or "
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930",
++      "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "3fdde4202364db337a8c3613d14ce85917938bf2d025c509886f41298c2d1425"
++  "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "3fdde4202364db337a8c3613d14ce85917938bf2d025c509886f41298c2d1425",
++    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930"
++        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "98bcd081e069fad6d0df346ff48c5b901fcc12552d22c585410b6c7062218e86"
++  "gt_version": "e0cb5326d0b3071e0c8a216f20ee87cf3e636adf1ac9fdcff6ef7b744065911a"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "3fdde4202364db337a8c3613d14ce85917938bf2d025c509886f41298c2d1425",
++    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930"
++        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "7d2ad2132cd35c3d5d21510c7eb7acb08f0d55fc1d17f618d70fc5362e345b9d"
++  "gt_version": "f8bf2a3cc826fb82358df2e5967effccba0940b00ba321202982418c79ffcfa6"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "3fdde4202364db337a8c3613d14ce85917938bf2d025c509886f41298c2d1425",
++    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930"
++        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "187356fed58597934ff2297483c38e85aaf94079760bd4c94b92aecc27b626f3"
++  "gt_version": "d66f48fbaeeedbc1cbe20cbc251692633e1c58b6d07bd5ab1769309bca241be4"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "3fdde4202364db337a8c3613d14ce85917938bf2d025c509886f41298c2d1425",
++    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "2116c475f579aaba9205ee50206fce4b6fe99fbbebb511255dbd2db894ac3930"
++        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "b05cb8e6250346857e0d8dc3f625370db57a29dff41e9f2a948523e9298a3d8d"
++  "gt_version": "60a50827ea822861975251d46651a2c09c8a8b199c5dd5e0ee5b6f0c9f79255c"
+ }
+diff --git a/tools/gate_false_deny_test.py b/tools/gate_false_deny_test.py
+new file mode 100755
+--- /dev/null
++++ b/tools/gate_false_deny_test.py
+@@ -0,0 +1,156 @@
++#!/usr/bin/env python3
++"""hestia #1494 / #1314: the two largest false-deny causes on McNugget's week of gate decisions
++(2026-11-03..10, 89 denies, 7 false), fixed without loosening any real secret read or outside reach.
++
++1. Gate 1a matched the env-file token as a raw SUBSTRING, so `os.environ`, `venv.EnvBuilder` and
++   `gh search 'os.environ'` were refused as secret reads. It is now matched as a file name: a hit
++   unless the token is glued inside one identifier on both sides.
++2. `mrh.command` judged a jq expression as a relative path: gh's `--jq`/`-q` value and jq's own
++   filter operand (`.state`, `.comments[-2:][]` — a glob, so a read of the cwd).
++3. Found while measuring: with the program from a FILE (`grep -f`, `sed -f`, `awk -f`, `jq -f`, and
++   clustered as `-rf`), the first operand was still taken as the pattern and never judged, so
++   `grep -f P /outside` passed.
++
++Every FALSE row below fails on main's core; every DENY row passes on both. Strings only: nothing
++here opens a file it names. No forbidden token is spelled in this source (tools/marker_bar_probe.py's
++discipline): the env token is built from the core's own constant.
++
++Run: python3 tools/gate_false_deny_test.py [dir holding core_rev.py]
++"""
++import importlib.util
++import os
++import pathlib
++import sys
++import tempfile
++
++OUT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
++ROOT = next(p for p in pathlib.Path(__file__).resolve().parents if (p / "plugins" / "_shared").is_dir())
++if (OUT / "core_rev.py").is_file():
++    spec = importlib.util.spec_from_file_location("hestia_gate_core", OUT / "core_rev.py")
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules["hestia_gate_core"] = mod
++    sys.path.insert(0, str(ROOT / "plugins" / "_shared"))
++    spec.loader.exec_module(mod)
++sys.path.insert(0, str(ROOT / "tools"))
++import grant_modes_gate_test as g  # noqa: E402
++
++core = g.core
++E = next(t for t in core.FORBIDDEN_DEFAULT if t.endswith("env"))
++OUTSIDE = "/etc/hosts"          # exists on every seat, outside every fixture workspace
++
++# Commands whose only "secret" is a word that merely CONTAINS the env token.
++ENV_ALLOW = [
++    ("os.environ in python -c", "python3 -c 'import os; print(os.environ.get(\"HOME\"))'"),
++    ("gh search for os.environ", "gh search issues --repo dp-web4/hestia --state open 'os.environ'"),
++    ("rg for venv.EnvBuilder (#1494)", "rg -n 'venv.EnvBuilder|system_site_packages' {ws}/repo"),
++    ("grep environ", "grep -rn environ {ws}/repo"),
++]
++# Every spelling of the env FILE stays refused by gate 1a, wherever it appears.
++ENV_DENY = [
++    ("the file", "cat {ws}/repo/" + E),
++    ("dot-slash .local", "cat ./" + E + ".local"),
++    ("home", "cp ~/" + E + " /tmp/x"),
++    ("redirect", "python3 x.py < {ws}/repo/" + E),
++    ("source", "source {ws}/repo/" + E),
++    ("prefixed name", "cat {ws}/repo/prod" + E),
++    ("prefixed name with suffix", "cat {ws}/repo/app" + E + ".bak"),
++    ("rc file", "cat {ws}/repo/" + E + "rc"),
++    ("upper case", "cat {ws}/repo/" + E.upper()),
++    ("python -c open", "python3 -c 'print(open(\"" + E + "\").read())'"),
++    ("jq on the file", "jq . {ws}/repo/" + E),
++    ("inside a --jq value", "gh api x --jq '" + E + "'"),
++    ("escaped in a regex (conservative)", "grep -rn '\\" + E + "' {ws}/repo"),
++    ("member access (conservative)", "grep -rn 'process" + E + ".HOME' {ws}/repo"),
++]
++# A jq expression is not a path: gh's --jq / -q value, and jq's filter operand.
++SCOPE_ALLOW = [
++    ("gh --jq brackets", "gh pr view 1 -R o/r --json comments --jq '.comments[-2:][]|.body[:1200]'"),
++    ("gh --jq bare", "gh pr view 1 -R o/r --json state --jq .state"),
++    ("gh -q", "gh pr view 1 -R o/r --json state -q .state"),
++    ("gh --jq=", "gh pr view 1 -R o/r --json state --jq=.state"),
++    ("gh api --jq", "gh api repos/o/r/pulls/1 --jq .head.sha"),
++    ("jq filter then a granted file", "jq .state {ws}/repo/a.json"),
++    ("jq filter in a pipe", "gh pr list -R o/r --json number | jq '.[].number'"),
++    ("jq -r filter", "jq -r '.reviews[-1].body' {ws}/repo/a.json"),
++]
++# Outside reaches stay refused, including through the new exemptions.
++SCOPE_DENY = [
++    ("jq reads an outside file", "jq .a " + OUTSIDE),
++    ("jq -f, outside data", "jq -f {ws}/repo/p.jq " + OUTSIDE),
++    ("jq --from-file, outside data", "jq --from-file {ws}/repo/p.jq " + OUTSIDE),
++    ("jq -f outside program", "jq -f " + OUTSIDE),
++    ("jq -L outside library", "jq -L /etc .a {ws}/repo/a.json"),
++    ("gh --jq, then an outside read", "gh api x --jq .a && cat " + OUTSIDE),
++    ("gh -q with an unquoted glob", "gh api x -q /etc/*"),
++    ("gh --body-file outside", "gh pr comment 1 --body-file " + OUTSIDE),
++    ("gh --template is a boolean under repo edit", "gh repo edit --template " + OUTSIDE),
++    # the hole this change closes: a program file means the operands are files
++    ("grep -f, outside data", "grep -f {ws}/repo/p " + OUTSIDE),
++    ("grep --file=, outside data", "grep --file={ws}/repo/p " + OUTSIDE),
++    ("grep -fFILE, outside data", "grep -f{ws}/repo/p " + OUTSIDE),
++    ("sed -f, outside data", "sed -f {ws}/repo/p.sed " + OUTSIDE),
++    ("awk -f, outside data", "awk -f {ws}/repo/p.awk " + OUTSIDE),
++    ("rg -f, outside data", "rg -f {ws}/repo/p " + OUTSIDE),
++    # clustered: getopt hands `f` the next word (or the rest of the word); every operand is a file
++    ("jq -rf outside program", "jq -rf " + OUTSIDE + " {ws}/repo/a.json"),
++    ("jq -rf, outside data", "jq -rf {ws}/repo/p.jq " + OUTSIDE),
++    ("grep -rf outside patterns", "grep -rf " + OUTSIDE + " {ws}/repo"),
++    ("grep -rf, outside data", "grep -rf {ws}/repo/p " + OUTSIDE),
++    ("grep -nfFILE, outside data", "grep -nf{ws}/repo/p " + OUTSIDE),
++    ("sed -nf, outside data", "sed -nf {ws}/repo/p.sed " + OUTSIDE),
++    # jq's library directory, every spelling (legion-claude and Nova on #1550; jq 1.8 long form)
++    ("jq -n --library-path outside", "jq -n --library-path /etc 'include \"x\"; .'"),
++    ("jq --library-path= outside", "jq -n --library-path=/etc 'include \"x\"; .'"),
++    ("jq -n -L outside", "jq -n -L /etc 'include \"x\"; .'"),
++    ("jq -L/DIR attached outside", "jq -n -L/etc 'include \"x\"; .'"),
++    ("jq -nL clustered outside", "jq -nL /etc 'include \"x\"; .'"),
++    ("jq -nL/DIR clustered attached", "jq -nL/etc 'include \"x\"; .'"),
++]
++# Shapes that must not be over-judged by the cluster rule.
++SCOPE_ALLOW += [
++    ("sed -if: `f` is -i's backup suffix", "sed -if 's/a/b/' {ws}/repo/a.json"),
++    ("jq -n --library-path granted", "jq -n --library-path {ws}/repo 'include \"x\"; .'"),
++]
++
++
++def main():
++    bad = []
++    cwd = tempfile.mkdtemp(prefix="hestia-fdr-cwd-")   # outside the grant: _Workspace turns temp admission off
++    try:
++        with g._Workspace() as ws:
++            os.makedirs(ws + "/repo", exist_ok=True)
++            for f in ("a.json", "p", "p.jq", "p.sed", "p.awk"):
++                pathlib.Path(ws, "repo", f).write_text("{}\n")
++            snap = g._snapshot(ws, standing=[{"path": ws, "recursive": True}])
++            prof, pol = g._policy(snap)
++
++            def verdict(cmd):
++                ev = core.NormalizedEvent(tool="Bash", paths=[], command=cmd.format(ws=ws), cwd=cwd)
++                return core.evaluate(ev, prof, ws, policy=pol)
++
++            for name, cmd in ENV_ALLOW + SCOPE_ALLOW:
++                v = verdict(cmd)
++                if v.blocks:
++                    bad.append(f"ALLOW expected, got {v.rule}: {name}")
++            for name, cmd in ENV_DENY:
++                v = verdict(cmd)
++                if v.rule != "egress.secret":
++                    bad.append(f"egress.secret expected, got {v.decision}/{v.rule}: {name}")
++            for name, cmd in SCOPE_DENY:
++                v = verdict(cmd)
++                if not (v.blocks and (v.rule or "").startswith("mrh.command")):
++                    bad.append(f"mrh.command expected, got {v.decision}/{v.rule}: {name}")
++    finally:
++        os.rmdir(cwd)
++    for b in bad:
++        print("FAIL", b)
++    n = len(ENV_ALLOW) + len(SCOPE_ALLOW) + len(ENV_DENY) + len(SCOPE_DENY)
++    print(f"{'PASS' if not bad else 'FAIL'}: {n - len(bad)}/{n} rows "
++          f"({len(ENV_ALLOW) + len(SCOPE_ALLOW)} false-deny, {len(ENV_DENY) + len(SCOPE_DENY)} must-deny)")
++    if bad:
++        raise SystemExit(1)       # raises under a runner too, never a silent pass
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
