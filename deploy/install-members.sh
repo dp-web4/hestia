@@ -375,19 +375,17 @@ has_plan() {   # has_plan <member> — any planned hook for this member?
 
 [ -f "$REPO_ROOT/tools/registration_resolver.py" ] || die "canonical registration resolver is missing at $REPO_ROOT/tools/registration_resolver.py"
 
+# Each member declares WHAT it installs and HOW its harness records a registration;
+# the canonical resolver derives WHERE from that registration, never from a guessed layout.
+# Resolve registrations and check their completeness and hydrate roots for EVERY member
+# before the shared engine or any member file changes.
+# Command substitution, NOT `mapfile < <(...)`: a process substitution's exit status is
+# not the producer's, so the resolver's SKIP codes below would all read as success.
+declare -A preflight_members=()
+declare -A resolved_registrations=()
 for expects in "$REPO_ROOT"/plugins/*/expects.json; do
   [ -e "$expects" ] || continue
   member="$(basename "$(dirname "$expects")")"
-
-  # --- decomposition: the member declares WHAT it installs, and HOW ITS HARNESS ------
-  # --- records a registration. The core derives WHERE from that registration. -------
-  # This is the fractal split dp asked for: the invariant (derive, never assume) stays
-  # up here once; the per-harness detail (which file, which syntax) decomposes into the
-  # member's own expects.json and needs no new script.
-  #
-  # One resolver owns registration syntax and full-path identity for every consumer.
-  # Command substitution, NOT `mapfile < <(...)`: a process substitution's exit status is
-  # not the producer's, so the resolver's SKIP codes below would all read as success.
   reg_rc=0
   reg_out="$(python3 "$REPO_ROOT/tools/registration_resolver.py" "$expects")" || reg_rc=$?
   case "$reg_rc" in
@@ -399,8 +397,6 @@ for expects in "$REPO_ROOT"/plugins/*/expects.json; do
          die "$member canonical registration resolver failed (rc=2); refusing to guess a target"
        fi ;;
     3) if has_plan "$member"; then
-         # The harness is here (its config DIR exists; the registrar checked) but has no
-         # registration file yet: install the planned hooks, then the registrar writes it.
          log "  $member: no registration file yet — installing its planned hooks, then registering"
          reg_out=""
        else
@@ -429,6 +425,32 @@ for target in result["targets"]:
     reg_out="$reg_targets"
   fi
 
+  preflight_members["$member"]=1
+  resolved_registrations["$member"]="$reg_out"
+  declare -A registered=()
+  while IFS=$'\t' read -r reg_base reg_path; do
+    [ -n "$reg_base" ] || continue
+    registered["$reg_base"]="${registered[$reg_base]:-}${reg_path}"$'\n'
+  done <<< "$reg_out"
+  if [ -f "$REPO_ROOT/plugins/$member/instance/identity.seed.json" ] && [ -n "${registered[hydrate.sh]:-}" ]; then
+    declare -A hydrate_seed_roots=()
+    mapfile -t hydrate_targets < <(printf '%s' "${registered[hydrate.sh]}")
+    for hydrate_target in "${hydrate_targets[@]}"; do
+      hydrate_seed_root="$(dirname "$(dirname "$hydrate_target")")"
+      hydrate_seed_roots["$hydrate_seed_root"]=1
+    done
+    if [ "${#hydrate_seed_roots[@]}" -gt 1 ]; then
+      die "$member has hydrate.sh targets with distinct identity-seed roots: ${!hydrate_seed_roots[*]}; refusing to choose one consumer"
+    fi
+  fi
+done
+
+for expects in "$REPO_ROOT"/plugins/*/expects.json; do
+  [ -e "$expects" ] || continue
+  member="$(basename "$(dirname "$expects")")"
+
+  [ "${preflight_members[$member]:-0}" = 1 ] || continue
+  reg_out="${resolved_registrations[$member]}"
   declare -A registered=()
   while IFS=$'\t' read -r reg_base reg_path; do
     [ -n "$reg_base" ] || continue
@@ -464,17 +486,6 @@ p=((json.load(open(sys.argv[1])).get("install") or {}).get("dest") or "")
 print(os.path.expanduser(p) if p else "")' "$expects")"
 
   log "MEMBER $member"
-  if [ -f "$REPO_ROOT/plugins/$member/instance/identity.seed.json" ] && [ -n "${registered[hydrate.sh]:-}" ]; then
-    declare -A hydrate_seed_roots=()
-    mapfile -t hydrate_targets < <(printf '%s' "${registered[hydrate.sh]}")
-    for hydrate_target in "${hydrate_targets[@]}"; do
-      hydrate_seed_root="$(dirname "$(dirname "$hydrate_target")")"
-      hydrate_seed_roots["$hydrate_seed_root"]=1
-    done
-    if [ "${#hydrate_seed_roots[@]}" -gt 1 ]; then
-      die "$member has hydrate.sh targets with distinct identity-seed roots: ${!hydrate_seed_roots[*]}; refusing to choose one consumer"
-    fi
-  fi
   member_files_json=""
   seed_anchor=""
   for rel in "${files[@]}"; do

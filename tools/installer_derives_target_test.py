@@ -476,6 +476,79 @@ printf '%s\\n' "$0" >> "$HOME/hydrated"
                   "both registered hydrate consumers did not execute successfully")
 
 
+def test_later_member_failure_happens_before_any_member_write():
+    for state in ("unparseable", "unclassified", "ambiguous-hydrate"):
+        with tempfile.TemporaryDirectory() as tmp:
+            broken_file = "hydrate.sh" if state == "ambiguous-hydrate" else "hook.py"
+            root, home, env = build(
+                tmp,
+                expects={
+                    "dest": "~/.b/hooks",
+                    "registration": {"reader": "json-hook-commands",
+                                     "path": [".b", "settings.json"]},
+                    "files": [f"hooks/{broken_file}"],
+                },
+                files=(broken_file,),
+            )
+            os.rename(os.path.join(root, "plugins", "m"), os.path.join(root, "plugins", "b"))
+
+            healthy = os.path.join(home, ".a", "hooks", "hook.py")
+            os.makedirs(os.path.dirname(healthy))
+            with open(healthy, "w") as fh:
+                fh.write("operator bytes\n")
+            os.makedirs(os.path.join(root, "plugins", "a", "hooks"))
+            with open(os.path.join(root, "plugins", "a", "hooks", "hook.py"), "w") as fh:
+                fh.write("# fake hook\n")
+            with open(os.path.join(root, "plugins", "a", "expects.json"), "w") as fh:
+                json.dump({"install": {
+                    "dest": "~/.a/hooks",
+                    "registration": {"reader": "json-hook-commands",
+                                     "path": [".a", "settings.json"]},
+                    "files": ["hooks/hook.py"],
+                }}, fh)
+            os.makedirs(os.path.join(home, ".a"), exist_ok=True)
+            with open(os.path.join(home, ".a", "settings.json"), "w") as fh:
+                fh.write(json.dumps({"hooks": {"PreToolUse": [{"hooks": [
+                    {"type": "command", "command": f"{sys.executable} {healthy}"},
+                ]}]}}))
+
+            os.makedirs(os.path.join(home, ".b"), exist_ok=True)
+            broken_config = os.path.join(home, ".b", "settings.json")
+            if state == "unparseable":
+                with open(broken_config, "w") as fh:
+                    fh.write("{")
+            elif state == "unclassified":
+                with open(broken_config, "w") as fh:
+                    fh.write(json.dumps({"hooks": {"PreToolUse": [{"hooks": [
+                        {"type": "command", "command": f"{sys.executable} {home}/.b/hooks/hook.py"},
+                        {"type": "command", "command": "unknown-wrapper --workspace /abs/directory"},
+                    ]}]}}))
+            else:
+                first = os.path.join(home, ".first", "hooks", "hydrate.sh")
+                second = os.path.join(home, ".second", "hooks", "hydrate.sh")
+                with open(broken_config, "w") as fh:
+                    fh.write(json.dumps({"hooks": {"SessionEnd": [{"hooks": [
+                        {"type": "command", "command": f"bash {first}"},
+                        {"type": "command", "command": f"bash {second}"},
+                    ]}]}}))
+                os.makedirs(os.path.join(root, "plugins", "b", "instance"))
+                with open(os.path.join(root, "plugins", "b", "instance", "identity.seed.json"), "w") as fh:
+                    fh.write('{"entity":"b"}\n')
+
+            os.makedirs(os.path.join(home, ".hestia", "shared.builds", "old"))
+            os.symlink("shared.builds/old", os.path.join(home, ".hestia", "shared"))
+            rc, out = run(root, normal(env))
+            check(rc != 0, f"{state}: later broken member exited 0: {out}")
+            with open(healthy) as fh:
+                check(fh.read() == "operator bytes\n", f"{state}: healthy member was written first")
+            check(not os.path.exists(healthy + ".pre-install.bak"),
+                  f"{state}: healthy member was backed up before the failure")
+            check(os.readlink(os.path.join(home, ".hestia", "shared")) == "shared.builds/old",
+                  f"{state}: shared engine moved before the failure")
+            check(not os.path.exists(os.path.join(home, ".hestia", "current-build.json")),
+                  f"{state}: partial install was recorded as authoritative")
+
+
 def test_missing_resolver_is_fatal_not_an_empty_registration():
     with tempfile.TemporaryDirectory() as tmp:
         root, _home, env = build(tmp, expects={
@@ -569,6 +642,7 @@ TESTS = [
     test_unparseable_and_unreadable_registrations_are_fatal_without_writes,
     test_duplicate_hydrate_targets_with_distinct_seed_roots_are_fatal,
     test_duplicate_hydrate_targets_with_shared_seed_root_serve_both_consumers,
+    test_later_member_failure_happens_before_any_member_write,
     test_missing_resolver_is_fatal_not_an_empty_registration,
     test_resolver_crash_is_fatal_not_an_empty_registration,
     test_not_declared_is_a_skip_not_a_resolver_failure,
