@@ -1900,7 +1900,7 @@ mod vault_add_tests {
     use hestia::vault::rules::{PresentationAudience, ReleaseRule};
 
     #[test]
-    fn no_explicit_consumer_or_presenter_stays_closed_and_unrecorded() {
+    fn no_explicit_consumer_or_presenter_preserves_legacy_runtime_and_records_consumer_only() {
         let (release, presentation) = vault_rules_for_add(false, &[], &[], None, None, None).unwrap();
         assert_eq!(release, ReleaseRule::ConsumerOnly);
         assert!(presentation.is_none(), "an unstated presenter escalates rather than publishing");
@@ -1908,11 +1908,12 @@ mod vault_add_tests {
             .with_release_rule(release)
             .with_consumers(Vec::new());
         assert!(!entry.allows("claude-code"));
-        assert!(!entry.allows("kimi-code"), "the new default cannot become more permissive");
+        assert!(!entry.allows("kimi-code"),
+                "the legacy empty consumer list, not the release rule, decides at this increment");
     }
 
     #[test]
-    fn explicit_consumers_keep_their_exact_legacy_release_outcome() {
+    fn explicit_consumers_keep_their_exact_legacy_list_outcome() {
         let consumers = vec!["claude-code".to_string()];
         let (release, presentation) = vault_rules_for_add(false, &consumers, &[], None, None, None).unwrap();
         assert_eq!(release, ReleaseRule::Holders { principals: consumers.clone() });

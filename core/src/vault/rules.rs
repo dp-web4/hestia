@@ -167,26 +167,38 @@ mod tests {
     #[test]
     fn presence_profile_tiers_form_the_curried_projection() {
         let tiers = [
-            ("public", "everyone"),
-            ("members", "hub-members"),
-            ("operators", "operators"),
-            ("owner", "owner"),
+            ("public", vec!["everyone", "hub-members", "operators", "owner"]),
+            ("members", vec!["hub-members", "operators", "owner"]),
+            ("operators", vec!["operators", "owner"]),
+            ("owner", vec!["owner"]),
         ];
         let rows: Vec<crate::vault::VaultEntry> = tiers
             .into_iter()
-            .map(|(tier, holder)| {
+            .map(|(tier, holders)| {
                 crate::vault::VaultEntry::new(format!("presence/profile/{tier}"), "view")
-                    .with_release_rule(ReleaseRule::Holders { principals: vec![holder.into()] })
+                    .with_release_rule(ReleaseRule::Holders {
+                        principals: holders.into_iter().map(Into::into).collect(),
+                    })
             })
             .collect();
-        assert_eq!(rows.len(), 4, "the collection, not a row-level bool, is the projection");
-        for (row, (_, holder)) in rows.iter().zip(tiers) {
-            assert_eq!(
-                row.release,
-                Some(ReleaseRule::Holders { principals: vec![holder.into()] }),
-                "each tier has its own explicit release rule"
-            );
-        }
+        let released_to = |recipient: &str| -> Vec<&str> {
+            rows.iter()
+                .filter(|row| match &row.release {
+                    Some(ReleaseRule::Holders { principals }) => {
+                        principals.iter().any(|principal| principal == recipient)
+                    }
+                    _ => false,
+                })
+                .map(|row| row.name.as_str())
+                .collect()
+        };
+        assert_eq!(released_to("everyone"), ["presence/profile/public"]);
+        assert_eq!(released_to("hub-members"),
+                   ["presence/profile/public", "presence/profile/members"]);
+        assert_eq!(released_to("owner"),
+                   ["presence/profile/public", "presence/profile/members",
+                    "presence/profile/operators", "presence/profile/owner"]);
+        assert!(released_to("stranger").is_empty());
     }
 
     /// The rules round-trip through serde with a stable, self-describing shape (a `kind` tag),
