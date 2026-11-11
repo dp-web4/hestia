@@ -794,7 +794,7 @@ def _chdirs(seg: list) -> list:
     return out
 
 
-def link_reach(event: "NormalizedEvent", within: Optional[tuple] = None) -> tuple:
+def link_reach(event: "NormalizedEvent", within: Optional[tuple] = None, hardlinks=None) -> tuple:
     """(targets, too_wide). `targets`: the resolved targets of the links an act names OR reaches, where they differ
     from the path as written (hestia #1331). #1433 judged only the links an act NAMES; measured on its applied core
     2026-10-28, every unnamed shape still reached a secret-named target. So:
@@ -809,7 +809,9 @@ def link_reach(event: "NormalizedEvent", within: Optional[tuple] = None) -> tupl
     apply to every word, so it can only ADD refusals, and only where a link really points at a secret-named target.
     Not the Grep/Glob tools: whether they read through links is the host's, unmeasured. Never raises.
     `within` (granted roots, absolute): when given, only reach rooted inside the grants is expanded or walked; the
-    overflow check passes it, so a pattern outside the grants is left to the scope pass and its escalation."""
+    overflow check passes it, so a pattern outside the grants is left to the scope pass and its escalation.
+    `hardlinks`: when a list is supplied, every regular file reached with st_nlink > 1 is appended. A hardlink has
+    no distinct realpath target, so the caller cannot prove its other name is not protected."""
     cwd = getattr(event, "cwd", None)
     # getattr, as egress_blobs does: an event shape without command/paths (the single gate's GateEvent) must
     # contribute nothing, never raise into gate.internal_error.
@@ -851,6 +853,8 @@ def link_reach(event: "NormalizedEvent", within: Optional[tuple] = None) -> tupl
             if p in seen or not os.path.lexists(p):
                 return
             seen.add(p)
+            if hardlinks is not None and os.path.isfile(p) and os.stat(p).st_nlink > 1:
+                hardlinks.append(p)
             real = os.path.realpath(p)
             if real != os.path.normpath(p):
                 out.append(real)
@@ -925,8 +929,17 @@ def link_reach_too_wide(event: "NormalizedEvent", within: Optional[tuple] = None
     degraded_verdict's read allows (with none: no scope layer there to defer to). Outside the grant the scope pass
     refuses or escalates first, and an
     out-of-scope glob must keep its escalation (one_gate_decide_contract phantom-glob-still-escalates). `within`
-    is the granted roots: a pattern or walk rooted outside them is not counted (None = an unscoped policy)."""
-    too_wide = link_reach(event, within)[1]
+    is the granted roots: a pattern or walk rooted outside them is not counted (None = an unscoped policy).
+    The same judgment also refuses every regular file with st_nlink > 1 under egress.secret (#1331 class 4).
+    That deliberate cost includes ordinary hardlinks, pnpm stores and cp -al trees: no name can prove which
+    other path shares the inode, and an innate leaked read cannot be undone."""
+    hardlinks = []
+    too_wide = link_reach(event, within, hardlinks=hardlinks)[1]
+    if hardlinks:
+        return _deny("egress.secret",
+                     f"'{event.tool}' reaches the regular file {hardlinks[0]!r} with st_nlink > 1; "
+                     "a hardlink has no distinct realpath target, so the gate cannot prove its other "
+                     "name is not protected")
     if not too_wide:
         return None
     return _deny("mrh.command.unenumerated",
