@@ -21,6 +21,13 @@
 //! every legacy credential, kimi) — are the following increments. Both new `VaultEntry` fields
 //! are `Option`, `#[serde(default)]`, so every existing vault loads unchanged and behaves
 //! exactly as today until enforcement lands.
+//!
+//! **Representation decision (schema v2): N rows / per-tier objects.** A row releases all or
+//! nothing; the COLLECTION of rows is the curried projection `R(recipient) -> released view`.
+//! This is not a boolean simplification of the projection — it is its representation. N-way
+//! issuance, revocation and custody belong to the collection contract, never to an implied
+//! per-row view function. Existing rows keep their exact legacy behavior; this decision adds
+//! no backfill semantics and no flag day.
 
 use serde::{Deserialize, Serialize};
 
@@ -107,11 +114,11 @@ impl PresentationRule {
     }
 
     /// Can this rule be presented without escalating? Only when the audience is fixed at
-    /// issuance — the whole point of the discriminating field. A presentation-time audience
-    /// (`AnyOf`) is presentable, but choosing the verifier is where the presentation-path
-    /// enforcement (next increment) does its work.
+    /// issuance and no use bound needs durable nullifier state. A presentation-time audience
+    /// (`AnyOf`) needs the presentation-path enforcement, and a capped fixed audience needs the
+    /// nullifier increment before it can be called self-sufficient.
     pub fn is_self_sufficient(&self) -> bool {
-        matches!(self.audience, PresentationAudience::Fixed { .. })
+        matches!(self.audience, PresentationAudience::Fixed { .. }) && self.max_uses.is_none()
     }
 }
 
@@ -145,6 +152,53 @@ mod tests {
             max_uses: Some(1),
         };
         assert!(!anyof.is_self_sufficient());
+    }
+
+    #[test]
+    fn a_fixed_single_use_rule_is_not_self_sufficient_before_nullifiers() {
+        let fixed = PresentationRule {
+            audience: PresentationAudience::Fixed { verifier: "github.com".into() },
+            disclose: Disclosure::Derived,
+            max_uses: Some(1),
+        };
+        assert!(!fixed.is_self_sufficient());
+    }
+
+    #[test]
+    fn presence_profile_tiers_form_the_curried_projection() {
+        let tiers = [
+            ("public", vec!["everyone", "hub-members", "operators", "owner"]),
+            ("members", vec!["hub-members", "operators", "owner"]),
+            ("operators", vec!["operators", "owner"]),
+            ("owner", vec!["owner"]),
+        ];
+        let rows: Vec<crate::vault::VaultEntry> = tiers
+            .into_iter()
+            .map(|(tier, holders)| {
+                crate::vault::VaultEntry::new(format!("presence/profile/{tier}"), "view")
+                    .with_release_rule(ReleaseRule::Holders {
+                        principals: holders.into_iter().map(Into::into).collect(),
+                    })
+            })
+            .collect();
+        let released_to = |recipient: &str| -> Vec<&str> {
+            rows.iter()
+                .filter(|row| match &row.release {
+                    Some(ReleaseRule::Holders { principals }) => {
+                        principals.iter().any(|principal| principal == recipient)
+                    }
+                    _ => false,
+                })
+                .map(|row| row.name.as_str())
+                .collect()
+        };
+        assert_eq!(released_to("everyone"), ["presence/profile/public"]);
+        assert_eq!(released_to("hub-members"),
+                   ["presence/profile/public", "presence/profile/members"]);
+        assert_eq!(released_to("owner"),
+                   ["presence/profile/public", "presence/profile/members",
+                    "presence/profile/operators", "presence/profile/owner"]);
+        assert!(released_to("stranger").is_empty());
     }
 
     /// The rules round-trip through serde with a stable, self-describing shape (a `kind` tag),
