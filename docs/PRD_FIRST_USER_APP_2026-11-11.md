@@ -22,6 +22,21 @@ A person must be able to use an ordinary Hub website without Hestia. Installing 
 
 These are baseline claims from maintained project docs, not assertions of new test results.
 
+## 2a. The adoption gap, which sets priority for this PRD (dp, 2026-11-11)
+
+Every audience gives the same answer: **"show me what I can use and I'll tell you if it's useful."** This is true of COWONDER, of the AI Collective Portland chapter, and of investors. Nobody wants to co-develop, or to spend time and energy building a solution out of the tools.
+
+What a user can do with Hestia today:
+- **Gate their agents**, but only for CLI harnesses (Claude Code, Codex, Kimi and similar), and setup is not intuitive.
+- With Hub, **connect those agents across Hestia-equipped machines.**
+
+That is geek/hobbyist use: not mature enough for a corporation, and not easy enough for a consumer. **The human layer is planned, its primitives are mostly ready, and none of it is built.** That layer is social channels, member discovery, committees and workgroups, and events. That is the gap.
+
+Consequences for this PRD:
+1. **The test is a person who will not build anything.** Journey D below is a volunteer officer of a real community. If the app needs them to configure, script or co-design, it fails.
+2. **The agent-gating job has to reach people who don't use CLI harnesses.** For most of the people above, "my agent" is a chat assistant, not a terminal harness. A Hestia whose only agent story is CLI hooks has no agent story for them. Name which non-CLI agent a first user can connect, or say plainly that the first-user app is about community participation and the agent gate stays advanced.
+3. **Priority goes to journeys a real group can judge.** Install polish and protocol views that serve no journey in §5 wait.
+
 ## 3. Personas and jobs
 
 | Person | Job | Successful visible result |
@@ -30,6 +45,7 @@ These are baseline claims from maintained project docs, not assertions of new te
 | Community member | Join and participate in a Hub | Membership, role, requests and receipts |
 | Agent owner | Connect a local AI agent and bound its authority | Plain-language permission settings and decisions |
 | Community participant | Verify a contribution or introduction | Context, actors, consent, evidence and recourse |
+| Community officer | Own a committee's or an event's work without dropping it | Sees what they own and back up; nudged in their usual channel; clean handoff |
 | Operator/advanced user | Inspect proofs, law, diagnostics and assurance | Drill-down with exact witness evidence |
 
 ## 4. Non-negotiable product requirements
@@ -77,15 +93,28 @@ Create a standalone synthetic society with two or more synthetic member profiles
 
 **Pass:** No live platform or member data is required, and the demo is resettable and inspectable. Matching logic may be an external toy module; it is not claimed to be a Web4 feature.
 
+### Journey D - Community officer (AI Collective Portland chapter)
+This journey is the companion to the Hub PRD's §5b (a real community runs itself). The chapter has six interest committees with leads, an all-group meeting every two weeks, and Slack and email as its working channels. On 2026-10-27 its pain was missed inbound mail, single-owner events with no backup, and nothing happening when nobody acts.
+
+1. A committee lead opens the chapter's Hub site in a browser and sees what they own and what they back up: inbound items and events. **No Hestia is needed for this.**
+2. They choose Hestia for durable presence. **Me** shows their roles (lead of a committee, backup on an event). **Activity** shows nudges and handoffs. **Communities** shows the chapter.
+3. An inbound item assigned to them is untouched past its stated time. The backup is nudged in the channel they already use, and the app shows the handoff with who, when and why.
+4. *(Only if a supported agent is connected.)* Their assistant drafts a reply to an inbound sponsor email under the lead's scoped authority. The lead approves before anything is sent, and the record shows the draft, the approval and the send.
+
+**Pass:** a real officer completes steps 1-3 during a live event cycle without terminal commands and without dp or a fleet member operating anything for them. Step 4 passes only with a non-CLI agent a real officer already uses, or is explicitly deferred. **Fail:** the officer has to install Hestia to see what they own, or has to leave Slack or email to get nudged.
+
 ## 6. Delivery slices
 
 | Phase | Scope | Exit evidence |
 |---|---|---|
 | P0 - Evidence inventory | Map each journey to existing daemon/app API, UI source, tests and outstanding gaps | Maintained capability matrix with explicit shipped / source-only / missing state |
+| P0b - Officer journey (Journey D) | Roles, ownership, nudges and handoffs in Me/Activity against the Hub §5b slice; browser-first | One real chapter event cycle; the officer's verdict recorded verbatim |
 | P1 - First-run spine | Installer, compatibility check, safe identity creation, Me/Communities/Activity path | Fresh-device recording and CI-tested app/daemon pair |
 | P2 - Real governance | Agent connect, scoped authorization, escalation, outcomes, evidence views | Automated and human-verified governed-action journey |
 | P3 - Hub membership | Inspect/join/leave, disclosure review and membership receipts | End-to-end browser-to-app-to-Hub tests against live runtimes |
 | P4 - Pilot and polish | Synthetic relationship demo, accessibility, recovery and errors | Independent nondeveloper participant completes all journeys |
+
+**Order:** P0 then P0b come first, because P0b is what an outside group can use and judge. P1-P4 follow in the order real use exposes.
 
 ### Measures, not promises
 Track unaided first-run completion, time to first useful action, number of unexplained prompts, decision correctness, data-disclosure surprises, and verifiable receipts per consequential action. Establish baselines before setting target thresholds.
