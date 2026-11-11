@@ -357,6 +357,11 @@ if __name__ == "__main__":
     test_registered_but_this_file_is_not()
     test_unknown_reader_is_fatal_not_empty()
     test_governed_session_is_refused_but_dry_run_is_not()
+    test_duplicate_basenames_keep_every_registered_target()
+    test_unclassified_registration_blocks_a_partial_install()
+    test_missing_resolver_is_fatal_not_an_empty_registration()
+    test_resolver_crash_is_fatal_not_an_empty_registration()
+    test_not_declared_is_a_skip_not_a_resolver_failure()
     test_every_shipped_member_declares_a_reader_the_core_implements()
     for f in FAILS:
         print("FAIL", f)

@@ -111,6 +111,29 @@ class RegistrationResolverTests(unittest.TestCase):
         self.assertEqual(r["targets"][0]["path"], str(hook))
         self.assertEqual(r["targets"][0]["event"], "SessionEnd")
 
+    def test_toml_multiline_args_does_not_consume_the_next_hook(self):
+        first = self.touch("hooks/first.js")
+        second = self.touch("hooks/second.js")
+        rel = [".codex", "config.toml"]
+        e = self.expects(member="codex", reader="toml-hook-commands", path=rel)
+        p = self.home.joinpath(*rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            '[[hooks.SessionEnd]]\ncommand = "node"\n'
+            f'args = [\n  "{first}",\n]\n'
+            '[[hooks.PostToolUse]]\ncommand = "node"\n'
+            f'args = ["{second}"]\n',
+            encoding="utf-8",
+        )
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertTrue(r["complete"])
+        self.assertEqual(r["commands_seen"], 2)
+        self.assertEqual(
+            [(target["event"], target["path"]) for target in r["targets"]],
+            [("SessionEnd", str(first)), ("PostToolUse", str(second))],
+        )
+
     def test_bare_interpreter_without_args_remains_unclassified(self):
         rel = [".codex", "config.toml"]
         e = self.expects(member="codex", reader="toml-hook-commands", path=rel)

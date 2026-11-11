@@ -118,7 +118,7 @@ def _toml_args(lines: list[str], index: int) -> tuple[list[str], int]:
                 raise ValueError("unparseable command args") from exc
             if not isinstance(parsed, list) or not all(isinstance(arg, str) for arg in parsed):
                 raise ValueError("command args must be a list of strings")
-            return parsed, index + len(fragments)
+            return parsed, index + 1
         index += 1
         if index >= len(lines):
             raise ValueError("unterminated command args")
