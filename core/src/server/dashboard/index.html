@@ -6983,6 +6983,13 @@
       const r = await hubFetch('/api/hub/status', { cache: 'no-store' });
       const d = await r.json();
       const st = $('hub-state');
+      if (!r.ok) {
+        st.className = 'hub-state err';
+        st.textContent = d.error || ('HTTP ' + r.status);
+        $('hub-meta').textContent = '';
+        $('hub-join').hidden = true;
+        return d;
+      }
       // Membership is the HUB's answer (pinned-pubkey resolve against our LCT),
       // not a local claim — so it gets its own words per state, and an unknown
       // stays unknown rather than defaulting to either yes or no.
@@ -7271,10 +7278,13 @@
       }
       if (!(d.entries || []).length) {
         const o = document.createElement('option');
-        o.value = ''; o.textContent = '(list empty — using ' + d.source + ')';
+        o.value = '';
+        o.textContent = d.source === 'unconfigured' ? '(no hubs configured)' : '(list empty — using ' + d.source + ')';
         sel.appendChild(o);
       }
-      $('hub-urls-summary').textContent = 'hub: ' + d.resolved + '  (' + d.source + ')'
+      $('hub-urls-summary').textContent = (d.resolved
+        ? 'hub: ' + d.resolved + '  (' + d.source + ')'
+        : 'hub: ' + d.source)
         + (d.env_override_active ? ' — env override wins; list edits will not retarget' : '');
     } catch (e) { $('hub-urls-summary').textContent = 'hubs: unavailable (' + e.message + ')'; }
   }
