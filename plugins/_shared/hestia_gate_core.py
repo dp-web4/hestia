@@ -1125,6 +1125,8 @@ def _egress_heredoc_data_removed(cmd: str) -> str:
       bash), no carriage return anywhere, and no backslash ending the heredoc line (bash continues it:
       `<<'EOF' \\` + `; cat key` is a command);
     - its consumer is a pure data writer (`_egress_pure_writer`);
+    - the physical heredoc line leaves no quote open: an open quote continues bash's command
+      line, so the next physical line is command text, not necessarily heredoc data;
     - it opens on line 1, so no earlier function, alias, hash or exec can change the consumer;
     - every later line is empty or inert (`_EGRESS_INERT_LATER`): writing `s.sh` and running it in the
       same act is not the Write-then-Bash split the premise rests on.
@@ -1138,6 +1140,8 @@ def _egress_heredoc_data_removed(cmd: str) -> str:
         return cmd
     k, m = found[0]
     line = lines[k]
+    if _quoted_at(line, len(line)):
+        return cmd
     dash, word = m.group(1), m.group(4)
     if not (m.group(2) or m.group(3)):
         return cmd                                   # unquoted: the shell expands the body
