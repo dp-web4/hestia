@@ -34,11 +34,16 @@ passes every assertion for the wrong reason).
 """
 from __future__ import annotations
 
+import http.server
 import importlib.util
 import os
 import pathlib
+import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 CORE_PATH = os.getenv("HESTIA_SCOPE_BATTERY_CORE") or str(REPO / "plugins" / "_shared" / "hestia_gate_core.py")
@@ -794,6 +799,81 @@ def run(fx: Fixture) -> dict:
         ):
             r = fx.reach(cmd, scopes=ws_tree, cwd=out_cwd)
             check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
+        # #1329: a network operand after a directory change is not a local path, but only
+        # when the client's complete, understood output grammar names every file it can write.
+        cwd_exact = ws_tree + (f"path:{out_cwd}",)
+        for name, cmd in (
+            ("1329-url-hostport-after-cd", f"cd {out_cwd} && curl -s -m 3 localhost:8760/health"),
+            ("1329-url-scheme-after-cd", f"cd {out_cwd} && curl -s -m 3 http://127.0.0.1:8760/health"),
+            ("1329-url-after-git-C", f"git -C {out_cwd} status && curl -s https://api.github.com/x"),
+            ("1329-url-curl-stdout-after-cd", f"cd {out_cwd} && curl -sS http://h/x"),
+            ("1329-url-curl-exact-long-flags-after-cd", f"cd {out_cwd} && curl --silent --show-error --location http://h/x"),
+            ("1329-url-curl-exact-long-value-after-cd", f"cd {out_cwd} && curl --silent --header=A:b --output {ws}/granted/out.txt http://h/x"),
+            ("1329-url-curl-output-to-granted-after-cd", f"cd {out_cwd} && curl -sS -o {ws}/granted/out.txt http://h/x"),
+            ("1329-url-curl-disable-config", f"cd {out_cwd} && curl -q -sS http://h/x"),
+            ("1329-url-httpie-exact-long", f"cd {out_cwd} && http --body --follow http://h/x"),
+            ("1329-url-httpie-stdout", f"cd {out_cwd} && http -b http://h/x"),
+            ("1329-url-httpie-output", f"cd {out_cwd} && http -o {ws}/granted/out.txt http://h/x"),
+            ("1329-url-xh-stdout", f"cd {out_cwd} && xh -b http://h/x"),
+        ):
+            r = fx.reach(cmd, scopes=cwd_exact, cwd=out_cwd)
+            check(f"allow-outside-cwd:{name}", r[0] is True, f"{cmd!r} -> {r}")
+        tmpl_scopes = cwd_exact + (f"path:{out_cwd}/out#1",)
+        for name, cmd in (
+            ("1329-control-non-client-url-path", f"cd {out_cwd} && mkdir -p http://newdir"),
+            ("1329-control-curl-remote-name", f"cd {out_cwd} && curl -sSO http://h/fresh.txt"),
+            ("1329-control-curl-remote-name-after-url", f"cd {out_cwd} && curl -sS http://h/fresh.txt -O"),
+            ("1329-control-curl-remote-name-abbrev", f"cd {out_cwd} && curl --remote-name-a -sS http://h/fresh.txt"),
+            ("1329-control-curl-remote-name-uppercase", f"cd {out_cwd} && curl --REMOTE-NAME http://h/fresh.txt"),
+            ("1329-control-curl-config-abbrev", f"cd {out_cwd} && curl --conf=cfg http://h/fresh.txt"),
+            ("1329-control-curl-unknown-long", f"cd {out_cwd} && curl --some-future-option http://h/fresh.txt"),
+            ("1329-control-curl-write-out-output", f"cd {out_cwd} && curl -q -sS --write-out '%output{{fresh.txt}}marker' http://h/fresh.txt"),
+            ("1329-control-curl-w-output", f"cd {out_cwd} && curl -q -sS -w '%output{{fresh.txt}}marker' http://h/fresh.txt"),
+            ("1329-control-curl-w-attached-output", f"cd {out_cwd} && curl -q -sS -w%output{{fresh.txt}}marker http://h/fresh.txt"),
+            ("1329-control-curl-output-template-glob", f"cd {out_cwd} && curl -q -sS -o 'out#1' 'http://h/[1-2]'"),
+            ("1329-control-curl-output-long-template-glob", f"cd {out_cwd} && curl -q -sS --output 'out#1' 'http://h/[1-2]'"),
+            ("1329-control-curl-proxy-value", f"cd {out_cwd} && curl -x http://proxy:8080 http://h/x"),
+            ("1329-control-curl-output-scheme-word", f"cd {out_cwd} && curl --create-dirs -o http://newdir/f http://h/x"),
+            ("1329-control-httpie-download", f"cd {out_cwd} && http --download http://h/fresh.txt"),
+            ("1329-control-httpie-download-abbrev", f"cd {out_cwd} && http --down http://h/fresh.txt"),
+            ("1329-control-httpie-download-short", f"cd {out_cwd} && http -bd http://h/fresh.txt"),
+            ("1329-control-wget-default", f"cd {out_cwd} && wget -q http://h/fresh.txt"),
+            ("1329-control-curl-next", f"cd {out_cwd} && curl -sS http://h/x --next -O http://h/fresh.txt"),
+            ("1329-control-sudo-curl", f"cd {out_cwd} && sudo curl -sS http://h/fresh.txt"),
+            ("1329-control-sudo-login-curl", f"cd {out_cwd} && sudo -i curl -sS http://h/fresh.txt"),
+            ("1329-control-doas-curl", f"cd {out_cwd} && doas curl -sS http://h/fresh.txt"),
+            ("1329-control-su-shell-curl", f"cd {out_cwd} && su other -c 'curl -sS http://h/fresh.txt'"),
+            ("1329-control-runuser-shell-curl", f"cd {out_cwd} && runuser -c 'curl -sS http://h/fresh.txt'"),
+            ("1329-control-sudo-shell-curl", f"cd {out_cwd} && sudo sh -c 'curl -sS http://h/fresh.txt'"),
+        ):
+            r = fx.reach(cmd, scopes=tmpl_scopes, cwd=out_cwd)
+            check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
+        curlrc = pathlib.Path(fx.base) / ".curlrc"
+        curlrc.write_text("remote-name\n")
+        try:
+            for name, cmd in (
+                ("1329-control-default-config", f"cd {out_cwd} && curl -sS http://h/fresh.txt"),
+                ("1329-control-disable-config-not-first", f"cd {out_cwd} && curl -sS -q http://h/fresh.txt"),
+            ):
+                r = fx.reach(cmd, scopes=cwd_exact, cwd=out_cwd)
+                check(f"deny-outside-cwd:{name}", r[0] is False, f"{cmd!r} -> {r}")
+            r = fx.reach(f"cd {out_cwd} && curl -q -sS http://h/fresh.txt",
+                         scopes=cwd_exact, cwd=out_cwd)
+            check("allow-outside-cwd:1329-disable-config-overrides-default", r[0] is True, r)
+        finally:
+            curlrc.unlink()
+        for config_dir in (".config/httpie", ".httpie"):
+            config = pathlib.Path(fx.base, config_dir, "config.json")
+            os.makedirs(config.parent, exist_ok=True)
+            config.write_text('{"default_options":["--download"]}\n')
+            try:
+                for head in ("http", "xh"):
+                    r = fx.reach(f"cd {out_cwd} && {head} -b http://h/fresh.txt",
+                                 scopes=cwd_exact, cwd=out_cwd)
+                    check(f"deny-outside-cwd:1329-default-config:{head}:{config_dir}",
+                          r[0] is False, r)
+            finally:
+                config.unlink()
         # Codex HOLD 23938 (P1 a): a `done` that ends a FILENAME after an already-closed loop is
         # not the loop's end. Stripping it judged `<o>/granted-` (granted) for `<o>/granted-done`.
         gd = pathlib.Path(o) / "granted-done"
@@ -993,6 +1073,102 @@ def run(fx: Fixture) -> dict:
     return {"deny": deny, "allow": allow, "request": request}
 
 
+def run_real_curl(fx: Fixture) -> None:
+    curl = shutil.which("curl")
+    check("real-curl-installed", bool(curl))
+    if not curl:
+        return
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = self.path.rsplit("/", 1)[-1].encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(dir=fx.base) as real:
+            cwd = f"{real}/cwd"
+            granted = f"{real}/granted"
+            home = f"{real}/home"
+            for directory in (cwd, granted, home):
+                os.makedirs(directory)
+            env = {k: v for k, v in os.environ.items()
+                   if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+            env.update(HOME=home, NO_PROXY="127.0.0.1,localhost")
+            env.pop("CURL_HOME", None)
+            env.pop("XDG_CONFIG_HOME", None)
+            url = f"http://127.0.0.1:{server.server_port}"
+            scopes = (f"path:{fx.ws}/**", f"path:{granted}/**", f"path:{cwd}",
+                      f"path:{cwd}/out#1")
+
+            def probe(name, args, allowed, written=(), absent=()):
+                for filename in ("fresh.txt", "written.txt", "out1", "out2", "out#1"):
+                    try:
+                        os.unlink(f"{cwd}/{filename}")
+                    except FileNotFoundError:
+                        pass
+                cmd = f"cd {shlex.quote(cwd)} && curl {shlex.join(args)}"
+                previous_home = os.environ.get("HOME")
+                os.environ["HOME"] = home
+                try:
+                    verdict = fx.reach(cmd, scopes=scopes, cwd=cwd)
+                finally:
+                    if previous_home is None:
+                        os.environ.pop("HOME", None)
+                    else:
+                        os.environ["HOME"] = previous_home
+                check(f"real-gate:{name}", verdict[0] is allowed,
+                      f"{cmd!r} -> {verdict}")
+                result = subprocess.run([curl, *args], cwd=cwd, env=env,
+                                        capture_output=True, text=True, timeout=15)
+                check(f"real-exit:{name}", result.returncode == 0,
+                      f"rc={result.returncode}: {result.stderr}")
+                for filename in written:
+                    check(f"real-write:{name}:{filename}",
+                          pathlib.Path(cwd, filename).is_file())
+                for filename in absent:
+                    check(f"real-no-write:{name}:{filename}",
+                          not pathlib.Path(cwd, filename).exists())
+                return result
+
+            result = probe("stdout", ["-sS", f"{url}/fresh.txt"], True,
+                           absent=("fresh.txt",))
+            check("real-stdout-content", result.stdout == "fresh.txt", result.stdout)
+            probe("named-output", ["-sS", "-o", f"{granted}/out.txt", f"{url}/fresh.txt"], True)
+            check("real-named-output-content", pathlib.Path(granted, "out.txt").read_text() == "fresh.txt")
+            probe("remote-name", ["-q", "-sSO", f"{url}/fresh.txt"], False,
+                  written=("fresh.txt",))
+            probe("remote-name-abbreviation", ["-q", "--remote-name-a", "-sS", f"{url}/fresh.txt"],
+                  False, written=("fresh.txt",))
+            probe("remote-name-uppercase", ["-q", "--REMOTE-NAME", f"{url}/fresh.txt"], False,
+                  written=("fresh.txt",))
+            probe("write-out-file", ["-q", "-sS", "-w", "%output{written.txt}marker",
+                                     f"{url}/fresh.txt"], False, written=("written.txt",))
+            probe("output-template-glob", ["-q", "-sS", "-o", "out#1", f"{url}/[1-2]"], False,
+                  written=("out1", "out2"), absent=("out#1",))
+
+            pathlib.Path(home, ".curlrc").write_text("remote-name\n")
+            probe("default-config", ["-sS", f"{url}/fresh.txt"], False,
+                  written=("fresh.txt",))
+            result = probe("disable-config-first", ["-q", "-sS", f"{url}/fresh.txt"], True,
+                           absent=("fresh.txt",))
+            check("real-disable-config-stdout", result.stdout == "fresh.txt", result.stdout)
+            probe("disable-config-not-first", ["-sS", "-q", f"{url}/fresh.txt"], False,
+                  written=("fresh.txt",))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def against_main(fx: Fixture) -> int:
     """How many DENY rows the given core lets through — on main, the size of the gap."""
     rows = run(fx)
@@ -1028,6 +1204,8 @@ def main() -> int:
     if "--classify" in sys.argv:
         return classify(fx)
     run(fx)
+    if "--real" in sys.argv:
+        run_real_curl(fx)
     print(f"shell-scope battery: {PASSES} passed, {len(FAILS)} failed (core: {CORE_PATH})")
     return 1 if FAILS else 0
 

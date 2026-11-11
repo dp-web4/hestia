@@ -2235,6 +2235,170 @@ def _shell_words(cmd: str, depth: int = 0, origin=None) -> list:
     return toks + extra
 
 
+#: #1329: network operands are data only for a whole simple command whose output grammar is
+#: understood. Unknown options, abbreviations and implicit downloads retain the old path judgment.
+_URL_HEADS = frozenset(("curl", "http", "https", "xh", "xhs"))
+_HTTPIE_HEADS = frozenset(("http", "https", "xh", "xhs"))
+_HOSTPORT = re.compile(r"^(?:localhost|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+                       r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]+\])"
+                       r":\d{1,5}(?:[/?#]|$)")
+_URL_WITH_SCHEME = re.compile(r"^(?:https?|ftp|ftps)://", re.IGNORECASE)
+_CURL_FLAG_LONG = frozenset((
+    "--silent", "--show-error", "--location", "--location-trusted", "--fail",
+    "--fail-with-body", "--fail-early", "--insecure", "--include", "--head", "--verbose",
+    "--get", "--no-buffer", "--compressed", "--http1.0", "--http1.1", "--http2",
+    "--http3", "--ipv4", "--ipv6", "--globoff", "--remote-time", "--progress-bar",
+    "--no-progress-meter", "--create-dirs", "--ssl", "--ssl-reqd", "--tlsv1.2",
+    "--tlsv1.3", "--disable", "--raw", "--no-keepalive", "--path-as-is",
+))
+_CURL_VALUE_LONG = frozenset((
+    "--output", "--header", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+    "--json", "--request", "--user-agent", "--user", "--referer", "--max-time",
+    "--connect-timeout", "--retry", "--retry-delay", "--retry-max-time", "--write-out",
+    "--cookie", "--form", "--range", "--resolve", "--proxy", "--oauth2-bearer",
+    "--max-redirs", "--limit-rate", "--max-filesize", "--speed-time", "--speed-limit",
+    "--cacert", "--interface", "--cert", "--key", "--upload-file", "--proxy-user",
+    "--continue-at", "--form-string", "--tls-max", "--dump-header", "--cookie-jar",
+))
+_HTTPIE_FLAG_LONG = frozenset((
+    "--body", "--headers", "--verbose", "--follow", "--stream", "--quiet",
+    "--check-status", "--ignore-stdin", "--offline", "--form", "--json", "--multipart",
+))
+_HTTPIE_VALUE_LONG = frozenset((
+    "--output", "--auth", "--auth-type", "--timeout", "--pretty", "--style", "--print",
+    "--verify", "--max-redirects", "--proxy", "--cert", "--cert-key", "--format-options",
+))
+_CURL_FLAG_SHORT = frozenset("sSLfkiIvGNqgjlnBZMVhRp0123456#")
+_CURL_VALUE_SHORT = frozenset("XHduAebmErTwxUCFyYzQtPowcD")
+_HTTPIE_FLAG_SHORT = frozenset("bhvFf")
+_HTTPIE_VALUE_SHORT = frozenset("oap")
+
+
+def _network_url(value: str) -> bool:
+    return ".." not in value.split("/") and bool(
+        _URL_WITH_SCHEME.match(value) or _HOSTPORT.match(value))
+
+
+def _client_config_unknown(head: str, first_arg: Optional[str], prefix_unknown: bool) -> bool:
+    if head == "curl" and first_arg == "-q":
+        return False
+    if prefix_unknown:
+        return True
+    if head == "curl":
+        if os.name != "posix":
+            return True
+        homes = [os.environ.get("CURL_HOME"), os.environ.get("XDG_CONFIG_HOME"),
+                 os.path.expanduser("~")]
+        return any(h and os.path.isfile(os.path.join(h, ".curlrc")) for h in homes)
+    config = os.environ.get("HTTPIE_CONFIG_DIR")
+    if config:
+        return os.path.isfile(os.path.join(config, "config.json"))
+    candidates = []
+    if os.environ.get("XDG_CONFIG_HOME"):
+        candidates.append(os.path.join(os.environ["XDG_CONFIG_HOME"], "httpie"))
+    home = os.path.expanduser("~")
+    candidates.extend((os.path.join(home, ".config", "httpie"), os.path.join(home, ".httpie")))
+    return any(os.path.isfile(os.path.join(config, "config.json")) for config in candidates)
+
+
+def _url_data_words(toks, at: int, head: str, prefix_unknown: bool = False) -> set:
+    for kind, word, _uglob in reversed(toks[:at]):
+        if kind in ("sep", "mark"):
+            break
+        if kind == "word" and (os.path.basename(word) in _HEREDOC_WRAPPERS
+                               or re.match(r"^(?:HOME|CURL_HOME|XDG_CONFIG_HOME|HTTPIE_CONFIG_DIR)=", word)):
+            prefix_unknown = True
+            break
+    args = []
+    skip = False
+    for idx in range(at + 1, len(toks)):
+        kind, word, uglob = toks[idx]
+        if kind in ("sep", "mark"):
+            break
+        if kind == "op":
+            skip = True
+            continue
+        if kind != "word":
+            continue
+        if skip:
+            skip = False
+            continue
+        if uglob or _BRACE in word:
+            return set()
+        try:
+            spans = _expansion_spans(word)
+            value = _word_value(word)
+        except _Unmodelled:
+            return set()
+        if spans and (spans[0][0] == 0 or word.startswith("-")):
+            return set()
+        args.append((idx, value))
+    if _client_config_unknown(head, args[0][1] if args else None, prefix_unknown):
+        return set()
+
+    curl = head == "curl"
+    flag_long = _CURL_FLAG_LONG if curl else _HTTPIE_FLAG_LONG
+    value_long = _CURL_VALUE_LONG if curl else _HTTPIE_VALUE_LONG
+    flag_short = _CURL_FLAG_SHORT if curl else _HTTPIE_FLAG_SHORT
+    value_short = _CURL_VALUE_SHORT if curl else _HTTPIE_VALUE_SHORT
+    operands, outputs, write_outs = [], [], []
+    i = 0
+    while i < len(args):
+        idx, word = args[i]
+        if word == "--":
+            operands.extend(args[i + 1:])
+            break
+        if word.startswith("--"):
+            name, eq, value = word.partition("=")
+            if name in flag_long and not eq:
+                i += 1
+                continue
+            if name not in value_long:
+                return set()
+            if not eq:
+                i += 1
+                if i >= len(args):
+                    return set()
+                value = args[i][1]
+            if name in ("--write-out",):
+                write_outs.append(value)
+            if name == "--output":
+                outputs.append(value)
+            i += 1
+            continue
+        if word.startswith("-") and word != "-":
+            body, j = word[1:], 0
+            while j < len(body):
+                letter = body[j]
+                if letter in flag_short:
+                    j += 1
+                    continue
+                if letter not in value_short:
+                    return set()
+                value = body[j + 1:]
+                if not value:
+                    i += 1
+                    if i >= len(args):
+                        return set()
+                    value = args[i][1]
+                if letter == "w":
+                    write_outs.append(value)
+                if letter == "o":
+                    outputs.append(value)
+                break
+            i += 1
+            continue
+        operands.append((idx, word))
+        i += 1
+    if any(fmt.startswith("@") or "%output{" in fmt or "%{output" in fmt for fmt in write_outs):
+        return set()
+    urls = [(idx, word) for idx, word in operands if _network_url(word)]
+    if any("#" in output for output in outputs) and any(
+            "[" in url or "{" in url for _, url in urls):
+        return set()
+    return {idx for idx, _ in urls}
+
+
 #: DEFAULT-JUDGE (Codex re-review of #1232; dp: "the shell is a grammar, and skip-lists keep
 #: leaking"). Every word that could be a path — it contains `/`, starts with `~` or `.`, or
 #: carries an UNQUOTED glob character — is judged. A word is skipped ONLY under a precise
@@ -2538,6 +2702,7 @@ class _Found:
         self.dirs_unknown = None    # why a directory change cannot be followed
         self.known = {}             # names bound to ONE literal so far (`_literal_names`)
         self.patterns = []          # literal grep-family PATTERN values (`_PATTERN_HEADS`, #1241)
+        self.user_switch = False    # a user-switching wrapper makes client config unknowable
 
 
 #: THE SINGLE-LITERAL-ASSIGNMENT RULE (dp's ruling, 2026-10-11, measured on #1232 first: ~45% of
@@ -2897,6 +3062,8 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                     bind["pending"] = (name, _word_value(val))
                 continue
             base = os.path.basename(w)
+            if base in ("su", "runuser", "sudo", "doas", "pkexec", "setpriv", "machinectl"):
+                found.user_switch = True
             if base in _STDIN_ARGV:
                 found.unenum.append(f"argv built from stdin (`{base}`)")
             if base in _HEREDOC_WRAPPERS or w.isdigit() or re.fullmatch(r"\d+[smhd]?", w) \
@@ -2908,6 +3075,12 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 found.unenum.append(f"an expansion handed to `{base}` in "
                                     f"${state['env_expansion']}")
             state["head"], state["spec"] = base, _CMD_SPECS.get(base, {})
+            if base in _URL_HEADS:
+                state["spec"] = {"value_opts": (
+                    _CURL_VALUE_LONG | _CURL_VALUE_SHORT if base == "curl"
+                    else _HTTPIE_VALUE_LONG | _HTTPIE_VALUE_SHORT)}
+            state["url_data"] = (_url_data_words(toks, idx, base, found.user_switch)
+                                 if base in _URL_HEADS else set())
             if "/" in w or w.startswith("."):
                 emit(w, uglob)                             # a program run by path is a reach
             if base in ("export", "local", "declare", "typeset", "readonly"):
@@ -3053,6 +3226,9 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
         mode = spec.get("positional")
         if mode == "code":
             code(w)                                        # `eval "…"`, `watch '…'`
+            continue
+        if idx in state.get("url_data", ()) and not uglob:
+            data(w)
             continue
         # An UNQUOTED glob is expanded by the shell BEFORE the command sees its arguments, so no
         # (command, position) exception can make it a string or a pattern: `tr /x/* y` and
