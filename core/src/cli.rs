@@ -168,6 +168,17 @@ enum Command {
         key: PathBuf,
     },
 
+    /// The member-mesh CLI, carried in this binary (#1503): `peek`, `drain`, `send`, `unanswered`,
+    /// `kinds [term]`. Runs the `hestia-mesh.py` compiled into this release (needs `python3`), as the
+    /// member named in HESTIA_MESH_PLUGIN; `kinds` prints the embedded KINDS.md. Adds no authority:
+    /// every act is the daemon's member tools under a stated, unauthenticated identity (#63).
+    #[command(disable_help_flag = true)]
+    Mesh {
+        /// Passed to the mesh CLI as-is (`hestia mesh help` prints its usage)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Governance-surface escalations — the remedy every gate deny already names.
     ///
     /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
@@ -200,6 +211,13 @@ enum GateCmd {
     Pending {
         /// Emit the daemon's `{ "pending": [...] }` response as JSON on stdout.
         /// Identity and caveats remain on stderr so this can be piped to a fold.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List unruled appeals, oldest first, with designation and your eligibility
+    Appeals {
+        /// Emit the daemon's `{ "open": [...] }` response as JSON on stdout.
         #[arg(long)]
         json: bool,
     },
@@ -1196,6 +1214,7 @@ pub fn run() -> AnyResult<()> {
         Command::Scope(ScopeCmd::Pending { json, as_member, endpoint }) => {
             hestia::gate_cli::scope_pending(&endpoint, as_member, "role:constellation:member", json)
         }
+        Command::Mesh { args } => std::process::exit(hestia::mesh_cli::run(&args)),
         Command::Gate { cmd, endpoint, asserted_id, role } => {
             use hestia::gate_cli;
             match cmd {
@@ -1203,6 +1222,9 @@ pub fn run() -> AnyResult<()> {
                 // added `--wait` to poll. They are orthogonal flags on different verbs.
                 GateCmd::Pending { json } => {
                     gate_cli::pending(&endpoint, asserted_id, &role, json)
+                }
+                GateCmd::Appeals { json } => {
+                    gate_cli::appeals(&endpoint, asserted_id, &role, json)
                 }
                 GateCmd::Poll { escalation_id, wait } => {
                     gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role, wait)
