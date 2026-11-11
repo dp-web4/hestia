@@ -3542,7 +3542,10 @@ fn actor_liveness_on_chain(
     store: &crate::storage::chain::SqliteChainStore,
     plugin_id: &str,
 ) -> crate::arbiter::Liveness {
-    let newest = store.latest_actor_act(plugin_id).ok().flatten()
+    // Rows older than a day cannot change the answer below, so the scan stops at a day
+    // (#1555): unbounded, a member with no acts cost a full-chain walk under the state lock.
+    let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let newest = store.latest_actor_act_since(plugin_id, &since).ok().flatten()
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
         .map(|t| t.with_timezone(&Utc));
     let now = Utc::now();
