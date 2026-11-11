@@ -121,8 +121,9 @@ PATTERNS = [
 
 # Declared exceptions: (class, substring, structural scope, justification).
 # Scope None means any scanned runtime line. "harness-registration" means the matching string
-# literal must live structurally inside HARNESS["registrations"]; the same spelling elsewhere
-# is a defect. Add a row only with a justification a reviewer can reject.
+# literal must live structurally inside HARNESS["registrations"]; any other scope is an exact
+# repo-relative filename. The same spelling outside that structure or file is a defect. Add a
+# row only with a justification a reviewer can reject.
 ALLOWED = [
     ("cwd-root-fallback", "os.fspath(entry) or os.getcwd()", None,
      "canonicalizing the EMPTY sys.path entry, which Python defines as cwd; not selecting authority"),
@@ -131,10 +132,10 @@ ALLOWED = [
     ("cwd-root-fallback", "pwd = cwd or os.getcwd()", None,
      "#1232's shell path judge: the same act-relative resolution as the row above (relative words "
      "in a command are resolved against the event cwd); data about the act, not a root"),
-    ("expanduser-tilde", 'os.path.expanduser("~")]', None,
+    ("expanduser-tilde", 'os.path.expanduser("~")]', "plugins/_shared/hestia_gate_core.py",
      "#1329's curl config probe models the client's own HOME-relative .curlrc lookup; data about "
      "the act, not a Hestia authority root"),
-    ("expanduser-tilde", 'home = os.path.expanduser("~")', None,
+    ("expanduser-tilde", 'home = os.path.expanduser("~")', "plugins/_shared/hestia_gate_core.py",
      "#1329's HTTPie-family config probe models the client's own HOME-relative lookup; data about "
      "the act, not a Hestia authority root"),
     # One-gate stage C: these defaults are data about where the HARNESS itself records this hook,
@@ -289,6 +290,16 @@ def _harness_registration_string_lines(src: str) -> set[int]:
     return lines
 
 
+def _matching_exception(rel: str, ln: int, line: str, cls: str,
+                        harness_registration_lines: set[int]):
+    return next((
+        a for a in ALLOWED
+        if a[0] == cls and a[1] in line
+        and (a[2] is None or a[2] == rel
+             or (a[2] == "harness-registration" and ln in harness_registration_lines))
+    ), None)
+
+
 def scan(rel: str) -> int:
     path = os.path.join(ROOT, rel)
     try:
@@ -315,12 +326,7 @@ def scan(rel: str) -> int:
                 continue
             if not re.search(pat, code_part):
                 continue
-            allowed = next((
-                a for a in ALLOWED
-                if a[0] == cls and a[1] in line
-                and (a[2] is None
-                     or (a[2] == "harness-registration" and ln in harness_registration_lines))
-            ), None)
+            allowed = _matching_exception(rel, ln, line, cls, harness_registration_lines)
             if allowed:
                 _ALLOWED_HITS.append(f"{rel}:{ln}  [{cls}]  allowed: {allowed[3]}")
                 continue
@@ -364,6 +370,15 @@ def test_every_declared_exception_is_live():
         assert any(f"[{cls}]" in h and why in h for h in _ALLOWED_HITS), (
             f"declared exception [{cls}] {needle!r} scope={scope!r} absorbed no hit — "
             f"retire it or fix it: {why}")
+
+
+def test_file_scoped_exceptions_do_not_cover_other_files():
+    gate = "plugins/_shared/hestia_gate_core.py"
+    other = "plugins/member-mesh/hestia-mesh.py"
+    for line in ('homes = [os.path.expanduser("~")]',
+                 'home = os.path.expanduser("~")'):
+        assert _matching_exception(gate, 1, line, "expanduser-tilde", set()) is not None
+        assert _matching_exception(other, 1, line, "expanduser-tilde", set()) is None
 
 
 def test_prose_is_reported_not_counted():
@@ -419,6 +434,7 @@ def test_the_directive_is_not_yet_met():
 
 
 ALL = [test_the_runtime_set_was_measured, test_every_declared_exception_is_live,
+       test_file_scoped_exceptions_do_not_cover_other_files,
        test_prose_is_reported_not_counted, test_no_new_path_literals,
        test_the_directive_is_not_yet_met]
 
