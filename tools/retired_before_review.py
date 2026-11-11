@@ -74,6 +74,7 @@ from collections import Counter
 
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from chain_walk import ChainWalker, payload
+from escalation_outcomes import TERMINAL_EVENTS as TERMINAL
 
 MAX = 60_000
 JSON_OUT = False
