@@ -131,6 +131,7 @@ impl ServerHandler for HestiaServer {
             "hestia_notify" => tool_notify(&self.state, &args).await,
             "hestia_member_notify" => tool_member_notify(&self.state, &args).await,
             "hestia_member_inbox" => tool_member_inbox(&self.state, &args).await,
+            "hestia_member_claim" => tool_member_claim(&self.state, &args).await,
             "hestia_egress_pending" => tool_egress_pending(&self.state, &args).await,
             "hestia_transport_binding" => tool_transport_binding(&self.state, &args).await,
             "hestia_channel_send" => tool_channel_send(&self.state, &args).await,
@@ -844,7 +845,23 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_member_inbox",
-            "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity)",
+            "Drain YOUR member notices (consume-once; recipient-scoped by resolved caller identity). A consuming drain skips another session's unexpired claims and never marks those rows drained; peek:true remains non-consuming",
+        ),
+        t_args(
+            "hestia_member_claim",
+            "Claim one of YOUR queued notices before acting on it. The default action=claim takes a 15-minute lease; renew uses the same transition and reports renewed:false if it took an available claim rather than extending your live one; release returns your claim to the queue. A different session's unexpired claim is a conflict, never an overwrite. Expired claims may be reclaimed. Requires your own live session_id; only notices addressed to your member can be claimed. Claims and releases are witnessed; a bystander's consuming hestia_member_inbox neither returns nor marks a live-claimed notice",
+            json!({
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["notice_id"],
+                "properties": {
+                    "notice_id": {"type": "integer", "minimum": 0},
+                    "action": {"type": "string", "enum": ["claim", "renew", "release"], "default": "claim"},
+                    "lease_secs": {"type": "integer", "minimum": 30, "maximum": 3600, "default": 900},
+                    "session_id": {"type": "string", "description": "Your own live session_id from hestia_connect."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id."}
+                }
+            }),
         ),
         t(
             "hestia_egress_pending",
@@ -9022,7 +9039,10 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
             .map_err(|e| anyhow::anyhow!("peeking member inbox: {e}"))?
     } else {
         s.inbox_store
-            .drain_member(&who.plugin_id)
+            .drain_member_for_session(
+                &who.plugin_id,
+                who.session_uuid.expect("attributed callers have a session"),
+            )
             .map_err(|e| anyhow::anyhow!("draining member inbox: {e}"))?
     };
     // Silently-dropped mail, reported to the only party who can tell what is
@@ -9044,6 +9064,147 @@ async fn tool_member_inbox(state: &SharedState, args: &Value) -> ToolResult {
         ));
     }
     Ok(out)
+}
+
+async fn tool_member_claim(state: &SharedState, args: &Value) -> ToolResult {
+    use crate::storage::inbox::MemberNoticeClaimOutcome;
+
+    let Some(notice_id) = args.get("notice_id").and_then(Value::as_u64) else {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid",
+            "member_claim requires a nonnegative integer notice_id",
+            None,
+        ));
+    };
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("claim");
+    if !matches!(action, "claim" | "renew" | "release") {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid",
+            "action must be claim, renew, or release",
+            None,
+        ));
+    }
+    let lease_secs = args
+        .get("lease_secs")
+        .and_then(Value::as_i64)
+        .unwrap_or(crate::storage::inbox::MEMBER_NOTICE_CLAIM_DEFAULT_LEASE_SECS);
+    if !(crate::storage::inbox::MEMBER_NOTICE_CLAIM_MIN_LEASE_SECS
+        ..=crate::storage::inbox::MEMBER_NOTICE_CLAIM_MAX_LEASE_SECS)
+        .contains(&lease_secs)
+    {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_invalid_lease",
+            "lease_secs must be between 30 and 3600",
+            Some(json!({"lease_secs": lease_secs})),
+        ));
+    }
+
+    let session_id_arg = optional_session_id(args);
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Ok(hestia_error_envelope(
+            "hestia.member_claim_unattributed",
+            "member_claim requires the caller's own live session_id (from hestia_connect)",
+            None,
+        ));
+    };
+    let target = format!("notice:{notice_id}");
+    if let Some(denied) = gate_direct_tool(
+        &mut s,
+        &who,
+        "hestia_member_claim",
+        "member_notify",
+        &target,
+    ) {
+        return Ok(denied);
+    }
+    let session = who.session_uuid.expect("attributed callers have a session");
+    let outcome = if action == "release" {
+        s.inbox_store.release_member_notice(notice_id, &who.plugin_id, session)
+    } else {
+        s.inbox_store.claim_member_notice(
+            notice_id,
+            &who.plugin_id,
+            session,
+            lease_secs,
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("changing member notice claim: {e}"))?;
+
+    match outcome {
+        MemberNoticeClaimOutcome::Claimed {
+            claim_expires_at,
+            renewed,
+            superseded_expired_claim,
+        } => {
+            let entry = s.append_chain(
+                "member_notice_claimed",
+                json!({
+                    "notice_id": notice_id,
+                    "plugin_id": who.plugin_id,
+                    "role_lct": who.role_lct,
+                    "session_id": session,
+                    "claim_expires_at": claim_expires_at,
+                    "lease_secs": lease_secs,
+                    "renewed": renewed,
+                    "superseded_expired_claim": superseded_expired_claim,
+                }),
+            )?;
+            Ok(json!({
+                "notice_id": notice_id,
+                "claimed": true,
+                "renewed": renewed,
+                "superseded_expired_claim": superseded_expired_claim,
+                "claim_expires_at": claim_expires_at,
+                "witnessEntryHash": entry.hash,
+            }))
+        }
+        MemberNoticeClaimOutcome::Released { was_claimed } => {
+            let witness = if was_claimed {
+                Some(s.append_chain(
+                    "member_notice_released",
+                    json!({
+                        "notice_id": notice_id,
+                        "plugin_id": who.plugin_id,
+                        "role_lct": who.role_lct,
+                        "session_id": session,
+                    }),
+                )?)
+            } else {
+                None
+            };
+            Ok(json!({
+                "notice_id": notice_id,
+                "released": was_claimed,
+                "witnessEntryHash": witness.map(|entry| entry.hash),
+            }))
+        }
+        MemberNoticeClaimOutcome::Conflict {
+            claimed_by_session,
+            claim_expires_at,
+        } => {
+            let owner_prefix: String = claimed_by_session.chars().take(8).collect();
+            Ok(hestia_error_envelope(
+                "hestia.member_claim_conflict",
+                "this notice is claimed by another session; wait for its lease to expire or coordinate with that session",
+                Some(json!({
+                    "notice_id": notice_id,
+                    "claimed_by_session_prefix": owner_prefix,
+                    "claim_expires_at": claim_expires_at,
+                })),
+            ))
+        }
+        MemberNoticeClaimOutcome::NotFound => Ok(hestia_error_envelope(
+            "hestia.member_claim_not_found",
+            "no queued notice with that id is addressed to your member on this machine",
+            Some(json!({"notice_id": notice_id})),
+        )),
+        MemberNoticeClaimOutcome::AlreadyDrained => Ok(hestia_error_envelope(
+            "hestia.member_claim_already_drained",
+            "this notice has already been drained and cannot be claimed",
+            Some(json!({"notice_id": notice_id})),
+        )),
+    }
 }
 
 /// "Which notices were queued and never answered?" — the query the mesh could
@@ -13176,6 +13337,72 @@ mod member_mesh_tests {
             .unwrap();
         assert_eq!(kimi_mail["total"], json!(1));
         assert_eq!(kimi_mail["notices"][0]["from_plugin"], json!("claude-code"));
+    }
+
+    #[tokio::test]
+    async fn a_claim_routes_one_notice_to_its_owner_without_blocking_other_mail() {
+        let (_dir, state) = test_state().await;
+        let sender = connect(&state, "claude-code").await;
+        let owner = connect(&state, "kimi-code").await;
+        let bystander = connect(&state, "kimi-code").await;
+
+        let mut queued = Vec::new();
+        for pointer in ["shared-context/forum/claimed.md", "shared-context/forum/other.md"] {
+            let sent = tool_member_notify(
+                &state,
+                &json!({
+                    "to_plugin_id": "kimi-code",
+                    "kind": "review_request",
+                    "pointer_uri": pointer,
+                    "session_id": sender,
+                }),
+            )
+            .await
+            .unwrap();
+            queued.push(sent["queued_id"].as_u64().expect("notice queued"));
+        }
+
+        let claimed = tool_member_claim(
+            &state,
+            &json!({"notice_id": queued[0], "session_id": owner}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], json!(true), "claim failed: {claimed}");
+        assert!(claimed["witnessEntryHash"].is_string());
+
+        let conflict = tool_member_claim(
+            &state,
+            &json!({"notice_id": queued[0], "session_id": bystander}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conflict["_hestia_error"]["code"], json!("hestia.member_claim_conflict"));
+        assert!(conflict["_hestia_error"]["data"]["claim_expires_at"].is_string());
+
+        let bystander_mail = tool_member_inbox(
+            &state,
+            &json!({"session_id": bystander}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bystander_mail["total"], json!(1));
+        assert_eq!(bystander_mail["notices"][0]["id"], json!(queued[1]));
+
+        let owner_mail = tool_member_inbox(&state, &json!({"session_id": owner}))
+            .await
+            .unwrap();
+        assert_eq!(owner_mail["total"], json!(1), "the bystander consumed the claim: {owner_mail}");
+        assert_eq!(owner_mail["notices"][0]["id"], json!(queued[0]));
+
+        let s = state.lock().await;
+        let event = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|entry| entry.event_type == "member_notice_claimed")
+            .expect("claim was not witnessed");
+        assert_eq!(event.event_data["notice_id"], json!(queued[0]));
+        assert_eq!(event.event_data["plugin_id"], json!("kimi-code"));
     }
 
     /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an
