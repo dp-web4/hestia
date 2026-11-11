@@ -1695,6 +1695,9 @@ pub async fn serve_with_callback(
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parsing bind address '{}'", bind))?;
+    // The dry-run reuse lookup returns an existing daemon session id. Without caller
+    // ownership proof (#824), it must not become an oracle on a non-loopback listener.
+    state.lock().await.allow_connect_dry_run = addr.ip().is_loopback();
 
     // Bounded operator bootstrap (RWOA genesis window): on a fresh vault this
     // mints the first operator so the gated surface isn't a permanent lockout;
@@ -7729,9 +7732,9 @@ async fn agent_register(
 // member's registry LCT (`agent_key_for_lct`), never typed -- the same rule as register.
 
 /// The nine society roles a delegation may carry, spelled as `parse_role` accepts them. A
-/// closed set, offered as a picker: `parse_role` maps any other string to `Custom(..)`, which
-/// is a free-text role by another name, and this surface takes no free-text identity of any
-/// kind. tools/delegation_panel_contract_test.py pins the picker to this list.
+/// closed set, offered as a picker: `parse_role` rejects every other string, so this surface
+/// takes no free-text role identity. tools/delegation_panel_contract_test.py pins the picker to
+/// this list.
 pub const DELEGATION_ROLES: &[&str] = &[
     "sovereign", "law_oracle", "policy_entity", "treasurer", "administrator",
     "archivist", "citizen", "witness", "auditor",
@@ -7968,13 +7971,21 @@ const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];
 fn agent_acts_since(s: &crate::server::state::ServerState, plugin_id: &str, cutoff: &str) -> Result<usize, String> {
     let want = plugin_id.trim().to_string();
     s.chain_store
-        .scan_recent(Some(cutoff), Some(AGENT_ACT_EVENTS), 50_000, |row| {
+        .scan_recent_page(Some(cutoff), Some(AGENT_ACT_EVENTS), None,
+                          crate::storage::chain::ROUTINE_CHAIN_MAX, |row| {
             serde_json::from_str::<serde_json::Value>(row.event_data)
                 .ok()
                 .and_then(|v| v.get("plugin_id").and_then(|p| p.as_str()).map(str::to_string))
         })
-        .map(|ids| ids.into_iter().filter(|id| *id == want).count())
         .map_err(|e| e.to_string())
+        .and_then(|page| {
+            if page.before_position.is_some() {
+                Err(format!("more than {} recent acts; this member is LIVE but the exact count is unmeasurable",
+                            crate::storage::chain::ROUTINE_CHAIN_MAX))
+            } else {
+                Ok(page.rows.into_iter().filter(|id| *id == want).count())
+            }
+        })
 }
 
 /// PURE: what the retire guard says, given what it could measure. `Err` (unmeasurable) is a
@@ -9064,22 +9075,27 @@ struct ChainQuery {
     /// a count-first window makes filtered views shrink as other signers
     /// churn (the filtered-window illusion).
     range: Option<String>,
+    /// Exclusive chain cursor returned by the previous page.
+    before_position: Option<u64>,
 }
 
 async fn chain_query(
     State(state): State<SharedState>,
     Query(q): Query<ChainQuery>,
 ) -> impl IntoResponse {
-    let s = state.lock().await;
+    let chain = {
+        let s = state.lock().await;
+        std::sync::Arc::clone(&s.chain_store)
+    };
     let now = chrono::Utc::now();
     let (cutoff, default_cap) = match q.range.as_deref() {
-        Some("hour") => (Some(now - chrono::Duration::hours(1)), 2_000),
-        Some("day") => (Some(now - chrono::Duration::days(1)), 5_000),
-        Some("week") => (Some(now - chrono::Duration::weeks(1)), 10_000),
-        Some("all") => (None, 10_000),
+        Some("hour") => (Some(now - chrono::Duration::hours(1)), crate::storage::chain::ROUTINE_CHAIN_PAGE),
+        Some("day") => (Some(now - chrono::Duration::days(1)), crate::storage::chain::ROUTINE_CHAIN_PAGE),
+        Some("week") => (Some(now - chrono::Duration::weeks(1)), crate::storage::chain::ROUTINE_CHAIN_PAGE),
+        Some("all") => (None, crate::storage::chain::ROUTINE_CHAIN_PAGE),
         _ => (None, 50), // legacy: no range → old count-window behavior
     };
-    let limit = q.limit.unwrap_or(default_cap);
+    let limit = q.limit.unwrap_or(default_cap).min(crate::storage::chain::ROUTINE_CHAIN_MAX);
     let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
     // A FAILED read must not render as an EMPTY chain. This is the third site of the defect fixed
     // in the dashboard snapshot on 2026-08-01 (stats) and 2026-08-02 (#190, the recent feed): a
@@ -9098,28 +9114,29 @@ async fn chain_query(
     // because it is a substring match on a projected field, which SQL cannot do for us
     // without reaching into the JSON.
     let type_filter: Option<Vec<&str>> = q.event_type.as_deref().map(|t| vec![t]);
-    let (entries, read_error) =
-        match s
-            .chain_store
-            .scan_recent(cutoff_str.as_deref(), type_filter.as_deref(), limit, |r| {
-                let e = super::dashboard::flatten_row(r);
-                if let Some(ref tf) = q.tool {
-                    match e.tool_name {
-                        Some(ref tn) if tn.contains(tf.as_str()) => {}
-                        // A row with no tool_name cannot match a tool filter. Dropping it
-                        // here is the same verdict the old post-filter reached.
-                        _ => return None,
-                    }
+    let (entries, before_position, read_error) = match chain.scan_recent_page(
+        cutoff_str.as_deref(), type_filter.as_deref(), q.before_position, limit, |r| {
+            let e = super::dashboard::flatten_row(r);
+            if let Some(ref tf) = q.tool {
+                match e.tool_name {
+                    Some(ref tn) if tn.contains(tf.as_str()) => {}
+                    // A row with no tool_name cannot match a tool filter. Dropping it
+                    // here is the same verdict the old post-filter reached.
+                    _ => return None,
                 }
-                Some(e)
-            }) {
-            Ok(v) => (v, None),
-            Err(e) => {
-                tracing::error!("chain query read failed: {e}");
-                (Vec::new(), Some(e.to_string()))
             }
-        };
-    Json(serde_json::json!({ "entries": entries, "read_error": read_error }))
+            Some(e)
+        },
+    ) {
+        Ok(p) => (p.rows, p.before_position, None),
+        Err(e) => {
+            tracing::error!("chain query read failed: {e}");
+            (Vec::new(), None, Some(e.to_string()))
+        }
+    };
+    Json(serde_json::json!({
+        "entries": entries, "before_position": before_position, "read_error": read_error
+    }))
 }
 
 /// `GET /api/governance/ledger?status=&range=&limit=` — the operator's ledger of ADMIN acts.
@@ -9173,36 +9190,41 @@ async fn governance_ledger(
         _ => Some(now_dt - chrono::Duration::days(30)),
     };
     let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
-    // The cap counts ADMIN ACTS, not chain entries — `read_recent_by_types` filters in SQL — so a
-    // wide range costs what its answer costs. Scanning the whole chain to discard member traffic
-    // would put the heaviest read in the daemon behind a UI panel.
-    const LEDGER_CAP: u64 = 5_000;
-
-    let (raw, read_error) = match chain.read_recent_by_types(
+    // A routine page is at most 500 selected admin acts by default, never more than 1,000.
+    // `before_position` makes older history an explicit follow-up rather than a 5,000-row read.
+    let chain_limit = q.limit.unwrap_or(crate::storage::chain::ROUTINE_CHAIN_PAGE)
+        .min(crate::storage::chain::ROUTINE_CHAIN_MAX);
+    let mut projection_error = None;
+    let scan = chain.scan_recent_page(
         cutoff_str.as_deref(),
-        gl::GOVERNANCE_EVENTS,
-        LEDGER_CAP,
-    ) {
-        Ok(v) => (v, None),
+        Some(gl::GOVERNANCE_EVENTS),
+        q.before_position,
+        chain_limit,
+        |row| match row.to_entry() {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                projection_error = Some(e.to_string());
+                None
+            }
+        },
+    );
+    let (raw, scanned, before_position, truncated, read_error) = match scan {
+        Ok(p) => {
+            let truncated = p.before_position.is_some();
+            (p.rows, p.scanned, p.before_position, truncated, projection_error)
+        }
         Err(e) => {
             tracing::error!("governance ledger chain read failed: {e}");
-            (Vec::new(), Some(e.to_string()))
+            (Vec::new(), 0, None, false, Some(e.to_string()))
         }
     };
-    let scanned = raw.len() as u64;
-    // The window FILLED. There may be older admin acts this page cannot see, and a reader must be
-    // told rather than shown a short list that looks complete.
-    let truncated = scanned >= LEDGER_CAP;
 
     let now = crate::server::gate_escalation::now_secs();
     let rows = gl::project(&raw, now);
-    let mut page = gl::page(
-        rows,
-        q.status.as_deref().unwrap_or("all"),
-        q.limit.unwrap_or(500).min(2_000) as usize,
-    );
+    let mut page = gl::page(rows, q.status.as_deref().unwrap_or("all"), chain_limit as usize);
     page.truncated = truncated;
     page.scanned = scanned;
+    page.before_position = before_position;
     page.read_error = read_error;
     Json(page)
 }
@@ -9214,6 +9236,8 @@ struct LedgerQuery {
     /// day | week | month (default) | all
     range: Option<String>,
     limit: Option<u64>,
+    /// Exclusive chain cursor returned by the previous page.
+    before_position: Option<u64>,
 }
 
 /// `POST /api/operator/gate-escalation` {id, approve, reason?} — the STRONG decision channel for
@@ -11811,6 +11835,25 @@ mod disposition_tests {
         assert!(retire_guard(&Ok(3), true).is_none());
     }
 
+    #[tokio::test]
+    async fn activity_beyond_the_routine_page_is_unmeasurable_not_truncated_488() {
+        let (_dir, state) = test_state().await;
+        {
+            let s = state.lock().await;
+            for _ in 0..=crate::storage::chain::ROUTINE_CHAIN_MAX {
+                s.append_chain("outcome", serde_json::json!({
+                    "plugin_id": "kimi-code", "success": true
+                })).unwrap();
+            }
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let s = state.lock().await;
+        let err = agent_acts_since(&s, "kimi-code", &cutoff).unwrap_err();
+        assert!(err.contains("unmeasurable"), "{err}");
+        let refusal = retire_guard(&Err(err), false).expect("overflow must fail closed");
+        assert_eq!(refusal["unmeasurable"], serde_json::json!(true));
+    }
+
     /// cbp, finding 5: `retired_member_connected` was documented and did not exist.
     #[tokio::test]
     async fn a_retired_id_that_connects_is_witnessed_not_hidden() {
@@ -14369,11 +14412,64 @@ mod tests {
     ///   order as wakeup latency); (b) amplifying with K queued readers
     ///   serialized the readers themselves on one worker — K x read even with
     ///   the fix — because nobody was awake to steal the woken waiters.
+    #[tokio::test]
+    async fn chain_query_returns_bounded_pages_and_continuation_488() {
+        let (_dir, state) = make_shared_state();
+        {
+            let s = state.lock().await;
+            for i in 0..1_005 {
+                s.append_chain("policy_edit", serde_json::json!({
+                    "change": "add_rule", "rule_id": format!("r{i}")
+                })).unwrap();
+            }
+        }
+        let expected = state.lock().await.chain_len() as usize;
+        let resp = chain_query(
+            State(state.clone()),
+            Query(ChainQuery {
+                range: Some("all".into()), limit: Some(500), ..Default::default()
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first["entries"].as_array().map(Vec::len), Some(500));
+        assert!(first["read_error"].is_null());
+        let cursor = first["before_position"].as_u64().expect("older rows");
+
+        let resp = chain_query(
+            State(state.clone()),
+            Query(ChainQuery {
+                range: Some("all".into()), limit: Some(500), before_position: Some(cursor),
+                ..Default::default()
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["entries"].as_array().map(Vec::len), Some(500));
+        let cursor = second["before_position"].as_u64().expect("the final page");
+        assert!(second["read_error"].is_null());
+
+        let resp = chain_query(
+            State(state.clone()),
+            Query(ChainQuery {
+                range: Some("all".into()), limit: Some(500), before_position: Some(cursor),
+                ..Default::default()
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let third: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(third["entries"].as_array().map(Vec::len), Some(expected - 1_000));
+        assert_eq!(third["before_position"], serde_json::Value::Null);
+        assert!(third["read_error"].is_null());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn governance_ledger_read_does_not_hold_the_state_lock() {
-        // ~77MB of event_data in total: the read costs ~2s on the 2026-08 WSL
-        // dev box. ROWS stays well under LEDGER_CAP (5000) so every seeded act
-        // is scanned; the per-row pad is what the fetch + parse pays for.
+        // ~77MB of event_data in total: the first page costs ~2s on the 2026-08 WSL
+        // dev box. ROWS crosses the hard page cap, so the cursor is exercised too.
         const ROWS: usize = 1_200;
         const PAD: usize = 65_536;
 
@@ -14402,6 +14498,7 @@ mod tests {
                             status: None,
                             range: Some("all".into()),
                             limit: Some(2_000),
+                            before_position: None,
                         }),
                     )
                     .await
@@ -14411,9 +14508,8 @@ mod tests {
             (handle, started_rx)
         };
 
-        // Calibrate: one full ledger read — and check the answer while at it:
-        // every seeded admin act, no read error (the lock change must not
-        // change the ledger's semantics).
+        // Calibrate one page, then follow its cursor: every seeded admin act is returned,
+        // no page exceeds the hard cap, and no read error is hidden.
         let t = std::time::Instant::now();
         let (h, started) = spawn_handler(&state);
         started.await.unwrap();
@@ -14424,9 +14520,27 @@ mod tests {
             .await
             .unwrap();
         let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(page["scanned"].as_u64(), Some(ROWS as u64));
-        assert_eq!(page["rows"].as_array().map(Vec::len), Some(ROWS));
+        assert_eq!(page["scanned"].as_u64(), Some(1_000));
+        assert_eq!(page["rows"].as_array().map(Vec::len), Some(1_000));
+        assert_eq!(page["truncated"].as_bool(), Some(true));
         assert!(page.get("read_error").is_none());
+        let cursor = page["before_position"].as_u64().expect("an older page");
+        let resp = governance_ledger(
+            State(state.clone()),
+            Query(LedgerQuery {
+                status: None,
+                range: Some("all".into()),
+                limit: Some(2_000),
+                before_position: Some(cursor),
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let older: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(older["scanned"].as_u64(), Some((ROWS - 1_000) as u64));
+        assert_eq!(older["rows"].as_array().map(Vec::len), Some(ROWS - 1_000));
+        assert_eq!(older["before_position"], serde_json::Value::Null);
+        assert!(older.get("read_error").is_none());
 
         // The spinners: keep every other worker awake and stealing, so the
         // woken waiter below is polled promptly (see the doc comment).

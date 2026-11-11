@@ -546,6 +546,9 @@ pub struct ServerState {
     pub scope_tally: std::collections::HashMap<(String, String), (u64, u64)>,
     pub vault: Vault,
     pub sessions: crate::server::published::Sessions,
+    /// The dry-run session lookup returns a real bearer id for a claimed member/host pair,
+    /// so it is admitted only when the HTTP listener is loopback. Off-host ownership is #824.
+    pub allow_connect_dry_run: bool,
     pub actions: HashMap<Uuid, InFlightAction>,
     /// BEHIND AN `Arc` SO A HEAVY READ NEED NOT HOLD THE GLOBAL STATE LOCK.
     ///
@@ -1297,6 +1300,8 @@ impl ServerState {
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: crate::server::published::Sessions::default(),
+            // In-process/IPC handlers are local; the HTTP bind may narrow this before serving.
+            allow_connect_dry_run: true,
             actions: HashMap::new(),
             // Rebuilt from the chain + settle record, so a late witness for an action from before
             // this restart finds its row and its charge state (one-gate stage A). Evaluated
@@ -2785,6 +2790,56 @@ mod tests {
         assert!(state.member_registry.get("_shared").is_none());
         assert!(state.member_registry.get("synthetic-seat").is_none());
         assert!(state.member_registry.get("not-a-seat").is_none());
+    }
+
+    #[test]
+    fn policy_generation_binds_projection_verdict_not_verification_time() {
+        let (_dir, mut state) = make_state();
+        let audit = |verified_at| crate::server::standing_scope::ProjectionAudit {
+            verified_at,
+            matches: true,
+            runtime_generation: 7,
+            vault_generation: 7,
+            runtime_digest: "same-runtime".into(),
+            vault_digest: "same-vault".into(),
+            divergence: vec![],
+        };
+
+        state.standing_projection_audit = crate::server::published::Watched::new(Some(audit(100)));
+        let first = state.build_publication();
+        let first_generation = first.policy_generation();
+        state.standing_projection_audit = crate::server::published::Watched::new(Some(audit(900)));
+        let second = state.build_publication();
+        let second_generation = second.policy_generation();
+
+        assert_eq!(first.canonical()["standing_projection_audit"]["verified_at"].as_u64(),
+                   Some(100));
+        assert_eq!(second.canonical()["standing_projection_audit"]["verified_at"].as_u64(),
+                   Some(900));
+        assert_eq!(first_generation, second_generation);
+
+        let mut assert_moves = |changed: crate::server::standing_scope::ProjectionAudit| {
+            state.standing_projection_audit = crate::server::published::Watched::new(Some(changed));
+            assert_ne!(first_generation, state.build_publication().policy_generation());
+        };
+        let mut changed = audit(901);
+        changed.matches = false;
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.runtime_generation = 8;
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.vault_generation = 8;
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.runtime_digest = "changed-runtime".into();
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.vault_digest = "changed-vault".into();
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.divergence = vec!["standing grant differs".into()];
+        assert_moves(changed);
     }
 
     /// B2 (#339): the daemon's chain rows are witnessed by the Society key, name the real

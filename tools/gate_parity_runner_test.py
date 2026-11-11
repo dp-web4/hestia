@@ -423,7 +423,7 @@ def test_seat_env_strips_ambient_and_pins_the_stub():
 
 
 def test_corpus_is_loaded_and_unmodified_shape():
-    assert len(runner.CORPUS) == 43, len(runner.CORPUS)
+    assert len(runner.CORPUS) == 46, len(runner.CORPUS)
     for act in runner.CORPUS:
         act_id, act_class, tool, tool_input, expected, note = act
         assert isinstance(act_id, str) and tool_input is not None
