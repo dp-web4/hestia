@@ -54,6 +54,10 @@ pub enum CoreError {
     )]
     InvalidPreset(String),
 
+    /// A gated-resource declaration the gate could not apply faithfully (#1548).
+    #[error("gated resource refused: {0}")]
+    InvalidResource(String),
+
     #[error("invalid passphrase: {0}")]
     InvalidPassphrase(&'static str),
 

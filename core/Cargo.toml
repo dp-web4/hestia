@@ -100,6 +100,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "blo
 
 # Policy engine
 regex = "1"
+# statvfs for gated-resource disk probes (#1548). Already in the lock transitively.
+libc = "0.2"
 globset = "0.4"
 chrono-tz = "0.10"
 

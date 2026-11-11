@@ -22,6 +22,8 @@ pub mod matchers;
 pub mod preamble;
 pub mod presets;
 pub mod rate_limit;
+pub mod resource_probes;
+pub mod resources;
 pub mod shell;
 pub mod types;
 
@@ -31,6 +33,7 @@ pub use law_gate::{LAW_FILE, LawGate};
 pub use preamble::LAW_PREAMBLE;
 pub use presets::{PRESET_NAMES, get_preset, is_preset_name, list_presets};
 pub use rate_limit::{RateLimitResult, RateLimiter};
+pub use resources::{GatedResource, ResourceMode};
 pub use shell::executable_positions;
 pub use types::{
     MatchScope, PolicyAction, PolicyConfig, PolicyDecision, PolicyEvaluation, PolicyMatch,

@@ -1619,6 +1619,22 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         }));
     }
 
+    // GATED RESOURCES (#1548), published as law beside the rules: what this machine can afford,
+    // what consumes it, the price, and what a refused act may do instead. Read from the society
+    // engine whatever layers apply, because the machine's disk does not change with a member's
+    // grant (and the gate assesses them the same way). Pushed only when declared, so a society
+    // without resources publishes exactly the law, and the law_hash, it did before.
+    let resources = &p.society.config().resources;
+    for r in resources {
+        statements.push(json!({
+            "layer": "society",
+            "rule": format!("gated resource: {}", r.id),
+            "decision": "gated",
+            "law": r.law_text(),
+            "enforced": r.mode == crate::policy::ResourceMode::Enforce,
+        }));
+    }
+
     // PER-LAYER, NOT A SINGLE MISLEADING VALUE (kimi, finding 1 + the related note).
     // `enforced` and `default_when_no_rule_matches` previously reported the SOCIETY engine
     // only, so a role or instance overlay could tighten the effective law while these
@@ -1697,6 +1713,10 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
             .collect::<Vec<_>>(),
         "law": statements,
     });
+    let mut body = body;
+    if !resources.is_empty() {
+        body["resources"] = crate::policy::resources::publish(resources);
+    }
 
     // THE HASH COVERS WHAT WAS RETURNED (kimi, finding 1). It was
     // `policy_engine.content_hash()` — the society layer alone — so a role rule, an
@@ -1747,6 +1767,9 @@ async fn tool_operating_law(state: &SharedState, args: &Value) -> ToolResult {
         "scope_grants": out.get("scope_grants").cloned().unwrap_or(Value::Null),
         "standing_grants": out.get("standing_grants").cloned().unwrap_or(Value::Null),
         "law": out.get("law").cloned().unwrap_or(Value::Null),
+        // SIXTH field through this allowlist, forwarded for the reason the five above are: it is
+        // in the hashed body when declared, so it must reach the member (#1548).
+        "resources": out.get("resources").cloned().unwrap_or(Value::Null),
         // Quote THIS to say which law you read: it covers every layer, every bound list,
         // and the redaction applied to you. `society_policy_hash` is kept only because
         // existing audit entries reference it.
@@ -1868,8 +1891,57 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
     // lock's second-largest holder (~3-4 ms a call, measured on #1267).
     let published = state.published();
     let policy_version = published.version;
-    let evaluation = published.evaluate(&session_plugin_id, &session_role, &pa);
+    let mut evaluation = published.evaluate(&session_plugin_id, &session_role, &pa);
     let (plugin_id_for_chain, role_lct) = (session_plugin_id.clone(), session_role.clone());
+
+    // GATED RESOURCES (#1548): can the community afford this act right now? Matching is cheap
+    // and runs on every act; probes are read only when the act consumes a declared resource, off
+    // the async workers and under a deadline (`resource_probes`), so a hung drive bridge makes a
+    // reading unknown rather than stalling the gate. An unknown reading never refuses.
+    //
+    // An assessment can only ADD a deny, and only in enforce mode, through the same strictest
+    // fold every layer uses: a destructive-command deny on the same act still wins on a tie and
+    // keeps its attribution, and nothing here can turn a deny into an allow (kimi-code's review
+    // of #1548, points 1-2). Society layer only: the machine's disk is the same whatever a
+    // member's role or grant.
+    let gated: Vec<(crate::policy::GatedResource, Option<bool>)> = published
+        .society
+        .matching_resources(&pa)
+        .into_iter()
+        .map(|(r, routed)| (r.clone(), routed))
+        .collect();
+    let mut answered_probes: Vec<crate::policy::resources::Probe> = Vec::new();
+    let assessments: Vec<crate::policy::resources::Assessment> = if gated.is_empty() {
+        Vec::new()
+    } else {
+        let mut probes: Vec<crate::policy::resources::Probe> = Vec::new();
+        for (r, _) in &gated {
+            for p in r.probes() {
+                if !probes.contains(&p) {
+                    probes.push(p);
+                }
+            }
+        }
+        let readings = tokio::task::spawn_blocking(move || {
+            crate::policy::resource_probes::LiveSampler::sample_all(&probes)
+        })
+        .await
+        .unwrap_or_default();
+        answered_probes = readings
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(p, _)| p.clone())
+            .collect();
+        gated
+            .iter()
+            .map(|(r, routed)| crate::policy::resources::assess(r, *routed, &readings))
+            .collect()
+    };
+    for a in &assessments {
+        if let Some(deny) = a.as_evaluation() {
+            evaluation = crate::policy::fold_strictest(evaluation, deny);
+        }
+    }
 
     // PHASE 3 (state lock): only the writes this verdict needs — the scope tally, the decision
     // row and its charge.
@@ -1952,6 +2024,63 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
             a
         }
     });
+    // THE ACT AS AN R6 TRANSACTION (#1548; dp: "we should be implementing r6 for all of this"):
+    // Rules (law + resource), Role, Request, Reference (the readings the verdict rests on),
+    // Resource (price at those readings), Result (pending until settlement). Witnessed on its own
+    // kind for EVERY consuming act, allows included: an allow writes no `policy_decision` row, so
+    // observe mode would otherwise leave no record of what the community was asked to afford.
+    // Its own kind for the reason `policy_unevaluable` has one: readers counting
+    // `policy_decision` rows must not start counting observations.
+    let resource_r6: Vec<Value> = assessments
+        .iter()
+        .map(|a| {
+            a.to_r6(&crate::policy::resources::R6Context {
+                law_hash: published.society.content_hash(),
+                actor: &plugin_id_for_chain,
+                role_lct: &role_lct,
+                tool_name: &action.tool_name,
+                target: attempted.as_deref(),
+                action_id: &action_id_str,
+            })
+        })
+        .collect();
+    // Whether the R6 records were witnessed (NOVA on #1551): an observation that did not commit
+    // is reported as such in the reply, never presented as recorded.
+    let mut resources_witnessed: Option<bool> = None;
+    if !assessments.is_empty() {
+        let instance_lct = s.member_lct(&plugin_id_for_chain);
+        let observed = s.append_chain(
+            "resource_observation",
+            json!({
+                "policy_version": policy_version,
+                "action_id": action_id_str,
+                "tool_name": action.tool_name,
+                "plugin_id": plugin_id_for_chain,
+                "instance_lct": instance_lct,
+                "role_lct": role_lct,
+                "session_id": action.session_id,
+                "host_session_id": action.host_session_id,
+                // The verdict actually returned, after every fold, so the row reads on its own:
+                // "observe said would-refuse, and the act was allowed" is visible in one place.
+                "decision": evaluation.decision.as_str(),
+                "enforced": evaluation.enforced,
+                "assessments": resource_r6,
+            }),
+        );
+        resources_witnessed = Some(observed.is_ok());
+        let now = crate::server::gate_escalation::now_secs();
+        crate::server::resource_remedy::note(&mut s, &assessments, &plugin_id_for_chain, now);
+        let stuck = crate::policy::resource_probes::stuck_probes(
+            crate::policy::resource_probes::STUCK_AFTER,
+        );
+        crate::server::resource_remedy::note_stuck(
+            &mut s,
+            &stuck,
+            &answered_probes,
+            &plugin_id_for_chain,
+            now,
+        );
+    }
     // THE VERDICT AS FEEDBACK (`verdict_feedback`): which level of the actor's work this verdict
     // is true at, the goal it bears on, the routes left open, and whether this identical act was
     // already decided. Additive: every existing field of the reply and the row is unchanged.
@@ -2073,6 +2202,12 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         if let Some(h) = &charge_held_by {
             own_data["charge_held_by"] = json!(h);
         }
+        // THE EVIDENCE IN THE SAME RECORD (CLAUDE.md, atomic rule): when this verdict involved a
+        // gated resource, the readings it rested on commit in this row, not only in the separate
+        // observation, whichever layer supplied the displayed reason.
+        if !resource_r6.is_empty() {
+            own_data["resource_assessments"] = json!(resource_r6);
+        }
         let own_row = s.append_chain("policy_decision", own_data);
         feedback_recorded = own_row.is_ok();
         if let Ok(row) = &own_row {
@@ -2168,6 +2303,13 @@ async fn tool_query_policy(state: &SharedState, args: &Value) -> ToolResult {
         // An existing decision hash is paired only with the feedback committed in that row.
         "feedback": committed_feedback.unwrap_or_else(|| feedback.to_value()),
         "feedbackRecorded": feedback_recorded,
+        // Additive (#1548): the R6 record of each gated resource this act consumes, with the
+        // readings, the price at those readings, and (when unaffordable) why and what would be
+        // allowed instead. Empty when the act consumes none.
+        "resources": resource_r6,
+        // true: the R6 records above committed as a `resource_observation` row; false: they did
+        // not, and exist only in this reply; null: the act consumes no gated resource.
+        "resourcesWitnessed": resources_witnessed,
     }))
 }
 
@@ -10573,6 +10715,7 @@ mod accountability_tests {
             s.role_policy_engines.insert(
                 "role:constellation:mesh-worker".into(),
                 crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                    resources: Vec::new(),
                     default_policy: crate::policy::PolicyDecision::Allow,
                     enforce: true,
                     rules: vec![crate::policy::PolicyRule {
@@ -10952,6 +11095,7 @@ mod accountability_tests {
             s.role_policy_engines.insert(
                 "role:constellation:mesh-worker".into(),
                 crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                    resources: Vec::new(),
                     default_policy: crate::policy::PolicyDecision::Allow,
                     enforce: true,
                     rules: vec![rule],
@@ -11010,6 +11154,7 @@ mod accountability_tests {
 
     fn deny_overlay_for(categories: &[&str]) -> crate::policy::PolicyEngine {
         crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+            resources: Vec::new(),
             default_policy: crate::policy::PolicyDecision::Allow,
             enforce: true,
             rules: vec![crate::policy::PolicyRule {
@@ -11846,6 +11991,7 @@ mod accountability_tests {
             s.role_policy_engines.insert(
                 "role:constellation:mesh-worker".into(),
                 crate::policy::PolicyEngine::new(crate::policy::PolicyConfig {
+                    resources: Vec::new(),
                     default_policy: crate::policy::PolicyDecision::Allow,
                     enforce: true,
                     rules: vec![rule],
@@ -11922,6 +12068,320 @@ mod accountability_tests {
             "role:constellation:mesh-worker"
         );
         // an unknown role would fail closed to the default (normalize covers that unit-side)
+    }
+
+    /// Gated resources (#1548), end to end through the gate. Probes read `/` with floors no
+    /// machine meets (or every machine meets), so readings are real but the outcome is fixed.
+    fn gated(mode: &str, min_mb: u64) -> crate::policy::PolicyConfig {
+        let mut cfg = crate::policy::get_preset("safety").unwrap().config;
+        cfg.resources = vec![serde_json::from_value(json!({
+            "id": "cargo",
+            "description": "one cargo run at a time; scratch must not run out",
+            "mode": mode,
+            "consumers": [{"tools": ["Bash"], "target_patterns_scope": "executable_positions",
+                           "target_patterns_are_regex": true,
+                           "target_patterns": [r"^cargo(-serial)?\s+(build|test|check)\b"]}],
+            "floors": [{"id": "scratch", "probe": {"kind": "disk_free", "path": "/"}, "min": min_mb}],
+            "pricing": {"base_milli_atp": 5000},
+            "runner": {"usage": "cargo-serial <cargo args>", "pattern": "^cargo-serial$"},
+            "on_unknown": "allow",
+            "alternatives": ["a later run, when scratch is back above the floor"],
+            "remedy": "free disk on /"
+        }))
+        .unwrap()];
+        cfg
+    }
+
+    async fn gate_bash(state: &SharedState, sid: &str, cmd: &str) -> Value {
+        let begin = tool_begin_action(
+            state,
+            &json!({"tool_name": "Bash", "target": cmd, "parameters": {"command": cmd},
+                    "session_id": sid, "intent": "build"}),
+        )
+        .await
+        .unwrap();
+        let aid = begin["actionId"].as_str().unwrap().to_string();
+        tool_query_policy(state, &json!({"action_id": aid})).await.unwrap()
+    }
+
+    async fn gated_session(mode: &str, min_mb: u64) -> (tempfile::TempDir, SharedState, String) {
+        let (dir, state) = test_state().await;
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = crate::policy::PolicyEngine::new(gated(mode, min_mb));
+        }
+        let connect = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "test"}))
+            .await
+            .unwrap();
+        let sid = connect["sessionId"].as_str().unwrap().to_string();
+        (dir, state, sid)
+    }
+
+    #[tokio::test]
+    async fn observe_mode_witnesses_an_allowed_act_and_opens_one_remedy_request() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+
+        let out = gate_bash(&state, &sid, "cargo-serial test -q").await;
+        assert_eq!(out["decision"], "allow", "observe never changes the verdict: {out}");
+        let r6 = &out["resources"][0];
+        assert_eq!(r6["rules"]["resource"], "cargo");
+        assert_eq!(r6["resource"]["affordable"], false);
+        assert!(r6["reference"]["readings"][0]["reading"].as_u64().is_some(), "a real reading of /");
+        // A second act meeting the same failed floor counts against the SAME request.
+        gate_bash(&state, &sid, "cargo-serial check").await;
+
+        let s = state.lock().await;
+        let chain = s.recent_chain(50);
+        let observed = chain.iter().filter(|e| e.event_type == "resource_observation").count();
+        assert_eq!(observed, 2, "an allowed act still leaves its R6 record");
+        assert!(chain.iter().all(|e| e.event_type != "policy_decision"), "an allow writes no decision row");
+        let opened = chain.iter().filter(|e| e.event_type == "resource_remedy_requested").count();
+        assert_eq!(opened, 1, "one request per failed floor, not one per act");
+        let snap = s.dashboard_snapshot(5);
+        assert_eq!(snap.pending_remedy_requests.len(), 1);
+        assert_eq!(snap.pending_remedy_requests[0]["acts_met"], 2);
+        assert_eq!(snap.pending_remedy_requests[0]["remedy"], "free disk on /");
+    }
+
+    #[tokio::test]
+    async fn a_recovered_reading_closes_the_remedy_request() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        {
+            let mut s = state.lock().await;
+            assert_eq!(s.remedy_requests.len(), 1);
+            *s.policy_engine = crate::policy::PolicyEngine::new(gated("observe", 0));
+        }
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        let s = state.lock().await;
+        assert!(s.remedy_requests.is_empty(), "the floor is met again, so the request closes");
+        assert!(s.recent_chain(20).iter().any(|e| e.event_type == "resource_remedy_cleared"));
+    }
+
+    #[tokio::test]
+    async fn enforce_mode_refuses_with_a_negotiation_and_commits_the_readings_in_the_deny_row() {
+        let (_dir, state, sid) = gated_session("enforce", u64::MAX).await;
+
+        let out = gate_bash(&state, &sid, "cargo-serial test").await;
+        assert_eq!(out["decision"], "deny");
+        assert_eq!(out["enforced"], true);
+        assert_eq!(out["ruleId"], "resource:cargo");
+        let reason = out["reason"].as_str().unwrap();
+        assert!(reason.contains("at or below the floor"), "{reason}");
+        assert!(reason.contains("a later run, when scratch is back above the floor"), "{reason}");
+        assert!(reason.contains("What would fix it (the operator's to do): free disk on /"), "{reason}");
+        assert!(!reason.contains("dashboard"), "the text must not claim a request was filed: {reason}");
+
+        let s = state.lock().await;
+        let pd = s
+            .recent_chain(20)
+            .into_iter()
+            .find(|e| e.event_type == "policy_decision")
+            .expect("an enforced resource deny is witnessed like any deny");
+        assert_eq!(
+            pd.event_data["resource_assessments"][0]["rules"]["resource"], "cargo",
+            "the readings the deny rested on commit in the deny row itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_mode_routes_direct_cargo_to_the_runner_and_an_affordable_runner_act_passes() {
+        let (_dir, state, sid) = gated_session("enforce", 0).await;
+
+        let direct = gate_bash(&state, &sid, "cargo test -q").await;
+        assert_eq!(direct["decision"], "deny");
+        assert!(direct["reason"].as_str().unwrap().contains("run it through the runner: cargo-serial"));
+        let routed = gate_bash(&state, &sid, "cargo-serial test -q").await;
+        assert_eq!(routed["decision"], "allow", "{routed}");
+        assert_eq!(routed["resources"][0]["resource"]["required"]["atp_milli"], 5000);
+        // Nothing scarce, so nothing is owed to the operator.
+        assert!(state.lock().await.remedy_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resource_deny_never_masks_the_destructive_deny_on_the_same_act() {
+        let (_dir, state, sid) = gated_session("enforce", u64::MAX).await;
+        let destructive = ["cargo-serial build && r", "m -rf /home/user/data"].concat();
+        let out = gate_bash(&state, &sid, &destructive).await;
+        assert_eq!(out["decision"], "deny");
+        assert_ne!(
+            out["ruleId"], "resource:cargo",
+            "on a tie the base deny keeps its attribution: {}",
+            out["ruleId"]
+        );
+        // The resource finding is still recorded beside it.
+        assert_eq!(out["resources"][0]["resource"]["affordable"], false);
+    }
+
+    #[tokio::test]
+    async fn acts_that_consume_no_resource_are_untouched() {
+        let (_dir, state, sid) = gated_session("enforce", u64::MAX).await;
+        let out = gate_bash(&state, &sid, "ls -la").await;
+        assert_eq!(out["decision"], "allow");
+        assert_eq!(out["resources"], json!([]));
+        let s = state.lock().await;
+        assert!(s.recent_chain(20).iter().all(|e| e.event_type != "resource_observation"));
+    }
+
+    #[tokio::test]
+    async fn an_open_remedy_request_survives_a_daemon_restart_and_a_cleared_one_does_not() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        {
+            let s = state.lock().await;
+            let rebuilt = crate::server::resource_remedy::rehydrate(&s.chain_store);
+            let r = rebuilt.get("cargo/scratch").expect("still open after a restart");
+            assert_eq!(r.remedy, "free disk on /");
+            assert_eq!(r.mode, "observe");
+            assert!(r.opened_entry.is_some());
+        }
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = crate::policy::PolicyEngine::new(gated("observe", 0));
+        }
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        let s = state.lock().await;
+        assert!(crate::server::resource_remedy::rehydrate(&s.chain_store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_stops_answering_pages_the_operator_until_it_answers() {
+        let (_dir, state) = test_state().await;
+        let probe = crate::policy::resources::Probe::DiskFree { path: "/mnt/c".into() };
+        let mut s = state.lock().await;
+        let stuck = vec![(probe.clone(), std::time::Duration::from_secs(46 * 3600))];
+        crate::server::resource_remedy::note_stuck(&mut s, &stuck, &[], "kimi-code", 100);
+        crate::server::resource_remedy::note_stuck(&mut s, &stuck, &[], "codex", 200);
+        let open = s.remedy_requests.get("probe/free disk at /mnt/c").expect("a stuck probe pages");
+        assert_eq!(open.mode, "health");
+        assert_eq!(open.acts_met, 2, "one request, counted, not one per act");
+        assert!(open.remedy.contains("has not answered for 2760 min"), "{}", open.remedy);
+        crate::server::resource_remedy::note_stuck(&mut s, &[], &[probe], "kimi-code", 300);
+        assert!(s.remedy_requests.is_empty(), "the probe answered, so the request clears");
+        let kinds: Vec<String> = s.recent_chain(10).into_iter().map(|e| e.event_type).collect();
+        assert!(kinds.iter().any(|k| k == "resource_remedy_requested"));
+        assert!(kinds.iter().any(|k| k == "resource_remedy_cleared"));
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_remedy_is_not_shown_open_and_an_unwitnessed_observation_says_so() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        {
+            let mut s = state.lock().await;
+            s.chain_fault_on.insert("resource_remedy_requested".into());
+            s.chain_fault_on.insert("resource_observation".into());
+        }
+        let out = gate_bash(&state, &sid, "cargo-serial build").await;
+        assert_eq!(out["resourcesWitnessed"], false, "{out}");
+        assert!(state.lock().await.remedy_requests.is_empty(), "no row, no open request");
+        {
+            let mut s = state.lock().await;
+            s.chain_fault_on.clear();
+        }
+        let out = gate_bash(&state, &sid, "cargo-serial build").await;
+        assert_eq!(out["resourcesWitnessed"], true);
+        assert_eq!(state.lock().await.remedy_requests.len(), 1, "the next act retries and opens it");
+    }
+
+    #[tokio::test]
+    async fn an_enforced_refusal_does_not_claim_a_request_whose_row_failed() {
+        let (_dir, state, sid) = gated_session("enforce", u64::MAX).await;
+        state.lock().await.chain_fault_on.insert("resource_remedy_requested".into());
+        let out = gate_bash(&state, &sid, "cargo-serial build").await;
+        assert_eq!(out["decision"], "deny");
+        let reason = out["reason"].as_str().unwrap();
+        assert!(!reason.contains("dashboard") && !reason.contains("request has"), "{reason}");
+        assert!(state.lock().await.remedy_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rehydration_reads_the_whole_history_not_a_window() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        gate_bash(&state, &sid, "cargo-serial build").await; // opens cargo/scratch
+        {
+            // Many later remedy rows for other keys, opened and cleared.
+            let s = state.lock().await;
+            for i in 0..60 {
+                let key = format!("other/{i}");
+                s.append_chain("resource_remedy_requested", json!({"key": key, "mode": "observe"})).unwrap();
+                s.append_chain("resource_remedy_cleared", json!({"key": key})).unwrap();
+            }
+            let rebuilt = crate::server::resource_remedy::rehydrate(&s.chain_store);
+            assert!(rebuilt.contains_key("cargo/scratch"), "an old open request survives");
+            assert_eq!(rebuilt.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_health_pass_reports_a_stuck_probe_without_any_gate_call() {
+        let (_dir, state) = test_state().await;
+        let probe = crate::policy::resources::Probe::DiskFree { path: "/health-pass-test-9e2".into() };
+        crate::policy::resource_probes::mark_in_flight_for_test(&probe, std::time::Duration::from_secs(600));
+        {
+            let mut s = state.lock().await;
+            crate::server::resource_remedy::health_pass(&mut s, 1000);
+            let open = s.remedy_requests.get("probe/free disk at /health-pass-test-9e2");
+            assert!(open.is_some_and(|r| r.mode == "health"), "no act happened, yet it is reported");
+        }
+        crate::policy::resource_probes::clear_in_flight_for_test(&probe);
+    }
+
+    #[tokio::test]
+    async fn the_health_pass_retries_unrebuilt_history_and_clears_its_stand_in() {
+        // kimi-code on #1551 at f5a8cfe3: the stand-in had no way to clear but a restart.
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        gate_bash(&state, &sid, "cargo-serial build").await; // opens cargo/scratch on the chain
+        let mut s = state.lock().await;
+        s.remedy_requests.clear();
+        let key = crate::server::resource_remedy::REHYDRATE_KEY.to_string();
+        let stand_in = crate::server::resource_remedy::RemedyRequest {
+            key: key.clone(),
+            resource_id: "hestia".into(),
+            floor_id: "remedy-rehydration".into(),
+            measures: "m".into(),
+            min: None,
+            max: None,
+            reading: None,
+            remedy: "r".into(),
+            mode: "health".into(),
+            opened_at: 1,
+            last_seen_at: 1,
+            acts_met: 0,
+            last_member: "hestia".into(),
+            opened_entry: None,
+        };
+        s.remedy_requests.insert(key.clone(), stand_in);
+        crate::server::resource_remedy::health_pass(&mut s, 1000);
+        assert!(!s.remedy_requests.contains_key(&key), "rebuilt, so the stand-in clears");
+        assert!(s.remedy_requests.contains_key("cargo/scratch"), "and what it stood in for is back");
+    }
+
+    #[tokio::test]
+    async fn an_unwitnessed_clear_leaves_the_request_open() {
+        let (_dir, state, sid) = gated_session("observe", u64::MAX).await;
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        {
+            let mut s = state.lock().await;
+            *s.policy_engine = crate::policy::PolicyEngine::new(gated("observe", 0));
+            s.chain_fault_on.insert("resource_remedy_cleared".into());
+        }
+        gate_bash(&state, &sid, "cargo-serial build").await;
+        assert_eq!(state.lock().await.remedy_requests.len(), 1, "chain and dashboard must agree");
+    }
+
+    #[tokio::test]
+    async fn a_runner_elsewhere_in_the_line_does_not_route_the_build_after_it() {
+        let (_dir, state, sid) = gated_session("enforce", 0).await;
+        let out = gate_bash(&state, &sid, "cargo-serial check && cargo test").await;
+        assert_eq!(out["decision"], "deny", "{out}");
+        assert!(out["reason"].as_str().unwrap().contains("does not go through its runner"));
+    }
+
+    #[test]
+    fn a_policy_without_resources_hashes_as_before() {
+        let cfg = crate::policy::get_preset("safety").unwrap().config;
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(!text.contains("resources"), "an empty resources list must not serialise");
     }
 
     /// The load-bearing case: a **denied** action is blocked *before* it runs,
@@ -12314,6 +12774,7 @@ mod accountability_tests {
                 },
             };
             let cfg = crate::policy::PolicyConfig {
+                resources: Vec::new(),
                 default_policy: crate::policy::PolicyDecision::Allow,
                 enforce: true,
                 rules: vec![rule],
@@ -15589,6 +16050,7 @@ mod tests {
 
     pub(super) fn deny_credential_access_engine() -> PolicyEngine {
         PolicyEngine::new(PolicyConfig {
+            resources: Vec::new(),
             default_policy: PolicyDecision::Allow,
             enforce: true,
             rules: vec![PolicyRule {

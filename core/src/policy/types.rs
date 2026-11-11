@@ -161,6 +161,12 @@ pub struct PolicyConfig {
     /// so the caller can run in audit/observation mode.
     pub enforce: bool,
     pub rules: Vec<PolicyRule>,
+    /// Gated resources (#1548): scarce things on this machine, the acts that consume them, and
+    /// whether the community can afford such an act right now. Local law like the rules above,
+    /// assessed beside them; an assessment can only add a deny, never loosen the fold. Empty and
+    /// skipped when absent, so a policy without resources hashes exactly as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<super::resources::GatedResource>,
 }
 
 /// Result of evaluating a tool call against a policy.

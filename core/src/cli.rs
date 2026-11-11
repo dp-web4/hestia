@@ -981,6 +981,22 @@ enum PolicyCmd {
         role: Option<String>,
     },
 
+    /// Add or replace a gated resource (#1548) from a JSON declaration: a scarce thing on this
+    /// machine, the acts that consume it, the floors and price that decide whether the community
+    /// can afford such an act right now, and what a refused act may do instead. Society law;
+    /// validated before it is stored.
+    SetResource {
+        /// Path to the JSON declaration (one resource object)
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
+    /// Remove a gated resource by id
+    RmResource {
+        /// The resource id
+        id: String,
+    },
+
     /// Remove a custom rule by id
     RmRule {
         /// The custom rule id
@@ -1283,6 +1299,8 @@ pub fn run() -> AnyResult<()> {
                 cmd_policy_add_rule(&home, &name, &decision, category, tool, command, targets, priority, role)
             }
             PolicyCmd::RmRule { id, role } => cmd_policy_rm_rule(&home, &id, role),
+            PolicyCmd::SetResource { file } => cmd_policy_set_resource(&home, &file),
+            PolicyCmd::RmResource { id } => cmd_policy_rm_resource(&home, &id),
         },
         Command::Delegate(d) => match d {
             DelegateCmd::AgentId { plugin_id } => cmd_delegate_agent_id(&home, &plugin_id),
@@ -2535,6 +2553,12 @@ fn cmd_policy_show(home: &std::path::Path) -> AnyResult<()> {
     if !state.custom_rules.is_empty() {
         println!("\ncustom rules: {}", state.custom_rules.len());
     }
+    if !state.resources.is_empty() {
+        println!("\ngated resources (#1548):");
+        for r in &state.resources {
+            println!("  {} [{}]: {}", r.id, r.mode.as_str(), r.law_text());
+        }
+    }
     if !state.role_overlays.is_empty() {
         println!("\nrole overlays (#403 — folded strictest-wins onto the base):");
         let mut roles: Vec<_> = state.role_overlays.iter().collect();
@@ -2703,6 +2727,34 @@ fn cmd_policy_add_rule(
             vault.upsert_custom_rule(rule)?;
             println!("✓ custom rule '{id}' added");
         }
+    }
+    println!("  (a running daemon won't pick this up until restart)");
+    Ok(())
+}
+
+fn cmd_policy_set_resource(home: &std::path::Path, file: &std::path::Path) -> AnyResult<()> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", file.display()))?;
+    let resource: hestia::policy::GatedResource = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("{} is not a gated-resource declaration: {e}", file.display()))?;
+    // Validate BEFORE prompting for the vault passphrase: a bad declaration shouldn't cost an
+    // unlock (the vault validates again on write).
+    resource.validate().map_err(|e| anyhow::anyhow!("gated resource refused: {e}"))?;
+    let mut vault = open_vault(home)?;
+    let id = resource.id.clone();
+    let mode = resource.mode.as_str();
+    vault.upsert_resource(resource)?;
+    println!("✓ gated resource '{id}' set ({mode})");
+    println!("  (a running daemon won't pick this up until restart)");
+    Ok(())
+}
+
+fn cmd_policy_rm_resource(home: &std::path::Path, id: &str) -> AnyResult<()> {
+    let mut vault = open_vault(home)?;
+    if vault.remove_resource(id)? {
+        println!("✓ gated resource '{id}' removed");
+    } else {
+        println!("no gated resource with id '{id}'");
     }
     println!("  (a running daemon won't pick this up until restart)");
     Ok(())

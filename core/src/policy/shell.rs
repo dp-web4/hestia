@@ -273,6 +273,37 @@ fn message_comes_from_stdin(rest: &[String]) -> bool {
 /// Character count is preserved (blanked bytes become `' '`, newlines are kept) so that
 /// anything reported against offsets in the projection still lines up with the original.
 pub fn executable_positions(cmd: &str) -> Option<String> {
+    parse(cmd).map(|(_, projection)| projection)
+}
+
+/// One simple command as the parser read it: the executable's basename and the argv it
+/// would receive (assignment prefixes and redirection targets excluded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimpleCommand {
+    pub head: Option<String>,
+    pub args: Vec<String>,
+}
+
+/// Split `cmd` into its simple commands (`;`, `&&`, `||`, `|`, `&`, newline, parentheses), with
+/// the same parser [`executable_positions`] uses. `None` when the command cannot be parsed with
+/// confidence; callers must then fail closed. Words inside a `$( … )` substitution are not
+/// split out: a caller that needs them must treat a substitution as opaque.
+///
+/// Exists for gated resources (#1548): a runner must be bound to the very invocation that
+/// consumes the resource, not found anywhere in the command (`cargo-serial check && cargo test`
+/// runs the second build unserialised).
+pub fn simple_commands(cmd: &str) -> Option<Vec<SimpleCommand>> {
+    parse(cmd).map(|(segs, _)| {
+        segs.into_iter()
+            .filter(|s| s.head.is_some() || !s.args.is_empty())
+            .map(|s| SimpleCommand { head: s.head, args: s.args })
+            .collect()
+    })
+}
+
+/// The parser behind [`executable_positions`] and [`simple_commands`]: the segments and the
+/// projection.
+fn parse(cmd: &str) -> Option<(Vec<Segment>, String)> {
     let ch: Vec<char> = cmd.chars().collect();
     let n = ch.len();
 
@@ -484,7 +515,7 @@ pub fn executable_positions(cmd: &str) -> Option<String> {
             }
         }
     }
-    Some(out.into_iter().collect())
+    Some((segs, out.into_iter().collect()))
 }
 
 /// Apply the scope to a command, returning the text a matcher should run against.
@@ -619,6 +650,11 @@ fn flush_word(
     }
     word.clear();
     *word_quoted = false;
+}
+
+/// `NAME=value`: a variable assignment, not a command word.
+pub(crate) fn is_assignment_word(word: &str) -> bool {
+    is_assignment(word)
 }
 
 fn is_assignment(word: &str) -> bool {
