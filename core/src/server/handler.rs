@@ -1083,10 +1083,14 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // the state lock: before this every gate call's first step queued behind every write in the
     // society. Same reply, same Guard A/C semantics (the key is (plugin_id, host_session_id),
     // never the host id alone); a miss falls through to the locked path, which re-checks.
+    // The intent lets the reaper retain role labels only for a reconnect already in flight, rather
+    // than leaving one permanent tombstone per historical host session.
+    let _reconnect_intent = host_session_id.as_deref().map(|hsid| {
+        state.published().sessions.reconnect_intent(&plugin_id, hsid)
+    });
     if let Some(hsid) = host_session_id.as_deref() {
         let published = state.published();
-        if let Some(existing) = published.sessions.find_reuse_live(&plugin_id, hsid, Utc::now()) {
-            existing.touch();
+        if let Some(existing) = published.sessions.touch_reuse_live(&plugin_id, hsid, Utc::now()) {
             if let Some(capabilities) = gate_capabilities.as_ref() {
                 published.gate_capabilities.insert(plugin_id.clone(), capabilities.clone());
             }
@@ -1106,12 +1110,10 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     }
 
     let mut s = state.lock().await;
+    s.reap_stale_sessions(Utc::now());
     let previous_transport = host_session_id
         .as_deref()
-        .and_then(|hsid| s.sessions.find_reuse_id(&plugin_id, hsid))
-        .and_then(|id| s.sessions.get(&id))
-        .cloned();
-    s.reap_stale_sessions(Utc::now());
+        .and_then(|hsid| s.sessions.reconnect_role(&plugin_id, hsid));
 
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
     // (fresh MCP connection per hook subprocess), so without this each tool call mints a distinct
@@ -16092,6 +16094,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn another_connect_reaping_first_does_not_change_reconnect_role() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "raced-role-reconnect",
+                "role": "role:constellation:interactive-dev", "role_basis": "original-role"
+            }),
+        )
+        .await
+        .unwrap();
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let first_uuid = Uuid::parse_str(&first_id).unwrap();
+        {
+            let mut s = shared.lock().await;
+            s.instance_grants.insert(
+                ("claude-code".into(), "role:constellation:reviewer".into()),
+                crate::server::state::InstanceGrant {
+                    preset: "permissive".into(),
+                    granted_by: "operator".into(),
+                    granted_at: 0,
+                    reason: "control: a racing reconnect must not adopt this grant".into(),
+                    expires_at: None,
+                },
+            );
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+
+        let directory = shared.lock().await.sessions.directory();
+        let reconnect_intent = directory.reconnect_intent("claude-code", "raced-role-reconnect");
+        let published = shared.published();
+        assert!(published
+            .sessions
+            .find_reuse_live("claude-code", "raced-role-reconnect", Utc::now())
+            .is_none(), "A misses the published live lookup before its locked reconnect");
+        drop(published);
+
+        tool_connect(
+            &shared,
+            &json!({"plugin_id": "codex", "host_agent": "cx", "host_session_id": "racing-b"}),
+        )
+        .await
+        .unwrap();
+        assert!(!shared.lock().await.sessions.contains_key(&first_uuid),
+            "B's connect reaps A before A reaches the locked reconnect");
+        assert_eq!(directory.reconnect_state_counts(), (1, 1),
+            "the paused reconnect holds the only role tombstone");
+
+        let second = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "raced-role-reconnect",
+                "role": "role:constellation:reviewer", "role_basis": "changed-role"
+            }),
+        )
+        .await
+        .unwrap();
+        let second_id = second["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(second_id, first_id);
+        assert_eq!(second["constellationRole"], "role:constellation:interactive-dev");
+        assert_eq!(second["roleBasis"], "original-role");
+        assert_eq!(second["roleDeclarationHonored"], false);
+        let law = tool_operating_law(&shared, &json!({"session_id": second_id}))
+            .await
+            .unwrap();
+        assert_eq!(law["identity"]["role"], "role:constellation:interactive-dev");
+        assert!(law["operator_grant"].is_null(), "the reviewer grant was not adopted: {law}");
+        drop(reconnect_intent);
+        assert_eq!(directory.reconnect_state_counts(), (0, 0),
+            "completion releases both the intent and its role tombstone");
+    }
+
+    #[tokio::test]
+    async fn reaping_without_a_reconnect_intent_leaves_no_role_residue() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "unclaimed-role-reaping"
+            }),
+        )
+        .await
+        .unwrap();
+        let first_uuid = Uuid::parse_str(first["sessionId"].as_str().unwrap()).unwrap();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+        let directory = shared.lock().await.sessions.directory();
+
+        tool_connect(
+            &shared,
+            &json!({"plugin_id": "codex", "host_agent": "cx", "host_session_id": "unrelated-connect"}),
+        )
+        .await
+        .unwrap();
+
+        assert!(!shared.lock().await.sessions.contains_key(&first_uuid));
+        assert_eq!(directory.reconnect_state_counts(), (0, 0),
+            "an idle host with no reconnect in flight leaves no permanent role metadata");
+    }
+
+    #[tokio::test]
+    async fn lock_free_reuse_and_stale_reaping_are_atomic_in_either_order() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "reuse-reap-race"}),
+        )
+        .await
+        .unwrap();
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let first_uuid = Uuid::parse_str(&first_id).unwrap();
+        let directory = shared.lock().await.sessions.directory();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+
+        directory.action_started(first_uuid);
+        let reused = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "reuse-reap-race"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reused["sessionId"], first_id);
+        assert_eq!(reused["reused"], true);
+        directory.action_finished(first_uuid);
+        assert_eq!(shared.lock().await.reap_stale_sessions(Utc::now()), 0,
+            "reuse touches liveness before a later reaper can remove the session");
+        assert!(directory.resolve_live(&first_uuid, Utc::now()).is_some());
+
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+        directory.action_started(first_uuid);
+        let selected = directory
+            .find_reuse_live("claude-code", "reuse-reap-race", Utc::now())
+            .expect("in-flight work makes the stale transport selectable");
+        assert_eq!(selected.session_id, first_uuid);
+        directory.action_finished(first_uuid);
+        assert_eq!(shared.lock().await.reap_stale_sessions(Utc::now()), 1,
+            "the reaper wins this ordering before any reuse touch");
+        assert!(directory
+            .touch_reuse_live("claude-code", "reuse-reap-race", Utc::now())
+            .is_none(), "a removed selection cannot be refreshed back into the directory");
+        assert!(directory.resolve_live(&first_uuid, Utc::now()).is_none());
+
+        let replacement = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "reuse-reap-race"}),
+        )
+        .await
+        .unwrap();
+        let replacement_id = replacement["sessionId"].as_str().unwrap();
+        assert_ne!(replacement_id, first_id, "the caller gets a live replacement, never the dead id");
+        let replacement_uuid = Uuid::parse_str(replacement_id).unwrap();
+        assert!(directory.resolve_live(&replacement_uuid, Utc::now()).is_some());
+    }
+
+    #[tokio::test]
     async fn stale_sessions_are_not_resolved_by_scope_or_law_reads() {
         let (_dir, shared) = make_shared_state();
         let connected = tool_connect(
@@ -16113,24 +16293,33 @@ mod tests {
             s.sessions.insert(uuid, session);
         }
 
-        let law = tool_operating_law(&shared, &json!({"session_id": session_id.clone()}))
+        for explicit_id in [session_id.clone(), Uuid::new_v4().to_string()] {
+            let law = tool_operating_law(&shared, &json!({"session_id": explicit_id.clone()}))
+                .await
+                .unwrap();
+            assert_eq!(law["_hestia_error"]["code"], "hestia.operating_law_unattributed");
+            let scope = tool_scope_request_view(
+                &shared,
+                &json!({"request_id": "scope-stale-read", "session_id": explicit_id.clone()}),
+            )
+            .await;
+            assert!(scope.unwrap_err().to_string().contains("live session_id"));
+            let status = tool_scope_status(
+                &shared,
+                &json!({"plugin_id": "claude-code", "session_id": explicit_id.clone()}),
+            )
             .await
             .unwrap();
-        assert_eq!(law["_hestia_error"]["code"], "hestia.operating_law_unattributed");
-        let scope = tool_scope_request_view(
-            &shared,
-            &json!({"request_id": "scope-stale-read", "session_id": session_id.clone()}),
-        )
-        .await;
-        assert!(scope.unwrap_err().to_string().contains("live session_id"));
-        let status = tool_scope_status(
-            &shared,
-            &json!({"plugin_id": "claude-code", "session_id": session_id}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(status["caller_bound"], false,
-            "the compatibility read may be unbound, never bound to a stale session: {status}");
+            assert_eq!(status["caller_bound"], false,
+                "the compatibility read may be unbound, never bound to a stale or unknown id: {status}");
+            let own = read_resource_body(
+                &shared,
+                &format!("hestia://session/own?session_id={explicit_id}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(own, "null", "an explicit stale or unknown id never falls back to a live session");
+        }
     }
 
     /// The read side of local coordination: siblings lists every connected session (heterogeneous by

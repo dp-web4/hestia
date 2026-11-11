@@ -20,9 +20,11 @@
 //! existing suite loudly instead of serving a stale law. `HESTIA_SKIP_PUBLICATION_CHECK=1` opts out.
 //!
 //! Session identity (for "who is asking") is served from a [`SessionDirectory`] beside the
-//! publication. Its changes are STAGED by [`Sessions`] and applied at the same release, under the
-//! same write lock as the publication swap. The connect REUSE arm (a timestamp bump on a known
-//! host session) is served from the directory too, and takes no state lock.
+//! publication. Ordinary changes are STAGED by [`Sessions`] and applied at the same release, under
+//! the same write lock as the publication swap. Stale reaping instead removes the map and directory
+//! entries under the directory write lock, which also excludes the connect REUSE arm's atomic
+//! lookup-and-touch. A reuse therefore either refreshes a session the reaper will retain or misses
+//! and falls through to locked replacement; it never returns an id concurrently removed as stale.
 //!
 //! WHAT THAT DOES AND DOES NOT MAKE ATOMIC (Codex reviews of #1267, 1f460fd4 and notice 19473). The
 //! directory is SHARED by every publication, not versioned with it: `StateCell::published()`
@@ -360,11 +362,31 @@ struct DirInner {
     /// The reuse key: (claimed member, host session id) — never the host id alone (Guard C).
     by_reuse_key: HashMap<(String, String), Uuid>,
     in_flight: HashMap<Uuid, usize>,
+    reconnecting: HashMap<(String, String), usize>,
+    reaped: HashMap<(String, String), TransportRole>,
 }
 
 #[derive(Default)]
 pub struct SessionDirectory {
     inner: RwLock<DirInner>,
+}
+
+pub struct ReconnectIntent {
+    directory: Arc<SessionDirectory>,
+    key: (String, String),
+}
+
+impl Drop for ReconnectIntent {
+    fn drop(&mut self) {
+        let mut g = self.directory.inner.write().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = g.reconnecting.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                g.reconnecting.remove(&self.key);
+                g.reaped.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl SessionDirectory {
@@ -392,6 +414,36 @@ impl SessionDirectory {
         let ident = g.by_id.get(id)?;
         Self::is_live(&g, id, ident, now).then(|| ident.clone())
     }
+    pub fn touch_reuse_live(
+        &self,
+        plugin_id: &str,
+        host_session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Arc<SessionIdent>> {
+        let g = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        let id = g.by_reuse_key.get(&(plugin_id.to_string(), host_session_id.to_string()))?;
+        let ident = g.by_id.get(id)?;
+        if !Self::is_live(&g, id, ident, now) {
+            return None;
+        }
+        ident.touch();
+        Some(ident.clone())
+    }
+    pub fn reconnect_intent(
+        self: &Arc<Self>,
+        plugin_id: &str,
+        host_session_id: &str,
+    ) -> ReconnectIntent {
+        let key = (plugin_id.to_string(), host_session_id.to_string());
+        let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        *g.reconnecting.entry(key.clone()).or_default() += 1;
+        ReconnectIntent { directory: self.clone(), key }
+    }
+    #[cfg(test)]
+    pub fn reconnect_state_counts(&self) -> (usize, usize) {
+        let g = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        (g.reconnecting.len(), g.reaped.len())
+    }
     pub fn action_started(&self, id: Uuid) {
         let mut g = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if g.by_id.contains_key(&id) {
@@ -404,6 +456,16 @@ impl SessionDirectory {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 g.in_flight.remove(&id);
+            }
+        }
+    }
+    fn remove(g: &mut DirInner, id: &Uuid) {
+        if let Some(old) = g.by_id.remove(id) {
+            if let Some(h) = &old.host_session_id {
+                let key = (old.plugin_id.clone(), h.clone());
+                if g.by_reuse_key.get(&key) == Some(id) {
+                    g.by_reuse_key.remove(&key);
+                }
             }
         }
     }
@@ -426,16 +488,7 @@ impl SessionDirectory {
                     }
                     g.by_id.insert(ident.session_id, Arc::new(ident));
                 }
-                DirOp::Remove(id) => {
-                    if let Some(old) = g.by_id.remove(&id) {
-                        if let Some(h) = &old.host_session_id {
-                            let key = (old.plugin_id.clone(), h.clone());
-                            if g.by_reuse_key.get(&key) == Some(&id) {
-                                g.by_reuse_key.remove(&key);
-                            }
-                        }
-                    }
-                }
+                DirOp::Remove(id) => Self::remove(&mut g, &id),
             }
         }
     }
@@ -444,6 +497,24 @@ impl SessionDirectory {
 enum DirOp {
     Put(SessionIdent),
     Remove(Uuid),
+}
+
+/// Role continuity for a reaped transport with a reconnect in flight, without its session id or soft LCT.
+#[derive(Clone)]
+pub struct TransportRole {
+    pub assigned_role: String,
+    pub constellation_role: String,
+    pub role_basis: Option<String>,
+}
+
+impl From<&Session> for TransportRole {
+    fn from(s: &Session) -> Self {
+        Self {
+            assigned_role: s.assigned_role.clone(),
+            constellation_role: s.constellation_role.clone(),
+            role_basis: s.role_basis.clone(),
+        }
+    }
 }
 
 /// The session map. Reads deref to the `HashMap`; every mutation goes through a method here, so
@@ -456,7 +527,11 @@ pub struct Sessions {
 
 impl Default for Sessions {
     fn default() -> Self {
-        Self { map: HashMap::new(), dir: Arc::new(SessionDirectory::default()), pending: Vec::new() }
+        Self {
+            map: HashMap::new(),
+            dir: Arc::new(SessionDirectory::default()),
+            pending: Vec::new(),
+        }
     }
 }
 
@@ -493,6 +568,18 @@ impl Sessions {
             .find(|s| s.plugin_id == plugin_id && s.host_session_id.as_deref() == Some(host_session_id))
             .map(|s| s.session_id)
     }
+    pub fn reconnect_role(&self, plugin_id: &str, host_session_id: &str) -> Option<TransportRole> {
+        self.map
+            .values()
+            .find(|s| s.plugin_id == plugin_id && s.host_session_id.as_deref() == Some(host_session_id))
+            .map(TransportRole::from)
+            .or_else(|| {
+                let g = self.dir.inner.read().unwrap_or_else(|p| p.into_inner());
+                g.reaped
+                    .get(&(plugin_id.to_string(), host_session_id.to_string()))
+                    .cloned()
+            })
+    }
     /// Liveness as every reader should see it: the later of the locked map's `connected_at` and
     /// any lock-free reuse bump since.
     pub fn last_seen(&self, s: &Session) -> DateTime<Utc> {
@@ -500,6 +587,42 @@ impl Sessions {
             Some(id) => id.last_seen().max(s.connected_at),
             None => s.connected_at,
         }
+    }
+    pub fn reap_stale(
+        &mut self,
+        actions: &HashMap<Uuid, super::state::InFlightAction>,
+        now: DateTime<Utc>,
+    ) -> usize {
+        let cutoff = now - chrono::Duration::seconds(super::state::MEMBER_SESSION_IDLE_TTL_SECS);
+        let mut g = self.dir.inner.write().unwrap_or_else(|p| p.into_inner());
+        let stale: Vec<Uuid> = self
+            .map
+            .values()
+            .filter(|session| {
+                let last_seen = g
+                    .by_id
+                    .get(&session.session_id)
+                    .map(|ident| ident.last_seen().max(session.connected_at))
+                    .unwrap_or(session.connected_at);
+                !actions.values().any(|a| a.session_id == session.session_id)
+                    && g.in_flight.get(&session.session_id).copied().unwrap_or(0) == 0
+                    && last_seen < cutoff
+            })
+            .map(|session| session.session_id)
+            .collect();
+        let count = stale.len();
+        for id in stale {
+            if let Some(session) = self.map.remove(&id) {
+                SessionDirectory::remove(&mut g, &id);
+                if let Some(h) = &session.host_session_id {
+                    let key = (session.plugin_id.clone(), h.clone());
+                    if g.reconnecting.contains_key(&key) {
+                        g.reaped.insert(key, TransportRole::from(&session));
+                    }
+                }
+            }
+        }
+        count
     }
     pub(crate) fn has_pending(&self) -> bool {
         !self.pending.is_empty()

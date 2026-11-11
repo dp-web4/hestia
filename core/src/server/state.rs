@@ -967,17 +967,7 @@ impl ServerState {
     /// Remove idle transport residue. A later host reconnect mints a replacement;
     /// policy and grants are never keyed to this RAM-only object.
     pub fn reap_stale_sessions(&mut self, now: chrono::DateTime<chrono::Utc>) -> usize {
-        let stale: Vec<uuid::Uuid> = self
-            .sessions
-            .values()
-            .filter(|session| !self.session_is_live(session, now))
-            .map(|session| session.session_id)
-            .collect();
-        let count = stale.len();
-        for id in stale {
-            self.sessions.remove(&id);
-        }
-        count
+        self.sessions.reap_stale(&self.actions, now)
     }
 
     /// Open all persistent stores rooted at `home` and prepare server state.
