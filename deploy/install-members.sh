@@ -373,84 +373,88 @@ has_plan() {   # has_plan <member> — any planned hook for this member?
   return 1
 }
 
+[ -f "$REPO_ROOT/tools/registration_resolver.py" ] || die "canonical registration resolver is missing at $REPO_ROOT/tools/registration_resolver.py"
+
+# Each member declares WHAT it installs and HOW its harness records a registration;
+# the canonical resolver derives WHERE from that registration, never from a guessed layout.
+# Resolve registrations and check their completeness and hydrate roots for EVERY member
+# before the shared engine or any member file changes.
+# Command substitution, NOT `mapfile < <(...)`: a process substitution's exit status is
+# not the producer's, so the resolver's SKIP codes below would all read as success.
+declare -A preflight_members=()
+declare -A resolved_registrations=()
 for expects in "$REPO_ROOT"/plugins/*/expects.json; do
   [ -e "$expects" ] || continue
   member="$(basename "$(dirname "$expects")")"
-
-  # --- decomposition: the member declares WHAT it installs, and HOW ITS HARNESS ------
-  # --- records a registration. The core derives WHERE from that registration. -------
-  # This is the fractal split dp asked for: the invariant (derive, never assume) stays
-  # up here once; the per-harness detail (which file, which syntax) decomposes into the
-  # member's own expects.json and needs no new script.
-  #
-  # The reader emits one `basename<TAB>absolute-path` line per registered hook. It never
-  # spells an install path itself — a source file in this repo that spells one
-  # contiguously is a file this repo's own gate refuses to let a governed member Write
-  # (the FP8 constraint), which is also why `registration.path` is a list of SEGMENTS.
-  # Command substitution, NOT `mapfile < <(...)`: a process substitution's exit status is
-  # not the producer's, so the reader's SKIP codes below would all read as success.
   reg_rc=0
-  reg_out="$(python3 - "$expects" <<'PY'
-import json, os, re, sys
-
-spec = (json.load(open(sys.argv[1], encoding="utf-8")).get("install") or {})
-reg = spec.get("registration") or {}
-segs, reader = reg.get("path") or [], reg.get("reader", "")
-if not segs or not reader:
-    sys.exit(2)                     # member declares no registration: caller SKIPs loudly
-path = os.path.join(os.path.expanduser("~"), *segs)
-if not os.path.exists(path):
-    sys.exit(3)                     # harness not registered on this host: not our member
-
-tokens = []
-if reader == "json-hook-commands":
-    def walk(o):
-        if isinstance(o, dict):
-            for k, v in o.items():
-                tokens.extend(v.split()) if k == "command" and isinstance(v, str) else walk(v)
-        elif isinstance(o, list):
-            for v in o:
-                walk(v)
-    try:
-        walk(json.load(open(path, encoding="utf-8")))
-    except ValueError:
-        sys.exit(4)                 # registration present but unparseable: never guess
-elif reader == "toml-hook-commands":
-    # Deliberately a line scan, not a TOML parse: tomllib is 3.11+ and this script must
-    # run on whatever python3 the operator's box has. Only `command = "..."` is read.
-    for line in open(path, encoding="utf-8", errors="replace"):
-        m = re.match(r"""\s*command\s*=\s*(['"])(.*)\1\s*$""", line)
-        if m:
-            tokens.extend(m.group(2).split())
-else:
-    sys.exit(5)                     # unknown reader: a typo must not read as "no hooks"
-
-seen = set()
-for tok in tokens:
-    # A hook command is `ENV=v python3 /abs/path/hook.py`; the target is the token that is
-    # an absolute path, and its DIRECTORY is where the harness actually invokes from.
-    if tok.startswith("/") and os.path.basename(tok) not in seen:
-        seen.add(os.path.basename(tok))
-        print(f"{os.path.basename(tok)}\t{tok}")
-PY
-)" || reg_rc=$?
+  reg_out="$(python3 "$REPO_ROOT/tools/registration_resolver.py" "$expects")" || reg_rc=$?
   case "$reg_rc" in
-    2) log "SKIP  $member — declares no install.registration (nothing to derive a target from)"; any_skipped=1; continue ;;
+    2) if python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("state") == "not_declared" else 1)' <<<"$reg_out"; then
+         log "SKIP  $member — declares no install.registration (nothing to derive a target from)"
+         any_skipped=1
+         continue
+       else
+         die "$member canonical registration resolver failed (rc=2); refusing to guess a target"
+       fi ;;
     3) if has_plan "$member"; then
-         # The harness is here (its config DIR exists; the registrar checked) but has no
-         # registration file yet: install the planned hooks, then the registrar writes it.
          log "  $member: no registration file yet — installing its planned hooks, then registering"
          reg_out=""
        else
          log "SKIP  $member — its harness registration file is absent (member not on this host)"; any_skipped=1; continue
        fi ;;
-    4) log "SKIP  $member — registration file present but unparseable; refusing to guess a target"; any_skipped=1; continue ;;
-    5) die  "$member declares an unknown install.registration.reader" ;;
+    4) die "$member registration file is present but unparseable; refusing to guess a target" ;;
+    5) die "$member declares an unknown install.registration.reader" ;;
+    6) die "$member registration file is unreadable; refusing to guess a target" ;;
+    *) if [ "$reg_rc" != 0 ]; then
+         die "$member canonical registration resolver failed (rc=$reg_rc); refusing to guess a target"
+       fi ;;
   esac
 
+  if [ "$reg_rc" = 0 ]; then
+    reg_complete_rc=0
+    reg_targets="$(python3 -c '
+import json,sys
+result=json.load(sys.stdin)
+if not result.get("complete"):
+    sys.exit(7)
+for target in result["targets"]:
+    print(f"{target['"'"'basename'"'"']}\t{target['"'"'path'"'"']}")' <<<"$reg_out")" || reg_complete_rc=$?
+    if [ "$reg_complete_rc" != 0 ]; then
+      die "$member registration has unclassified commands; refusing to guess a complete target set"
+    fi
+    reg_out="$reg_targets"
+  fi
+
+  preflight_members["$member"]=1
+  resolved_registrations["$member"]="$reg_out"
   declare -A registered=()
   while IFS=$'\t' read -r reg_base reg_path; do
-    [ -n "$reg_base" ] && registered["$reg_base"]="$reg_path"
+    [ -n "$reg_base" ] || continue
+    registered["$reg_base"]="${registered[$reg_base]:-}${reg_path}"$'\n'
+  done <<< "$reg_out"
+  if [ -f "$REPO_ROOT/plugins/$member/instance/identity.seed.json" ] && [ -n "${registered[hydrate.sh]:-}" ]; then
+    declare -A hydrate_seed_roots=()
+    mapfile -t hydrate_targets < <(printf '%s' "${registered[hydrate.sh]}")
+    for hydrate_target in "${hydrate_targets[@]}"; do
+      hydrate_seed_root="$(dirname "$(dirname "$hydrate_target")")"
+      hydrate_seed_roots["$hydrate_seed_root"]=1
+    done
+    if [ "${#hydrate_seed_roots[@]}" -gt 1 ]; then
+      die "$member has hydrate.sh targets with distinct identity-seed roots: ${!hydrate_seed_roots[*]}; refusing to choose one consumer"
+    fi
+  fi
+done
+
+for expects in "$REPO_ROOT"/plugins/*/expects.json; do
+  [ -e "$expects" ] || continue
+  member="$(basename "$(dirname "$expects")")"
+
+  [ "${preflight_members[$member]:-0}" = 1 ] || continue
+  reg_out="${resolved_registrations[$member]}"
+  declare -A registered=()
+  while IFS=$'\t' read -r reg_base reg_path; do
+    [ -n "$reg_base" ] || continue
+    registered["$reg_base"]="${registered[$reg_base]:-}${reg_path}"$'\n'
   done <<< "$reg_out"
 
   mapfile -t files < <(python3 -c '
@@ -489,21 +493,13 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
     [ -f "$src" ] || die "$member declares '$rel' but $src does not exist"
     base="$(basename "$rel")"
 
-    target="${registered[$base]:-}"
+    mapfile -t targets < <(printf '%s' "${registered[$base]:-}")
     is_planned=""
-    if [ -z "$target" ] && [ -n "${planned[$member/$base]:-}" ]; then
-      target="${planned[$member/$base]}"
+    if [ "${#targets[@]}" -eq 0 ] && [ -n "${planned[$member/$base]:-}" ]; then
+      targets=("${planned[$member/$base]}")
       is_planned=1
-      if [ ! -d "$(dirname "$target")" ]; then
-        if [ "$DRY_RUN" = "1" ]; then
-          log "  would create $(dirname "$target")"
-        else
-          mkdir -p -m 0755 "$(dirname "$target")"
-          log "  made  $(dirname "$target")"
-        fi
-      fi
     fi
-    if [ -z "$target" ]; then
+    if [ "${#targets[@]}" -eq 0 ]; then
       # NOT an error and NOT a silent success: a host that does not register this hook has
       # nothing to deploy, which is a different outcome from "deployed". Same reason the
       # deploy gauge must not read amber as green.
@@ -511,42 +507,49 @@ print(os.path.expanduser(p) if p else "")' "$expects")"
       any_skipped=1
       continue
     fi
-    target_dir="$(dirname "$target")"
-    if [ ! -d "$target_dir" ]; then
-      if [ -n "$is_planned" ] && [ "$DRY_RUN" = "1" ]; then
-        :   # a dry run creates nothing; the planned directory is named above
-      else
-        die "$member/$base is registered at $target but $target_dir does not exist"
-      fi
-    fi
-    if [ -n "$declared" ] && [ "$target_dir" != "$declared" ]; then
-      warn "$member/$base: expects.json declares '$declared' but the harness invokes it from '$target_dir' — installing to the REGISTERED path. The declared value is a per-seat CLAIM this run just checked, not a fleet-wide target: layouts differ by seat, so this divergence may be structural rather than a stale string to correct"
-    fi
-
-    # A registered consumer exists on this host: the engine it imports must be active (and
-    # re-verified) before its bytes are touched or confirmed current. Once per run, lazily.
-    activate_shared_engine
     src_hash="$(sha256sum "$src" | cut -d' ' -f1)"
-    if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$src_hash" ]; then
-      log "  ok    $base (already current) -> $target_dir"
-    elif [ "$DRY_RUN" = "1" ]; then
-      log "  would $base -> $target_dir"
-    else
-      # INVARIANT 2: preserve what is currently enforcing before replacing it.
-      [ -f "$target" ] && cp -p "$target" "$target.pre-install.bak"
-      install -m 0755 "$src" "$target"
-      # INVARIANT 3: prove the bytes landed. cp exiting 0 is not evidence.
-      got="$(sha256sum "$target" | cut -d' ' -f1)"
-      [ "$got" = "$src_hash" ] || die "$member/$base verify FAILED (src $src_hash != installed $got)"
-      log "  wrote $base -> $target_dir"
-    fi
-    # The recorded path is the DERIVED one, so the authority file says where the bytes
-    # actually went — not where a manifest said they would. An audit that reads this can
-    # now be checked against the live registration instead of against the same claim.
-    member_files_json="$member_files_json{\"file\":\"$base\",\"path\":\"$target\",\"sha256\":\"$src_hash\"},"
-    # Where the hooks actually run from anchors the identity seed below. hydrate.sh's fallback is
-    # $(dirname "$0")/.., so its own directory wins when it is one of the files.
-    if [ -z "$seed_anchor" ] || [ "$base" = "hydrate.sh" ]; then seed_anchor="$target_dir"; fi
+    for target in "${targets[@]}"; do
+      target_dir="$(dirname "$target")"
+      if [ ! -d "$target_dir" ]; then
+        if [ -n "$is_planned" ]; then
+          if [ "$DRY_RUN" = "1" ]; then
+            log "  would create $target_dir"
+          else
+            mkdir -p -m 0755 "$target_dir"
+            log "  made  $target_dir"
+          fi
+        else
+          die "$member/$base is registered at $target but $target_dir does not exist"
+        fi
+      fi
+      if [ -n "$declared" ] && [ "$target_dir" != "$declared" ]; then
+        warn "$member/$base: expects.json declares '$declared' but the harness invokes it from '$target_dir' — installing to the REGISTERED path. The declared value is a per-seat CLAIM this run just checked, not a fleet-wide target: layouts differ by seat, so this divergence may be structural rather than a stale string to correct"
+      fi
+
+      # A registered consumer exists on this host: the engine it imports must be active (and
+      # re-verified) before its bytes are touched or confirmed current. Once per run, lazily.
+      activate_shared_engine
+      if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$src_hash" ]; then
+        log "  ok    $base (already current) -> $target_dir"
+      elif [ "$DRY_RUN" = "1" ]; then
+        log "  would $base -> $target_dir"
+      else
+        # INVARIANT 2: preserve what is currently enforcing before replacing it.
+        [ -f "$target" ] && cp -p "$target" "$target.pre-install.bak"
+        install -m 0755 "$src" "$target"
+        # INVARIANT 3: prove the bytes landed. cp exiting 0 is not evidence.
+        got="$(sha256sum "$target" | cut -d' ' -f1)"
+        [ "$got" = "$src_hash" ] || die "$member/$base verify FAILED (src $src_hash != installed $got)"
+        log "  wrote $base -> $target_dir"
+      fi
+      # The recorded path is the DERIVED one, so the authority file says where the bytes
+      # actually went — not where a manifest said they would. An audit that reads this can
+      # now be checked against the live registration instead of against the same claim.
+      member_files_json="$member_files_json{\"file\":\"$base\",\"path\":\"$target\",\"sha256\":\"$src_hash\"},"
+      # Where the hooks actually run from anchors the identity seed below. hydrate.sh's fallback is
+      # $(dirname "$0")/.., so its own directory wins when it is one of the files.
+      if [ -z "$seed_anchor" ] || [ "$base" = "hydrate.sh" ]; then seed_anchor="$target_dir"; fi
+    done
   done
 
   # --- THE MEMBER MESH RUNTIME (#1373) ------------------------------------------------------------
@@ -576,9 +579,22 @@ import json,sys
 print((json.load(open(sys.argv[1])).get("install") or {}).get("mesh_member") or "")' "$expects")"
   if [ -n "$mesh_id" ]; then
     [ -f "$mesh_manifest" ] || die "$member declares mesh_member but $mesh_manifest is missing"
-    mesh_anchor="${registered[session-mesh-inbox.sh]:-${planned[$member/session-mesh-inbox.sh]:-}}"
-    mesh_dir=""; mesh_skip=""
-    if [ -z "$mesh_anchor" ]; then
+    mapfile -t mesh_anchors < <(printf '%s' "${registered[session-mesh-inbox.sh]:-}")
+    if [ "${#mesh_anchors[@]}" -eq 0 ] && [ -n "${planned[$member/session-mesh-inbox.sh]:-}" ]; then
+      mesh_anchors=("${planned[$member/session-mesh-inbox.sh]}")
+    fi
+    mesh_anchor=""; mesh_dir=""; mesh_skip=""
+    for mesh_candidate in "${mesh_anchors[@]}"; do
+      if [ -z "$mesh_anchor" ]; then
+        mesh_anchor="$mesh_candidate"
+      elif [ "$mesh_candidate" != "$mesh_anchor" ]; then
+        mesh_skip="multiple registered targets for session-mesh-inbox.sh: $mesh_anchor and $mesh_candidate"
+        break
+      fi
+    done
+    if [ -n "$mesh_skip" ]; then
+      :
+    elif [ -z "$mesh_anchor" ]; then
       mesh_skip="its mesh hooks are neither registered nor planned on this host"
     else
       mesh_dir="$(dirname "$mesh_anchor")"
@@ -589,10 +605,16 @@ print((json.load(open(sys.argv[1])).get("install") or {}).get("mesh_member") or 
     if [ -z "$mesh_skip" ]; then
       for name in "${mesh_names[@]}"; do
         src="$mesh_root/$name"   # name, source and directory validated before any write (preflight above)
-        t="${registered[$name]:-${planned[$member/$name]:-}}"
-        if [ -n "$t" ] && [ "$(dirname "$t")" != "$mesh_dir" ]; then
-          mesh_skip="its $name is registered at $t, apart from session-mesh-inbox.sh in $mesh_dir"; break
+        mapfile -t name_targets < <(printf '%s' "${registered[$name]:-}")
+        if [ "${#name_targets[@]}" -eq 0 ] && [ -n "${planned[$member/$name]:-}" ]; then
+          name_targets=("${planned[$member/$name]}")
         fi
+        for t in "${name_targets[@]}"; do
+          if [ "$t" != "$mesh_dir/$name" ]; then
+            mesh_skip="its $name is registered at $t, apart from session-mesh-inbox.sh in $mesh_dir"; break
+          fi
+        done
+        [ -z "$mesh_skip" ] || break
         t="$mesh_dir/$name"
         if [ -L "$t" ]; then mesh_skip="$t is a symlink"; break; fi
         if [ "$name" = "session-mesh-inbox.sh" ] && [ -f "$t" ] && ! cmp -s "$src" "$t"; then

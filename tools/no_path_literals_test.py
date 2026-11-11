@@ -197,7 +197,7 @@ PINNED_BASELINE: dict | None = {
     "deploy/from-main/hestia-deploy-check.timer":   {},
     "deploy/from-main/hestia-deploy.sh":            {"shell-home-default": 3, "shell-home-hestia": 2},
     "deploy/fleet/install.sh":                      {"shell-home-hestia": 2},  # #1444 unit, #1443 gate step
-    "deploy/install-members.sh":                    {"expanduser-tilde": 1, "shell-home-default": 1, "shell-home-hestia": 1},
+    "deploy/install-members.sh":                    {"shell-home-default": 1, "shell-home-hestia": 1},
 }
 
 _FAILS: list[str] = []          # every counted code hit, "rel:line  [class]  text"

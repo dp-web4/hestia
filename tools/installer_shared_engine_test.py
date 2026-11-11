@@ -82,11 +82,14 @@ def build(tmp):
     home = os.path.join(tmp, "home")
     hestia_home = os.path.join(tmp, "hestia-home")
     os.makedirs(os.path.join(root, "deploy"))
+    os.makedirs(os.path.join(root, "tools"))
     os.makedirs(os.path.join(root, "plugins", "m", "hooks"))
     shared = os.path.join(root, "plugins", "_shared")
     os.makedirs(shared)
     os.makedirs(home)
     shutil.copy(SCRIPT, os.path.join(root, "deploy", "install-members.sh"))
+    shutil.copy(os.path.join(REPO, "tools", "registration_resolver.py"),
+                os.path.join(root, "tools", "registration_resolver.py"))
     with open(os.path.join(root, "plugins", "m", "hooks", "hook.py"), "w") as fh:
         fh.write("# fake hook\n")
     for f in ENGINE_FILES + (DECOY_TEST,):
