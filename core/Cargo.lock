@@ -2953,6 +2953,7 @@ name = "web4-policy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "regex",
  "semver",
  "serde",
  "serde_yaml",
