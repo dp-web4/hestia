@@ -77,6 +77,16 @@ class RegistrationResolverTests(unittest.TestCase):
         self.assertEqual({x["path"] for x in r["targets"]}, {str(a), str(b)})
         self.assertTrue(r["complete"])
 
+    def test_absolute_interpreter_resolves_its_script_not_the_interpreter(self):
+        hook = self.touch("hooks/absolute.py")
+        rel = [".claude", "settings.json"]
+        e = self.expects(path=rel)
+        self.reg_json(rel, [f"{sys.executable} {hook}"])
+        r = rr.resolve_registration(e, self.home)
+        self.assertEqual(r["state"], "ok")
+        self.assertTrue(r["complete"])
+        self.assertEqual([x["path"] for x in r["targets"]], [str(hook)])
+
     def test_json_bare_interpreter_uses_separate_args(self):
         hook = self.touch("hooks/arguments.py")
         rel = [".gemini", "settings.json"]

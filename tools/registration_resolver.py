@@ -294,10 +294,7 @@ def _command_target(command: str) -> tuple[str | None, str | None]:
 
     head = tokens[0]
     expanded_head = os.path.expandvars(os.path.expanduser(head))
-    if os.path.isabs(expanded_head):
-        return _expand_path(expanded_head), None
-
-    if os.path.basename(head).lower() in _INTERPRETERS:
+    if os.path.basename(expanded_head).lower() in _INTERPRETERS:
         script = _interpreter_script(tokens)
         if script is None:
             return None, "interpreter invocation has no safely classifiable script operand"
@@ -305,6 +302,9 @@ def _command_target(command: str) -> tuple[str | None, str | None]:
         if os.path.isabs(expanded):
             return _expand_path(expanded), None
         return None, "interpreter script operand is not absolute"
+
+    if os.path.isabs(expanded_head):
+        return _expand_path(expanded_head), None
 
     # Do not scan arbitrary arguments for absolute paths. That was the CBP
     # `--workspace /abs/dir` phantom. A command whose executable is not itself an

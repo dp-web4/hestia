@@ -406,9 +406,9 @@ for expects in "$REPO_ROOT"/plugins/*/expects.json; do
        else
          log "SKIP  $member — its harness registration file is absent (member not on this host)"; any_skipped=1; continue
        fi ;;
-    4) log "SKIP  $member — registration file present but unparseable; refusing to guess a target"; any_skipped=1; continue ;;
-    5) die  "$member declares an unknown install.registration.reader" ;;
-    6) log "SKIP  $member — registration file is unreadable; refusing to guess a target"; any_skipped=1; continue ;;
+    4) die "$member registration file is present but unparseable; refusing to guess a target" ;;
+    5) die "$member declares an unknown install.registration.reader" ;;
+    6) die "$member registration file is unreadable; refusing to guess a target" ;;
     *) if [ "$reg_rc" != 0 ]; then
          die "$member canonical registration resolver failed (rc=$reg_rc); refusing to guess a target"
        fi ;;
@@ -424,9 +424,7 @@ if not result.get("complete"):
 for target in result["targets"]:
     print(f"{target['"'"'basename'"'"']}\t{target['"'"'path'"'"']}")' <<<"$reg_out")" || reg_complete_rc=$?
     if [ "$reg_complete_rc" != 0 ]; then
-      log "SKIP  $member — registration has unclassified commands; refusing to guess a complete target set"
-      any_skipped=1
-      continue
+      die "$member registration has unclassified commands; refusing to guess a complete target set"
     fi
     reg_out="$reg_targets"
   fi
@@ -466,6 +464,17 @@ p=((json.load(open(sys.argv[1])).get("install") or {}).get("dest") or "")
 print(os.path.expanduser(p) if p else "")' "$expects")"
 
   log "MEMBER $member"
+  if [ -f "$REPO_ROOT/plugins/$member/instance/identity.seed.json" ] && [ -n "${registered[hydrate.sh]:-}" ]; then
+    declare -A hydrate_seed_roots=()
+    mapfile -t hydrate_targets < <(printf '%s' "${registered[hydrate.sh]}")
+    for hydrate_target in "${hydrate_targets[@]}"; do
+      hydrate_seed_root="$(dirname "$(dirname "$hydrate_target")")"
+      hydrate_seed_roots["$hydrate_seed_root"]=1
+    done
+    if [ "${#hydrate_seed_roots[@]}" -gt 1 ]; then
+      die "$member has hydrate.sh targets with distinct identity-seed roots: ${!hydrate_seed_roots[*]}; refusing to choose one consumer"
+    fi
+  fi
   member_files_json=""
   seed_anchor=""
   for rel in "${files[@]}"; do
@@ -559,10 +568,22 @@ import json,sys
 print((json.load(open(sys.argv[1])).get("install") or {}).get("mesh_member") or "")' "$expects")"
   if [ -n "$mesh_id" ]; then
     [ -f "$mesh_manifest" ] || die "$member declares mesh_member but $mesh_manifest is missing"
-    mesh_anchor="${registered[session-mesh-inbox.sh]:-${planned[$member/session-mesh-inbox.sh]:-}}"
-    mesh_anchor="${mesh_anchor%%$'\n'*}"
-    mesh_dir=""; mesh_skip=""
-    if [ -z "$mesh_anchor" ]; then
+    mapfile -t mesh_anchors < <(printf '%s' "${registered[session-mesh-inbox.sh]:-}")
+    if [ "${#mesh_anchors[@]}" -eq 0 ] && [ -n "${planned[$member/session-mesh-inbox.sh]:-}" ]; then
+      mesh_anchors=("${planned[$member/session-mesh-inbox.sh]}")
+    fi
+    mesh_anchor=""; mesh_dir=""; mesh_skip=""
+    for mesh_candidate in "${mesh_anchors[@]}"; do
+      if [ -z "$mesh_anchor" ]; then
+        mesh_anchor="$mesh_candidate"
+      elif [ "$mesh_candidate" != "$mesh_anchor" ]; then
+        mesh_skip="multiple registered targets for session-mesh-inbox.sh: $mesh_anchor and $mesh_candidate"
+        break
+      fi
+    done
+    if [ -n "$mesh_skip" ]; then
+      :
+    elif [ -z "$mesh_anchor" ]; then
       mesh_skip="its mesh hooks are neither registered nor planned on this host"
     else
       mesh_dir="$(dirname "$mesh_anchor")"
@@ -573,10 +594,16 @@ print((json.load(open(sys.argv[1])).get("install") or {}).get("mesh_member") or 
     if [ -z "$mesh_skip" ]; then
       for name in "${mesh_names[@]}"; do
         src="$mesh_root/$name"   # name, source and directory validated before any write (preflight above)
-        t="${registered[$name]:-${planned[$member/$name]:-}}"
-        if [ -n "$t" ] && [ "$(dirname "$t")" != "$mesh_dir" ]; then
-          mesh_skip="its $name is registered at $t, apart from session-mesh-inbox.sh in $mesh_dir"; break
+        mapfile -t name_targets < <(printf '%s' "${registered[$name]:-}")
+        if [ "${#name_targets[@]}" -eq 0 ] && [ -n "${planned[$member/$name]:-}" ]; then
+          name_targets=("${planned[$member/$name]}")
         fi
+        for t in "${name_targets[@]}"; do
+          if [ "$t" != "$mesh_dir/$name" ]; then
+            mesh_skip="its $name is registered at $t, apart from session-mesh-inbox.sh in $mesh_dir"; break
+          fi
+        done
+        [ -z "$mesh_skip" ] || break
         t="$mesh_dir/$name"
         if [ -L "$t" ]; then mesh_skip="$t is a symlink"; break; fi
         if [ "$name" = "session-mesh-inbox.sh" ] && [ -f "$t" ] && ! cmp -s "$src" "$t"; then
