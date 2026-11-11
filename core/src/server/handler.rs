@@ -935,7 +935,7 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
     let declared_role = optional_string(args, "role").unwrap_or_default();
     // The published directory first, as real connect does; on a miss the locked state, which
     // real connect also re-checks. Both are reads.
-    let found = match state.published().sessions.find_reuse(&plugin_id, &host_session_id) {
+    let found = match state.published().sessions.find_reuse_live(&plugin_id, &host_session_id, Utc::now()) {
         Some(id) => Some((id.session_id, id.soft_lct.clone(), id.assigned_role.clone(),
                           id.constellation_role.clone(), id.role_basis.clone())),
         None => {
@@ -943,6 +943,7 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
             s.sessions
                 .find_reuse_id(&plugin_id, &host_session_id)
                 .and_then(|id| s.sessions.get(&id))
+                .filter(|session| s.session_is_live(session, Utc::now()))
                 .map(|e| (e.session_id, e.soft_lct.clone(), e.assigned_role.clone(),
                           e.constellation_role.clone(), e.role_basis.clone()))
         }
@@ -16711,6 +16712,37 @@ mod tests {
         assert_eq!(dry["sessionId"], real["sessionId"]);
         let s = shared.lock().await;
         assert_eq!(s.sessions.last_seen(s.sessions.get(&id).unwrap()), before);
+    }
+
+    #[tokio::test]
+    async fn connect_dry_run_rejects_stale_session_without_refreshing_it() {
+        let (_dir, shared) = make_shared_state();
+        let real = tool_connect(&shared, &json!({
+            "plugin_id": "m", "host_agent": "test", "host_session_id": "hs-stale",
+        })).await.unwrap();
+        let id = uuid::Uuid::parse_str(real["sessionId"].as_str().unwrap()).unwrap();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&id).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(id, session);
+        }
+        let (before, chain_before) = {
+            let s = shared.lock().await;
+            (s.sessions.last_seen(s.sessions.get(&id).unwrap()), s.chain_len())
+        };
+
+        let dry = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "m", "host_agent": "test", "host_session_id": "hs-stale",
+        })).await.unwrap();
+        assert_eq!(dry["_hestia_error"]["code"], "hestia.connect_dry_run_no_session");
+        assert!(dry.get("sessionId").is_none());
+
+        let s = shared.lock().await;
+        assert_eq!(s.sessions.last_seen(s.sessions.get(&id).unwrap()), before);
+        assert_eq!(s.sessions.len(), 1, "a dry run neither reaps nor replaces transport");
+        assert_eq!(s.chain_len(), chain_before);
     }
 
     #[tokio::test]
