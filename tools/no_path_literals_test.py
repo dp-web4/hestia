@@ -131,6 +131,12 @@ ALLOWED = [
     ("cwd-root-fallback", "pwd = cwd or os.getcwd()", None,
      "#1232's shell path judge: the same act-relative resolution as the row above (relative words "
      "in a command are resolved against the event cwd); data about the act, not a root"),
+    ("expanduser-tilde", 'os.path.expanduser("~")]', None,
+     "#1329's curl config probe models the client's own HOME-relative .curlrc lookup; data about "
+     "the act, not a Hestia authority root"),
+    ("expanduser-tilde", 'home = os.path.expanduser("~")', None,
+     "#1329's HTTPie-family config probe models the client's own HOME-relative lookup; data about "
+     "the act, not a Hestia authority root"),
     # One-gate stage C: these defaults are data about where the HARNESS itself records this hook,
     # used only to read the timeout the harness enforces. They are allowed ONLY as string literals
     # under HARNESS["registrations"]; an identical fallback anywhere else remains a hardcoded path.
