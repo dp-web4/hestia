@@ -26,19 +26,19 @@ from escalation_payload_census import _cap_suspects, classify  # noqa: E402
 
 def test_claude_edit_fallback_is_destination_only():
     """This seat renders `Tool -> path`. Nothing of old_string/new_string reaches it."""
-    assert classify("Edit -> /mnt/c/exe/projects/ai-agents/hestia/plugins/_shared/x.py") \
+    assert classify("Edit -> /opt/hestia/plugins/_shared/x.py") \
         == "destination-only"
 
 
 def test_kimi_edit_fallback_is_destination_only():
     """kimi renders the SAME fallback as a bare path -- observed on 289e46bfe1be5a3e."""
     assert classify(
-        "/mnt/c/exe/projects/ai-agents/hestia/plugins/_shared/shell_grammar_test.py") \
+        "/opt/hestia/plugins/_shared/shell_grammar_test.py") \
         == "destination-only"
 
 
 def test_write_fallback_is_destination_only():
-    assert classify("Write -> /home/dp/.claude/hooks/hestia/pre_tool_use.py") \
+    assert classify("Write -> /home/member/.claude/hooks/hestia/pre_tool_use.py") \
         == "destination-only"
 
 
@@ -88,7 +88,7 @@ def test_kimi_and_codex_bracket_marker_is_truncated():
     """`s[:400] + "…[truncated]"`. Observed at exactly 412 chars on BOTH seats -- verbatim
     from 13674a4dde3475ce, whose act stops after a bare `|`."""
     assert classify(
-        "cd /mnt/c/exe/projects/ai-agents/hestia && for f in plugins/claude-code/hooks/"
+        "cd /opt/hestia && for f in plugins/claude-code/hooks/"
         "pre_tool_use.py; do git show origin/main:$f | grep -n foo; done; "
         "git show origin/main:plugins/codex/hooks/pre_tool_use.py |…[truncated]") \
         == "truncated"
@@ -98,7 +98,7 @@ def test_a_cut_path_is_truncated_not_destination_only():
     """SYNTHETIC, and the reason `_TRUNCATED` is tested first. A cut path is still one
     whitespace-free token, so `_DEST_ONLY` matches it and the cut vanishes -- the row would
     be counted as a destination the member was reaching, at a path that does not exist."""
-    assert classify("Write -> /home/dp/" + "d/" * 200 + "fi…[truncated]") == "truncated"
+    assert classify("Write -> /home/member/" + "d/" * 200 + "fi…[truncated]") == "truncated"
 
 
 def test_an_uncut_command_is_still_attestable():
@@ -132,7 +132,7 @@ def test_missing_reason_is_absent():
 
 def test_path_with_trailing_space_is_still_destination_only():
     """SYNTHETIC. Trailing whitespace is a transport artefact, not a payload."""
-    assert classify("  Edit -> /home/dp/.claude/settings.json  ") == "destination-only"
+    assert classify("  Edit -> /home/member/.claude/settings.json  ") == "destination-only"
 
 
 # ---- the finding itself, as an executable claim ----

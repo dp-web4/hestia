@@ -216,7 +216,7 @@ check("and the credential-shaped path itself is not copied onto the wire",
       a and "ssh" not in json.dumps(a[0].get("resolved_targets")), a)
 # P1-3, producer side end to end: a credential-shaped COMMAND is withheld whole from the summary,
 # and its sovereign target still rides — redaction is the summary's, not the targets'.
-_cmd = "cp /home/m/" + "." + f"ssh/{_KEYFILE} {_T}"
+_cmd = "cp /home/member/" + "." + f"ssh/{_KEYFILE} {_T}"
 _summary = mech.attempted_summary("Bash", {"command": _cmd}, command=_cmd)
 check("control: the credential-shaped command's summary is withheld whole",
       "REDACTED" in _summary and _HOOK not in _summary, _summary)

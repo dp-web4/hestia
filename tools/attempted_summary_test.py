@@ -201,7 +201,7 @@ def test_no_input_is_stated_not_guessed():
 def test_a_codex_patch_names_its_targets_or_its_body():
     """codex's file acts arrive as apply_patch; the body is the command text, held to the
     same rule (a patch touching a key file is withheld whole)."""
-    body = "*** Begin Patch\n*** Add File: /home/m/.ssh/authorized_keys\n+x\n*** End Patch\n"
+    body = "*** Begin Patch\n*** Add File: /home/member/.ssh/authorized_keys\n+x\n*** End Patch\n"
     ev, out = attempted("codex", "apply_patch", {"command": body}, "PreToolUse")
     check("codex_patch_to_a_key_file_redacts", "REDACTED" in out, out)
     body = "*** Begin Patch\n*** Update File: /tmp/w/notes.md\n+x\n*** End Patch\n"

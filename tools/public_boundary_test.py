@@ -154,7 +154,7 @@ with tempfile.TemporaryDirectory() as td:
     root = Path(td)
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     staged = root / "runtime.py"
-    staged.write_text('ROOT = "/home/actual-operator/runtime"\n')
+    staged.write_text(f'ROOT = "/home/{"actual-operator"}/runtime"\n')
     subprocess.run(["git", "add", "runtime.py"], cwd=root, check=True)
     # A working-tree scan sees the safe unstaged replacement.  A pre-commit
     # scan must still reject the exact installation path already in the index.
@@ -166,7 +166,7 @@ with tempfile.TemporaryDirectory() as td:
     # Git permits newlines in filenames. The index reader uses NUL framing so an
     # adversarial path cannot desynchronize the scanner's path-to-blob mapping.
     odd = root / "odd\nruntime.py"
-    odd.write_text('ROOT = "/home/another-operator/runtime"\n')
+    odd.write_text(f'ROOT = "/home/{"another-operator"}/runtime"\n')
     subprocess.run(["git", "add", "odd\nruntime.py"], cwd=root, check=True)
     cached = boundary.inspect(root, boundary.tracked_paths(root), cached=True)
     check("newline path stays framed", any("odd\nruntime.py" in p for p in cached))
@@ -248,6 +248,33 @@ with tempfile.TemporaryDirectory() as td:
             os.environ.pop("HESTIA_WORKSPACE", None)
         else:
             os.environ["HESTIA_WORKSPACE"] = old_ws
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    (root / "plugins" / "_shared").mkdir(parents=True)
+    (root / "tools").mkdir()
+    test_file = root / "plugins" / "_shared" / "example_test.py"
+    test_file.write_text(f'TARGET = "/mnt/{"c"}/work/web4/hub/target/release/hub"\n')
+    check("mounted host is rejected on test paths too",
+          any("mounted-host" in p for p in boundary.inspect(root, [str(test_file.relative_to(root))])))
+    test_file.write_text(f'TARGET = "/home/{"actual-operator"}/runtime"\n')
+    check("local home is rejected on test paths too",
+          any("local home" in p for p in boundary.inspect(root, [str(test_file.relative_to(root))])))
+    test_file.write_text('TARGET = "/home/member/runtime"\n')
+    check("synthetic local user still passes",
+          boundary.inspect(root, [str(test_file.relative_to(root))]) == [])
+    test_file.write_text('CONTEXT = "private-context"\n')
+    check("private-context keeps its adversarial-test exemption",
+          boundary.inspect(root, [str(test_file.relative_to(root))]) == [])
+    runtime = root / "tools" / "runtime.py"
+    runtime.write_text('PARTIAL = "/tmp/hli7/home/.local/bin"\n')
+    check("mid-path home fragment is not a local home",
+          boundary.inspect(root, [str(runtime.relative_to(root))]) == [])
+    probe = root / "tools" / "gemini_probe.py"
+    probe.write_text("print('probe')\n")
+    check("gemini research probe is named by the guard",
+          any("seat-prefixed research probe" in p
+              for p in boundary.inspect(root, [str(probe.relative_to(root))])))
 
 live = boundary.inspect(REPO, boundary.tracked_paths(REPO), modes=boundary.tracked_modes(REPO))
 if live:
