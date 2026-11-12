@@ -29874,6 +29874,7 @@ mod standing_scope_surface_tests {
     /// `commit_standing_scope` persists a candidate before swapping it live, so
     /// unchangedness is construction, not cleanup. Failure is injected the way it happens:
     /// the vault's directory is made unwritable, so the atomic temp-file write fails.
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_persist_on_replacement_leaves_store_bit_identical() {
         use std::os::unix::fs::PermissionsExt;
@@ -29916,6 +29917,7 @@ mod standing_scope_surface_tests {
     /// restart stays revoked. The first cut's existence check 404ed the retry because the
     /// row had left memory, stranding the operator with a resurrection-on-restart hazard
     /// and no working recovery verb.
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_revoke_is_retryable_and_restart_stays_revoked() {
         use std::os::unix::fs::PermissionsExt;
@@ -33584,12 +33586,14 @@ mod decision_witness_tests {
     /// while the chain keeps committing (row commits, trust write fails). Reads still work — a
     /// store that cannot be READ is an error, not an absent entity (#1271 review 19166), so
     /// swapping the directory for a file no longer models a lost write.
+    #[cfg(unix)]
     fn break_trust(dir: &tempfile::TempDir) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path().join("trust"), std::fs::Permissions::from_mode(0o555))
             .unwrap();
     }
 
+    #[cfg(unix)]
     fn heal_trust(dir: &tempfile::TempDir) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir.path().join("trust"), std::fs::Permissions::from_mode(0o755))
@@ -33616,6 +33620,7 @@ mod decision_witness_tests {
     /// TRUST IS A PROJECTION OF THE CHAIN (#1271). A failing trust-cache write no longer touches
     /// the decision: the charge is the committed row's, acknowledged with it. A restart over the
     /// lost cache replays it exactly once, and a retry charges nothing more.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lost_trust_cache_write_is_replayed_exactly_once() {
         use crate::storage::durability::durable_scope;
@@ -35367,6 +35372,7 @@ mod existence_first_tests {
         assert_eq!(daemon, gate, "daemon READ_ONLY_PATH_TOOLS must equal the gate's read set");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_hint_is_withheld_when_the_member_could_not_read_the_candidate() {
         // Nova/nomad on #1415: the gate's #1412 repair, applied to the daemon's hint.

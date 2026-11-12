@@ -847,6 +847,7 @@ mod tests {
         assert!(restore(&home, "nobody").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_config_keeps_its_mode() {
         use std::os::unix::fs::PermissionsExt;

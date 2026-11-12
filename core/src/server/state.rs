@@ -909,6 +909,103 @@ pub enum StandingGrantFailure {
     },
 }
 
+#[cfg(unix)]
+fn protect_operator_key(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn valid_windows_sid(value: &str) -> bool {
+    let Some(remainder) = value.strip_prefix("S-1-") else {
+        return false;
+    };
+    let components: Vec<_> = remainder.split('-').collect();
+    components.len() >= 2
+        && components.iter().all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+#[cfg(windows)]
+fn parse_whoami_user_sid(output: &[u8]) -> Option<String> {
+    let line = output.split(|byte| *byte == b'\n').next()?;
+    let comma = line.iter().rposition(|byte| *byte == b',')?;
+    let sid = std::str::from_utf8(&line[comma + 1..])
+        .ok()?
+        .trim()
+        .trim_matches('"');
+    valid_windows_sid(sid).then(|| sid.to_owned())
+}
+
+#[cfg(windows)]
+fn current_user_sid() -> Option<String> {
+    let output = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .ok()?;
+    output.status.success().then(|| parse_whoami_user_sid(&output.stdout))?
+}
+
+#[cfg(all(windows, test))]
+std::thread_local! {
+    static OPERATOR_SID_TEST_OVERRIDE: std::cell::RefCell<Option<Option<String>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(windows)]
+fn restrict_operator_key(path: &Path, sid: &str, icacls: &Path) -> Result<()> {
+    match std::process::Command::new(icacls)
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("*{sid}:M"))
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            let _ = std::fs::remove_file(path);
+            anyhow::bail!("icacls could not restrict operator.key to the current process SID ({status}); deleting it")
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(path);
+            Err(anyhow::anyhow!("could not run icacls for operator.key: {error}; deleting it"))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn protect_operator_key_with_sid(path: &Path, sid: Option<&str>) -> Result<()> {
+    let sid = match sid {
+        Some(value) if valid_windows_sid(value) => value,
+        _ => {
+            let _ = std::fs::remove_file(path);
+            anyhow::bail!("current process SID is unavailable or invalid; deleting unprotected operator.key")
+        }
+    };
+    restrict_operator_key(path, sid, Path::new("icacls"))
+}
+
+#[cfg(windows)]
+fn protect_operator_key(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    let sid = OPERATOR_SID_TEST_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(current_user_sid);
+    #[cfg(not(test))]
+    let sid = current_user_sid();
+    protect_operator_key_with_sid(path, sid.as_deref())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn protect_operator_key(path: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(path);
+    anyhow::bail!("operator.key has no private-permission implementation on this platform; deleting it")
+}
+
 fn warm_configured_members(
     vault: &mut Vault,
     registry: &mut crate::member_registry::MemberRegistry,
@@ -1354,7 +1451,6 @@ impl ServerState {
         if self.vault.policy().operator_access_bootstrapped() {
             return Ok(None); // window shut — no re-entry
         }
-        use std::os::unix::fs::PermissionsExt;
         let kp = web4_core::crypto::KeyPair::generate();
         let lct_id = web4_core::lct::derive_lct_id(&kp.verifying_key());
         // Self-contained credential the operator loads into their client: the
@@ -1387,9 +1483,7 @@ impl ServerState {
             serde_json::to_vec_pretty(&cred).unwrap_or_default(),
         )
         .map_err(|e| anyhow::anyhow!("writing operator.key: {e}"))?;
-        let mut perms = std::fs::metadata(&key_path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&key_path, perms)?;
+        protect_operator_key(&key_path)?;
 
         let mut policy = self.vault.policy().clone();
         policy.operator_access.push(crate::vault::OperatorIdentity {
@@ -1401,9 +1495,15 @@ impl ServerState {
             .set_policy(policy)
             .map_err(|e| anyhow::anyhow!("persisting bootstrapped operator: {e}"))?;
 
+        #[cfg(unix)]
+        let protection = "0600";
+        #[cfg(windows)]
+        let protection = "current-user ACL";
+        #[cfg(not(any(unix, windows)))]
+        let protection = "private";
         eprintln!(
             "[hestia] OPERATOR BOOTSTRAP: minted genesis operator {lct_id}\n\
-             [hestia]   private key written to {} (0600) — load it into your operator client;\n\
+             [hestia]   private key written to {} ({protection}) — load it into your operator client;\n\
              [hestia]   the bootstrap window is now SHUT (add further operators via law).",
             key_path.display()
         );
@@ -3145,6 +3245,120 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    static USERNAME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    struct UsernameRestore(Option<String>);
+
+    #[cfg(windows)]
+    impl Drop for UsernameRestore {
+        fn drop(&mut self) {
+            if let Some(value) = self.0.take() {
+                std::env::set_var("USERNAME", value);
+            } else {
+                std::env::remove_var("USERNAME");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    struct OperatorSidOverride;
+
+    #[cfg(windows)]
+    impl Drop for OperatorSidOverride {
+        fn drop(&mut self) {
+            OPERATOR_SID_TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(windows)]
+    fn override_operator_sid(value: Option<&str>) -> OperatorSidOverride {
+        OPERATOR_SID_TEST_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = Some(value.map(str::to_owned));
+        });
+        OperatorSidOverride
+    }
+
+    #[cfg(windows)]
+    fn operator_key_acl(path: &Path) -> String {
+        let output = std::process::Command::new("icacls")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "icacls read failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[cfg(windows)]
+    fn operator_key_sddl(path: &Path) -> String {
+        let quoted_path = path.display().to_string().replace('\'', "''");
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command"])
+            .arg(format!("(Get-Acl -LiteralPath '{quoted_path}').Sddl"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "Get-Acl failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[cfg(windows)]
+    fn assert_current_user_acl(path: &Path) {
+        let acl = operator_key_acl(path);
+        let sddl = operator_key_sddl(path);
+        let sid = current_user_sid().unwrap();
+        let modify_grant = format!(";M;;;{sid})");
+        let modify_grant_hex = format!(";0x1301bf;;;{sid})");
+        assert!(
+            sddl.contains(&modify_grant) || sddl.contains(&modify_grant_hex),
+            "current process SID modify grant: {sddl}"
+        );
+        assert!(!acl.lines().any(|line| line.contains("(I)")), "inherited grants removed: {acl}");
+        assert!(!sddl.contains("S-1-5-32-545"), "shared Users group has no grant: {sddl}");
+        if sid != "S-1-5-20" {
+            assert!(!sddl.contains("S-1-5-20"), "Network Service has no grant: {sddl}");
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_effective_access(path: &Path) {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("tools/windows_acl_effective_probe.ps1");
+        let command = format!("& '{}' -Path '{}'", script.display(), path.display());
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "effective access probe failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_whoami_sid_parser_does_not_decode_account_name() {
+        let sid = "S-1-5-21-100-200-300-1000";
+        let mut output = b"\"non-utf8-\xff\",\"".to_vec();
+        output.extend_from_slice(sid.as_bytes());
+        output.extend_from_slice(b"\"\r\n");
+        assert_eq!(parse_whoami_user_sid(&output).as_deref(), Some(sid));
+        for malformed in [
+            "",
+            "\"user\",\"\"",
+            "\"user\",\"S-2-5-18\"",
+            "\"user\",\"S-1-5\"",
+            "\"user\",\"S-1-5-x\"",
+        ] {
+            assert_eq!(parse_whoami_user_sid(malformed.as_bytes()), None, "{malformed}");
+        }
+    }
+
     #[test]
     fn operator_bootstrap_is_bounded_and_no_reentry() {
         let (_dir, mut state) = make_state();
@@ -3154,15 +3368,21 @@ mod tests {
         assert!(first.is_some(), "genesis mints an operator");
         assert!(state.vault.policy().operator_access_bootstrapped());
         assert_eq!(state.vault.policy().operator_access.len(), 1);
-        // the credential was written 0600 for the operator to load, and is a
-        // valid {lct_id, secret_key_hex} the client can sign with
+        // the credential is private to the operator and is a valid client signing identity
         let key = state.home.join("operator.key");
         assert!(key.exists());
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        assert_current_user_acl(&key);
+        #[cfg(windows)]
+        assert_effective_access(&key);
         let cred: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&key).unwrap()).unwrap();
         assert_eq!(cred["lct_id"], first.clone().unwrap());
@@ -3170,6 +3390,101 @@ mod tests {
         // window shut: re-run is a no-op (no re-entry, no second operator)
         assert!(state.bootstrap_operator_if_genesis().unwrap().is_none());
         assert_eq!(state.vault.policy().operator_access.len(), 1);
+
+        drop(state);
+        let vault = Vault::open(_dir.path().join("v.enc"), "p".into()).unwrap();
+        let mut state = ServerState::open(vault, _dir.path(), "p").unwrap();
+        assert!(state.bootstrap_operator_if_genesis().unwrap().is_none());
+        assert_eq!(state.vault.policy().operator_access.len(), 1);
+        #[cfg(windows)]
+        assert_current_user_acl(&key);
+        #[cfg(windows)]
+        assert_effective_access(&key);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_operator_key_acl_is_idempotent_and_allows_the_current_user() {
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("operator.key");
+        std::fs::write(&key, b"first").unwrap();
+        protect_operator_key(&key).unwrap();
+        std::fs::write(&key, b"second").unwrap();
+        assert_eq!(std::fs::read(&key).unwrap(), b"second");
+        assert_current_user_acl(&key);
+        assert_effective_access(&key);
+
+        protect_operator_key(&key).unwrap();
+        let sddl = operator_key_sddl(&key);
+        assert_current_user_acl(&key);
+        let sid = current_user_sid().unwrap();
+        // SDDL may render Modify as M or its exact mask, 0x1301bf.
+        let modify_grants = ["M", "0x1301bf"]
+            .iter()
+            .map(|mask| sddl.matches(&format!(";{mask};;;{sid})")).count())
+            .sum::<usize>();
+        assert_eq!(modify_grants, 1, "reapplication does not duplicate grants: {sddl}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_operator_key_ignores_username_and_uses_process_sid() {
+        let _username_lock = USERNAME_LOCK.lock().unwrap();
+        let previous = std::env::var("USERNAME").ok();
+        std::env::set_var("USERNAME", "hestia missing user with spaces");
+        let _restore = UsernameRestore(previous);
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("operator.key");
+        std::fs::write(&key, b"private").unwrap();
+        protect_operator_key(&key).unwrap();
+        assert_current_user_acl(&key);
+        assert_effective_access(&key);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_operator_key_failures_leave_no_unprotected_file() {
+        let dir = TempDir::new().unwrap();
+        let key = dir.path().join("operator.key");
+        for sid in [None, Some("   "), Some("not-a-sid"), Some("S-1-5")] {
+            std::fs::write(&key, b"unprotected").unwrap();
+            let error = protect_operator_key_with_sid(&key, sid)
+                .expect_err("missing or invalid SIDs must fail closed");
+            assert!(error.to_string().contains("deleting"), "{error}");
+            assert!(!key.exists(), "the unprotected key was removed for {sid:?}");
+        }
+
+        let sid = current_user_sid().unwrap();
+        for icacls in [dir.path().join("missing-icacls.exe"), Path::new("whoami").to_path_buf()] {
+            std::fs::write(&key, b"unprotected").unwrap();
+            let error = restrict_operator_key(&key, &sid, &icacls)
+                .expect_err("an icacls failure must fail closed");
+            assert!(error.to_string().contains("deleting"), "{error}");
+            assert!(!key.exists(), "the unprotected key was removed after {icacls:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_operator_bootstrap_failure_deletes_the_key_and_allows_retry() {
+        let sid_override = override_operator_sid(None);
+        let (_dir, mut state) = make_state();
+        let key = state.home.join("operator.key");
+
+        let error = state
+            .bootstrap_operator_if_genesis()
+            .expect_err("an unavailable process SID must fail the bootstrap");
+        assert!(error.to_string().contains("deleting"), "{error}");
+        assert!(!key.exists(), "no unprotected key survives the failed bootstrap");
+        assert!(!state.vault.policy().operator_access_bootstrapped());
+
+        drop(sid_override);
+        let first = state.bootstrap_operator_if_genesis().unwrap();
+        assert!(first.is_some(), "restoring process identity permits a clean retry");
+        assert!(key.exists());
+        assert_current_user_acl(&key);
+        assert_effective_access(&key);
+        assert!(state.bootstrap_operator_if_genesis().unwrap().is_none());
     }
 
     #[test]
