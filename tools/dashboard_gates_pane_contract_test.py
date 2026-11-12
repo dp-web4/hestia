@@ -31,8 +31,29 @@ def block() -> str:
     return UI[a:b]
 
 
+def banner_block() -> str:
+    try:
+        a = UI.index("GATE INTEGRITY overview banner")
+        return UI[a:]
+    except ValueError:
+        return ""
+
+
 def main() -> int:
     g = block()
+    b = banner_block()
+    check("#1378: a persistent overview banner exists", 'id="gate-integrity-banner"' in b)
+    check("#1378: the banner links to the Gates remedy pane",
+          'id="gate-integrity-banner-btn"' in b and "setView('govern', true); governShow('gates')" in b)
+    check("#1378: the overview polls without overlapping itself",
+          "gateIntegrityBusy" in b and re.search(r"setInterval\(\(\) => \{ if \(!document.hidden\) gateIntegrityLoad\(\); \}, 30000\)", b) is not None)
+    check("#1378: UNKNOWN and a failed read never look healthy",
+          "r.status === 'UNKNOWN'" in b and "Gate integrity could not be read" in b)
+    check("#1378: deploy-pending, modified, deploy-different and bypass are distinct",
+          "g.status === 'unratified'" in b and "g.status === 'modified'" in b
+          and "g.deployment === 'differs'" in b and "g.not_registered === true" in b)
+    check("#1378: a verified set hides the banner", "gateIntegrityHealthy" in b)
+
     check("govern sub-nav has the chip", 'data-gov="gates"' in UI)
     check("pane registered and mounts by loading",
           re.search(r"gates:\s*\{\s*el:\s*'govern-gates',\s*mount:\s*\(\)\s*=>\s*gatesLoad\(\)", UI) is not None)

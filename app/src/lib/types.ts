@@ -426,6 +426,8 @@ export type GateVerdict = (
   | { status: "unratified"; path: string }
   | { status: "unreadable"; path: string; error: string }
 ) & {
+  /** Discovery fills this even when the verdict variant carries no expectation. */
+  plugin_id?: string;
   /** false = an expectation for a path no gate is wired at any more (offered for forget). */
   discovered?: boolean;
   /** Current bytes vs the deploy record. */
