@@ -1,4 +1,4 @@
-# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: b4570b065deba9aae840e21f8cefd5c3dd2625ab6240aa9728b06d07c2da2d6f  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -1101,7 +1101,7 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
     try:
         claimed = _bounded(
             inv.phase_deadline, mechanism.claim_self_write,
-            marker, ev.tool, inv.attempted, plugin_id=prof.member_id, role=_role(inv),
+            marker, ev.tool, inv.attempted_full or inv.attempted, plugin_id=prof.member_id, role=_role(inv),
             client_name=_client_name(prof), host_session_id=ev.session_id,
             invocation_key=inv.key,
             # THIS module stops a superseded invocation in every rollout mode (step 5), so it

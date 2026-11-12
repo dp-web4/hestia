@@ -500,6 +500,31 @@ def test_the_key_from_the_raw_event_reaches_every_join(m, g, wc, home):
         stub.close()
 
 
+def test_escalation_record_carries_the_full_held_patch_apply(m, g, wc, home):
+    digest = "61fcd377" * 8
+    with tempfile.TemporaryDirectory() as tmp:
+        patch = pathlib.Path(tmp) / ("d" * 120) / "held" / f"{digest}.patch"
+        patch.parent.mkdir(parents=True)
+        patch.write_text("diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py\n"
+                         "--- a/plugins/_shared/hestia_gate_core.py\n"
+                         "+++ b/plugins/_shared/hestia_gate_core.py\n"
+                         "@@ -1 +1 @@\n-old\n+new\n")
+        command = f"git -C {REPO} apply {patch}"
+        check("held-patch-fixture-is-past-display-depth", len(command) > 220, len(command))
+        stub = Stub()
+        try:
+            with _Env(m, stub.url, home):
+                _decide(g, "kimi", "Bash", {"command": command}, home)
+            claims = [a for a, _ in stub.named("hestia_gate_escalation_claim")]
+            check("held-patch-claim-is-present", len(claims) == 1, claims)
+            if claims:
+                reason = claims[0].get("reason")
+                check("held-patch-act-is-uncut", reason == f"Bash: {command}", reason)
+                check("held-patch-digest-survives", isinstance(reason, str) and digest in reason, reason)
+        finally:
+            stub.close()
+
+
 def test_the_gate_owns_no_cache_no_client_and_one_recorder(m, g, wc, home):
     src = gate_source_path().read_text(encoding="utf-8")
     tree = ast.parse(src)
@@ -1759,6 +1784,7 @@ DEADLINE_TESTS = {"test_one_deadline_bounds_the_whole_invocation",
 CONTRACT_TESTS = [
     test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial,
     test_the_key_from_the_raw_event_reaches_every_join,
+    test_escalation_record_carries_the_full_held_patch_apply,
     test_the_gate_owns_no_cache_no_client_and_one_recorder,
     test_one_deadline_bounds_the_whole_invocation,
     test_c_threads_the_deadline_through_the_mechanism,

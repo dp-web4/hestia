@@ -1100,7 +1100,7 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
     try:
         claimed = _bounded(
             inv.phase_deadline, mechanism.claim_self_write,
-            marker, ev.tool, inv.attempted, plugin_id=prof.member_id, role=_role(inv),
+            marker, ev.tool, inv.attempted_full or inv.attempted, plugin_id=prof.member_id, role=_role(inv),
             client_name=_client_name(prof), host_session_id=ev.session_id,
             invocation_key=inv.key,
             # THIS module stops a superseded invocation in every rollout mode (step 5), so it
