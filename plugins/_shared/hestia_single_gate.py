@@ -1086,7 +1086,10 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
                      "gate_self_read", marker, ev.tool, cv.rule, plugin_id=prof.member_id,
                      role=_role(inv), gate_path=prof.gate_path or "",
                      client_name=_client_name(prof), host_session_id=ev.session_id,
-                     deadline=inv.phase_deadline)
+                     deadline=inv.phase_deadline,
+                     target_path=(closure.resolve_location(cv.resource, ev.cwd)
+                                  if cv.resource else None),
+                     target_as_named=cv.resource)
         except Exception:  # noqa: BLE001
             pass
         return None

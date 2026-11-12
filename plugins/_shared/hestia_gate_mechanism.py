@@ -1573,12 +1573,13 @@ def gate_self_call(tool, args, *, plugin_id, role, client_name, host_session_id=
 
 def witness_gate_self(event_type, marker, tool_name, rule=None, *,
                       plugin_id, role, gate_path, client_name, host_session_id=None,
-                      deadline=None):
+                      deadline=None, target_path=None, target_as_named=None):
     """Record a governance-surface event as its OWN class — `gate_self_read` for a permitted
     read, `gate_self_access` (appealable) for a refused write. The two stay distinct so an
     alert on the refusal keeps its meaning. Best effort: a failed record never changes the
     decision — the daemon's health is not a precondition for reading one's own law, and the
-    deny already happened locally."""
+    deny already happened locally. `gate_path` is the recorder; the target fields name the
+    object actually accessed, both as resolved and as the caller spelled it (#487)."""
     return gate_self_call("hestia_request_witness", {
         "event_type": event_type,
         "event_data": {"plugin_id": plugin_id,
@@ -1586,6 +1587,8 @@ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
                        "marker": marker,
                        "rule": rule,
                        "gate_path": gate_path,
+                       "target_path": target_path,
+                       "target_as_named": target_as_named,
                        "severity": "record" if event_type == "gate_self_read" else "escalate",
                        "role_lct": role}},
         plugin_id=plugin_id, role=role, client_name=client_name,

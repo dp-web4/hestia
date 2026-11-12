@@ -668,11 +668,44 @@ def test_gate_file_read_allowed_and_witnessed():
         stub = Stub()
         try:
             home = fx.home(seat, stub.url)
-            v, text, _ = run(seat, home, native(seat, "Read", {"file_path": gate_file(fx, seat)}))
+            target = gate_file(fx, seat)
+            v, text, _ = run(seat, home, native(seat, "Read", {"file_path": target}))
             check(f"{seat}-allowed", v == "allow", text)
-            check(f"{seat}-witnessed-as-read", any(a.get("event_type") == "gate_self_read"
-                                                   for a in stub.args("hestia_request_witness")), stub.calls)
+            witnesses = [a for a in stub.args("hestia_request_witness")
+                         if a.get("event_type") == "gate_self_read"]
+            check(f"{seat}-witnessed-as-read", witnesses, stub.calls)
+            check(f"{seat}-witness-names-resolved-target",
+                  witnesses and all(a["event_data"].get("target_path") == os.path.realpath(target)
+                                    for a in witnesses), witnesses)
+            check(f"{seat}-witness-keeps-target-as-named",
+                  witnesses and all(a["event_data"].get("target_as_named") == target
+                                    for a in witnesses), witnesses)
             check(f"{seat}-reads-meet-daemon-law", "hestia_begin_action" in stub.names(), stub.names())
+        finally:
+            stub.close()
+    _each_seat(arm)
+
+
+def test_cross_seat_gate_read_is_explicitly_allowed_and_targeted_487():
+    """No grant for B's tree is needed for publish-the-law; the witness names B's file."""
+    def arm(seat, fx):
+        other = next(name for name in SEATS if name != seat)
+        stub = Stub()
+        try:
+            home = fx.home(seat, stub.url)
+            target = gate_file(fx, other)
+            v, text, _ = run(seat, home, native(seat, "Read", {"file_path": target}))
+            check(f"{seat}-reading-{other}-allowed", v == "allow", text)
+            check("cross-seat-read-has-no-scope-grant",
+                  all(not a.get("live_grants") and not a.get("standing_grants")
+                      for a in stub.args("hestia_scope_status")), stub.args("hestia_scope_status"))
+            witnesses = [a for a in stub.args("hestia_request_witness")
+                         if a.get("event_type") == "gate_self_read"]
+            check(f"{seat}-reading-{other}-target-witnessed",
+                  witnesses and all(a["event_data"].get("target_path") == os.path.realpath(target)
+                                    and a["event_data"].get("target_as_named") == target
+                                    and a["event_data"].get("gate_path") != target
+                                    for a in witnesses), witnesses)
         finally:
             stub.close()
     _each_seat(arm)
@@ -783,6 +816,7 @@ ALL = [
     test_distinctive_names_govern_anywhere_hooks_only_names_do_not,
     test_ordinary_write_is_asked_allowed_and_recorded,
     test_gate_file_read_allowed_and_witnessed,
+    test_cross_seat_gate_read_is_explicitly_allowed_and_targeted_487,
     test_daemon_down,
     test_missing_and_poisoned_engine_block,
     test_decision_time_internal_error_denies_in_every_rollout,
