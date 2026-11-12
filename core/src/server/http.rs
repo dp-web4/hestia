@@ -1692,7 +1692,7 @@ mod deployment_update_tests {
         assert_eq!(build, running);
         assert!(crate::server::dashboard::same_deployed_build(&build, None, running));
 
-        for partial in ["{", "{}"] {
+        for partial in ["\x7b", "{}"] {
             std::fs::write(&install_manifest, partial).unwrap();
             assert!(deployment_update_authority_from(Some(&install_manifest), &server_home).is_err());
         }
