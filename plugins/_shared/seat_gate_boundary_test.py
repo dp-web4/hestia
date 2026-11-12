@@ -87,10 +87,13 @@ def shim(seat):
 # ── stub daemon (the real wire shape: every reply a `result` with structuredContent) ────────
 
 class Stub:
-    def __init__(self, claim=None, verdict="allow"):
+    def __init__(self, claim=None, verdict="allow", scope_status=None):
         self.claim = claim
         self.verdict = verdict
+        self.scope_status = scope_status or {
+            "live_grants": [], "standing_grants": [], "society_floor": []}
         self.calls = []
+        self.response_log = []
         self.lock = threading.Lock()
         stub = self
 
@@ -115,6 +118,8 @@ class Stub:
                     with stub.lock:
                         stub.calls.append((name, args))
                     payload = stub.respond(name, args)
+                    with stub.lock:
+                        stub.response_log.append((name, payload))
                     out = {"jsonrpc": "2.0", "id": body.get("id"), "result": {
                         "structuredContent": payload,
                         "content": [{"type": "text", "text": json.dumps(payload)}]}}
@@ -140,7 +145,7 @@ class Stub:
         if name == "hestia_operating_law":
             return {"identity": {"role": "role:constellation:member"}}
         if name == "hestia_scope_status":
-            return {"live_grants": [], "standing_grants": [], "society_floor": []}
+            return dict(self.scope_status)
         if name == "hestia_begin_action":
             return {"actionId": str(uuid.uuid4())}
         if name == "hestia_query_policy":
@@ -166,6 +171,9 @@ class Stub:
 
     def args(self, name):
         return [a for n, a in self.calls if n == name]
+
+    def responses(self, name):
+        return [r for n, r in self.response_log if n == name]
 
 
 DEAD = "http://127.0.0.1:9/mcp"   # discard port: closed by convention, nothing binds it here
@@ -687,27 +695,33 @@ def test_gate_file_read_allowed_and_witnessed():
 
 
 def test_cross_seat_gate_read_is_explicitly_allowed_and_targeted_487():
-    """No grant for B's tree is needed for publish-the-law; the witness names B's file."""
+    """Existing publish-the-law behavior is grant-independent; the witness names B's file."""
     def arm(seat, fx):
         other = next(name for name in SEATS if name != seat)
-        stub = Stub()
-        try:
-            home = fx.home(seat, stub.url)
-            target = gate_file(fx, other)
-            v, text, _ = run(seat, home, native(seat, "Read", {"file_path": target}))
-            check(f"{seat}-reading-{other}-allowed", v == "allow", text)
-            check("cross-seat-read-has-no-scope-grant",
-                  all(not a.get("live_grants") and not a.get("standing_grants")
-                      for a in stub.args("hestia_scope_status")), stub.args("hestia_scope_status"))
-            witnesses = [a for a in stub.args("hestia_request_witness")
-                         if a.get("event_type") == "gate_self_read"]
-            check(f"{seat}-reading-{other}-target-witnessed",
-                  witnesses and all(a["event_data"].get("target_path") == os.path.realpath(target)
-                                    and a["event_data"].get("target_as_named") == target
-                                    and a["event_data"].get("gate_path") != target
-                                    for a in witnesses), witnesses)
-        finally:
-            stub.close()
+        target = gate_file(fx, other)
+        for label, grants in (("no-grant", []),
+                              ("with-grant", [{"path": target, "recursive": False}])):
+            stub = Stub(scope_status={
+                "live_grants": grants, "standing_grants": [], "society_floor": []})
+            try:
+                home = fx.home(seat, stub.url)
+                v, text, _ = run(seat, home, native(seat, "Read", {"file_path": target}))
+                check(f"{seat}-{label}-reading-{other}-allowed", v == "allow", text)
+                scope_replies = stub.responses("hestia_scope_status")
+                check(f"{seat}-{label}-configured-scope-response-exercised",
+                      scope_replies and all(r.get("live_grants") == grants
+                                            and not r.get("standing_grants")
+                                            and not r.get("society_floor")
+                                            for r in scope_replies), scope_replies)
+                witnesses = [a for a in stub.args("hestia_request_witness")
+                             if a.get("event_type") == "gate_self_read"]
+                check(f"{seat}-{label}-reading-{other}-target-witnessed",
+                      witnesses and all(a["event_data"].get("target_path") == os.path.realpath(target)
+                                        and a["event_data"].get("target_as_named") == target
+                                        and a["event_data"].get("gate_path") != target
+                                        for a in witnesses), witnesses)
+            finally:
+                stub.close()
     _each_seat(arm)
 
 
