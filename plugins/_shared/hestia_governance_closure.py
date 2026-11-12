@@ -883,15 +883,36 @@ def _tokenize(cmd: str) -> list:
     return out
 
 
+# Environment prefixes are executable semantics, not decoration (#1360): loader/startup
+# variables can make a nominal reader run code, PATH selects the program, and an allowlist
+# does not need another patch whenever a new loader variable is named. Locale and display
+# facts do not select code or a destination. Everything else is out of grammar.
+_SAFE_ENV_NAMES = frozenset({"LANG", "TZ", "TERM", "COLUMNS", "LINES"})
+
+
+def _safe_env_assignment(word: str) -> bool:
+    name = word.split("=", 1)[0]
+    return name.startswith("LC_") or name in _SAFE_ENV_NAMES
+
+
 def _strip_wrappers(words: list) -> list:
     words = list(words)
     for _ in range(8):  # bounded; wrappers nest shallowly
         while words and _ASSIGN_RE.match(words[0]):
+            # A bare assignment starts no child to inherit the variable. Only a prefix
+            # on an actual command changes that command's environment.
+            if len(words) > 1 and not _safe_env_assignment(words[0]):
+                raise _OutOfGrammar()
             words.pop(0)
         if not words:
             return words
         head = os.path.basename(words[0])
         if head in _WRAPPERS:
+            if head == "env" and len(words) > 1 and words[1].startswith("-"):
+                # env -S hides a new argv in one word; -C changes the write cwd. Rather
+                # than stripping an option table as if every option were inert, keep all
+                # env options out of grammar. `env NAME=value command` stays in grammar.
+                raise _OutOfGrammar()
             words.pop(0)
             while words and words[0].startswith("-"):
                 opt = words.pop(0)
@@ -1389,6 +1410,16 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         return []
     name = os.path.basename(words[0])
     args = words[1:]
+
+    if name in ("export", "readonly", "declare", "typeset", "local"):
+        # An unsafe variable exported here reaches a LATER simple command, which the
+        # per-command prefix check cannot see. Declaration flags do not make the name inert:
+        # declare -x LD_PRELOAD=... is the same execution path as export LD_PRELOAD=....
+        for arg in args:
+            var = arg.split("=", 1)[0]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", var) and not _safe_env_assignment(var):
+                raise _OutOfGrammar()
+        return []
 
     if name in ("cp", "mv", "install", "rsync"):
         ovals = ("-t", "--target-directory", "-S", "--suffix", "-m", "-o", "-g",

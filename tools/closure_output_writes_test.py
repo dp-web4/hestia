@@ -170,6 +170,25 @@ PAIRS = [
     ("xargs nice ./env cat", f"ls {D} | xargs nice ./env cat", f"ls {D} | xargs nice env cat"),
     ("find -exec env ./nice cat", f"find {D} -exec env ./nice cat {{}} +",
      f"find {D} -exec /usr/bin/env nice cat {{}} +"),
+    # #1360: environment prefixes can select code the read verb runs. Unknown names are out
+    # of grammar; the small locale/display allowlist keeps the corresponding read arms live.
+    ("inline LD_PRELOAD cat", f"LD_PRELOAD=/tmp/x.so cat {T}", f"LC_ALL=C cat {T}"),
+    ("inline LD_PRELOAD grep", f"LD_PRELOAD=/tmp/x.so grep x {T}", f"LC_ALL=C grep x {T}"),
+    ("env LD_PRELOAD head", f"env LD_PRELOAD=/tmp/x.so head {T}", f"env LC_ALL=C head {T}"),
+    ("outer environment inherited by xargs", f"ls {D} | LD_PRELOAD=/tmp/x.so xargs cat",
+     f"ls {D} | LC_ALL=C xargs cat"),
+    ("find -exec env LD_PRELOAD", f"find {D} -exec env LD_PRELOAD=/tmp/x.so cat {{}} +",
+     f"find {D} -exec env LC_ALL=C cat {{}} +"),
+    ("xargs env LD_PRELOAD", f"ls {D} | xargs env LD_PRELOAD=/tmp/x.so cat",
+     f"ls {D} | xargs env LC_ALL=C cat"),
+    ("env split-string", f"env -S 'LD_PRELOAD=/tmp/x.so cat {T}'", f"env LC_ALL=C cat {T}"),
+    ("interpreter module path", f"PYTHONPATH=/tmp python3 -c 'pass' {T}",
+     f"LC_ALL=C python3 -c 'pass' {T}"),
+    ("inline PATH selects the reader", f"PATH=/tmp cat {T}", f"LC_ALL=C cat {T}"),
+    ("exported loader variable", f"export LD_PRELOAD=/tmp/x.so; cat {T}",
+     f"export LC_ALL=C; cat {T}"),
+    ("declared exported loader variable", f"declare -x LD_PRELOAD=/tmp/x.so; cat {T}",
+     f"declare -x LC_ALL=C; cat {T}"),
 ]
 
 
@@ -224,7 +243,17 @@ def test_an_early_out_of_grammar_command_does_not_hide_a_later_opaque_writer():
         check(f"passive:{read[:30]}", v.classification != "write", str(v))
 
 
+def test_safe_environment_prefixes_and_benign_unknowns():
+    for assignment in ("LC_ALL=C", "LANG=C", "TZ=UTC", "TERM=xterm", "COLUMNS=80", "LINES=40"):
+        for prefix in (f"{assignment} ", f"env {assignment} "):
+            v = cls(f"{prefix}cat {T}")
+            check(f"safe:{prefix}", v.classification != "write", str(v))
+    v = cls("CUSTOM=1 cat /tmp/ordinary")
+    check("unknown_env_benign_is_none", v.classification == "none", str(v))
+
+
 ALL = [
+    test_safe_environment_prefixes_and_benign_unknowns,
     test_an_early_out_of_grammar_command_does_not_hide_a_later_opaque_writer,
     test_every_hidden_output_is_a_write,
     test_the_same_verb_reading_the_gate_is_not_a_write,
