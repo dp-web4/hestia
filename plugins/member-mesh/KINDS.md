@@ -246,13 +246,21 @@ escalation (decided, withdrawn, or lapsed) is *moot*: it moves from
 `i_owe`/`owed_to_me` to `i_owe_moot`/`owed_to_me_moot` and counts as debt nowhere.
 
 The terminal ruling's disposition projection sets `mooted_at` and `moot_reason` in the
-same transaction as the disposition row. The reason names the ruling hash; both fields
-appear on the mooted unanswered row and survive request-map eviction, escalation reaping,
-and restart. Projection retries preserve the first evidence. A still-live terminal target
-can also be derived at read time without a sweep or a mutation by `member_unanswered`.
-Once that live evidence is gone, an unmarked row fails back to owed: **unknown is not
-moot**. A durable mark does not un-derive. The gate's `status_of(unknown) = expired`
-denial rule is not evidence of mootness and is deliberately not used here.
+same transaction as the disposition row. A matching `review_request` enqueued after that
+ruling inherits the earliest disposition's evidence in its own INSERT. The reason names the
+ruling hash; both fields appear on the mooted unanswered row and survive request-map
+eviction, escalation reaping, and restart. Projection retries preserve the first evidence.
+A still-live terminal target can also be derived at read time without a sweep or a mutation
+by `member_unanswered`. Once that live evidence is gone, an unmarked row fails back to owed:
+**unknown is not moot**. In particular, an undecided scope request whose window merely
+lapses has no disposition and therefore no durable mark; its live-derived mootness still
+reverts after request-map eviction or restart. A durable mark does not un-derive. The gate's
+`status_of(unknown) = expired` denial rule is not evidence of mootness and is deliberately
+not used here.
+
+Moot means **no longer counted as responsiveness debt**, not "nothing left to do." Late
+corroboration can still find a defect, and a factor filed after the verdict is still
+recorded.
 
 Two precedence rules remain: `recipient_liveness: unknown` (a misroute) outranks mootness
 in `owed_to_me`, because the misroute is sender-actionable; and durable pointers (PRs,

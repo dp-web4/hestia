@@ -9188,14 +9188,19 @@ async fn tool_member_unanswered(state: &SharedState, args: &Value) -> ToolResult
         "i_owe_moot": mine_moot,
         "owed_to_me_moot": theirs_moot,
         "moot_scope": "moot = a review_request row (the transient ASK kind — a durable \
-                       reply never moots) whose scope/escalation target is terminal. A \
-                       terminal disposition durably marks mooted_at and moot_reason, which \
-                       survive map eviction, escalation reaping, and restart. A still-live \
-                       target can also be derived at read time, with no sweep and no mutation \
-                       by this read-only tool. An absent target is UNKNOWN, never terminal: \
-                       without durable evidence the row fails back to owed. In owed_to_me a \
-                       misroute (recipient_liveness unknown) outranks mootness — the misroute \
-                       is sender-actionable (#1354).",
+                       reply never moots) whose scope/escalation target is terminal. Moot means \
+                       no longer counted as responsiveness debt, not that late review is \
+                       worthless: a factor filed now is still recorded. A terminal disposition \
+                       durably marks mooted_at and moot_reason on rows already queued and on \
+                       late asks enqueued after the ruling; those marks survive map eviction, \
+                       escalation reaping, and restart. A still-live target can also be derived \
+                       at read time, with no sweep and no mutation by this read-only tool. An \
+                       undecided scope request whose window merely lapses has no disposition, \
+                       so its live-derived mootness returns to owed after map eviction or \
+                       restart; the same fail-back applies to every unmarked target. An absent \
+                       target is UNKNOWN, never terminal. In owed_to_me a misroute \
+                       (recipient_liveness unknown) outranks mootness — the misroute is \
+                       sender-actionable (#1354).",
         "scope": "unanswered = no notice binds in_reply_to to it; \
                   drained_at:null means the drain mark is absent; a peek may still \
                   have seen it. A mark does not prove it was returned or read; \
@@ -13919,6 +13924,15 @@ mod member_mesh_tests {
             ensure_disposition(&s, "cbp-being", "hestia://scope/scope-moot-decided",
                                "scope-ruling-hash");
         }
+        let late_scope_ptr =
+            "hestia://scope/scope-moot-decided#peer-decide;late-after-eviction";
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": late_scope_ptr, "session_id": claude}),
+        )
+        .await
+        .unwrap();
         let rows3 = tool_member_unanswered(
             &state,
             &json!({"session_id": kimi, "older_than_secs": 0}),
@@ -13934,6 +13948,17 @@ mod member_mesh_tests {
         assert!(durable["mooted_at"].is_string(), "{rows3}");
         assert!(durable["moot_reason"].as_str().unwrap_or_default().contains("scope-ruling-hash"),
                 "the evidence names the ruling that made it moot: {rows3}");
+        let late_scope = rows3["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == late_scope_ptr)
+            .unwrap_or_else(|| {
+                panic!("a post-ruling scope ask inherits durable mootness: {rows3}")
+            });
+        assert!(late_scope["mooted_at"].is_string(), "{rows3}");
+        assert!(late_scope["moot_reason"].as_str().unwrap_or_default()
+                .contains("scope-ruling-hash"), "{rows3}");
 
         // Mootness reclassifies; it does not close. The ASKED member can still bind late.
         let late = tool_member_notify(
@@ -14031,6 +14056,14 @@ mod member_mesh_tests {
                                &format!("hestia://escalation/{decided}#withdrawn"),
                                "withdrawn-ruling-hash");
         }
+        let late_ptr = format!("{decided_ptr};exact-reviewed-v2-late-follow-up");
+        tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": late_ptr, "session_id": claude}),
+        )
+        .await
+        .unwrap();
         {
             let mut s = state.lock().await;
             s.gate_escalations.reap(now + 7200, 0);
@@ -14049,6 +14082,17 @@ mod member_mesh_tests {
             .unwrap_or_else(|| panic!("terminal evidence survives escalation eviction: {after}"));
         assert!(durable["mooted_at"].is_string(), "{after}");
         assert!(durable["moot_reason"].as_str().unwrap_or_default()
+                .contains("withdrawn-ruling-hash"), "{after}");
+        let late = after["i_owe_moot"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["pointer_uri"] == late_ptr)
+            .unwrap_or_else(|| {
+                panic!("a post-ruling ask keeps durable mootness after reaping: {after}")
+            });
+        assert!(late["mooted_at"].is_string(), "{after}");
+        assert!(late["moot_reason"].as_str().unwrap_or_default()
                 .contains("withdrawn-ruling-hash"), "{after}");
         assert!(pointers(&after, "i_owe").contains(&expired_ptr),
                 "an unmarked expired row fails back to owed after its live evidence is gone: {after}");

@@ -469,8 +469,10 @@ impl SqliteInboxStore {
     /// reports the failure as a ruling failure, because the ruling succeeded.
     ///
     /// For scope/escalation pointers the same transaction also marks matching local
-    /// `review_request` rows moot (#1354), preserving the ruling hash as evidence. Other
-    /// pointer kinds and durable replies are not transient target asks and are untouched.
+    /// `review_request` rows moot (#1354), preserving the ruling hash as evidence. Late matching
+    /// asks inherit the earliest stored disposition when `enqueue_member_on` inserts them, so
+    /// post-ruling follow-ups keep that evidence after the live target is reaped. Other pointer
+    /// kinds and durable replies are not transient target asks and are untouched.
     ///
     /// No cap eviction here, on purpose: `enqueue_member`'s cap makes room by
     /// DELETING the recipient's oldest undrained notice, and for a disposition
@@ -1385,11 +1387,31 @@ impl SqliteInboxStore {
             .context("recording member queue eviction")?;
             }
         }
+        let moot_target = pointer_uri
+            .filter(|_| kind.split('.').next() == Some("review_request"))
+            .map(|p| p.split('#').next().unwrap_or(p))
+            .filter(|p| p.starts_with("hestia://scope/") || p.starts_with("hestia://escalation/"));
+        // A post-ruling corroboration ask still has review value, but it is not
+        // responsiveness debt. Inherit the earliest terminal disposition in the same INSERT
+        // so live-map reaping cannot make the late row owed again. The dummy input row keeps
+        // ordinary inserts working when no disposition matches.
         conn.execute(
             "INSERT INTO member_notices
                  (to_plugin, from_plugin, from_role, kind, pointer_uri, chain_hash, queued_at,
-                  in_reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  in_reply_to, mooted_at, moot_reason)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                    CASE WHEN d.chain_hash IS NULL THEN NULL ELSE ?9 END,
+                    'terminal ruling ' || d.chain_hash
+               FROM (SELECT 1) AS insert_once
+               LEFT JOIN member_notices AS d ON d.id = (
+                   SELECT d2.id FROM member_notices AS d2
+                    WHERE ?10 IS NOT NULL
+                      AND d2.disposition_key IS NOT NULL
+                      AND d2.dest_peer IS NULL
+                      AND (d2.pointer_uri = ?10
+                           OR substr(d2.pointer_uri, 1, length(?10) + 1) = ?10 || '#')
+                    ORDER BY d2.id ASC LIMIT 1
+               )",
             params![
                 to_plugin,
                 from_plugin,
@@ -1399,6 +1421,8 @@ impl SqliteInboxStore {
                 chain_hash,
                 now.to_rfc3339(),
                 in_reply_to.map(|v| v as i64),
+                now.to_rfc3339(),
+                moot_target,
             ],
         )
         .context("enqueuing member notice")?;
@@ -3925,6 +3949,14 @@ mod tests {
             .ensure_member_disposition("claude-code", "disposition",
                                        "hestia://appeal/a#ruled", "appeal-ruling")
             .unwrap();
+        for (kind, chain_hash) in [("review_request.pr", "ask-late"), ("reply", "reply-late")] {
+            store
+                .enqueue_member("kimi-code", "claude-code", "role:constellation:interactive-dev",
+                                kind,
+                                Some("hestia://escalation/a#corroborate-or-dissent;late-follow-up"),
+                                chain_hash, None)
+                .unwrap();
+        }
 
         let evidence = |store: &SqliteInboxStore| {
             let conn = store.conn.lock().unwrap();
@@ -3949,10 +3981,15 @@ mod tests {
                    "a durable reply never moots: {rows:?}");
         assert_eq!((rows[3].1.as_deref(), rows[3].2.as_deref()), (None, None),
                    "the id is a complete path segment, never a string prefix: {rows:?}");
-        for row in &rows[4..] {
+        for row in &rows[4..6] {
             assert_eq!((row.1.as_deref(), row.2.as_deref()), (None, None),
                        "appeals and durable pointers are not transient target asks: {rows:?}");
         }
+        assert!(rows[6].1.is_some(),
+                "an ask enqueued after the ruling inherits its durable evidence: {rows:?}");
+        assert!(rows[6].2.as_deref().unwrap_or_default().contains("ruling-a"), "{rows:?}");
+        assert_eq!((rows[7].1.as_deref(), rows[7].2.as_deref()), (None, None),
+                   "a late durable reply is still content, not a transient ask: {rows:?}");
         let first_stamp = rows[0].1.clone();
         drop(store);
 
