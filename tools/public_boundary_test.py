@@ -270,6 +270,16 @@ with tempfile.TemporaryDirectory() as td:
     runtime.write_text('PARTIAL = "/tmp/hli7/home/.local/bin"\n')
     check("mid-path home fragment is not a local home",
           boundary.inspect(root, [str(runtime.relative_to(root))]) == [])
+    for label, line in (
+        ("environment assignment", f'HOME=/home/{"realop"}/x\n'),
+        ("PATH join", f'PATH="x:/home/{"realop"}/bin"\n'),
+        ("option assignment", f'ROOT="--root=/home/{"realop"}/repo"\n'),
+        ("call argument", f'Path(/home/{"realop"}/x)\n'),
+        ("brace expression", f'BASE=f"{{base}}/home/{"realop"}/x"\n'),
+    ):
+        runtime.write_text(line)
+        check(f"local home after {label} is rejected",
+              any("local home" in p for p in boundary.inspect(root, [str(runtime.relative_to(root))])))
     probe = root / "tools" / "gemini_probe.py"
     probe.write_text("print('probe')\n")
     check("gemini research probe is named by the guard",

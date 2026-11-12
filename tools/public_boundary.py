@@ -26,7 +26,7 @@ FORBIDDEN_ROOTS = (
     "deploy/cbp/",
 )
 LOCAL_PROBE = re.compile(r"^tools/(?:cbp|claude|codex|kimi|gemini)_")
-LOCAL_HOME = re.compile(r"(?:^|[\s\"'`])/home/([A-Za-z0-9_.-]+)/")
+LOCAL_HOME = re.compile(r"(?<![\w./-])/home/([A-Za-z0-9_.-]+)/")
 ALLOWED_SYNTHETIC_USERS = {"member", "user", "tester", "x", "u", "other"}
 MOUNTED_HOST_PATH = re.compile(r"/mnt/[A-Za-z]/(?:[^\s'\"`]+/){2,}")
 TOKEN_SHAPES = (
