@@ -1639,11 +1639,44 @@ def _strip_heredoc_bodies(command: str) -> str:
     return "\n".join(out)
 
 
+def _has_ansi_c_quote(command: str) -> bool:
+    """Whether an UNQUOTED `$'` opens an ANSI-C quote (#485).
+
+    POSIX shlex does not model that form. In particular, an apostrophe inside it is literal to
+    Bash but closes the quote to shlex, so a later write can land in a heredoc body or outside
+    the command the classifier sees. Detect it at the BASE boundary and make it undecidable
+    rather than return a different program as read. Ordinary quoted strings do not trigger it.
+    """
+    quote = None
+    i = 0
+    while i + 1 < len(command):
+        c = command[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote is None and c == "$" and command[i + 1] == "'":
+            return True
+        if c == "'":
+            if quote is None:
+                quote = "'"
+            elif quote == "'":
+                quote = None
+        elif c == '"':
+            if quote is None:
+                quote = '"'
+            elif quote == '"':
+                quote = None
+        i += 1
+    return False
+
+
 def _bash_write_targets(command: str) -> list:
     """All write-position arguments across a compound command: redirect targets plus each
     simple command's write positions, each resolved against the cd-tracked effective cwd.
     Raises on tokenizer failure (caller -> unparseable posture) and raises _OutOfGrammar on
     any out-of-grammar construct (caller -> out-of-grammar posture)."""
+    if _has_ansi_c_quote(command):
+        raise _OutOfGrammar()
     toks = _tokenize(_strip_heredoc_bodies(command))
     targets, cur = [], []
     # An out-of-grammar SIMPLE command is remembered, not raised on the spot: the walk goes on,
