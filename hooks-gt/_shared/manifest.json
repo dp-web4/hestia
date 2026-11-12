@@ -17,7 +17,7 @@
     },
     {
       "path": "hestia_governance_closure.py",
-      "sha256": "41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2",
+      "sha256": "8368abe7a935b597652cca6328f37448af9c4edc606434ccc4a487103df0003f",
       "source": "plugins/_shared/hestia_governance_closure.py"
     },
     {
@@ -38,5 +38,5 @@
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538"
+  "gt_version": "70228e3b0dfe02f7c7162e7312e2824b7d496af8508e4cfd3257c1f15d57c5bf"
 }

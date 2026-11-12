@@ -14,7 +14,9 @@ machine; the write arm is the hole.
 
 Run: python3 tools/closure_output_writes_test.py
 """
+import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 
@@ -224,7 +226,37 @@ def test_an_early_out_of_grammar_command_does_not_hide_a_later_opaque_writer():
         check(f"passive:{read[:30]}", v.classification != "write", str(v))
 
 
+def test_nm2_and_nm2b_fail_closed_at_the_base_lexer():
+    # Original #485 specimens, compared against the shell itself, not another tokenizer.
+    for name, template in (
+        ("NM2", "printf %s $'it\\'s <<EOF'\nprintf x > {gate}\nEOF'"),
+        ("NM2b", "printf %s $'it\\'s'\nprintf x > {gate}\n:'"),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            gate = os.path.join(td, "plugins", "kimi", "hooks", "pre_tool_use.py")
+            os.makedirs(os.path.dirname(gate))
+            cmd = template.format(gate=gate)
+            v = cls(cmd)
+            check(f"{name}_is_write_not_read", v.classification == "write", str(v))
+            check(f"{name}_base_lexer_out_of_grammar",
+                  v.rule == "governance-closure-out-of-grammar", str(v))
+            p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            check(f"{name}_bash_really_writes", os.path.isfile(gate),
+                  f"rc={p.returncode} stderr={p.stderr}")
+
+
+def test_ansi_c_fallback_cost_is_explicit():
+    # The conservative fallback costs a genuinely read-only ANSI-C path. That is a visible
+    # false positive, accepted by #485 rather than hidden by another desynchronized quote model.
+    v = cls(f"cat $'{T}'")
+    check("ansi_c_governed_read_costs_a_refusal", v.classification == "write", str(v))
+    v = cls("printf %s $'a\\tb' > /tmp/zz")
+    check("ansi_c_without_closure_vocabulary_stays_none", v.classification == "none", str(v))
+
+
 ALL = [
+    test_nm2_and_nm2b_fail_closed_at_the_base_lexer,
+    test_ansi_c_fallback_cost_is_explicit,
     test_an_early_out_of_grammar_command_does_not_hide_a_later_opaque_writer,
     test_every_hidden_output_is_a_write,
     test_the_same_verb_reading_the_gate_is_not_a_write,
