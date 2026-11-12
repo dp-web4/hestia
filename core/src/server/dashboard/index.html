@@ -1170,6 +1170,15 @@
       <button class="esc-banner-btn" id="scope-banner-btn">review</button>
     </div>
 
+    <!-- GATE INTEGRITY overview banner (#1378). Modified, unratified, missing, unregistered,
+         deploy-different bytes and UNKNOWN stay above the views; only a verified set without
+         differing deployed bytes is silent. -->
+    <div class="esc-banner" id="gate-integrity-banner" hidden>
+      <span class="esc-dot"></span>
+      <span id="gate-integrity-banner-text">…</span>
+      <button class="esc-banner-btn" id="gate-integrity-banner-btn">Gates</button>
+    </div>
+
     <!-- TWO TOP-LEVEL VIEWS (dp, 2026-08-11). Everything from here to the end of .live-grid
          is the AGENTS view — local orchestrators + trust/histogram/witness-chain, i.e.
          governance of the agents on this box. The HUBS view (the outward community surface)
@@ -5844,6 +5853,54 @@
     });
   })();
 
+  // ---- GATE INTEGRITY overview banner (#1378) ------------------------------------------------
+  let gateIntegrityBusy = false;
+  function gateIntegrityHealthy(r) {
+    return r.status === 'VERIFIED'
+      && !(r.gates || []).some(g => g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs');
+  }
+  async function gateIntegrityLoad() {
+    const banner = $('gate-integrity-banner'), text = $('gate-integrity-banner-text');
+    if (gateIntegrityBusy) return;
+    gateIntegrityBusy = true;
+    try {
+      const res = await apiFetch('/api/gates/verify', { cache: 'no-store' });
+      if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+      const r = await res.json();
+      if (gateIntegrityHealthy(r)) { banner.hidden = true; return; }
+      if (r.status === 'UNKNOWN') {
+        text.textContent = `Gate integrity UNKNOWN — ${r.reason || 'the gate set could not be established'}`;
+        banner.hidden = false;
+        return;
+      }
+      const rows = (r.gates || []).filter(g => g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs');
+      const count = pick => rows.filter(pick).length;
+      const parts = [];
+      const notRegistered = count(g => g.not_registered === true);
+      const modified = count(g => g.status === 'modified');
+      const missing = count(g => g.status === 'missing' || g.status === 'unreadable');
+      const differs = count(g => g.deployment === 'differs');
+      const pending = count(g => g.status === 'unratified' && g.deployment === 'match');
+      const unratified = count(g => g.status === 'unratified' && g.deployment !== 'match');
+      if (notRegistered) parts.push(`${notRegistered} not registered — possible bypass`);
+      if (modified) parts.push(`${modified} modified since ratification`);
+      if (missing) parts.push(`${missing} missing or unreadable`);
+      if (differs) parts.push(`${differs} differs from the deploy`);
+      if (pending) parts.push(`${pending} deployed, not yet ratified`);
+      if (unratified) parts.push(`${unratified} unratified`);
+      if (!parts.length) parts.push(r.status);
+      const members = [...new Set(rows.map(g => g.plugin_id || g.path.split('/').filter(Boolean).pop() || g.path))];
+      const shown = members.slice(0, 3).join(', ') + (members.length > 3 ? ` +${members.length - 3} more` : '');
+      text.textContent = `Gate integrity: ${rows.length} gate${rows.length === 1 ? '' : 's'}: ${parts.join(' · ')}${shown ? ` — ${shown}` : ''}`;
+      banner.hidden = false;
+    } catch (e) {
+      text.textContent = `Gate integrity could not be read — ${e.message}`;
+      banner.hidden = false;
+    } finally {
+      gateIntegrityBusy = false;
+    }
+  }
+
   // ---- GATES pane ----------------------------------------------------------------------------
   // GET /api/gates/verify and POST /api/gates/ratify, as the desktop app's Gates screen uses them.
   // The ratify carries `expected` = the evidence.current THIS pane rendered: the daemon recomputes
@@ -6916,6 +6973,10 @@
   // when it is actually read.
   setInterval(() => { if (!document.hidden) tick(); }, REFRESH_MS);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+
+  $('gate-integrity-banner-btn').addEventListener('click', () => { setView('govern', true); governShow('gates'); });
+  gateIntegrityLoad();
+  setInterval(() => { if (!document.hidden) gateIntegrityLoad(); }, 30000);
 
   // Display alias editor (#998). Set and clear are operator acts on the console's own
   // presentation store; neither is witnessed, by ruling. The picker's value is the id.
