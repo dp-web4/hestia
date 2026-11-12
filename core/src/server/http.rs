@@ -8462,7 +8462,11 @@ fn deployed_gate_digests_from(path: &std::path::Path) -> Option<serde_json::Valu
 }
 
 fn deployed_gate_digests(home: &std::path::Path) -> Option<serde_json::Value> {
-    deployed_gate_digests_from(&super::dashboard::deployment_authority_path(home))
+    let path = super::dashboard::deployment_authority_path(home);
+    if super::dashboard::deployment_authority_file_error(&path).is_some() {
+        return None;
+    }
+    deployed_gate_digests_from(&path)
 }
 
 /// Ratifying is the approve direction of the most consequential decision on a box — it
@@ -9677,6 +9681,41 @@ mod disposition_tests {
         assert!(deployed_gate_digests_from(&dir.path().join("absent.json")).is_none());
         std::fs::write(&p, b"not json").unwrap();
         assert!(deployed_gate_digests_from(&p).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_deployment_authority_cannot_back_bulk_ratify() {
+        let dir = TempDir::new().unwrap();
+        let real_home = dir.path().join("real");
+        let linked_home = dir.path().join("linked");
+        std::fs::create_dir_all(&real_home).unwrap();
+        std::fs::create_dir_all(&linked_home).unwrap();
+        std::fs::write(real_home.join("current-build.json"), serde_json::json!({
+            "build_id": "b1",
+            "members": [{"files": [{"path": "/h/cc.py", "sha256": "aaaa"}]}],
+        }).to_string()).unwrap();
+        std::os::unix::fs::symlink(
+            real_home.join("current-build.json"), linked_home.join("current-build.json")).unwrap();
+        let discovered = vec![("claude-code".to_string(), "/h/cc.py".to_string())];
+        let current = serde_json::json!({"/h/cc.py": "aaaa"}).as_object().unwrap().clone();
+        let body = serde_json::json!({"expected": current.clone()});
+        let previous = Default::default();
+
+        let regular = deployed_gate_digests(&real_home);
+        assert!(regular.is_some());
+        assert!(plan_ratification(&body, "r", &discovered, &current, regular.as_ref(),
+                                  &previous, chrono::Utc::now()).is_ok());
+
+        let linked = deployed_gate_digests(&linked_home);
+        assert!(linked.is_none(), "a symlink must not become ratify evidence");
+        let Err((code, refusal)) = plan_ratification(
+            &body, "r", &discovered, &current, linked.as_ref(), &previous, chrono::Utc::now())
+        else {
+            panic!("bulk ratify accepted a symlinked deployment authority");
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(refusal["not_matching"][0]["deployment"], "no-deploy-record");
     }
 
     // ---- per-gate ratification (dp, 2026-09-28) ----
