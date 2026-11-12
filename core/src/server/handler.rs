@@ -10024,6 +10024,44 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
     })
 }
 
+/// What an invited peer's answer does on this escalation, derived from the bar predicate
+/// (`Escalation::peer_ruling_suffices`) rather than restated, so it cannot go stale the way
+/// the dashboard's copy of the bar once did. Three cases, each naming the door:
+///
+/// * the peer's ruling DECIDES: bar is met by a peer factor, the asker is proven, it is open;
+/// * the peer's ruling cannot decide (sovereign bar, unproven asker, or already settled):
+///   corroboration is the useful answer and is evidence only.
+fn peer_answer(esc: &crate::server::gate_escalation::Escalation, now: u64) -> Value {
+    use crate::server::gate_escalation::Status;
+    let open = esc.status_at(now) == Status::Pending;
+    let proven = esc.asker_basis == crate::arbiter::AskerBasis::Session;
+    let suffices = esc.peer_ruling_suffices();
+    if open && proven && suffices {
+        json!({
+            "your_ruling_decides": true,
+            "rule_with": "hestia_gate_arbitrate_escalation",
+            "note": "This bar is met by one NOT-SAME peer's ruling: approve (with a stated \
+                     reason) or deny with hestia_gate_arbitrate_escalation and the escalation \
+                     is decided without waiting on the operator. hestia_gate_escalation_corroborate \
+                     only adds evidence and decides nothing.",
+        })
+    } else {
+        let why = if !open {
+            "already settled: a factor now is a record for later readers, not a decision"
+        } else if !suffices {
+            "sovereign_plus_peer: only an operator factor meets this bar; a peer ruling is \
+             recorded but authorises nothing"
+        } else {
+            "asker_basis is asserted: no peer may rule it (#128); the operator decides"
+        };
+        json!({
+            "your_ruling_decides": false,
+            "why": why,
+            "corroborate_with": "hestia_gate_escalation_corroborate",
+        })
+    }
+}
+
 /// Dereference `hestia://escalation/{id}` — carried by escalation invitations
 /// (`#corroborate-or-dissent`, minted since 2026-08 with no resolver behind it)
 /// and by escalation `disposition` notices (`#decided` / `#lapsed`, #459). All
@@ -10044,7 +10082,13 @@ fn escalation_answer_guidance() -> Value {
     json!({
         "tool": "hestia_gate_escalation_corroborate",
         "cli": "hestia gate corroborate <escalation_id> --stance concur|dissent --argument <text>",
-        "note": "Put your stance and argument on the escalation record. A review_done mesh notice is only a wake, not a factor; a pointer fragment alone is not a durable review."
+        "note": "Put your stance and argument on the escalation record. A review_done mesh notice is only a wake, not a factor; a pointer fragment alone is not a durable review.",
+        // 2026-11-12: this guidance named only the evidence door, on every bar, and peers
+        // followed it: single-approver asks their ruling alone would have decided were
+        // corroborated and expired. Static on purpose (it must read the same before and
+        // after a reap); the bar-aware answer is `peer_answer` on the live record.
+        "rule_instead": "If peer_answer.your_ruling_decides is true, corroboration decides nothing: rule with hestia_gate_arbitrate_escalation (approve with a stated reason, or deny).",
+        "rule_tool": "hestia_gate_arbitrate_escalation"
     })
 }
 
@@ -10086,6 +10130,14 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "factors_present": esc.factors,
             "invited_peers": esc.invited_peers,
             "asker_basis": esc.asker_basis,
+            // WHAT YOUR ANSWER DOES (2026-11-12). Every invitation points at
+            // `#corroborate-or-dissent`, whatever the bar, so invited peers corroborated
+            // single-approver asks their RULING alone would have decided, and the asks
+            // expired waiting on a human. This says, from the bar predicate itself, which
+            // door decides and which only adds evidence. Eligibility (NOT-SAME, #128) is
+            // still enforced at the arbitrate door; `asker_basis` above is the half a peer
+            // can check before trying.
+            "peer_answer": peer_answer(esc, now),
             "decided_by": esc.decided_by,
             "decided_at": esc.decided_at,
             "reason": esc.reason,
@@ -30304,6 +30356,15 @@ mod disposition_durability_tests {
         );
         assert_eq!(body["how_to_answer"]["tool"], "hestia_gate_escalation_corroborate");
         assert!(body["how_to_answer"]["note"].as_str().unwrap().contains("not a factor"));
+        // 2026-11-12: the invited peer must also learn whether its RULING decides, from the
+        // bar predicate, and which door that is. Derived, so asserted against the predicate.
+        let expected = {
+            let s = state.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            e.peer_ruling_suffices() && e.asker_basis == crate::arbiter::AskerBasis::Session
+        };
+        assert_eq!(body["peer_answer"]["your_ruling_decides"], json!(expected), "{body}");
+        assert_eq!(body["how_to_answer"]["rule_tool"], "hestia_gate_arbitrate_escalation");
     }
 
     /// Change 1 + review point 1b: `reap`'s call-site invariant — "reaping can never

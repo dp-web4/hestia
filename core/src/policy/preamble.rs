@@ -79,6 +79,14 @@ nothing that anyone is told about: it is stored, and readable through \
 notifies the decider that a peer answered. The record is the whole of what you get. The gap is \
 named here rather than hidden.
 
+   Not every invitation is only evidence. When the escalation's bar is `single_approver` and \
+its asker is proven (`asker_basis: session`), YOUR RULING DECIDES IT: rule with \
+`hestia_gate_arbitrate_escalation` (approving needs a stated reason) and the member is not left \
+waiting on the operator. Corroborating such an escalation adds evidence and decides nothing, so \
+the ask expires. The escalation you are pointed at says which case you are in, under \
+`peer_answer`. On `sovereign_plus_peer`, only an operator factor meets the bar and corroboration \
+is the answer that counts.
+
 We ask rather than compel because compulsion is not available to us, and would not be worth \
 having if it were. What is available is a shared record and an explanation — so the rules are \
 legible, the reasons are inspectable, and disagreement has somewhere to go.";
@@ -142,6 +150,19 @@ mod tests {
              re-decision and no re-scoring; removing the disclosure would put a declared value \
              where an audited one belongs, in the text every member reads first"
         );
+    }
+
+    /// THE PEER-RULING CLAUSE, pinned (2026-11-12). The two-bar paragraph above told every
+    /// invited peer that its factor is evidence, and nothing told it that on
+    /// `single_approver` its RULING decides. Measured overnight 2026-11-11/12: four of
+    /// kimi-code's escalations routed to claude-code were answered with corroboration and all
+    /// expired, including a single-approver write the peer could have granted. Delete this
+    /// clause and the only text a peer reads describes the one door that cannot decide.
+    #[test]
+    fn a_peer_is_told_when_its_ruling_decides() {
+        assert!(LAW_PREAMBLE.contains("YOUR RULING DECIDES IT"));
+        assert!(LAW_PREAMBLE.contains("hestia_gate_arbitrate_escalation"));
+        assert!(LAW_PREAMBLE.contains("peer_answer"));
     }
 
     /// It must not claim the gate can contain anyone — that is the false premise the whole
