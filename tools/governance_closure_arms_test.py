@@ -299,7 +299,9 @@ def test_a_control_flow_keyword_no_longer_refuses_a_plain_read():
     what holds the repair down in both directions. This arm holds the direction that suite's
     read half holds; the hole direction is held by its generated write half.
     """
-    looped = "for w in /tmp/a /tmp/b; do PYTHONPATH=$w/" + SHARED_DIR + " python3 t.py; done"
+    # #529 separately makes unmodelled interpreters undecidable. Use a modeled read-only
+    # verb so this arm measures control-flow stripping, not that newer command contract.
+    looped = "for w in /tmp/a /tmp/b; do PYTHONPATH=$w/" + SHARED_DIR + " cat t.py; done"
     got = verdict(looped)
     check("FP12_loop_over_a_read_is_a_read", got[0] == "read",
           f"FP12 HAS REGRESSED — a loop that only reads the closure is {got[0]!r} again "
@@ -310,13 +312,13 @@ def test_a_control_flow_keyword_no_longer_refuses_a_plain_read():
     check("FP12_benign_twin", twin == "none",
           f"a loop naming no closure vocabulary must stay none; got {twin}")
 
-    unlooped = cls("PYTHONPATH=$w/" + SHARED_DIR + " python3 t.py")
+    unlooped = cls("PYTHONPATH=$w/" + SHARED_DIR + " cat t.py")
     check("FP12_unlooped_is_a_read", unlooped == "read",
           f"the same read without the loop is allowed; got {unlooped}")
     check("FP12_loop_agrees_with_its_unlooped_body", got[0] == unlooped,
           f"the loop and its own body must agree; loop={got[0]!r} body={unlooped!r}")
 
-    literal = cls("PYTHONPATH=/tmp/a/" + SHARED_DIR + " python3 t.py")
+    literal = cls("PYTHONPATH=/tmp/a/" + SHARED_DIR + " cat t.py")
     check("FP12_assignment_is_not_the_cause", literal == "read",
           "a literal-valued assignment naming the closure is also a read — the $VAR was "
           f"never what triggered FP12; got {literal}")

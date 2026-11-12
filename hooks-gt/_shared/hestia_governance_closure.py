@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: c7dd1297df92bb31e3d87016ad0f3a9cc64161231b19eaa769f52f28ce0f642b  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1374,17 +1374,16 @@ def _output_verb_write_targets(name: str, args: list, path_pinned: bool = False)
             w.append(".")
         return [x for x in w if x != ""]
     if name in ("perl", "ruby"):
-        if any(a.startswith("-") and not a.startswith("--")
-               and re.match(r"^-[A-Za-z]*i", a) is not None for a in args):
-            raise _OutOfGrammar()  # rewrites every file operand; the script is opaque
-        return []
+        raise _OutOfGrammar()  # the program is opaque, with or without an in-place option
     return None
 
 
+_FALLBACK_READ_ONLY_VERBS = _PASSIVE_VERBS | {"date", "false", ":", "pwd", "read", "sleep"}
+
+
 def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:
-    """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
-    their file args are read positions by default (the anti-FP stance; the daemon's
-    destructive preset stays behind anything exotic)."""
+    """Write-position arguments of ONE simple command. A trusted read-only verb contributes
+    none; an unmodelled command is undecidable and raises _OutOfGrammar (#529)."""
     words = _strip_wrappers(words)
     if not words:
         return []
@@ -1554,7 +1553,11 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         if sub == "bundle" and rest[:1] == ["create"] and len(rest) > 1:
             out.append(rest[1])
         return out
-    return []
+    if (((name == "systemctl" and args[:1] == ["status"])
+         or name in _FALLBACK_READ_ONLY_VERBS)
+            and _is_trusted_program(words[0], path_pinned)):
+        return []
+    raise _OutOfGrammar()
 
 
 def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None,
@@ -1580,12 +1583,10 @@ def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None,
             return eff
         # The strip consumes what it models and hands back the rest unchanged. If what it
         # hands back STILL starts with a block keyword — `{`, `}`, `((`, `[[`, `function`,
-        # `select` — the construct is unmodelled and must stay out of grammar. This check is
-        # load-bearing here and not in the classifier: an unknown head REFUSES there (it is
-        # absent from the read-only allowlist) but contributes NO write targets here (the
-        # anti-FP default), so without it `{ cp x GATE; }` resolved to nothing and was
-        # permitted. Caught by test_control_flow_read_is_read_fp12's write arm before it
-        # shipped, 2026-09-04.
+        # `select` — the construct is unmodelled and must stay out of grammar. Before #529
+        # an unknown head contributed NO write targets here, so this check was the only
+        # thing that kept `{ cp x GATE; }` from resolving to nothing. Keep the explicit
+        # block-shape refusal as the documented contract, not a fallback side effect.
         if remainder[0] in _SHELL_BLOCK_KEYWORDS:
             raise _OutOfGrammar()
         words = stripped = remainder
@@ -1657,6 +1658,14 @@ def _bash_write_targets(command: str) -> list:
     # A bare name run by find -exec / xargs is found through PATH; trust it only when no word of
     # this line (heredoc bodies included, to err toward refusing) names PATH (Nova, #1356).
     path_pinned = not _PATH_WORD.search(command)
+    defined_functions = set()
+
+    def flush(words, effective, found, stdin):
+        # A bare call runs the already-walked definition, not a new unknown program.
+        if len(words) == 1 and words[0] in defined_functions:
+            return effective
+        return _flush_simple_command(words, effective, found, stdin, path_pinned)
+
     i = 0
     while i < len(toks):
         t = toks[i]
@@ -1669,10 +1678,17 @@ def _bash_write_targets(command: str) -> list:
             cur.append(t)
             i += 1
             continue
+        if (t == "(" and len(cur) == 1 and _FOR_NAME.fullmatch(cur[0])
+                and i + 1 < len(toks) and toks[i + 1] == ")"):
+            # `name ()` declares, rather than invokes, the function whose body is walked next.
+            defined_functions.add(cur[0])
+            cur = []
+            i += 1
+            continue
         if t in _SEPARATORS:
             if cur:
                 try:
-                    eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
+                    eff = flush(cur, eff, targets, stdin_src)
                 except _OutOfGrammar:
                     deferred_oog = True
                 cur = []
@@ -1706,7 +1722,7 @@ def _bash_write_targets(command: str) -> list:
         i += 1
     if cur:
         try:
-            eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
+            eff = flush(cur, eff, targets, stdin_src)
         except _OutOfGrammar:
             deferred_oog = True
     if deferred_oog:
