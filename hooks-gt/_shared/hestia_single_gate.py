@@ -1,4 +1,4 @@
-# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 33f8998e2fe3b999fb8484d6a05f3137870e99435fd699ed3a08ef4a1ac886e2  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -1087,7 +1087,10 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
                      "gate_self_read", marker, ev.tool, cv.rule, plugin_id=prof.member_id,
                      role=_role(inv), gate_path=prof.gate_path or "",
                      client_name=_client_name(prof), host_session_id=ev.session_id,
-                     deadline=inv.phase_deadline)
+                     deadline=inv.phase_deadline,
+                     target_path=(closure.resolve_location(cv.resource, ev.cwd)
+                                  if cv.resource else None),
+                     target_as_named=cv.resource)
         except Exception:  # noqa: BLE001
             pass
         return None
