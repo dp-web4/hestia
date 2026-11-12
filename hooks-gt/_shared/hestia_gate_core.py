@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: e78513bd94e63a4432d70188ec4e329fcc9bd4ea48486e2d939a66d2df8b1f6e  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -1742,8 +1742,6 @@ def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, works
     Read keeps its own rule (`path_in_scope` refuses outside the workspace either way)."""
     lexical = os.path.normpath(resolved).replace("\\", "/")
     target = os.path.realpath(lexical).replace("\\", "/")
-    if target == lexical and _under_temp_root(lexical):
-        return None
     if target == lexical:
         return (seg or "<workspace root>"), resolved
     wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
