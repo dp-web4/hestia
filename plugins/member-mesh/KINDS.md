@@ -240,30 +240,27 @@ a dead fire look like a delivered one, one level up):
    answered*; it still cannot say *nobody acted*.
 
 **A transient ask dies with its target (#1354, 2026-10-20).** A counted row of the
-**ask kind** — `review_request` and its dotted specializations, never a durable `reply`
-(a reply carrying a terminal scope pointer is content the recipient is still owed) —
-whose pointer names a **terminal scope request** — ruled, revoked, or past its window —
-is *moot*: it moves from `i_owe`/`owed_to_me` to `i_owe_moot`/`owed_to_me_moot` and
-counts as debt nowhere. The classification is derived at read time against the live
-(memory-only) scope request map, so there is no sweep and no new mutation; the cost of
-that choice is that a request the map no longer holds (a daemon restart drops them all)
-reads **unknown, and unknown is not moot** — the row stays owed and fails toward
-visibility, the pointer resolver's "UNKNOWN, not refused" principle one level up.
-Mootness is therefore **non-monotonic**: eviction or restart moves a mooted row back to
-owed. That is intentional fail-toward-visibility until durable, event-driven `mooted_at`
-evidence lands — the named #1354 follow-up, along with escalation-pointer mootness and
-fire-digest rendering of the moot counts. Two precedence rules:
-`recipient_liveness: unknown` (a misroute) outranks mootness in `owed_to_me`, because the
-misroute is sender-actionable and mootness is not; and durable pointers (PRs, forum posts,
-anything without a `hestia://scope/` referent) never moot, because a reply is a person
-waiting, not a window. Binding to a mooted row stays legal — mootness reclassifies the
-debt, it does not close the row. The measured forcing case: a seat down five days on
-provider quota accumulated ~276 transient rows (scope peer-decides raced by live peers in
-68–151 s, escalations self-withdrawn 10 s after opening). At most the ~244 scope-pointer
-rows of those are mootable by this slice, and only while their terminal requests remain
-in the live map; the ~32 escalation-pointer rows are out of scope here. Unmooted, they
-render as a 148-row wall in every fire primer while the seat's own default 6 h
-`unanswered` window truthfully reads `i_owe 0`.
+**ask kind** — `review_request` and its dotted specializations, never a durable `reply` —
+whose pointer names a terminal scope request (ruled, revoked, or past its window) or
+escalation (decided, withdrawn, or lapsed) is *moot*: it moves from
+`i_owe`/`owed_to_me` to `i_owe_moot`/`owed_to_me_moot` and counts as debt nowhere.
+
+The terminal ruling's disposition projection sets `mooted_at` and `moot_reason` in the
+same transaction as the disposition row. The reason names the ruling hash; both fields
+appear on the mooted unanswered row and survive request-map eviction, escalation reaping,
+and restart. Projection retries preserve the first evidence. A still-live terminal target
+can also be derived at read time without a sweep or a mutation by `member_unanswered`.
+Once that live evidence is gone, an unmarked row fails back to owed: **unknown is not
+moot**. A durable mark does not un-derive. The gate's `status_of(unknown) = expired`
+denial rule is not evidence of mootness and is deliberately not used here.
+
+Two precedence rules remain: `recipient_liveness: unknown` (a misroute) outranks mootness
+in `owed_to_me`, because the misroute is sender-actionable; and durable pointers (PRs,
+forum posts, appeals, replies) never moot, because a reply is a person waiting, not a
+window. Binding to a mooted row stays legal — mootness reclassifies the debt, it does not
+close the row. The measured forcing case was a seat down five days on provider quota,
+which accumulated ~276 transient rows and rendered a 148-row wall in every fire primer.
+Fire-digest rendering of the moot counts is a separate rendering follow-up.
 
 Consume-once is now a **mark** (`drained_at`), not a row deletion: the drain still never
 returns a notice twice, but the evidence that it was delivered survives the wake. Deleting
