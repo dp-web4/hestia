@@ -1741,6 +1741,8 @@ def _symlinked_reach_verdict(resolved: str, seg: str, repo_scopes, scopes, works
     Read keeps its own rule (`path_in_scope` refuses outside the workspace either way)."""
     lexical = os.path.normpath(resolved).replace("\\", "/")
     target = os.path.realpath(lexical).replace("\\", "/")
+    if target == lexical and _under_temp_root(lexical):
+        return None
     if target == lexical:
         return (seg or "<workspace root>"), resolved
     wsr = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")

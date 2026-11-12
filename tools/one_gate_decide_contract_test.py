@@ -1189,14 +1189,15 @@ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home)
     finally:
         stub.close()
     # (7) device sinks and temp roots are never escalated.
-    stub = Stub(Policy())
-    try:
-        with _Env(m, stub.url, home):
-            d, _ = _decide(g, "codex", "Bash", {"command": "ls 2>/dev/null >/tmp/x"}, home)
-        check("scope-sinks-allowed", d.decision == "allow", d)
-        check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
-    finally:
-        stub.close()
+    with tempfile.TemporaryDirectory() as sink:
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home):
+                d, _ = _decide(g, "codex", "Bash", {"command": f"ls 2>/dev/null >{sink}/x"}, home)
+            check("scope-sinks-allowed", d.decision == "allow", d)
+            check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
+        finally:
+            stub.close()
 
 
 def test_an_unenumerated_reach_is_refused_with_rewrite_guidance(m, g, wc, home):
@@ -1725,7 +1726,7 @@ def test_the_mcp_transport_is_command_scoped(m, g, wc, home):
     stub = Stub()
     try:
         with _Env(m, stub.url, home):
-            sibling = REPO.parent / "decide-contract-ungranted-sibling"
+            sibling = pathlib.Path.home() / f"decide-contract-ungranted-sibling-{uuid.uuid4().hex}"
             sibling.mkdir(exist_ok=True)
             try:
                 raw = native_event("gemini", "mcp_fs_read", {"path": "x"}, str(REPO), 14)
