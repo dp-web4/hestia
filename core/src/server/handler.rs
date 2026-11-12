@@ -935,7 +935,7 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
     let declared_role = optional_string(args, "role").unwrap_or_default();
     // The published directory first, as real connect does; on a miss the locked state, which
     // real connect also re-checks. Both are reads.
-    let found = match state.published().sessions.find_reuse(&plugin_id, &host_session_id) {
+    let found = match state.published().sessions.find_reuse_live(&plugin_id, &host_session_id, Utc::now()) {
         Some(id) => Some((id.session_id, id.soft_lct.clone(), id.assigned_role.clone(),
                           id.constellation_role.clone(), id.role_basis.clone())),
         None => {
@@ -943,6 +943,7 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
             s.sessions
                 .find_reuse_id(&plugin_id, &host_session_id)
                 .and_then(|id| s.sessions.get(&id))
+                .filter(|session| s.session_is_live(session, Utc::now()))
                 .map(|e| (e.session_id, e.soft_lct.clone(), e.assigned_role.clone(),
                           e.constellation_role.clone(), e.role_basis.clone()))
         }
@@ -1082,10 +1083,14 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // the state lock: before this every gate call's first step queued behind every write in the
     // society. Same reply, same Guard A/C semantics (the key is (plugin_id, host_session_id),
     // never the host id alone); a miss falls through to the locked path, which re-checks.
+    // The intent lets the reaper retain role labels only for a reconnect already in flight, rather
+    // than leaving one permanent tombstone per historical host session.
+    let _reconnect_intent = host_session_id.as_deref().map(|hsid| {
+        state.published().sessions.reconnect_intent(&plugin_id, hsid)
+    });
     if let Some(hsid) = host_session_id.as_deref() {
         let published = state.published();
-        if let Some(existing) = published.sessions.find_reuse(&plugin_id, hsid) {
-            existing.touch();
+        if let Some(existing) = published.sessions.touch_reuse_live(&plugin_id, hsid, Utc::now()) {
             if let Some(capabilities) = gate_capabilities.as_ref() {
                 published.gate_capabilities.insert(plugin_id.clone(), capabilities.clone());
             }
@@ -1105,6 +1110,10 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     }
 
     let mut s = state.lock().await;
+    s.reap_stale_sessions(Utc::now());
+    let previous_transport = host_session_id
+        .as_deref()
+        .and_then(|hsid| s.sessions.reconnect_role(&plugin_id, hsid));
 
     // Connect idempotency (HUB ruling 2026-07-24): the claude-code hook connects on EVERY tool call
     // (fresh MCP connection per hook subprocess), so without this each tool call mints a distinct
@@ -1157,6 +1166,13 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
 
     let session_id = Uuid::new_v4();
     let soft_lct = s.issue_soft_lct(session_id);
+    let (assigned_role, constellation_role, role_basis) = previous_transport
+        .map(|previous| {
+            (previous.assigned_role, previous.constellation_role, previous.role_basis)
+        })
+        .unwrap_or((requested_role, constellation_role, role_basis));
+    let role_declaration_honored =
+        role_declaration_honored && declared_role == constellation_role;
 
     let session = Session {
         session_id,
@@ -1164,7 +1180,7 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         plugin_version,
         host_agent,
         host_agent_version,
-        assigned_role: requested_role.clone(),
+        assigned_role,
         constellation_role: constellation_role.clone(),
         role_basis,
         soft_lct: soft_lct.clone(),
@@ -1248,6 +1264,7 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // reads back — so the two paths cannot disagree about what was assigned,
     // and a later policy change can't silently split them.
     let assigned_role = s.sessions[&session_id].assigned_role.clone();
+    let constellation_role = s.sessions[&session_id].constellation_role.clone();
     let role_basis = s.sessions[&session_id].role_basis.clone();
 
     // session_started is intentionally NOT written to the witness chain.
@@ -1347,6 +1364,7 @@ its permit now belongs to another invocation, so this one may not begin"),
             chain_position,
         },
     );
+    s.sessions.directory().action_started(session_id);
 
     Ok(json!({
         "actionId": action_id,
@@ -1389,6 +1407,7 @@ pub(crate) async fn tool_record_outcome(state: &SharedState, args: &Value) -> To
             ));
         }
     };
+    s.sessions.directory().action_finished(action.session_id);
 
     let (plugin_id, role_lct, role_basis) = s
         .sessions
@@ -2193,7 +2212,10 @@ fn resolve_attributed_caller(
     session_id_arg: Option<&str>,
 ) -> Option<CallerWho> {
     let uuid = Uuid::parse_str(session_id_arg?).ok()?;
-    let sess = s.sessions.get(&uuid)?;
+    let sess = s
+        .sessions
+        .get(&uuid)
+        .filter(|session| s.session_is_live(session, Utc::now()))?;
     Some(CallerWho {
         session_uuid: Some(uuid),
         plugin_id: sess.plugin_id.clone(),
@@ -9495,10 +9517,18 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         let explicit = rest
             .strip_prefix("?session_id=")
             .and_then(|v| Uuid::parse_str(v.trim()).ok());
+        let now = Utc::now();
         let resolved = match explicit {
-            Some(u) => s.sessions.get(&u).cloned(),
+            Some(u) => s
+                .sessions
+                .get(&u)
+                .filter(|session| s.session_is_live(session, now))
+                .cloned(),
             None => {
-                let mut it = s.sessions.values();
+                let mut it = s
+                    .sessions
+                    .values()
+                    .filter(|session| s.session_is_live(session, now));
                 match (it.next(), it.next()) {
                     (Some(only), None) => Some(only.clone()), // exactly one session: unambiguous
                     (None, _) => None,                        // no sessions connected
@@ -9532,7 +9562,12 @@ async fn read_resource_body(state: &SharedState, uri: &str) -> Result<String, St
         // audit missed it — the two-caller discipline caught it). So siblings exposes ONLY
         // coordination-safe metadata and REDACTS the bearer fields. `session/own` still returns the full
         // session: you may hold your OWN capability, never a peer's.
-        let mut sessions: Vec<&Session> = s.sessions.values().collect();
+        let now = Utc::now();
+        let mut sessions: Vec<&Session> = s
+            .sessions
+            .values()
+            .filter(|session| s.session_is_live(session, now))
+            .collect();
         // Liveness includes lock-free reuse bumps (stage 2), which land in the directory.
         sessions.sort_by_key(|sess| s.sessions.last_seen(sess));
         let safe: Vec<Value> = sessions
@@ -13178,6 +13213,70 @@ mod member_mesh_tests {
         assert_eq!(kimi_mail["notices"][0]["from_plugin"], json!("claude-code"));
     }
 
+    #[tokio::test]
+    async fn pending_mesh_delivery_survives_stale_transport_replacement() {
+        let (_dir, state) = test_state().await;
+        let alice = connect(&state, "claude-code").await;
+        let first = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "kimi-code", "host_agent": "kc",
+                "host_session_id": "pending-mesh-horizon"
+            }),
+        )
+        .await
+        .unwrap();
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let first_uuid = Uuid::parse_str(&first_id).unwrap();
+        let sent = tool_member_notify(
+            &state,
+            &json!({
+                "to_plugin_id": "kimi-code", "kind": "review_done",
+                "pointer_uri": "shared-context/forum/x.md", "session_id": alice
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(sent["queued_id"].is_number(), "send failed: {sent}");
+        {
+            let mut s = state.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+            assert_eq!(s.inbox_store.peek_member("kimi-code").unwrap().len(), 1);
+        }
+
+        let stale_read = tool_member_inbox(&state, &json!({"session_id": first_id.clone()}))
+            .await
+            .unwrap();
+        assert_eq!(stale_read["_hestia_error"]["code"], "hestia.member_inbox_unattributed");
+        let removed = state.lock().await.reap_stale_sessions(Utc::now());
+        assert_eq!(removed, 1, "only the stale recipient transport is replaced");
+        assert_eq!(
+            state.lock().await.inbox_store.peek_member("kimi-code").unwrap().len(),
+            1,
+            "the durable notice is not keyed to the removed transport"
+        );
+
+        let second = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "kimi-code", "host_agent": "kc",
+                "host_session_id": "pending-mesh-horizon"
+            }),
+        )
+        .await
+        .unwrap();
+        let second_id = second["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(second_id, first_id);
+        let mail = tool_member_inbox(&state, &json!({"session_id": second_id}))
+            .await
+            .unwrap();
+        assert_eq!(mail["total"], 1, "{mail}");
+        assert_eq!(mail["notices"][0]["from_plugin"], "claude-code");
+    }
+
     /// T3 (McNugget on `17a928d`): a REFUSED forward must be distinguishable from an
     /// accepted one **on the chain**, not just in an ephemeral tool response.
     ///
@@ -15760,6 +15859,472 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_stale_reuse_is_replaced_instead_of_refreshed_forever() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "stale-host"}),
+        )
+        .await
+        .unwrap();
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let first_uuid = Uuid::parse_str(&first_id).unwrap();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+        let (map_seen, directory_seen) = {
+            let s = shared.lock().await;
+            let session = s.sessions.get(&first_uuid).unwrap();
+            (
+                s.sessions.last_seen(session),
+                s.sessions.directory().get(&first_uuid).unwrap().last_seen(),
+            )
+        };
+        let stale_before = Utc::now()
+            - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS);
+        assert!(
+            map_seen < stale_before && directory_seen < stale_before,
+            "map and published directory must both be stale: map={map_seen}, directory={directory_seen}"
+        );
+
+        let second = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "stale-host"}),
+        )
+        .await
+        .unwrap();
+        let second_id = second["sessionId"].as_str().unwrap();
+        assert_ne!(second_id, first_id, "stale transport is replaced, not refreshed");
+        assert_eq!(shared.lock().await.sessions.len(), 1, "the old session was reaped");
+        let old = read_resource_body(
+            &shared,
+            &format!("hestia://session/own?session_id={first_id}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(old, "null", "an explicitly named stale session is not live: {old}");
+        let siblings = read_resource_body(&shared, "hestia://session/siblings").await.unwrap();
+        let view: Value = serde_json::from_str(&siblings).unwrap();
+        assert_eq!(view["count"], 1, "{view}");
+        assert_eq!(view["sessions"][0]["host_session_id"], "stale-host", "{view}");
+    }
+
+    #[tokio::test]
+    async fn stale_liveness_retains_inflight_actions_and_filters_the_single_session_fallback() {
+        let (_dir, shared) = make_shared_state();
+        let (stale, fresh, acting) = {
+            let mut s = shared.lock().await;
+            let ids = (
+                add_session(&mut s, "stale-drop"),
+                add_session(&mut s, "fresh-live"),
+                add_session(&mut s, "stale-action"),
+            );
+            for id in [ids.0, ids.2] {
+                let mut session = s.sessions.remove(&id).unwrap();
+                session.connected_at = Utc::now()
+                    - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+                s.sessions.insert(id, session);
+            }
+            let action_id = Uuid::new_v4();
+            s.actions.insert(
+                action_id,
+                InFlightAction {
+                    action_id,
+                    session_id: ids.2,
+                    tool_name: "Edit".into(),
+                    target: Some("/tmp/work".into()),
+                    parameters: None,
+                    intent: None,
+                    host_session_id: None,
+                    serves: None,
+                    started_at: Utc::now(),
+                    chain_position: 0,
+                },
+            );
+            ids
+        };
+
+        let removed = shared.lock().await.reap_stale_sessions(Utc::now());
+        assert_eq!(removed, 1, "only the idle stale session is removed");
+        {
+            let s = shared.lock().await;
+            assert!(!s.sessions.contains_key(&stale));
+            assert!(s.sessions.contains_key(&fresh));
+            assert!(s.sessions.contains_key(&acting), "an in-flight action retains its session");
+        }
+        let siblings = read_resource_body(&shared, "hestia://session/siblings").await.unwrap();
+        assert!(!siblings.contains("stale-drop"), "{siblings}");
+        assert!(siblings.contains("fresh-live") && siblings.contains("stale-action"), "{siblings}");
+        let own = read_resource_body(&shared, "hestia://session/own").await.unwrap();
+        assert!(own.contains("ambiguous_caller"), "two live sessions stay ambiguous: {own}");
+
+        shared.lock().await.actions.clear();
+        let removed = shared.lock().await.reap_stale_sessions(Utc::now());
+        assert_eq!(removed, 1, "the action session becomes removable when its work closes");
+        let own = read_resource_body(&shared, "hestia://session/own").await.unwrap();
+        assert!(own.contains(&fresh.to_string()), "the sole live session resolves: {own}");
+        assert!(!own.contains("ambiguous_caller"), "{own}");
+    }
+
+    #[tokio::test]
+    async fn stale_inflight_action_keeps_original_attribution_across_the_reap_horizon() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "inflight-horizon",
+                "role": "role:constellation:interactive-dev", "role_basis": "original-role"
+            }),
+        )
+        .await
+        .unwrap();
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let first_uuid = Uuid::parse_str(&first_id).unwrap();
+        let action = tool_begin_action(
+            &shared,
+            &json!({
+                "tool_name": "Edit", "session_id": first_id.clone(),
+                "target": "/tmp/work", "parameters": {}
+            }),
+        )
+        .await
+        .unwrap();
+        let action_id = action["actionId"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+
+        let removed = shared.lock().await.reap_stale_sessions(Utc::now());
+        assert_eq!(removed, 0, "an in-flight act retains its original session");
+        let law = tool_operating_law(&shared, &json!({"session_id": first_id.clone()}))
+            .await
+            .unwrap();
+        assert!(law["_hestia_error"].is_null(), "the published path retains the acting session: {law}");
+        assert_eq!(law["identity"]["role"], "role:constellation:interactive-dev");
+
+        let recorded = tool_record_outcome(
+            &shared,
+            &json!({"action_id": action_id.clone(), "success": true}),
+        )
+        .await
+        .unwrap();
+        assert!(recorded["witnessEntryHash"].is_string(), "{recorded}");
+        let entries = { shared.lock().await.recent_chain(20) };
+        let outcome = entries
+            .iter()
+            .find(|entry| entry.event_type == "outcome"
+                && entry.event_data["action_id"] == json!(action_id))
+            .expect("the action outcome is witnessed");
+        assert_eq!(outcome.event_data["session_id"], json!(first_id));
+        assert_eq!(outcome.event_data["plugin_id"], "claude-code");
+        assert_eq!(outcome.event_data["role_lct"], "role:constellation:interactive-dev");
+        assert_eq!(outcome.event_data["role_basis"], "original-role");
+
+        let removed = shared.lock().await.reap_stale_sessions(Utc::now());
+        assert_eq!(removed, 1, "the stale transport is removable after its outcome closes");
+    }
+
+    #[tokio::test]
+    async fn stale_reconnect_preserves_the_effective_role_and_does_not_adopt_a_new_grant() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "role-preserving-reconnect",
+                "role": "role:constellation:interactive-dev", "role_basis": "original-role"
+            }),
+        )
+        .await
+        .unwrap();
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let first_uuid = Uuid::parse_str(&first_id).unwrap();
+        {
+            let mut s = shared.lock().await;
+            s.instance_grants.insert(
+                ("claude-code".into(), "role:constellation:reviewer".into()),
+                crate::server::state::InstanceGrant {
+                    preset: "permissive".into(),
+                    granted_by: "operator".into(),
+                    granted_at: 0,
+                    reason: "control: reconnect must not adopt this other-role grant".into(),
+                    expires_at: None,
+                },
+            );
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+
+        let second = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "role-preserving-reconnect",
+                "role": "role:constellation:reviewer", "role_basis": "changed-role"
+            }),
+        )
+        .await
+        .unwrap();
+        let second_id = second["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(second_id, first_id, "stale transport is replaced");
+        assert_eq!(second["constellationRole"], "role:constellation:interactive-dev");
+        assert_eq!(second["roleBasis"], "original-role");
+        assert_eq!(second["roleDeclarationHonored"], false, "the changed declaration is visible");
+
+        let law = tool_operating_law(&shared, &json!({"session_id": second_id}))
+            .await
+            .unwrap();
+        assert_eq!(law["identity"]["role"], "role:constellation:interactive-dev");
+        assert!(law["operator_grant"].is_null(), "the reviewer grant was not adopted: {law}");
+        assert!(!law["layers"].to_string().contains("operator-grant"), "{law}");
+        let s = shared.lock().await;
+        assert!(s.instance_grants.contains_key(&(
+            "claude-code".into(),
+            "role:constellation:reviewer".into(),
+        )), "transport replacement does not revoke or mutate policy grants");
+    }
+
+    #[tokio::test]
+    async fn another_connect_reaping_first_does_not_change_reconnect_role() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "raced-role-reconnect",
+                "role": "role:constellation:interactive-dev", "role_basis": "original-role"
+            }),
+        )
+        .await
+        .unwrap();
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let first_uuid = Uuid::parse_str(&first_id).unwrap();
+        {
+            let mut s = shared.lock().await;
+            s.instance_grants.insert(
+                ("claude-code".into(), "role:constellation:reviewer".into()),
+                crate::server::state::InstanceGrant {
+                    preset: "permissive".into(),
+                    granted_by: "operator".into(),
+                    granted_at: 0,
+                    reason: "control: a racing reconnect must not adopt this grant".into(),
+                    expires_at: None,
+                },
+            );
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+
+        let directory = shared.lock().await.sessions.directory();
+        let reconnect_intent = directory.reconnect_intent("claude-code", "raced-role-reconnect");
+        let published = shared.published();
+        assert!(published
+            .sessions
+            .find_reuse_live("claude-code", "raced-role-reconnect", Utc::now())
+            .is_none(), "A misses the published live lookup before its locked reconnect");
+        drop(published);
+
+        tool_connect(
+            &shared,
+            &json!({"plugin_id": "codex", "host_agent": "cx", "host_session_id": "racing-b"}),
+        )
+        .await
+        .unwrap();
+        assert!(!shared.lock().await.sessions.contains_key(&first_uuid),
+            "B's connect reaps A before A reaches the locked reconnect");
+        assert_eq!(directory.reconnect_state_counts(), (1, 1),
+            "the paused reconnect holds the only role tombstone");
+
+        let second = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "raced-role-reconnect",
+                "role": "role:constellation:reviewer", "role_basis": "changed-role"
+            }),
+        )
+        .await
+        .unwrap();
+        let second_id = second["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(second_id, first_id);
+        assert_eq!(second["constellationRole"], "role:constellation:interactive-dev");
+        assert_eq!(second["roleBasis"], "original-role");
+        assert_eq!(second["roleDeclarationHonored"], false);
+        let law = tool_operating_law(&shared, &json!({"session_id": second_id}))
+            .await
+            .unwrap();
+        assert_eq!(law["identity"]["role"], "role:constellation:interactive-dev");
+        assert!(law["operator_grant"].is_null(), "the reviewer grant was not adopted: {law}");
+        drop(reconnect_intent);
+        assert_eq!(directory.reconnect_state_counts(), (0, 0),
+            "completion releases both the intent and its role tombstone");
+    }
+
+    #[tokio::test]
+    async fn reaping_without_a_reconnect_intent_leaves_no_role_residue() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "unclaimed-role-reaping"
+            }),
+        )
+        .await
+        .unwrap();
+        let first_uuid = Uuid::parse_str(first["sessionId"].as_str().unwrap()).unwrap();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+        let directory = shared.lock().await.sessions.directory();
+
+        tool_connect(
+            &shared,
+            &json!({"plugin_id": "codex", "host_agent": "cx", "host_session_id": "unrelated-connect"}),
+        )
+        .await
+        .unwrap();
+
+        assert!(!shared.lock().await.sessions.contains_key(&first_uuid));
+        assert_eq!(directory.reconnect_state_counts(), (0, 0),
+            "an idle host with no reconnect in flight leaves no permanent role metadata");
+    }
+
+    #[tokio::test]
+    async fn lock_free_reuse_and_stale_reaping_are_atomic_in_either_order() {
+        let (_dir, shared) = make_shared_state();
+        let first = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "reuse-reap-race"}),
+        )
+        .await
+        .unwrap();
+        let first_id = first["sessionId"].as_str().unwrap().to_string();
+        let first_uuid = Uuid::parse_str(&first_id).unwrap();
+        let directory = shared.lock().await.sessions.directory();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+
+        directory.action_started(first_uuid);
+        let reused = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "reuse-reap-race"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reused["sessionId"], first_id);
+        assert_eq!(reused["reused"], true);
+        directory.action_finished(first_uuid);
+        assert_eq!(shared.lock().await.reap_stale_sessions(Utc::now()), 0,
+            "reuse touches liveness before a later reaper can remove the session");
+        assert!(directory.resolve_live(&first_uuid, Utc::now()).is_some());
+
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&first_uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(first_uuid, session);
+        }
+        directory.action_started(first_uuid);
+        let selected = directory
+            .find_reuse_live("claude-code", "reuse-reap-race", Utc::now())
+            .expect("in-flight work makes the stale transport selectable");
+        assert_eq!(selected.session_id, first_uuid);
+        directory.action_finished(first_uuid);
+        assert_eq!(shared.lock().await.reap_stale_sessions(Utc::now()), 1,
+            "the reaper wins this ordering before any reuse touch");
+        assert!(directory
+            .touch_reuse_live("claude-code", "reuse-reap-race", Utc::now())
+            .is_none(), "a removed selection cannot be refreshed back into the directory");
+        assert!(directory.resolve_live(&first_uuid, Utc::now()).is_none());
+
+        let replacement = tool_connect(
+            &shared,
+            &json!({"plugin_id": "claude-code", "host_agent": "cc", "host_session_id": "reuse-reap-race"}),
+        )
+        .await
+        .unwrap();
+        let replacement_id = replacement["sessionId"].as_str().unwrap();
+        assert_ne!(replacement_id, first_id, "the caller gets a live replacement, never the dead id");
+        let replacement_uuid = Uuid::parse_str(replacement_id).unwrap();
+        assert!(directory.resolve_live(&replacement_uuid, Utc::now()).is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_sessions_are_not_resolved_by_scope_or_law_reads() {
+        let (_dir, shared) = make_shared_state();
+        let connected = tool_connect(
+            &shared,
+            &json!({
+                "plugin_id": "claude-code", "host_agent": "cc",
+                "host_session_id": "stale-read"
+            }),
+        )
+        .await
+        .unwrap();
+        let session_id = connected["sessionId"].as_str().unwrap().to_string();
+        let uuid = Uuid::parse_str(&session_id).unwrap();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&uuid).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(uuid, session);
+        }
+
+        for explicit_id in [session_id.clone(), Uuid::new_v4().to_string()] {
+            let law = tool_operating_law(&shared, &json!({"session_id": explicit_id.clone()}))
+                .await
+                .unwrap();
+            assert_eq!(law["_hestia_error"]["code"], "hestia.operating_law_unattributed");
+            let scope = tool_scope_request_view(
+                &shared,
+                &json!({"request_id": "scope-stale-read", "session_id": explicit_id.clone()}),
+            )
+            .await;
+            assert!(scope.unwrap_err().to_string().contains("live session_id"));
+            let status = tool_scope_status(
+                &shared,
+                &json!({"plugin_id": "claude-code", "session_id": explicit_id.clone()}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status["caller_bound"], false,
+                "the compatibility read may be unbound, never bound to a stale or unknown id: {status}");
+            let own = read_resource_body(
+                &shared,
+                &format!("hestia://session/own?session_id={explicit_id}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(own, "null", "an explicit stale or unknown id never falls back to a live session");
+        }
+    }
+
     /// The read side of local coordination: siblings lists every connected session (heterogeneous by
     /// host_agent) but exposes a NAME, not a CAPABILITY — the bearer-bearing session_id/soft_lct are
     /// redacted (Legion second-caller finding: session_id is a bearer token in the vault path).
@@ -16339,6 +16904,37 @@ mod tests {
         assert_eq!(dry["sessionId"], real["sessionId"]);
         let s = shared.lock().await;
         assert_eq!(s.sessions.last_seen(s.sessions.get(&id).unwrap()), before);
+    }
+
+    #[tokio::test]
+    async fn connect_dry_run_rejects_stale_session_without_refreshing_it() {
+        let (_dir, shared) = make_shared_state();
+        let real = tool_connect(&shared, &json!({
+            "plugin_id": "m", "host_agent": "test", "host_session_id": "hs-stale",
+        })).await.unwrap();
+        let id = uuid::Uuid::parse_str(real["sessionId"].as_str().unwrap()).unwrap();
+        {
+            let mut s = shared.lock().await;
+            let mut session = s.sessions.remove(&id).unwrap();
+            session.connected_at = Utc::now()
+                - chrono::Duration::seconds(crate::server::state::MEMBER_SESSION_IDLE_TTL_SECS + 60);
+            s.sessions.insert(id, session);
+        }
+        let (before, chain_before) = {
+            let s = shared.lock().await;
+            (s.sessions.last_seen(s.sessions.get(&id).unwrap()), s.chain_len())
+        };
+
+        let dry = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "m", "host_agent": "test", "host_session_id": "hs-stale",
+        })).await.unwrap();
+        assert_eq!(dry["_hestia_error"]["code"], "hestia.connect_dry_run_no_session");
+        assert!(dry.get("sessionId").is_none());
+
+        let s = shared.lock().await;
+        assert_eq!(s.sessions.last_seen(s.sessions.get(&id).unwrap()), before);
+        assert_eq!(s.sessions.len(), 1, "a dry run neither reaps nor replaces transport");
+        assert_eq!(s.chain_len(), chain_before);
     }
 
     #[tokio::test]

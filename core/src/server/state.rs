@@ -909,6 +909,8 @@ pub enum StandingGrantFailure {
     },
 }
 
+pub const MEMBER_SESSION_IDLE_TTL_SECS: i64 = 900;
+
 fn warm_configured_members(
     vault: &mut Vault,
     registry: &mut crate::member_registry::MemberRegistry,
@@ -954,6 +956,20 @@ fn warm_configured_members(
 }
 
 impl ServerState {
+    /// Coordination liveness, not capability lifetime. An in-flight action keeps its
+    /// transport session resident regardless of age; all other idle transport is droppable.
+    pub fn session_is_live(&self, session: &Session, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.actions.values().any(|a| a.session_id == session.session_id)
+            || self.sessions.last_seen(session)
+                >= now - chrono::Duration::seconds(MEMBER_SESSION_IDLE_TTL_SECS)
+    }
+
+    /// Remove idle transport residue. A later host reconnect mints a replacement;
+    /// policy and grants are never keyed to this RAM-only object.
+    pub fn reap_stale_sessions(&mut self, now: chrono::DateTime<chrono::Utc>) -> usize {
+        self.sessions.reap_stale(&self.actions, now)
+    }
+
     /// Open all persistent stores rooted at `home` and prepare server state.
     /// `passphrase` is the vault passphrase — used to derive the storage key
     /// that seals the witness chain + trust files.
