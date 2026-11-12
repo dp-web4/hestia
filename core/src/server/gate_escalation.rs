@@ -1358,6 +1358,34 @@ impl Escalation {
         )
     }
 
+    /// Would a NOT-SAME peer's approval, ON ITS OWN, carry this escalation over its bar?
+    ///
+    /// The peer-side twin of `operator_alone_suffices`, asked by the INVITED PEER rather than
+    /// by the operator's button, and derived the same way: the real predicate over the factor
+    /// set as it would stand once `hestia_gate_arbitrate_escalation` appends its
+    /// `PeerMember` factor. So it cannot drift from what the ruling actually does.
+    ///
+    /// WHY IT EXISTS, measured 2026-11-12 (dp: "make sure that not-same peer review can work
+    /// without waiting on a human"): kimi-code routed four escalations to claude-code
+    /// overnight; claude-code answered every one with `corroborate` (evidence, never a
+    /// ruling), so none was approved and all expired, including a `single_approver` test-file
+    /// write that the peer's RULING alone would have granted. The invitation pointer says
+    /// `#corroborate-or-dissent` on every bar and the law text only describes corroboration,
+    /// so a peer had no way to learn from what it reads that its ruling would decide.
+    ///
+    /// Answers the BAR question only. Whether this peer may rule at all (NOT-SAME, the asker
+    /// basis clause #128, an open status) is the arbitrate door's to enforce, and the
+    /// invitation reports those separately.
+    pub fn peer_ruling_suffices(&self) -> bool {
+        Self::bar_met_over(
+            self.bar,
+            self.factors
+                .iter()
+                .map(|f| f.channel)
+                .chain(std::iter::once(Channel::PeerMember)),
+        )
+    }
+
     /// Stated positively so a UI never has to infer a remedy from a false boolean: what is
     /// still missing, in the operator's terms, or `None` when nothing is.
     pub fn still_needs(&self) -> Option<&'static str> {
@@ -6663,6 +6691,40 @@ mod bar_factor_tests {
                 "{marker}: and the write itself must follow the same promise"
             );
         }
+    }
+
+    #[test]
+    fn the_peer_is_told_truly_whether_its_ruling_decides() {
+        // The peer-side twin of the operator promise above, pinned the same way: as a
+        // property over the markers `bar_for` routes, never as a transcription of today's
+        // bar. `peer_ruling_suffices()` is what the invitation's `peer_answer` shows a
+        // NOT-SAME peer; the peer then rules through the arbitrate door, which appends a
+        // `PeerMember` decision. Whatever the prediction said must be what happens.
+        for marker in ["law_inject.py", "pre_tool_use.py", "witness.py", "hestia_gate_mechanism.py",
+                       "seat_gate_boundary_test.py"]
+        {
+            let (mut s, id) = open_with(marker);
+            let promised = s.get(&id).unwrap().peer_ruling_suffices();
+            let e = s
+                .decide(&id, true, "claude-code", "role:constellation:member", Channel::PeerMember,
+                        Some(crate::arbiter::Independence::CrossVendor), Some("reviewed"), T0 + 5)
+                .expect("a not-same peer rules");
+            assert_eq!(
+                e.bar_met(),
+                promised,
+                "{marker}: told the peer `peer_ruling_suffices = {promised}`, then its ruling \
+                 produced bar_met = {}",
+                e.bar_met()
+            );
+            assert_eq!(e.is_claimable(T0 + 6), promised, "{marker}: and the write follows it");
+        }
+        // The two cases the overnight escalations of 2026-11-12 actually hit, by name.
+        let (s, id) = open_with("seat_gate_boundary_test.py");
+        assert!(s.get(&id).unwrap().peer_ruling_suffices(),
+                "a single-approver test file: the peer's ruling alone decides");
+        let (s, id) = open_with("hestia_single_gate.py");
+        assert!(!s.get(&id).unwrap().peer_ruling_suffices(),
+                "the common gate is sovereign_plus_peer: no peer ruling meets it");
     }
 
     #[test]
