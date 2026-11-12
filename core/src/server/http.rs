@@ -725,10 +725,21 @@ fn deployment_update_trigger_for(os: &str, uid: Option<&str>) -> Option<Deployme
     }
 }
 
-fn deployment_update_authority() -> std::result::Result<(std::path::PathBuf, String, Option<String>), String> {
-    let manifest_path = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| "deployment update unavailable: HESTIA_CURRENT_BUILD_FILE is not configured".to_string())?;
+fn deployment_update_authority(home: &std::path::Path) -> std::result::Result<(std::path::PathBuf, String, Option<String>), String> {
+    deployment_update_authority_from(
+        std::env::var_os("HESTIA_CURRENT_BUILD_FILE").as_deref().map(std::path::Path::new),
+        home,
+    )
+}
+
+fn deployment_update_authority_from(
+    configured: Option<&std::path::Path>,
+    home: &std::path::Path,
+) -> std::result::Result<(std::path::PathBuf, String, Option<String>), String> {
+    let manifest_path = super::dashboard::deployment_authority_path_from(configured, home);
+    if let Some(error) = super::dashboard::deployment_authority_file_error(&manifest_path) {
+        return Err(format!("deployment update unavailable: {error}"));
+    }
     let raw = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("deployment update unavailable: cannot read deployment authority: {e}"))?;
     let manifest: serde_json::Value = serde_json::from_str(&raw)
@@ -851,12 +862,13 @@ async fn operator_deployment_update(
 ) -> impl IntoResponse {
     let request_id = uuid::Uuid::new_v4().to_string();
     let now = super::state::unix_now();
-    let (operator, provenance) = {
+    let (operator, provenance, server_home) = {
         let s = state.lock().await;
-        current_operator_context(&s, &headers, now)
+        let (operator, provenance) = current_operator_context(&s, &headers, now);
+        (operator, provenance, s.home.clone())
     };
 
-    let (home, authority_build, authority_head_sha) = match deployment_update_authority() {
+    let (home, authority_build, authority_head_sha) = match deployment_update_authority(&server_home) {
         Ok(value) => value,
         Err(error) => {
             return (
@@ -873,7 +885,7 @@ async fn operator_deployment_update(
     // daemon never fetches, so only the supervisor knows. With the timer off, this request is
     // the box's only way to find out, so it is not short-circuited here ("check for updates").
     // The supervisor syncs, compares, and logs CURRENT without building when nothing moved.
-    let locally_current = super::dashboard::same_deployed_build(
+    let locally_current = crate::server::dashboard::same_deployed_build(
         &authority_build,
         authority_head_sha.as_deref(),
         env!("HESTIA_GIT_VERSION"),
@@ -1129,11 +1141,12 @@ async fn operator_deployment_check(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let now = super::state::unix_now();
-    let (operator, provenance) = {
+    let (operator, provenance, server_home) = {
         let s = state.lock().await;
-        current_operator_context(&s, &headers, now)
+        let (operator, provenance) = current_operator_context(&s, &headers, now);
+        (operator, provenance, s.home.clone())
     };
-    let home = match deployment_update_authority() {
+    let home = match deployment_update_authority(&server_home) {
         Ok((home, _, _)) => home,
         Err(error) => {
             return (
@@ -1655,6 +1668,42 @@ mod deployment_update_tests {
     #[test]
     fn unsupported_platform_has_no_shell_fallback() {
         assert_eq!(deployment_update_trigger_for("windows", None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deployment_update_authority_is_fail_visible_and_home_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let server_home = dir.path().join("server");
+        let install_home = dir.path().join("install");
+        std::fs::create_dir_all(&server_home).unwrap();
+        std::fs::create_dir_all(&install_home).unwrap();
+        let running = env!("HESTIA_GIT_VERSION");
+        std::fs::write(server_home.join("current-build.json"), r#"{"build_id":"wrong-home-build"}"#).unwrap();
+        let install_manifest = install_home.join("current-build.json");
+        std::fs::write(&install_manifest, format!(r#"{{"build_id":"{running}"}}"#)).unwrap();
+
+        let (home, build, _) = deployment_update_authority_from(None, &server_home).unwrap();
+        assert_eq!(home, server_home);
+        assert_eq!(build, "wrong-home-build");
+        assert!(!crate::server::dashboard::same_deployed_build(&build, None, running));
+        let (home, build, _) = deployment_update_authority_from(Some(&install_manifest), &server_home).unwrap();
+        assert_eq!(home, install_home);
+        assert_eq!(build, running);
+        assert!(crate::server::dashboard::same_deployed_build(&build, None, running));
+
+        for partial in ["\x7b", "{}"] {
+            std::fs::write(&install_manifest, partial).unwrap();
+            assert!(deployment_update_authority_from(Some(&install_manifest), &server_home).is_err());
+        }
+        let linked_home = dir.path().join("linked");
+        std::fs::create_dir_all(&linked_home).unwrap();
+        let linked_manifest = linked_home.join("current-build.json");
+        std::os::unix::fs::symlink(&install_manifest, &linked_manifest).unwrap();
+        let error = deployment_update_authority_from(None, &linked_home).unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(!linked_home.join("deploy-update.request").exists(),
+                "invalid authority must not create an update request");
     }
 
     #[test]
@@ -8389,7 +8438,7 @@ pub(crate) fn gate_paths_from(inv: &serde_json::Value) -> Vec<(String, String)> 
 }
 
 /// The deployment authority's own record of what it installed, per file, read from
-/// `HESTIA_CURRENT_BUILD_FILE` (written by `deploy/install-members.sh` on full success).
+/// `HESTIA_CURRENT_BUILD_FILE` or the server home's `current-build.json`.
 ///
 /// This is the evidence an operator ratifies AGAINST. The ratify handler's own doc says
 /// "nothing here can tell a good build from a bad one; the operator must ratify from a
@@ -8424,9 +8473,12 @@ fn deployed_gate_digests_from(path: &std::path::Path) -> Option<serde_json::Valu
     }))
 }
 
-fn deployed_gate_digests() -> Option<serde_json::Value> {
-    let p = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")?;
-    deployed_gate_digests_from(std::path::Path::new(&p))
+fn deployed_gate_digests(home: &std::path::Path) -> Option<serde_json::Value> {
+    let path = super::dashboard::deployment_authority_path(home);
+    if super::dashboard::deployment_authority_file_error(&path).is_some() {
+        return None;
+    }
+    deployed_gate_digests_from(&path)
 }
 
 /// Ratifying is the approve direction of the most consequential decision on a box — it
@@ -8908,7 +8960,7 @@ async fn gates_verify(State(state): State<SharedState>) -> impl IntoResponse {
     // The daemon hashes every discovered gate itself — an unratified gate included, which
     // `verify` does not hash — so an operator can see which bytes a ratify would bless.
     let current_digests = hash_gate_paths(wired.iter());
-    let deployed = deployed_gate_digests();
+    let deployed = deployed_gate_digests(&s.home);
     let verdicts = crate::vault::gate_integrity::verify(&exp, &wired);
     let findings = verdicts.iter().filter(|v| v.is_finding()).count();
     let (rows, bulk) = annotate_gate_verdicts(&verdicts, &discovered, &declaring, &current_digests, deployed.as_ref());
@@ -8992,7 +9044,7 @@ async fn gates_ratify(
     // The same `{path: sha256|null}` map verify shows as evidence.current, recomputed here,
     // under the lock, from the bytes this handler is about to record.
     let current = hash_gate_paths(discovered.iter().map(|(_, p)| p));
-    let deployed = deployed_gate_digests();
+    let deployed = deployed_gate_digests(&s.home);
     let previous = s.vault.gate_expectations();
     let plan = match plan_ratification(&body, &reason, &discovered, &current, deployed.as_ref(),
                                        &previous, chrono::Utc::now()) {
@@ -9654,6 +9706,41 @@ mod disposition_tests {
         assert!(deployed_gate_digests_from(&dir.path().join("absent.json")).is_none());
         std::fs::write(&p, b"not json").unwrap();
         assert!(deployed_gate_digests_from(&p).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_deployment_authority_cannot_back_bulk_ratify() {
+        let dir = TempDir::new().unwrap();
+        let real_home = dir.path().join("real");
+        let linked_home = dir.path().join("linked");
+        std::fs::create_dir_all(&real_home).unwrap();
+        std::fs::create_dir_all(&linked_home).unwrap();
+        std::fs::write(real_home.join("current-build.json"), serde_json::json!({
+            "build_id": "b1",
+            "members": [{"files": [{"path": "/h/cc.py", "sha256": "aaaa"}]}],
+        }).to_string()).unwrap();
+        std::os::unix::fs::symlink(
+            real_home.join("current-build.json"), linked_home.join("current-build.json")).unwrap();
+        let discovered = vec![("claude-code".to_string(), "/h/cc.py".to_string())];
+        let current = serde_json::json!({"/h/cc.py": "aaaa"}).as_object().unwrap().clone();
+        let body = serde_json::json!({"expected": current.clone()});
+        let previous = Default::default();
+
+        let regular = deployed_gate_digests(&real_home);
+        assert!(regular.is_some());
+        assert!(plan_ratification(&body, "r", &discovered, &current, regular.as_ref(),
+                                  &previous, chrono::Utc::now()).is_ok());
+
+        let linked = deployed_gate_digests(&linked_home);
+        assert!(linked.is_none(), "a symlink must not become ratify evidence");
+        let Err((code, refusal)) = plan_ratification(
+            &body, "r", &discovered, &current, linked.as_ref(), &previous, chrono::Utc::now())
+        else {
+            panic!("bulk ratify accepted a symlinked deployment authority");
+        };
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(refusal["not_matching"][0]["deployment"], "no-deploy-record");
     }
 
     // ---- per-gate ratification (dp, 2026-09-28) ----
