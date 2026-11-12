@@ -53,6 +53,9 @@ def main() -> int:
           "g.status === 'unratified'" in b and "g.status === 'modified'" in b
           and "g.deployment === 'differs'" in b and "g.not_registered === true" in b)
     check("#1378: a verified set hides the banner", "gateIntegrityHealthy" in b)
+    check("#1378: verified deploy mismatches stay visible and totals count gates once",
+          b.count("g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs'") == 2
+          and "rows.length} gate${rows.length === 1 ? '' : 's'}:" in b)
 
     check("govern sub-nav has the chip", 'data-gov="gates"' in UI)
     check("pane registered and mounts by loading",

@@ -1171,7 +1171,8 @@
     </div>
 
     <!-- GATE INTEGRITY overview banner (#1378). Modified, unratified, missing, unregistered,
-         and UNKNOWN all stay above the views; only a verified set is silent. -->
+         deploy-different bytes and UNKNOWN stay above the views; only a verified set without
+         differing deployed bytes is silent. -->
     <div class="esc-banner" id="gate-integrity-banner" hidden>
       <span class="esc-dot"></span>
       <span id="gate-integrity-banner-text">…</span>
@@ -5856,7 +5857,7 @@
   let gateIntegrityBusy = false;
   function gateIntegrityHealthy(r) {
     return r.status === 'VERIFIED'
-      && !(r.gates || []).some(g => g.status !== 'verified' || g.not_registered === true);
+      && !(r.gates || []).some(g => g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs');
   }
   async function gateIntegrityLoad() {
     const banner = $('gate-integrity-banner'), text = $('gate-integrity-banner-text');
@@ -5872,7 +5873,7 @@
         banner.hidden = false;
         return;
       }
-      const rows = (r.gates || []).filter(g => g.status !== 'verified' || g.not_registered === true);
+      const rows = (r.gates || []).filter(g => g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs');
       const count = pick => rows.filter(pick).length;
       const parts = [];
       const notRegistered = count(g => g.not_registered === true);
@@ -5890,7 +5891,7 @@
       if (!parts.length) parts.push(r.status);
       const members = [...new Set(rows.map(g => g.plugin_id || g.path.split('/').filter(Boolean).pop() || g.path))];
       const shown = members.slice(0, 3).join(', ') + (members.length > 3 ? ` +${members.length - 3} more` : '');
-      text.textContent = `Gate integrity: ${parts.join(' · ')}${shown ? ` — ${shown}` : ''}`;
+      text.textContent = `Gate integrity: ${rows.length} gate${rows.length === 1 ? '' : 's'}: ${parts.join(' · ')}${shown ? ` — ${shown}` : ''}`;
       banner.hidden = false;
     } catch (e) {
       text.textContent = `Gate integrity could not be read — ${e.message}`;

@@ -38,15 +38,26 @@ describe("GateIntegrityBanner", () => {
     expect(screen.getByRole("link", { name: "Review and ratify in Gates" }).getAttribute("href")).toBe("/gates");
   });
 
-  it("distinguishes modified bytes and a deploy mismatch", async () => {
+  it("distinguishes modified bytes and a deploy mismatch without double-counting the gate", async () => {
     show({
       status: "MODIFIED",
       gates: [{ status: "modified", path: "/g/b.py", plugin_id: "codex", expected: "a", actual: "b",
               ratified_at: "2026-10-01", deployment: "differs" }],
     });
     const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("1 gate:");
     expect(alert.textContent).toContain("1 modified since ratification");
     expect(alert.textContent).toContain("1 differs from the deploy");
+    expect(alert.textContent).toContain("codex");
+  });
+
+  it("shows a verified gate whose deployment differs", async () => {
+    show({
+      status: "VERIFIED",
+      gates: [{ status: "verified", path: "/g/b.py", plugin_id: "codex", sha256: "a", deployment: "differs" }],
+    });
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("1 gate: 1 differs from the deploy");
     expect(alert.textContent).toContain("codex");
   });
 

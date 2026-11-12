@@ -11,7 +11,7 @@ function summary(report: GateReport): string {
   if (report.status === "UNKNOWN") {
     return `UNKNOWN — ${report.reason || "the gate set could not be established"}`;
   }
-  const rows = (report.gates || []).filter((v) => v.status !== "verified" || v.not_registered === true);
+  const rows = (report.gates || []).filter((v) => v.status !== "verified" || v.not_registered === true || v.deployment === "differs");
   const count = (pick: (v: GateVerdict) => boolean) => rows.filter(pick).length;
   const parts: string[] = [];
   const notRegistered = count((v) => v.not_registered === true);
@@ -29,12 +29,12 @@ function summary(report: GateReport): string {
   if (!parts.length) parts.push(report.status);
   const members = [...new Set(rows.map(member))];
   const shown = members.slice(0, 3).join(", ") + (members.length > 3 ? ` +${members.length - 3} more` : "");
-  return `${parts.join(" · ")}${shown ? ` — ${shown}` : ""}`;
+  return `${rows.length} gate${rows.length === 1 ? "" : "s"}: ${parts.join(" · ")}${shown ? ` — ${shown}` : ""}`;
 }
 
 function healthy(report: GateReport): boolean {
   return report.status === "VERIFIED"
-    && !(report.gates || []).some((v) => v.status !== "verified" || v.not_registered === true);
+    && !(report.gates || []).some((v) => v.status !== "verified" || v.not_registered === true || v.deployment === "differs");
 }
 
 export function GateIntegrityBanner() {
