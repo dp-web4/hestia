@@ -3316,6 +3316,84 @@ def _only_pattern_text(text: str, patterns, judged) -> bool:
     return bool(text) and any(text in p_ for p_ in patterns) and not any(text in j for j in judged)
 
 
+def _recursive_search_words(words: list) -> bool:
+    """Whether this argv is a search that reads descendants of its directory operands."""
+    prog = os.path.basename(words[0])
+    args = words[1:]
+    if prog == "rg":
+        depth = None
+        for i, word in enumerate(args):
+            if word == "--max-depth" and i + 1 < len(args):
+                depth = args[i + 1]
+            elif word.startswith("--max-depth="):
+                depth = word.split("=", 1)[1]
+        return depth != "0"
+    if prog in ("grep", "egrep", "fgrep", "zgrep"):
+        return _has_flag(prog, frozenset({"-r", "-R", "--recursive", "--dereference-recursive"}), args)
+    if prog != "git":
+        return False
+    i = 0
+    while i < len(args):
+        word = args[i]
+        if word in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+            i += 2
+        elif word.startswith("-"):
+            i += 1
+        else:
+            break
+    return i < len(args) and args[i] == "grep"
+
+
+def _exact_grant_recursive_search(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
+                                  home_markers=None) -> Optional[tuple]:
+    """The first recursive-search operand admitted only by an EXACT directory grant (#1366).
+
+    `path:<dir>` judges the directory object, not the files a recursive reader reaches beneath
+    it. Search operands come from the same grammar as the other scope passes, so pattern text is
+    not mistaken for a path. Named repo grants, explicit recursive grants, exact FILE grants,
+    temp roots and member homes keep their existing meaning. Only absolute operands are handled
+    here; relative candidates retain the existing relative-pass judgement.
+    """
+    roots = _scope_roots_with_reach(scopes, workspace)
+    if not roots:
+        return None
+    repo_scopes, _ = _scope_parts(scopes, workspace)
+    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+    profile = HarnessProfile(member_id="command-scope", identity_path="",
+                             home_markers=tuple(home_markers or ()))
+    for seg in _reach_segments(cmd):
+        words = [word for word, _quoted in seg]
+        if not words or not _recursive_search_words(words):
+            continue
+        try:
+            candidates = _outside_candidates(shlex.join(words), cwd or "")
+        except _Unmodelled:
+            continue
+        for spelling, kind, _globbed in candidates:
+            if kind != "abs":
+                continue
+            target = os.path.realpath(os.path.normpath(spelling)).replace("\\", "/").rstrip("/") or "/"
+            if not os.path.isdir(target):
+                continue
+
+            def covers(root, recursive):
+                root = root or "/"
+                return target == root or (recursive and (root == "/" or target.startswith(root + "/")))
+
+            if any(recursive and covers(root, True) for root, recursive in roots):
+                continue
+            if not any(not recursive and target == (root or "/") for root, recursive in roots):
+                continue
+            named = False
+            if ws and (target == ws or target.startswith(ws + "/")):
+                segment = target[len(ws):].lstrip("/").split("/", 1)[0]
+                named = bool(segment) and segment in repo_scopes
+            if named or path_in_scope(target, (), workspace, profile, cwd):
+                continue
+            return spelling, target
+    return None
+
+
 def command_scope_reach(cmd: str, scopes, workspace: str, cwd: Optional[str] = None,
                         forbidden=None, home_markers=None):
     """Returns (ok, offending_token, resolved_path). See `_command_scope_reach_one`; a command
@@ -3395,6 +3473,9 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     # (`cat <root>/lib/link/x`), because the exemption was lexical. A caller-controlled
     # environment must not become authority.
     patterns, judged_words = _grammar_patterns(cmd, cwd)
+    exact_search = _exact_grant_recursive_search(cmd, scopes, workspace, cwd, home_markers)
+    if exact_search is not None:
+        return False, exact_search[0], exact_search[1]
     for after in cmd.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while

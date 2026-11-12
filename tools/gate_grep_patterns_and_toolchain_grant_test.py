@@ -133,6 +133,62 @@ def main() -> int:
     d, off = denied(f"grep -e 'unbalanced {ws}/other/x")
     check("an unreadable line is judged as before, never less", d, off)
 
+    # ---- #1366: an EXACT directory grant does not authorise a recursive search beneath it ----
+    cache = os.path.expanduser("~/.cache")
+    os.makedirs(cache, exist_ok=True)
+    xbase = tempfile.mkdtemp(prefix="grep-exact-", dir=cache)
+    xws = f"{xbase}/ws"
+    os.makedirs(f"{xws}/granted/sub")
+    os.makedirs(f"{xws}/other")
+    open(f"{xws}/granted/f", "w").close()
+    exact_dir = (f"path:{xws}/granted",)
+    recursive_dir = (f"path:{xws}/granted/**",)
+
+    def reach_exact(c, sc):
+        return G.command_scope_reach(c, sc, xws, cwd=f"{xws}/granted")
+
+    searches = (
+        f"grep -r -n -I -E -s --max-count=20 -e needle -- {xws}/granted",
+        f"rg needle {xws}/granted",
+        f"git --no-pager -C {xws}/granted grep -n -I -E --max-count=20 -e needle -- {xws}/granted",
+    )
+    for c in searches:
+        ok, off, resolved = reach_exact(c, exact_dir)
+        check(f"an EXACT directory grant refuses recursive search: {c}",
+              not ok and resolved and os.path.realpath(resolved) == os.path.realpath(f"{xws}/granted"),
+              f"ok={ok} off={off} resolved={resolved}")
+        ok, off, _ = reach_exact(c, recursive_dir)
+        check(f"an explicitly recursive grant admits the same search: {c}", ok, off)
+    ok, off, resolved = reach_exact(
+        f"grep -r -e '{xws}/other/never-opened' -- {xws}/granted", exact_dir)
+    check("the exact-directory refusal is the operand, never the pattern",
+          not ok and os.path.realpath(resolved) == os.path.realpath(f"{xws}/granted"),
+          f"ok={ok} off={off} resolved={resolved}")
+    exact_file = (f"path:{xws}/granted/f",)
+    for c in (f"grep -r -n -e needle -- {xws}/granted/f",
+              f"grep -n needle {xws}/granted/f"):
+        ok, off, _ = reach_exact(c, exact_file)
+        check(f"an EXACT file grant still admits its search: {c}", ok, off)
+    ok, off, _ = reach_exact(f"grep -r needle {xws}/granted", ("granted",))
+    check("a named repo grant keeps its recursive meaning", ok, off)
+    ok, off, _ = reach_exact(f"rg --max-depth=0 needle {xws}/granted", exact_dir)
+    check("ripgrep depth zero does not read beneath the exact directory", ok, off)
+    temp_root = tempfile.mkdtemp(prefix="grep-exact-temp-")
+    ok, off, _ = G.command_scope_reach(f"grep -r needle {temp_root}", (f"path:{temp_root}",),
+                                      xws, cwd=f"{xws}/granted")
+    check("the independent temp-root allowance is unchanged", ok, off)
+    home_root = f"{xbase}/member-home"
+    os.makedirs(home_root)
+    ok, off, _ = G.command_scope_reach(f"grep -r needle {home_root}", (f"path:{home_root}",),
+                                      xws, cwd=f"{xws}/granted", home_markers=(home_root,))
+    check("the independent member-home allowance is unchanged", ok, off)
+    outside_dir = f"{xbase}/outside-grant"
+    os.makedirs(outside_dir)
+    ok, off, resolved = reach_exact(f"grep -r needle {outside_dir}", (f"path:{outside_dir}",))
+    check("the issue's OUTSIDE-workspace exact directory is refused too",
+          not ok and os.path.realpath(resolved) == os.path.realpath(outside_dir),
+          f"ok={ok} off={off} resolved={resolved}")
+
     # ---- the same text as a pattern AND an operand: the operand is judged ----
     d, off = denied(f"grep '{ws}/other' {ws}/other")
     check("a path that is both the pattern and the operand is judged", d and off == "other", off)
