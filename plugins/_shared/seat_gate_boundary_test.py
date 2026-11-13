@@ -340,6 +340,8 @@ def test_gate_file_write_refused_before_the_daemon():
             v, text, _ = run(seat, home, native(seat, "Write", {"file_path": gate_file(fx, seat), "content": "x"}))
             check(f"{seat}-missing-receipt-still-denied", v == "deny", text)
             check(f"{seat}-missing-receipt-is-explicit", "refusal_unwitnessed" in text, text)
+            check(f"{seat}-missing-receipt-remedy",
+                  "hestia status" in text and "re-issuing this identical act is safe" in text, text)
             check(f"{seat}-missing-receipt-does-not-claim",
                   "hestia_gate_escalation_claim" not in stub.names(), stub.names())
             check(f"{seat}-missing-receipt-no-escalation-id", "esc-stub-1" not in text, text)

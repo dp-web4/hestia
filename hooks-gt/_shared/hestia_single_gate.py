@@ -1,4 +1,4 @@
-# hestia-gt-sha256: 5d53911bb98d56517838cf5a80fabbb9ebe4e529390eaa6a57935a48f21bda0e  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: f682169711ffd340b4b58b5652914c6cb892469c20e0eb8e48d149cf43ea0cac  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -1112,7 +1112,9 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
         pass
     if deny_hash is None:
         verdict, detail, esc_id, how = (
-            "unwitnessed", "refusal_unwitnessed: no deny receipt; escalation was not opened",
+            "unwitnessed",
+            "refusal_unwitnessed: no deny receipt; escalation was not opened; the daemon may "
+            "be cold or down (hestia status); re-issuing this identical act is safe",
             None, None)
     else:
         try:

@@ -1111,7 +1111,9 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
         pass
     if deny_hash is None:
         verdict, detail, esc_id, how = (
-            "unwitnessed", "refusal_unwitnessed: no deny receipt; escalation was not opened",
+            "unwitnessed",
+            "refusal_unwitnessed: no deny receipt; escalation was not opened; the daemon may "
+            "be cold or down (hestia status); re-issuing this identical act is safe",
             None, None)
     else:
         try:
