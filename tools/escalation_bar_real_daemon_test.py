@@ -85,7 +85,15 @@ def read_escalation(url, esc_id):
     _, out = _post(url, {"jsonrpc": "2.0", "id": 2, "method": "resources/read",
                          "params": {"uri": f"hestia://escalation/{esc_id}"}}, sid)
     contents = ((out or {}).get("result") or {}).get("contents") or []
-    return json.loads(contents[0]["text"]) if contents else {"_raw": out}
+    rec = json.loads(contents[0]["text"]) if contents else {"_raw": out}
+    _, opened = _post(url, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "hestia_query_history", "arguments": {"filter": {
+            "event_type": "gate_escalation_opened", "limit": 500}}}}, sid)
+    opened_content = ((opened or {}).get("result") or {}).get("content") or []
+    history = json.loads(opened_content[0]["text"]) if opened_content else {}
+    rec["_opened"] = next((e.get("eventData") or {} for e in history.get("entries") or []
+                           if (e.get("eventData") or {}).get("escalation_id") == esc_id), {})
+    return rec
 
 
 ESC_ID = re.compile(r"Escalation ([0-9a-f]{8,}) is open")
@@ -94,15 +102,20 @@ ESC_ID = re.compile(r"Escalation ([0-9a-f]{8,}) is open")
 def open_and_read(seat, home, event, label, shim_path=None):
     # A cold daemon (a debug build's first claims) can miss the gate's claim deadline: the gate
     # then says OUTCOME UNKNOWN and that re-issuing the identical act is safe (it returns the
-    # same escalation). Re-issue, bounded; the refusal itself never depends on it.
+    # same escalation). Its first witness can likewise miss the connect deadline before any
+    # claim or open: refusal_unwitnessed says so explicitly, and re-issuing opens at most one
+    # linked escalation after the session is warm. Re-issue, bounded; the refusal never depends on it.
     for _attempt in range(3):
         v, text, _ = sb.run(seat, home, event, shim_path=shim_path)
-        if "OUTCOME UNKNOWN" not in text:
+        if "OUTCOME UNKNOWN" not in text and "refusal_unwitnessed" not in text:
             break
     check(f"{seat}-{label}-refused", v == "deny" and "gate.self_access" in text, text)
     m = ESC_ID.search(text)
     check(f"{seat}-{label}-escalation-opened", m, text)
-    return read_escalation(ENDPOINT, m.group(1)) if m else {}
+    rec = read_escalation(ENDPOINT, m.group(1)) if m else {}
+    check(f"{seat}-{label}-answers-deny",
+          re.fullmatch(r"[0-9a-f]{64}", (rec.get("_opened") or {}).get("answers_deny") or ""), rec)
+    return rec
 
 
 @reported
