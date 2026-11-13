@@ -556,7 +556,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_gate_escalation_claim",
-            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. A live session_id (or sessionId) is REQUIRED to claim or open: without one, the act stays refused with only a witnessed diagnostic — no queue row and no approval spent. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
+            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. A live session_id (or sessionId) is REQUIRED to claim, or to open through this tool: without one, the act stays refused with only a witnessed diagnostic — no queue row and no approval spent. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
              already pending from you, the answer carries THAT escalation_id with `coalesced: true` \
              — no second petition is minted and no peer is woken again; wait on the id you are given. \
              OPTIONAL resolved_targets = EVERY write-position path the gate's closure resolved \
@@ -587,7 +587,7 @@ fn hestia_tools() -> Vec<Tool> {
                     "supersession": {"type": "string", "enum": ["hard_stop"], "description": "Declare hard_stop only when the hook stops a superseded invocation in every rollout mode."},
                     "host_session_id": {"type": "string", "description": "Host wake correlation. A proven session's value is authoritative; a contradictory assertion is refused."},
                     "gate_path": {"type": "string", "description": "Optional realpath of the hook making this claim."},
-                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect. Required to claim or open; without it the act is refused with a witnessed diagnostic, no queue row, and no approval spent."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect. Required to claim, or to open through this tool; without it the act is refused with a witnessed diagnostic, no queue row, and no approval spent."},
                     "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
                 }
             }),
@@ -27985,7 +27985,7 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
             "escalation_id": Value::Null,
             "asker_basis": "asserted",
             "invited_peers": [],
-            "error": "a live session_id is required to claim or open an escalation; the write \
+            "error": "a live session_id is required to claim an approval or open an escalation through this tool; the write \
                       is refused, no approval was spent, and no escalation was opened",
             "witnessEntryHash": entry.hash,
             "then": "the write is refused; re-issue with a live session_id to ask through the \
