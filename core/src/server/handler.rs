@@ -577,6 +577,7 @@ fn hestia_tools() -> Vec<Tool> {
                     "answers_deny": {"type": "string", "description": "Chain hash of the deny being escalated, when available."},
                     "reason": {"type": "string", "description": "Your rationale. Legacy gate callers also use this as the act when act is omitted."},
                     "act": {"type": "string", "description": "Exact act to claim or escalate. When both act and reason are present, act identifies the operation and reason carries the rationale."},
+                    "canonical_act": {"type": "string", "description": "Canonical normalized request JSON from the common gate (v, tool, input, cwd, session). The daemon validates tool/session and hashes this request itself; display summaries are never its authorization key."},
                     "resolved_targets": {"type": "array", "items": {"type": "string"}, "description": "Every write-position path resolved by the gate."},
                     "resolved_target": {"type": "string", "description": "Single-target compatibility spelling, joined with resolved_targets."},
                     "also_resolved": {"type": "array", "items": {"type": "string"}, "description": "Additional resolved targets, joined with resolved_targets and resolved_target."},
@@ -10466,6 +10467,7 @@ const ESCALATION_CLAIM_ACCEPTED_KEYS: &[&str] = &[
     "answers_deny",
     "reason",
     "act",
+    "canonical_act",
     "resolved_targets",
     "resolved_target",
     "also_resolved",
@@ -18638,9 +18640,9 @@ mod tests {
     /// payload is the row a later auditor must be able to join from.
     ///
     /// BOTH FIELDS ARE NAMED FOR WHAT THEY PROVE (GPT review of #445). The act is
-    /// `stated_attempted_act` — caller prose, testimony, unverified by anything on this
-    /// path; canonicalising it so the daemon could check it is #318's job and is NOT done
-    /// here. The join key is DERIVED from the proven session, so it is named plainly; the
+    /// `stated_attempted_act` — caller prose and testimony; `canonical_act`, when present,
+    /// is instead validated normalized request JSON and the digest preimage (#600).
+    /// The join key is DERIVED from the proven session, so it is named plainly; the
     /// three tests below this one pin that derivation from all three directions.
     ///
     /// The marker is the gate-hook path, spelled with this file's existing `<gate-hook>`
@@ -19407,6 +19409,85 @@ mod tests {
         let mine = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-reissue")).await.unwrap();
         assert_eq!(mine["claimed"], json!(true), "the asker's exact re-issue must claim its lapsed grant: {mine}");
         assert_eq!(mine["escalation_id"], json!(id), "{mine}");
+    }
+
+    #[tokio::test]
+    async fn act_digest_binds_tool_not_just_destination() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "h", "host_session_id": "hs-600",
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let args = |tool: &str| json!({
+            "plugin_id": "claude-code", "session_id": session, "tool_name": tool,
+            "marker": "policy.json", "reason": "/repo/core/policy.json",
+        });
+
+        let opened = tool_gate_escalation_claim(&shared, &args("Edit")).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now_secs()).unwrap();
+        }
+
+        let write = tool_gate_escalation_claim(&shared, &args("Write")).await.unwrap();
+        assert_eq!(write["claimed"], false, "a full-file Write spent an Edit approval: {write}");
+        assert_eq!(shared.lock().await.gate_escalations.get(&id).unwrap().consumed_at, None);
+
+        let edit = tool_gate_escalation_claim(&shared, &args("Edit")).await.unwrap();
+        assert_eq!(edit["claimed"], true, "the same Edit must still claim: {edit}");
+    }
+
+    #[tokio::test]
+    async fn canonical_act_digest_binds_full_request_not_display_text() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "h", "host_session_id": "hs-600-canonical",
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let canonical = |replacement: &str| json!({
+            "v": 1, "tool": "Edit",
+            "input": {"file_path": "/repo/core/policy.json", "old_string": "a", "new_string": replacement},
+            "cwd": "/repo", "session": "hs-600-canonical",
+        }).to_string();
+        let args = |request: String, summary: &str| json!({
+            "plugin_id": "claude-code", "session_id": session, "tool_name": "Edit",
+            "marker": "policy.json", "reason": summary, "canonical_act": request,
+        });
+
+        let opened = tool_gate_escalation_claim(&shared, &args(canonical("b"), "Edit -> one summary"))
+            .await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let folded = tool_gate_escalation_claim(&shared, &args(canonical("b"), "a different summary"))
+            .await.unwrap();
+        assert_eq!(folded["coalesced"], true, "the digest, not the display text, is the key: {folded}");
+        assert_eq!(folded["escalation_id"], id, "{folded}");
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now_secs()).unwrap();
+        }
+
+        let other = tool_gate_escalation_claim(&shared, &args(canonical("changed"), "Edit -> one summary"))
+            .await.unwrap();
+        assert_eq!(other["claimed"], false, "a different request spent the canonical approval: {other}");
+        assert_eq!(shared.lock().await.gate_escalations.get(&id).unwrap().consumed_at, None);
+
+        let wrong_tool = canonical("b").replace("\"tool\":\"Edit\"", "\"tool\":\"Write\"");
+        let err = tool_gate_escalation_claim(&shared, &args(wrong_tool, "Edit -> one summary"))
+            .await.expect_err("a canonical request for another tool must be refused");
+        assert!(err.to_string().contains("matching tool"), "{err}");
+        let wrong_session = canonical("b").replace("hs-600-canonical", "hs-other");
+        let err = tool_gate_escalation_claim(&shared, &args(wrong_session, "Edit -> one summary"))
+            .await.expect_err("a canonical request from another wake must be refused");
+        assert!(err.to_string().contains("host session") || err.to_string().contains("host_session_id"), "{err}");
+        assert_eq!(shared.lock().await.gate_escalations.get(&id).unwrap().consumed_at, None);
+
+        let same = tool_gate_escalation_claim(&shared, &args(canonical("b"), "yet another summary"))
+            .await.unwrap();
+        assert_eq!(same["claimed"], true, "the same normalized request claims: {same}");
+        assert_eq!(same["escalation_id"], id, "{same}");
     }
 
     /// THE CLAIMABLE REPLY STATES THE ANCHOR ITS OWN CALL USES (GPT review of #613 @ dd3f1b1).
@@ -27908,11 +27989,36 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // whose seat did not declare it is never reclaimed, because the fence would not stop it.
     let supersession_hard_stop = optional_string(args, "supersession").as_deref()
         == Some(super::gate_escalation::SUPERSESSION_HARD_STOP);
-    let attempted_act_digest = attempted_act
+    let canonical_act = optional_string(args, "canonical_act");
+    let canonical_json = canonical_act
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
+        .transpose()?;
+    if let Some(c) = &canonical_json {
+        if c.get("v").and_then(Value::as_u64) != Some(1)
+            || c.get("tool") != Some(&Value::String(tool_name.clone()))
+            || c.get("input").and_then(Value::as_object).is_none()
+            || c.get("cwd").and_then(Value::as_str).is_none()
+            || c.get("session").and_then(Value::as_str).is_none()
+        {
+            return Err(anyhow::anyhow!(
+                "canonical_act must be normalized request JSON with v=1, the matching tool, \
+                 structural input, cwd, and session"
+            ));
+        }
+    }
+    let attempted_act_digest = canonical_act
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .map(super::gate_escalation::EscalationStore::act_digest_of);
+        .map(super::gate_escalation::EscalationStore::act_digest_of)
+        .or_else(|| {
+            attempted_act
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(super::gate_escalation::EscalationStore::act_digest_of)
+        });
     // The durable per-wake key the daemon's own outcome rows carry — the value that joins a
     // spent approval to the act that consumed it. ACCEPTED HERE ONLY TO BE CHECKED, NEVER TO
     // BE BELIEVED: the row written below carries the value DERIVED from the caller's proven
@@ -28020,6 +28126,23 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
             ));
         }
     }
+    if let Some(c) = &canonical_json {
+        let stated = c["session"].as_str().unwrap_or_default();
+        match &proven_host_session_id {
+            Some(proven) if stated == proven => {}
+            Some(proven) => {
+                return Err(refuse_host_session_mismatch(
+                    &s, &plugin_id, &tool_name, &marker, stated, proven,
+                    session_id_arg.as_deref(), attempted_act.as_deref(), request_key.as_deref(),
+                ));
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "canonical_act requires a live host_session_id matching its session"
+                ));
+            }
+        }
+    }
 
     // #539: the claim is now keyed on the ACT the approval was rendered from, not only on
     // the rule that refused it. The gate-hook compatibility path still carries that act in
@@ -28044,13 +28167,21 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // for, instead of lapsing at decided_at + 600 and minting a duplicate petition. The key is
     // the DERIVED host session above, never the caller's assertion (the precedence block).
     if let Some(h) = proven_host_session_id.as_deref() {
-        s.gate_escalations
-            .observe_reissue(&plugin_id, h, &marker, attempted_act.as_deref(), now);
+        s.gate_escalations.observe_reissue_with_act_digest(
+            &plugin_id,
+            h,
+            &marker,
+            attempted_act.as_deref(),
+            canonical_act.as_deref(),
+            now,
+        );
     }
-    if let Some(esc) = s.gate_escalations.claim_bound(
+    if let Some(esc) = s.gate_escalations.claim_bound_with_digest(
         &plugin_id,
+        &tool_name,
         &marker,
         attempted_act.as_deref(),
+        canonical_act.as_deref(),
         attempted_payload.as_deref(),
         incoming_bar,
         now,
@@ -28089,10 +28220,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         // against — a census treating a self-report as a finding. The `stated_` prefix is the
         // same discipline `stated_reason`/`stated_detail` already carry ten lines up.
         //
-        // Upgrading `reason` to a CANONICAL act representation — one the daemon could compare
-        // against the write it later witnesses — is #318's job (act-binding). This PR does not
-        // solve it and must not read as though it had. Until #318 lands, the honest shape is:
-        // the session key is proof, the act string is testimony.
+        // `canonical_act`, when present, is the digest preimage, validated and hashed here.
+        // `stated_attempted_act` remains human-facing testimony and is not the authority key.
         let entry = s.append_chain(
             "gate_escalation_claimed",
             json!({
@@ -28105,9 +28234,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
                 "decided_via": esc.decided_via,
                 "reason": esc.reason,
                 // WHAT the caller SAYS the authorised write is, in its own words at claim
-                // time. Testimony, not proof — see the note above and #318. This is the SAME
-                // value used for the digest join: recording `reason` here after `act` won the
-                // join would make the witness row misdescribe the act that spent the permit.
+                // time. Testimony, not proof. Legacy rows hash this display text; canonical
+                // rows instead hash the validated `canonical_act` request.
                 "stated_attempted_act": attempted_act,
                 // The per-wake key that joins this spend to its consuming act's outcomes.
                 // DERIVED from the proven session, never from the arguments.
@@ -28268,7 +28396,7 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
     // the paperwork attached to a refusal that already happened.
     match s
         .gate_escalations
-        .open_or_coalesce_with_payload(&plugin_id, &role, &tool_name, &marker,
+        .open_or_coalesce_with_act_digest(&plugin_id, &role, &tool_name, &marker,
               // The gate hook composes `reason` AS the act, and has always done so, so it is
               // the act here. `act` still wins if a caller sends both.
               attempted_act.as_deref(),
@@ -28276,7 +28404,7 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
               // above is a bounded summary that can cut the filename out; this cannot.
               &resolved_targets,
               stated_reason.as_deref(), stated_detail.as_deref(),
-              Some(&attempted_binding), now, DEFAULT_TTL_SECS)
+              Some(&attempted_binding), canonical_act.as_deref(), now, DEFAULT_TTL_SECS)
     {
         // ONE ACT, ONE RULING (#668). This is the door the gate hook calls, and the hook
         // re-trips on the same refused act — 25 of 49 same-digest re-opens in the

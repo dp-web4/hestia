@@ -1107,6 +1107,7 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             # may make the declaration that lets the daemon reclaim a lost answer (#1169).
             supersession=mechanism.SUPERSESSION_HARD_STOP,
             deadline=inv.phase_deadline,
+            canonical_act=mechanism.scope_act_canonical(ev.tool, ev.tool_input, ev.cwd, ev.session_id),
             # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
             # path the closure resolved, not only the one `cv` reports — each with its other
             # spellings and the LOCATION it lands at (#1247). The daemon prices the bar over the marker, the act and all of

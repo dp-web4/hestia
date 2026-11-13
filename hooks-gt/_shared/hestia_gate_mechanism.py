@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 458e7bbbda444490b5e30b21378560c8689994bf3985214f3dd0acfdc0c10603  (published ground truth; manifest: hooks-gt)
 """Shared in-process daemon-query mechanism — the society-safety verdict path.
 
 PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
@@ -1636,7 +1636,7 @@ def resolved_targets_for_claim(targets, complete=True):
 
 def claim_self_write(marker, tool_name, attempted, *,
                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
-                     supersession=None, deadline=None, resolved_targets=None,
+                     supersession=None, deadline=None, canonical_act=None, resolved_targets=None,
                      resolved_targets_complete=True):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
@@ -1691,6 +1691,8 @@ def claim_self_write(marker, tool_name, attempted, *,
     # this spend, which only costs a lost answer a fresh petition.
     if supersession:
         claim_args["supersession"] = supersession
+    if canonical_act:
+        claim_args["canonical_act"] = canonical_act
     rts = resolved_targets_for_claim(resolved_targets, resolved_targets_complete)
     if rts:
         claim_args["resolved_targets"] = rts
@@ -1742,21 +1744,24 @@ def scope_request_key(plugin_id: str, path: str) -> str:
                           .encode("utf-8")).hexdigest()
 
 
-def scope_act_digest(tool_name, tool_input, cwd, host_session_id) -> str:
-    """THE ACT BINDING for a one-time scope approval: sha256 over the canonical, COMPLETE act —
-    the whole tool input (Write/Edit contents, the unmasked command), the working directory and
-    the host session. Never over the masked/truncated display summary (Codex review of #1232,
-    P1-1; the #1229 / #627 class: a scrubbed preview must never be an authorisation preimage).
-    Only the digest leaves this process. `description` is dropped: it is the harness's prose
-    about the act, not the act, and an identical retry must redeem the approval. Invocation ids
-    are excluded for the same reason."""
-    import hashlib
+def scope_act_canonical(tool_name, tool_input, cwd, host_session_id) -> str:
+    """The canonical, COMPLETE act for a one-time approval: the whole tool input (Write/Edit
+    contents, the unmasked command), the working directory and the host session. Never the
+    masked/truncated display summary (#600 / N6). `description` and invocation ids are harness
+    metadata, not the act, so an identical retry redeems the approval."""
     ti = tool_input if isinstance(tool_input, dict) else {"_raw": tool_input}
     ti = {k: v for k, v in ti.items() if k != "description"}
-    canon = json.dumps({"v": 1, "tool": tool_name, "input": ti, "cwd": cwd or "",
-                        "session": host_session_id or ""},
-                       sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
-    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    return json.dumps({"v": 1, "tool": tool_name, "input": ti, "cwd": cwd or "",
+                       "session": host_session_id or ""},
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def scope_act_digest(tool_name, tool_input, cwd, host_session_id) -> str:
+    """THE ACT BINDING for a one-time scope approval: sha256 over `scope_act_canonical`.
+    Only the digest leaves this process (#1232 P1-1)."""
+    import hashlib
+    return hashlib.sha256(scope_act_canonical(tool_name, tool_input, cwd, host_session_id)
+                          .encode("utf-8")).hexdigest()
 
 
 #: Outcome of a scope RPC whose answer did not arrive: the mutation MAY have landed.
