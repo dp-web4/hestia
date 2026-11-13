@@ -98,6 +98,10 @@ Environment=RUST_LOG=warn
 # surface drops by ~30x. Paired with the malloc_trim(0) on the maintenance tick, which
 # releases what the cap does not prevent.
 Environment=MALLOC_ARENA_MAX=2
+# MEMORY CEILING (#592). The post-mitigation process peaked at 331 MB; 1G leaves ~3x
+# headroom for ordinary work while asking the kernel to reclaim before the ~1.7 GB failure
+# region. MemoryHigh throttles; it is not the hard MemoryMax kill switch.
+MemoryHigh=1G
 # Optional workspace handed to agent-inventory for the dashboard read list.
 # Installers should render this from explicit operator configuration. Unset or
 # empty means the inventory must report inference/unknown rather than guess.

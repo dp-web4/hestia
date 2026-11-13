@@ -246,6 +246,10 @@ Environment=HESTIA_CURRENT_BUILD_FILE=${HESTIA_HOME}/current-build.json
 # workload is I/O-bound on SQLCipher, so the contention is cheap and the fragmentation
 # surface drops ~30x. Paired with malloc_trim(0) on the daemon's maintenance tick.
 Environment=MALLOC_ARENA_MAX=2
+# MEMORY CEILING (#592). The post-mitigation process peaked at 331 MB; 1G leaves ~3x
+# headroom for ordinary work while asking the kernel to reclaim before the ~1.7 GB failure
+# region. MemoryHigh throttles; it is not the hard MemoryMax kill switch.
+MemoryHigh=1G
 # The workspace the daemon hands to agent-inventory when the dashboard asks for the
 # read list. Without it the inventory falls back to a compiled-in default that is only
 # correct on the machine it was written on, and — correctly — degrades its whole report
