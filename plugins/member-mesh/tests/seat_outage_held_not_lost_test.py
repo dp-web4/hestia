@@ -103,7 +103,7 @@ def section_a():
         ("kimi weekly 403", "error: failed to run prompt: provider.auth_error: 403 You've reached "
          "your weekly (7-day) usage limit. Your quota will reset when the current 7-day window "
          "ends. To continue now, purchase extra usage or upgrade your plan: https://x\n"
-         "See log: /home/dp/.kimi-code/logs/kimi-code.log\n", "1", "terminal", "out-of-credits"),
+         "See log: /home/member/.kimi-code/logs/kimi-code.log\n", "1", "terminal", "out-of-credits"),
         ("codex workspace", "hook: SessionStart Completed\nERROR: Your workspace is out of credits. "
          "Add credits to continue.\n", "1", "terminal", "out-of-credits"),
         ("codex 401 (codex-20260901-213954)", "ERROR: Reconnecting... 5/5\nERROR: unexpected status "
@@ -114,8 +114,8 @@ def section_a():
         ("kimi launch", "timeout: failed to run command ‘kimi’: No such file or directory\n",
          "1", "terminal", "launch-failed"),
         ("codex config (codex-20260903-202613)", "Error loading config.toml:\n"
-         "/home/dp/.codex/config.toml:106:11: duplicate key\n    |\n"
-         '106 | [projects."/home/dp/ai-workspace"]\n    |           ^^^^^^^^^^^^\n',
+         "/home/member/.codex/config.toml:106:11: duplicate key\n    |\n"
+         '106 | [projects."/home/member/ai-workspace"]\n    |           ^^^^^^^^^^^^\n',
          "1", "terminal", "launch-failed"),
         ("rc 127", "", "127", "terminal", "launch-failed"),
         # Prose ABOUT an outage in a wake that ran: the vendor string is far above the end.

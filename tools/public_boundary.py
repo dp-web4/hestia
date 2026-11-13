@@ -25,8 +25,8 @@ FORBIDDEN_ROOTS = (
     ".local-deployment/",
     "deploy/cbp/",
 )
-LOCAL_PROBE = re.compile(r"^tools/(?:cbp|claude|codex|kimi)_")
-LOCAL_HOME = re.compile(r"/home/([A-Za-z0-9_.-]+)/")
+LOCAL_PROBE = re.compile(r"^tools/(?:cbp|claude|codex|kimi|gemini)_")
+LOCAL_HOME = re.compile(r"(?<![\w./-])/home/([A-Za-z0-9_.-]+)/")
 ALLOWED_SYNTHETIC_USERS = {"member", "user", "tester", "x", "u", "other"}
 MOUNTED_HOST_PATH = re.compile(r"/mnt/[A-Za-z]/(?:[^\s'\"`]+/){2,}")
 TOKEN_SHAPES = (
@@ -210,10 +210,9 @@ def inspect(repo: Path, paths: list[str], *, cached: bool = False,
         if "-----BEGIN PRIVATE KEY-----" in text and not is_test(rel) and not boundary_impl:
             problems.append(f"{rel}: private-key header outside an adversarial test")
 
-        runtime = (Path(rel).suffix in RUNTIME_SUFFIXES and not is_test(rel)
-                   and not boundary_impl)
+        runtime = Path(rel).suffix in RUNTIME_SUFFIXES and not boundary_impl
         if runtime:
-            if "private-context" in text or "repos.jsonl" in text:
+            if not is_test(rel) and ("private-context" in text or "repos.jsonl" in text):
                 problems.append(f"{rel}: runtime mechanism depends on private operator context")
             if MOUNTED_HOST_PATH.search(text):
                 problems.append(f"{rel}: runtime mechanism bakes a mounted-host path")

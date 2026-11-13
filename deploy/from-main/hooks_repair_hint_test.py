@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """`hooks_repair_hint` must name the cause it actually hit, not the one that shares its prefix.
 
-WHY THIS EXISTS (CBP, 2026-08-31, measured from /home/dp/.hestia/deploy.log).
+WHY THIS EXISTS (2026-08-31, measured from an installation-local deploy log).
 
 Two producers put a value starting with `refused(` into `$hooks`, and they need OPPOSITE
 advice:

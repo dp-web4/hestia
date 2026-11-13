@@ -73,7 +73,7 @@ import datetime, json, re, sys, statistics
 from collections import Counter
 
 sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
-from chain_walk import ChainWalker, payload
+from chain_walk import ChainWalker, ESCALATION_TERMINAL_EVENTS, payload
 
 MAX = 60_000
 JSON_OUT = False
@@ -83,7 +83,7 @@ while _a:
     if x == "--json": JSON_OUT = True
     else: MAX = int(x)
 
-TERMINAL = {"gate_escalation_decided", "gate_escalation_withdrawn", "gate_escalation_expired"}
+TERMINAL = ESCALATION_TERMINAL_EVENTS
 
 def esc_id(p):
     return p.get("escalation_id") or p.get("id")

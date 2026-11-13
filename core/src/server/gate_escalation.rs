@@ -1963,6 +1963,18 @@ pub fn valid_request_key(k: &str) -> bool {
     k.len() == 64 && k.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// The hook's request-key rule: member, marker, exact attempted act and host session (#540).
+/// Open-door refusals use this to name the same attempt when no caller key was supplied.
+pub fn request_key_for_act(
+    plugin_id: &str,
+    marker: &str,
+    attempted_act: &str,
+    host_session_id: Option<&str>,
+) -> String {
+    let fields = [plugin_id, marker, attempted_act, host_session_id.unwrap_or("")];
+    format!("{:x}", Sha256::digest(fields.join("\x1f").as_bytes()))
+}
+
 pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4063,6 +4075,18 @@ mod tests {
         table.sort();
         assert!(declared.len() >= 4, "found {declared:?}");
         assert_eq!(table, declared, "MEMBER_GATE_ENTRIES drifted from plugins/*/expects.json");
+    }
+
+    #[test]
+    fn request_key_for_act_matches_the_hook_rule() {
+        assert_eq!(
+            request_key_for_act("claude-code", "plugins/_shared", "Bash: true", Some("wake-1")),
+            "24251c2de7e2bbcae020a004921fd02a32be73f6e105cfe45e34c68f055fb1d2"
+        );
+        let absent = request_key_for_act("claude-code", "plugins/_shared", "Bash: true", None);
+        assert!(valid_request_key(&absent));
+        assert_ne!(absent, request_key_for_act("claude-code", "plugins/_shared", "Bash: false", None));
+        assert_ne!(absent, request_key_for_act("claude-code", "plugins/_shared", "Bash: true", Some("wake-1")));
     }
 
     /// #774/#1169: a reclaim is recovery of one lost answer. Every conjunct is exercised on its
