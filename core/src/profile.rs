@@ -263,9 +263,9 @@ impl ProfileLink {
 
     fn projection_is_safe(&self, tier: &Visibility) -> bool {
         self.visibility.permits(tier)
-            && (!matches!(tier, Visibility::Member)
+            && (matches!(self.owner, ProfileOwner::Member)
                 || !matches!(self.visibility, Visibility::Member)
-                || matches!(self.owner, ProfileOwner::Member))
+                || matches!(tier, Visibility::Private))
     }
 }
 
@@ -301,7 +301,8 @@ impl ProfileStore {
 
     /// Current, evidenced links safe to project at a given tier. Legacy claimed links remain
     /// visible; self-/attester-verified links with missing evidence do not. A foreign-owned
-    /// member-only link stays hidden because this API has no shared-membership proof.
+    /// member-only link is private-only because no external tier, including Trusted, proves
+    /// shared membership with its owner.
     pub fn links_for_tier(&self, tier: &Visibility) -> Vec<&ProfileLink> {
         let now = Utc::now();
         self.links
@@ -620,6 +621,10 @@ mod tests {
         assert!(links.iter().all(|link| link.platform == "slack"));
         assert!(links.iter().all(|link| link.url != "https://chat.example/foreign-members"));
         assert!(store.hub_fields().values().all(|url| url != "https://chat.example/foreign-members"));
+        let trusted = store.present(&Visibility::Trusted);
+        assert_eq!(trusted.links.len(), 3);
+        assert!(trusted.links.iter().all(|link| link.url != "https://chat.example/foreign-members"),
+                "trust in an outsider is not proof of membership in the link owner's group");
         assert_eq!(store.present(&Visibility::Private).links.len(), 4,
                    "external projection restrictions must not erase local/private access");
     }
