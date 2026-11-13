@@ -118,6 +118,9 @@ def section_a():
          '106 | [projects."/home/dp/ai-workspace"]\n    |           ^^^^^^^^^^^^\n',
          "1", "terminal", "launch-failed"),
         ("rc 127", "", "127", "terminal", "launch-failed"),
+        ("timeout with an empty log", "", "124", "terminal", "timeout-no-output"),
+        ("timeout with only Execution error", "Execution error", "124", "terminal", "timeout-no-output"),
+        ("timeout with substantive output", "real work\n" * 20, "124", "terminal", "timeout"),
         # Prose ABOUT an outage in a wake that ran: the vendor string is far above the end.
         ("prose: limits discussed, run ended normally",
          "the codex seat hit your usage limit earlier today\n" + "work line\n" * 30
@@ -138,6 +141,8 @@ def section_a():
           and classify("codex remains out of credits\n", mode="terminal") == "unknown")
     check("A: out-of-credits/auth-failed/launch-failed are seat-down",
           all(unavailable(c, "1") for c in ("out-of-credits", "auth-failed", "launch-failed")))
+    check("A: timeout-no-output is seat-down, ordinary timeout is not",
+          unavailable("timeout-no-output", "124") and not unavailable("timeout", "124"))
     check("A: timeout/egress/unknown are NOT seat-down",
           not any(unavailable(c, "1") for c in ("timeout", "egress-blocked", "unknown")))
     check("A: a template/lock refusal rc (70, 75) is never seat-down, whatever the old log says",
