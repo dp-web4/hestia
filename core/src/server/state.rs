@@ -546,6 +546,9 @@ pub struct ServerState {
     pub scope_tally: std::collections::HashMap<(String, String), (u64, u64)>,
     pub vault: Vault,
     pub sessions: crate::server::published::Sessions,
+    /// The dry-run session lookup returns a real bearer id for a claimed member/host pair,
+    /// so it is admitted only when the HTTP listener is loopback. Off-host ownership is #824.
+    pub allow_connect_dry_run: bool,
     pub actions: HashMap<Uuid, InFlightAction>,
     /// BEHIND AN `Arc` SO A HEAVY READ NEED NOT HOLD THE GLOBAL STATE LOCK.
     ///
@@ -906,6 +909,50 @@ pub enum StandingGrantFailure {
     },
 }
 
+fn warm_configured_members(
+    vault: &mut Vault,
+    registry: &mut crate::member_registry::MemberRegistry,
+    synthetic: &HashSet<String>,
+    home: &Path,
+    sovereign_lct_id: &str,
+    sovereign_anchor: &str,
+) {
+    let seats = home.join("seats");
+    let mut paths = match std::fs::read_dir(&seats) {
+        Ok(entries) => entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect::<Vec<_>>(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!("[hestia] WARNING: configured-member warm-up could not read {}: {e}", seats.display());
+            Vec::new()
+        }
+    };
+    paths.sort();
+    let before = registry.len();
+    for path in paths {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("env") {
+            continue;
+        }
+        let Some(plugin_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if plugin_id.starts_with('_') {
+            continue;
+        }
+        crate::member_registry::ensure_member(
+            vault,
+            registry,
+            plugin_id,
+            synthetic.contains(plugin_id),
+            sovereign_lct_id,
+            sovereign_anchor,
+        );
+    }
+    let minted = registry.len().saturating_sub(before);
+    if minted > 0 {
+        eprintln!("[hestia] warmed {minted} configured member LCT(s) at startup (#423)");
+    }
+}
+
 impl ServerState {
     /// Open all persistent stores rooted at `home` and prepare server state.
     /// `passphrase` is the vault passphrase — used to derive the storage key
@@ -1018,7 +1065,7 @@ impl ServerState {
             &sovereign.lct_id(),
         );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
-        let member_registry = crate::member_registry::load_members(&vault);
+        let mut member_registry = crate::member_registry::load_members(&vault);
         let retired_members = crate::server::retirement::load(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
@@ -1064,6 +1111,16 @@ impl ServerState {
                 "synthetic-plugin set unreadable — failing closed instead of treating it as empty",
             )?
         };
+        // Pay every configured member's first-LCT mint here, before the first request can take
+        // the state lock. Unknown future members still use ensure_member on first connect.
+        warm_configured_members(
+            &mut vault,
+            &mut member_registry,
+            &synthetic_plugins,
+            home,
+            &sovereign.lct_id(),
+            &sovereign_lct,
+        );
 
         // Standing scope grants (durable loosenings — POLICY_SCOPE_ASYMMETRY row 3).
         // Present-but-unparseable must abort startup like the synthetic set: collapsing a
@@ -1146,6 +1203,8 @@ impl ServerState {
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: crate::server::published::Sessions::default(),
+            // In-process/IPC handlers are local; the HTTP bind may narrow this before serving.
+            allow_connect_dry_run: true,
             actions: HashMap::new(),
             // Rebuilt from the chain + settle record, so a late witness for an action from before
             // this restart finds its row and its charge state (one-gate stage A). Evaluated
@@ -2606,6 +2665,81 @@ mod tests {
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         let state = ServerState::open(vault, dir.path(), "p").unwrap();
         (dir, state)
+    }
+
+    #[test]
+    fn startup_warms_configured_member_lcts_before_any_connect() {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let mut initial = ServerState::open(vault, dir.path(), "p").unwrap();
+        initial.mark_synthetic("synthetic-seat", 1).unwrap();
+        drop(initial);
+        let seats = dir.path().join("seats");
+        std::fs::create_dir(&seats).unwrap();
+        for name in ["alpha-seat", "beta-seat", "_shared", "synthetic-seat"] {
+            std::fs::write(seats.join(format!("{name}.env")), "# fixture\n").unwrap();
+        }
+        std::fs::write(seats.join("not-a-seat.txt"), "# fixture\n").unwrap();
+
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
+        let alpha = state.member_registry.get("alpha-seat").expect("alpha minted at startup");
+        let beta = state.member_registry.get("beta-seat").expect("beta minted at startup");
+        assert!(alpha.lct_id().starts_with("lct:web4:mb32:"));
+        assert!(beta.lct_id().starts_with("lct:web4:mb32:"));
+        assert!(state.member_registry.get("_shared").is_none());
+        assert!(state.member_registry.get("synthetic-seat").is_none());
+        assert!(state.member_registry.get("not-a-seat").is_none());
+    }
+
+    #[test]
+    fn policy_generation_binds_projection_verdict_not_verification_time() {
+        let (_dir, mut state) = make_state();
+        let audit = |verified_at| crate::server::standing_scope::ProjectionAudit {
+            verified_at,
+            matches: true,
+            runtime_generation: 7,
+            vault_generation: 7,
+            runtime_digest: "same-runtime".into(),
+            vault_digest: "same-vault".into(),
+            divergence: vec![],
+        };
+
+        state.standing_projection_audit = crate::server::published::Watched::new(Some(audit(100)));
+        let first = state.build_publication();
+        let first_generation = first.policy_generation();
+        state.standing_projection_audit = crate::server::published::Watched::new(Some(audit(900)));
+        let second = state.build_publication();
+        let second_generation = second.policy_generation();
+
+        assert_eq!(first.canonical()["standing_projection_audit"]["verified_at"].as_u64(),
+                   Some(100));
+        assert_eq!(second.canonical()["standing_projection_audit"]["verified_at"].as_u64(),
+                   Some(900));
+        assert_eq!(first_generation, second_generation);
+
+        let mut assert_moves = |changed: crate::server::standing_scope::ProjectionAudit| {
+            state.standing_projection_audit = crate::server::published::Watched::new(Some(changed));
+            assert_ne!(first_generation, state.build_publication().policy_generation());
+        };
+        let mut changed = audit(901);
+        changed.matches = false;
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.runtime_generation = 8;
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.vault_generation = 8;
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.runtime_digest = "changed-runtime".into();
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.vault_digest = "changed-vault".into();
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.divergence = vec!["standing grant differs".into()];
+        assert_moves(changed);
     }
 
     /// B2 (#339): the daemon's chain rows are witnessed by the Society key, name the real

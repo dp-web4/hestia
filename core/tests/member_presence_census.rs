@@ -343,6 +343,9 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
         "let adjudicator_instance_lct = s.member_lct(&adjudicator.plugin_id);",
         "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
     ], SiteClass::Predicate),
+    ("server/handler.rs::tool_cross_chain_checkpoint", &[
+        "let Some(observer_lct) = s.member_lct(&caller.plugin_id) else {",
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_witness_decision", &[
         "let instance_lct = s.member_lct(&plugin_id);",
     ], SiteClass::Naming),
@@ -1333,8 +1336,14 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/handler.rs::tool_connect", &[
         "crate::member_registry::ensure_member(",
     ]),
+    // Startup preloading is a producer, not an authorization decision. It mints only the
+    // durable LCT that the member's first connect would mint later; synthetic and shared
+    // pseudo-seat exclusions stay explicit, and no session, role or grant is created.
+    ("server/state.rs::warm_configured_members", &[
+        "crate::member_registry::ensure_member(",
+    ]),
     ("server/state.rs::open", &[
-        "let member_registry = crate::member_registry::load_members(&vault);",
+        "let mut member_registry = crate::member_registry::load_members(&vault);",
     ]),
 ];
 

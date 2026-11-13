@@ -297,6 +297,8 @@ pub struct LedgerPage {
     pub truncated: bool,
     /// How many chain entries were scanned to build this page.
     pub scanned: u64,
+    /// Exclusive cursor for the next older chain page; null when this page reached the floor.
+    pub before_position: Option<u64>,
     /// Set when the chain read FAILED. The rows are then whatever was readable — which may be
     /// nothing — and a caller must render this rather than an empty ledger.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -777,6 +779,7 @@ pub fn page(rows: Vec<LedgerRow>, status_filter: &str, limit: usize) -> LedgerPa
         counts,
         truncated: false,
         scanned: 0,
+        before_position: None,
         read_error: None,
     }
 }

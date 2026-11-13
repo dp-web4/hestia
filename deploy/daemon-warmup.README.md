@@ -20,4 +20,7 @@ Install (operator):
 Clamp facts verified from config (Class T discipline — measure, never remember):
 codex gate hook timeout = **15s** (config.toml; the "3s clamp" was folklore, wrong 5x).
 Budget ladder: 15s clamp > 2.5s mechanism budget > ~30ms steady-state legs.
-The rust-side fix (move the page-in to daemon startup proper) remains #423.
+Current source also performs the daemon-side fix: `ServerState::open` mints every configured,
+non-synthetic member LCT before the first request, so a first connect finds the hot in-memory
+registry. The `ExecStartPost` roster remains useful for older builds and for exercising each
+member's other cold request paths; it is no longer the only place that pays the member-LCT mint.
