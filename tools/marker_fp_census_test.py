@@ -30,9 +30,9 @@ check("no-colon prefix still stripped", _acttext(rec("Bash cat /tmp/plugins/_sha
 check("tmp class sees tokens, not chars",
       tmp_only(rec("Bash: cat /tmp/plugins/_shared/f")), True)
 check("non-tmp marker token excludes",
-      tmp_only(rec("Bash: cat /home/dp/plugins/_shared/f")), False)
+      tmp_only(rec("Bash: cat /home/member/plugins/_shared/f")), False)
 check("mixed tmp and non-tmp is NOT in class",
-      tmp_only(rec("Bash: cp /tmp/plugins/_shared/a /home/dp/plugins/_shared/b")), False)
+      tmp_only(rec("Bash: cp /tmp/plugins/_shared/a /home/member/plugins/_shared/b")), False)
 
 # 3. Censored act text is NOT decidable. Scoring it either way is a guess, and the two
 #    censors are seat-disjoint, so guessing biases the class BY SEAT.

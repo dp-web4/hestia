@@ -26,7 +26,7 @@ DELIM = dw.DELIM
 CODEX_DEAD = "hook: SessionStart Completed\nERROR: Your workspace is out of credits. Ask your workspace owner to refill in order to continue.\nERROR: Your workspace is out of credits. Ask your workspace owner to refill in order to continue.\n"
 CODEX_DEAD_FOOTER = "...working...\nERROR: Your workspace is out of credits. Add credits to continue.\ntokens used\n167,656\n"
 CODEX_DEAD_UNLISTED = "ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://x\ntokens used\n1,204\n"
-KIMI_DEAD = "kimi version 0.39.1\nerror: failed to run prompt: provider.auth_error: 403 You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends.\nSee log: /home/dp/.kimi-code/logs/kimi-code.log\n"
+KIMI_DEAD = "kimi version 0.39.1\nerror: failed to run prompt: provider.auth_error: 403 You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends.\nSee log: /home/member/.kimi-code/logs/kimi-code.log\n"
 CLAUDE_DEAD = "API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check https://status.claude.com.\n"
 
 # Healthy wakes v1 called dead: prose about a peer, a design table, a grep in a diff, a

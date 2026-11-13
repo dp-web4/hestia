@@ -347,7 +347,7 @@ def native_event(seat, act_tool, act_input, cwd, n):
     """The act in this harness's native hook event, shaped on recorded events (see docstring)."""
     if seat == "claude-code":
         return {"session_id": "9261dc9a-0000-4000-8000-00000000c1a0",
-                "transcript_path": "/home/probe/.claude/projects/x/9261dc9a.jsonl", "cwd": cwd,
+                "transcript_path": "/home/member/.claude/projects/x/9261dc9a.jsonl", "cwd": cwd,
                 "permission_mode": "default", "hook_event_name": "PreToolUse",
                 "tool_name": act_tool, "tool_input": act_input, "tool_use_id": f"toolu_01Contract{n:04d}"}
     if seat == "codex":
@@ -360,7 +360,7 @@ def native_event(seat, act_tool, act_input, cwd, n):
         else:
             tool, ti = act_tool, act_input
         return {"session_id": "019f94e0-0000-7000-8000-00000000c0de", "turn_id": f"019f94e0-{n:04d}",
-                "transcript_path": "/home/probe/.codex/sessions/rollout.jsonl", "cwd": cwd,
+                "transcript_path": "/home/member/.codex/sessions/rollout.jsonl", "cwd": cwd,
                 "hook_event_name": "PreToolUse", "model": "gpt-probe", "permission_mode": "default",
                 "tool_name": tool, "tool_input": ti, "tool_use_id": f"call_Contract{n:04d}"}
     if seat == "kimi":
@@ -373,7 +373,7 @@ def native_event(seat, act_tool, act_input, cwd, n):
                 "cwd": cwd, "tool_name": act_tool, "tool_input": ti, "tool_call_id": f"tool_Contract{n:04d}"}
     gtool = {"Read": "read_file", "Edit": "replace", "Write": "write_file",
              "Bash": "run_shell_command"}.get(act_tool, act_tool)
-    return {"session_id": "gemini-contract-session", "transcript_path": "/home/probe/.gemini/tmp/chat.json",
+    return {"session_id": "gemini-contract-session", "transcript_path": "/home/member/.gemini/tmp/chat.json",
             "cwd": cwd, "hook_event_name": "BeforeTool", "timestamp": "2026-10-01T00:00:00Z",
             "tool_name": gtool, "tool_input": dict(act_input)}
 
@@ -1786,7 +1786,7 @@ CONTRACT_TESTS = [
 
 # ── parity arm (subprocesses) ─────────────────────────────────────────────────────────────────
 
-PROBE_HOME = "/home/gate-parity-probe"   # text the gates classify; never a path touched
+PROBE_HOME = "/home/member"   # text the gates classify; never a path touched
 #: A credential-file path, assembled from parts so its literal never has to be typed anywhere.
 CRED_PATH = (PROBE_HOME + "/.config/x/." + "e" + "nv")
 
