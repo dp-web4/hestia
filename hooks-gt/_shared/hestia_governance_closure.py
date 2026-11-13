@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 0355d17e7e482629beafa63b5b1a06161c88cd57a4228559990e5c3cca0e0c52  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 9e1b57ca71484adea3cf88bf48ba4b822a57432882433bc0914b5ef10b3ee720  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1379,7 +1379,7 @@ def _output_verb_write_targets(name: str, args: list, path_pinned: bool = False)
 
 
 _FALLBACK_READ_ONLY_VERBS = _PASSIVE_VERBS | {
-    "date", "export", "false", ":", "pwd", "read", "sleep"}
+    "date", "export", "false", ":", "pwd", "read", "set", "sleep", "unset"}
 
 
 def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:

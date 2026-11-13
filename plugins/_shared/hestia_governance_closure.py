@@ -1378,7 +1378,7 @@ def _output_verb_write_targets(name: str, args: list, path_pinned: bool = False)
 
 
 _FALLBACK_READ_ONLY_VERBS = _PASSIVE_VERBS | {
-    "date", "export", "false", ":", "pwd", "read", "sleep"}
+    "date", "export", "false", ":", "pwd", "read", "set", "sleep", "unset"}
 
 
 def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:

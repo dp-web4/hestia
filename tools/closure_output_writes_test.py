@@ -203,6 +203,10 @@ def test_read_and_opaque_counterparts_keep_their_contract():
                 over.append(f"{name}: opaque interpreter must be out of grammar, got {v}")
         elif v.classification == "write":
             over.append(f"{name}: {read!r} -> write ({v.marker})")
+    for cmd in (f"set -e; cat {T}", f"set -euo pipefail; cat {T}", f"unset X; cat {T}"):
+        v = cls(cmd)
+        if v.classification == "write":
+            over.append(f"shell builtin preamble: {cmd!r} -> write ({v.marker})")
     check("read_counterparts_keep_their_contract", not over, "\n  " + "\n  ".join(over))
 
 
