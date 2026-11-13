@@ -115,7 +115,7 @@ def open_and_read(seat, home, event, label, shim_path=None):
     rec = read_escalation(ENDPOINT, m.group(1)) if m else {}
     answers_deny = (rec.get("_opened") or {}).get("answers_deny") or ""
     check(f"{seat}-{label}-answers-deny", re.fullmatch(r"[0-9a-f]{64}", answers_deny), rec)
-    if _attempt == 1:
+    if _attempt == 0:
         denial = re.search(r"DENY ([0-9a-f]{64}) — appeal", text)
         check(f"{seat}-{label}-answers-deny-matches-refusal",
               denial and answers_deny == denial.group(1), (text, rec))
