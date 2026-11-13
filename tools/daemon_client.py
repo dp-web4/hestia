@@ -31,8 +31,8 @@ def call(tool_name: str, arguments: dict):
         raise ValueError("tool_name must be a non-empty string")
     if not isinstance(arguments, dict):
         raise TypeError("arguments must be a JSON object")
-    h, _session_id = _mesh.connect()
-    out = _mesh.rpc(h, tool_name, arguments)
+    h, session_id = _mesh.connect()
+    out = _mesh.rpc(h, tool_name, dict(arguments, session_id=session_id))
     if _mesh.failed(out):
         raise _mesh.DaemonRefusal(out)
     return out

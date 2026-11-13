@@ -121,6 +121,7 @@ def test_generic_call_reaches_the_tool():
         names = [name for name, _args in stub.calls]
         assert names == ["hestia_connect", "hestia_appeal"], names
         assert stub.calls[1][1]["reason"] == "false positive", stub.calls
+        assert stub.calls[1][1]["session_id"] == "s-603", stub.calls
     finally:
         stub.close()
 
