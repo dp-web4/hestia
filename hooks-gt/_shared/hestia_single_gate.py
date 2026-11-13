@@ -1,4 +1,4 @@
-# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 93a6a17a27130dc63aca441aab17a251af009d91e8b7ce26fd8887532ebb3cd7  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -1108,6 +1108,7 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
             # may make the declaration that lets the daemon reclaim a lost answer (#1169).
             supersession=mechanism.SUPERSESSION_HARD_STOP,
             deadline=inv.phase_deadline,
+            canonical_act=mechanism.scope_act_canonical(ev.tool, ev.tool_input, ev.cwd, ev.session_id),
             # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
             # path the closure resolved, not only the one `cv` reports — each with its other
             # spellings and the LOCATION it lands at (#1247). The daemon prices the bar over the marker, the act and all of

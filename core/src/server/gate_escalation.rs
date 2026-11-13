@@ -2626,8 +2626,31 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Opened, OpenError> {
+        self.open_or_coalesce_with_act_digest(
+            plugin_id, role, tool_name, marker, act, resolved_targets, stated_reason,
+            stated_detail, binding, None, now, ttl_secs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_or_coalesce_with_act_digest(
+        &mut self,
+        plugin_id: &str,
+        role: &str,
+        tool_name: &str,
+        marker: &str,
+        act: Option<&str>,
+        resolved_targets: &[String],
+        stated_reason: Option<&str>,
+        stated_detail: Option<&str>,
+        binding: Option<&PayloadBinding>,
+        canonical_act: Option<&str>,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<Opened, OpenError> {
+        let canonical_act = canonical_act.map(str::trim).filter(|v| !v.is_empty());
         if let Some(a) = act.map(str::trim).filter(|v| !v.is_empty()) {
-            let digest = Self::act_digest_of(a);
+            let digest = canonical_act.map(Self::act_digest_of).unwrap_or_else(|| Self::act_digest_of(a));
             // A FOLD MUST NOT LOWER THE PRICE. The twin was priced from what ITS ask carried; an
             // ask for the same act that prices HIGHER (a resolved target the first ask lacked —
             // an old hook then a new one, across an upgrade) is not folded into the weaker row,
@@ -2642,9 +2665,18 @@ impl EscalationStore {
                 return Ok(Opened::Coalesced(twin.clone()));
             }
         }
-        self.open_with_payload(plugin_id, role, tool_name, marker, act, resolved_targets,
+        let opened = self.open_with_payload(plugin_id, role, tool_name, marker, act, resolved_targets,
                                stated_reason, stated_detail, binding, now, ttl_secs)
-            .map(Opened::Minted)
+            .map(Opened::Minted)?;
+        if let Some(canonical_act) = canonical_act {
+            if let Opened::Minted(esc) = opened {
+                let mut bound = esc;
+                bound.act_digest = Some(Self::act_digest_of(canonical_act));
+                self.by_id.insert(bound.id.clone(), bound.clone());
+                return Ok(Opened::Minted(bound));
+            }
+        }
+        Ok(opened)
     }
 
     /// Record which seats were INVITED to participate — the production writer the invitation
@@ -2824,14 +2856,27 @@ impl EscalationStore {
         attempted_act: Option<&str>,
         now: u64,
     ) -> Vec<String> {
+        self.observe_reissue_with_act_digest(plugin_id, host_session_id, marker, attempted_act, None, now)
+    }
+
+    pub fn observe_reissue_with_act_digest(
+        &mut self,
+        plugin_id: &str,
+        host_session_id: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        canonical_act: Option<&str>,
+        now: u64,
+    ) -> Vec<String> {
         let (plugin_id, marker) = (plugin_id.trim(), marker.trim());
         if host_session_id.trim().is_empty() || plugin_id.is_empty() || marker.is_empty() {
             return Vec::new();
         }
-        let Some(want) = attempted_act
+        let Some(want) = canonical_act
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(Self::act_digest_of)
+            .or_else(|| attempted_act.map(str::trim).filter(|v| !v.is_empty()).map(Self::act_digest_of))
         else {
             return Vec::new();
         };
@@ -3247,6 +3292,23 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         at_least: Bar,
         now: u64,
     ) -> Option<Escalation> {
+        self.claim_bound_with_digest(
+            plugin_id, "", marker, attempted_act, None, attempted_payload, at_least, now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_bound_with_digest(
+        &mut self,
+        plugin_id: &str,
+        tool_name: &str,
+        marker: &str,
+        attempted_act: Option<&str>,
+        canonical_act: Option<&str>,
+        attempted_payload: Option<&str>,
+        at_least: Bar,
+        now: u64,
+    ) -> Option<Escalation> {
         let plugin_id = plugin_id.trim();
         let marker = marker.trim();
         if plugin_id.is_empty() || marker.is_empty() {
@@ -3261,11 +3323,13 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             .or_default()
             .insert(marker.to_string());
         // Oldest claimable first, so a member that somehow holds two approvals spends the one
-        // closest to expiring rather than stranding it.
-        let want_digest = attempted_act
+        // closest to expiring rather than stranding it. The canonical request wins when present;
+        // legacy display-act claims still have to arrive under the approved tool.
+        let want_digest = canonical_act
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(Self::act_digest_of);
+            .map(Self::act_digest_of)
+            .or_else(|| attempted_act.map(str::trim).filter(|v| !v.is_empty()).map(Self::act_digest_of));
         let want_payload = Self::normalize_payload(attempted_payload);
         let mut ids: Vec<(u64, String)> = self
             .by_id
@@ -3275,6 +3339,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                 // digest and they must be equal: `None == None` is NOT a match, because an
                 // approval that named no act cannot authorise this one.
                 e.plugin_id == plugin_id
+                    && (tool_name.is_empty() || e.tool_name == tool_name)
                     && e.marker == marker
                     && match (&e.act_digest, &want_digest) {
                         (Some(bound), Some(asked)) => bound == asked,
