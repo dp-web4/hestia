@@ -199,13 +199,12 @@ fn every_declared_event_type_is_actually_read() {
 /// so the FILE-grained assertion below went green through the whole divergence. The
 /// mention was never the invariant; the ARGUMENT was.
 ///
-/// The repair removed the ambiguity rather than parsing it: all three sites now take their
-/// window from `derivation::scan_window`, one function, split budgets inside it. So the
-/// assertion is no longer "names the declared list somewhere" — it is "gets its window
-/// from the ONE place that applies the declared prefilters". That is strictly stronger
-/// than what this test asserted before, and it needs no parser: a second, unprefiltered
-/// fold beside a prefiltered one now fails, because the check is that a folding file
-/// obtains windows ONLY through `scan_window`.
+/// The repair removed the ambiguity rather than parsing it: the ordinary sites take their
+/// window from `derivation::scan_window`, one function, split budgets inside it. The
+/// event-triggered cache has ONE explicitly audited alternative: its per-member call to
+/// `scan_subject_window`, introduced for #578. That alternative must prove population parity
+/// behaviorally (aliases, global events, backfill and replay); naming it here only prevents
+/// an unreviewed third window from slipping into another fold. It is not evidence of parity.
 ///
 /// GRAIN, stated because it bounds what a green here means: still FILE-grained. A file
 /// that calls `scan_window` and ALSO hand-builds a second window still passes. Catching
@@ -246,14 +245,15 @@ fn every_fold_call_site_applies_the_declared_prefilter() {
                 || prod.contains("derivation::derive_evidence(");
             if folds {
                 checked.push(path.display().to_string());
-                // The window must come from the ONE prefiltered path. A file that builds
-                // its own window with `scan_recent` is exactly the divergence that let the
-                // dashboard read 17 hours while the API read 3.6 days.
-                // NOT also flagging bare `scan_recent` in the file: dashboard.rs reads a
-                // stats/feed window that way and it is not a derivation fold. Separating
-                // those needs the call's ARGUMENTS, which is the parser this test has
-                // always declined to write.
-                if !prod.contains("derivation::scan_window(") {
+                // Ordinary folds use the canonical prefiltered path. The cache's exact
+                // subject-indexed call is the sole declared alternative; any other custom
+                // window remains an offender.
+                let subject_indexed_cache = path.file_name().and_then(|s| s.to_str())
+                    == Some("derivation_cache.rs")
+                    && prod.contains(
+                        "derivation::scan_subject_window(chain_store, &plugin_id)"
+                    );
+                if !prod.contains("derivation::scan_window(") && !subject_indexed_cache {
                     offenders.push(path.display().to_string());
                 }
             }
@@ -269,11 +269,10 @@ fn every_fold_call_site_applies_the_declared_prefilter() {
     );
     assert!(
         offenders.is_empty(),
-        "{offenders:?} fold trust without taking the window from `derivation::scan_window`, \
-         or build one by hand with `scan_recent` alongside it. A fold whose window came from \
-         a different prefilter or a different BUDGET scores the same member from a different \
-         population than /api/trust/derivation does — measured 2026-08-23, that was 17 hours \
-         of chain against 3.6 days, and both sites named the declared list. Checked: \
+        "{offenders:?} fold trust without the canonical `derivation::scan_window` or the \
+         cache's one sanctioned subject-indexed call. Any other custom prefilter or BUDGET \
+         can score a member from a different population than /api/trust/derivation. The \
+         subject-indexed exception separately owes behavioral parity evidence. Checked: \
          {checked:?}"
     );
 }
