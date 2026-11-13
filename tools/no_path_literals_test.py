@@ -190,7 +190,7 @@ PINNED_BASELINE: dict | None = {
     "plugins/gemini/hooks/observe.sh":              {"shell-home-default": 1},
     "plugins/gemini/hooks/hydrate.sh":              {"shell-home-default": 1},
     # DEPLOY set
-    "deploy/templates/hestia.service":              {"unit-home-hestia": 4},
+    "deploy/templates/hestia.service":              {"unit-home-hestia": 3},  # #581 direct exec drops the shell wrapper
     "deploy/from-main/hestia-deploy.service":       {"unit-home-hestia": 2},
     "deploy/from-main/hestia-deploy.timer":         {},
     "deploy/from-main/hestia-deploy-check.service": {"unit-home-hestia": 1},
