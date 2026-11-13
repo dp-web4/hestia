@@ -124,6 +124,11 @@ with tempfile.TemporaryDirectory() as tmp:
     check("C2. the prompt names the mesh CLI by its real path",
           f"python3 {cli} send" in prompt and os.path.isfile(cli),
           f"cli={cli!r} tail={prompt[-500:]!r}")
+    check("C3. no unavailable MCP tool is offered", "hestia MCP tool" not in prompt, prompt[-700:])
+    daemon_client = os.path.abspath(os.path.join(MESH, "..", "..", "tools", "daemon_client.py"))
+    check("C4. the prompt names the tracked generic daemon client",
+          f"python3 {daemon_client} <tool>" in prompt and os.path.isfile(daemon_client),
+          f"client={daemon_client!r} tail={prompt[-700:]!r}")
 
 print()
 if failures:
