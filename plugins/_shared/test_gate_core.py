@@ -1216,18 +1216,21 @@ def test_a_forbidden_token_inside_a_longer_word_is_pinned_open():
     def verdict(command):
         return G.evaluate(G.NormalizedEvent(tool="Bash", command=command, cwd=ws), prof, ws)
 
-    # THE FALSE DENY, pinned as it behaves TODAY. Flip these to `not v.blocks` in the commit
-    # that narrows the matcher.
-    for name, cmd in (
-        ("reading_an_env_var_in_python", "python3 -c 'import os; print(os.environ)'"),
-        ("grepping_the_rules_own_source",
-         'grep -n "SECRET\\|\\' + tok + '" plugins/_shared/hestia_gate_core.py'),
-    ):
-        v = verdict(cmd)
-        check("fp_token_substring_still_open__" + name,
-              v.blocks and v.rule == "egress.secret",
-              "this no longer denies — the matcher was narrowed and nobody moved the row. "
-              "If that was earned, the red arms below must pass in the same commit")
+    # EARNED by #1550 (a8fec0a3, #1494): the env-file token is matched as a FILE NAME, a hit unless
+    # it is glued inside one identifier on both sides. Python's environ identifier no longer denies,
+    # and every red arm below still does. The narrowing was measured on McNugget's week
+    # (2026-11-03..10): 7 of 89 denies false, 3 of them this shape.
+    v = verdict("python3 -c 'import os; print(os.environ)'")
+    check("fp_token_substring_closed__reading_an_env_var_in_python", not v.blocks,
+          "Python's environ identifier is denied again: the file-name match (#1494) regressed")
+
+    # STILL A REFUSAL, by design: a backslash before the token followed by a non-word is also how
+    # a real env-file path reads in a regex, and over-denying is the safe direction (#1494).
+    v = verdict('grep -n "SECRET\\|\\' + tok + '" plugins/_shared/hestia_gate_core.py')
+    check("fp_token_substring_still_open__grepping_the_rules_own_source",
+          v.blocks and v.rule == "egress.secret",
+          "this no longer denies — the matcher was narrowed past #1494 and nobody moved the row. "
+          "If that was earned, the red arms below must pass in the same commit")
 
     # THE RED ARMS. A narrowing that greens the rows above and ANY of these is a hole, not a
     # fix: each names a real secret, and only the first carries a leading separator.

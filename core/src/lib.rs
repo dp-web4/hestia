@@ -24,6 +24,7 @@ pub mod lct_publish;
 pub mod legacy_parity;
 pub mod member_cli;
 pub mod member_registry;
+pub mod mesh_cli;
 pub mod orchestrators;
 pub mod pairing;
 pub mod plugin;

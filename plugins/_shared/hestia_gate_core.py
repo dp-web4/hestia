@@ -2280,6 +2280,15 @@ _CMD_SPECS = {
                               "-regex", "-iregex", "-lname", "-ilname"},
              "string_opts": {"-printf"}},
     "git": {"string_opts": {"-m", "--message", "--grep", "--author", "--format", "--pretty", "-S", "-G"}},
+    # gh's `-q`/`--jq` takes a jq expression in every subcommand that has it: 55 of 55 in `gh help
+    # reference` (gh 2.x, McNugget, 2026-11-10). `--template` and `-t` are NOT listed: under `repo
+    # edit` and `auth status` they are booleans, so the next word would be swallowed (#1314).
+    "gh": {"string_opts": {"--jq", "-q"}},
+    # jq's first operand is its FILTER, unless `-f`/`--from-file` supplies the program (then every
+    # operand is a file). `-L` and its jq 1.8 long form `--library-path` name a library directory
+    # and are judged (legion-claude on #1550: without the long form its DIR became the filter).
+    "jq": {"pattern_first": True, "file_opts": {"-f", "--from-file"},
+           "value_opts": {"--indent", "-L", "--library-path"}},
 }
 _CMD_SPECS["gawk"] = _CMD_SPECS["mawk"] = _CMD_SPECS["awk"]
 #: Heads whose `-c` value is shell code (they also disqualify the literal rule).
@@ -2930,6 +2939,10 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
             if opt in spec.get("code_opts", ()):
                 code(w)
                 continue
+            if opt in spec.get("file_opts", ()):
+                # The program came from a file (`grep -f P`, `sed -f S`, `jq -f F`): every operand
+                # is a file. Before this the first one was taken as the pattern and never judged.
+                state["pattern_given"] = True
             if (opt in spec.get("delim_opts", ()) or opt in spec.get("pattern_opts", ())
                     or opt in _string_opts(head, spec, state["subs"])) and not uglob:
                 if opt in spec.get("pattern_opts", ()):
@@ -2972,7 +2985,7 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 if name in spec.get("code_opts", ()):
                     code(val)
                     continue
-                if name in spec.get("pattern_opts", ()):
+                if name in spec.get("pattern_opts", ()) or name in spec.get("file_opts", ()):
                     state["pattern_given"] = True
                 if uglob or not (name in spec.get("delim_opts", ())
                                  or name in spec.get("pattern_opts", ())
@@ -3003,7 +3016,7 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 if w[:2] in spec.get("code_opts", ()):
                     code(w[2:])
                     continue
-                if w[:2] in spec.get("pattern_opts", ()):
+                if w[:2] in spec.get("pattern_opts", ()) or w[:2] in spec.get("file_opts", ()):
                     state["pattern_given"] = True
                 if uglob or not (w[:2] in spec.get("delim_opts", ())
                                  or w[:2] in spec.get("pattern_opts", ())
@@ -3011,6 +3024,24 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                     emit(w[2:], uglob)
                 elif w[:2] in spec.get("pattern_opts", ()):
                     pattern(w[2:], judge=False)            # as before, plus its value recorded
+                continue
+            run = re.match(r"-[A-Za-z0-9]+", w) if not w.startswith("--") and len(w) > 2 else None
+            valued = spec.get("file_opts", set()) | spec.get("value_opts", set())
+            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued), None) if run else None
+            if fat is not None and head == "sed" and "i" in w[1:fat]:
+                fat = None          # GNU `sed -if S`: `-i` takes the rest as its backup suffix
+            if fat is not None:
+                # A clustered option that takes a value (`grep -rf P`, `grep -nfP`, `jq -rf F`,
+                # `jq -nL DIR`): getopt reads the letters before it as flags and hands it the rest of
+                # the word, or the next word, which is judged as that option's value always is. A
+                # program-file option also means every operand is a file. A letter before it that
+                # itself takes a value only makes this judge more, never less.
+                if "-" + w[fat] in spec.get("file_opts", ()):
+                    state["pattern_given"] = True
+                if fat == len(w) - 1:
+                    state["pending"] = "-" + w[fat]
+                else:
+                    emit(w[fat + 1:], uglob)
                 continue
             m = _ATTACHED_OPT.match(w)
             if m:
@@ -3608,6 +3639,22 @@ def forbidden_tokens(profile: HarnessProfile) -> tuple:
     return FORBIDDEN_DEFAULT + tuple(t.strip() for t in extra.split(",") if t.strip())
 
 
+#: The env-file token is matched as a FILE NAME, not a substring (#1494, #639). It is a hit unless it is
+#: glued inside one identifier on BOTH sides: `os.environ`, `venv.EnvBuilder` and `environ` are not the
+#: file, while `.env`, `./.env.local`, `.envrc`, `prod.env`, `app.env.bak` and a `\.env` regex still are.
+#: `process.env.X` stays a hit too: a word before and a dot after is also how a named env file reads.
+#: Measured on McNugget, 2026-11-03..10: 3 of the 4 egress.secret false denies were the glued shape.
+#: Every other token keeps the substring match.
+_ENV_FILE = re.compile(r"(?<![a-z0-9_])\.env|\.env(?![a-z0-9_])")
+
+
+def forbidden_hit(token: str, low: str) -> bool:
+    """Gate 1a's match of one forbidden token against LOWERED text."""
+    if token == ".env":
+        return _ENV_FILE.search(low) is not None
+    return token in low
+
+
 # ── The decision ─────────────────────────────────────────────────────────────────────────
 #: Tools whose path is only READ. The read-only floor admits these and nothing else. Each is
 #: also a reader in the governance closure (`_READ_PATH_TOOLS`), which
@@ -3788,7 +3835,7 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
-            if f in low:
+            if forbidden_hit(f, low):
                 return _deny(
                     "egress.secret",
                     f"'{event.tool}' touches a forbidden path (secret/credential or "
@@ -4085,7 +4132,7 @@ def degraded_verdict(event: NormalizedEvent,
     for blob in egress_blobs(event):
         low = blob.lower()
         for f in forbidden:
-            if f in low:
+            if forbidden_hit(f, low):
                 return _deny(
                     "egress.secret",
                     f"'{event.tool}' touches a forbidden path (secret/credential or "
