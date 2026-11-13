@@ -1576,10 +1576,10 @@ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
                       deadline=None):
     """Record a governance-surface event as its OWN class — `gate_self_read` for a permitted
     read, `gate_self_access` (appealable) for a refused write. The two stay distinct so an
-    alert on the refusal keeps its meaning. Best effort: a failed record never changes the
-    decision — the daemon's health is not a precondition for reading one's own law, and the
-    deny already happened locally."""
-    return gate_self_call("hestia_request_witness", {
+    alert on the refusal keeps its meaning. Returns the witnessEntryHash on success, None
+    otherwise. Reads stay best effort; a deny that needs a linked escalation must treat None
+    as NO RECEIPT, never as evidence that the deny exists (#537)."""
+    out = gate_self_call("hestia_request_witness", {
         "event_type": event_type,
         "event_data": {"plugin_id": plugin_id,
                        "tool_name": tool_name,
@@ -1589,7 +1589,12 @@ def witness_gate_self(event_type, marker, tool_name, rule=None, *,
                        "severity": "record" if event_type == "gate_self_read" else "escalate",
                        "role_lct": role}},
         plugin_id=plugin_id, role=role, client_name=client_name,
-        host_session_id=host_session_id, deadline=deadline) is not None
+        host_session_id=host_session_id, deadline=deadline)
+    if isinstance(out, dict):
+        receipt = out.get("witnessEntryHash")
+        if isinstance(receipt, str) and receipt:
+            return receipt
+    return None
 
 
 RESOLVED_TARGET_MAX = 400
@@ -1636,7 +1641,7 @@ def resolved_targets_for_claim(targets, complete=True):
 def claim_self_write(marker, tool_name, attempted, *,
                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
                      supersession=None, deadline=None, resolved_targets=None,
-                     resolved_targets_complete=True):
+                     resolved_targets_complete=True, answers_deny=None):
     """Ask ONCE whether a human has already approved this exact (member, marker) write.
     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
 
@@ -1656,7 +1661,7 @@ def claim_self_write(marker, tool_name, attempted, *,
     `resolved_targets_for_claim`). `resolved_targets_complete=False` says the gate could not
     enumerate the write set; the daemon then prices the highest bar. Not part of the request
     key: they are derived from the same act. Old daemons ignore the key; callers that omit
-    it price exactly as before."""
+    it price exactly as before. `answers_deny` is the already-committed deny receipt (#537)."""
     claim_args = {
         "plugin_id": plugin_id,
         "role": role,
@@ -1670,6 +1675,8 @@ def claim_self_write(marker, tool_name, attempted, *,
         "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
                    "because it did not choose to escalate. Approving authorises this one write."),
     }
+    if answers_deny:
+        claim_args["answers_deny"] = answers_deny
     # The claimed-row join key (reply-2005/reply-2006, 2026-08-12): of the three session-id
     # namespaces in a claim window, only the per-wake host session appears on the outcome rows
     # an auditor joins from — the gate-self connect session above joins only to gate witnesses.

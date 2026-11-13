@@ -1,4 +1,4 @@
-# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 5d53911bb98d56517838cf5a80fabbb9ebe4e529390eaa6a57935a48f21bda0e  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -1098,49 +1098,60 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
         # in-band, so the daemon prices it like a declared entry even when it is not the target
         # the closure reported first (`cv`'s marker covers only that one).
         write_set = (write_set[0] + [REGISTERED_ENTRY_MARKER], write_set[1])
+    deny_hash = None
     try:
-        claimed = _bounded(
-            inv.phase_deadline, mechanism.claim_self_write,
-            marker, ev.tool, inv.attempted, plugin_id=prof.member_id, role=_role(inv),
+        receipt = _bounded(
+            inv.phase_deadline, mechanism.witness_gate_self,
+            "gate_self_access", marker, ev.tool, cv.rule, plugin_id=prof.member_id,
+            role=_role(inv), gate_path=prof.gate_path or "",
             client_name=_client_name(prof), host_session_id=ev.session_id,
-            invocation_key=inv.key,
-            # THIS module stops a superseded invocation in every rollout mode (step 5), so it
-            # may make the declaration that lets the daemon reclaim a lost answer (#1169).
-            supersession=mechanism.SUPERSESSION_HARD_STOP,
-            deadline=inv.phase_deadline,
-            # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
-            # path the closure resolved, not only the one `cv` reports — each with its other
-            # spellings and the LOCATION it lands at (#1247). The daemon prices the bar over the marker, the act and all of
-            # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
-            # cut a filename out (or withhold the whole command); these are carried
-            # independently of it. An unenumerable write set is said as such, and priced highest.
-            resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
-        if claimed is _LATE:
-            # Unknown, not "nothing happened": the daemon may have opened or matched an
-            # escalation after the bound (#1166). Re-issuing the identical act is safe.
-            claimed = ("unknown", "OUTCOME UNKNOWN — the claim did not answer inside the gate's "
-                       "deadline; re-issuing this identical act is safe", None, None)
-        verdict, detail, esc_id, how = claimed
-    except Exception:  # noqa: BLE001 — every failure is a refusal
-        verdict, detail, esc_id, how = "unreachable", "no answer from the daemon — refused", None, None
+            deadline=inv.phase_deadline)
+        if isinstance(receipt, str) and receipt:
+            deny_hash = receipt
+    except Exception:  # noqa: BLE001
+        pass
+    if deny_hash is None:
+        verdict, detail, esc_id, how = (
+            "unwitnessed", "refusal_unwitnessed: no deny receipt; escalation was not opened",
+            None, None)
+    else:
+        try:
+            claimed = _bounded(
+                inv.phase_deadline, mechanism.claim_self_write,
+                marker, ev.tool, inv.attempted, plugin_id=prof.member_id, role=_role(inv),
+                client_name=_client_name(prof), host_session_id=ev.session_id,
+                invocation_key=inv.key,
+                # THIS module stops a superseded invocation in every rollout mode (step 5), so it
+                # may make the declaration that lets the daemon reclaim a lost answer (#1169).
+                supersession=mechanism.SUPERSESSION_HARD_STOP,
+                deadline=inv.phase_deadline,
+                # THE ACT'S RESOLVED TARGETS (#810; recut of #812, kimi-code): EVERY write-position
+                # path the closure resolved, not only the one `cv` reports — each with its other
+                # spellings and the LOCATION it lands at (#1247). The daemon prices the bar over the marker, the act and all of
+                # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
+                # cut a filename out (or withhold the whole command); these are carried
+                # independently of it. An unenumerable write set is said as such, and priced highest.
+                resolved_targets=write_set[0], resolved_targets_complete=write_set[1],
+                answers_deny=deny_hash)
+            if claimed is _LATE:
+                # Unknown, not "nothing happened": the daemon may have opened or matched an
+                # escalation after the bound (#1166). Re-issuing the identical act is safe.
+                claimed = ("unknown", "OUTCOME UNKNOWN — the claim did not answer inside the gate's "
+                           "deadline; re-issuing this identical act is safe", None, None)
+            verdict, detail, esc_id, how = claimed
+        except Exception:  # noqa: BLE001 — every failure is a refusal
+            verdict, detail, esc_id, how = "unreachable", "no answer from the daemon — refused", None, None
     if verdict == "approved":
         # Approval lifts the closure bar for THIS call only; ordinary law still runs below.
         inv.notices.append(f"hestia: gate write APPROVED — {detail}")
         return None
-    try:
-        _bounded(inv.phase_deadline, mechanism.witness_gate_self,
-                 "gate_self_access", marker, ev.tool, cv.rule, plugin_id=prof.member_id,
-                 role=_role(inv), gate_path=prof.gate_path or "",
-                 client_name=_client_name(prof), host_session_id=ev.session_id,
-                 deadline=inv.phase_deadline)
-    except Exception:  # noqa: BLE001
-        pass
     esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); re-issue the "
            f"write afterwards to claim the approval." if esc_id else "")
-    v = core._deny("gate.self_access",
-                   f"'{ev.tool}' would WRITE the governance surface: {cv.resource or marker} "
-                   f"(matched marker {marker!r}; rule {cv.rule or 'gate-self'}; {detail}).{esc}",
-                   innate=True)
+    denial = (f"'{ev.tool}' would WRITE the governance surface: {cv.resource or marker} "
+              f"(matched marker {marker!r}; rule {cv.rule or 'gate-self'}; {detail}).{esc}")
+    if deny_hash:
+        denial += f" DENY {deny_hash} — appeal with this chain hash."
+    v = core._deny("gate.self_access", denial, innate=True)
     return _verdict_deny(v, escalation_id=esc_id)
 
 
