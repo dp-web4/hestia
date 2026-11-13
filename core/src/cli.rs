@@ -1485,14 +1485,34 @@ fn resolve_home(cli: &Cli) -> AnyResult<PathBuf> {
     default_hestia_home().context("could not resolve hestia home directory")
 }
 
+/// Read `$HESTIA_HOME/.passphrase` without putting its value in the daemon environment.
+fn read_passphrase_file(home: &std::path::Path) -> AnyResult<Option<String>> {
+    let path = home.join(".passphrase");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let pp = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string();
+    if pp.is_empty() {
+        anyhow::bail!("{} is empty", path.display());
+    }
+    Ok(Some(pp))
+}
+
 /// Resolve a passphrase. Order:
 /// 1. `HESTIA_PASSPHRASE` env var (for automation; not recommended for daily use)
-/// 2. Prompt the TTY via rpassword
-fn prompt_passphrase(prompt: &str) -> AnyResult<String> {
+/// 2. `$HESTIA_HOME/.passphrase`, read in-process rather than exported through a shell
+/// 3. Prompt the TTY via rpassword
+fn prompt_passphrase(home: &std::path::Path, prompt: &str) -> AnyResult<String> {
     if let Ok(pp) = std::env::var("HESTIA_PASSPHRASE") {
         if pp.is_empty() {
             anyhow::bail!("HESTIA_PASSPHRASE is set but empty");
         }
+        return Ok(pp);
+    }
+    if let Some(pp) = read_passphrase_file(home)? {
         return Ok(pp);
     }
     let pp = rpassword::prompt_password(prompt).context("reading passphrase")?;
@@ -1676,7 +1696,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: b
             path.display()
         );
     }
-    let passphrase = prompt_passphrase("Vault passphrase: ")?;
+    let passphrase = prompt_passphrase(home, "Vault passphrase: ")?;
     let vault = hestia::Vault::open(path, passphrase.clone())?;
     println!("Vault unlocked. Starting Hestia MCP server on {bind}...");
 
@@ -2107,7 +2127,7 @@ fn cmd_witness_confer(
         return Ok(());
     }
 
-    let passphrase = prompt_passphrase("Vault passphrase: ")?;
+    let passphrase = prompt_passphrase(home, "Vault passphrase: ")?;
     let path = vault_path(home);
     if !path.exists() {
         anyhow::bail!("no vault at {} — run `hestia init` first", path.display());
@@ -2480,7 +2500,7 @@ fn open_vault_with_passphrase(home: &std::path::Path) -> AnyResult<(Vault, Strin
             path.display()
         );
     }
-    let passphrase = prompt_passphrase("Vault passphrase: ")?;
+    let passphrase = prompt_passphrase(home, "Vault passphrase: ")?;
     let vault = Vault::open(path, passphrase.clone())?;
     Ok((vault, passphrase))
 }
@@ -6495,4 +6515,28 @@ mod member_key_source_tests {
 
     // `expand_tilde` moved to `hestia::hub` with member_signing_keypair; its test
     // moved with it (hub.rs `expand_tilde_expands_leading_home`).
+}
+
+#[cfg(test)]
+mod passphrase_file_tests {
+    use super::read_passphrase_file;
+
+    #[test]
+    fn a_missing_file_is_not_a_source_and_crlf_is_only_a_line_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_passphrase_file(dir.path()).unwrap(), None);
+        std::fs::write(dir.path().join(".passphrase"), " value with spaces \r\n").unwrap();
+        assert_eq!(
+            read_passphrase_file(dir.path()).unwrap().as_deref(),
+            Some(" value with spaces ")
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".passphrase"), "\r\n").unwrap();
+        let error = read_passphrase_file(dir.path()).unwrap_err().to_string();
+        assert!(error.contains(".passphrase") && error.contains("empty"), "{error}");
+    }
 }

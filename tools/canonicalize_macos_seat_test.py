@@ -83,7 +83,7 @@ def main():
         check("the passphrase is GONE from the agent", "HESTIA_PASSPHRASE" in pl["EnvironmentVariables"], False)
         check("every other env key survives", sorted(pl["EnvironmentVariables"]),
               ["HESTIA_CURRENT_BUILD_FILE", "HESTIA_HOME", "HESTIA_WORKSPACE"])
-        check("ProgramArguments is the installer's /bin/sh -c shape", pl["ProgramArguments"][:2], ["/bin/sh", "-c"])
+        check("ProgramArguments preserves direct argv", pl["ProgramArguments"], [str(binp), "serve"])
         check("KeepAlive restarts on a crash only", pl["KeepAlive"], {"SuccessfulExit": False})
         check("unrelated keys survive", (pl["Label"], pl["RunAtLoad"], pl["StandardOutPath"]),
               ("com.web4.hestia.daemon", True, "/tmp/x.log"))
@@ -95,14 +95,11 @@ def main():
 
         r = run(home, agents)
         check("a second run is a no-op", ("already canonical" in r.stdout, r.returncode), (True, 0))
-        # EXECUTE the rewritten line, as launchd will: the fake daemon records the passphrase it
-        # inherited and the argv it got. What runs, not a string about it.
-        ex = subprocess.run(["/bin/sh", "-c", plistlib.loads(p.read_bytes())["ProgramArguments"][2]],
-                            capture_output=True, text=True)
-        check("executed: the rewritten command line runs at all", (ex.returncode, ex.stderr[-160:]), (0, ""))
+        ex = subprocess.run(pl["ProgramArguments"], capture_output=True, text=True)
+        check("executed: direct argv runs at all", (ex.returncode, ex.stderr[-160:]), (0, ""))
         out = binp.parent / "daemon.out"
-        check("executed: the daemon gets the passphrase and exactly its original argv",
-              out.read_text().splitlines() if out.exists() else None, [FAKE, "serve"])
+        check("executed: no passphrase reaches the environment and argv is unchanged",
+              out.read_text().splitlines() if out.exists() else None, ["", "serve"])
 
     with tempfile.TemporaryDirectory(dir=str(Path.home())) as tmp:
         home, agents, p, _ = seat(tmp, passfile="a-different-one")
@@ -122,13 +119,12 @@ def main():
                                      argv_tail=("serve", "--bind", "127.0.0.1:7799", "--verbose"))
         r = run(home, agents, "--apply")
         check("spaces + a non-default bind: applies", (r.returncode, r.stderr[-200:]), (0, ""))
-        ex = subprocess.run(["/bin/sh", "-c", plistlib.loads(p.read_bytes())["ProgramArguments"][2]],
-                            capture_output=True, text=True)
-        check("spaces: the rewritten command line runs at all", (ex.returncode, ex.stderr[-160:]), (0, ""))
+        ex = subprocess.run(pl["ProgramArguments"], capture_output=True, text=True)
+        check("spaces: direct argv runs at all", (ex.returncode, ex.stderr[-160:]), (0, ""))
         out = binp.parent / "daemon.out"
-        check("spaces: both paths work and the argv is kept verbatim",
+        check("spaces: both paths work, no environment secret, and the argv is kept verbatim",
               out.read_text().splitlines() if out.exists() else None,
-              [FAKE, "serve", "--bind", "127.0.0.1:7799", "--verbose"])
+              ["", "serve", "--bind", "127.0.0.1:7799", "--verbose"])
         check("...and it is recognised as canonical on the next run", "already canonical" in run(home, agents).stdout)
 
     with tempfile.TemporaryDirectory(dir=str(Path.home())) as tmp:

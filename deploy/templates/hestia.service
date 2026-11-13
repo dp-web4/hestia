@@ -73,10 +73,9 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# Load HESTIA_PASSPHRASE from ~/.hestia/.passphrase (mode 600) and exec hestia.
-# The passphrase file is the consumer-tier security boundary; Hardbound
-# replaces this with TPM unsealing.
-ExecStart=/bin/sh -c 'HESTIA_PASSPHRASE="$(cat %h/.hestia/.passphrase)" exec %h/.local/bin/hestia serve --bind 127.0.0.1:7711'
+# The daemon reads ~/.hestia/.passphrase (mode 600) in-process, so the secret
+# never enters its environment. Hardbound replaces this with TPM unsealing.
+ExecStart=%h/.local/bin/hestia serve --bind 127.0.0.1:7711
 Environment=HESTIA_HOME=%h/.hestia
 # Supervisor-owned build identity; the dashboard turns amber when this differs
 # from the build actually running.
