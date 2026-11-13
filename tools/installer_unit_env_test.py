@@ -83,9 +83,10 @@ def main():
 
     for name, text in (("template", template), ("installer", unit)):
         assert re.search(r"^MemoryHigh=1G$", text, re.M), (
-            f"{name} drops the #592 memory ceiling. The measured post-mitigation peak is "
-            "331 MB and the historic failure region is ~1.7 GB; 1G leaves headroom while "
-            "asking the kernel to reclaim before the whole box swaps."
+            f"{name} drops the provisional #592 memory bound. Validate 1G against cgroup "
+            "MemoryCurrent/MemoryPeak and memory.stat during the soak, and record both "
+            "memory.events high and gate-unavailable frequency before treating it as "
+            "validated. Process RSS alone is not the cgroup memory controlled here."
         )
 
     print(f"ok: installer sets all {len(declared)} declared Environment vars {sorted(declared)}")
