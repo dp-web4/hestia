@@ -383,14 +383,15 @@ def native_event(seat, act_tool, act_input, cwd, n):
 class _Env:
     """Point the mechanism at a stub (or a dead port) for one test; restore after."""
 
-    def __init__(self, m, url, home: pathlib.Path):
+    def __init__(self, m, url, home: pathlib.Path, workspace: pathlib.Path | None = None):
         self.m, self.url, self.home = m, url, home
+        self.workspace = workspace or REPO.parent
 
     def __enter__(self):
         self.saved = {k: os.environ.get(k) for k in ("HESTIA_ENDPOINT", "HESTIA_HOME", "HESTIA_WORKSPACE")}
         os.environ["HESTIA_ENDPOINT"] = self.url
         os.environ["HESTIA_HOME"] = str(self.home)
-        os.environ["HESTIA_WORKSPACE"] = str(REPO.parent)
+        os.environ["HESTIA_WORKSPACE"] = str(self.workspace)
         self.m._POLICY_SNAPSHOT_CACHE.clear()
         self.saved_disc = self.m._discover_endpoint
         self.m._discover_endpoint = lambda: self.url
@@ -1189,14 +1190,15 @@ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home)
     finally:
         stub.close()
     # (7) device sinks and temp roots are never escalated.
-    stub = Stub(Policy())
-    try:
-        with _Env(m, stub.url, home):
-            d, _ = _decide(g, "codex", "Bash", {"command": "ls 2>/dev/null >/tmp/x"}, home)
-        check("scope-sinks-allowed", d.decision == "allow", d)
-        check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
-    finally:
-        stub.close()
+    with tempfile.TemporaryDirectory(dir="/tmp") as sink, tempfile.TemporaryDirectory() as workspace:
+        stub = Stub(Policy())
+        try:
+            with _Env(m, stub.url, home, workspace=pathlib.Path(workspace)):
+                d, _ = _decide(g, "codex", "Bash", {"command": f"ls 2>/dev/null >{sink}/x"}, home)
+            check("scope-sinks-allowed", d.decision == "allow", d)
+            check("scope-sinks-open-nothing", not stub.named("hestia_scope_claim"))
+        finally:
+            stub.close()
 
 
 def test_an_unenumerated_reach_is_refused_with_rewrite_guidance(m, g, wc, home):
@@ -1725,7 +1727,7 @@ def test_the_mcp_transport_is_command_scoped(m, g, wc, home):
     stub = Stub()
     try:
         with _Env(m, stub.url, home):
-            sibling = REPO.parent / "decide-contract-ungranted-sibling"
+            sibling = REPO.parent / f"decide-contract-ungranted-sibling-{uuid.uuid4().hex}"
             sibling.mkdir(exist_ok=True)
             try:
                 raw = native_event("gemini", "mcp_fs_read", {"path": "x"}, str(REPO), 14)
