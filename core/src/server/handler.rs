@@ -28133,6 +28133,7 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
             Some(proven) => {
                 return Err(refuse_host_session_mismatch(
                     &s, &plugin_id, &tool_name, &marker, stated, proven,
+                    session_id_arg.as_deref(), attempted_act.as_deref(), request_key.as_deref(),
                 ));
             }
             None => {
