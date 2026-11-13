@@ -17486,6 +17486,8 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let session = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
 
         // Nothing to claim, so this opens — the auto-open the gate performs on every refused
         // governance write. Same marker the open-door tests use, so `bar_for` selects the arm
@@ -17494,6 +17496,7 @@ mod tests {
             &shared,
             &json!({
                 "plugin_id": "codex",
+                "session_id": session,
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
                 "reason": "Edit -> a governance file",
@@ -17528,9 +17531,8 @@ mod tests {
              point of #226's ruling: {d}"
         );
         assert_eq!(
-            d["asker_basis"], "asserted",
-            "the hook sends no session_id, so the honest basis is `asserted` — and it must be \
-             WRITTEN, not left to a reader to infer from silence: {d}"
+            d["asker_basis"], "session",
+            "the resolved session must be written, not left to a reader to infer: {d}"
         );
 
         // The rest of the shared shape, so a future edit cannot quietly drop half of it.
@@ -17550,29 +17552,22 @@ mod tests {
         // discriminator, so it is replaced with a deliberate one rather than lost.
         assert_eq!(d["opened_via"], "claim", "{d}");
 
-        // AND NOBODY WAS WOKEN, because the asker is a bare string. This is not the fix
-        // failing — it is the half of the remedy that lives in the hook, asserted so that the
-        // day the hook threads its session through, this line is what changes.
-        assert_eq!(
-            d["invited_peers"].as_array().map(Vec::len),
-            Some(0),
-            "an unproven asker wakes nobody: {d}"
+        assert!(
+            !d["invited_peers"].as_array().unwrap().is_empty(),
+            "a session-proven asker invites the eligible peers: {d}"
         );
         assert!(
-            !d["invitation_withheld"].as_array().unwrap().is_empty(),
-            "but the peers who WOULD have been asked must be recorded, or `never asked` and \
-             `nobody to ask` stay the same row: {d}"
+            d["invitation_withheld"].as_array().unwrap().is_empty(),
+            "attribution is proven, so no peer is withheld for that reason: {d}"
         );
     }
 
-    /// The positive control for the claim door: the same call, varying ONLY whether the asker
-    /// proves itself, must actually invite and wake peers. Without this, a fix that made every
-    /// invitation vanish would pass the test above — and that is exactly the failure mode #241
-    /// shipped, so it is the one this file has to be able to catch.
+    /// The positive control for the claim door: a resolved asker must actually invite and wake
+    /// peers. Without this, a fix that made every invitation vanish would pass — exactly the
+    /// failure mode #241 shipped, so this file has to be able to catch it.
     ///
-    /// This is also the executable statement of what the hook change buys. Today the hook
-    /// sends no `session_id` and every production escalation lands on the `asserted` branch;
-    /// this test drives the branch that a one-line hook change would switch on.
+    /// This is the executable statement of the normal attributed path: the hook connects and
+    /// threads its live `session_id`, so the claim lands on the `session` branch.
     #[tokio::test]
     async fn a_proven_asker_on_the_claim_door_invites_and_wakes_real_peers() {
         let (_dir, shared) = make_shared_state();
