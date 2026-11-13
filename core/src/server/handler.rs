@@ -556,7 +556,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_gate_escalation_claim",
-            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
+            "Claim a human's approval for a write to the governance surface, or open an escalation and REFUSE. A live session_id (or sessionId) is REQUIRED to claim, or to open through this tool: without one, the act stays refused with only a witnessed diagnostic — no queue row and no approval spent. One round trip, because a hook that outlives its harness timeout is killed and the tool then runs ANYWAY — so nothing waits in-hook. Either an approval already exists for this exact (member, file) and is spent here (single use), or the write is refused now and a human decides out of band; re-issue the write to use the approval. ONE ACT, ONE RULING (#668): if this exact act is \
              already pending from you, the answer carries THAT escalation_id with `coalesced: true` \
              — no second petition is minted and no peer is woken again; wait on the id you are given. \
              OPTIONAL resolved_targets = EVERY write-position path the gate's closure resolved \
@@ -570,7 +570,7 @@ fn hestia_tools() -> Vec<Tool> {
                 "additionalProperties": false,
                 "required": ["plugin_id", "tool_name", "marker"],
                 "properties": {
-                    "plugin_id": {"type": "string", "minLength": 1, "description": "Your member id. If session_id resolves, it must name the same member."},
+                    "plugin_id": {"type": "string", "minLength": 1, "description": "Your member id. It must name the same member as your required live session."},
                     "tool_name": {"type": "string", "minLength": 1, "description": "The tool whose governance write is being claimed or escalated."},
                     "marker": {"type": "string", "minLength": 1, "description": "The governance marker that refused the write."},
                     "role": {"type": "string", "description": "Optional constellation role declared by the gate."},
@@ -587,7 +587,7 @@ fn hestia_tools() -> Vec<Tool> {
                     "supersession": {"type": "string", "enum": ["hard_stop"], "description": "Declare hard_stop only when the hook stops a superseded invocation in every rollout mode."},
                     "host_session_id": {"type": "string", "description": "Host wake correlation. A proven session's value is authoritative; a contradictory assertion is refused."},
                     "gate_path": {"type": "string", "description": "Optional realpath of the hook making this claim."},
-                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect. Optional for version-skew compatibility, but recommended for attributed review."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect. Required to claim, or to open through this tool; without it the act is refused with a witnessed diagnostic, no queue row, and no approval spent."},
                     "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
                 }
             }),
@@ -17523,6 +17523,8 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let session = tool_connect(&shared, &json!({ "plugin_id": "codex", "host_agent": "h" }))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
 
         // Nothing to claim, so this opens — the auto-open the gate performs on every refused
         // governance write. Same marker the open-door tests use, so `bar_for` selects the arm
@@ -17531,6 +17533,7 @@ mod tests {
             &shared,
             &json!({
                 "plugin_id": "codex",
+                "session_id": session,
                 "tool_name": "Edit",
                 "marker": "pre_tool_use.py",
                 "reason": "Edit -> a governance file",
@@ -17565,9 +17568,8 @@ mod tests {
              point of #226's ruling: {d}"
         );
         assert_eq!(
-            d["asker_basis"], "asserted",
-            "the hook sends no session_id, so the honest basis is `asserted` — and it must be \
-             WRITTEN, not left to a reader to infer from silence: {d}"
+            d["asker_basis"], "session",
+            "the resolved session must be written, not left to a reader to infer: {d}"
         );
 
         // The rest of the shared shape, so a future edit cannot quietly drop half of it.
@@ -17587,29 +17589,22 @@ mod tests {
         // discriminator, so it is replaced with a deliberate one rather than lost.
         assert_eq!(d["opened_via"], "claim", "{d}");
 
-        // AND NOBODY WAS WOKEN, because the asker is a bare string. This is not the fix
-        // failing — it is the half of the remedy that lives in the hook, asserted so that the
-        // day the hook threads its session through, this line is what changes.
-        assert_eq!(
-            d["invited_peers"].as_array().map(Vec::len),
-            Some(0),
-            "an unproven asker wakes nobody: {d}"
+        assert!(
+            !d["invited_peers"].as_array().unwrap().is_empty(),
+            "a session-proven asker invites the eligible peers: {d}"
         );
         assert!(
-            !d["invitation_withheld"].as_array().unwrap().is_empty(),
-            "but the peers who WOULD have been asked must be recorded, or `never asked` and \
-             `nobody to ask` stay the same row: {d}"
+            d["invitation_withheld"].as_array().unwrap().is_empty(),
+            "attribution is proven, so no peer is withheld for that reason: {d}"
         );
     }
 
-    /// The positive control for the claim door: the same call, varying ONLY whether the asker
-    /// proves itself, must actually invite and wake peers. Without this, a fix that made every
-    /// invitation vanish would pass the test above — and that is exactly the failure mode #241
-    /// shipped, so it is the one this file has to be able to catch.
+    /// The positive control for the claim door: a resolved asker must actually invite and wake
+    /// peers. Without this, a fix that made every invitation vanish would pass — exactly the
+    /// failure mode #241 shipped, so this file has to be able to catch it.
     ///
-    /// This is also the executable statement of what the hook change buys. Today the hook
-    /// sends no `session_id` and every production escalation lands on the `asserted` branch;
-    /// this test drives the branch that a one-line hook change would switch on.
+    /// This is the executable statement of the normal attributed path: the hook connects and
+    /// threads its live `session_id`, so the claim lands on the `session` branch.
     #[tokio::test]
     async fn a_proven_asker_on_the_claim_door_invites_and_wakes_real_peers() {
         let (_dir, shared) = make_shared_state();
@@ -19407,6 +19402,88 @@ mod tests {
         let mine = tool_gate_escalation_claim(&shared, &claim(&asker, ACT, "inv-reissue")).await.unwrap();
         assert_eq!(mine["claimed"], json!(true), "the asker's exact re-issue must claim its lapsed grant: {mine}");
         assert_eq!(mine["escalation_id"], json!(id), "{mine}");
+    }
+
+    #[tokio::test]
+    async fn unattributed_claim_miss_is_a_witnessed_refusal_without_a_pending_escalation() {
+        let (_dir, shared) = make_shared_state();
+        for session_id in [None, Some("not-a-live-session")] {
+            let mut args = json!({
+                "plugin_id": "claude-code", "tool_name": "Bash", "marker": "policy.json",
+                "reason": "Bash: cp /tmp/x /repo/core/policy.json",
+            });
+            if let Some(session_id) = session_id {
+                args["session_id"] = json!(session_id);
+            }
+            let out = tool_gate_escalation_claim(&shared, &args).await.unwrap();
+            assert_eq!(out["claimed"], false, "{out}");
+            assert_eq!(out["permits_write"], false, "{out}");
+            assert_eq!(out["escalation_id"], Value::Null, "no approvable row: {out}");
+            assert_eq!(out["asker_basis"], "asserted", "{out}");
+            assert!(out["error"].as_str().unwrap_or("").contains("session_id"), "{out}");
+            assert!(out["witnessEntryHash"].as_str().is_some(), "the refusal is witnessed: {out}");
+        }
+
+        let pending = tool_gate_pending_escalations(&shared, &json!({})).await.unwrap();
+        assert_eq!(pending["pending"].as_array().map(Vec::len), Some(0), "{pending}");
+        let rows = shared.lock().await.recent_chain(10);
+        let refused: Vec<_> = rows.iter().filter(|e| {
+            e.event_type == "gate_escalation_refused"
+                && e.event_data["why"] == "unattributed claim-or-open"
+        }).collect();
+        assert_eq!(refused.len(), 2, "both refused calls leave a diagnostic: {rows:?}");
+        assert!(refused.iter().all(|e| e.event_data["asker_basis"] == "asserted"
+                    && e.event_data["spent"] == false), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn unattributed_claim_cannot_spend_a_live_approval() {
+        use crate::server::gate_escalation::{now_secs, Channel};
+        const ACT: &str = "Bash: cp /tmp/x /repo/core/policy.json";
+        const MARKER: &str = "policy.json";
+
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "h", "host_session_id": "hs-589",
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let args = |session_id: Option<&str>| {
+            let mut args = json!({
+                "plugin_id": "claude-code", "tool_name": "Bash", "marker": MARKER,
+                "reason": ACT,
+            });
+            if let Some(session_id) = session_id {
+                args["session_id"] = json!(session_id);
+            }
+            args
+        };
+
+        let opened = tool_gate_escalation_claim(&shared, &args(Some(&session))).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        {
+            let mut s = shared.lock().await;
+            s.gate_escalations.decide(&id, true, "operator", "role:constellation:sovereign",
+                                      Channel::OperatorSession, None, Some("ok"), now_secs()).unwrap();
+        }
+
+        for session_id in [None, Some("not-a-live-session")] {
+            let out = tool_gate_escalation_claim(&shared, &args(session_id)).await.unwrap();
+            assert_eq!(out["claimed"], false, "unattributed caller spent the grant: {out}");
+            assert_eq!(out["permits_write"], false, "{out}");
+            assert_eq!(out["escalation_id"], Value::Null, "{out}");
+            let s = shared.lock().await;
+            assert_eq!(s.gate_escalations.get(&id).unwrap().consumed_at, None,
+                       "the approval remains unspent: {out}");
+        }
+
+        let opened_rows = shared.lock().await.recent_chain(100).iter()
+            .filter(|e| e.event_type == "gate_escalation_opened").count();
+        assert_eq!(opened_rows, 1, "refusals did not open or coalesce another petition");
+
+        let claimed = tool_gate_escalation_claim(&shared, &args(Some(&session))).await.unwrap();
+        assert_eq!(claimed["claimed"], true, "the proven asker retains the normal claim path: {claimed}");
+        let poll = tool_gate_escalation_poll(&shared, &json!({"escalation_id": id})).await.unwrap();
+        assert_eq!(poll["marker"], MARKER, "poll exposes the key its claim surface needs: {poll}");
+        assert!(poll["consumed_at"].is_u64(), "the valid control spent the grant: {poll}");
     }
 
     /// THE CLAIMABLE REPLY STATES THE ANCHOR ITS OWN CALL USES (GPT review of #613 @ dd3f1b1).
@@ -27653,6 +27730,7 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
     Ok(json!({
         "escalation_id": id,
         "status": status,
+        "marker": esc.map(|e| e.marker.clone()),
         // Told, not inferred: if this poll is what started the claim fuse, the member should
         // know its window is now measured from THIS moment and not from the ruling.
         "observation_started_claim_window": observed,
@@ -27934,8 +28012,8 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // WHO is asking, provable. Accepted here for the same reason `tool_gate_escalation_open`
     // accepts it (#128: `eligibility` otherwise compares an ASSERTION against an IDENTITY),
     // and because the invitation half cannot issue without it — an invitation is an outward
-    // message sent on behalf of an identity, so an unproven asker gets its peers RECORDED and
-    // nobody woken.
+    // message sent on behalf of an identity, so an unproven asker gets only a diagnostic and
+    // no invitation or queue row.
     //
     // THE HOOK HALF LANDED 2026-08-07 (kimi-code, claiming claude-code notices 1529/1530).
     // The <gate-hook> opens a second MCP client for this call and now does its own
@@ -27953,9 +28031,9 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
     // a redaction, not a recast. Escalations minted proving it: dc93b3329cf9aa97 on the Edit,
     // e074d2587bdf8fdc on the appeal that tried to dispute it.)
     //
-    // Optional, never required: making it required would fail every escalation opened by a
-    // hook mid-upgrade, and the gate's own refusal channel is the last surface that should go
-    // dark on a version skew.
+    // Minting or spending authority requires a resolved caller. A mid-upgrade hook that cannot
+    // supply one still fails closed, but leaves only a diagnostic: no approvable queue row,
+    // invitation, observation, or claim (#589).
     let session_id_arg = optional_session_id(args);
     let now = now_secs();
 
@@ -27980,6 +28058,35 @@ async fn tool_gate_escalation_claim(state: &SharedState, args: &Value) -> ToolRe
         }
     }
     let asker_is_proven = proven_asker.is_some();
+    if !asker_is_proven {
+        let entry = s.append_chain(
+            "gate_escalation_refused",
+            json!({
+                "plugin_id": plugin_id,
+                "tool_name": tool_name,
+                "marker": marker,
+                "stated_attempted_act": attempted_act,
+                "asker_basis": "asserted",
+                "session_supplied": session_id_arg.is_some(),
+                "spent": false,
+                "opened": false,
+                "why": "unattributed claim-or-open",
+            }),
+        )?;
+        return Ok(json!({
+            "claimed": false,
+            "permits_write": false,
+            "request_key": request_key,
+            "escalation_id": Value::Null,
+            "asker_basis": "asserted",
+            "invited_peers": [],
+            "error": "a live session_id is required to claim an approval or open an escalation through this tool; the write \
+                      is refused, no approval was spent, and no escalation was opened",
+            "witnessEntryHash": entry.hash,
+            "then": "the write is refused; re-issue with a live session_id to ask through the \
+                     witnessed channel",
+        }));
+    }
 
     // THE JOIN KEY IS DERIVED, NOT ASSERTED.
     //
