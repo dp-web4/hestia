@@ -1,0 +1,283 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -3395,7 +3395,17 @@
+     # (`cat <root>/lib/link/x`), because the exemption was lexical. A caller-controlled
+     # environment must not become authority.
+     patterns, judged_words = _grammar_patterns(cmd, cwd)
+-    for after in cmd.split(workspace)[1:]:
++    # THE TEXT PASSES 1 AND 2 SCAN (#1594): the same text pass 3 judges, with every DATA heredoc
++    # body removed (`_strip_data_heredocs`). Before this they read the raw command, so prose in a
++    # quoted `cat > f <<'EOF'` body naming `<ws>/..` was refused and opened a scope request for the
++    # workspace's parent. A body the shell runs, an interpreter's path literals and every `$( )` in
++    # an unquoted-delimiter body are kept by that function, so they stay judged. A heredoc it cannot
++    # read leaves the raw text here: pass 3 refuses that act as unenumerated anyway.
++    try:
++        scan = _strip_data_heredocs(cmd)
++    except _Unmodelled:
++        scan = cmd
++    for after in scan.split(workspace)[1:]:
+         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
+         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
+         # resolving into an ungranted repo — path_in_scope's B5 one function over. A command's
+@@ -3438,7 +3448,7 @@
+     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
+     probes = 0
+     seen2 = set()
+-    for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
++    for raw in re.split(r"""[\s;|&<>()'"`]+""", scan):
+         for tok in raw.split("="):
+             tok = tok.strip()
+             if not tok or tok.startswith(("-", "/")) or ":" in tok or tok.strip(".") == "":
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: a1d7bcca7d38ba6e0bca33005bbc49c80e2f0d27266cc51158390037805450a6  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -3396,7 +3396,17 @@
+     # (`cat <root>/lib/link/x`), because the exemption was lexical. A caller-controlled
+     # environment must not become authority.
+     patterns, judged_words = _grammar_patterns(cmd, cwd)
+-    for after in cmd.split(workspace)[1:]:
++    # THE TEXT PASSES 1 AND 2 SCAN (#1594): the same text pass 3 judges, with every DATA heredoc
++    # body removed (`_strip_data_heredocs`). Before this they read the raw command, so prose in a
++    # quoted `cat > f <<'EOF'` body naming `<ws>/..` was refused and opened a scope request for the
++    # workspace's parent. A body the shell runs, an interpreter's path literals and every `$( )` in
++    # an unquoted-delimiter body are kept by that function, so they stay judged. A heredoc it cannot
++    # read leaves the raw text here: pass 3 refuses that act as unenumerated anyway.
++    try:
++        scan = _strip_data_heredocs(cmd)
++    except _Unmodelled:
++        scan = cmd
++    for after in scan.split(workspace)[1:]:
+         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
+         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
+         # resolving into an ungranted repo — path_in_scope's B5 one function over. A command's
+@@ -3439,7 +3449,7 @@
+     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
+     probes = 0
+     seen2 = set()
+-    for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
++    for raw in re.split(r"""[\s;|&<>()'"`]+""", scan):
+         for tok in raw.split("="):
+             tok = tok.strip()
+             if not tok or tok.startswith(("-", "/")) or ":" in tok or tok.strip(".") == "":
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b",
++      "sha256": "a1d7bcca7d38ba6e0bca33005bbc49c80e2f0d27266cc51158390037805450a6",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538"
++  "gt_version": "8229169883f2f666c0ddcc008b90d28c057b6fdcb2b643256562baae902d43d7"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "8229169883f2f666c0ddcc008b90d28c057b6fdcb2b643256562baae902d43d7",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
++        "sha256": "a1d7bcca7d38ba6e0bca33005bbc49c80e2f0d27266cc51158390037805450a6"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "e0cb5326d0b3071e0c8a216f20ee87cf3e636adf1ac9fdcff6ef7b744065911a"
++  "gt_version": "f3126d55c3fefe31e507a5c03b81519f341c6f580a453182f8100fc93880ca3f"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "8229169883f2f666c0ddcc008b90d28c057b6fdcb2b643256562baae902d43d7",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
++        "sha256": "a1d7bcca7d38ba6e0bca33005bbc49c80e2f0d27266cc51158390037805450a6"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "f8bf2a3cc826fb82358df2e5967effccba0940b00ba321202982418c79ffcfa6"
++  "gt_version": "32250fbbd8503c47e29b7169ba5e3f7894047c5b469c3c7f20d2cc81a35c6304"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "8229169883f2f666c0ddcc008b90d28c057b6fdcb2b643256562baae902d43d7",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
++        "sha256": "a1d7bcca7d38ba6e0bca33005bbc49c80e2f0d27266cc51158390037805450a6"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "d66f48fbaeeedbc1cbe20cbc251692633e1c58b6d07bd5ab1769309bca241be4"
++  "gt_version": "f7ac043bacbf89fc745159f94e351d734adaa1b19d19cf201904d8a5465e71bb"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "8229169883f2f666c0ddcc008b90d28c057b6fdcb2b643256562baae902d43d7",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
++        "sha256": "a1d7bcca7d38ba6e0bca33005bbc49c80e2f0d27266cc51158390037805450a6"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "60a50827ea822861975251d46651a2c09c8a8b199c5dd5e0ee5b6f0c9f79255c"
++  "gt_version": "14801a23dfce42b3d40fa51cee5c314af0619bb40bb54651a91fabab5014e48d"
+ }
+diff --git a/tools/gate_heredoc_inside_passes_test.py b/tools/gate_heredoc_inside_passes_test.py
+new file mode 100755
+--- /dev/null
++++ b/tools/gate_heredoc_inside_passes_test.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""Command scope: the in-workspace passes judge the same text pass 3 does, with data heredocs removed (#1594).
++
++Pass 1 (the workspace-prefix scan) and pass 2 (relative tokens) read the RAW command, so they judged the body
++of a QUOTED data heredoc that pass 3 strips (`_strip_data_heredocs`). Prose naming `<ws>/..` was refused
++`mrh.command` and opened a scope request for the workspace's PARENT (McNugget, 2026-11-13, scope-577f201a0fce
++for the home directory): `cat > notes.md <<'EOF'` with a row quoting `~/repos/..`.
++
++Now all three passes judge one text. A body the shell runs (`sh <<EOF`), an interpreter's path literals
++(`python3 <<EOF`), and every `$( … )` in an UNQUOTED-delimiter body are kept by `_strip_data_heredocs`, so
++they stay judged.
++
++Run:  ./tools/gate_heredoc_inside_passes_test.py
++      HESTIA_SCOPE_BATTERY_CORE=<path> ./tools/gate_heredoc_inside_passes_test.py   (a staged core)
++"""
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "plugins" / "_shared"))
++_staged = os.getenv("HESTIA_SCOPE_BATTERY_CORE")
++if _staged:
++    _spec = importlib.util.spec_from_file_location("hestia_gate_core", _staged)
++    G = importlib.util.module_from_spec(_spec)
++    sys.modules["hestia_gate_core"] = G
++    _spec.loader.exec_module(G)
++else:
++    import hestia_gate_core as G  # noqa: E402
++
++FAIL = []
++
++
++def check(name, cond, detail=""):
++    print(("  ok    " if cond else "  FAIL  ") + name + ("" if cond else f"  {detail}"))
++    if not cond:
++        FAIL.append(name)
++
++
++def main() -> int:
++    base = tempfile.mkdtemp(prefix="hd-")
++    ws = f"{base}/ws"
++    for d in ("granted", "other"):
++        os.makedirs(f"{ws}/{d}")
++    open(f"{ws}/other/secret", "w").close()
++    out = f"{ws}/granted/note.md"
++    scopes = ("granted",)
++
++    def reach(c):
++        return G.command_scope_reach(c, scopes, ws, cwd=f"{ws}/granted")
++
++    def doc(body, delim="'EOF'", head=f"cat > {out}"):
++        return f"{head} <<{delim}\n{body}\nEOF"
++
++    # ---- quoted data bodies are text in EVERY pass ----
++    ok, off, _ = reach(doc(f"see `{ws}/..` for the parent"))
++    check("pass 1: '<ws>/..' in a quoted data body is text (the #1594 act)", ok, off)
++    ok, off, _ = reach(doc(f"the secret lives at {ws}/other/secret"))
++    check("pass 1: an ungranted <ws> path in a quoted data body is text", ok, off)
++    ok, off, _ = reach(doc("relative mention: other/secret and ../other/secret"))
++    check("pass 2: an ungranted relative path in a quoted data body is text", ok, off)
++    ok, off, _ = reach(doc(f"{ws}/..", delim='"EOF"'))
++    check("a double-quoted delimiter is literal too", ok, off)
++    ok, off, _ = reach(doc(f"{ws}/..", delim="\\EOF"))
++    check("a backslash-quoted delimiter is literal too", ok, off)
++    ok, off, _ = reach(doc(f"{ws}/..", head=f"tee {out}"))
++    check("tee as the consumer: data", ok, off)
++
++    # ---- what stays judged ----
++    ok, off, _ = reach(doc(f"cat {ws}/other/secret", delim="EOF", head="sh"))
++    check("must deny: a body the SHELL runs is judged (pass 1)", not ok, off)
++    ok, off, _ = reach(doc(f"open('{ws}/other/secret')", head="python3"))
++    check("must deny: an interpreter's path literal is judged", not ok, off)
++    ok, off, _ = reach(doc(f"$(cat {ws}/other/secret)", delim="EOF"))
++    check("must deny: $( ) in an UNQUOTED data body runs and is judged", not ok, off)
++    ok, off, _ = reach(f"cat > {out} <<'EOF' && cat {ws}/other/secret\nx\nEOF")
++    check("must deny: a command chained on the heredoc's own line is judged", not ok, off)
++    ok, off, _ = reach(f"cat {ws}/other/secret > {out} <<'EOF'\nx\nEOF")
++    check("must deny: an operand on the heredoc line is judged", not ok, off)
++    ok, off, _ = reach(doc("x") + f"\ncat {ws}/other/secret")
++    check("must deny: a line after the terminator is a command again", not ok, off)
++    ok, off, _ = reach(f"cat {ws}/../x")
++    check("must deny: '<ws>/..' outside a heredoc is still judged where it lands", not ok, off)
++
++    print(f"\n{'FAIL' if FAIL else 'PASS'}: {len(FAIL)} failing")
++    return 1 if FAIL else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
