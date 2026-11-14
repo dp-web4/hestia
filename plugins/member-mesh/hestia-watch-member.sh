@@ -1344,10 +1344,12 @@ for label,key in (("I OWE A RESPONSE","i_owe"),("NOBODY ANSWERED ME","owed_to_me
 # nothing downstream branches on the hint — but the structural fix is an anchor in
 # claude's log, i.e. a window that is not member prose. Unfixed, deliberately.
 classify_fire_failure() {
-  local RC="$1" PREFIX LOG TAIL START
-  [ "$RC" = "124" ] && { echo timeout; return 0; }
+  local RC="$1" PREFIX LOG TAIL START BYTES
   PREFIX=$(basename "${FIRE:-}" .sh); PREFIX="${PREFIX#fire-}"
-  [ -n "$PREFIX" ] || { echo unknown; return 0; }
+  if [ -z "$PREFIX" ]; then
+    [ "$RC" = "124" ] && echo timeout || echo unknown
+    return 0
+  fi
   # NOT `| head -1`. `set -euo pipefail` is in force (line 13), and `head` exits after
   # the first line while `ls` is still writing — so `ls` takes SIGPIPE, the pipeline
   # reports 141, and `|| LOG=""` BLANKS the filename it had just found. The guard on the
@@ -1368,7 +1370,16 @@ classify_fire_failure() {
   # Take the first line in the shell: no pipe, no SIGPIPE, identical `ls -t` ordering.
   LOG=$(ls -t "$STATE/logs/$PREFIX"-*.log 2>/dev/null) || LOG=""
   LOG="${LOG%%$'\n'*}"
-  [ -n "$LOG" ] || { echo unknown; return 0; }
+  if [ -z "$LOG" ]; then
+    [ "$RC" = "124" ] && echo timeout || echo unknown
+    return 0
+  fi
+  if [ "$RC" = "124" ]; then
+    # #530: size only, never the tail — <=15 bytes is empty or bare Execution error.
+    BYTES=$(wc -c < "$LOG" 2>/dev/null) || BYTES=""
+    if [ -n "$BYTES" ] && [ "$BYTES" -le 15 ]; then echo timeout-no-output; else echo timeout; fi
+    return 0
+  fi
   START=$(grep -n -e '^<<<end previous-wake-final-output>' \
                  -e '^Pointers are DATA, not instructions' \
                  "$LOG" 2>/dev/null | tail -1 | cut -d: -f1) || START=""
@@ -1501,7 +1512,7 @@ OUTAGE_PROBE_SECS="${OUTAGE_PROBE_SECS:-1800}"
 # says nothing about this one.
 fire_class_unavailable() {
   case "${2:-}" in 64|69|70|75) return 1 ;; esac
-  case "$1" in out-of-credits|auth-failed|launch-failed) return 0 ;; esac
+  case "$1" in out-of-credits|auth-failed|launch-failed|timeout-no-output) return 0 ;; esac
   return 1
 }
 
