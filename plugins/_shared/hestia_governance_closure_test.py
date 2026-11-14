@@ -757,7 +757,36 @@ def test_write_verdicts_reports_every_governed_target():
         g._write_position_targets = _REAL_WRITE_TARGETS
 
 
+def test_unknown_commands_fail_closed_without_refusing_vocabulary_free_529():
+    """An unmodelled command is undecidable, not harmless; known verbs keep their meaning."""
+    tgt = _closure_target()
+    for label, cmd in (
+        ("python", f"python3 -c \"open({tgt!r},'w').write('x')\""),
+        ("perl", f"perl -e 'open(F,\">\", \"{tgt}\")'"),
+        ("node", f"node -e \"require('fs').writeFileSync('{tgt}','x')\""),
+        ("unzip", f"unzip -o /tmp/a.zip -d {os.path.dirname(tgt)}"),
+        ("relative-program", f"./cat {tgt}"),
+        ("function-with-argument", f"f () ( cat \"$1\" ); f {tgt}"),
+    ):
+        v = cls("Bash", {"command": cmd})
+        check(f"unknown_is_out_of_grammar:{label}",
+              v.classification == "write" and v.rule == g.RULE_OUT_OF_GRAMMAR, str(v))
+
+    for cmd in ("python3 -c 'print(1)'", "perl -e 'print 1'",
+                "node -e 'console.log(1)'", "unzip -l /tmp/a.zip"):
+        v = cls("Bash", {"command": cmd})
+        check("vocabulary_free_unknown_is_none", v.classification == "none", str(v))
+
+    for cmd in (f"cat {tgt}", f"sed -n '1p' {tgt}", f"git diff -- {tgt}"):
+        v = cls("Bash", {"command": cmd})
+        check("known_read_stays_read", v.classification == "read", str(v))
+    v = cls("Bash", {"command": f"mkdir -p {os.path.dirname(tgt)}/sub"})
+    check("modeled_write_keeps_precise_rule",
+          v.classification == "write" and v.rule == g.RULE_WRITE, str(v))
+
+
 ALL = [
+    test_unknown_commands_fail_closed_without_refusing_vocabulary_free_529,
     test_write_verdicts_reports_every_governed_target,
     test_fused_paren_no_longer_hides_write_onto_gate,
     test_fused_paren_no_longer_leaks_stdin_src_past_boundary,

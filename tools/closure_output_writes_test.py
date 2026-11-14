@@ -191,13 +191,23 @@ def test_every_hidden_output_is_a_write():
     check("hidden_outputs_are_writes", not missed, "\n  " + "\n  ".join(missed))
 
 
-def test_the_same_verb_reading_the_gate_is_not_a_write():
+def test_read_and_opaque_counterparts_keep_their_contract():
     over = []
+    # #529: a Perl program is opaque even when this fixture only prints. The refusal is
+    # intentional; modeled read-only commands must still read rather than being swept in.
+    opaque = {"perl -i", "perl -pi cluster"}
     for name, _, read in PAIRS:
         v = cls(read)
-        if v.classification == "write":
+        if name in opaque:
+            if v.classification != "write" or v.rule != g.RULE_OUT_OF_GRAMMAR:
+                over.append(f"{name}: opaque interpreter must be out of grammar, got {v}")
+        elif v.classification == "write":
             over.append(f"{name}: {read!r} -> write ({v.marker})")
-    check("reads_stay_reads", not over, "\n  " + "\n  ".join(over))
+    for cmd in (f"set -e; cat {T}", f"set -euo pipefail; cat {T}", f"unset X; cat {T}"):
+        v = cls(cmd)
+        if v.classification == "write":
+            over.append(f"shell builtin preamble: {cmd!r} -> write ({v.marker})")
+    check("read_counterparts_keep_their_contract", not over, "\n  " + "\n  ".join(over))
 
 
 def test_the_known_writers_still_write():
@@ -227,7 +237,7 @@ def test_an_early_out_of_grammar_command_does_not_hide_a_later_opaque_writer():
 ALL = [
     test_an_early_out_of_grammar_command_does_not_hide_a_later_opaque_writer,
     test_every_hidden_output_is_a_write,
-    test_the_same_verb_reading_the_gate_is_not_a_write,
+    test_read_and_opaque_counterparts_keep_their_contract,
     test_the_known_writers_still_write,
 ]
 

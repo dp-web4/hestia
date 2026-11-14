@@ -345,12 +345,21 @@ def test_differential_against_real_shell():
 # That session was a mesh wake, and 442199f318d19f8a is why it woke at all ─ an unrelated
 # interactive seat tripped the class, self-withdrew, and the withdrawal disposition fired a
 # whole wake on a co-seat. The cost of this FP is not bounded by the asker who pays it.
-_BLOCK_BODY_READS = [
-    # (name, blocked form, the same body unblocked)
+_BLOCK_BODY_UNKNOWN_COMMANDS = [
+    # #529: the original interpreter rows stay exact, now on the out-of-grammar side.
     ("a3557a7f__interpreter_then_loop",
      f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3; echo "=== t ==="; '
      f'for t in plugins/kimi/tests/*.py; do r=$(python3 "$t" 2>&1 | tail -1); echo "$r"; done',
      f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3'),
+    ("ffcf0139__loop_running_these_very_suites",
+     f'for f in {SHARED_DIR}/shell_grammar_test.py {SHARED_DIR}/{CORE}; do '
+     f'timeout 600 python3 "$f" 2>&1 | tail -15; done',
+     f'timeout 600 python3 {SHARED_DIR}/shell_grammar_test.py 2>&1 | tail -15'),
+]
+
+
+_BLOCK_BODY_READS = [
+    # (name, blocked form, the same body unblocked)
     ("c83eccb2__loop_sed_n_program_expansion",
      f'for r in 1-3 5-7; do echo "--- $r"; sed -n "${{r}}p" {SHARED_DIR}/{CORE}; done',
      f'sed -n "${{r}}p" {SHARED_DIR}/{CORE}'),
@@ -370,10 +379,6 @@ _BLOCK_BODY_READS = [
     ("71199e4b__loop_ls_over_config_paths",
      f'for p in {SHARED_DIR} {HOOKS}/{HOOK}; do echo "== $p"; ls -la $p; done',
      f'ls -la {SHARED_DIR} {HOOKS}/{HOOK}'),
-    ("ffcf0139__loop_running_these_very_suites",
-     f'for f in {SHARED_DIR}/shell_grammar_test.py {SHARED_DIR}/{CORE}; do '
-     f'timeout 600 python3 "$f" 2>&1 | tail -15; done',
-     f'timeout 600 python3 {SHARED_DIR}/shell_grammar_test.py 2>&1 | tail -15'),
     # Nesting and terminators: a block inside a block, and a redirect hanging off `done`
     # (harvested by _bash_write_targets BEFORE the segment is flushed, so stripping the
     # terminator must not lose it ─ the write arm for this shape is generated below).
@@ -499,7 +504,8 @@ def test_block_and_its_unblocked_body_agree():
                         f"UNCOVERED here; add a shape rather than dropping the verb")
 
     graded = {"read": 0, "write": 0, "neutral": 0}
-    for half, arms in (("read", _BLOCK_BODY_READS), ("write", writes),
+    for half, arms in (("read", _BLOCK_BODY_READS),
+                       ("write", writes + _BLOCK_BODY_UNKNOWN_COMMANDS),
                        ("neutral", _BLOCK_BODY_NEUTRAL)):
         for name, block, body in arms:
             vb = cls(body)
