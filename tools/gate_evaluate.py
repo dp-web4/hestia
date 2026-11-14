@@ -105,6 +105,7 @@ def _dry(mechanism, gate, snapshot=None):
     def witness_gate_self(event_type, marker, tool_name, rule=None, **kw):
         if event_type == "gate_self_read":
             rec["closure_read"] = {"marker": marker, "rule": rule}
+        return "0" * 64  # Synthetic dry-run receipt; no chain write lets the closure reach its route.
 
     def claim_scope(path, tool_name, attempted, rule, **kw):
         return ("not_opened", "dry run", None)

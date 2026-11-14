@@ -140,6 +140,8 @@ class Stub(BaseHTTPRequestHandler):
                 payload = {"actionId": "act-" + str(k)}
         elif name == "hestia_query_policy":
             payload = {"status": "decided", "decision": "allow"}
+        elif name == "hestia_request_witness":
+            payload = {"witnessEntryHash": "c" * 64}
         elif name == "hestia_witness_decision":
             d = args.get("decision")
             payload = {"witnessEntryHash": "b" * 64,
