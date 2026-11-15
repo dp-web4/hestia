@@ -104,7 +104,7 @@ def sections(text):
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     core_new = patch_core(blob(CORE))
-    test_new = (HERE / "gate_pgrep_pattern_test.py").read_text(encoding="utf-8")
+    test_new = (HERE / "gate_pgrep_pattern_test.py.held").read_text(encoding="utf-8")
     (OUT / "core_rev.py").write_text(core_new, encoding="utf-8")
 
     sys.path.insert(0, str(WT / "tools"))
