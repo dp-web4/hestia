@@ -103,7 +103,7 @@ def sections(text):
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     new = patch_closure(blob(SRC))
-    test_new = (HERE / "closure_bsd_sed_test.py").read_text(encoding="utf-8")
+    test_new = (HERE / "closure_bsd_sed_test.py.held").read_text(encoding="utf-8")
     (OUT / "closure_rev.py").write_text(new, encoding="utf-8")
 
     sys.path.insert(0, str(WT / "tools"))
