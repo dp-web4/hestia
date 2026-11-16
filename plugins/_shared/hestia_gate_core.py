@@ -2255,12 +2255,23 @@ _GIT_GREP_SPEC = dict(_GREP_SPEC)
 #: Heads whose PATTERN operands the in-workspace passes of `command_scope_reach` do not read as
 #: reaches (#1241 recut, SAGE #368): the tool matches the text against what it reads and never
 #: opens it. Recorded by value in `_Found.patterns`, LITERAL words only (an expansion stays live).
-_PATTERN_HEADS = frozenset(("grep", "egrep", "fgrep", "rg", "git-grep"))
+_PATTERN_HEADS = frozenset(("grep", "egrep", "fgrep", "rg", "git-grep", "pgrep", "pkill"))
+#: `pgrep` / `pkill` (#1595): the first positional is a regex matched against process names or
+#: (`-f`) command lines; neither tool opens it. Their one FILE operand is `-F` / `--pidfile`.
+#: `signal_words`: pkill's `-HUP` / `-9` / `-SIGTERM` is a flag, not a cluster that hands `-U` or
+#: `-P` a value. Options are the union of the BSD (macOS) and procps (Linux) spellings.
+_PGREP_SPEC = {"pattern_first": True, "signal_words": True,
+               "file_opts": {"-F", "--pidfile"},
+               "value_opts": {"-G", "-g", "-P", "-s", "-t", "-U", "-u", "-d", "-c", "-O", "-r",
+                              "--delimiter", "--group", "--pgroup", "--parent", "--session",
+                              "--terminal", "--euid", "--uid", "--ns", "--nslist", "--signal",
+                              "--older", "--runstates", "--cgroup", "--env"}}
 _CMD_SPECS = {
     "tr": {"positional": "strings"},
     "echo": {"positional": "strings_noglob"},
     "printf": {"positional": "strings_noglob"},
     "grep": _GREP_SPEC, "egrep": _GREP_SPEC, "fgrep": _GREP_SPEC, "zgrep": _GREP_SPEC,
+    "pgrep": _PGREP_SPEC, "pkill": _PGREP_SPEC,
     "rg": {"pattern_first": True, "pattern_opts": {"-e", "--regexp"}, "file_opts": {"-f", "--file"},
            "value_opts": {"-g", "--glob", "-t", "--type", "-T", "--type-not", "-m", "--max-count",
                           "-A", "-B", "-C", "-j", "--threads", "-M", "--max-columns",
@@ -2981,6 +2992,9 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
                      | strs | spec.get("file_opts", set())
                      | spec.get("value_opts", set()) | spec.get("code_opts", set()))
+            if spec.get("signal_words") and w not in takes \
+                    and re.fullmatch(r"-(?:SIG)?[A-Z][A-Z0-9+-]*|-[0-9]+", w):
+                continue                                   # `pkill -HUP`, `-9`, `-SIGTERM` (#1595)
             if eq:
                 if name in spec.get("code_opts", ()):
                     code(val)
