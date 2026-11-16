@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: f2c7ea5e8cc2800459613d8f29b9d5e4d874c535b31ec76292fe3c793829ae96  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -3028,9 +3028,28 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 continue
             run = re.match(r"-[A-Za-z0-9]+", w) if not w.startswith("--") and len(w) > 2 else None
             valued = spec.get("file_opts", set()) | spec.get("value_opts", set())
-            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued), None) if run else None
+            # Pattern and delimiter options only: string options are head-wide and some are booleans in
+            # another subcommand (`git checkout -m`), so a cluster ending in one keeps the old scan.
+            worded = spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
+            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued | worded), None) if run else None
             if fat is not None and head == "sed" and "i" in w[1:fat]:
                 fat = None          # GNU `sed -if S`: `-i` takes the rest as its backup suffix
+            if fat is not None and "-" + w[fat] in worded:
+                # A clustered option whose value is TEXT (`grep -nefoo`: `-e` takes `foo`, #1560): getopt
+                # hands it the rest of the word, or the next word, so the letters after it are its value,
+                # not options (before this the scan went on and judged `oo` as a `-f` program file). Its
+                # value is skipped as the attached spelling's is (`-efoo`), unless it carries an unquoted
+                # glob the shell expands. A pattern option still means every operand is a file.
+                opt = "-" + w[fat]
+                if opt in spec.get("pattern_opts", ()):
+                    state["pattern_given"] = True
+                if fat == len(w) - 1:
+                    state["pending"] = opt
+                elif uglob:
+                    emit(w[fat + 1:], uglob)
+                elif opt in spec.get("pattern_opts", ()):
+                    pattern(w[fat + 1:], judge=False)
+                continue
             if fat is not None:
                 # A clustered option that takes a value (`grep -rf P`, `grep -nfP`, `jq -rf F`,
                 # `jq -nL DIR`): getopt reads the letters before it as flags and hands it the rest of
