@@ -42,6 +42,11 @@ def check(name, cond, detail=""):
 
 
 def main() -> int:
+    # Temp-root admission off (as grant_modes_gate_test._Workspace does): every path here is a
+    # mkdtemp, and path_in_scope admits anything under a temp root before it consults grants. On
+    # Linux CI that is /tmp, so a must-deny row passed as allowed for the wrong reason (main CI
+    # at 480279d3); on a macOS seat whose TMPDIR is not a temp root it did not show.
+    G._under_temp_root = lambda *a, **k: False
     base = tempfile.mkdtemp(prefix="hd-")
     ws = f"{base}/ws"
     for d in ("granted", "other"):
