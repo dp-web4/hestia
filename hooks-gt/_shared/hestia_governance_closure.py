@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 44ab6242455da28bb28d5b7537db14ddf6ae0a494cd9451503b078cd32b97e8e  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1421,6 +1421,17 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         _, pos, seen, vals = _parse_opts(args, *_SED)
         scripts = vals.get("-e", []) + vals.get("--expression", [])
         operands = pos if scripts else pos[1:]
+        bsd_suffix = (not scripts and not vals.get("-f") and not vals.get("--file")
+                      and vals.get("-i") and all(v is None for v in vals["-i"])
+                      and "--in-place" not in seen and len(pos) >= 3
+                      and (pos[0] == "" or pos[0].startswith(".")))
+        if bsd_suffix:
+            # BSD sed (macOS): a BARE `-i` takes the backup suffix as the NEXT argument
+            # (`sed -i '' SCRIPT FILE`, `sed -i .bak SCRIPT FILE`), so the script is the second
+            # positional, not an operand (#1598: a script naming a closure path was refused as a
+            # closure write). Taken only on this shape: as a GNU script, `''` edits nothing and a
+            # dot-led one is a syntax error, so no GNU act that writes content reads this way.
+            scripts, operands = pos[1:2], pos[2:]
         if not scripts:
             scripts = pos[:1]
         if any(_SED_WRITE.search(sc) for sc in scripts):
