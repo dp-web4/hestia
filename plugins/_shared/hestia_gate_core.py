@@ -3428,7 +3428,17 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     # (`cat <root>/lib/link/x`), because the exemption was lexical. A caller-controlled
     # environment must not become authority.
     patterns, judged_words = _grammar_patterns(cmd, cwd)
-    for after in cmd.split(workspace)[1:]:
+    # THE TEXT PASSES 1 AND 2 SCAN (#1594): the same text pass 3 judges, with every DATA heredoc
+    # body removed (`_strip_data_heredocs`). Before this they read the raw command, so prose in a
+    # quoted `cat > f <<'EOF'` body naming `<ws>/..` was refused and opened a scope request for the
+    # workspace's parent. A body the shell runs, an interpreter's path literals and every `$( )` in
+    # an unquoted-delimiter body are kept by that function, so they stay judged. A heredoc it cannot
+    # read leaves the raw text here: pass 3 refuses that act as unenumerated anyway.
+    try:
+        scan = _strip_data_heredocs(cmd)
+    except _Unmodelled:
+        scan = cmd
+    for after in scan.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
         # resolving into an ungranted repo — path_in_scope's B5 one function over. A command's
@@ -3471,7 +3481,7 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
     probes = 0
     seen2 = set()
-    for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
+    for raw in re.split(r"""[\s;|&<>()'"`]+""", scan):
         for tok in raw.split("="):
             tok = tok.strip()
             if not tok or tok.startswith(("-", "/")) or ":" in tok or tok.strip(".") == "":
