@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 44ab6242455da28bb28d5b7537db14ddf6ae0a494cd9451503b078cd32b97e8e  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1381,6 +1381,23 @@ def _output_verb_write_targets(name: str, args: list, path_pinned: bool = False)
     return None
 
 
+# One literal word: plain path characters only (#1583). A lone cp/install/rsync/ln positional made of
+# anything else (a glob, a brace, `$`, a backtick, zsh's `<n-m>`) can expand to source AND destination.
+_PLAIN_WORD = re.compile(r"[A-Za-z0-9_./~+@%,:= -]+")
+
+
+def _last_positional_dest(pos: list) -> list:
+    """The destination of a `SRC... DEST` command: the last positional, when there are two or more.
+    A single positional names no destination only if it is one literal word. `cp G/x{.py,_test.py}`,
+    `cp G/x*`, `cp $X`, `set -- A B; cp "$@"` and `ln -f G/x*` all run as `CMD SRC DEST`, and DEST
+    may be a closure file, so a non-literal lone word is out of grammar: a write iff closure
+    vocabulary appears in the line (#1583). The test is inverted (allow plain, refuse the rest) so
+    no expansion form, in bash or zsh, needs listing."""
+    if len(pos) == 1 and not _PLAIN_WORD.fullmatch(pos[0]):
+        raise _OutOfGrammar()
+    return [pos[-1]] if len(pos) >= 2 else []
+
+
 def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:
     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
     their file args are read positions by default (the anti-FP stance; the daemon's
@@ -1402,7 +1419,7 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
             return pos + ([tdir] if tdir else [])
         if tdir:
             return [tdir]
-        return [pos[-1]] if len(pos) >= 2 else []
+        return _last_positional_dest(pos)
     if name == "tee":
         return _positionals(args)
     if name == "dd":
@@ -1449,7 +1466,7 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         tdir = _opt_value(args, "-t", "--target-directory")
         if tdir:
             return [tdir]
-        return [pos[-1]] if len(pos) >= 2 else []
+        return _last_positional_dest(pos)
     if name in ("rm", "unlink", "rmdir", "shred"):
         return _positionals(args)
     if name == "touch":
