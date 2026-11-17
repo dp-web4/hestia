@@ -3599,7 +3599,14 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             probe = _glob_probe(cand) if globbed else cand
             if not _is_reach(probe.rstrip("*").rstrip("/") or "/"):
                 continue
-            if not os.path.lexists(os.path.dirname(probe.rstrip("*").rstrip("/")) or "/"):
+            # WHERE IT COULD NAME SOMETHING (#1317): a plain path when its parent exists; a glob
+            # only when its OWN directory does, since a glob expands inside that directory and a
+            # missing one leaves the word literal. Taking the dirname of a glob probe's `<dir>`
+            # climbed a level, so after `cd D &&` the event-cwd reading `<cwd>/tools/*` was refused
+            # while `<cwd>/tools` did not exist (McNugget, 2026-11-13 and 2026-11-16).
+            anchor = (probe[:-2] if globbed and probe.endswith("/*")
+                      else os.path.dirname(probe.rstrip("*").rstrip("/")))
+            if not os.path.lexists(anchor or "/"):
                 continue
             if cand == ws or cand.startswith(ws + "/"):
                 seg = cand[len(ws):].lstrip("/").split("/", 1)[0]
