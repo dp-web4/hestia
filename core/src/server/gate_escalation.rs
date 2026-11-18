@@ -6697,9 +6697,9 @@ mod bar_factor_tests {
     fn the_peer_is_told_truly_whether_its_ruling_decides() {
         // The peer-side twin of the operator promise above, pinned the same way: as a
         // property over the markers `bar_for` routes, never as a transcription of today's
-        // bar. `peer_ruling_suffices()` is what the invitation's `peer_answer` shows a
-        // NOT-SAME peer; the peer then rules through the arbitrate door, which appends a
-        // `PeerMember` decision. Whatever the prediction said must be what happens.
+        // bar. `peer_ruling_suffices()` is what the invitation's `peer_answer` shows about
+        // an eligible NOT-SAME peer; that peer then rules through the arbitrate door, which
+        // appends a `PeerMember` decision. Whatever the prediction said must be what happens.
         for marker in ["law_inject.py", "pre_tool_use.py", "witness.py", "hestia_gate_mechanism.py",
                        "seat_gate_boundary_test.py"]
         {
@@ -6725,6 +6725,24 @@ mod bar_factor_tests {
         let (s, id) = open_with("hestia_single_gate.py");
         assert!(!s.get(&id).unwrap().peer_ruling_suffices(),
                 "the common gate is sovereign_plus_peer: no peer ruling meets it");
+
+        // A peer DENIAL is a terminal ruling too. Its factor meets the evidence bar on a
+        // single-approver ask, but a denied status never becomes a grant, and a later approval
+        // cannot rewrite it after a reader has acted on the earlier answer.
+        let (mut s, id) = open_with("seat_gate_boundary_test.py");
+        assert!(s.get(&id).unwrap().peer_ruling_suffices());
+        let denied = s
+            .decide(&id, false, "codex", "role:constellation:member", Channel::PeerMember,
+                    Some(crate::arbiter::Independence::CrossVendor), None, T0 + 5)
+            .expect("a not-same peer may deny");
+        assert_eq!(denied.stored_status(), Status::Denied);
+        assert!(denied.bar_met(), "the peer factor still meets the single-approver evidence bar");
+        assert!(!denied.is_claimable(T0 + 6), "a denial is never a grant");
+        let raced = s
+            .decide(&id, true, "codex", "role:constellation:member", Channel::PeerMember,
+                    Some(crate::arbiter::Independence::CrossVendor), Some("too late"), T0 + 6)
+            .expect_err("a settled denial cannot be upgraded by a raced approval");
+        assert_eq!(raced, DecideError::AlreadyDecided(Status::Denied));
     }
 
     #[test]
