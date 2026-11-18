@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 63da54c047cbea9b6fe18c53b209aaa3f14f5468fe0f20fbdf069933b681442c  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -3600,7 +3600,14 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             probe = _glob_probe(cand) if globbed else cand
             if not _is_reach(probe.rstrip("*").rstrip("/") or "/"):
                 continue
-            if not os.path.lexists(os.path.dirname(probe.rstrip("*").rstrip("/")) or "/"):
+            # WHERE IT COULD NAME SOMETHING (#1317): a plain path when its parent exists; a glob
+            # only when its OWN directory does, since a glob expands inside that directory and a
+            # missing one leaves the word literal. Taking the dirname of a glob probe's `<dir>`
+            # climbed a level, so after `cd D &&` the event-cwd reading `<cwd>/tools/*` was refused
+            # while `<cwd>/tools` did not exist (McNugget, 2026-11-13 and 2026-11-16).
+            anchor = (probe[:-2] if globbed and probe.endswith("/*")
+                      else os.path.dirname(probe.rstrip("*").rstrip("/")))
+            if not os.path.lexists(anchor or "/"):
                 continue
             if cand == ws or cand.startswith(ws + "/"):
                 seg = cand[len(ws):].lstrip("/").split("/", 1)[0]
