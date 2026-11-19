@@ -10061,6 +10061,51 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
     })
 }
 
+/// What a peer's answer does on this escalation, derived from the bar predicate
+/// (`Escalation::peer_ruling_suffices`) rather than restated, so it cannot go stale the way
+/// the dashboard's copy of the bar once did. Three cases, each naming the door:
+///
+/// * an ELIGIBLE NOT-SAME peer's ruling CAN DECIDE: a peer factor would meet the bar, the
+///   asker is proven, and the request is open;
+/// * a peer ruling cannot decide (sovereign bar, unproven asker, or already settled):
+///   corroboration is the useful answer and is evidence only.
+///
+/// The resolver does not authenticate its reader. Eligibility is checked by the arbitrate door,
+/// so a true answer is a conditional statement about an eligible peer, never a promise that the
+/// particular reader may rule.
+fn peer_answer(esc: &crate::server::gate_escalation::Escalation, now: u64) -> Value {
+    use crate::server::gate_escalation::Status;
+    let open = esc.status_at(now) == Status::Pending;
+    let proven = esc.asker_basis == crate::arbiter::AskerBasis::Session;
+    let suffices = esc.peer_ruling_suffices();
+    if open && proven && suffices {
+        json!({
+            "eligible_not_same_peer_ruling_decides": true,
+            "rule_with": "hestia_gate_arbitrate_escalation",
+            "eligibility_checked_at": "hestia_gate_arbitrate_escalation",
+            "note": "An eligible NOT-SAME peer's ruling can decide this escalation without \
+                     waiting on the operator. This record does not authenticate the reader or \
+                     decide eligibility: hestia_gate_arbitrate_escalation does. Approve (with a \
+                     stated reason) or deny there. hestia_gate_escalation_corroborate only adds \
+                     evidence and decides nothing.",
+        })
+    } else {
+        let why = if !open {
+            "already settled: a factor now is a record for later readers, not a decision"
+        } else if !suffices {
+            "sovereign_plus_peer: only an operator factor meets this bar; a peer ruling is \
+             recorded but authorises nothing"
+        } else {
+            "asker_basis is asserted: no peer may rule it (#128); the operator decides"
+        };
+        json!({
+            "eligible_not_same_peer_ruling_decides": false,
+            "why": why,
+            "corroborate_with": "hestia_gate_escalation_corroborate",
+        })
+    }
+}
+
 /// Dereference `hestia://escalation/{id}` — carried by escalation invitations
 /// (`#corroborate-or-dissent`, minted since 2026-08 with no resolver behind it)
 /// and by escalation `disposition` notices (`#decided` / `#lapsed`, #459). All
@@ -10081,7 +10126,13 @@ fn escalation_answer_guidance() -> Value {
     json!({
         "tool": "hestia_gate_escalation_corroborate",
         "cli": "hestia gate corroborate <escalation_id> --stance concur|dissent --argument <text>",
-        "note": "Put your stance and argument on the escalation record. A review_done mesh notice is only a wake, not a factor; a pointer fragment alone is not a durable review."
+        "note": "Put your stance and argument on the escalation record. A review_done mesh notice is only a wake, not a factor; a pointer fragment alone is not a durable review.",
+        // 2026-11-12: this guidance named only the evidence door, on every bar, and peers
+        // followed it: single-approver asks their ruling alone would have decided were
+        // corroborated and expired. Static on purpose (it must read the same before and
+        // after a reap); the bar-aware answer is `peer_answer` on the live record.
+        "rule_instead": "If peer_answer.eligible_not_same_peer_ruling_decides is true, an eligible NOT-SAME peer may rule with hestia_gate_arbitrate_escalation (approve with a stated reason, or deny); that door checks the reader's eligibility. Corroboration decides nothing.",
+        "rule_tool": "hestia_gate_arbitrate_escalation"
     })
 }
 
@@ -10123,6 +10174,14 @@ fn resolve_escalation_pointer(s: &super::state::ServerState, pointer: &str) -> V
             "factors_present": esc.factors,
             "invited_peers": esc.invited_peers,
             "asker_basis": esc.asker_basis,
+            // WHAT YOUR ANSWER DOES (2026-11-12). Every invitation points at
+            // `#corroborate-or-dissent`, whatever the bar, so invited peers corroborated
+            // single-approver asks their RULING alone would have decided, and the asks
+            // expired waiting on a human. This says, from the bar predicate itself, which
+            // door decides and which only adds evidence. Eligibility (NOT-SAME, #128) is
+            // still enforced at the arbitrate door; `asker_basis` above is the half a peer
+            // can check before trying.
+            "peer_answer": peer_answer(esc, now),
             "decided_by": esc.decided_by,
             "decided_at": esc.decided_at,
             "reason": esc.reason,
@@ -17442,7 +17501,26 @@ mod tests {
         // THE GRANT DIRECTION STAYS SHUT. Asserted first: if this ever opens, the withdrawal
         // arm below is worthless, and a test that only proved the permissive half would read
         // as a pass while the boundary was gone.
-        let to_approve = open_one("pre_tool_use.py").await;
+        // Use a single-approver ask here: the conditional peer-ruling offer is true on that
+        // bar, and the asker still may not approve its own request.
+        let to_approve = open_one("seat_gate_boundary_test.py").await;
+        {
+            let s = shared.lock().await;
+            let body = resolve_escalation_pointer(&s, &to_approve);
+            assert!(
+                !body["invited_peers"].as_array().unwrap().contains(&json!("claude-code")),
+                "the asker is not invited to rule its own request: {body}"
+            );
+            assert_eq!(
+                body["peer_answer"]["eligible_not_same_peer_ruling_decides"], true,
+                "the offer describes only what an eligible peer could do: {body}"
+            );
+            assert!(
+                body["peer_answer"]["note"].as_str().unwrap().contains("does not authenticate"),
+                "and never claims this reader was authenticated: {body}"
+            );
+            assert!(body["peer_answer"].get("your_ruling_decides").is_none(), "{body}");
+        }
         let denied_self_grant = tool_gate_arbitrate_escalation(
             &shared,
             &json!({
@@ -30370,6 +30448,10 @@ mod disposition_durability_tests {
                 now,
                 3600,
             );
+            assert!(s.gate_escalations.record_asker_basis(
+                &id,
+                crate::arbiter::AskerBasis::Session,
+            ));
             s.gate_escalations
                 .invite(&id, vec!["claude-code".into(), "codex".into()]);
             id
@@ -30404,6 +30486,73 @@ mod disposition_durability_tests {
         );
         assert_eq!(body["how_to_answer"]["tool"], "hestia_gate_escalation_corroborate");
         assert!(body["how_to_answer"]["note"].as_str().unwrap().contains("not a factor"));
+        // 2026-11-12: the invited peer must also learn whether an eligible peer's RULING
+        // decides, from the bar predicate, and which door checks that peer's eligibility.
+        let expected = {
+            let s = state.lock().await;
+            let e = s.gate_escalations.get(&id).unwrap();
+            e.peer_ruling_suffices() && e.asker_basis == crate::arbiter::AskerBasis::Session
+        };
+        assert_eq!(
+            body["peer_answer"]["eligible_not_same_peer_ruling_decides"], json!(expected),
+            "{body}"
+        );
+        assert_eq!(
+            body["peer_answer"]["eligibility_checked_at"], "hestia_gate_arbitrate_escalation"
+        );
+        assert!(body["peer_answer"].get("your_ruling_decides").is_none(), "{body}");
+        assert_eq!(body["how_to_answer"]["rule_tool"], "hestia_gate_arbitrate_escalation");
+        assert!(
+            body["how_to_answer"]["rule_instead"]
+                .as_str().unwrap().contains("eligible_not_same_peer_ruling_decides")
+        );
+    }
+
+    /// A pointer read is a snapshot, not permission to rule later. Once a peer denial settles
+    /// the request, the same resolver withdraws the conditional offer instead of leaving a raced
+    /// reader with the stale impression that another ruling can land.
+    #[tokio::test]
+    async fn a_settled_escalation_pointer_withdraws_the_ruling_offer() {
+        let (_dir, state) = test_state().await;
+        let now = now_secs();
+        let id = {
+            let mut s = state.lock().await;
+            let id = witness_open(&mut s, "kimi-code", Some("review the exact act"), now, 3600);
+            assert!(s.gate_escalations.record_asker_basis(
+                &id,
+                crate::arbiter::AskerBasis::Session,
+            ));
+            id
+        };
+        let before = {
+            let s = state.lock().await;
+            resolve_escalation_pointer(&s, &id)
+        };
+        assert_eq!(before["status"], "pending");
+        assert_eq!(before["peer_answer"]["eligible_not_same_peer_ruling_decides"], true);
+
+        let mut s = state.lock().await;
+        s.gate_escalations
+            .decide(
+                &id,
+                false,
+                "codex",
+                "role:constellation:member",
+                crate::server::gate_escalation::Channel::PeerMember,
+                Some(crate::arbiter::Independence::CrossVendor),
+                None,
+                now + 1,
+            )
+            .expect("a not-same peer denial settles the request");
+        let after = resolve_escalation_pointer(&s, &id);
+        assert_eq!(after["source"], "live_store");
+        assert_eq!(after["status"], "denied");
+        assert_eq!(after["peer_answer"]["eligible_not_same_peer_ruling_decides"], false);
+        assert!(
+            after["peer_answer"]["why"].as_str().unwrap().contains("already settled"),
+            "the raced reader must learn why the offer disappeared: {after}"
+        );
+        assert!(after["peer_answer"].get("rule_with").is_none(), "{after}");
     }
 
     /// Change 1 + review point 1b: `reap`'s call-site invariant — "reaping can never
