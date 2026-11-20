@@ -19992,6 +19992,10 @@ mod tests {
         })).await.unwrap();
         let session = r["sessionId"].as_str().unwrap().to_string();
 
+        // #1497 (dp, 2026-11-05): a claim with nothing approved or pending opens nothing and
+        // writes no chain row; the refusal is recorded in memory and answered `not_asked`.
+        // Identical retries collapse on ONE refusal id, the in-memory twin of the stable key.
+        let mut refusal_ids = Vec::new();
         for _ in 0..2 {
             let refused = tool_gate_escalation_claim(&shared, &json!({
                 "plugin_id": "kimi-code", "session_id": session,
@@ -19999,7 +20003,11 @@ mod tests {
                 "request_key": "d".repeat(64),
             })).await.unwrap();
             assert_eq!(refused["claimed"], false, "an unnamed act is refused: {refused}");
+            assert_eq!(refused["not_asked"], true, "and nothing was asked: {refused}");
+            refusal_ids.push(refused["refusal_id"].as_str().unwrap_or("").to_string());
         }
+        assert!(refusal_ids[0].starts_with("refusal-"), "{refusal_ids:?}");
+        assert_eq!(refusal_ids[0], refusal_ids[1], "a retry keeps its refusal id: {refusal_ids:?}");
         let err = tool_gate_escalation_open(&shared, &json!({
             "plugin_id": "kimi-code", "session_id": session,
             "role": "role:constellation:member", "tool_name": "Bash",
@@ -20012,10 +20020,9 @@ mod tests {
             .filter(|e| e.event_type == "gate_escalation_refused")
             .map(|e| e.event_data["request_key"].as_str().unwrap_or("").to_string())
             .collect();
-        assert_eq!(keys.len(), 3, "two claim refusals and one open refusal: {rows:?}");
+        assert_eq!(keys.len(), 1, "only the open refusal is on the chain: {rows:?}");
         let supplied = "d".repeat(64);
-        assert_eq!(keys.iter().filter(|key| key.as_str() == supplied.as_str()).count(), 2,
-                   "identical claim retries collapse on the supplied key: {keys:?}");
+        assert!(!keys.contains(&supplied), "an unasked claim refusal is not on the chain: {keys:?}");
         let derived = crate::server::gate_escalation::request_key_for_act(
             "kimi-code", "pre_tool_use.py", "", Some("wake-540"),
         );
@@ -20071,7 +20078,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let opened = tool_gate_escalation_claim(
+        let opened = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "kimi-code", "session_id": session,
@@ -20118,7 +20125,7 @@ mod tests {
                     .to_string(),
             );
         }
-        let opened = tool_gate_escalation_claim(
+        let opened = gate_claim_and_escalate(
             &shared,
             &json!({
                 "plugin_id": "codex", "session_id": sessions["codex"],
