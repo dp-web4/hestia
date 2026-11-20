@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hestia_gate_core.py",
-      "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc",
+      "sha256": "bba684b4c804df9a8a9713137651688ea07ab129d457b04edb151c14d56c4466",
       "source": "plugins/_shared/hestia_gate_core.py"
     },
     {
@@ -38,5 +38,5 @@
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
+  "gt_version": "747adbced2a6086150ffea254d2cfb672bbda696ccc7112dfaf429ab383c9196"
 }
