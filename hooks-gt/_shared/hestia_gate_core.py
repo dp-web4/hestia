@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: bba684b4c804df9a8a9713137651688ea07ab129d457b04edb151c14d56c4466  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 929afd79093deb8c20b99a4455e5e50419ad1c27ac2bac2d753f2084c6d24af4  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -3505,9 +3505,12 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             elif head == "tee":
                 for word, uglob in operands:
                     add_bare(word, uglob, True)
-            elif head in ("cat", "rm"):
+            elif head == "cat":
                 for word, uglob in operands:
                     add_bare(word, uglob, False)
+            elif head == "rm":
+                for word, uglob in operands:
+                    add_bare(word, uglob, True)
 
         head, operands, cp_target = None, [], False
         redirect, pending, opts_done = None, None, False
@@ -3559,7 +3562,7 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
                             add_bare(value, uglob, True)
                         else:
                             pending = "target"
-                    elif name in ("-S", "--suffix", "--backup") and not eq:
+                    elif name in ("-S", "--suffix") and not eq:
                         pending = "data"
                     elif name.startswith("-t") and not name.startswith("--") and len(name) > 2:
                         cp_target = True

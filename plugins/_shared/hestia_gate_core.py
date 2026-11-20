@@ -3504,9 +3504,12 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             elif head == "tee":
                 for word, uglob in operands:
                     add_bare(word, uglob, True)
-            elif head in ("cat", "rm"):
+            elif head == "cat":
                 for word, uglob in operands:
                     add_bare(word, uglob, False)
+            elif head == "rm":
+                for word, uglob in operands:
+                    add_bare(word, uglob, True)
 
         head, operands, cp_target = None, [], False
         redirect, pending, opts_done = None, None, False
@@ -3558,7 +3561,7 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
                             add_bare(value, uglob, True)
                         else:
                             pending = "target"
-                    elif name in ("-S", "--suffix", "--backup") and not eq:
+                    elif name in ("-S", "--suffix") and not eq:
                         pending = "data"
                     elif name.startswith("-t") and not name.startswith("--") and len(name) > 2:
                         cp_target = True

@@ -343,6 +343,8 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
         ("bare_remove", "rm -f remove.txt", "remove.txt"),
         ("literal_open_brace_read", "cat {notes", "{notes"),
         ("literal_open_brace_write", "echo hi > {out", "{out"),
+        ("cp_backup_optional_argument_does_not_swallow_source",
+         f"cp --backup a.txt {ws}/copy-out.txt", "a.txt"),
     )
     for name, command, target in cases:
         ok, offending, refused = reach(command)
@@ -355,6 +357,10 @@ def test_bare_name_file_operands_in_an_ungranted_cwd():
     # still wins, and a missing bare read target is not a new scope request (#1404).
     for base in (ws, outside):
         open(os.path.join(base, "shared.txt"), "w").close()
+    ok, offending, refused = reach("rm -f shared.txt")
+    expected = os.path.normpath(os.path.join(outside, "shared.txt")).replace("\\", "/")
+    check("bare_remove_does_not_use_an_in_scope_namesake",
+          not ok and refused == expected)
     check("existing_in_scope_interpretation_still_allows", reach("cat shared.txt")[0])
     check("missing_bare_read_target_is_not_a_new_ask", reach("cat absent.txt")[0])
     check("echo_operands_remain_strings", reach("echo notes.txt")[0])
