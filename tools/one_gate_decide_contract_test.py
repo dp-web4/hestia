@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import re
 import time
 import uuid
 
@@ -2340,16 +2341,20 @@ def test_against_an_isolated_real_daemon(m, g, wc, home):
         check("real-daemon-deny-one-row", d.evidence_committed, d)
         d = run("Read", {"file_path": str(REPO / "README.md")}, 4)
         check("real-read-allowed-and-recorded", d.decision == "allow" and d.evidence_committed, d)
-        # A scope refusal against the REAL daemon opens a request, and a re-issue finds it
-        # (hestia_scope_claim, 2026-10-05). An older daemon answers no-channel; say so.
+        # A scope refusal against the REAL daemon opens NOTHING (dp, 2026-11-05, #1497: "deny
+        # with option to escalate ... as a deliberate act"). The deny names a refusal id the
+        # member may escalate, and a re-issue names the same one. Both the held gate and the
+        # current gate carry the daemon's refusal id through to the deny text.
         d = run("Bash", {"command": "cat /etc/hostname"}, 5)
         check("real-scope-refusal-is-mrh-command", d.decision == "deny" and d.rule == "mrh.command", d)
-        check("real-scope-refusal-opens-a-request", bool(d.escalation_id)
-              and str(d.escalation_id).startswith("scope-"), d)
+        check("real-scope-refusal-opens-nothing", not d.escalation_id, d)
+        rid = re.search(r"\b(refusal-[0-9a-f]{8,})\b", d.reason or "")
+        check("real-scope-refusal-names-an-escalatable-refusal", rid and "escalate" in d.reason, d.reason)
         again = run("Bash", {"command": "cat /etc/hostname"}, 6)
-        check("real-scope-reissue-finds-the-same-request", again.escalation_id == d.escalation_id,
-              (d.escalation_id, again.escalation_id))
-        check("real-scope-reissue-says-pending", "still pending" in again.reason, again.reason)
+        check("real-scope-reissue-opens-nothing", not again.escalation_id, again)
+        rid2 = re.search(r"\b(refusal-[0-9a-f]{8,})\b", again.reason or "")
+        check("real-scope-reissue-keeps-the-refusal-id", rid and rid2 and rid.group(1) == rid2.group(1),
+              (rid and rid.group(1), rid2 and rid2.group(1)))
         # dp, 2026-10-14 (hestia#1313): an act whose reach an expansion decides is refused under
         # its own rule against the real handler too, and opens no request, on a re-issue either.
         u = run("Bash", {"command": 'cat "$(date +/etc/hostname)"'}, 7)
