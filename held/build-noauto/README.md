@@ -1,6 +1,8 @@
 # build-noauto: the gate opens no requests or escalations on its own (held, not applied)
 
-**Patch:** `held/e1a515cd362c26c112cfc27e0b4a8cb7d861046cd13923437cff5ae1c2966eb3.patch`. It is built by `build_noauto.py` (the build-1450a recipe, with `SOURCES` naming the mechanism and the single gate) over base `5cf6e607`, whose `plugins/_shared` and `hooks-gt` are identical to main `9ae2b633`. It supersedes `adb06466…`, the scope-only cut.
+**Patch:** `held/dae63377386fee0e494ad478453503f21dd5fd5a630ca2b17e7e77be52edd75a.patch`. It is built by `build_noauto.py` (the build-1450a recipe, with `SOURCES` naming the mechanism and the single gate) over base `078d2c52`, the merge of main `b28574dc` into this branch. Main had not changed `hestia_gate_mechanism.py` or `hestia_single_gate.py` since the first cut, so the source change is byte-identical (`mechanism_rev.py` and `single_gate_rev.py` are unchanged). Only the hooks-gt manifests' `gt_version` hashes moved.
+
+It supersedes `e1a515cd…` (cut over `5cf6e607`, whose manifests no longer apply to main), which superseded `adb06466…`, the scope-only cut. `e1a515cd…` is still in `held/` only because removing it from this seat hit the destructive-command deny. Delete it when the patch lands; do not apply it.
 
 ## Rulings
 
