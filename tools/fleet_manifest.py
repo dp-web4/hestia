@@ -60,6 +60,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import registration_resolver as rr
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 HOME = os.path.expanduser("~")
@@ -71,106 +72,56 @@ MEMBERS = {  # member -> (installed hooks dir under $HOME, plugins/ dir name)
     "codex":       (".codex/hooks",     "codex"),
     "gemini":      (".gemini/hooks",    "gemini"),
 }
-# Where each member ACTUALLY declares its hooks. The directory in MEMBERS is only one
-# install layout; wiring may instead name absolute paths from a config file, in which case a
-# directory-keyed survey reports a gated seat as ungated (HUB 2026-08-21, and this seat's own
-# ungoverned finding). These are read as FILES. Never build a shell command naming them: on a
-# properly-gated seat the gate classifies a command carrying that marker as a write to the thing
-# that governs the agent and refuses it — so the seats the survey most needs to classify are the
-# ones most likely to refuse the probe.
-MEMBER_CONFIG = {
-    "claude-code": ".claude/settings.json",
-    "codex":       ".codex/config.toml",
-    "gemini":      ".gemini/settings.json",
-    "kimi-code":   ".kimi-code/config.json",
-}
-GATE_EVENT = "PreToolUse"          # the enforcing hook; everything else is witness
-
-
-def _hestia_hook_commands(path):
-    """(events_with_hestia_hooks, resolved_paths) from a member config file, or None if unreadable."""
-    try:
-        raw = open(path, encoding="utf-8", errors="replace").read()
-    except OSError:
-        return None
-    events, paths = {}, []
-    if path.endswith((".json",)):
-        try:
-            doc = json.loads(raw)
-        except ValueError:
-            return None
-        for ev, entries in (doc.get("hooks") or {}).items():
-            for entry in (entries or []):
-                for hk in (entry.get("hooks") or []):
-                    cmd = str(hk.get("command", ""))
-                    if "hestia" not in cmd.lower():
-                        continue
-                    events.setdefault(ev, 0)
-                    events[ev] += 1
-                    for tok in cmd.split():
-                        if "/" in tok and "hestia" in tok.lower():
-                            paths.append((ev, tok))
-    else:  # toml/ini-ish: line scan is enough to answer "is anything wired at all"
-        for line in raw.splitlines():
-            low = line.lower()
-            if "hestia" in low and any(k in low for k in ("hook", "notify", "command")):
-                events.setdefault("unparsed", 0)
-                events["unparsed"] += 1
-    return events, paths
+GATE_EVENT = "PreToolUse"          # fallback when expects.json does not declare its gate event
 
 
 def gate_surface(member, inst_dir):
-    """Resolve a member's GATE from its real config surface.
+    """Resolve a member's GATE through the canonical registration resolver.
 
-    Returns one of, and these are FOUR states plus a distinct undetermined:
-      gated-at-canonical-path | gated-from-a-working-tree |
-      provisioned-but-UNGOVERNED | not-provisioned | UNDETERMINED
-
-    UNDETERMINED must never collapse into a negative. A survey that falls back to the
-    directory check on an unreadable config reports a properly-gated seat as ungated —
-    the exact inversion HUB hit while probing its own seat.
+    ENFORCING BUT UNAUDITED is explicit when a present registered hook is outside the compared
+    install dir. Partial or unreadable classification is UNDETERMINED, never a healthy gate.
     """
-    cfg_rel = MEMBER_CONFIG.get(member)
-    cfg = os.path.join(HOME, cfg_rel) if cfg_rel else None
+    expects = os.path.join(REPO, "plugins", MEMBERS[member][1], "expects.json")
+    resolved = rr.resolve_registration(expects, HOME)
+    state = resolved["state"]
     home_dir_present = os.path.isdir(os.path.join(HOME, "." + member.split("-")[0])) or os.path.isdir(inst_dir)
+    detail = resolved.get("error") or resolved.get("registration_path") or expects
+    if state in {"unreadable", "unparseable", "unknown_reader"}:
+        return "UNDETERMINED", f"{state}: {detail}"
+    if state == "not_present":
+        if home_dir_present:
+            return "UNDETERMINED", f"member dir present but registration is not_present: {detail}"
+        return "not-provisioned", f"registration is not_present: {detail}"
+    if state == "not_declared":
+        if home_dir_present:
+            return "provisioned-but-UNGOVERNED", "no registration is declared"
+        return "not-provisioned", "no registration contract or member dir"
 
-    if cfg and os.path.exists(cfg):
-        parsed = _hestia_hook_commands(cfg)
-        if parsed is None:
-            return "UNDETERMINED", f"config present but unparseable: {cfg_rel}"
-        events, paths = parsed
-        if not events:
-            # Schema safety: my parser understands claude-code's hooks{} shape. Another
-            # member could wire a gate under a schema it does not walk, and reporting that
-            # as UNGOVERNED would be the false-negative-about-governance this whole change
-            # exists to remove. So distinguish by evidence that is schema-independent:
-            # if the file mentions hestia ANYWHERE, something is wired that I failed to
-            # parse -> UNDETERMINED. Only a file with no hestia reference at all is safely
-            # ungoverned.
-            try:
-                mentions = "hestia" in open(cfg, encoding="utf-8", errors="replace").read().lower()
-            except OSError:
-                return "UNDETERMINED", f"config unreadable: {cfg_rel}"
-            if mentions:
-                return ("UNDETERMINED",
-                        f"{cfg_rel} references hestia but not in a shape this parser walks")
-            return "provisioned-but-UNGOVERNED", f"{cfg_rel} declares no hestia hook"
-        if GATE_EVENT in events:
-            # Only paths declared under the GATE event describe the gate. Collecting them
-            # globally let the row name another event's file (a PostToolUse witness reported
-            # as the PreToolUse target) — a wrong answer to "which file is my gate?".
-            gate_paths = [q for ev_, q in paths if ev_ == GATE_EVENT]
-            where = next((q for q in gate_paths
-                          if REPO and os.path.abspath(q).startswith(os.path.abspath(REPO))), None)
-            if where:
-                return ("gated-from-a-working-tree",
-                        f"{GATE_EVENT} -> {os.path.relpath(where, REPO)} (in checkout; only as current as its branch)")
-            return "gated-at-canonical-path", f"{GATE_EVENT} -> {gate_paths[0] if gate_paths else 'resolved'}"
+    if not resolved["complete"]:
+        return "UNDETERMINED", "registration is only partially classified; gate targets are not exhaustive"
+    gate_events = resolved.get("gate_events") or [GATE_EVENT]
+    gate_label = ",".join(gate_events)
+    gate_targets = [t for t in resolved["targets"] if t.get("event") in gate_events]
+    if not gate_targets:
         return ("provisioned-but-UNGOVERNED",
-                f"hestia hooks at {sorted(events)} but NO {GATE_EVENT} — witness only, no gate")
-    if home_dir_present:
-        return "UNDETERMINED", "member dir present but no known config surface to read"
-    return "not-provisioned", "no config surface and no member dir"
+                f"registered events {resolved['events_seen']} contain no {gate_label}")
+
+    paths = [t["path"] for t in gate_targets]
+    if any(t["kind"] == "unreadable" for t in gate_targets):
+        return "UNDETERMINED", f"{gate_label} -> {paths} includes an unreadable registered hook"
+    repo_prefix = os.path.abspath(REPO) + os.sep
+    working = next((p for p in paths if os.path.abspath(p).startswith(repo_prefix)), None)
+    if working:
+        return ("gated-from-a-working-tree",
+                f"{gate_label} -> {os.path.relpath(working, REPO)} (in checkout; only as current as its branch)")
+
+    install_prefix = os.path.abspath(inst_dir) + os.sep
+    outside = [p for p in paths if not os.path.abspath(p).startswith(install_prefix)]
+    kinds = ",".join(sorted({t["kind"] for t in gate_targets}))
+    evidence = f"{gate_label} -> {paths} (kind={kinds})"
+    if outside:
+        return "ENFORCING BUT UNAUDITED", f"{evidence}; outside compared dir {inst_dir}"
+    return "gated-at-canonical-path", evidence
 
 
 WATCH_GLOB = "plugins/member-mesh/hestia-watch-member.sh"

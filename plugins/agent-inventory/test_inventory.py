@@ -416,6 +416,70 @@ def test_member_states():
     check("worst of two rows for one member", both.get("m"), "miswired")
 
 
+def test_windows_host_harness_is_its_own_state():
+    """hestia#1495 (TL-Dell, 2026-11-04): Codex installed on Windows reached this WSL seat as
+    `codex.exe` under a drive mount. `real_executable` looks for `codex`, so the report said
+    "not installed here" and Discover offered nothing. It must be its own state: not absent
+    (it is here), and not installed (this seat cannot gate it)."""
+    orig = inventory.WSL_DRIVE_ROOT
+    orig_registry = inventory.REGISTRY
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            mnt = Path(d) / "mnt"
+            win_bin = mnt / "c" / "Users" / "TL" / "Codex" / "bin"
+            win_bin.mkdir(parents=True)
+            (win_bin / "codex.exe").write_bytes(b"MZ")
+            linux_bin = Path(d) / "linux-bin"
+            linux_bin.mkdir()
+            (linux_bin / "codex.exe").write_bytes(b"MZ")   # same name, NOT under the drive root
+            inventory.WSL_DRIVE_ROOT = str(mnt) + "/"
+            got = inventory.windows_host_executable(["codex"], [str(linux_bin), str(win_bin)])
+            check("found through the drive mount", got, str(win_bin / "codex.exe"))
+            check("a .exe outside the drive root is not a Windows host install",
+                  inventory.windows_host_executable(["codex"], [str(linux_bin)]), None)
+            check("no Windows copy -> None",
+                  inventory.windows_host_executable(["gemini"], [str(win_bin)]), None)
+            (linux_bin / "codex").write_bytes(b"#!/bin/sh\n")
+            (linux_bin / "codex").chmod(0o755)
+            class Registry:
+                def has(self, _plugin):
+                    return True
+                def expects(self, _plugin):
+                    return {}
+            inventory.REGISTRY = Registry()
+            dual = inventory.inspect("codex", [str(linux_bin), str(win_bin)])
+            check("dual install keeps Linux installed", dual["installed"], True)
+            check("dual install preserves Windows-host evidence",
+                  dual["windows_host_executable"], str(win_bin / "codex.exe"))
+    finally:
+        inventory.WSL_DRIVE_ROOT = orig
+        inventory.REGISTRY = orig_registry
+
+    def rec(**kw):
+        base = {"agent": "codex", "member": "codex", "installed": False, "plugin_available": True,
+                "governed": False, "wired": False, "partial": False, "miswired": False,
+                "miswired_3p": False, "unknown": [], "windows_host_executable": "/x/codex.exe"}
+        return {**base, **kw}
+    gaps = inventory.classify([rec()])
+    check("filed under windows_host", gaps["windows_host"], ["codex"])
+    check("NOT filed as dormant ('not installed here')", gaps["dormant_plugin"], [])
+    check("an ungoverned agent is present", inventory.status_of(gaps, []), "UNGOVERNED_PRESENT")
+    check("member state", inventory.member_states([rec()]).get("codex"), "windows_host")
+    # A Linux install wins: the Windows copy is then just a second copy, not the state.
+    both = rec(installed=True, windows_host_executable=None)
+    check("a Linux install is classified as before",
+          inventory.classify([both])["windows_host"], [])
+    dual = rec(installed=True, governed=True)
+    check("dual install keeps the Windows gap",
+          inventory.classify([dual])["windows_host"], ["codex"])
+    check("dual install is present, not OK", inventory.status_of(inventory.classify([dual]), []),
+          "UNGOVERNED_PRESENT")
+    check("dual member state remains windows_host",
+          inventory.member_states([dual]).get("codex"), "windows_host")
+    check("no Windows copy -> still dormant",
+          inventory.classify([rec(windows_host_executable=None)])["dormant_plugin"], ["codex"])
+
+
 def test_ownership_is_provenance_never_text():
     """dp and GPT, 2026-09-28 (#1144): three text rules each claimed a stranger's hook -- a mention
     of hestia in the file (snarc's comment), "hestia" in the path or command (a foreign hook under a
@@ -1646,6 +1710,7 @@ if __name__ == "__main__":
     test_hook_providers_load_from_the_atlas()
     test_known_provider_with_unknown_capability_stays_unknown()
     test_member_states()
+    test_windows_host_harness_is_its_own_state()
     test_has_tag()
     test_role_target()
     test_fallback_enumeration()

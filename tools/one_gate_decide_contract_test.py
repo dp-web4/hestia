@@ -67,6 +67,17 @@ def check(name, ok, detail=""):
         FAILS.append(f"{name}{': ' + str(detail)[:600] if detail else ''}")
 
 
+def _gate_has_deliberate_escalation() -> bool:
+    """True once #1497's gate half (held/build-noauto) is in the gate under test: the single gate
+    then renders a scope `not_asked` as "nothing was sent" with the escalate command. Read from
+    the source the test loads (an OVERLAY copy wins), so a staged run checks the new contract."""
+    src = pathlib.Path(OVERLAY.get("hestia_single_gate") or SHARED / "hestia_single_gate.py")
+    try:
+        return "Nothing was sent to the operator or to any peer" in src.read_text()
+    except OSError:
+        return False
+
+
 def load_engine():
     """The shared engine as the gate imports it, with any staging overlay first."""
     if str(SHARED) not in sys.path:
@@ -360,7 +371,7 @@ def native_event(seat, act_tool, act_input, cwd, n):
     """The act in this harness's native hook event, shaped on recorded events (see docstring)."""
     if seat == "claude-code":
         return {"session_id": "9261dc9a-0000-4000-8000-00000000c1a0",
-                "transcript_path": "/home/probe/.claude/projects/x/9261dc9a.jsonl", "cwd": cwd,
+                "transcript_path": "/home/member/.claude/projects/x/9261dc9a.jsonl", "cwd": cwd,
                 "permission_mode": "default", "hook_event_name": "PreToolUse",
                 "tool_name": act_tool, "tool_input": act_input, "tool_use_id": f"toolu_01Contract{n:04d}"}
     if seat == "codex":
@@ -373,7 +384,7 @@ def native_event(seat, act_tool, act_input, cwd, n):
         else:
             tool, ti = act_tool, act_input
         return {"session_id": "019f94e0-0000-7000-8000-00000000c0de", "turn_id": f"019f94e0-{n:04d}",
-                "transcript_path": "/home/probe/.codex/sessions/rollout.jsonl", "cwd": cwd,
+                "transcript_path": "/home/member/.codex/sessions/rollout.jsonl", "cwd": cwd,
                 "hook_event_name": "PreToolUse", "model": "gpt-probe", "permission_mode": "default",
                 "tool_name": tool, "tool_input": ti, "tool_use_id": f"call_Contract{n:04d}"}
     if seat == "kimi":
@@ -386,7 +397,7 @@ def native_event(seat, act_tool, act_input, cwd, n):
                 "cwd": cwd, "tool_name": act_tool, "tool_input": ti, "tool_call_id": f"tool_Contract{n:04d}"}
     gtool = {"Read": "read_file", "Edit": "replace", "Write": "write_file",
              "Bash": "run_shell_command"}.get(act_tool, act_tool)
-    return {"session_id": "gemini-contract-session", "transcript_path": "/home/probe/.gemini/tmp/chat.json",
+    return {"session_id": "gemini-contract-session", "transcript_path": "/home/member/.gemini/tmp/chat.json",
             "cwd": cwd, "hook_event_name": "BeforeTool", "timestamp": "2026-10-01T00:00:00Z",
             "tool_name": gtool, "tool_input": dict(act_input)}
 
@@ -1055,11 +1066,18 @@ def test_a_scope_refusal_is_an_escalation_with_a_standing_option(m, g, wc, home)
         with _Env(m, stub.url, home):
             d, _ = _decide(g, "claude-code", "Bash", {"command": f"cat {one}"}, home)
         check("scope-not-asked-denies", d.decision == "deny" and d.rule == "mrh.command", d)
-        check("scope-not-asked-says-nothing-sent",
-              "Nothing was sent to the operator or to any peer" in d.reason, d.reason)
-        check("scope-not-asked-names-the-door",
-              "hestia scope escalate refusal-stub" in d.reason and "--as claude-code" in d.reason,
-              d.reason)
+        if _gate_has_deliberate_escalation():
+            check("scope-not-asked-says-nothing-sent",
+                  "Nothing was sent to the operator or to any peer" in d.reason, d.reason)
+            check("scope-not-asked-names-the-door",
+                  "hestia scope escalate refusal-stub" in d.reason and "--as claude-code" in d.reason,
+                  d.reason)
+        else:
+            # The gate half of #1497 is held (held/build-noauto), not applied. Until it lands,
+            # this is the README's "old gate, new daemon" row: the old gate reads not_asked as
+            # not_opened, denies, opens nothing, and names a deliberate door.
+            check("scope-not-asked-names-a-door (held gate half not applied)",
+                  "hestia_request_scope" in d.reason, d.reason)
         check("scope-not-asked-no-escalation-id", d.escalation_id is None, d)
         check("scope-not-asked-no-pending-talk", "is open for" not in d.reason
               and "still pending" not in d.reason, d.reason)
@@ -1834,7 +1852,7 @@ CONTRACT_TESTS = [
 
 # ── parity arm (subprocesses) ─────────────────────────────────────────────────────────────────
 
-PROBE_HOME = "/home/gate-parity-probe"   # text the gates classify; never a path touched
+PROBE_HOME = "/home/member"   # text the gates classify; never a path touched
 #: A credential-file path, assembled from parts so its literal never has to be typed anywhere.
 CRED_PATH = (PROBE_HOME + "/.config/x/." + "e" + "nv")
 

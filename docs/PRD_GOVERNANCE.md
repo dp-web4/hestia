@@ -473,6 +473,18 @@ Hestia uses `web4_core::role::{SocietyRole, RoleAssignment, RoleEvent}` directly
 
 `SocietyRole::Custom("git-manager")` covers the merge-partition office. No new role vocabulary.
 
+**Role-name parsing is a separate boundary from role occupancy and tensor dimensions.** `parse_role`
+accepts the nine standard offices (`sovereign`, `law_oracle`, `policy_entity`, `treasurer`,
+`administrator`, `archivist`, `citizen`, `witness`, `auditor`) and their existing aliases
+(`laworacle`, `policyentity`, `admin`, and hyphenated `law-oracle` / `policy-entity`). Any other
+spelling is an error, not an implicit custom role. `custom_role(name)` is the explicit constructor:
+it trims surrounding whitespace, preserves case inside the name, and rejects the empty string.
+
+Only grant creation uses this parser: `delegate grant` and the HTTP delegation-grant route. Existing
+persisted custom roles remain listable and revocable; they are not reparsed for migration. This is
+not the canonical T3/V3 tensor-dimension work tracked separately in web4 #980, and it does not make a
+role label proof of occupancy.
+
 ### 7.2 Capacity moves to the agent
 
 `interactive-dev`, `mesh-worker`, `reviewer`, `autonomous-timer`, `member` are **agent kinds**, not offices. They move to an enum on the agent's LCT.

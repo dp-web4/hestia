@@ -497,6 +497,48 @@ def cleanup() -> None:
           "g.rows.filter(r => !r.retired && !r.actionCount).map(r => r.governanceId)" in UI)
 
 
+def windows_host() -> None:
+    def report(governed_linux, unknown=False):
+        gaps = {"windows_host": ["codex"]}
+        if governed_linux:
+            gaps["governed"] = ["codex"]
+        else:
+            gaps["ungoverned"] = ["codex"]
+        if unknown:
+            gaps["unknown"] = ["codex"]
+        return {
+            "status": "UNKNOWN" if unknown else "OK",
+            "governed": ["codex"] if governed_linux else [],
+            "gaps": gaps,
+            "detail": [agent("codex", "codex", True,
+                             executable="/linux/codex", windows_host_executable="/mnt/c/codex.exe",
+                             governed=governed_linux,
+                             unknown=["Linux config unreadable"] if unknown else [])],
+        }
+
+    for governed in (True, False):
+        m = run_model(report(governed))
+        groups = {g["key"]: g for g in m["groups"]}
+        windows = groups["windows_host"]["rows"][0]
+        linux_key = "governed" if governed else "ungoverned"
+        linux = groups[linux_key]["rows"][0]
+        check("Windows row shows the Windows executable", windows["executable"], "/mnt/c/codex.exe")
+        check("Linux row shows the Linux executable", linux["executable"], "/linux/codex")
+        check("Windows row never offers the Linux register action", windows["registerable"], False)
+        check("Linux register state is independent", linux["registerable"], not governed)
+        check("dual install does not prescribe another WSL install",
+              "another WSL install is not the remedy" in groups["windows_host"]["remedy"], True)
+
+    m = run_model(report(False, unknown=True))
+    groups = {g["key"]: g for g in m["groups"]}
+    check("unknown Linux config does not suppress the Windows finding", "windows_host" in groups, True)
+    check("unknown and Windows evidence coexist as separate rows",
+          (groups["unknown"]["rows"][0]["atlasId"], groups["windows_host"]["rows"][0]["atlasId"]),
+          ("codex", "codex"))
+    check("the independent Windows row still shows its own path",
+          groups["windows_host"]["rows"][0]["executable"], "/mnt/c/codex.exe")
+
+
 def live() -> None:
     """The real report from this machine, when there is one. It is the only fixture nobody wrote."""
     inv = Path.home() / ".local/bin/hestia-agent-inventory"
@@ -551,6 +593,7 @@ def main() -> int:
         registry_members()
         cleanup()
         member_ids()
+        windows_host()
         live()
     else:
         print("SKIPPED: behaviour -- no node on PATH (the source contract above still ran)")

@@ -20,13 +20,11 @@
 //! ## Why now
 //!
 //! #502 declares `gate_escalation_expired` and `gate_escalation_withdrawn` in
-//! `GOVERNANCE_EVENTS`, so a lapse and a withdrawal now *render* differently in the ledger.
-//! Neither name is in `DERIVATION_EVENT_TYPES`, so both are still filtered out in SQL and
-//! *score* identically — invisibly. That asymmetry (#503) is not a typo in #502; it is what
-//! an unguarded declaration looks like from the outside. This test does not decide whether
-//! the fold *should* see those events — that is an operator question. It makes the answer
-//! **loud** instead of silent: whichever way it is decided, the list and the scorers can no
-//! longer disagree without a red test.
+//! `GOVERNANCE_EVENTS`, so a lapse and a withdrawal *render* differently in the ledger.
+//! #503 makes the scoring asymmetry explicit: withdrawal is attributable member conduct and
+//! belongs in the fold at 0.85, while expiry has no performer and stays out. The declared set
+//! below is the UNION of the legacy list and the live governance prefilter, so adding a scorer
+//! to only one list cannot silently zero the other path.
 //!
 //! ## What is asserted, and what each assertion is worth
 //!
@@ -39,7 +37,9 @@
 //! Both directions currently hold: ten names declared, ten names read, equal. That equality
 //! is a measured result, not an assumption — and it is unpinned until this file exists.
 
-use hestia::derivation::{DERIVATION_EVENT_TYPES, IDENTITY_ALIAS_EVENT};
+use hestia::derivation::{
+    DERIVATION_EVENT_TYPES, DERIVATION_GOVERNANCE_EVENT_TYPES, IDENTITY_ALIAS_EVENT,
+};
 use std::collections::BTreeSet;
 
 const SRC: &str = include_str!("../src/derivation.rs");
@@ -148,6 +148,7 @@ fn event_types_read_by_the_fold() -> BTreeSet<String> {
 fn declared() -> BTreeSet<String> {
     DERIVATION_EVENT_TYPES
         .iter()
+        .chain(DERIVATION_GOVERNANCE_EVENT_TYPES.iter())
         .map(|s| (*s).to_string())
         .collect()
 }

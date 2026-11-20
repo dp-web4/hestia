@@ -23,7 +23,8 @@ A tool call is a governance write only if a WRITE-POSITION argument resolves int
   * Bash: parsed write positions only — redirect targets (>, >>, &>, >|), tee arguments,
     cp/install/rsync DESTINATION (mv: EVERY operand — the source is destroyed too), sed -i
     file args, chmod/chown/chgrp/truncate/ln -sf targets, rm/unlink/rmdir/shred targets,
-    dd of=, touch targets, git checkout -- / git restore / git clean pathspecs.
+    dd of=, touch targets, git checkout -- / git restore / git clean / git rm / git mv
+    pathspecs (git rm/mv --dry-run/-n writes nothing).
 A command that merely NAMES a closure file in a read position (grep pattern, find -name, cat
 source, cp SOURCE, ls) is classified "read" — allowed, witnessed by the caller. Payload text
 (Write `content`, Edit `old_string`/`new_string`, heredoc bodies) is NEVER a haystack: a
@@ -1379,6 +1380,23 @@ def _output_verb_write_targets(name: str, args: list, path_pinned: bool = False)
     return None
 
 
+# One literal word: plain path characters only (#1583). A lone cp/install/rsync/ln positional made of
+# anything else (a glob, a brace, `$`, a backtick, zsh's `<n-m>`) can expand to source AND destination.
+_PLAIN_WORD = re.compile(r"[A-Za-z0-9_./~+@%,:= -]+")
+
+
+def _last_positional_dest(pos: list) -> list:
+    """The destination of a `SRC... DEST` command: the last positional, when there are two or more.
+    A single positional names no destination only if it is one literal word. `cp G/x{.py,_test.py}`,
+    `cp G/x*`, `cp $X`, `set -- A B; cp "$@"` and `ln -f G/x*` all run as `CMD SRC DEST`, and DEST
+    may be a closure file, so a non-literal lone word is out of grammar: a write iff closure
+    vocabulary appears in the line (#1583). The test is inverted (allow plain, refuse the rest) so
+    no expansion form, in bash or zsh, needs listing."""
+    if len(pos) == 1 and not _PLAIN_WORD.fullmatch(pos[0]):
+        raise _OutOfGrammar()
+    return [pos[-1]] if len(pos) >= 2 else []
+
+
 def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:
     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
     their file args are read positions by default (the anti-FP stance; the daemon's
@@ -1400,7 +1418,7 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
             return pos + ([tdir] if tdir else [])
         if tdir:
             return [tdir]
-        return [pos[-1]] if len(pos) >= 2 else []
+        return _last_positional_dest(pos)
     if name == "tee":
         return _positionals(args)
     if name == "dd":
@@ -1419,6 +1437,17 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         _, pos, seen, vals = _parse_opts(args, *_SED)
         scripts = vals.get("-e", []) + vals.get("--expression", [])
         operands = pos if scripts else pos[1:]
+        bsd_suffix = (not scripts and not vals.get("-f") and not vals.get("--file")
+                      and vals.get("-i") and all(v is None for v in vals["-i"])
+                      and "--in-place" not in seen and len(pos) >= 3
+                      and (pos[0] == "" or pos[0].startswith(".")))
+        if bsd_suffix:
+            # BSD sed (macOS): a BARE `-i` takes the backup suffix as the NEXT argument
+            # (`sed -i '' SCRIPT FILE`, `sed -i .bak SCRIPT FILE`), so the script is the second
+            # positional, not an operand (#1598: a script naming a closure path was refused as a
+            # closure write). Taken only on this shape: as a GNU script, `''` edits nothing and a
+            # dot-led one is a syntax error, so no GNU act that writes content reads this way.
+            scripts, operands = pos[1:2], pos[2:]
         if not scripts:
             scripts = pos[:1]
         if any(_SED_WRITE.search(sc) for sc in scripts):
@@ -1436,7 +1465,7 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         tdir = _opt_value(args, "-t", "--target-directory")
         if tdir:
             return [tdir]
-        return [pos[-1]] if len(pos) >= 2 else []
+        return _last_positional_dest(pos)
     if name in ("rm", "unlink", "rmdir", "shred"):
         return _positionals(args)
     if name == "touch":
@@ -1521,6 +1550,15 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
             if "--" in rest:
                 return rest[rest.index("--") + 1:]
             return []
+        if sub in ("rm", "mv"):
+            options_end = rest.index("--") if "--" in rest else len(rest)
+            if "--dry-run" in rest[:options_end] or "-n" in rest[:options_end]:
+                return []
+            if sub == "rm" and any(
+                    a == "--pathspec-from-file" or a.startswith("--pathspec-from-file=")
+                    for a in rest[:options_end]):
+                raise _OpaqueWriter()
+            return _positionals(rest)
         if sub == "restore":
             return _positionals(rest, opts_with_value=("-s", "--source"))
         if sub == "clean":

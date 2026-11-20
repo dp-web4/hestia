@@ -98,14 +98,18 @@ pub enum HubUrlSource {
 /// `None` for anything that is not an http(s) URL — the list must never hold a
 /// value the client cannot dial.
 fn normalise_hub_url(raw: &str) -> Option<String> {
-    let s = raw.trim().trim_end_matches('/').to_string();
-    if s.starts_with("http://") || s.starts_with("https://") {
-        // A bare scheme with no host is not dialable.
-        let host = s.trim_start_matches("https://").trim_start_matches("http://");
-        if host.is_empty() { None } else { Some(s) }
-    } else {
-        None
+    let url = reqwest::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
     }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url.to_string().trim_end_matches('/').to_string())
 }
 
 impl HubUrls {
@@ -158,13 +162,30 @@ fn resolve_from_list(list: &HubUrls) -> (String, HubUrlSource) {
     (DEFAULT_HUB_URL.to_string(), HubUrlSource::Default)
 }
 
-/// Discovery may advertise a relative REST path (e.g. "/v1"); make it absolute.
-fn abs_rest(base: &str, rest: &str) -> String {
-    if rest.starts_with("http://") || rest.starts_with("https://") {
-        rest.trim_end_matches('/').to_string()
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), rest.trim_matches('/'))
+/// Discovery may advertise a relative REST path (e.g. "/v1"); make it absolute,
+/// but never let discovery choose a different origin than the operator selected.
+fn abs_rest(base: &str, rest: &str) -> Result<String, String> {
+    if rest.contains('?') || rest.contains('#') {
+        return Err("discovery endpoint query/fragment is not allowed".into());
     }
+    if rest.starts_with("http://") || rest.starts_with("https://") {
+        let base = reqwest::Url::parse(base).map_err(|e| format!("invalid selected hub URL: {e}"))?;
+        let endpoint = reqwest::Url::parse(rest).map_err(|e| format!("invalid discovery endpoint: {e}"))?;
+        if base.scheme() != endpoint.scheme()
+            || base.host_str() != endpoint.host_str()
+            || base.port_or_known_default() != endpoint.port_or_known_default()
+        {
+            return Err(format!("cross-origin discovery endpoint refused: {rest}"));
+        }
+        if !endpoint.username().is_empty() || endpoint.password().is_some() {
+            return Err("discovery endpoint user-info is not allowed".into());
+        }
+        return Ok(endpoint.to_string().trim_end_matches('/').to_string());
+    }
+    if rest.contains("://") {
+        return Err(format!("non-http discovery endpoint refused: {rest}"));
+    }
+    Ok(format!("{}/{}", base.trim_end_matches('/'), rest.trim_matches('/')))
 }
 
 fn hex_to_32(s: &str) -> Option<[u8; 32]> {
@@ -256,7 +277,10 @@ pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoRespo
         (list.entries, active, source, me)
     };
 
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
     let mut out = Vec::new();
     for e in entries {
         let mut row = serde_json::json!({
@@ -276,9 +300,13 @@ pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoRespo
                 row["hub_name"] = serde_json::json!(h.name);
             }
             if let Some(me) = me {
+                let rest = match abs_rest(&e.url, &info.endpoints.rest) {
+                    Ok(rest) => rest,
+                    Err(error) => return err_json(axum::http::StatusCode::BAD_GATEWAY, error),
+                };
                 let probe = format!(
                     "{}/hubs/{}/members/{}/pubkey",
-                    abs_rest(&e.url, &info.endpoints.rest).trim_end_matches('/'),
+                    rest.trim_end_matches('/'),
                     info.hub_lct_id, me
                 );
                 match tokio::time::timeout(NET_TIMEOUT, http.get(&probe).send()).await {
@@ -370,7 +398,10 @@ pub async fn hub_withdraw(
         Ok(i) => i,
         Err(e) => return err_json(axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    let rest = abs_rest(&url, &info.endpoints.rest);
+    let rest = match abs_rest(&url, &info.endpoints.rest) {
+        Ok(rest) => rest,
+        Err(error) => return err_json(axum::http::StatusCode::BAD_GATEWAY, error),
+    };
     let client = HubClient::new();
     match tokio::time::timeout(
         NET_TIMEOUT,
@@ -420,7 +451,10 @@ pub async fn hub_status(State(state): State<SharedState>) -> impl IntoResponse {
                 None => serde_json::json!({ "state": "no_identity" }),
                 Some((lct, local_pub)) => {
                     let hub_id = info.hubs.first().map(|h| h.id).unwrap_or(info.hub_lct_id);
-                    let rest = abs_rest(&url, &info.endpoints.rest);
+                    let rest = match abs_rest(&url, &info.endpoints.rest) {
+        Ok(rest) => rest,
+        Err(error) => return err_json(axum::http::StatusCode::BAD_GATEWAY, error),
+    };
                     let client = HubClient::new();
                     match tokio::time::timeout(
                         NET_TIMEOUT,
@@ -663,7 +697,10 @@ pub async fn hub_join(
         Ok(i) => i,
         Err(e) => return err_json(axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    let rest = abs_rest(&url, &info.endpoints.rest);
+    let rest = match abs_rest(&url, &info.endpoints.rest) {
+        Ok(rest) => rest,
+        Err(error) => return err_json(axum::http::StatusCode::BAD_GATEWAY, error),
+    };
 
     let client = HubClient::new();
     let joined = tokio::time::timeout(
@@ -701,8 +738,14 @@ pub async fn hub_topics(State(state): State<SharedState>) -> impl IntoResponse {
         Ok(i) => i,
         Err(e) => return err_json(axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    let rest = abs_rest(&url, &info.endpoints.rest);
-    let http = reqwest::Client::new();
+    let rest = match abs_rest(&url, &info.endpoints.rest) {
+        Ok(rest) => rest,
+        Err(error) => return err_json(axum::http::StatusCode::BAD_GATEWAY, error),
+    };
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
 
     let list_url = format!("{rest}/hubs/{}/topics", info.hub_lct_id);
     let list: serde_json::Value = match tokio::time::timeout(NET_TIMEOUT, async {
@@ -790,14 +833,20 @@ async fn submit_act(
         Ok(i) => i,
         Err(e) => return err_json(axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
     };
-    let rest = abs_rest(&url, &info.endpoints.rest);
+    let rest = match abs_rest(&url, &info.endpoints.rest) {
+        Ok(rest) => rest,
+        Err(error) => return err_json(axum::http::StatusCode::BAD_GATEWAY, error),
+    };
     let client = HubClient::new();
 
     let outcome = tokio::time::timeout(NET_TIMEOUT, async {
         let challenge = client.challenge(&rest, member_lct).await?;
         let envelope = SignedEnvelope::create(challenge.nonce, payload, member_lct, &keypair);
         let events_url = format!("{rest}/hubs/{}/events", info.hub_lct_id);
-        let resp = reqwest::Client::new()
+        let resp = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default()
             .post(&events_url)
             .json(&envelope)
             .send()
@@ -876,6 +925,47 @@ mod tests {
         assert_eq!(normalise_hub_url("https://"), None);
         assert_eq!(normalise_hub_url("   "), None);
         assert_eq!(normalise_hub_url("ftp://h"), None);
+    }
+
+    #[test]
+    fn parser_rejects_ambiguous_authorities_and_accepts_a_local_hub() {
+        assert_eq!(normalise_hub_url("http://127.0.0.1:8770/"), Some("http://127.0.0.1:8770".into()));
+        assert_eq!(normalise_hub_url("https://?"), None);
+        assert_eq!(normalise_hub_url("https://user@example.com"), None);
+        assert_eq!(normalise_hub_url("https://user:pass@example.com"), None);
+        assert_eq!(normalise_hub_url("https://example.com/#fragment"), None);
+        assert_eq!(normalise_hub_url("https://example.com/?query=1"), None);
+        assert_eq!(normalise_hub_url("https://example.com:8443/base/"), Some("https://example.com:8443/base".into()));
+    }
+
+    #[test]
+    fn discovery_cannot_move_rest_to_another_origin() {
+        let selected = "http://127.0.0.1:8770";
+        assert_eq!(abs_rest(selected, "/v1").unwrap(), "http://127.0.0.1:8770/v1");
+        let cross = abs_rest(selected, "http://127.0.0.1:9999/v1").unwrap_err();
+        assert!(cross.contains("cross-origin"), "{cross}");
+        assert!(abs_rest(selected, "https://127.0.0.1:8770/v1").is_err(), "scheme is origin too");
+        assert!(abs_rest(selected, "http://user@127.0.0.1:8770/v1").is_err());
+        assert!(abs_rest(selected, "file:///tmp/hook").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed_to_another_origin() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "http://127.0.0.1:1")],
+            )
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let error = HubClient::new()
+            .discover(&format!("http://{addr}"))
+            .await
+            .expect_err("redirect must be refused, not followed");
+        server.abort();
+        assert!(format!("{error:#}").contains("302"), "{error:#}");
     }
 
     #[test]
