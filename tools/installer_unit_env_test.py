@@ -23,7 +23,8 @@ loss. The reverse — the installer setting something the template does not ment
 allowed here, because the installer legitimately substitutes host-derived values.
 
 Same class as `merged != deployed` and `registration != reachability`: two spellings of one
-fact, and the one nobody reads drifts.
+fact, and the one nobody reads drifts. The #592 `MemoryHigh=1G` service directive is pinned
+across the same pair: dropping it from either producer silently removes the ceiling.
 """
 import pathlib
 import re
@@ -80,7 +81,16 @@ def main():
         f"loses its only signal about whether a deploy landed."
     )
 
+    for name, text in (("template", template), ("installer", unit)):
+        assert re.search(r"^MemoryHigh=1G$", text, re.M), (
+            f"{name} drops the provisional #592 memory bound. Validate 1G against cgroup "
+            "MemoryCurrent/MemoryPeak and memory.stat during the soak, and record both "
+            "memory.events high and gate-unavailable frequency before treating it as "
+            "validated. Process RSS alone is not the cgroup memory controlled here."
+        )
+
     print(f"ok: installer sets all {len(declared)} declared Environment vars {sorted(declared)}")
+    print("ok: both systemd producers carry MemoryHigh=1G")
     return 0
 
 
