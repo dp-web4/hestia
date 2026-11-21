@@ -343,6 +343,7 @@ pub fn get_preset(name: &str) -> Option<PresetDefinition> {
             // the gate and are not relaxed by any preset (hestia_single_gate._sequence).
             description: "No society-safety rules (observe only). Scope, governance closure and secret egress still apply".into(),
             config: PolicyConfig {
+                resources: Vec::new(),
                 default_policy: PolicyDecision::Allow,
                 enforce: false,
                 rules: vec![],
@@ -352,6 +353,7 @@ pub fn get_preset(name: &str) -> Option<PresetDefinition> {
             name: "safety".into(),
             description: "Deny destructive bash, deny secret file reads, warn on network".into(),
             config: PolicyConfig {
+                resources: Vec::new(),
                 default_policy: PolicyDecision::Allow,
                 enforce: true,
                 rules: safety_rules(),
@@ -361,6 +363,7 @@ pub fn get_preset(name: &str) -> Option<PresetDefinition> {
             name: "strict".into(),
             description: "Deny everything except Read, Glob, Grep, and TodoWrite".into(),
             config: PolicyConfig {
+                resources: Vec::new(),
                 default_policy: PolicyDecision::Deny,
                 enforce: true,
                 rules: vec![PolicyRule {
@@ -387,6 +390,7 @@ pub fn get_preset(name: &str) -> Option<PresetDefinition> {
                 "Same rules as safety but enforce=false (dry-run, logs what would be blocked)"
                     .into(),
             config: PolicyConfig {
+                resources: Vec::new(),
                 default_policy: PolicyDecision::Allow,
                 enforce: false,
                 rules: safety_rules(),

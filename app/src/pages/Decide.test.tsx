@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import type { PendingEscalation, PendingScopeRequest } from "../lib/types";
+import type { PendingEscalation, PendingRemedyRequest, PendingScopeRequest } from "../lib/types";
 
 const getDashboard = vi.fn();
 const operatorStatus = vi.fn();
@@ -68,6 +68,26 @@ function gateScopeRequest(over: Partial<PendingScopeRequest> = {}): PendingScope
     once_available: true,
     ...over,
   });
+}
+
+function remedy(over: Partial<PendingRemedyRequest> = {}): PendingRemedyRequest {
+  return {
+    key: "cargo/scratch",
+    resource_id: "cargo",
+    floor_id: "scratch",
+    measures: "free disk at /mnt/c (permille)",
+    min: 50,
+    max: null,
+    reading: 41,
+    remedy: "free disk on C:",
+    mode: "observe",
+    opened_at: 1_700_000_000,
+    last_seen_at: 1_700_000_600,
+    acts_met: 3,
+    last_member: "claude-code",
+    opened_entry: null,
+    ...over,
+  };
 }
 
 afterEach(() => {
@@ -408,6 +428,50 @@ describe("Decide — scope requests (Sprint 2)", () => {
     render(<Decide />);
     await screen.findByText(/blocked since July/);
     expect(screen.queryByText(/Nothing is waiting on you/)).toBeNull();
+  });
+
+  it("shows a floor remedy with its reading and bound (#1548)", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [],
+      pending_remedy_requests: [remedy()],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    await screen.findByText(/free disk on C:/);
+    expect(screen.getByText(/below 50/)).toBeTruthy();
+    expect(screen.getByText(/closes by itself when a later reading recovers/)).toBeTruthy();
+    expect(screen.queryByText(/Nothing is waiting on you/)).toBeNull();
+  });
+
+  it("shows a health entry without a floor comparison or a reading's promise (#1551)", async () => {
+    // The payload `resource_remedy::rehydrate` stands in when remedy history cannot be read.
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [],
+      pending_remedy_requests: [
+        remedy({
+          key: "rehydrate/remedy-requests",
+          resource_id: "hestia",
+          floor_id: "remedy-rehydration",
+          measures: "open remedy requests rebuilt from the chain at startup",
+          min: null,
+          max: null,
+          reading: null,
+          remedy: "the daemon could not read its remedy history (db locked)",
+          mode: "health",
+          acts_met: 0,
+          last_member: "hestia",
+        }),
+      ],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    render(<Decide />);
+    await screen.findByText(/could not read its remedy history/);
+    expect(screen.getByText(/Hestia health \(hestia\/remedy-rehydration\)/)).toBeTruthy();
+    expect(screen.queryByText(/above 0/)).toBeNull();
+    expect(screen.queryByText(/below/)).toBeNull();
+    expect(screen.queryByText(/later reading recovers/)).toBeNull();
   });
 
   // spec decide-escalation obligations: the measured write effect, copy and patch (#648)

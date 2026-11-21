@@ -207,6 +207,14 @@ pub struct DashboardSnapshot {
     /// that implies something is owed.
     #[serde(default)]
     pub pending_scope_requests: Vec<serde_json::Value>,
+    /// Remedy requests (#1548): a gated resource's floor has failed (cbp's scratch disk below
+    /// what a large build needs, memory short, a critical process running), so acts that consume
+    /// it are refused, or would be in observe mode, and no member can fix it by changing its
+    /// act. The fix is the operator's, and this is where the operator is told: on the snapshot
+    /// both operator surfaces already poll, for the reason `pending_scope_requests` records.
+    /// One entry per resource and floor, closed by the first later reading that meets it.
+    #[serde(default)]
+    pub pending_remedy_requests: Vec<serde_json::Value>,
     /// MRH scope grants currently in force — BOTH kinds, each labelled with its lifetime.
     ///
     /// Rides the snapshot for the reason the two fields above do, and the doc comment on
@@ -1773,6 +1781,11 @@ impl ServerState {
                     })
                     .collect()
             },
+            pending_remedy_requests: self
+                .remedy_requests
+                .values()
+                .map(crate::server::resource_remedy::RemedyRequest::to_value)
+                .collect(),
             pending_scope_requests: {
                 let now = crate::server::gate_escalation::now_secs();
                 let mut v: Vec<serde_json::Value> = self
