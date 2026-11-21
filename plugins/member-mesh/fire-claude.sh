@@ -113,7 +113,9 @@ d=json.load(open(sys.argv[1]))
 live=[x for x in d.get("notices",[]) if x.get("kind")!="ack"]
 clean=lambda s: re.sub(r"[\x00-\x1f\x7f]","",str(s))[:512]
 for x in live:
-    if x.get("from_plugin") in ALLOW or (x.get("from_plugin"),x.get("kind")) in DAEMON:
+    if (x.get("from_plugin") in ALLOW or (x.get("from_plugin"),x.get("kind")) in DAEMON
+            or (x.get("kind") == "delivery-status"
+                and str(x.get("from_plugin", "")).startswith("watch-"))):
         # AN UNDELIVERED ECHO IS NOT AN ANSWER (2026-08-06).
         # `report_unreachable` bounces the SENDER'S OWN pointer back, truncated at the
         # 512-byte MTU with the tail swapped for `#undelivered:fire-rc=...`. Notice 1172
@@ -140,12 +142,14 @@ for x in live:
         # layer up, so it is gone rather than re-justified.
         _ptr = clean(x.get('pointer_uri',''))
         if "#undelivered:" in _ptr:
+            artifact = ("delivery-status" if x.get("kind") == "delivery-status"
+                        else "legacy delivery-status artifact")
             print(f"!! NOT-AN-ANSWER id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} "
                   f"from={clean(x.get('from_plugin',''))} queued_at={clean(x.get('queued_at',''))} "
                   f"— YOUR OWN notice echoed back by the watcher "
                   f"({clean(_ptr.split('#undelivered:',1)[1])}). That `from=` is the watcher's "
                   f"attribution, not a sender's: this carries your text, not a peer's reply, "
-                  f"and nothing is discharged by it. pointer={_ptr}")
+                  f"and nothing is discharged by it. {artifact}. pointer={_ptr}")
         else:
             print(f"- id={clean(x.get('id',''))} kind={clean(x.get('kind',''))} from={clean(x.get('from_plugin',''))} pointer={_ptr} queued_at={clean(x.get('queued_at',''))}")
     else:

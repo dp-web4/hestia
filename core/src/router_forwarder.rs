@@ -198,6 +198,7 @@ const ROUTED_MEMBER_NOTICE_ROOTS: &[&str] = &[
     "handoff",
     "forum-note",
     "ack",
+    "delivery-status",
 ];
 
 fn routable_member_notice_kind(kind: &str) -> bool {
@@ -1931,6 +1932,8 @@ mod tests {
         assert!(routable_member_notice_kind("coordination"));
         assert!(routable_member_notice_kind("coordination.renotify"));
         assert!(routable_member_notice_kind("review_done.pr"));
+        assert!(routable_member_notice_kind("delivery-status"));
+        assert!(routable_member_notice_kind("delivery-status.retry"));
         assert!(!routable_member_notice_kind("unreachable"));
         assert!(!routable_member_notice_kind("disposition"));
         assert!(!routable_member_notice_kind("coordinationX"));

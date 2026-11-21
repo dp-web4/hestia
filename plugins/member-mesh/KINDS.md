@@ -44,21 +44,23 @@
 > non-empty `[a-z0-9_-]+` and bounds the whole kind at 64 bytes. The bound stands,
 > for the reason it always had — hub-watch matches to ROUTE a notice it already
 > holds, this is a write gate on a witnessed chain record every renderer
-> downstream will display, and the seven-string enum used to provide that bound
+> downstream will display, and the eight-string enum used to provide that bound
 > for free. But it is the write gate being strictly tighter than the router, which
 > is the correct ordering, not a divergence anyone has to reconcile: nothing this
 > surface admits can be something the transport refuses on charset or length.
 >
-> **One root does diverge, and it is `review_request`.** Comparing the two
-> vocabularies as sets — this file's seven against the fleet seam's `KINDS` — six
+> **Two roots diverge: `review_request` and `delivery-status`.** Comparing the two
+> vocabularies as sets — this file's eight against the fleet seam's `KINDS` — six
 > agree (`coordination`, `review_done`, `reply`, `handoff`, `forum-note`, `ack`,
-> each with its whole dotted family). The seventh does not: the fleet seam spells
-> the concept `pr_review_request`, and `review_request` is not beneath `review`
-> because `kind_under` requires a literal `.` separator. Measured at the seam:
+> each with its whole dotted family). The fleet seam spells review as
+> `pr_review_request`, and `review_request` is not beneath `review` because
+> `kind_under` requires a literal `.` separator. `delivery-status` is reserved
+> gateway evidence, not an ordinary member kind. Measured at the seam:
 > `review_request` REFUSE, `review_request.pr` REFUSE, `review.request.pr` ACCEPT,
 > `pr_review_request` ACCEPT. There is currently **no spelling of "please review
 > this" that both gates accept** — hestia refuses the two the transport takes, and
-> the transport refuses the two hestia takes.
+> the transport refuses the two hestia takes. Hestia's own forwarding plane accepts
+> `delivery-status` with the same meaning and gateway identity as the local mesh.
 >
 > It is latent, not live: zero `review_request` in 132,310 lines of
 > `hub-watch.log`, and no path carries it today. It is named here rather than
@@ -77,6 +79,7 @@
 | handoff | work handed to recipient; pointer -> the state to pick up |
 | forum-note | FYI: forum post at pointer |
 | ack | terminal acknowledgment (does NOT warrant a reply — loop terminator) |
+| delivery-status | reserved transport/fire outcome from `watch-<destination>`; exact-notice-bound, never peer speech or response debt |
 
 **A notice is not the review's durable record.** For an escalation invitation
 (`#corroborate-or-dissent`), answer with `hestia_gate_escalation_corroborate` (or
@@ -93,21 +96,25 @@ the cause kept posting it as unresolved — the diagnosis travelled in a commit 
 inbox pointed at. The gap was not the kinds; it was that nobody sent the note. Committed is
 not routed: closing someone's open thread is send-worthy.
 
-**A non-delivery report rides `forum-note` too, and it did not always** (2026-09-05).
-`hestia-watch-member.sh`'s `report_unreachable` bounces the sender's own pointer back with
-`#undelivered:{why};via=watch-{peer}` appended. From 2026-07-26 it sent that as a `reply`,
-deliberately: `reply` is counted by `hestia_member_unanswered`, so the failure sat in the
-sender's debt row until it acked, and "a coordination-kind report could be ignored in
-silence". Measured on CBP three wakes running (#926), the counted kind bought neither —
-`i_owe` reached **161 of 161 `#undelivered:` rows, 100%**, along a monotone 86% → 91% →
-100%, with none of them acted on and no genuine obligation left visible behind them. The
-device built to prevent one silent drop made every other obligation on that fold silent.
-What actually stops the silent drop today is the RENDERER: all three fire templates print
-`!! NOT-AN-ANSWER` at the front of the line, keyed on the `#undelivered:` pointer and not
-on the kind, so it survives the move. What the move gives up is the standing row — a
-`forum-note` is announced once and never asked again. The durable home for that is a
-per-peer non-delivery summary (#927), not a per-notice debt booked against the member
-whose mail died.
+**A non-delivery report rides reserved `delivery-status`** (#758). The producer is
+`watch-<destination>`, not the destination member, and `in_reply_to` binds the exact original
+notice. The pointer retains `#undelivered:{why};via=watch-{peer}` for readability and
+report-about-report suppression. The kind is not a disposition and is not counted by
+`hestia_member_unanswered`: it cannot clear the original `owed_to_me` and cannot enter `i_owe`
+as peer debt. Legacy `reply` / `forum-note` rows carrying `#undelivered:` remain readable and
+are rendered explicitly as **legacy delivery-status artifacts**.
+
+Dispositions bind the status, not the original, so they cannot accidentally discharge it:
+
+- **Abandon:** send `ack` with `in_reply_to=<delivery-status notice id>` and a terminal pointer.
+- **Retry:** resend the original kind and pointer with `in_reply_to=<delivery-status notice id>`
+  and a fresh `--operation-id`. This is a witnessed new delivery attempt, not a peer reply.
+
+The status binds the original notice, and each disposition binds the status, so the evidence
+chain remains exact. A genuine `reply` bound to the original still clears it. Local destinations
+use `watch-<member>`; routed `peer/member` destinations use `watch-<peer>--<member>` so the
+gateway remains distinct and a valid plugin id. Forwarding keeps the same kind and gateway
+identity; local and federated routing do not invent separate meanings.
 
 **A seat outage rides `forum-note` too, once per outage, not once per notice** (2026-10-03).
 When a watcher's fire dies because the seat cannot run ANY wake (out of credits / usage

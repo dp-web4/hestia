@@ -13,7 +13,7 @@ fire_concurrency_test.py: the test cannot pass by exercising a path only the
 test uses.
 
 Four cases:
-  A  ordinary notice          -> one `forum-note` report, bound (in_reply_to=id),
+  A  ordinary notice          -> one `delivery-status` report, bound (in_reply_to=id),
                                  pointer keeps naming the content and gains
                                  `#undelivered:fire-rc=N;via=watch-<member>` —
                                  the fragment names the routing verdict AND the
@@ -68,6 +68,7 @@ class StubDaemon:
         self.notices = notices
         self.notify_error = notify_error
         self.notify_calls = []
+        self.connect_calls = []
         self.inbox_calls = 0
         outer = self
 
@@ -98,6 +99,7 @@ class StubDaemon:
                 tool = req["params"]["name"]
                 args = req["params"].get("arguments", {})
                 if tool == "hestia_connect":
+                    outer.connect_calls.append(args)
                     payload = {"sessionId": "stub-session"}
                 elif tool == "hestia_member_inbox":
                     outer.inbox_calls += 1
@@ -214,14 +216,17 @@ def main():
     reports = [c for c in daemon.notify_calls]
     ok = (len(reports) == 1
           and reports[0].get("to_plugin_id") == "claude-code"
-          and reports[0].get("kind") == "forum-note"
+          and reports[0].get("kind") == "delivery-status"
           and reports[0].get("in_reply_to") == 42
           and reports[0].get("pointer_uri")
           == NOTICE_A["pointer_uri"]
           + "#undelivered:fire-rc=3;why=unknown;via=watch-dest-member")
-    check("A: exactly one bound forum-note report to the original sender, pointer "
+    check("A: exactly one bound delivery-status report to the original sender, pointer "
           "names the undelivered content + the routing verdict + the observer", ok,
           f"notify_calls={json.dumps(reports)}\n{out}")
+    check("A: the producer is the gateway, not the destination member",
+          any(c.get("plugin_id") == "watch-dest-member" for c in daemon.connect_calls),
+          f"connect_calls={json.dumps(daemon.connect_calls)}")
     check("A: report journaled", "UNREACHABLE reported" in out, out)
 
     # Case G (CBP review §5) — the report's own receipt is not success-shaped:

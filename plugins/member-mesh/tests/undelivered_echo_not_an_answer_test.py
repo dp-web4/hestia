@@ -179,6 +179,8 @@ for script, stub, peer in CASES:
               f"`#undelivered:` would be mislabelled — from= is the evidence that "
               f"disproves it, and dropping it strips the reader's only recourse; "
               f"line={str(line)[:300]!r}")
+        check(f"B1e. {script}: legacy replies are classified as legacy delivery-status artifacts",
+              "legacy delivery-status artifact" in (line or ""), f"line={str(line)[:300]!r}")
 
     # B2. THE REGRESSION (kimi review of PR #216, finding 2). 1172 was ALONE in
     #     its batch. If the label costs the wake, the misread is "fixed" by never
@@ -234,6 +236,23 @@ for script, stub, peer in CASES:
         check(f"B5b. {script}: the withheld notice's pointer is still withheld",
               "WITHHELD" in (prompt or "") and "evil.example" not in (prompt or ""),
               f"prompt={str(prompt)[:300]!r}")
+
+
+for script, stub, gateway in (("fire-claude.sh", "claude", "watch-claude-code"),
+                              ("fire-kimi.sh", "kimi", "watch-kimi-code"),
+                              ("fire-codex.sh", "codex", "watch-codex")):
+    with tempfile.TemporaryDirectory() as tmp:
+        r, prompt = fire(script, stub, [
+            notice(12, gateway, kind="delivery-status", pointer=PTR_1172)], tmp)
+        line = digest_line(prompt, "id=12")
+        check(f"B6. {script}: reserved delivery-status is admitted from its gateway",
+              r.returncode == 0 and line is not None and line.startswith("!! NOT-AN-ANSWER")
+              and f"from={gateway}" in line,
+              f"rc={r.returncode} line={str(line)[:300]!r}")
+        check(f"B6b. {script}: the new kind is not mislabeled as a legacy artifact",
+              "delivery-status" in (line or "")
+              and "legacy delivery-status artifact" not in (line or ""),
+              f"line={str(line)[:300]!r}")
 
 
 print()

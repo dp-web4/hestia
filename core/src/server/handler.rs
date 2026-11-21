@@ -797,7 +797,7 @@ fn hestia_tools() -> Vec<Tool> {
                         // `kind_under` does, so the published interface and the gate admit
                         // the same set and a validating client fails fast for the same
                         // reasons the daemon would.
-                        "description": "Notice kind (see plugins/member-mesh/KINDS.md). A dotted path narrowing left-to-right, accepted by PREFIX: any specialization of a listed root is accepted, so `coordination.renotify` and `review_done.pr` need no vocabulary edit. Roots: coordination, review_request, review_done, reply, handoff, forum-note, ack. Only these roots — a kind that is not one of them, or a longer word merely starting like one (`coordinationX`), is refused. NOTE: the `review_request` family is accepted HERE but refused by the fleet transport, which spells the concept `pr_review_request`; see KINDS.md.",
+                        "description": "Notice kind (see plugins/member-mesh/KINDS.md). A dotted path narrowing left-to-right, accepted by PREFIX: any specialization of a listed root is accepted, so `coordination.renotify` and `review_done.pr` need no vocabulary edit. Roots: coordination, review_request, review_done, reply, handoff, forum-note, ack, delivery-status. delivery-status is reserved for a watch-<destination> gateway and never discharges or creates peer-response debt. Only these roots — a kind that is not one of them, or a longer word merely starting like one (`coordinationX`), is refused. NOTE: the `review_request` family is accepted HERE but refused by the fleet transport, which spells the concept `pr_review_request`; see KINDS.md.",
                         "pattern": member_notice_kind_pattern(),
                         "maxLength": MAX_NOTICE_KIND_BYTES
                     },
@@ -5442,7 +5442,7 @@ async fn tool_notify(state: &SharedState, args: &Value) -> ToolResult {
 /// queued (O: witness precedes delivery), carrying sender WHO + recipient + kind +
 /// pointer — never a payload.
 ///
-/// **Six of these seven cross the fleet seam; `review_request` does not.** Compared
+/// **Seven of these eight cross the fleet seam; `review_request` does not.** Compared
 /// as sets against `hub-watch.sh`'s `KINDS` (Sprout on the receiver seat, reproduced
 /// on Legion, 2026-09-06): `coordination`, `review_done`, `reply`, `handoff`,
 /// `forum-note` and `ack` are all accepted there, each with its whole dotted family.
@@ -5469,6 +5469,7 @@ const MEMBER_NOTICE_KINDS: &[&str] = &[
     "handoff",
     "forum-note",
     "ack",
+    "delivery-status",
 ];
 
 /// A kind is a name, not a payload. Bounded for the same reason
@@ -5477,7 +5478,7 @@ const MEMBER_NOTICE_KINDS: &[&str] = &[
 ///
 /// This bound is NEW with fractal acceptance and is the cost of it. While the gate
 /// was `MEMBER_NOTICE_KINDS.contains(&kind)`, the vocabulary bounded the field for
-/// free — seven known strings, none of them long, none containing a control
+/// free — eight known strings, none of them long, none containing a control
 /// character. Opening the tail to specializations opens it to arbitrary bytes, so
 /// the bound the enum was providing implicitly has to be restated explicitly. Same
 /// for the segment charset in [`kind_under`]: a newline in a kind is not a
@@ -5502,7 +5503,7 @@ const MAX_NOTICE_KIND_BYTES: usize = 64;
 /// merely starts with the same bytes — `coordination` admits `coordination.renotify`
 /// and refuses `coordinationX`. That is what keeps the daemon-only kinds
 /// unforgeable: [`DAEMON_NOTICE_KIND_UNREACHABLE`] and
-/// [`DAEMON_NOTICE_KIND_DISPOSITION`] are new ROOTS, prefix-disjoint from all seven
+/// [`DAEMON_NOTICE_KIND_DISPOSITION`] are new ROOTS, prefix-disjoint from all eight
 /// member entries, so no dotted member kind can reach them. That disjointness is an
 /// invariant this change depends on rather than a coincidence, so
 /// `member_notify_admits_fractal_specializations` asserts it instead of this
@@ -6011,6 +6012,14 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             None,
         ));
     };
+    if crate::storage::inbox::is_delivery_status_kind(&kind)
+        && !sender.plugin_id.starts_with("watch-") {
+        return Ok(hestia_error_envelope(
+            "hestia.member_notify_delivery_status_requires_gateway",
+            "delivery-status is reserved for a watch-<destination> gateway, never peer speech",
+            Some(json!({"kind": kind, "sender_plugin_id": sender.plugin_id})),
+        ));
+    }
 
     // D2c retry identity. The key is scoped by the authenticated LEGACY actor
     // (plugin_id); the immutable binding names the application send intent and
@@ -6211,6 +6220,10 @@ async fn tool_member_notify(state: &SharedState, args: &Value) -> ToolResult {
             .map_err(|e| anyhow::anyhow!("resolving in_reply_to: {e}"))?
         {
             Some(addressee) if addressee == sender.plugin_id => binding_verified = true,
+            Some(addressee) if crate::storage::inbox::is_delivery_status_kind(&kind)
+                && sender.plugin_id == crate::storage::inbox::delivery_gateway_id(&addressee) => {
+                binding_verified = true
+            }
             Some(addressee) => {
                 return Ok(hestia_error_envelope(
                     "hestia.member_notify_reply_binding_not_yours",
@@ -13648,6 +13661,124 @@ mod member_mesh_tests {
         assert!(scope.contains("does not prove it was returned or read"), "{rows}");
     }
 
+    #[tokio::test]
+    async fn delivery_status_binds_gateway_and_dispositions_without_peer_debt() {
+        let (_dir, state) = test_state().await;
+        let claude = connect(&state, "claude-code").await;
+        let kimi = connect(&state, "kimi-code").await;
+        let gateway = connect(&state, "watch-kimi-code").await;
+        let original = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "pr/1", "session_id": claude}),
+        )
+        .await
+        .unwrap();
+        let original_id = original["queued_id"].as_u64().unwrap();
+        let before = tool_member_unanswered(&state, &json!({"session_id": claude, "older_than_secs": -1}))
+            .await.unwrap();
+        assert!(before["owed_to_me"].as_array().unwrap().iter()
+            .any(|row| row["id"] == original_id), "the original starts owed: {before}");
+        let status = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "delivery-status",
+                    "pointer_uri": "pr/1#undelivered:fire-rc=3;via=watch-kimi-code",
+                    "in_reply_to": original_id, "session_id": gateway}),
+        )
+        .await
+        .expect("the exact destination gateway can report a failed delivery");
+        let status_id = status["queued_id"].as_u64()
+            .unwrap_or_else(|| panic!("delivery status failed: {status}"));
+        assert_eq!(status["kind"], "delivery-status");
+        assert_eq!(status["in_reply_to"], original_id);
+        let mail = tool_member_inbox(&state, &json!({"session_id": claude, "peek": true}))
+            .await.unwrap();
+        let stored = mail["notices"].as_array().unwrap().iter()
+            .find(|row| row["id"] == status_id).expect("the status is in the sender's inbox");
+        assert_eq!(stored["from_plugin"], "watch-kimi-code");
+        assert!(!MEMBER_KINDS_AWAIT_RESPONSE.contains(&"delivery-status"));
+
+        let ordinary = connect(&state, "codex").await;
+        let refused = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "delivery-status",
+                    "pointer_uri": "pr/1#undelivered:fire-rc=3", "in_reply_to": original_id,
+                    "session_id": ordinary}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["_hestia_error"]["code"],
+                   "hestia.member_notify_delivery_status_requires_gateway");
+
+        let wrong_gateway = connect(&state, "watch-claude-code").await;
+        let refused = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "delivery-status",
+                    "pointer_uri": "pr/1#undelivered:fire-rc=3", "in_reply_to": original_id,
+                    "session_id": wrong_gateway}),
+        )
+        .await
+        .unwrap();
+        assert!(refused.get("_hestia_error").is_some(),
+                "another destination's gateway cannot bind the original: {refused}");
+
+        let specialized = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "delivery-status.retry",
+                    "pointer_uri": "pr/1#transport-failure", "in_reply_to": original_id,
+                    "session_id": gateway}),
+        )
+        .await
+        .expect("a delivery-status specialization has the same gateway binding");
+        let specialized_id = specialized["queued_id"].as_u64().unwrap();
+
+        let unanswered = tool_member_unanswered(&state, &json!({"session_id": claude, "older_than_secs": -1}))
+            .await.unwrap();
+        assert!(unanswered["owed_to_me"].as_array().unwrap().iter()
+            .any(|row| row["id"] == original_id), "status never clears the original: {unanswered}");
+        for id in [status_id, specialized_id] {
+            assert!(!unanswered["i_owe"].as_array().unwrap().iter()
+                .any(|row| row["id"] == id), "status is not peer debt: {unanswered}");
+        }
+
+        let abandoned = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "watch-kimi-code", "kind": "ack",
+                    "pointer_uri": "abandoned", "in_reply_to": status_id,
+                    "session_id": claude}),
+        )
+        .await
+        .expect("ack on the status is an exact abandon disposition");
+        assert_eq!(abandoned["in_reply_to"], status_id);
+        let retried = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "kimi-code", "kind": "review_request",
+                    "pointer_uri": "pr/1", "in_reply_to": status_id,
+                    "operation_id": "retry-delivery-status-1", "session_id": claude}),
+        )
+        .await
+        .expect("the original kind and pointer can be retried against the status");
+        assert_eq!(retried["in_reply_to"], status_id);
+        let unanswered = tool_member_unanswered(&state, &json!({"session_id": claude, "older_than_secs": -1}))
+            .await.unwrap();
+        assert!(unanswered["owed_to_me"].as_array().unwrap().iter()
+            .any(|row| row["id"] == original_id), "retry/abandon does not clear the original");
+
+        let replied = tool_member_notify(
+            &state,
+            &json!({"to_plugin_id": "claude-code", "kind": "reply",
+                    "pointer_uri": "reviewed", "in_reply_to": original_id,
+                    "session_id": kimi}),
+        )
+        .await
+        .expect("a genuine reply still clears its bound original");
+        assert_eq!(replied["in_reply_to"], original_id);
+        let unanswered = tool_member_unanswered(&state, &json!({"session_id": claude, "older_than_secs": -1}))
+            .await.unwrap();
+        assert!(!unanswered["owed_to_me"].as_array().unwrap().iter()
+            .any(|row| row["id"] == original_id), "the genuine reply discharges the original");
+    }
+
     /// **The site the fractal change could have broken silently, and the reason it is
     /// a five-site edit and not a four-site one.** `member_notify`'s gate and
     /// `member_unanswered`'s query are two different rules over the same vocabulary:
@@ -13667,7 +13798,7 @@ mod member_mesh_tests {
     /// a kind this daemon must account for. That is the point of the row.
     ///
     /// The negative arm is the LIKE-wildcard trap, asserted rather than commented
-    /// because the wrong spelling is the obvious one. Four of seven roots contain `_`,
+    /// because the wrong spelling is the obvious one. Four of eight roots contain `_`,
     /// which LIKE reads as "any single character", so `LIKE 'review_request.%'` counts
     /// `reviewXrequest.pr` — a kind `tool_member_notify` refuses. A ledger looser than
     /// its gate is how a kind that cannot be sent shows up as a debt.
@@ -14258,6 +14389,7 @@ mod member_mesh_tests {
     async fn member_notify_admits_fractal_specializations() {
         let (_dir, state) = test_state().await;
         let sid = connect(&state, "claude-code").await;
+        let gateway = connect(&state, "watch-kimi-code").await;
 
         let tool = hestia_tools()
             .into_iter()
@@ -14301,15 +14433,17 @@ mod member_mesh_tests {
         );
 
         // 1 + 2. Every root sends, and so does a specialization of every root. Run over
-        // ALL seven rather than a sample: `advertised[0]` was the old test's coverage and
-        // it would not have noticed a rule keyed on one entry.
+        // ALL roots rather than a sample: `advertised[0]` was the old test's coverage and
+        // it would not have noticed a rule keyed on one entry. The reserved delivery kind
+        // still exercises its fractal forms, but through the destination's exact gateway.
         for root in MEMBER_NOTICE_KINDS {
+            let session = if *root == "delivery-status" { &gateway } else { &sid };
             for kind in [
                 root.to_string(),
                 format!("{root}.renotify"),
                 format!("{root}.a.b"),
             ] {
-                let out = tool_member_notify(&state, &args_for_kind(&kind, &sid))
+                let out = tool_member_notify(&state, &args_for_kind(&kind, session))
                     .await
                     .unwrap();
                 assert!(
@@ -14327,7 +14461,7 @@ mod member_mesh_tests {
         // 3 + 4. The separator is the safety property. `coordinationX` starts with a
         // listed root and is NOT under it; `unreachable` and `disposition` are the
         // daemon's own kinds and stay unforgeable by construction — new roots,
-        // prefix-disjoint from all seven — which is the invariant that makes prefix
+        // prefix-disjoint from every member root — which is the invariant that makes prefix
         // acceptance safe here at all. Asserted, per the argument that carried this
         // change, rather than left to a comment.
         for (root, why) in [
@@ -14372,7 +14506,7 @@ mod member_mesh_tests {
             );
         }
 
-        // The bound the enum used to provide for free. Seven fixed strings could not be
+        // The bound the enum used to provide for free. Fixed strings could not be
         // long; an open tail can, and a kind lands in the witness chain and every
         // renderer. Checked at the boundary in both directions so the const and the
         // published `maxLength` cannot drift apart.
