@@ -55,6 +55,66 @@ console.log(JSON.stringify(Object.fromEntries(
         check("enforcing strict stays calm", got["strict"] is False)
         check("missing policy is not a healthy claim", got["missing"] is False)
 
+def policy_editor_behavior(data):
+    start = UI.index("  (function wirePolicyEditor() {")
+    end = UI.index("\n  })();", start) + len("\n  })();")
+    block = UI[start:end]
+    js = """
+const sent = [], confirms = [], prompts = [];
+const card = { handlers: {}, addEventListener(kind, fn) { this.handlers[kind] = fn; } };
+const $ = id => id === 'govern-policy' ? card : { textContent: '' };
+const selectedOrch = null;
+const lastData = DATA;
+const confirm = message => { confirms.push(message); return lastData.ack !== false; };
+const prompt = message => { prompts.push(message); return lastData.reason || null; };
+const polSend = async (...args) => { sent.push(args); };
+BLOCK
+(async () => {
+  await card.handlers.click({ target: { dataset: { preset: lastData.target } } });
+  console.log(JSON.stringify({ sent, confirms, prompts }));
+})();
+""".replace("DATA", json.dumps(data)).replace("BLOCK", block)
+    result = subprocess.run([node, "-e", js], capture_output=True, text=True, timeout=30)
+    check("policy editor executes", result.returncode == 0, result.stderr.strip()[:500])
+    return json.loads(result.stdout) if result.returncode == 0 else {}
+
+
+if node:
+    loosening = {"policy": {"preset": "strict", "enforce": True}, "target": "permissive"}
+    cancelled = policy_editor_behavior(dict(loosening, ack=False))
+    check("society loosening acknowledges the transition before sending",
+          len(cancelled["confirms"]) == 1 and "strict" in cancelled["confirms"][0]
+          and "permissive" in cancelled["confirms"][0] and cancelled["sent"] == [], cancelled)
+    refused = policy_editor_behavior(loosening)
+    check("cancelling a society loosening sends nothing", refused["sent"] == [], refused)
+    accepted = policy_editor_behavior(dict(loosening, reason="incident review"))
+    check("a reasoned loosening reaches the daemon with that reason",
+          len(accepted["sent"]) == 1
+          and accepted["sent"][0][2] == {"preset": "permissive", "reason": "incident review"},
+          accepted)
+    tightened = policy_editor_behavior({
+        "policy": {"preset": "permissive", "enforce": True}, "target": "strict"})
+    check("tightening stays one click with no acknowledgement or reason prompt",
+          tightened["confirms"] == [] and tightened["prompts"] == []
+          and tightened["sent"][0][2] == {"preset": "strict"}, tightened)
+    audit = policy_editor_behavior({
+        "policy": {"preset": "safety", "enforce": True}, "target": "audit-only",
+        "reason": "temporary observation"})
+    check("enforcement-off is also a reasoned loosening",
+          len(audit["confirms"]) == 1 and audit["sent"][0][2]["reason"] == "temporary observation",
+          audit)
+    from_audit = policy_editor_behavior({
+        "policy": {"preset": "audit-only", "enforce": False}, "target": "permissive",
+        "reason": "incident review"})
+    check("audit-only to permissive requires the same acknowledgement and reason",
+          len(from_audit["confirms"]) == 1
+          and from_audit["sent"][0][2] == {"preset": "permissive", "reason": "incident review"},
+          from_audit)
+    from_audit_refused = policy_editor_behavior({
+        "policy": {"preset": "audit-only", "enforce": False}, "target": "permissive"})
+    check("audit-only to permissive without a reason sends nothing",
+          from_audit_refused["sent"] == [], from_audit_refused)
+
 if FAILURES:
     raise SystemExit("dashboard policy posture contract failed: " + ", ".join(FAILURES))
 print("dashboard policy posture contract: PASS")
