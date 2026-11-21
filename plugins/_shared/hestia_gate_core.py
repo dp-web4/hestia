@@ -1571,9 +1571,13 @@ def resolve_agent_policy(profile: HarnessProfile,
                     allowlist = got.get("allowlist")
                     raw_tools = (allowlist.get("tools")
                                  if isinstance(allowlist, dict) else None)
+                    try:
+                        tool_parsed = _parse_allowlist_tools(raw_tools)
+                    except Exception:
+                        tool_parsed = ()
                     return AgentPolicy(
                         member_id=profile.member_id,
-                        scope=parsed + _parse_allowlist_tools(raw_tools), source="vault",
+                        scope=parsed + tool_parsed, source="vault",
                         generation=gen, expires_at=exp,
                         read_scope=tuple(read_parsed or ()),
                         mode_scope=_parse_mode_scope(got.get("in_scope_modes")),

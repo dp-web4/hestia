@@ -36,6 +36,30 @@ class ToolsAxisTest(unittest.TestCase):
                                   tools_configured=tools_configured)
         return gate.evaluate(event, self.profile, self.workspace, policy)
 
+    def resolve_with_stale_replica(self, files, tools):
+        identity = os.path.join(self.workspace, "identity.json")
+        with open(identity, "w", encoding="utf-8") as fh:
+            json.dump({"mrh": {
+                "in_scope": ["repo:retired"],
+                "replica": {"generation": 1, "expires_at": gate.now_secs() + 3600},
+            }}, fh)
+        self.profile = gate.HarnessProfile(member_id="acx", identity_path=identity)
+        return gate.resolve_agent_policy(self.profile, lambda _member: {
+            "in_scope": files,
+            "generation": 2,
+            "expires_at": gate.now_secs() + 3600,
+            "allowlist": {"tools": tools},
+        })
+
+    def read_verdict(self, repo, policy):
+        os.makedirs(os.path.join(self.workspace, repo), exist_ok=True)
+        path = os.path.join(self.workspace, repo, "file.txt")
+        with open(path, "a", encoding="utf-8"):
+            pass
+        event = gate.NormalizedEvent(tool="Read", cwd=self.workspace, paths=[path])
+        with mock.patch.object(gate, "_under_temp_root", return_value=False):
+            return gate.evaluate(event, self.profile, self.workspace, policy)
+
     def shadow_rows(self):
         path = os.path.join(self.home, gate.ALLOWLIST_SHADOW_RELPATH)
         if not os.path.exists(path):
@@ -96,6 +120,30 @@ class ToolsAxisTest(unittest.TestCase):
                     self.assertEqual(row["grants"], ["python3"])
                     self.assertEqual(row["would_deny"], would_deny)
                     self.assertEqual(row["target"], target)
+
+    def test_malformed_tools_preserve_current_files_and_block_stale_widening(self):
+        for tools in (["git status"], [""], [{}], [[]], [None], "python3"):
+            with self.subTest(tools=tools):
+                policy = self.resolve_with_stale_replica(["repo:current"], tools)
+                self.assertEqual(policy.source, "vault")
+                self.assertEqual(policy.generation, 2)
+                self.assertIn("current", policy.scope)
+                self.assertNotIn("retired", policy.scope)
+                self.assertEqual(self.read_verdict("current", policy).decision, "allow")
+                revoked = self.read_verdict("retired", policy)
+                self.assertEqual(revoked.decision, "deny")
+                self.assertEqual(revoked.rule, "mrh.path")
+
+    def test_tools_parser_exception_cannot_discard_vault_files(self):
+        with mock.patch.object(gate, "_parse_allowlist_tools", side_effect=ValueError("bad")):
+            policy = self.resolve_with_stale_replica(["repo:current"], [])
+        self.assertEqual(policy.source, "vault")
+        self.assertEqual(policy.scope, ("current",))
+        self.assertEqual(policy.generation, 2)
+        self.assertEqual(self.read_verdict("current", policy).decision, "allow")
+        revoked = self.read_verdict("retired", policy)
+        self.assertEqual(revoked.decision, "deny")
+        self.assertEqual(revoked.rule, "mrh.path")
 
     def test_scope_parser_preserves_tool_entries(self):
         self.assertEqual(gate._parse_scope_entries(["tool:python3"]), ("tool:python3",))
