@@ -4441,6 +4441,18 @@ async fn config_put_seat(
         }
     }
 
+    let previous_role = previous.as_ref()
+        .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok())
+        .and_then(|old| old.env.get("HESTIA_ROLE").cloned());
+    if previous_role.as_ref() != cfg.env.get("HESTIA_ROLE") && cfg.note.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "note is required to change HESTIA_ROLE — say why this capacity role changes authority"
+            })),
+        );
+    }
+
     // WITNESS FIRST, the same ordering as every other authority write here: a failed vault write
     // must not leave the chain silent about an attempted change to what a seat runs with. The
     // record names the KEYS, never the values — a config document can carry a token, and the
@@ -10357,6 +10369,36 @@ mod disposition_tests {
         assert!(v["config"]["env"].get("HESTIA_PLUGIN_ID").is_none(), "{v}");
     }
 
+    #[tokio::test]
+    async fn role_changes_require_a_reason_and_are_witnessed() {
+        let (_dir, state) = test_state().await;
+        let put = |body: serde_json::Value| {
+            let st = state.clone();
+            async move {
+                axum::response::IntoResponse::into_response(
+                    super::config_put_seat(axum::extract::State(st), axum::Json(body)).await,
+                )
+            }
+        };
+        let refused = put(serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"}, "note": ""},
+        })).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let accepted = put(serde_json::json!({
+            "plugin_id": "claude-code",
+            "config": {"env": {"HESTIA_ROLE": "role:constellation:reviewer"},
+                       "note": "review duty is deliberate"},
+        })).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let entries = state.lock().await.recent_chain(8);
+        let intent = entries.iter().find(|entry| entry.event_type == "config_seat_write_intent")
+            .expect("the role change is witnessed");
+        assert_eq!(intent.event_data["note"], "review duty is deliberate");
+        assert!(intent.event_data["keys"].as_array().unwrap()
+            .iter().any(|key| key == "HESTIA_ROLE"));
+    }
+
     /// THE SHARED SET (dp, 2026-09-05). Written through the same door under the reserved id;
     /// inherited by every seat with shared winning; a seat that restates a shared key is refused
     /// at the door; a shared write re-renders every seat in the same act; the list names the
@@ -10378,7 +10420,7 @@ mod disposition_tests {
         };
         // two seats first, each carrying only its own facts
         for (m, role) in [("claude-code", "role:constellation:interactive-dev"), ("codex", "role:constellation:member")] {
-            let (st, _) = put(serde_json::json!({"plugin_id": m, "config": {"env": {"HESTIA_ROLE": role, "HESTIA_PLUGIN_ID": m}, "note": ""}})).await;
+            let (st, _) = put(serde_json::json!({"plugin_id": m, "config": {"env": {"HESTIA_ROLE": role, "HESTIA_PLUGIN_ID": m}, "note": "test role assignment"}})).await;
             assert_eq!(st, StatusCode::OK);
         }
         // the shared set: society facts, and a token-shaped value that must never reach the chain

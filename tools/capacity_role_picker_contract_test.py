@@ -87,6 +87,59 @@ def behaviour() -> None:
         opts = run("capacityRoleOptions(A)", empty) or []
         check(f"no value ({empty!r}): a placeholder, not a silently chosen role",
               (opts[0]["value"], opts[0]["selected"], sum(o["selected"] for o in opts)) if opts else None, ("", True, 1))
+    approval_behaviour()
+
+
+def cfg_save_behavior(data):
+    start = UI.index("  async function cfgSave() {")
+    end = UI.index("  // From an agent to its seat.", start)
+    block = UI[start:end]
+    js = """
+const sent = [], confirms = [];
+const data = DATA;
+const cfgRows = data.previous ? [{ key: 'HESTIA_ROLE', value: data.previous }] : [];
+const cfgReadRows = () => data.next ? [{ key: 'HESTIA_ROLE', value: data.next }] : [];
+const cfgSelected = 'claude-code';
+const confirm = message => { confirms.push(message); return data.ack !== false; };
+const els = {};
+const $ = id => els[id] || (els[id] = {
+  value: id === 'cfg-note' ? (data.note || '') : '', hidden: true,
+  textContent: '', innerHTML: '', disabled: false,
+});
+const cfgEsc = String;
+const apiFetch = async (path, options) => {
+  sent.push({ path, body: JSON.parse(options.body) });
+  return { ok: true, json: async () => ({ member: 'claude-code', artifact: '/tmp/x',
+    intentEntryHash: 'abcdef', verdict: [] }) };
+};
+const cfgOpen = async () => {};
+const cfgLoadList = async () => {};
+BLOCK
+(async () => {
+  await cfgSave();
+  console.log(JSON.stringify({ sent, confirms, err: $('cfg-err').textContent }));
+})();
+""".replace("DATA", json.dumps(data)).replace("BLOCK", block)
+    result = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        FAILS.append(f"cfgSave node failed: {result.stderr.strip()[-500:]}")
+        return {}
+    return json.loads(result.stdout)
+
+
+def approval_behaviour() -> None:
+    cancelled = cfg_save_behavior({"previous": "member", "next": "reviewer", "ack": False})
+    check("a role change is confirmed before any save",
+          cancelled["confirms"] and cancelled["sent"] == [])
+    missing = cfg_save_behavior({"previous": "member", "next": "reviewer"})
+    check("a role change without a reason never reaches the daemon",
+          missing["sent"] == [] and "reason (note) is required" in missing["err"])
+    approved = cfg_save_behavior({"previous": "member", "next": "reviewer", "note": "review duty"})
+    check("a reasoned role change sends the note as its auditable reason",
+          approved["sent"] and approved["sent"][0]["body"]["config"]["note"] == "review duty")
+    unchanged = cfg_save_behavior({"previous": "member", "next": "member"})
+    check("a no-op role save does not manufacture an acknowledgement",
+          unchanged["confirms"] == [] and bool(unchanged["sent"]))
 
 
 def test_capacity_role_picker_contract() -> None:
