@@ -283,6 +283,25 @@ enum GateCmd {
         reason: Option<String>,
     },
 
+    /// Ratify the exact gate bytes the daemon just verified. With no --path this is the bulk
+    /// arm, accepted only when every discovered gate matches the deploy record. Repeated
+    /// --path selects individual gates for a per-gate merge.
+    Ratify {
+        /// Operator credential file (JSON `{lct_id, secret_key_hex}`) whose public
+        /// half is law-listed in `operator_access`. Read, never printed.
+        #[arg(long, env = "HESTIA_OPERATOR_KEY")]
+        key: PathBuf,
+        /// Why these bytes are the ones you reviewed (single line, <=512 bytes)
+        #[arg(long)]
+        reason: String,
+        /// Discovered gate path to ratify; repeat for a per-gate merge
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// Emit the daemon's response as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Add evidence WITHOUT deciding (#122 — approval accumulates as factors)
     Corroborate {
         /// Escalation id from the deny text
@@ -1271,6 +1290,9 @@ pub fn run() -> AnyResult<()> {
                 GateCmd::Deny { escalation_id, reason } => gate_cli::arbitrate(
                     &endpoint, &escalation_id, false, reason, asserted_id, &role,
                 ),
+                GateCmd::Ratify { key, reason, paths, json } => {
+                    gate_cli::ratify(&endpoint, &key, &reason, &paths, json)
+                }
                 GateCmd::Corroborate { escalation_id, stance, argument } => {
                     gate_cli::corroborate(&endpoint, &escalation_id, &stance, argument, asserted_id, &role)
                 }
