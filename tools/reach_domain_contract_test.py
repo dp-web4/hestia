@@ -85,11 +85,9 @@ def typed_contract(mod) -> list[str]:
         bad.append("the observed bare GitNexus name exposes its local repo path")
     if pt("mcp__gitnexus__detect_changes", {"repo": "/repo"}) != ["/repo"]:
         bad.append("the real MCP GitNexus name exposes its local repo path")
-    if pt("mcp__gitnexus__detect_changes", {"repo": "~/repo"}) != ["~/repo"]:
-        bad.append("a ~-prefixed GitNexus repo is a local path")
     if any(pt("mcp__gitnexus__detect_changes", {"repo": value})
-           for value in ("notgranted", "../notgranted", "owner/repo")):
-        bad.append("a bare or relative GitNexus repo identity is NOT an absolute/~ local path")
+           for value in ("notgranted", "../notgranted", "owner/repo", "~/repo")):
+        bad.append("a bare, relative, or ~-prefixed GitNexus repo identity is NOT an absolute local path")
     if pt("mcp__github__get_file", {"repo": "dp-web4/repo"}) != []:
         bad.append("a remote GitHub repo identity is NOT a filesystem path")
     for tool in ("mcp__codex_apps__gitnexus__detect_changes",
@@ -246,6 +244,16 @@ def test_behaviour_across_seats() -> None:
              {"repo": "notgranted"}, "mrh.repo"),
             ("repo-bare-name-tmp-still-denied", "mcp__gitnexus__detect_changes",
              {"repo": "notgranted"}, "mrh.repo"),
+            ("repo-tilde-name-still-denied", "mcp__gitnexus__detect_changes",
+             {"repo": "~/notgranted"}, "mrh.repo"),
+            ("repo-name-with-path-still-denied", "mcp__gitnexus__detect_changes",
+             {"repo": "notgranted", "path": f"{ws}/granted"}, "mrh.repo"),
+            ("repo-name-with-files-still-denied", "mcp__gitnexus__detect_changes",
+             {"repo": "notgranted", "files": [f"{ws}/granted/x"]}, "mrh.repo"),
+            ("repo-name-with-filename-still-denied", "mcp__gitnexus__detect_changes",
+             {"repo": "notgranted", "filename": f"{ws}/granted/x"}, "mrh.repo"),
+            ("repo-name-with-file-path-still-denied", "mcp__gitnexus__detect_changes",
+             {"repo": "notgranted", "file_path": f"{ws}/granted/x"}, "mrh.repo"),
             ("repo-codex-shaped-namespace-still-denied", "mcp__codex_apps__gitnexus__detect_changes",
              {"repo": "notgranted"}, "mrh.repo"),
             ("repo-foreign-namespace-remote-still-denied", "mcp__github__gitnexus__detect_changes",
