@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from pathlib import Path
 import select
 import shutil
@@ -166,7 +167,19 @@ def unavailable_startup_is_absorbing() -> None:
             stop(proc)
 
 
+def default_gauge_cadence_fits_measured_journal_retention() -> None:
+    text = WATCHER.read_text()
+    match = re.search(r'^UNANSWERED_EVERY="\$\{UNANSWERED_EVERY:-(\d+)\}"', text, re.MULTILINE)
+    assert match is not None, "the watcher must declare a default level-gauge cadence"
+    seconds = int(match.group(1))
+    assert seconds == 600, (
+        f"default cadence {seconds}s does not put about three level lines in the measured "
+        "~1900s journal retention window; the UNANSWERED_EVERY override remains available"
+    )
+
+
 def main() -> None:
+    default_gauge_cadence_fits_measured_journal_retention()
     real_drift_stays_visible()
     unavailable_startup_is_absorbing()
 
