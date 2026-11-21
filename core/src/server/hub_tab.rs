@@ -14,7 +14,8 @@
 //! hash-chained ledger (each response carries the entry index/hash), which is
 //! the record of consequence for these remote acts.
 //!
-//! The hub address is hardwired for the demo (env `HESTIA_HUB_URL` overrides).
+//! The hub address comes from the operator-editable vault list; `HESTIA_HUB_URL`
+//! overrides it. Missing or invalid configuration never falls back to an implicit origin.
 
 use axum::{extract::State, response::IntoResponse, Json};
 use serde::Deserialize;
@@ -24,22 +25,6 @@ use crate::hub::{HubClient, JoinOutcome, SignedEnvelope, WithdrawOutcome};
 use crate::server::state::SharedState;
 use crate::vault::{Vault, VaultEntry};
 use web4_core::crypto::KeyPair;
-
-/// Last-resort hub address, used only when neither `HESTIA_HUB_URL` nor a
-/// vault-stored known-hub list resolves one. Quick-tunnel hostnames are
-/// ephemeral — this is a compiled fallback, not the configuration surface. The
-/// configuration surface is the editable list ([`HubUrls`]) and the env
-/// override, both of which take precedence and neither of which needs a rebuild.
-// A bare host name, resolved by whatever name service the machine has — on a
-// tailnet with MagicDNS that is the node named `hub`, through the tailnet's own
-// search domain. Purely a default: the env override and the operator's vault hub
-// list both take precedence, and this carries no identity.
-//
-// Deliberately NOT the fully-qualified MagicDNS name. That form embeds the
-// tailnet's own identifier, and this is a public repository; the short name
-// reaches the same node for any machine on that tailnet and names nothing for
-// anyone else. (Previously the hackathon trycloudflare tunnel, long dead.)
-const DEFAULT_HUB_URL: &str = "http://hub:8770";
 
 /// The vault key under which the known-hub list is stored (config-in-vault:
 /// PRD_CONFIG_IN_VAULT). The list is not a secret, but the vault is hestia's
@@ -90,8 +75,10 @@ pub enum HubUrlSource {
     Active,
     /// No active set: the first entry in the list.
     FirstEntry,
-    /// Nothing configured: the compiled [`DEFAULT_HUB_URL`].
-    Default,
+    /// No valid origin is configured. No outbound request is made.
+    Unconfigured,
+    /// The stored or env-supplied origin is invalid. No outbound request is made.
+    ConfigInvalid,
 }
 
 /// Normalise a URL for storage/compare: trim, strip a trailing slash. Returns
@@ -113,19 +100,37 @@ fn normalise_hub_url(raw: &str) -> Option<String> {
 }
 
 impl HubUrls {
-    /// Load the list from the vault, or an empty list if unset/corrupt. A corrupt
-    /// blob is treated as empty rather than an error: the daemon must still
-    /// resolve *a* hub (falling through to env/default), never hang the card on
-    /// unparseable config.
-    fn load(vault: &Vault) -> Self {
-        vault
-            .get(HUB_URLS_VAULT_KEY)
-            .and_then(|e| serde_json::from_str::<HubUrls>(&e.secret).ok())
-            .unwrap_or_default()
+    fn validate(&self) -> Result<(), HubUrlSource> {
+        let entries_valid = self.entries.iter().all(|entry| {
+            normalise_hub_url(&entry.url).as_deref() == Some(entry.url.as_str())
+        });
+        let active_valid = self.active.as_ref().map_or(true, |active| {
+            normalise_hub_url(active).as_deref() == Some(active.as_str())
+        });
+        if entries_valid && active_valid {
+            Ok(())
+        } else {
+            Err(HubUrlSource::ConfigInvalid)
+        }
+    }
+
+    /// Load the list, preserving corrupt configuration as a non-dialing state
+    /// rather than silently converting it into an approved outbound origin.
+    fn load(vault: &Vault) -> Result<Self, HubUrlSource> {
+        match vault.get(HUB_URLS_VAULT_KEY) {
+            Some(entry) => {
+                let list = serde_json::from_str::<HubUrls>(&entry.secret)
+                    .map_err(|_| HubUrlSource::ConfigInvalid)?;
+                list.validate()?;
+                Ok(list)
+            }
+            None => Ok(Self::default()),
+        }
     }
 
     /// Persist (upsert — create or replace). Auto-saves the encrypted vault.
     fn store(&self, vault: &mut Vault) -> anyhow::Result<()> {
+        self.validate().map_err(|_| anyhow::anyhow!("refusing to store an invalid hub list"))?;
         let json = serde_json::to_string(self)?;
         vault.upsert(
             VaultEntry::new(HUB_URLS_VAULT_KEY, json).with_tags(vec!["config".into(), "hub".into()]),
@@ -138,28 +143,57 @@ impl HubUrls {
     }
 }
 
-/// Resolve the hub URL the daemon should use right now, and say where it came
-/// from. Precedence: env override → vault active → first vault entry → default.
-fn resolve_hub_url(vault: &Vault) -> (String, HubUrlSource) {
-    if let Some(env) = std::env::var("HESTIA_HUB_URL")
-        .ok()
-        .and_then(|s| normalise_hub_url(&s))
-    {
-        return (env, HubUrlSource::Env);
-    }
-    resolve_from_list(&HubUrls::load(vault))
+fn env_hub_url() -> Option<(Option<String>, HubUrlSource)> {
+    std::env::var("HESTIA_HUB_URL").ok().map(|raw| {
+        match normalise_hub_url(&raw) {
+            Some(url) => (Some(url), HubUrlSource::Env),
+            None => (None, HubUrlSource::ConfigInvalid),
+        }
+    })
 }
 
-/// The env-independent half of resolution: active → first entry → default.
-/// Split out so precedence is testable without touching the process-global env.
-fn resolve_from_list(list: &HubUrls) -> (String, HubUrlSource) {
+/// Resolve the hub URL the daemon should use right now, and say where it came
+/// from. Precedence: env override → vault active → first vault entry. Missing or
+/// corrupt configuration never becomes an implicit outbound origin.
+fn resolve_hub_url(vault: &Vault) -> (Option<String>, HubUrlSource) {
+    if let Some(resolved) = env_hub_url() {
+        return resolved;
+    }
+    match HubUrls::load(vault) {
+        Ok(list) => resolve_from_list(&list),
+        Err(source) => (None, source),
+    }
+}
+
+fn resolve_with_env(list: &HubUrls) -> (Option<String>, HubUrlSource) {
+    env_hub_url().unwrap_or_else(|| resolve_from_list(list))
+}
+
+/// The env-independent half of resolution: active → first entry → non-dialing
+/// unconfigured state. Split out so precedence is testable without process-global env.
+fn resolve_from_list(list: &HubUrls) -> (Option<String>, HubUrlSource) {
+    if list.validate().is_err() {
+        return (None, HubUrlSource::ConfigInvalid);
+    }
     if let Some(active) = list.active.as_ref().filter(|a| list.contains(a)) {
-        return (active.clone(), HubUrlSource::Active);
+        return (Some(active.clone()), HubUrlSource::Active);
     }
     if let Some(first) = list.entries.first() {
-        return (first.url.clone(), HubUrlSource::FirstEntry);
+        return (Some(first.url.clone()), HubUrlSource::FirstEntry);
     }
-    (DEFAULT_HUB_URL.to_string(), HubUrlSource::Default)
+    (None, HubUrlSource::Unconfigured)
+}
+
+fn config_error(source: HubUrlSource) -> axum::response::Response {
+    let state = match source {
+        HubUrlSource::ConfigInvalid => "config_invalid",
+        HubUrlSource::Unconfigured => "unconfigured",
+        _ => "unavailable",
+    };
+    err_json(
+        axum::http::StatusCode::FAILED_DEPENDENCY,
+        format!("hub configuration is {state}; no outbound request was made"),
+    )
 }
 
 /// Discovery may advertise a relative REST path (e.g. "/v1"); make it absolute,
@@ -269,11 +303,19 @@ async fn discover_with_timeout(
 pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoResponse {
     let (entries, active, active_source, me) = {
         let s = state.lock().await;
-        let list = HubUrls::load(&s.vault);
+        let list = match HubUrls::load(&s.vault) {
+            Ok(list) => list,
+            Err(source) => return config_error(source),
+        };
         let me = read_member_identity(&s.vault).map(|(lct, _)| lct);
         // The EFFECTIVE target (an env override wins), not just the stored selection, so the
         // `active` marker names the hub `join` would actually reach.
         let (active, source) = resolve_hub_url(&s.vault);
+        if active.is_none()
+            && (!list.entries.is_empty() || matches!(source, HubUrlSource::ConfigInvalid))
+        {
+            return config_error(source);
+        }
         (list.entries, active, source, me)
     };
 
@@ -283,10 +325,11 @@ pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoRespo
         .unwrap_or_default();
     let mut out = Vec::new();
     for e in entries {
+        let is_active = active.as_deref() == Some(e.url.as_str());
         let mut row = serde_json::json!({
             "url": e.url,
             "label": e.label,
-            "active": e.url == active,
+            "active": is_active,
             "reachable": false,
             "hub_lct_id": serde_json::Value::Null,
             "hub_name": serde_json::Value::Null,
@@ -382,7 +425,11 @@ pub async fn hub_withdraw(
         let Some(url) = normalise_hub_url(&req.url) else {
             return err_json(axum::http::StatusCode::BAD_REQUEST, format!("not an http(s) URL: {}", req.url));
         };
-        if !HubUrls::load(&s.vault).contains(&url) {
+        let list = match HubUrls::load(&s.vault) {
+            Ok(list) => list,
+            Err(source) => return config_error(source),
+        };
+        if !list.contains(&url) {
             return err_json(axum::http::StatusCode::NOT_FOUND,
                 format!("not in the known hub list: {url}"));
         }
@@ -434,7 +481,10 @@ pub async fn hub_withdraw(
 pub async fn hub_status(State(state): State<SharedState>) -> impl IntoResponse {
     let (url, url_source, identity) = {
         let s = state.lock().await;
-        let (url, src) = resolve_hub_url(&s.vault);
+        let (url, src) = match resolve_hub_url(&s.vault) {
+            (Some(url), source) => (url, source),
+            (_, source) => return config_error(source),
+        };
         let identity =
             read_member_identity(&s.vault).map(|(lct, kp)| (lct, kp.verifying_key().to_hex()));
         (url, src, identity)
@@ -519,7 +569,7 @@ pub async fn hub_status(State(state): State<SharedState>) -> impl IntoResponse {
 /// (so the UI can show `env`-override precedence honestly rather than implying
 /// the list is in control when it is not).
 fn hub_urls_response(vault: &Vault) -> serde_json::Value {
-    let list = HubUrls::load(vault);
+    let list = HubUrls::load(vault).unwrap_or_default();
     let (resolved, source) = resolve_hub_url(vault);
     serde_json::json!({
         "active": list.active,
@@ -550,9 +600,76 @@ pub struct HubUrlAddReq {
     pub activate: Option<bool>,
 }
 
+fn commit_hub_mutation(
+    s: &mut crate::server::state::ServerState,
+    list: &HubUrls,
+    previous: &HubUrls,
+    operation: &str,
+    url: &str,
+    gate: &Option<axum::Extension<super::operator_auth::GateWitness>>,
+) -> Result<crate::storage::chain::ChainEntry, axum::response::Response> {
+    let (previous_active, previous_active_source) = resolve_with_env(previous);
+    let (new_active, new_active_source) = resolve_with_env(list);
+    let record = serde_json::json!({
+        "operation": operation,
+        "url": url,
+        "previous_active": previous_active,
+        "previous_active_source": previous_active_source,
+        "new_active": new_active,
+        "new_active_source": new_active_source,
+    });
+    let record = match gate {
+        Some(axum::Extension(witness)) => witness.stamp(record),
+        None => record,
+    };
+    let intent = match s.append_chain("hub_url_mutation_intent", record.clone()) {
+        Ok(entry) => entry,
+        Err(error) => {
+            return Err(err_json(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("hub mutation intent was not recorded ({error}); configuration unchanged"),
+            ));
+        }
+    };
+
+    if let Err(error) = list.store(&mut s.vault) {
+        let restore = previous.store(&mut s.vault);
+        return Err(match restore {
+            Ok(()) => err_json(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persisting hub list failed ({error}); previous configuration restored"),
+            ),
+            Err(restore_error) => err_json(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persisting hub list failed ({error}); restore also failed ({restore_error})"),
+            ),
+        });
+    }
+    let mut success = record;
+    success["intent"] = serde_json::json!(intent.hash);
+    success["success"] = serde_json::json!(true);
+    match s.append_chain("hub_url_mutation", success) {
+        Ok(entry) => Ok(entry),
+        Err(error) => {
+            let restore = previous.store(&mut s.vault);
+            match restore {
+                Ok(()) => Err(err_json(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("hub mutation was not recorded ({error}); previous configuration restored"),
+                )),
+                Err(restore_error) => Err(err_json(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("hub mutation was not recorded ({error}); restore also failed ({restore_error})"),
+                )),
+            }
+        }
+    }
+}
+
 /// POST /api/hub/urls — add a hub to the list (idempotent on URL).
 pub async fn hub_urls_add(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(req): Json<HubUrlAddReq>,
 ) -> impl IntoResponse {
     let Some(url) = normalise_hub_url(&req.url) else {
@@ -562,7 +679,11 @@ pub async fn hub_urls_add(
         );
     };
     let mut s = state.lock().await;
-    let mut list = HubUrls::load(&s.vault);
+    let mut list = match HubUrls::load(&s.vault) {
+        Ok(list) => list,
+        Err(source) => return config_error(source),
+    };
+    let previous = list.clone();
 
     if let Some(existing) = list.entries.iter_mut().find(|e| e.url == url) {
         // Idempotent: re-adding updates the label rather than duplicating.
@@ -582,13 +703,13 @@ pub async fn hub_urls_add(
         list.active = Some(url.clone());
     }
 
-    if let Err(e) = list.store(&mut s.vault) {
-        return err_json(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("persisting hub list: {e}"),
-        );
-    }
-    Json(hub_urls_response(&s.vault)).into_response()
+    let entry = match commit_hub_mutation(&mut s, &list, &previous, "add", &url, &gate) {
+        Ok(entry) => entry,
+        Err(response) => return response,
+    };
+    let mut response = hub_urls_response(&s.vault);
+    response["witnessEntryHash"] = serde_json::json!(entry.hash);
+    Json(response).into_response()
 }
 
 #[derive(Deserialize)]
@@ -597,9 +718,10 @@ pub struct HubUrlRefReq {
 }
 
 /// DELETE /api/hub/urls — remove a hub from the list. If it was the active pick,
-/// active clears (resolution falls to the first remaining entry, then env/default).
+/// active clears (resolution falls to the first remaining entry, then env/unconfigured).
 pub async fn hub_urls_remove(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(req): Json<HubUrlRefReq>,
 ) -> impl IntoResponse {
     // Normalise the same way it was stored, so a caller passing a trailing slash
@@ -611,7 +733,11 @@ pub async fn hub_urls_remove(
         );
     };
     let mut s = state.lock().await;
-    let mut list = HubUrls::load(&s.vault);
+    let mut list = match HubUrls::load(&s.vault) {
+        Ok(list) => list,
+        Err(source) => return config_error(source),
+    };
+    let previous = list.clone();
     let before = list.entries.len();
     list.entries.retain(|e| e.url != url);
     if list.entries.len() == before {
@@ -623,13 +749,13 @@ pub async fn hub_urls_remove(
     if list.active.as_deref() == Some(url.as_str()) {
         list.active = None;
     }
-    if let Err(e) = list.store(&mut s.vault) {
-        return err_json(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("persisting hub list: {e}"),
-        );
-    }
-    Json(hub_urls_response(&s.vault)).into_response()
+    let entry = match commit_hub_mutation(&mut s, &list, &previous, "remove", &url, &gate) {
+        Ok(entry) => entry,
+        Err(response) => return response,
+    };
+    let mut response = hub_urls_response(&s.vault);
+    response["witnessEntryHash"] = serde_json::json!(entry.hash);
+    Json(response).into_response()
 }
 
 /// PUT /api/hub/urls/active — select which known hub the daemon uses. The URL
@@ -637,6 +763,7 @@ pub async fn hub_urls_remove(
 /// point the daemon at a hub the operator never reviewed.
 pub async fn hub_urls_set_active(
     State(state): State<SharedState>,
+    gate: Option<axum::Extension<super::operator_auth::GateWitness>>,
     Json(req): Json<HubUrlRefReq>,
 ) -> impl IntoResponse {
     let Some(url) = normalise_hub_url(&req.url) else {
@@ -646,21 +773,25 @@ pub async fn hub_urls_set_active(
         );
     };
     let mut s = state.lock().await;
-    let mut list = HubUrls::load(&s.vault);
+    let mut list = match HubUrls::load(&s.vault) {
+        Ok(list) => list,
+        Err(source) => return config_error(source),
+    };
     if !list.contains(&url) {
         return err_json(
             axum::http::StatusCode::NOT_FOUND,
             format!("not in the list (add it first): {url}"),
         );
     }
-    list.active = Some(url);
-    if let Err(e) = list.store(&mut s.vault) {
-        return err_json(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("persisting hub list: {e}"),
-        );
-    }
-    Json(hub_urls_response(&s.vault)).into_response()
+    let previous = list.clone();
+    list.active = Some(url.clone());
+    let entry = match commit_hub_mutation(&mut s, &list, &previous, "activate", &url, &gate) {
+        Ok(entry) => entry,
+        Err(response) => return response,
+    };
+    let mut response = hub_urls_response(&s.vault);
+    response["witnessEntryHash"] = serde_json::json!(entry.hash);
+    Json(response).into_response()
 }
 
 #[derive(Deserialize)]
@@ -670,12 +801,18 @@ pub struct JoinReq {
 }
 
 /// POST /api/hub/join — provision (if needed) the member identity and self-add
-/// to the hardwired hub. Closed admission comes back as `pending`.
+/// to the selected hub. Closed admission comes back as `pending`.
 pub async fn hub_join(
     State(state): State<SharedState>,
     Json(req): Json<JoinReq>,
 ) -> impl IntoResponse {
-    let url = { let s = state.lock().await; resolve_hub_url(&s.vault).0 };
+    let url = {
+        let s = state.lock().await;
+        match resolve_hub_url(&s.vault) {
+            (Some(url), _) => url,
+            (_, source) => return config_error(source),
+        }
+    };
 
     // Provision under the lock, then release it before any network await —
     // holding the daemon-wide mutex across a tunnel round-trip would stall
@@ -733,7 +870,13 @@ pub async fn hub_join(
 /// GET /api/hub/topics — the discussion, topics with posts. Unauthenticated on
 /// the hub side; proxied here so the browser never needs cross-origin access.
 pub async fn hub_topics(State(state): State<SharedState>) -> impl IntoResponse {
-    let url = { let s = state.lock().await; resolve_hub_url(&s.vault).0 };
+    let url = {
+        let s = state.lock().await;
+        match resolve_hub_url(&s.vault) {
+            (Some(url), _) => url,
+            (_, source) => return config_error(source),
+        }
+    };
     let info = match discover_with_timeout(&url).await {
         Ok(i) => i,
         Err(e) => return err_json(axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
@@ -816,7 +959,13 @@ async fn submit_act(
     state: &SharedState,
     payload: serde_json::Value,
 ) -> axum::response::Response {
-    let url = { let s = state.lock().await; resolve_hub_url(&s.vault).0 };
+    let url = {
+        let s = state.lock().await;
+        match resolve_hub_url(&s.vault) {
+            (Some(url), _) => url,
+            (_, source) => return config_error(source),
+        }
+    };
 
     let identity = {
         let s = state.lock().await;
@@ -913,6 +1062,36 @@ mod tests {
         (dir, v)
     }
 
+    fn shared_state() -> (tempfile::TempDir, SharedState) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    static HUB_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn take_hub_env() -> Option<String> {
+        let previous = std::env::var("HESTIA_HUB_URL").ok();
+        std::env::remove_var("HESTIA_HUB_URL");
+        previous
+    }
+
+    fn restore_hub_env(previous: Option<String>) {
+        match previous {
+            Some(value) => std::env::set_var("HESTIA_HUB_URL", value),
+            None => std::env::remove_var("HESTIA_HUB_URL"),
+        }
+    }
+
+    async fn assert_config_error(response: axum::response::Response, expected: &str) {
+        assert_eq!(response.status(), axum::http::StatusCode::FAILED_DEPENDENCY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains(expected), "{body}");
+        assert!(body.contains("no outbound request was made"), "{body}");
+    }
+
     #[test]
     fn normalise_rejects_non_dialable_and_strips_trailing_slash() {
         assert_eq!(
@@ -969,14 +1148,12 @@ mod tests {
     }
 
     #[test]
-    fn list_resolution_precedence_active_then_first_then_default() {
-        // Empty list → compiled default.
+    fn list_resolution_precedence_active_then_first_then_unconfigured() {
         let empty = HubUrls::default();
         let (u, src) = resolve_from_list(&empty);
-        assert_eq!(u, DEFAULT_HUB_URL);
-        assert!(matches!(src, HubUrlSource::Default));
+        assert_eq!(u, None);
+        assert!(matches!(src, HubUrlSource::Unconfigured));
 
-        // Entries but no active → first entry.
         let mut list = HubUrls {
             active: None,
             entries: vec![
@@ -985,21 +1162,19 @@ mod tests {
             ],
         };
         let (u, src) = resolve_from_list(&list);
-        assert_eq!(u, "https://a");
+        assert_eq!(u.as_deref(), Some("https://a"));
         assert!(matches!(src, HubUrlSource::FirstEntry));
 
-        // Active set (and present) → active, even though it is not first.
         list.active = Some("https://b".into());
         let (u, src) = resolve_from_list(&list);
-        assert_eq!(u, "https://b");
+        assert_eq!(u.as_deref(), Some("https://b"));
         assert!(matches!(src, HubUrlSource::Active));
 
-        // Active pointing at a URL NOT in the list must not be honoured — that is
-        // a stale/dangling selection, and honouring it would dial a hub the list
-        // no longer vouches for. Falls back to first.
+        // A dangling active selection falls back to the first entry, never to an
+        // implicit outbound origin.
         list.active = Some("https://gone".into());
         let (u, src) = resolve_from_list(&list);
-        assert_eq!(u, "https://a");
+        assert_eq!(u.as_deref(), Some("https://a"));
         assert!(matches!(src, HubUrlSource::FirstEntry));
     }
 
@@ -1021,28 +1196,33 @@ mod tests {
         }
         // Reopen from disk — the whole point is that config survives a restart.
         let v = Vault::open(path, "p".into()).unwrap();
-        let loaded = HubUrls::load(&v);
+        let loaded = HubUrls::load(&v).unwrap();
         assert_eq!(loaded.active.as_deref(), Some("https://one"));
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].label.as_deref(), Some("demo"));
     }
 
     #[test]
-    fn a_corrupt_blob_reads_as_empty_not_an_error() {
+    fn corrupt_config_is_an_explicit_non_dialing_state() {
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = take_hub_env();
         let (_dir, mut v) = temp_vault();
-        // Plant a non-JSON value under the key.
         v.upsert(VaultEntry::new(HUB_URLS_VAULT_KEY, "not json {{{")).unwrap();
-        let loaded = HubUrls::load(&v);
-        assert!(loaded.entries.is_empty() && loaded.active.is_none());
-        // And resolution still yields a usable default rather than hanging.
-        let (u, src) = resolve_from_list(&loaded);
-        assert_eq!(u, DEFAULT_HUB_URL);
-        assert!(matches!(src, HubUrlSource::Default));
+        let error = HubUrls::load(&v).unwrap_err();
+        assert!(matches!(error, HubUrlSource::ConfigInvalid));
+        let (u, src) = resolve_hub_url(&v);
+        assert_eq!(u, None);
+        assert!(matches!(src, HubUrlSource::ConfigInvalid));
+        let response = hub_urls_response(&v);
+        assert_eq!(response["resolved"], serde_json::Value::Null);
+        assert_eq!(response["source"], "config_invalid");
+        restore_hub_env(previous);
     }
 
     #[test]
     fn env_override_wins_over_the_list() {
-        // The one test that touches the process-global env. Set → resolve → clear.
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = take_hub_env();
         let (_dir, mut v) = temp_vault();
         HubUrls {
             active: Some("https://list-pick".into()),
@@ -1057,14 +1237,282 @@ mod tests {
 
         std::env::set_var("HESTIA_HUB_URL", "https://env-pick/");
         let (u, src) = resolve_hub_url(&v);
-        std::env::remove_var("HESTIA_HUB_URL");
 
-        assert_eq!(u, "https://env-pick", "env override must win and be normalised");
+        assert_eq!(u.as_deref(), Some("https://env-pick"), "env override must win and be normalised");
         assert!(matches!(src, HubUrlSource::Env));
 
-        // With env cleared, the list pick resolves.
+        std::env::remove_var("HESTIA_HUB_URL");
         let (u2, src2) = resolve_hub_url(&v);
-        assert_eq!(u2, "https://list-pick");
+        assert_eq!(u2.as_deref(), Some("https://list-pick"));
         assert!(matches!(src2, HubUrlSource::Active));
+        restore_hub_env(previous);
+    }
+
+    #[tokio::test]
+    async fn missing_and_corrupt_config_are_explicit_non_dialing_states() {
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = take_hub_env();
+        let (_dir, state) = shared_state();
+
+        for (corrupt, expected) in [(false, "unconfigured"), (true, "config_invalid")] {
+            if corrupt {
+                state.lock().await.vault.upsert(
+                    VaultEntry::new(HUB_URLS_VAULT_KEY, "not json {{{"),
+                ).unwrap();
+            }
+            assert_config_error(hub_status(State(state.clone())).await.into_response(), expected).await;
+            assert_config_error(hub_topics(State(state.clone())).await.into_response(), expected).await;
+            assert_config_error(
+                hub_join(State(state.clone()), Json(JoinReq { name: None })).await.into_response(),
+                expected,
+            ).await;
+            assert_config_error(
+                submit_act(&state, serde_json::json!({"action": "test"})).await,
+                expected,
+            ).await;
+        }
+
+        assert!(state.lock().await.vault.get("ai_identity_lct_id").is_none(),
+                "join must not provision an identity when configuration cannot be dialed");
+        restore_hub_env(previous);
+    }
+
+    #[tokio::test]
+    async fn json_valid_invalid_entries_never_dial_or_provision_an_identity() {
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = take_hub_env();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            while let Ok((_socket, _)) = listener.accept().await {
+                if tx.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let (_dir, state) = shared_state();
+        let stored = serde_json::json!({
+            "active": listener_url,
+            "entries": [
+                {"url": listener_url, "label": null, "added_at": null},
+                {"url": "JSON-valid, not a URL", "label": null, "added_at": null},
+            ],
+        });
+        state.lock().await.vault.upsert(
+            VaultEntry::new(HUB_URLS_VAULT_KEY, stored.to_string()),
+        ).unwrap();
+
+        let statuses = vec![
+            hub_join(State(state.clone()), Json(JoinReq { name: None }))
+                .await.into_response().status(),
+            hub_status(State(state.clone())).await.into_response().status(),
+            hub_topics(State(state.clone())).await.into_response().status(),
+            hub_memberships(State(state.clone())).await.into_response().status(),
+            submit_act(&state, serde_json::json!({"action": "test"})).await.status(),
+        ];
+
+        server.abort();
+        assert!(rx.try_recv().is_err(),
+                "an invalid stored list reached the configured listener: {statuses:?}");
+        assert_eq!(statuses, vec![axum::http::StatusCode::FAILED_DEPENDENCY; 5]);
+        assert!(state.lock().await.vault.get("ai_identity_lct_id").is_none(),
+                "join provisioned an identity before rejecting the invalid list");
+        restore_hub_env(previous);
+    }
+
+    #[tokio::test]
+    async fn empty_memberships_are_a_list_not_a_configuration_error() {
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = take_hub_env();
+        let (_dir, state) = shared_state();
+        let response = hub_memberships(State(state.clone())).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["hubs"], serde_json::json!([]));
+        assert_eq!(body["active_source"], "unconfigured");
+
+        state.lock().await.vault.upsert(
+            VaultEntry::new(HUB_URLS_VAULT_KEY, "not json {{{"),
+        ).unwrap();
+        assert_config_error(
+            hub_memberships(State(state.clone())).await.into_response(),
+            "config_invalid",
+        ).await;
+        restore_hub_env(previous);
+    }
+
+    #[tokio::test]
+    async fn mutation_intent_survives_a_success_append_failure() {
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = take_hub_env();
+        let (_dir, state) = shared_state();
+        let url = "https://rollback.example";
+        state.lock().await.chain_fault_on.insert("hub_url_mutation".into());
+        let response = hub_urls_add(
+            State(state.clone()),
+            None,
+            Json(HubUrlAddReq { url: url.into(), label: None, activate: Some(true) }),
+        ).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        {
+            let mut s = state.lock().await;
+            assert!(HubUrls::load(&s.vault).unwrap().entries.is_empty(),
+                    "the failed success append did not restore the previous list");
+            let chain = s.recent_chain(20);
+            let intents: Vec<_> = chain.iter()
+                .filter(|entry| entry.event_type == "hub_url_mutation_intent")
+                .collect();
+            assert_eq!(intents.len(), 1, "the durable change had no pre-write witness");
+            assert_eq!(intents[0].event_data["operation"], "add");
+            assert_eq!(intents[0].event_data["url"], url);
+            assert_eq!(intents[0].event_data["new_active"], url);
+            assert_ne!(intents[0].event_data["success"], true);
+            assert!(!chain.iter().any(|entry| entry.event_type == "hub_url_mutation"),
+                    "a failed append produced a success event");
+            s.chain_fault_on.clear();
+            s.chain_fault_on.insert("hub_url_mutation_intent".into());
+        }
+
+        let refused = hub_urls_add(
+            State(state.clone()),
+            None,
+            Json(HubUrlAddReq {
+                url: "https://must-not-persist.example".into(),
+                label: None,
+                activate: Some(true),
+            }),
+        ).await.into_response();
+        assert_eq!(refused.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let s = state.lock().await;
+        assert!(HubUrls::load(&s.vault).unwrap().entries.is_empty(),
+                "a mutation whose intent could not be witnessed changed the vault");
+        assert!(!s.recent_chain(20).iter().any(|entry|
+            entry.event_data["url"] == "https://must-not-persist.example"));
+        restore_hub_env(previous);
+    }
+
+    #[tokio::test]
+    async fn mutation_events_record_effective_fallback_and_env_targets() {
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = take_hub_env();
+        let (_dir, state) = shared_state();
+        HubUrls {
+            active: None,
+            entries: vec![HubUrlEntry {
+                url: "https://first.example".into(),
+                label: None,
+                added_at: None,
+            }],
+        }.store(&mut state.lock().await.vault).unwrap();
+
+        let added = hub_urls_add(
+            State(state.clone()),
+            None,
+            Json(HubUrlAddReq {
+                url: "https://second.example".into(),
+                label: None,
+                activate: Some(true),
+            }),
+        ).await.into_response();
+        assert_eq!(added.status(), axum::http::StatusCode::OK);
+
+        std::env::set_var("HESTIA_HUB_URL", "https://env.example/");
+        let activated = hub_urls_set_active(
+            State(state.clone()),
+            None,
+            Json(HubUrlRefReq { url: "https://first.example".into() }),
+        ).await.into_response();
+        assert_eq!(activated.status(), axum::http::StatusCode::OK);
+        restore_hub_env(previous);
+
+        let chain = state.lock().await.recent_chain(20);
+        let added = chain.iter().find(|entry|
+            entry.event_type == "hub_url_mutation" && entry.event_data["operation"] == "add"
+        ).unwrap();
+        assert_eq!(added.event_data["previous_active"], "https://first.example");
+        assert_eq!(added.event_data["new_active"], "https://second.example");
+        let activated = chain.iter().find(|entry|
+            entry.event_type == "hub_url_mutation" && entry.event_data["operation"] == "activate"
+        ).unwrap();
+        assert_eq!(activated.event_data["previous_active"], "https://env.example");
+        assert_eq!(activated.event_data["new_active"], "https://env.example");
+        assert!(added.event_data["intent"].is_string());
+        assert!(activated.event_data["intent"].is_string());
+    }
+
+    #[tokio::test]
+    async fn successful_mutations_record_the_target_and_operator_provenance() {
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = take_hub_env();
+        let (_dir, state) = shared_state();
+        let gate = Some(axum::Extension(crate::server::operator_auth::GateWitness {
+            operator: Some("lct:web4:test:operator".into()),
+            provenance: Some(crate::server::operator_auth::OperatorProvenance {
+                actor: "lct:web4:test:actor".into(),
+                principal: "lct:web4:test:principal".into(),
+                via_device: "lct:web4:test:device".into(),
+                office: "lct:web4:test:office".into(),
+                authority: "lct:web4:test:session".into(),
+            }),
+            gate_entry_hash: Some("gate-1".into()),
+        }));
+        let url = "http://127.0.0.1:8770/";
+
+        let added = hub_urls_add(
+            State(state.clone()),
+            gate.clone(),
+            Json(HubUrlAddReq { url: url.into(), label: None, activate: Some(true) }),
+        ).await.into_response();
+        assert_eq!(added.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(added.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["witnessEntryHash"].is_string());
+
+        let activated = hub_urls_set_active(
+            State(state.clone()), gate.clone(), Json(HubUrlRefReq { url: url.into() }),
+        ).await.into_response();
+        assert_eq!(activated.status(), axum::http::StatusCode::OK);
+        let removed = hub_urls_remove(
+            State(state.clone()), gate.clone(), Json(HubUrlRefReq { url: url.into() }),
+        ).await.into_response();
+        assert_eq!(removed.status(), axum::http::StatusCode::OK);
+
+        let chain = state.lock().await.recent_chain(10);
+        let mutations: Vec<_> = chain.iter()
+            .filter(|entry| entry.event_type == "hub_url_mutation")
+            .collect();
+        assert_eq!(mutations.len(), 3);
+        for (operation, previous_active, new_active) in [
+            ("add", None, Some("http://127.0.0.1:8770")),
+            ("activate", Some("http://127.0.0.1:8770"), Some("http://127.0.0.1:8770")),
+            ("remove", Some("http://127.0.0.1:8770"), None),
+        ] {
+            let entry = mutations.iter()
+                .find(|entry| entry.event_data["operation"] == operation)
+                .unwrap_or_else(|| panic!("missing {operation} event"));
+            assert_eq!(entry.event_data["url"], "http://127.0.0.1:8770");
+            assert_eq!(entry.event_data["previous_active"], serde_json::json!(previous_active));
+            assert_eq!(entry.event_data["new_active"], serde_json::json!(new_active));
+            assert_eq!(entry.event_data["success"], true);
+            assert_eq!(entry.event_data["authorized_by_gate"], "gate-1");
+            assert_eq!(entry.event_data["actor"], "lct:web4:test:actor");
+            assert_eq!(entry.event_data["principal"], "lct:web4:test:principal");
+            assert_eq!(entry.event_data["via_device"], "lct:web4:test:device");
+            assert_eq!(entry.event_data["office"], "lct:web4:test:office");
+            assert_eq!(entry.event_data["session_ref"], "lct:web4:test:session");
+        }
+
+        let rejected = hub_urls_add(
+            State(state.clone()), gate,
+            Json(HubUrlAddReq { url: "not a URL".into(), label: None, activate: None }),
+        ).await.into_response();
+        assert_eq!(rejected.status(), axum::http::StatusCode::BAD_REQUEST);
+        let chain = state.lock().await.recent_chain(10);
+        assert_eq!(chain.iter().filter(|entry| entry.event_type == "hub_url_mutation").count(), 3,
+                   "a rejected mutation must not mint a success event");
+        restore_hub_env(previous);
     }
 }
