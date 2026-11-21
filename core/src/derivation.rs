@@ -343,6 +343,57 @@ pub fn scan_window_with(
     out
 }
 
+/// The same derivation window, bounded by the member and its witnessed aliases rather than
+/// by unrelated traffic elsewhere on the chain.
+pub fn scan_subject_window(
+    chain_store: &crate::storage::chain::SqliteChainStore,
+    plugin_id: &str,
+) -> Vec<ChainEntry> {
+    scan_subject_window_with(chain_store, plugin_id, DERIVATION_HOT_SCAN, DERIVATION_GOVERNANCE_SCAN)
+}
+
+pub fn scan_subject_window_with(
+    chain_store: &crate::storage::chain::SqliteChainStore,
+    plugin_id: &str,
+    hot_scan: u64,
+    governance_scan: u64,
+) -> Vec<ChainEntry> {
+    let mut aliases = match chain_store.scan_recent(
+        None,
+        Some(&[IDENTITY_ALIAS_EVENT]),
+        ALIAS_SCAN,
+        project_row,
+    ) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("derivation alias chain read failed: {e}");
+            Vec::new()
+        }
+    };
+    let alias_refs: Vec<&ChainEntry> = aliases.iter().collect();
+    let identities = aliased_identities(plugin_id, &alias_refs);
+    let subject_ids: Vec<&str> = identities.iter().map(String::as_str).collect();
+    let scan = |types: &[&str], limit: u64, label: &str| -> Vec<ChainEntry> {
+        match chain_store.scan_subjects_recent(&subject_ids, None, types, limit, project_row) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!("derivation {label} subject read failed: {e}");
+                Vec::new()
+            }
+        }
+    };
+    let mut out = scan(
+        DERIVATION_GOVERNANCE_EVENT_TYPES,
+        governance_scan,
+        "governance",
+    );
+    out.extend(scan(DERIVATION_HOT_EVENT_TYPES, hot_scan, "outcome"));
+    out.append(&mut aliases);
+    out.sort_by(|a, b| b.chain_position.cmp(&a.chain_position));
+    out.dedup_by_key(|e| e.chain_position);
+    out
+}
+
 /// How many alias records a read takes: a FINITE BOUND, not "all of them".
 ///
 /// Said plainly because the prose around this repair says "no window", and that means no
@@ -1444,6 +1495,196 @@ mod tests {
         let mut desc = positions.clone();
         desc.sort_by(|a, b| b.cmp(a));
         assert_eq!(positions, desc, "merged window must stay chain_position DESC");
+    }
+
+    #[test]
+    fn a_subject_window_excludes_other_members_floods() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        for plugin_id in ["kimi-code", "kimi-code"] {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": plugin_id, "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+        for _ in 0..40 {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": "codex", "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+
+        let old = store.scan_recent(
+            None,
+            Some(DERIVATION_GOVERNANCE_EVENT_TYPES),
+            2,
+            project_row,
+        ).unwrap();
+        assert!(old.iter().all(|event| {
+            event.event_data.get("plugin_id").and_then(Value::as_str) == Some("codex")
+        }), "control: the peer flood must fill the global read");
+
+        let subject = scan_subject_window_with(&store, "kimi-code", 2, 2);
+        assert_eq!(subject.len(), 2);
+        assert!(subject.iter().all(|event| {
+            event.event_data.get("plugin_id").and_then(Value::as_str) == Some("kimi-code")
+        }));
+    }
+
+    #[test]
+    fn a_subject_window_preserves_alias_and_global_invalidation_evidence() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        store.append(
+            IDENTITY_ALIAS_EVENT,
+            json!({"alias": "kimi-cli", "alias_of": "kimi-code"}),
+            "lct:test",
+        ).unwrap();
+        let deny = store.append(
+            "policy_decision",
+            json!({"plugin_id": "kimi-cli", "decision": "deny", "enforced": true}),
+            "lct:test",
+        ).unwrap();
+        store.append(
+            "amnesty",
+            json!({"data": {"class": "deny", "before_position": 0}}),
+            "lct:test",
+        ).unwrap();
+        store.append(
+            "exoneration",
+            json!({"requested_by": {"plugin_id": "codex"}, "data": {"deny_hash": deny.hash}}),
+            "lct:test",
+        ).unwrap();
+
+        let window = scan_subject_window_with(&store, "kimi-code", 10, 10);
+        for event_type in ["identity_alias", "amnesty", "exoneration"] {
+            assert!(window.iter().any(|event| event.event_type == event_type));
+        }
+        let derived = derive_evidence("kimi-code", "role:constellation:member", &window);
+        assert_eq!(derived.temperament.observations, 0);
+        assert_eq!(derived.temperament.evidence.len(), 1);
+        assert!(derived.temperament.evidence[0].contribution.contains("EXCLUDED — exonerated"));
+    }
+
+    #[test]
+    fn subject_window_matches_global_fold_on_frozen_multi_member_corpus() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, [7u8; 32]).unwrap();
+        let tamper = |sql: &str| {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "key", hex::encode([7u8; 32])).unwrap();
+            conn.execute_batch(sql)
+        };
+        let append = |event_type: &str, data: serde_json::Value| {
+            store.append(event_type, data, "lct:test").unwrap()
+        };
+        append(IDENTITY_ALIAS_EVENT, json!({"alias": "kimi-cli", "alias_of": "kimi-code"}));
+        let deny = append("policy_decision", json!({
+            "plugin_id": "kimi-cli", "decision": "deny", "enforced": true,
+            "session_id": "s-kimi", "tool_name": "Bash", "target": "/tmp/x",
+            "payload_sha256": "p1", "attempted": "Bash: x"
+        }));
+        append("outcome", json!({
+            "plugin_id": "kimi-cli", "success": true, "session_id": "s-kimi",
+            "tool_name": "Bash", "target": "/tmp/x", "payload_sha256": "p1"
+        }));
+        append("appeal", json!({
+            "plugin_id": "kimi-code", "deny_hash": deny.hash.clone(), "reason": "data, not act"
+        }));
+        append("adjudication", json!({
+            "subject_plugin_id": "kimi-code", "subject_role": "role:constellation:member",
+            "about_deny_hash": deny.hash.clone(), "upheld": true,
+            "adjudicator": "codex", "rationale": "the deny confused data with execution",
+            "axis": "validity", "verdict": "upheld", "score": 1.0, "method": "peer-review"
+        }));
+        let other_deny = append("policy_decision", json!({
+            "plugin_id": "codex", "decision": "deny", "enforced": true,
+            "session_id": "s-codex", "tool_name": "Read", "target": "/tmp/y"
+        }));
+        append("outcome", json!({
+            "plugin_id": "codex", "success": true, "session_id": "s-codex",
+            "tool_name": "Read", "target": "/tmp/y"
+        }));
+        append("scope_attestation", json!({
+            "data": {"plugin_id": "kimi-code", "requested_by": {"plugin_id": "kimi-code"},
+                     "attested_by": "hestia-gate", "allows": 4, "denies": 0, "score": 1.0}
+        }));
+        append("scope_attestation", json!({
+            "requested_by": {"plugin_id": "codex"},
+            "data": {"plugin_id": "codex", "subject_plugin_id": "kimi-code",
+                     "attested_by": "plugin-gate:codex", "allows": 2, "denies": 1, "score": 0.85}
+        }));
+        append("amnesty", json!({"data": {"class": "deny", "before_position": 0}}));
+        append("exoneration", json!({
+            "requested_by": {"plugin_id": "kimi-code"},
+            "data": {"deny_hash": other_deny.hash.clone(), "ref": "frozen-corpus-proof"}
+        }));
+        append("unrelated", json!({"plugin_id": "kimi-code", "ignored": true}));
+        append("policy_decision", json!({
+            "plugin_id": "kimi-code", "decision": "allow",
+            "data": {"plugin_id": "codex", "subject_plugin_id": "kimi-code"},
+            "requested_by": {"plugin_id": "claude-code"}
+        }));
+        append(IDENTITY_ALIAS_EVENT, json!({"alias": "kimi-cli", "alias_of": "kimi-code"}));
+        append("outcome", json!({"data": {"plugin_id": "kimi-code", "success": true}}));
+        append("policy_decision", json!({"plugin_id": "claude-code", "decision": "allow"}));
+
+        let normalize = |plugin_id: &str, role_lct: &str, window: &[ChainEntry]| {
+            let mut value = serde_json::to_value(derive_evidence(plugin_id, role_lct, window)).unwrap();
+            value.as_object_mut().unwrap().remove("generated_at");
+            value
+        };
+        let assert_parity = |store: &SqliteChainStore| {
+            let global = scan_window_with(store, 1_000, 1_000);
+            for (plugin_id, role) in [
+                ("kimi-code", "role:constellation:member"),
+                ("kimi-code", "role:constellation:interactive-dev"),
+                ("kimi-cli", "role:constellation:member"),
+                ("codex", "role:constellation:member"),
+                ("claude-code", "role:constellation:member"),
+            ] {
+                let subject = scan_subject_window_with(store, plugin_id, 1_000, 1_000);
+                assert_eq!(
+                    normalize(plugin_id, role, &global),
+                    normalize(plugin_id, role, &subject),
+                    "subject/global derivation mismatch for {plugin_id} / {role}"
+                );
+                assert_eq!(
+                    alias_target(plugin_id, &global),
+                    alias_target(plugin_id, &subject),
+                    "alias mismatch for {plugin_id}"
+                );
+            }
+        };
+        assert_parity(&store);
+
+        // Position, not timestamp order, is the backfill contract. Both reads must see the
+        // same evidence even when the fixture's timestamps are deliberately out of order.
+        tamper(
+            "UPDATE chain_entries SET timestamp = '2027-01-01T00:00:00Z' WHERE chain_position = 1;
+             UPDATE chain_entries SET timestamp = '2026-01-01T00:00:00Z' WHERE chain_position = 2;",
+        ).unwrap();
+        assert_parity(&store);
+
+        // Force a complete restart rebuild and prove it does not duplicate or lose evidence.
+        tamper(
+            "DELETE FROM chain_subjects;
+             DELETE FROM chain_meta WHERE key = 'subjects_backfilled_through';",
+        ).unwrap();
+        drop(store);
+        let store = SqliteChainStore::open(&path, [7u8; 32]).unwrap();
+        assert_parity(&store);
+
+        let window = scan_window_with(&store, 1_000, 1_000);
+        let derived = derive_evidence("kimi-code", "role:constellation:member", &window);
+        assert!(derived.temperament.observations > 0, "the frozen corpus must exercise conduct");
+        assert!(derived.validity.observations > 0, "the frozen corpus must exercise adjudication");
     }
 
     /// A merge the operator performed must STAY performed (agent-lifecycle PRD R6).
