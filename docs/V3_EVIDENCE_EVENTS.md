@@ -69,8 +69,9 @@ legacy judgment-axis trust negatively. Every other cause is witnessed without
 an automatic subject penalty.
 
 `self-correction` does not automatically award Temperament. Promptness,
-forthrightness, boundary conduct, and attribution require adjudication; the
-cause label alone cannot prove them.
+forthrightness, boundary conduct, and attribution require independently
+witnessed conduct and a versioned derivation rule; the cause label alone
+cannot prove them. An unconfirmed reversal remains neutral.
 
 Legacy reversal events without a classified cause are retained but are not
 silently treated as invalid-result events by the calibration exporter.
@@ -87,7 +88,7 @@ separate events linked explicitly:
 | `changed-requirements` | none | follow-up verdicts SHOULD `depends_on` the reversal and new requirement evidence | neutral |
 | `new-evidence` | none | a replacement verdict MUST `supersedes` the prior same-axis adjudication and SHOULD `depends_on` the reversal/evidence | neutral until separately adjudicated |
 | `corrected-adjudication` | none | reversal `ref` MUST identify the prior same-grain adjudication; it tombstones that verdict. A replacement MUST `supersedes` the prior verdict and SHOULD `depends_on` the reversal | removes the corrected verdict at read time; replacement folds normally |
-| `self-correction` | none | future positive conduct evidence MUST link to the reversal | neutral today; no automatic Temperament |
+| `self-correction` | none | positive conduct requires a valid `conduct_confirmation` linking the reversal, original outcome, and successful corrective outcome | neutral unless independently confirmed |
 | `obsolescence` | none | follow-up verdicts SHOULD `depends_on` the reversal and obsolescence evidence | neutral |
 
 `supersedes` accepts a raw witness hash or `chain:<hash>` and is canonicalized
@@ -98,6 +99,48 @@ visible but is excluded from the active score. A
 a replacement verdict is pending. Because that exclusion changes the
 subject's active score, the subject cannot issue it about itself; it requires
 an attributable, law-authorized independent witness.
+
+### Independently confirmed self-correction
+
+`hestia_confirm_self_correction` emits a reserved
+`hestia.conduct-confirmation/v1` `conduct_confirmation` event only when the
+daemon can verify this graph:
+
+```text
+original outcome ──referenced by──> self-correction reversal
+       │                                  │
+       └──────── precedes ────────────────┤
+                                          v
+                              successful corrective outcome
+                                          │
+                                          v
+                          not-the-subject conduct confirmation
+```
+
+The original and corrective outcomes must belong to the same subject and role.
+The reversal must be reported by that subject and identify the original by
+witness hash. The confirmation must come from a different attributable entity
+and pass the `conduct_confirmation` policy category. The confirmer supplies a
+bounded textual attestation explaining why the later outcome is corrective;
+the daemon witnesses their identity alongside it.
+
+The read-time derivation independently revalidates the graph and assigns the
+fixed conduct score `0.9`. It ignores any caller-provided or stored score.
+Confirmations de-duplicate by reversal: additional witnesses remain visible as
+receipts but cannot multiply one act into multiple Temperament observations.
+This makes self-correction positive without making self-labeling, repeated
+confirmation, or a merely attempted/failed fix rewarding.
+
+`0.9` places confirmed correction above quiet compliance (`0.85`) and below an
+accountable appeal (`1.0`). One observation moves the `0.5` prior to `0.70`,
+at the high boundary, while leaving headroom for the fully accountable appeal
+path. Adding this predicate changes the projection formula, so receipts identify
+the derivation as `v3-derived-v2`; `v3-derived-v1` retains its original meaning.
+
+The predicate does **not** claim to measure promptness. Hestia currently
+witnesses the original, reversal, and correction times but not when the defect
+was discovered; treating elapsed time since the original as reaction time
+would fabricate knowledge. A future discovery event can add that dimension.
 
 ## Accountability self-audit
 
@@ -121,6 +164,16 @@ O: pass [construct: cause/role/kind validation and gate_direct_tool before appen
 A: pass [construct: cause + subject + reporter + evidence pointer in append_chain("reversal")]
 V: n/a [construct: reversible projection; challenge/supersession stage remains required before consequential publication]
 verdict: PASS
+
+surface: hestia_confirm_self_correction
+act: confirm one subject-reported correction as positive Temperament conduct
+S: medium/reversible [construct: append-only evidence + recomputable 0.9 projection]
+R: pass [construct: live confirmer session + original/reversal/correction chain graph]
+W: pass [construct: not-the-subject confirmer identity and role witnessed]
+O: pass [construct: conduct_confirmation law gate before any hash resolution]
+A: pass [construct: fixed daemon score; full graph pointers + bounded attestation]
+V: pass [construct: read-time revalidation; duplicate confirmations count once; raw event type reserved]
+verdict: PASS
 ```
 
 ---
@@ -132,7 +185,7 @@ verdict: PASS
   In-tree callers are updated; update any runbooks/operator habits.
 - Aggregate closure-claims payload is capped at 64 KB serialized per outcome
   (`MAX_CLOSURE_CLAIMS_TOTAL_BYTES`) — large evidence goes behind pointers, not inline.
-- `self-correction` remains neutral until independently witnessed conduct
-  confirmation lands; the per-cause emission and lineage contract above is
-  explicit, and the daemon validates and derives `supersedes`, `depends_on`,
-  and corrected-adjudication tombstones accordingly.
+- The per-cause emission/lineage contract is explicit, and the daemon validates
+  and derives `supersedes`, `depends_on`, and corrected-adjudication tombstones.
+  Self-correction remains neutral at reversal time; the dedicated not-the-subject
+  conduct-confirmation graph above is the only path by which it enters Temperament.
