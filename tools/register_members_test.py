@@ -1179,6 +1179,8 @@ def _e2e_root(tmp: Path):
     (root / "deploy").mkdir(parents=True)
     for f in ("install-members.sh", "register-members.py"):
         shutil.copy(REPO / "deploy" / f, root / "deploy" / f)
+    (root / "tools").mkdir()
+    shutil.copy(REPO / "tools" / "registration_resolver.py", root / "tools" / "registration_resolver.py")
     shutil.copytree(REPO / "plugins" / "_shared", root / "plugins" / "_shared")
     shutil.copytree(REPO / "plugins" / "member-mesh", root / "plugins" / "member-mesh",
                     ignore=shutil.ignore_patterns("__pycache__", "tests"))
@@ -1323,6 +1325,32 @@ def test_mesh_runtime_refuses_unsafe_names_and_symlinks_before_any_write():
     assert (dest / "hestia-mesh.py").is_symlink() and (dest / "hestia-mesh.py").read_text() == "operator's file\n"
 
 
+def test_mesh_runtime_refuses_ambiguous_duplicate_hook_targets():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        root, home, env = _e2e_root(tmp)
+        dest = home / ".claude" / "hooks" / "hestia"
+        elsewhere = tmp / "elsewhere"
+        dest.mkdir(parents=True)
+        elsewhere.mkdir()
+        settings = {"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": _mesh_cmd("claude-code", dest, "session-mesh-inbox.sh")},
+            {"type": "command", "command": _mesh_cmd("claude-code", elsewhere, "session-mesh-inbox.sh")},
+        ]}]}}
+        (home / ".claude" / "settings.json").write_text(json.dumps(settings))
+        p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")],
+                           capture_output=True, text=True, env=env)
+        out = p.stdout + p.stderr
+        assert p.returncode == 0, out[-3000:]
+        assert "skip  member mesh — multiple registered targets for session-mesh-inbox.sh" in out, out[-3000:]
+        for directory in (dest, elsewhere):
+            for base in _MESH_FILES + ("hestia-mesh.py",):
+                assert not (directory / base).exists(), f"ambiguous mesh target installed {directory / base}"
+        auth = json.loads((Path(env["HESTIA_HOME"]) / "current-build.json").read_text())
+        files = [f["file"] for m in auth["members"] if m["member"] == "claude-code" for f in m["files"]]
+        assert not set(files) & set(_MESH_FILES + ("hestia-mesh.py",)), files
+
+
 def test_install_members_reports_a_foreign_narrow_gate_and_widens_an_owned_one():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -1359,7 +1387,7 @@ def test_install_names_the_seat_document_step_and_never_fails_on_it():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         root, home, env = _e2e_root(tmp)
-        (root / "tools").mkdir()
+        (root / "tools").mkdir(exist_ok=True)
         shutil.copy(REPO / "tools" / "seed_seat_config.py", root / "tools" / "seed_seat_config.py")
         p = subprocess.run(["bash", str(root / "deploy" / "install-members.sh")], capture_output=True,
                            text=True, env=env)
@@ -2118,6 +2146,7 @@ TESTS = [
     test_install_members_end_to_end_in_an_isolated_home,
     test_mesh_runtime_loss_refuses_a_local_tuning_and_upgrades_a_banner_only_copy,
     test_mesh_runtime_refuses_unsafe_names_and_symlinks_before_any_write,
+    test_mesh_runtime_refuses_ambiguous_duplicate_hook_targets,
     test_install_members_reports_a_foreign_narrow_gate_and_widens_an_owned_one,
     test_install_names_the_seat_document_step_and_never_fails_on_it,
     test_a_short_registered_timeout_is_reconciled_in_every_reader,
