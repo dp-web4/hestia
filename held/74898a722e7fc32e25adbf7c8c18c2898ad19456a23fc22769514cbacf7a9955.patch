@@ -1,0 +1,421 @@
+diff --git a/plugins/_shared/hestia_witness_core.py b/plugins/_shared/hestia_witness_core.py
+--- a/plugins/_shared/hestia_witness_core.py
++++ b/plugins/_shared/hestia_witness_core.py
+@@ -46,6 +46,7 @@
+ import hashlib
+ import json
+ import os
++import re
+ import sys
+ import time
+ import urllib.error
+@@ -306,8 +307,52 @@
+     return None
+ 
+ 
++_EXIT_CODE_KEYS = ("exit_code", "exitCode", "returncode", "return_code")
++
++
++def _exit_status(value) -> Optional[int]:
++    """A numeric process status, never a boolean or arbitrary output text."""
++    if isinstance(value, bool):
++        return None
++    if isinstance(value, int):
++        return value
++    if isinstance(value, str):
++        text = value.strip()
++        if text.lstrip("-").isdigit():
++            return int(text)
++    return None
++
++
++_SHELL_RESULT_TOOLS = frozenset({"Bash", "Shell", "run_shell_command", "shell", "exec_command", "bash"})
++_SHELL_EXIT_RE = re.compile(r"^Exit [Cc]ode: (\d+)\s*$", re.MULTILINE)
++
++
++def _rendered_exit_status(tool_name, response) -> Optional[int]:
++    """Read a shell tool's labeled result footer, never an arbitrary number in its output.
++
++    The last label wins: the tool's own footer follows anything the command printed.
++    """
++    if tool_name not in _SHELL_RESULT_TOOLS:
++        return None
++    candidates = [response] if isinstance(response, str) else [
++        response.get(key) for key in ("llmContent", "returnDisplay")
++    ] if isinstance(response, dict) else []
++    for text in candidates:
++        if not isinstance(text, str):
++            continue
++        matches = _SHELL_EXIT_RE.findall(text)
++        if matches:
++            return int(matches[-1])
++    return None
++
++
+ def derive_success(event: dict) -> tuple[bool, Optional[str]]:
+-    """Best-effort success flag across the harnesses' outcome shapes."""
++    """Best-effort success flag across the harnesses' outcome shapes.
++
++    An explicit nonzero process status is a failed act even when the tool envelope itself was
++    well formed. Missing status evidence keeps the legacy best-effort answer. Only a documented
++    shell result's labeled exit footer is parsed; arbitrary output text is not searched.
++    """
+     forced = OUTCOME_EVENTS.get(event.get("hook_event_name"))
+     if forced is False:  # kimi's PostToolUseFailure: the event IS the failure
+         err = event.get("error")
+@@ -315,6 +360,14 @@
+             err = err.get("message") or json.dumps(err)
+         return False, str(err or "tool error")[:500]
+     resp = event.get("tool_response")
++    if isinstance(resp, str):
++        try:
++            decoded = json.loads(resp)
++        except (TypeError, ValueError):
++            decoded = None
++        if isinstance(decoded, dict):
++            resp = decoded
++    statuses = []
+     if isinstance(resp, dict):
+         if resp.get("is_error") or resp.get("isError"):
+             err = resp.get("error") or resp.get("message") or "tool error"
+@@ -324,6 +377,24 @@
+             if isinstance(err, dict):
+                 err = err.get("message") or json.dumps(err)
+             return False, str(err)[:500]
++        for key in _EXIT_CODE_KEYS:
++            status = _exit_status(resp.get(key))
++            if status is None:
++                continue
++            statuses.append(status)
++            if status != 0:
++                err = resp.get("stderr") or resp.get("message")
++                if isinstance(err, dict):
++                    err = err.get("message") or json.dumps(err)
++                detail = f": {err}" if err else ""
++                return False, f"exit status {status}{detail}"[:500]
++        if resp.get("interrupted") is True:
++            return False, "tool interrupted"
++    rendered = _rendered_exit_status(event.get("tool_name"), resp)
++    if rendered:
++        return False, f"exit status {rendered}"
++    if rendered == 0 or 0 in statuses:
++        return True, None
+     return True, None
+ 
+ 
+diff --git a/hooks-gt/_shared/hestia_witness_core.py b/hooks-gt/_shared/hestia_witness_core.py
+--- a/hooks-gt/_shared/hestia_witness_core.py
++++ b/hooks-gt/_shared/hestia_witness_core.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: 750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 426a4c77e67041426758dc54757ec1421613e876b09dd3fcbde89195fa24ba38  (published ground truth; manifest: hooks-gt)
+ """The outcome witness — ONE implementation for every harness; the shims only say who they are.
+ 
+ WHY THIS EXISTS (findings/per-harness-witness-drift-2026-09-28.md; dp agreed all five
+@@ -47,6 +47,7 @@
+ import hashlib
+ import json
+ import os
++import re
+ import sys
+ import time
+ import urllib.error
+@@ -307,8 +308,52 @@
+     return None
+ 
+ 
++_EXIT_CODE_KEYS = ("exit_code", "exitCode", "returncode", "return_code")
++
++
++def _exit_status(value) -> Optional[int]:
++    """A numeric process status, never a boolean or arbitrary output text."""
++    if isinstance(value, bool):
++        return None
++    if isinstance(value, int):
++        return value
++    if isinstance(value, str):
++        text = value.strip()
++        if text.lstrip("-").isdigit():
++            return int(text)
++    return None
++
++
++_SHELL_RESULT_TOOLS = frozenset({"Bash", "Shell", "run_shell_command", "shell", "exec_command", "bash"})
++_SHELL_EXIT_RE = re.compile(r"^Exit [Cc]ode: (\d+)\s*$", re.MULTILINE)
++
++
++def _rendered_exit_status(tool_name, response) -> Optional[int]:
++    """Read a shell tool's labeled result footer, never an arbitrary number in its output.
++
++    The last label wins: the tool's own footer follows anything the command printed.
++    """
++    if tool_name not in _SHELL_RESULT_TOOLS:
++        return None
++    candidates = [response] if isinstance(response, str) else [
++        response.get(key) for key in ("llmContent", "returnDisplay")
++    ] if isinstance(response, dict) else []
++    for text in candidates:
++        if not isinstance(text, str):
++            continue
++        matches = _SHELL_EXIT_RE.findall(text)
++        if matches:
++            return int(matches[-1])
++    return None
++
++
+ def derive_success(event: dict) -> tuple[bool, Optional[str]]:
+-    """Best-effort success flag across the harnesses' outcome shapes."""
++    """Best-effort success flag across the harnesses' outcome shapes.
++
++    An explicit nonzero process status is a failed act even when the tool envelope itself was
++    well formed. Missing status evidence keeps the legacy best-effort answer. Only a documented
++    shell result's labeled exit footer is parsed; arbitrary output text is not searched.
++    """
+     forced = OUTCOME_EVENTS.get(event.get("hook_event_name"))
+     if forced is False:  # kimi's PostToolUseFailure: the event IS the failure
+         err = event.get("error")
+@@ -316,6 +361,14 @@
+             err = err.get("message") or json.dumps(err)
+         return False, str(err or "tool error")[:500]
+     resp = event.get("tool_response")
++    if isinstance(resp, str):
++        try:
++            decoded = json.loads(resp)
++        except (TypeError, ValueError):
++            decoded = None
++        if isinstance(decoded, dict):
++            resp = decoded
++    statuses = []
+     if isinstance(resp, dict):
+         if resp.get("is_error") or resp.get("isError"):
+             err = resp.get("error") or resp.get("message") or "tool error"
+@@ -325,6 +378,24 @@
+             if isinstance(err, dict):
+                 err = err.get("message") or json.dumps(err)
+             return False, str(err)[:500]
++        for key in _EXIT_CODE_KEYS:
++            status = _exit_status(resp.get(key))
++            if status is None:
++                continue
++            statuses.append(status)
++            if status != 0:
++                err = resp.get("stderr") or resp.get("message")
++                if isinstance(err, dict):
++                    err = err.get("message") or json.dumps(err)
++                detail = f": {err}" if err else ""
++                return False, f"exit status {status}{detail}"[:500]
++        if resp.get("interrupted") is True:
++            return False, "tool interrupted"
++    rendered = _rendered_exit_status(event.get("tool_name"), resp)
++    if rendered:
++        return False, f"exit status {rendered}"
++    if rendered == 0 or 0 in statuses:
++        return True, None
+     return True, None
+ 
+ 
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -32,11 +32,11 @@
+     },
+     {
+       "path": "hestia_witness_core.py",
+-      "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777",
++      "sha256": "426a4c77e67041426758dc54757ec1421613e876b09dd3fcbde89195fa24ba38",
+       "source": "plugins/_shared/hestia_witness_core.py"
+     }
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
++  "gt_version": "f2d0dc04377cebf30f544a840975308fff48c74649b702cf176c6988c730a3c1"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "f2d0dc04377cebf30f544a840975308fff48c74649b702cf176c6988c730a3c1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -57,7 +57,7 @@
+       },
+       {
+         "path": "hestia_witness_core.py",
+-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
++        "sha256": "426a4c77e67041426758dc54757ec1421613e876b09dd3fcbde89195fa24ba38"
+       }
+     ]
+   },
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
++  "gt_version": "09d4d5e71aa52bd3984dd1440633fc35eef0a28e2a3eb6fe272ad866e5b62de8"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "f2d0dc04377cebf30f544a840975308fff48c74649b702cf176c6988c730a3c1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -57,7 +57,7 @@
+       },
+       {
+         "path": "hestia_witness_core.py",
+-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
++        "sha256": "426a4c77e67041426758dc54757ec1421613e876b09dd3fcbde89195fa24ba38"
+       }
+     ]
+   },
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
++  "gt_version": "075afcca82a55a4b391501ebd4101172119b734b7a8656eb173d2bf7df919e5c"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "f2d0dc04377cebf30f544a840975308fff48c74649b702cf176c6988c730a3c1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -57,10 +57,10 @@
+       },
+       {
+         "path": "hestia_witness_core.py",
+-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
++        "sha256": "426a4c77e67041426758dc54757ec1421613e876b09dd3fcbde89195fa24ba38"
+       }
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
++  "gt_version": "fb50a2f0859f01d812a5f238e3a3c58c649009d4b3424874453f04a7c7f7dc5d"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "f2d0dc04377cebf30f544a840975308fff48c74649b702cf176c6988c730a3c1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -57,7 +57,7 @@
+       },
+       {
+         "path": "hestia_witness_core.py",
+-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
++        "sha256": "426a4c77e67041426758dc54757ec1421613e876b09dd3fcbde89195fa24ba38"
+       }
+     ]
+   },
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
++  "gt_version": "8e9784cf60076d3fef3a2495f5e52d517a6519c2040d85e608bab10b5825c7c9"
+ }
+diff --git a/plugins/_shared/hestia_witness_core_test.py b/plugins/_shared/hestia_witness_core_test.py
+--- a/plugins/_shared/hestia_witness_core_test.py
++++ b/plugins/_shared/hestia_witness_core_test.py
+@@ -170,6 +170,44 @@
+     bad_g = core.intent_from({**g_post, "tool_response": {"error": {"message": "EACCES"}}})
+     check("B gemini AfterTool with an error is a failure",
+           bad_g and bad_g["success"] is False and "EACCES" in bad_g["error"], json.dumps(bad_g))
++    for name, response, status in (
++            ("snake-case", {"exit_code": 1, "stderr": "deliberate failure"}, 1),
++            ("camel-case", {"exitCode": 124, "stderr": "deliberate failure"}, 124),
++            ("numeric-string", {"returncode": "127", "stderr": "deliberate failure"}, 127),
++            ("json-response", json.dumps({"return_code": 2, "stderr": "deliberate failure"}), 2)):
++        failed = core.intent_from({**P["claude-code"][1], "tool_response": response})
++        check(f"B explicit nonzero status is failure: {name}",
++              failed and failed["success"] is False
++              and failed["error"] == f"exit status {status}: deliberate failure", json.dumps(failed))
++    for name, event, response in (
++            ("gemini-content", P["gemini"][1],
++             {"llmContent": "Command: false\nExit Code: 1\nSignal: (none)"}),
++            ("gemini-display", P["gemini"][1], {"returnDisplay": "Exit Code: 1"}),
++            ("codex-string", P["codex"][1], "Exit Code: 1")):
++        rendered = core.intent_from({**event, "tool_response": response})
++        check(f"B documented shell footer is failure: {name}",
++              rendered and rendered["success"] is False
++              and rendered["error"] == "exit status 1", json.dumps(rendered))
++    final_zero = core.intent_from({**P["codex"][1], "tool_response": "Exit Code: 1\nExit Code: 0"})
++    check("B the final shell footer controls, not command output",
++          final_zero and final_zero["success"] is True, json.dumps(final_zero))
++    unlabelled = core.intent_from({**P["codex"][1], "tool_response": "exit status 1"})
++    check("B arbitrary output is not parsed for a status",
++          unlabelled and unlabelled["success"] is True, json.dumps(unlabelled))
++    zero = core.intent_from({**P["claude-code"][1],
++                             "tool_response": {"exit_code": 0, "stderr": "warning only"}})
++    check("B zero status with stderr is still success",
++          zero and zero["success"] is True and zero["error"] is None, json.dumps(zero))
++    boolean = core.intent_from({**P["claude-code"][1], "tool_response": {"exit_code": False}})
++    check("B a boolean is not a process status",
++          boolean and boolean["success"] is True, json.dumps(boolean))
++    interrupted = core.intent_from({**P["claude-code"][1], "tool_response": {"interrupted": True}})
++    check("B an interrupted act is failure",
++          interrupted and interrupted["success"] is False
++          and interrupted["error"] == "tool interrupted", json.dumps(interrupted))
++    legacy = core.intent_from(P["claude-code"][1])
++    check("B missing status evidence keeps the legacy answer",
++          legacy and legacy["success"] is True and legacy["error"] is None, json.dumps(legacy))
+     check("B a non-outcome event is not witnessed", core.intent_from({"hook_event_name": "SessionStart"}) is None)
+     check("B gemini's absolute_path is the target", core.extract_target({"absolute_path": "/x/y"}) == "/x/y")
+ 
+@@ -203,6 +241,30 @@
+                   [c.get("plugin_id") for c in daemon.named("hestia_connect")] == [member],
+                   json.dumps(daemon.named("hestia_connect")))
+ 
++        print("C2. a top-level nonzero exit reaches the outcome record on every harness")
++        for member, (pre, post) in P.items():
++            daemon.calls.clear()
++            core.configure(plugin_id=member)
++            verdict = mech.query_society_safety(
++                pre, plugin_id=member, host_agent=member, host_session_id=pre.get("session_id"),
++                correlation_key=mech.correlation_key(pre))
++            gated = verdict.action_id
++            failed = {**post, "tool_response": {"exit_code": 1, "stderr": "deliberate failure"}}
++            if member == "kimi-code":
++                failed["hook_event_name"] = "PostToolUse"
++                failed.pop("error", None)
++            if member == "gemini":
++                failed["tool_response"] = {"llmContent": "Command: false\nExit Code: 1"}
++            want_error = "exit status 1" if member == "gemini" else "exit status 1: deliberate failure"
++            daemon.calls.clear()
++            core.run(failed)
++            recs = daemon.named("hestia_record_outcome")
++            check(f"C2 {member}: exit 1 closes the gate's action as a failure",
++                  len(recs) == 1 and recs[0].get("action_id") == gated
++                  and recs[0].get("success") is False
++                  and recs[0].get("error") == want_error,
++                  json.dumps(daemon.calls))
++
+         print("D. control: without the key the gate caches nothing and the witness goes cold")
+         pre, post = P["kimi-code"]
+         daemon.calls.clear()
