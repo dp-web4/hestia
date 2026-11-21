@@ -483,8 +483,51 @@ fn mint_once(
         return Some(lct.lct_id()); // hot path: already present
     }
 
-    // First sight: mint an AiSoftware LCT with a custodial keypair.
-    let (mut lct, keypair) = Lct::new(EntityType::AiSoftware, None);
+    persist_mint(
+        vault,
+        registry,
+        id,
+        filler,
+        sovereign_lct_id,
+        sovereign_anchor,
+        Lct::new(EntityType::AiSoftware, None),
+    )
+}
+
+fn persist_mint(
+    vault: &mut crate::vault::Vault,
+    registry: &mut MemberRegistry,
+    id: &str,
+    filler: bool,
+    sovereign_lct_id: &str,
+    sovereign_anchor: &str,
+    new_mint: (Lct, web4_core::crypto::KeyPair),
+) -> Option<String> {
+    let (mut lct, keypair) = new_mint;
+    let secret = keypair.secret_key_bytes();
+    if secret.iter().all(|b| *b == 0) {
+        eprintln!("[members] REFUSED: '{id}' mint produced an all-zero seed");
+        return None;
+    }
+    let secret_hex = hex::encode(secret);
+    let public_key = keypair.verifying_key();
+
+    // Persist: reload the doc, append, save (append-only; other members untouched).
+    let mut persisted: Vec<PersistedMember> =
+        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
+            .unwrap_or_default();
+    if let Some(existing) = persisted
+        .iter()
+        .find(|p| p.keypair_secret_hex == secret_hex || p.lct.public_key == public_key)
+    {
+        eprintln!(
+            "[members] REFUSED: '{id}' mint seed is already present under '{}'; \
+             one key cannot mint a second local presence",
+            existing.plugin_id
+        );
+        return None;
+    }
+
     lct.sign_binding(&keypair); // self-issued §3.2 bootstrap, custodial key proves the binding
     lct.legacy_alias = Some(member_legacy_alias(id, sovereign_anchor));
     if !sovereign_lct_id.is_empty() {
@@ -494,15 +537,10 @@ fn mint_once(
             ts: lct.created_at,
         }];
     }
-
-    // Persist: reload the doc, append, save (append-only; other members untouched).
-    let mut persisted: Vec<PersistedMember> =
-        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
-            .unwrap_or_default();
     persisted.push(PersistedMember {
         plugin_id: id.to_string(),
         lct: lct.clone(),
-        keypair_secret_hex: hex::encode(keypair.secret_key_bytes()),
+        keypair_secret_hex: secret_hex,
         filler,
     });
     if let Err(e) = crate::vault::save_doc(
@@ -570,6 +608,59 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let vault = crate::vault::Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
         (dir, vault)
+    }
+
+    fn mint_from_seed(seed: [u8; 32]) -> (Lct, web4_core::crypto::KeyPair) {
+        let keypair = web4_core::crypto::KeyPair::from_secret_bytes(&seed);
+        let (mut lct, _) = Lct::new(EntityType::AiSoftware, None);
+        lct.public_key = keypair.verifying_key();
+        (lct, keypair)
+    }
+
+    #[test]
+    fn member_seed_all_zero_is_refused_without_presence() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        assert!(persist_mint(
+            &mut vault,
+            &mut reg,
+            "zero-seed",
+            false,
+            "sid",
+            "anchor",
+            mint_from_seed([0; 32]),
+        ).is_none());
+        assert!(reg.is_empty());
+        assert!(load_members(&vault).is_empty(), "the refused mint did not persist");
+    }
+
+    #[test]
+    fn member_seed_already_present_cannot_mint_a_second_identity() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        let first = persist_mint(
+            &mut vault,
+            &mut reg,
+            "first-member",
+            false,
+            "sid",
+            "anchor",
+            mint_from_seed([7; 32]),
+        ).expect("the first use of a nonzero seed mints");
+        assert!(persist_mint(
+            &mut vault,
+            &mut reg,
+            "second-member",
+            false,
+            "sid",
+            "anchor",
+            mint_from_seed([7; 32]),
+        ).is_none(), "the same seed cannot mint another plugin identity");
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("second-member").is_none());
+        let reloaded = load_members(&vault);
+        assert_eq!(reloaded.len(), 1, "the refusal added no vault row");
+        assert_eq!(reloaded.get("first-member").unwrap().lct_id(), first);
     }
 
     #[test]
