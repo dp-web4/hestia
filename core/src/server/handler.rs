@@ -115,6 +115,7 @@ impl ServerHandler for HestiaServer {
             "hestia_gate_escalation_claim" => tool_gate_escalation_claim(&self.state, &args).await,
             "hestia_gate_escalation_escalate" => tool_gate_escalation_escalate(&self.state, &args).await,
             "hestia_gate_escalation_lookup" => tool_gate_escalation_lookup(&self.state, &args).await,
+            "hestia_gate_escalation_presented" => tool_gate_escalation_presented(&self.state, &args).await,
             "hestia_gate_escalation_corroborate" => {
                 tool_gate_escalation_corroborate(&self.state, &args).await
             }
@@ -529,6 +530,20 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_gate_arbitrate_escalation",
             "Rule on ANOTHER member's governance-write escalation. NOT-SAME enforced server-side using the same independence rules as the appeal arbiter — you can never grant your own gate write, and an escalation whose asker was never proven against a session (asker_basis: asserted) cannot be peer-cleared at all; the operator decides those. Approving requires a stated reason; refusing does not. Records role@agent and the independence tier. At A1 a peer shares the operator's UID, so this is recorded SECOND-PARTY REVIEW, not an enforced boundary",
+        ),
+        t_args(
+            "hestia_gate_escalation_presented",
+            "Record that THIS member's completed CLI wake presented one exact escalation invitation. This is member-side observation evidence, not a peer factor and not a ruling: it creates no concurrence, dissent, refusal, or reputation signal. Mailbox drains, watcher liveness, generic actor activity, and escalation polls MUST NOT call this. The caller's live session binds the member identity; the escalation must actually invite that member. Duplicate calls are idempotent, and the chain event preserves the same state through restart",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["escalation_id"],
+                "properties": {
+                    "escalation_id": {"type": "string", "description": "The exact escalation presented in this member's completed wake."},
+                    "session_id": {"type": "string", "description": "The presented member's own live session_id from hestia_connect."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; both resolve to the same session."}
+                }
+            }),
         ),
         t_args(
             "hestia_gate_escalation_corroborate",
@@ -20822,6 +20837,50 @@ mod tests {
         (dir, shared, esc_id, session_of["codex"].clone())
     }
 
+    #[tokio::test]
+    async fn invitation_presentation_is_attributed_idempotent_and_not_a_factor() {
+        let (_dir, shared, esc_id, codex_sid) = opened_escalation_with_peer().await;
+        let recorded = tool_gate_escalation_presented(
+            &shared,
+            &json!({"escalation_id": esc_id, "session_id": codex_sid}),
+        )
+        .await
+        .expect("the invited member's completed wake is observation evidence");
+        assert_eq!(recorded["recorded"], true);
+        assert_eq!(recorded["presented_to"], "codex");
+        assert_eq!(recorded["peer_participation"]["observed_no_response"], 1);
+        let codex_state = recorded["peer_participation"]["peer_states"].as_array().unwrap()
+            .iter().find(|row| row["peer"] == "codex").unwrap();
+        assert_eq!(codex_state["state"], "observed_no_response");
+
+        let duplicate = tool_gate_escalation_presented(
+            &shared,
+            &json!({"escalation_id": esc_id, "session_id": codex_sid}),
+        )
+        .await
+        .expect("a repeated wake is idempotent");
+        assert_eq!(duplicate["recorded"], false);
+        assert_eq!(duplicate["replayed"], true);
+        let s = shared.lock().await;
+        let esc = s.gate_escalations.get(&esc_id).unwrap();
+        assert!(esc.factors.is_empty(), "presentation is not concurrence or dissent");
+        let observations = s.chain_store.read_recent(100).unwrap().into_iter()
+            .filter(|entry| entry.event_type == "gate_escalation_presented")
+            .count();
+        assert_eq!(observations, 1, "the duplicate adds no second chain event");
+        drop(s);
+
+        let asker = tool_connect(&shared, &json!({"plugin_id": "claude-code", "host_agent": "h"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let err = tool_gate_escalation_presented(
+            &shared,
+            &json!({"escalation_id": esc_id, "session_id": asker}),
+        )
+        .await
+        .expect_err("the uninvited asker cannot mint observation on this invitation");
+        assert!(format!("{err}").contains("not invited"), "{err}");
+    }
+
     /// Issue #367's newest specimen, escalation 99417cc39a7acb5d (2026-08-14): codex called
     /// this door WITH a dissent argument. The argument was silently discarded (#419's
     /// accept-what-you-won't-honour class) and chain position 137353 recorded
@@ -29842,6 +29901,80 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
 /// a contract that says one thing and does another (review 4940109239 on PR #437).
 /// Both session-id spellings appear because `optional_session_id` accepts both — the
 /// `hestia_connect` reply emits camelCase and every handler here reads snake_case (#155).
+const PRESENTED_ACCEPTED_KEYS: &[&str] = &["escalation_id", "session_id", "sessionId"];
+
+async fn tool_gate_escalation_presented(state: &SharedState, args: &Value) -> ToolResult {
+    let escalation_id = require_string(args, "escalation_id")?;
+    let session_id_arg = optional_session_id(args);
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !PRESENTED_ACCEPTED_KEYS.contains(key))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(anyhow::anyhow!(
+                "unrecognised argument(s) {unknown:?}; presentation records exactly one member and one escalation"
+            ));
+        }
+    }
+
+    let mut s = state.lock().await;
+    let Some(caller) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Err(anyhow::anyhow!(
+            "recording an invitation presentation requires the presented member's live session_id"
+        ));
+    };
+    let Some(escalation) = s.gate_escalations.get(&escalation_id).cloned() else {
+        return Err(anyhow::anyhow!(escalation_miss_reason(&s, &escalation_id)));
+    };
+    if !escalation.invited_peers.contains(&caller.plugin_id) {
+        return Err(anyhow::anyhow!(
+            "{} was not invited to escalation {escalation_id}; refusing an unbound observation",
+            caller.plugin_id
+        ));
+    }
+    if escalation.observed_peers.contains(&caller.plugin_id) {
+        return Ok(json!({
+            "escalation_id": escalation_id,
+            "presented_to": caller.plugin_id,
+            "observed": true,
+            "recorded": false,
+            "replayed": true,
+            "witnessEntryHash": null,
+        }));
+    }
+
+    let host_session_id = caller
+        .session_uuid
+        .and_then(|uuid| s.sessions.get(&uuid))
+        .and_then(|session| session.host_session_id.clone());
+    let entry = s.append_chain(
+        "gate_escalation_presented",
+        json!({
+            "escalation_id": escalation_id,
+            "plugin_id": escalation.plugin_id,
+            "presented_to": caller.plugin_id,
+            "presented_role": caller.role_lct,
+            "presenter_host_session_id": host_session_id,
+            "evidence": "member_cli_wake_completed",
+        }),
+    )?;
+    if !s.gate_escalations.record_presented(&escalation_id, &caller.plugin_id) {
+        return Err(anyhow::anyhow!("presentation state changed unexpectedly while recording"));
+    }
+    let participation = s.gate_escalations.get(&escalation_id).unwrap().peer_participation();
+    Ok(json!({
+        "escalation_id": escalation_id,
+        "presented_to": caller.plugin_id,
+        "observed": true,
+        "recorded": true,
+        "replayed": false,
+        "peer_participation": participation,
+        "witnessEntryHash": entry.hash,
+    }))
+}
+
 const CORROBORATE_ACCEPTED_KEYS: &[&str] =
     &["escalation_id", "session_id", "sessionId", "stance", "argument"];
 
