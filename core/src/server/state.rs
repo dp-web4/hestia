@@ -232,6 +232,9 @@ pub struct ScopeRequest {
 /// standing, the breadth.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScopeRequestExt {
+    /// Reach only the directory's immediate entries, never a deeper descendant (#919).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shallow: bool,
     /// `Some` when the gate opened this request on a refusal; `None` when the member filed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateDenyOrigin>,
@@ -285,6 +288,10 @@ pub struct ScopeRequestExt {
     /// refused it as a live twin: "converted, then could not be edited".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted_at: Option<u64>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ScopeRequestExt {
@@ -629,6 +636,7 @@ fn rehydrate_scope_requests(
                 request.ext.peer_basis = data.get("peer_basis").cloned();
                 if granted {
                     request.ext.once = scope_bool(data, "once");
+                    request.ext.shallow = scope_bool(data, "shallow");
                     request.ext.granted_path = scope_text(data, "grant_path")
                         .filter(|path| path != &request.path);
                 }
@@ -3184,6 +3192,7 @@ mod tests {
             ("scope-pending", "/w/pending"),
             ("scope-once", "/w/once"),
             ("scope-live", "/w/live"),
+            ("scope-shallow", "/w/shallow"),
             ("scope-refused", "/w/refused"),
             ("scope-reserved", "/w/reserved"),
             ("scope-released", "/w/released"),
@@ -3204,7 +3213,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        for id in ["scope-once", "scope-live", "scope-refused", "scope-reserved", "scope-released", "scope-spent", "scope-revoked"] {
+        for id in ["scope-once", "scope-live", "scope-shallow", "scope-refused", "scope-reserved", "scope-released", "scope-spent", "scope-revoked"] {
             state
                 .append_chain(
                     if id == "scope-refused" { "scope_refused" } else { "scope_granted" },
@@ -3215,13 +3224,14 @@ mod tests {
                         "granted_by": if id == "scope-refused" { "codex" } else { "dp" },
                         "decision_reason": "reviewed",
                         "expires_at": expires,
-                        "once": id != "scope-live" && id != "scope-refused" && id != "scope-revoked",
+                        "once": id != "scope-live" && id != "scope-shallow" && id != "scope-refused" && id != "scope-revoked",
                         "grant_path": if id == "scope-once" {
                             "/w".to_string()
                         } else {
                             format!("/w/{}", id.trim_start_matches("scope-"))
                         },
-                        "recursive": true,
+                        "recursive": id != "scope-shallow",
+                        "shallow": id == "scope-shallow",
                         "peer_basis": {"independence": "cross_vendor"},
                     }),
                 )
@@ -3277,6 +3287,9 @@ mod tests {
         }));
         assert!(restored.scope_requests.get("scope-live").is_some_and(|r| {
             r.status(now) == "granted" && r.grants("/w/live/child.txt", now)
+        }));
+        assert!(restored.scope_requests.get("scope-shallow").is_some_and(|r| {
+            r.status(now) == "granted" && r.ext.shallow && !r.recursive
         }));
         assert!(restored.scope_requests.get("scope-refused").is_some_and(|r| {
             r.status(now) == "refused" && r.decided_by.as_deref() == Some("codex")
