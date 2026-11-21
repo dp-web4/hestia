@@ -1,0 +1,271 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -1593,12 +1593,27 @@
+ # Declared RED in the Sprint F notes; this bridge dies the day the certified snapshot
+ # carries an explicit launch-cwd grant.
+ def launch_cwd_repo(profile: HarnessProfile, workspace: str) -> list:
+-    """The repo the member is launched in is always in scope (dp 2026-07-21: 'whatever cwd we
+-    launch it in') — a per-launch dynamic grant on top of the static allowlist, so a
+-    task-specific launch dir is reachable for that session without widening the standing
+-    grant. This is the precedent `hestia_request_scope` generalises."""
++    """The launch directory is in scope, as a per-launch dynamic grant.
++
++    Inside the workspace that is the first repo segment, as before. An ABSOLUTE directory supplied
++    through the profile's declared launch variable may instead be outside the workspace: it gets a
++    recursive `path:` grant for that directory alone. A relative path, a workspace ancestor, or an
++    external cwd with no declared launch variable grants nothing.
++    """
+     env = os.environ.get(profile.launch_cwd_env) if profile.launch_cwd_env else None
+     cwd = (env or os.getcwd()).replace("\\", "/")
++    if env:
++        expanded = os.path.expanduser(cwd).replace("\\", "/")
++        if not expanded.startswith("/"):
++            return []
++        candidate = os.path.realpath(expanded).replace("\\", "/").rstrip("/")
++        ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++        if candidate == ws or ws.startswith(candidate + "/"):
++            return []
++        if candidate.startswith(ws + "/"):
++            rest = candidate[len(ws):].lstrip("/")
++            return [rest.split("/", 1)[0]]
++        return ["path:" + candidate + "/**"]
+     if workspace in cwd:
+         rest = cwd.split(workspace, 1)[1].lstrip("/")
+         seg = rest.split("/", 1)[0] if rest else ""
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 3f7ff348114c79527f22eedd8a81af6273a94c1d05c4d5af115d3683ecead0cb  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -1594,12 +1594,27 @@
+ # Declared RED in the Sprint F notes; this bridge dies the day the certified snapshot
+ # carries an explicit launch-cwd grant.
+ def launch_cwd_repo(profile: HarnessProfile, workspace: str) -> list:
+-    """The repo the member is launched in is always in scope (dp 2026-07-21: 'whatever cwd we
+-    launch it in') — a per-launch dynamic grant on top of the static allowlist, so a
+-    task-specific launch dir is reachable for that session without widening the standing
+-    grant. This is the precedent `hestia_request_scope` generalises."""
++    """The launch directory is in scope, as a per-launch dynamic grant.
++
++    Inside the workspace that is the first repo segment, as before. An ABSOLUTE directory supplied
++    through the profile's declared launch variable may instead be outside the workspace: it gets a
++    recursive `path:` grant for that directory alone. A relative path, a workspace ancestor, or an
++    external cwd with no declared launch variable grants nothing.
++    """
+     env = os.environ.get(profile.launch_cwd_env) if profile.launch_cwd_env else None
+     cwd = (env or os.getcwd()).replace("\\", "/")
++    if env:
++        expanded = os.path.expanduser(cwd).replace("\\", "/")
++        if not expanded.startswith("/"):
++            return []
++        candidate = os.path.realpath(expanded).replace("\\", "/").rstrip("/")
++        ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
++        if candidate == ws or ws.startswith(candidate + "/"):
++            return []
++        if candidate.startswith(ws + "/"):
++            rest = candidate[len(ws):].lstrip("/")
++            return [rest.split("/", 1)[0]]
++        return ["path:" + candidate + "/**"]
+     if workspace in cwd:
+         rest = cwd.split(workspace, 1)[1].lstrip("/")
+         seg = rest.split("/", 1)[0] if rest else ""
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc",
++      "sha256": "3f7ff348114c79527f22eedd8a81af6273a94c1d05c4d5af115d3683ecead0cb",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
++  "gt_version": "0dfd7171b76df9be516d1076f218d0b4377ddcde38bafc84212f3f52fa4f7979"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "0dfd7171b76df9be516d1076f218d0b4377ddcde38bafc84212f3f52fa4f7979",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
++        "sha256": "3f7ff348114c79527f22eedd8a81af6273a94c1d05c4d5af115d3683ecead0cb"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
++  "gt_version": "ca4a8c211d0be41e14b4fe8c7140df8043b41b98e0f860734f0597b9bf53766e"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "0dfd7171b76df9be516d1076f218d0b4377ddcde38bafc84212f3f52fa4f7979",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
++        "sha256": "3f7ff348114c79527f22eedd8a81af6273a94c1d05c4d5af115d3683ecead0cb"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
++  "gt_version": "3bd6c8fc6c0b2a5a49a3a1abab4ad689df7d40108b9e87aff30b43f595ac0817"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "0dfd7171b76df9be516d1076f218d0b4377ddcde38bafc84212f3f52fa4f7979",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
++        "sha256": "3f7ff348114c79527f22eedd8a81af6273a94c1d05c4d5af115d3683ecead0cb"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
++  "gt_version": "62f2b559e09c538d58940dccc733d00a8f42749599d271e923eb43301aa3454e"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "0dfd7171b76df9be516d1076f218d0b4377ddcde38bafc84212f3f52fa4f7979",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
++        "sha256": "3f7ff348114c79527f22eedd8a81af6273a94c1d05c4d5af115d3683ecead0cb"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
++  "gt_version": "1f534db77db2805962ccac2e557b2949692a4e6e618669a206ca11de2fb2e56b"
+ }
+diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.py
+--- a/plugins/_shared/test_gate_core.py
++++ b/plugins/_shared/test_gate_core.py
+@@ -21,6 +21,7 @@
+ """
+ from __future__ import annotations
+ 
++import dataclasses
+ import json
+ import os
+ import re
+@@ -289,6 +290,51 @@
+         json.dump({"mrh": mrh, "role": "role:constellation:member"}, fh)
+     return G.HarnessProfile(member_id="test-member", identity_path=p,
+                             home_markers=("~/.test-member",))
++
++
++def test_an_explicit_external_launch_dir_is_the_launch_grant():
++    """#647: a per-fire worktree is not under the workspace, but its declared launch dir is
++    still the one place this session may reach. No other external path is widened."""
++    ws, launched, sibling = _workspace(), _workspace(), _workspace()
++    key = "HESTIA_TEST_LAUNCH_CWD"
++    previous = os.environ.get(key)
++    target = os.path.join(launched, "notes.md")
++    other = os.path.join(sibling, "other.md")
++    for path in (target, other):
++        with open(path, "w", encoding="utf-8") as fh:
++            fh.write("x\n")
++    try:
++        os.environ[key] = launched
++        prof = dataclasses.replace(_profile(ws, []), launch_cwd_env=key)
++        expected = "path:" + os.path.realpath(launched).replace("\\", "/").rstrip("/") + "/**"
++        check("external-launch-grant-is-exact-recursive-path",
++              G.launch_cwd_repo(prof, ws) == [expected], G.launch_cwd_repo(prof, ws))
++        allowed = G.evaluate(G.NormalizedEvent(tool="Read", paths=[target], cwd=launched), prof, ws)
++        check("external-launch-file-allows", allowed.decision == "allow", allowed)
++        denied = G.evaluate(G.NormalizedEvent(tool="Read", paths=[other], cwd=launched), prof, ws)
++        check("external-sibling-still-denies", denied.blocks and denied.rule == "mrh.path", denied)
++
++        os.environ[key] = os.path.dirname(ws)
++        check("workspace-ancestor-is-not-a-launch-grant", G.launch_cwd_repo(prof, ws) == [],
++              G.launch_cwd_repo(prof, ws))
++        os.environ[key] = "relative-launch-dir"
++        check("relative-launch-dir-is-not-a-grant", G.launch_cwd_repo(prof, ws) == [],
++              G.launch_cwd_repo(prof, ws))
++        os.environ[key] = "relative/" + ws
++        check("relative-path-containing-workspace-is-not-a-grant", G.launch_cwd_repo(prof, ws) == [],
++              G.launch_cwd_repo(prof, ws))
++        os.environ[key] = os.path.join(ws, "granted")
++        check("in-workspace-launch-keeps-repo-grant", G.launch_cwd_repo(prof, ws) == ["granted"],
++              G.launch_cwd_repo(prof, ws))
++        os.environ.pop(key)
++        denied = G.evaluate(G.NormalizedEvent(tool="Read", paths=[target], cwd=launched), prof, ws)
++        check("external-cwd-without-declaration-still-denies",
++              denied.blocks and denied.rule == "mrh.path", denied)
++    finally:
++        if previous is None:
++            os.environ.pop(key, None)
++        else:
++            os.environ[key] = previous
+ 
+ 
+ def test_path_and_command_scope():
+@@ -1311,6 +1357,7 @@
+     "test_egress_offers_no_door",
+     "test_scope_remedy_distinguishes_itself_from_appeal",
+     "test_path_and_command_scope",
++    "test_an_explicit_external_launch_dir_is_the_launch_grant",
+     "test_path_grant_reaches_a_sibling_of_the_repos",
+     "test_path_grants_keep_their_type_and_match_resolved_boundaries",
+     "test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly",
+@@ -1390,6 +1437,7 @@
+     test_egress_offers_no_door()
+     test_scope_remedy_distinguishes_itself_from_appeal()
+     test_path_and_command_scope()
++    test_an_explicit_external_launch_dir_is_the_launch_grant()
+     test_path_grant_reaches_a_sibling_of_the_repos()
+     test_path_grants_keep_their_type_and_match_resolved_boundaries()
+     test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly()
