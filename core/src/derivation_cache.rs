@@ -1,4 +1,4 @@
-//! Denial-triggered trust derivation.
+//! Event-triggered trust derivation.
 //!
 //! dp, 2026-09-17: "trust derivation should be event-triggered not timed. a negative event
 //! would trigger trust derivation for the affected member. all should be derived on start
@@ -16,11 +16,12 @@
 //! THE RULE. A member's derivation is cached. It is re-derived when a DENY naming that member
 //! lands on the chain — and once more when that deny's retry window closes, because what the
 //! member did next (retried the act: 0.0; reached the same resource another way: 0.35;
-//! adapted: 0.85) is only fully on the chain then. Both are triggered by the denial; nothing
-//! else the member or anyone else does triggers anything. The rule is applied in
-//! `SqliteChainStore::append`, the one path every chain write takes.
+//! adapted: 0.85) is only fully on the chain then. Sparse adjudications and
+//! corrected-adjudication reversals also invalidate their subject: they change the active
+//! evidence leaves immediately, and superseded observations cannot wait for a daily refresh.
+//! The rule is applied in `SqliteChainStore::append`, the one path every chain write takes.
 //!
-//! Everything a deny does not cover — a ruling on an appeal or escalation, an alias, an
+//! Everything those triggers do not cover — a ruling on an appeal or escalation, an alias, an
 //! exoneration or amnesty, the slow drift of governed volume and of the window itself — is
 //! picked up when everyone is re-derived: at start, and once a day
 //! ([`EVERYONE_REDERIVE_EVERY`]). That is the stated trade: a member whose appeal is upheld
@@ -99,8 +100,8 @@ impl Inner {
                 .all(|(id, ep)| self.member_epoch.get(id).copied().unwrap_or(0) == *ep)
     }
 
-    /// Start of day, and closed retry windows: the two things besides a deny that make a
-    /// derivation stale, both settled here before anyone asks what is due.
+    /// Start of day, and closed retry windows: the time-based invalidation rules,
+    /// both settled here before anyone asks what is due.
     fn settle(&mut self, now: Instant) {
         match self.everyone_since {
             Some(t) if now.saturating_duration_since(t) < EVERYONE_REDERIVE_EVERY => {}
@@ -182,7 +183,7 @@ impl DerivationCache {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The trigger: the member a chain entry DENIES, or `None`. Nothing else triggers.
+    /// The deny arm of the trigger: the member a chain entry DENIES, or `None`.
     ///
     /// Deliberately looser than the deny `derive` scores (it also excludes probe sessions,
     /// no-verdict denies and unenforced ones): a re-derivation that changes nothing costs one
@@ -195,16 +196,30 @@ impl DerivationCache {
         flat_or_data(e, "plugin_id").filter(|p| !p.is_empty())
     }
 
+    fn adjudication_subject(e: &ChainEntry) -> Option<&str> {
+        match e.event_type.as_str() {
+            "adjudication" => flat_or_data(e, "subject_plugin_id"),
+            "reversal" if flat_or_data(e, "cause") == Some("corrected-adjudication") => {
+                flat_or_data(e, "subject_plugin_id")
+            }
+            _ => None,
+        }
+        .filter(|p| !p.is_empty())
+    }
+
     /// Called by `SqliteChainStore::append` after an entry is durably committed.
     ///
     /// Ordering is what makes the cache sound: the invalidation lands AFTER the row is
     /// readable, and [`Self::refresh`] captures epochs BEFORE it scans. So a scan either sees
     /// the row, or its result is recorded under the old epoch and is already stale.
     pub fn observe(&self, e: &ChainEntry) {
-        let Some(member) = Self::denied_member(e) else { return };
+        let denied = Self::denied_member(e);
+        let Some(member) = denied.or_else(|| Self::adjudication_subject(e)) else { return };
         let mut inner = self.lock();
         inner.bump(member);
-        inner.schedule_recheck(member, Instant::now() + recheck_after());
+        if denied.is_some() {
+            inner.schedule_recheck(member, Instant::now() + recheck_after());
+        }
     }
 
     /// The cached derivation for a grain, current or awaiting its re-derivation. `None` if
@@ -351,10 +366,9 @@ mod tests {
         }
     }
 
-    /// dp's rule, end to end through the real append path: a deny re-derives the member it
-    /// names, and nobody else; everything else re-derives nobody.
+    /// Denies and sparse adjudicated-evidence changes re-derive their member, and nobody else.
     #[test]
-    fn only_a_deny_rederives_and_only_its_member() {
+    fn denies_and_adjudicated_revisions_rederive_only_their_member() {
         let (_d, s) = store();
         let cache = s.derivations();
         deny(&s, "kimi-code", "s-k", "/etc/a");
@@ -364,19 +378,24 @@ mod tests {
         assert_eq!(cache.refresh(&s), 0, "nothing happened: nothing is re-derived");
         assert_eq!(cache.lookup("kimi-code", ROLE).unwrap().evidence.temperament.observations, 1);
 
-        // Everything that is not a deny: routine traffic, allows, the governance acts a first
-        // cut also triggered on. None of it re-derives anyone.
+        // High-volume and unrelated governance traffic still re-derives nobody.
         for _ in 0..50 {
             outcome(&s, "codex");
             allow(&s, "codex", "s-c", "/tmp/fine");
         }
         s.append("appeal", json!({"plugin_id": "kimi-code", "deny_hash": "ab"}), "lct:test").unwrap();
-        s.append("adjudication", json!({"subject_plugin_id": "kimi-code", "about_deny_hash": "ab", "upheld": true}), "lct:test").unwrap();
         s.append("gate_escalation_decided", json!({"plugin_id": "codex", "status": "approved"}), "lct:test").unwrap();
         s.append(IDENTITY_ALIAS_EVENT, json!({"alias": "codex-cli", "alias_of": "codex"}), "lct:test").unwrap();
         s.append("amnesty", json!({"data": {"class": "deny", "before_position": 0}}), "lct:test").unwrap();
         past_coalesce(cache);
-        assert_eq!(cache.refresh(&s), 0, "no deny, no derivation — however much else happened");
+        assert_eq!(cache.refresh(&s), 0, "no deny or adjudicated revision");
+
+        s.append("adjudication", json!({"subject_plugin_id": "kimi-code", "about_deny_hash": "ab", "upheld": true}), "lct:test").unwrap();
+        past_coalesce(cache);
+        assert_eq!(cache.refresh(&s), 1, "an adjudication re-derives exactly its subject");
+        s.append("reversal", json!({"subject_plugin_id": "codex", "cause": "corrected-adjudication"}), "lct:test").unwrap();
+        past_coalesce(cache);
+        assert_eq!(cache.refresh(&s), 1, "a correction re-derives exactly its subject");
 
         deny(&s, "kimi-code", "s-k", "/etc/b");
         past_coalesce(cache);
