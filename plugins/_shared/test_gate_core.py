@@ -315,6 +315,116 @@ def test_path_and_command_scope():
     check("tmp_allows", G.evaluate(ev, prof, ws).decision == "allow")
 
 
+def test_bare_name_file_operands_in_an_ungranted_cwd():
+    """#1609: a slashless name reaches the same file as its `./` spelling.
+
+    The event cwd is outside every grant and is not a scratch root. Only the workspace is
+    granted recursively. Read operands are judged when they name an existing file; write
+    operands are judged even when the file does not exist yet.
+    """
+    ws = _workspace()
+    outside = tempfile.mkdtemp(dir=os.path.dirname(ws))
+    scopes = ["path:" + ws + G.RECURSIVE_SUFFIX]
+    for name in ("notes.txt", "a.txt", "remove.txt"):
+        open(os.path.join(outside, name), "w").close()
+    open(os.path.join(outside, "{notes"), "w").close()
+    open(os.path.join(ws, "source.txt"), "w").close()
+
+    def reach(command):
+        return G.command_scope_reach(command, scopes, ws, outside)
+
+    cases = (
+        ("bare_read", "cat notes.txt", "notes.txt"),
+        ("slashed_read_control", "cat ./notes.txt", "notes.txt"),
+        ("bare_redirect_to_a_new_file", "echo hi > out.txt", "out.txt"),
+        ("bare_tee_to_a_new_file", "tee tee-out.txt", "tee-out.txt"),
+        ("bare_copy_source", "cp a.txt b.txt", "a.txt"),
+        ("bare_copy_destination", f"cp {ws}/source.txt copy-out.txt", "copy-out.txt"),
+        ("bare_remove", "rm -f remove.txt", "remove.txt"),
+        ("literal_open_brace_read", "cat {notes", "{notes"),
+        ("literal_open_brace_write", "echo hi > {out", "{out"),
+        ("cp_backup_optional_argument_does_not_swallow_source",
+         f"cp --backup a.txt {ws}/copy-out.txt", "a.txt"),
+    )
+    for name, command, target in cases:
+        ok, offending, refused = reach(command)
+        expected = os.path.normpath(os.path.join(outside, target)).replace("\\", "/")
+        check(name, not ok and refused == expected,
+              f"{command!r}: ok={ok}, offending={offending!r}, refused={refused!r}; "
+              f"wanted {expected!r}")
+
+    # The event cwd is only a POSSIBLE working directory. An existing in-scope interpretation
+    # still wins, and a missing bare read target is not a new scope request (#1404).
+    for base in (ws, outside):
+        open(os.path.join(base, "shared.txt"), "w").close()
+    ok, offending, refused = reach("rm -f shared.txt")
+    expected = os.path.normpath(os.path.join(outside, "shared.txt")).replace("\\", "/")
+    check("bare_remove_does_not_use_an_in_scope_namesake",
+          not ok and refused == expected)
+    check("existing_in_scope_interpretation_still_allows", reach("cat shared.txt")[0])
+    check("missing_bare_read_target_is_not_a_new_ask", reach("cat absent.txt")[0])
+    check("echo_operands_remain_strings", reach("echo notes.txt")[0])
+    check("printf_operands_remain_strings", reach("printf '%s' notes.txt")[0])
+
+    permitted = scopes + ["path:" + outside + G.RECURSIVE_SUFFIX]
+    check("an_explicit_cwd_grant_admits_the_same_read",
+          G.command_scope_reach("cat notes.txt", permitted, ws, outside)[0])
+    check("an_explicit_cwd_grant_admits_the_same_new_write",
+          G.command_scope_reach("echo hi > permitted.txt", permitted, ws, outside)[0])
+
+    prof = _profile(ws, scopes)
+    v = G.evaluate(G.NormalizedEvent(tool="Bash", command="echo hi > evaluated.txt",
+                                    cwd=outside), prof, ws)
+    expected = os.path.normpath(os.path.join(outside, "evaluated.txt")).replace("\\", "/")
+    check("the_real_evaluate_path_refuses_and_names_the_bare_write_target",
+          v.blocks and v.rule == "mrh.command" and expected in v.reason, repr(v))
+
+    repo = os.path.join(ws, "repo")
+    os.mkdir(repo)
+    open(os.path.join(ws, "outside"), "w").close()
+    repo_scopes = ["path:" + repo + G.RECURSIVE_SUFFIX]
+    check("quoted_commit_message_dotdot_is_data",
+          G.command_scope_reach('git commit -m "explain ../ word"', repo_scopes, ws, repo)[0])
+    check("git_pathspec_after_message_remains_a_reach",
+          not G.command_scope_reach("git commit -m plain -- ../outside", repo_scopes, ws, repo)[0])
+
+    glob_dir = os.path.join(ws, "glob-outside")
+    os.mkdir(glob_dir)
+    for name in ("a.txt", "b.txt"):
+        open(os.path.join(glob_dir, name), "w").close()
+    check("quoted_glob_in_commit_message_is_data",
+          G.command_scope_reach('git commit -m "../glob-outside/*"', repo_scopes, ws, repo)[0])
+    check("unquoted_glob_in_commit_message_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/*", repo_scopes, ws, repo)[0])
+
+    check("unquoted_brace_list_in_commit_message_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a,b}.txt", repo_scopes, ws, repo)[0])
+    check("unquoted_brace_range_in_commit_message_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a..b}.txt", repo_scopes, ws, repo)[0])
+
+    check("quoted_brace_list_in_commit_message_is_data",
+          G.command_scope_reach('git commit -m "../glob-outside/{a,b}.txt"', repo_scopes, ws, repo)[0])
+    check("quoted_brace_range_in_commit_message_is_data",
+          G.command_scope_reach('git commit -m "../glob-outside/{a..b}.txt"', repo_scopes, ws, repo)[0])
+    check("partially_double_quoted_brace_expansion_remains_a_reach",
+          not G.command_scope_reach('git commit -m ../glob-outside/{a,"b"}.txt', repo_scopes, ws, repo)[0])
+    check("partially_single_quoted_brace_expansion_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a,'b'}.txt", repo_scopes, ws, repo)[0])
+
+    check("quoted_first_brace_item_remains_a_reach",
+          not G.command_scope_reach('git commit -m ../glob-outside/{"a",b}.txt', repo_scopes, ws, repo)[0])
+    check("escaped_space_brace_expansion_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a.txt,b\\ }", repo_scopes, ws, repo)[0])
+    check("double_quoted_open_brace_inside_expansion_remains_a_reach",
+          not G.command_scope_reach('git commit -m ../glob-outside/{a,"{"}.txt', repo_scopes, ws, repo)[0])
+    check("single_quoted_open_brace_inside_expansion_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a,'{'}.txt", repo_scopes, ws, repo)[0])
+    check("escaped_open_brace_inside_expansion_remains_a_reach",
+          not G.command_scope_reach("git commit -m ../glob-outside/{a.txt,\\{}", repo_scopes, ws, repo)[0])
+    check("quoted_open_brace_inside_second_item_remains_a_reach",
+          not G.command_scope_reach('git commit -m ../glob-outside/{a,"b{"}.txt', repo_scopes, ws, repo)[0])
+
+
 def test_path_grant_reaches_a_sibling_of_the_repos():
     """`.git-inbox` is a sibling of the repos, so a repo: grant never reaches it — the exact
     refusal kimi hit on 2026-08-02 while reading the directory the push guard names."""
@@ -1311,6 +1421,7 @@ ALL_TESTS = [
     "test_egress_offers_no_door",
     "test_scope_remedy_distinguishes_itself_from_appeal",
     "test_path_and_command_scope",
+    "test_bare_name_file_operands_in_an_ungranted_cwd",
     "test_path_grant_reaches_a_sibling_of_the_repos",
     "test_path_grants_keep_their_type_and_match_resolved_boundaries",
     "test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly",
@@ -1390,6 +1501,7 @@ if __name__ == "__main__":
     test_egress_offers_no_door()
     test_scope_remedy_distinguishes_itself_from_appeal()
     test_path_and_command_scope()
+    test_bare_name_file_operands_in_an_ungranted_cwd()
     test_path_grant_reaches_a_sibling_of_the_repos()
     test_path_grants_keep_their_type_and_match_resolved_boundaries()
     test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly()
