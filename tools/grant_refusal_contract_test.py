@@ -106,6 +106,8 @@ BLOCK
     fill();
     await el('sg-grant-btn').click();
     log.push({ step: 'the ordinary grant after it', sent: sent.length, flag: sent[1] && sent[1].body.grant_ahead_of_connect });
+  } else if (script === 'coverage') {
+    log.push({ html: el('sg-ok').innerHTML });
   }
   process.stdout.write(JSON.stringify(log));
 })();
@@ -135,6 +137,16 @@ def run(replies, script) -> list:
 REFUSED = {"status": 409, "body": {"error": "no member 'Claude-code' has ever connected", "member_known": False,
                                     "nearest": ["claude-code"]}}
 GRANTED = {"status": 200, "body": {"ok": True, "member_known": False, "plugin_id": "Claude-code", "path": "/w/repos"}}
+COVERAGE = {"status": 200, "body": {
+    "ok": True, "member_known": True, "plugin_id": "claude-code", "path": "/w/root/child",
+    "replaced_existing": True,
+    "coverage_overlaps": [
+        {"path": "/w/root", "relation": "existing_covers_new"},
+        {"path": "/w/root/other", "relation": "new_covers_existing"},
+        {"path": "/w/root/third", "relation": "existing_covers_new"},
+        {"path": "/w/root/fourth", "relation": "existing_covers_new"},
+    ],
+}}
 
 
 def source_contract() -> None:
@@ -192,6 +204,14 @@ def behaviour() -> None:
     check("...and is SPENT anyway: the next ordinary grant carries no flag",
           (step.get("the ordinary grant after it", {}).get("sent"), step.get("the ordinary grant after it", {}).get("flag")),
           (2, None))
+
+    html = next((row["html"] for row in run([COVERAGE], "coverage") if "html" in row), "")
+    check("replacement is rendered, not left only in the JSON response",
+          "Replaced the existing grant on this member and path." in html)
+    for fragment in ("existing covers new: /w/root", "new covers existing: /w/root/other",
+                     "existing covers new: /w/root/third", "(+1 more)",
+                     "modes, exact/recursive reach, and expiry can differ intentionally"):
+        check(f"coverage feedback includes {fragment!r}", fragment in html)
 
 
 def test_grant_refusal_contract() -> None:

@@ -6452,6 +6452,18 @@
              The grant was recorded and no seat may ever read it. This is what a typo looks
              like; it is only correct if you are granting ahead of a first connect.
              <em>Nothing is enforced differently until a member by that exact id connects.</em>`;
+        if (out.replaced_existing) {
+          ok.innerHTML = `<strong>Replaced the existing grant on this member and path.</strong> `
+            + ok.innerHTML;
+        }
+        const coverageOverlaps = Array.isArray(out.coverage_overlaps) ? out.coverage_overlaps : [];
+        if (coverageOverlaps.length) {
+          const described = coverageOverlaps.slice(0, 3).map(o =>
+            `${o.relation === 'existing_covers_new' ? 'existing covers new' : 'new covers existing'}: ${o.path}`);
+          const remainder = coverageOverlaps.length > 3 ? ` (+${coverageOverlaps.length - 3} more)` : '';
+          ok.innerHTML += `<br><strong>Coverage overlap:</strong> ${escapeHtml(described.join('; ') + remainder)}.
+            Existing rows are retained; modes, exact/recursive reach, and expiry can differ intentionally.`;
+        }
         ok.hidden = false;
         path.value = ''; reason.value = '';
         sync();
