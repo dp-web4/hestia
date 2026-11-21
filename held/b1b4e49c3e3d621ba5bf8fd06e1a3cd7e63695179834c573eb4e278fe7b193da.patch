@@ -1,0 +1,261 @@
+diff --git a/plugins/_shared/hestia_governance_closure.py b/plugins/_shared/hestia_governance_closure.py
+--- a/plugins/_shared/hestia_governance_closure.py
++++ b/plugins/_shared/hestia_governance_closure.py
+@@ -304,6 +304,27 @@
+                 pass
+         return cands
+ 
++    def _match_ancestor(self, candidate: str) -> Optional[str]:
++        """A directory the candidate CONTAINS, when this is a relocating/write act.
++
++        `plugins` and `plugins/kimi` prefix `plugins/*/hooks`; an existing repo root is also
++        checked for the marker's literal leading directory, which covers `git checkout -- .`.
++        """
++        segs = _segments(candidate)
++        for pat in self.dir_markers:
++            if segs and len(segs) < len(pat) and all(
++                    pat[i] == "*" or pat[i] == segs[i] for i in range(len(segs))):
++                return "/".join(pat)
++            if os.path.isabs(candidate):
++                literal = []
++                for segment in pat:
++                    if segment == "*":
++                        break
++                    literal.append(segment)
++                if literal and os.path.isdir(os.path.join(candidate, *literal)):
++                    return "/".join(pat)
++        return None
++
+     def match(self, target: str, *, cwd: Optional[str] = None,
+               position: str = "write") -> Optional[str]:
+         """The matched closure element, or None, over every form in `forms`."""
+@@ -311,6 +332,10 @@
+             hit = self._match_segments(_segments(c), position)
+             if hit:
+                 return hit
++            if position == "write":
++                hit = self._match_ancestor(c)
++                if hit:
++                    return hit
+         return None
+ 
+ 
+diff --git a/hooks-gt/_shared/hestia_governance_closure.py b/hooks-gt/_shared/hestia_governance_closure.py
+--- a/hooks-gt/_shared/hestia_governance_closure.py
++++ b/hooks-gt/_shared/hestia_governance_closure.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 958b52617ddb41fa026722eca0333937a136a9083adf0175d5a94d09a4114be8  (published ground truth; manifest: hooks-gt)
+ """hestia_governance_closure — ONE governance-access classifier for every harness shim.
+ 
+ PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
+@@ -305,6 +305,27 @@
+                 pass
+         return cands
+ 
++    def _match_ancestor(self, candidate: str) -> Optional[str]:
++        """A directory the candidate CONTAINS, when this is a relocating/write act.
++
++        `plugins` and `plugins/kimi` prefix `plugins/*/hooks`; an existing repo root is also
++        checked for the marker's literal leading directory, which covers `git checkout -- .`.
++        """
++        segs = _segments(candidate)
++        for pat in self.dir_markers:
++            if segs and len(segs) < len(pat) and all(
++                    pat[i] == "*" or pat[i] == segs[i] for i in range(len(segs))):
++                return "/".join(pat)
++            if os.path.isabs(candidate):
++                literal = []
++                for segment in pat:
++                    if segment == "*":
++                        break
++                    literal.append(segment)
++                if literal and os.path.isdir(os.path.join(candidate, *literal)):
++                    return "/".join(pat)
++        return None
++
+     def match(self, target: str, *, cwd: Optional[str] = None,
+               position: str = "write") -> Optional[str]:
+         """The matched closure element, or None, over every form in `forms`."""
+@@ -312,6 +333,10 @@
+             hit = self._match_segments(_segments(c), position)
+             if hit:
+                 return hit
++            if position == "write":
++                hit = self._match_ancestor(c)
++                if hit:
++                    return hit
+         return None
+ 
+ 
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -17,7 +17,7 @@
+     },
+     {
+       "path": "hestia_governance_closure.py",
+-      "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc",
++      "sha256": "958b52617ddb41fa026722eca0333937a136a9083adf0175d5a94d09a4114be8",
+       "source": "plugins/_shared/hestia_governance_closure.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
++  "gt_version": "c47e2edae5cec4009f069ad73f98fc53fb5d51a89d3a712bc1de27f656b0d5b1"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "c47e2edae5cec4009f069ad73f98fc53fb5d51a89d3a712bc1de27f656b0d5b1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "958b52617ddb41fa026722eca0333937a136a9083adf0175d5a94d09a4114be8"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
++  "gt_version": "aa4eaae0c160c6887dc86745aa089f70edc3a9dca2266d7e66e3d6268d12b98a"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "c47e2edae5cec4009f069ad73f98fc53fb5d51a89d3a712bc1de27f656b0d5b1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "958b52617ddb41fa026722eca0333937a136a9083adf0175d5a94d09a4114be8"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
++  "gt_version": "b9a7d809d424bca0320bdf1f8ad4dd624b55e99126b95b1da499c399e63000d5"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "c47e2edae5cec4009f069ad73f98fc53fb5d51a89d3a712bc1de27f656b0d5b1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "958b52617ddb41fa026722eca0333937a136a9083adf0175d5a94d09a4114be8"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
++  "gt_version": "f5be808229145fefeef99b327d2084a5eef2dd0acff46ccf120fdb3913397fa7"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "c47e2edae5cec4009f069ad73f98fc53fb5d51a89d3a712bc1de27f656b0d5b1",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "958b52617ddb41fa026722eca0333937a136a9083adf0175d5a94d09a4114be8"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
++  "gt_version": "c97831bded6c4deb2e1682c4e6906b564e6c030835ac5d773a810998bec47992"
+ }
+diff --git a/plugins/_shared/hestia_governance_closure_test.py b/plugins/_shared/hestia_governance_closure_test.py
+--- a/plugins/_shared/hestia_governance_closure_test.py
++++ b/plugins/_shared/hestia_governance_closure_test.py
+@@ -140,6 +140,27 @@
+     check("truncate_write", v2.classification == "write", str(v2))
+     v3 = cls("Bash", {"command": "ln -sf /tmp/evil.py plugins/kimi/hooks/pre_tool_use.py"})
+     check("ln_write", v3.classification == "write", str(v3))
++
++
++def test_ancestor_moves_are_closure_writes():
++    for command in (
++            "mv plugins/kimi /tmp/k",
++            "mv plugins/kimi plugins/kimi.bak",
++            "mv plugins plugins.bak",
++            "cp -r plugins/kimi plugins/kimi2",
++            "mv plugins/kimi/hooks /tmp/h"):
++        v = cls("Bash", {"command": command}, cwd="/w/hestia")
++        check(f"ancestor-write: {command}", v.classification == "write", str(v))
++
++    root = tempfile.mkdtemp(prefix="hgc-ancestor-repo-")
++    os.makedirs(os.path.join(root, "plugins"))
++    v = cls("Bash", {"command": "git checkout -q origin/main -- ."}, cwd=root)
++    check("repo-root-checkout-is-write", v.classification == "write", str(v))
++    v = cls("Bash", {"command": "ls"}, cwd=root)
++    check("repo-root-read-is-not-write", v.classification != "write", str(v))
++    empty = tempfile.mkdtemp(prefix="hgc-ancestor-empty-")
++    v = cls("Bash", {"command": "git checkout -q origin/main -- ."}, cwd=empty)
++    check("unrelated-root-is-not-invented", v.classification != "write", str(v))
+ 
+ 
+ def test_fd_dup_is_not_a_file_target():
+@@ -775,6 +796,7 @@
+     test_sed_in_place_on_gate_is_write_without_i_is_read,
+     test_git_checkout_pathspec_into_hooks_is_write,
+     test_chmod_truncate_ln_targets_are_write,
++    test_ancestor_moves_are_closure_writes,
+     test_fd_dup_is_not_a_file_target,
+     test_heredoc_body_naming_gate_is_read_not_write,
+     test_here_string_is_not_a_heredoc_13545,
