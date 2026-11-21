@@ -3693,6 +3693,13 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         self.by_id.insert(prior.id.clone(), prior);
     }
 
+    /// Restore the exact pre-corroboration row when the factor's witness append fails.
+    /// The caller holds the state lock across mutation, append, and rollback, so no reader
+    /// or decider can observe the unwitnessed factor in between.
+    pub fn undo_corroborate(&mut self, prior: Escalation) {
+        self.by_id.insert(prior.id.clone(), prior);
+    }
+
     /// Add a peer's evidence to an escalation without deciding it.
     ///
     /// This is the accumulation half of the constellation model: approval is not a boolean

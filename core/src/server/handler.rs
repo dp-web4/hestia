@@ -24481,6 +24481,70 @@ mod appeal_tests {
         );
     }
 
+    /// #823: a factor whose own evidence append fails must not remain visible to the
+    /// decider. The retry writes one attributable event, and replay reconstructs that
+    /// same factor without manufacturing events for historical snapshot-only factors.
+    #[tokio::test]
+    async fn an_unwitnessed_corroboration_leaves_no_decision_relevant_factor() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let asker_sid = seat(&state, "claude-code").await;
+        let peer_sid = seat(&state, "codex").await;
+        let opened = tool_gate_escalation_open(&state, &json!({
+            "plugin_id": "claude-code", "tool_name": "policy_edit", "marker": "policy.json",
+            "act": "policy_edit -> policy.json",
+            "reason": "the deny blocks a legitimate rule addition",
+            "session_id": asker_sid.to_string(),
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+        let args = json!({
+            "escalation_id": esc_id, "session_id": peer_sid.to_string(),
+            "stance": "dissent", "argument": "the proposed rule is broader than its evidence",
+        });
+
+        // Let factor validation and state mutation succeed while the witness write fails.
+        let key = crate::storage::storage_key(dir.path(), "p").unwrap();
+        let blocker = rusqlite::Connection::open(dir.path().join("witness.db")).unwrap();
+        blocker.pragma_update(None, "key", hex::encode(key)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let failed = tool_gate_escalation_corroborate(&state, &args).await;
+        assert!(failed.is_err(), "an unwitnessed factor cannot report success: {failed:?}");
+        {
+            let s = state.lock().await;
+            let esc = s.gate_escalations.get(&esc_id).expect("the prior escalation remains");
+            assert!(esc.factors.is_empty(), "the failed factor never became live: {esc:?}");
+            assert!(s.chain_store.read_recent(500).unwrap().iter()
+                .all(|e| e.event_type != "gate_escalation_corroborated"),
+                "the failed append left no canonical factor event");
+        }
+        blocker.execute_batch("COMMIT").unwrap();
+
+        let recorded = tool_gate_escalation_corroborate(&state, &args).await.unwrap();
+        assert!(recorded["witnessEntryHash"].is_string(), "the retry is durable: {recorded}");
+        assert_eq!(recorded["factors_present"].as_array().unwrap().len(), 1);
+        let s = state.lock().await;
+        let mut chain = s.chain_store.read_recent(500).unwrap();
+        chain.reverse();
+        let events: Vec<_> = chain.iter()
+            .filter(|e| e.event_type == "gate_escalation_corroborated")
+            .collect();
+        assert_eq!(events.len(), 1, "exactly one canonical factor record");
+        assert_eq!(events[0].event_data["corroborated_by"], "codex");
+        assert_eq!(events[0].event_data["stance"], "dissent");
+        assert_eq!(events[0].event_data["argument"], "the proposed rule is broader than its evidence");
+
+        let mut replayed = crate::server::gate_escalation::EscalationStore::default();
+        replayed.rehydrate(&chain, crate::server::gate_escalation::now_secs());
+        let replayed_esc = replayed.get(&esc_id).expect("the committed factor replays");
+        assert_eq!(replayed_esc.factors.len(), 1);
+        assert_eq!(replayed_esc.factors[0].by, "codex");
+        assert!(replayed_esc.factors[0].dissent);
+        assert_eq!(replayed_esc.factors[0].argument.as_deref(),
+                   Some("the proposed rule is broader than its evidence"));
+        assert_eq!(serde_json::to_value(&replayed_esc.factors).unwrap(),
+                   recorded["factors_present"]);
+    }
+
     /// Revised #480 review, defect 2: WITNESS IS FINALITY. If the
     /// `gate_escalation_decided` append fails, the decision must not stand — the
     /// store is rolled back to Pending, nothing is claimable, and the caller gets
@@ -30016,6 +30080,16 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "bar_met_if_decided_now": updated.bar_met(),
                 }),
             );
+            let witness_hash = match entry {
+                Ok(e) => e.hash,
+                Err(append_err) => {
+                    s.gate_escalations.undo_corroborate(esc);
+                    return Err(anyhow::anyhow!(
+                        "corroboration NOT recorded — its witness append failed ({append_err}); \
+                         the escalation is unchanged and no factor was added"
+                    ));
+                }
+            };
             Ok(json!({
                 "escalation_id": updated.id,
                 // `corroborated` keeps its original meaning — "your CONCURRENCE landed" —
@@ -30030,7 +30104,7 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                 "post_claim": updated.consumed_at.is_some(),
                 "bar": updated.bar,
                 "bar_met_if_decided_now": updated.bar_met(),
-                "witnessEntryHash": entry.ok().map(|e| e.hash),
+                "witnessEntryHash": witness_hash,
                 "note": if dissent {
                     "your dissent is ON THE RECORD as evidence for review — never a veto: \
                      the sovereign decision stands or lands regardless, with your argument \
