@@ -1436,18 +1436,6 @@ impl ServerState {
                 let t3c = *t.t3.observation_counts();
                 let v3c = *t.v3.observation_counts();
                 let dim = |v: f64, c: u64| if c > 0 { Some(v) } else { None };
-                // The ADJUDICATED grain lives at `<grain>#adjudicated` — earned
-                // trust, folded only from witnessed adjudications (Stage 1).
-                let adj = self
-                    .trust_store
-                    .get(&format!("{key}#adjudicated"))
-                    .unwrap_or_else(|_| EntityTrust::new(format!("{key}#adjudicated")));
-                let adj_counts = *adj.v3.observation_counts();
-                let adj_dims = (
-                    dim(adj.validity(), adj_counts[2]),
-                    dim(adj.veracity(), adj_counts[1]),
-                    dim(adj.valuation(), adj_counts[0]),
-                );
                 // v3-derived-v1: the DISPLAYED level comes from derived
                 // evidence (adjudications + governance conduct) — never from
                 // the self-report scalar. Unmeasured renders as unmeasured.
@@ -1461,13 +1449,16 @@ impl ServerState {
                     success_acts: t.success_count,
                 });
                 let cached = self.chain_store.derivations().lookup(pid, _role);
-                // (level, basis, baseline acts, governed acts, temperament, its n, alias)
-                let (level, level_basis, baseline_acts, governed_acts, temperament, temperament_n, aliased_to) =
-                    match &cached {
+                let (level, level_basis, baseline_acts, governed_acts, temperament, temperament_n,
+                     aliased_to, adj_dims, adj_counts) = match &cached {
                         Some(c) => {
                             let d = crate::derivation::with_volume((*c.evidence).clone(), volume);
+                            let adj_dims = (d.validity.score, d.veracity.score, d.valuation.score);
+                            let adj_counts = [d.valuation.observations, d.veracity.observations,
+                                              d.validity.observations];
                             (d.level, d.level_basis, d.baseline_acts, d.governed_acts,
-                             d.temperament.score, d.temperament.observations, c.aliased_to.clone())
+                             d.temperament.score, d.temperament.observations, c.aliased_to.clone(),
+                             adj_dims, adj_counts)
                         }
                         // Registered by the lookup and derived before the worker publishes;
                         // reached only by a grain that appeared between the worker's two
@@ -1475,7 +1466,8 @@ impl ServerState {
                         // have — a verdict from no evidence is the thing the derivation
                         // exists not to render, and the UI already skips an unknown level
                         // when it rolls grains up.
-                        None => ("pending".to_string(), "pending".to_string(), 0, 0, None, 0, None),
+                        None => ("pending".to_string(), "pending".to_string(), 0, 0, None, 0, None,
+                                 (None, None, None), [0; 3]),
                     };
                 TrustView {
                     plugin_id: pid.clone(),
@@ -2475,6 +2467,42 @@ mod tests {
         assert_eq!(s.recent[2].event_type, "outcome");
         assert_eq!(s.recent[2].tool_name.as_deref(), Some("Bash"));
         assert_eq!(s.recent[2].success, Some(false));
+    }
+
+    #[test]
+    fn dashboard_reads_adjudicated_dimensions_from_active_derivation_leaves() {
+        let (_dir, state) = make_state();
+        let role = crate::reputation::DEFAULT_CONSTELLATION_ROLE;
+        state.append_chain("outcome", json!({"plugin_id":"worker-agent","role_lct":role,"success":true})).unwrap();
+        state.apply_outcome("worker-agent", true, 0.5).unwrap();
+        let original = state.append_chain("adjudication", json!({
+            "subject_plugin_id":"worker-agent","subject_instance_lct":state.member_lct("worker-agent"),
+            "subject_role":role,"axis":"validity",
+            "verdict":"refuted","score":0.0,"method":"review","ref":"pr:1"
+        })).unwrap();
+        let ctx = crate::reputation::RepContext {
+            class: crate::reputation::DeltaClass::Conduct,
+            role_lct: role,
+            action_type: "adjudication",
+            action_target: "pr:1",
+            action_id: "",
+            rule_triggered: "",
+            reason: "adjudication:validity:refuted:review",
+        };
+        state.apply_adjudication_ctx("worker-agent", web4_core::v3::ValueDimension::Validity,
+            0.0, &ctx, Some(&original)).unwrap();
+        assert_eq!(state.adjudicated_for_role("worker-agent", role).v3.observation_counts()[2], 1,
+            "the eager cache still holds the immutable original");
+        state.append_chain("reversal", json!({
+            "subject_plugin_id":"worker-agent","subject_role":role,"kind":"override",
+            "cause":"corrected-adjudication","ref":original.hash,
+            "reported_by":{"plugin_id":"codex"}
+        })).unwrap();
+
+        let snapshot = state.dashboard_snapshot(20);
+        let view = snapshot.trust.iter().find(|row| row.plugin_id == "worker-agent").unwrap();
+        assert_eq!(view.adjudicated_counts[2], 0);
+        assert_eq!(view.adjudicated_validity, None);
     }
 
     #[test]

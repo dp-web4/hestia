@@ -7,9 +7,9 @@
 //! revision. Both are deterministic over the same immutable events.
 //!
 //! v1 scope (plan: private-context/plans/t3-from-v3-synthesis-2026-07-24.md):
-//! - **Adjudicated V3** (validity/veracity/valuation): read straight off the
-//!   `#adjudicated` grain — that grain is derivation-compliant by construction
-//!   (folded ONLY from witnessed not-the-actor adjudications, Stage 1).
+//! - **Adjudicated V3** (validity/veracity/valuation): folded directly from
+//!   witnessed not-the-actor adjudication events, honoring validated
+//!   supersession and correction tombstones at read time.
 //! - **Temperament**: derived here from governance-response conduct in the
 //!   chain — deny events and what the actor did next. Predicates below.
 //! - **Training / Talent**: NOT derived in v1 (Training needs distinct
@@ -258,11 +258,12 @@ fn ema_fold(scores: &[f64]) -> Option<f64> {
 /// looks fine, so this list is load-bearing and belongs next to the code that reads it.
 pub const DERIVATION_KEYS: &[&str] = &[
     "about_deny_hash", "action_id", "adjudicator", "alias", "alias_of", "answers_deny",
-    "attempted", "axis", "before_position", "charge", "charge_held_by", "class", "data",
-    "decision", "deny_hash", "enforced", "escalation_id", "magnitude", "member", "method",
-    "outcome_hash", "plugin_id", "reason", "ref", "requested_by", "role_lct", "row", "score",
-    "session_id", "status", "subject_plugin_id", "subject_role", "success", "target",
-    "tool_name", "upheld", "verdict", "verdict_available",
+    "attempted", "axis", "before_position", "cause", "charge", "charge_held_by", "class",
+    "data", "decision", "deny_hash", "depends_on", "enforced", "escalation_id", "magnitude",
+    "member", "method", "outcome_hash", "plugin_id", "reason", "ref", "reported_by",
+    "requested_by", "role_lct", "row", "score", "session_id", "status", "subject_plugin_id",
+    "subject_role", "success", "supersedes", "target", "tool_name", "upheld", "verdict",
+    "verdict_available",
 ];
 
 /// Event types derivation folds. Lets the reader filter in SQL rather than scanning the
@@ -271,8 +272,8 @@ pub const DERIVATION_KEYS: &[&str] = &[
 pub const DERIVATION_EVENT_TYPES: &[&str] = &[
     "adjudication", "amnesty", "appeal", "decision_charge_settled", "exoneration",
     "exoneration_correction", "gate_escalation_decided", "gate_escalation_opened",
-    "gate_escalation_withdrawn", "outcome", "policy_decision", "refutation", "scope_attestation",
-    IDENTITY_ALIAS_EVENT,
+    "gate_escalation_withdrawn", "outcome", "policy_decision", "refutation", "reversal",
+    "scope_attestation", IDENTITY_ALIAS_EVENT,
 ];
 
 /// The high-volume half: routine outcomes, read only within `RETRY_WINDOW_MINUTES` of a
@@ -285,7 +286,7 @@ pub const DERIVATION_HOT_EVENT_TYPES: &[&str] = &["outcome"];
 pub const DERIVATION_GOVERNANCE_EVENT_TYPES: &[&str] = &[
     "adjudication", "amnesty", "appeal", "decision_charge_settled", "exoneration",
     "exoneration_correction", "gate_escalation_decided", "gate_escalation_opened",
-    "gate_escalation_withdrawn", "policy_decision", "refutation", "scope_attestation",
+    "gate_escalation_withdrawn", "policy_decision", "refutation", "reversal", "scope_attestation",
     IDENTITY_ALIAS_EVENT,
 ];
 
@@ -398,6 +399,10 @@ pub fn project_row(r: crate::storage::chain::ChainRowRef<'_>) -> Option<ChainEnt
 
 fn entry_str<'a>(e: &'a ChainEntry, key: &str) -> Option<&'a str> {
     e.event_data.get(key).and_then(Value::as_str)
+}
+
+fn chain_hash(reference: &str) -> &str {
+    reference.strip_prefix("chain:").unwrap_or(reference)
 }
 
 /// Derive temperament + collect adjudication evidence for one grain from a
@@ -1108,24 +1113,86 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         });
     }
 
-    // ---- Adjudicated V3: evidence from adjudication events for this grain ----
-    let mut adj_scores: [Vec<f64>; 3] = Default::default(); // [validity, veracity, valuation]
-    let mut adj_evidence: [Vec<Evidence>; 3] = Default::default();
-    for e in entries.iter().filter(|e| {
-        e.event_type == "adjudication"
+    // ---- Adjudicated V3: active leaves over immutable adjudication history ----
+    let adjudications: Vec<&ChainEntry> = entries
+        .iter()
+        .copied()
+        .filter(|e| {
+            e.event_type == "adjudication"
+                && is_member(entry_str(e, "subject_plugin_id"))
+                && entry_str(e, "subject_role")
+                    .map_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE, |r| r)
+                    == role_lct
+        })
+        .collect();
+    let adjudication_by_hash: HashMap<&str, &ChainEntry> = adjudications
+        .iter()
+        .map(|entry| (entry.hash.as_str(), *entry))
+        .collect();
+    let mut superseded_by: HashMap<&str, &ChainEntry> = HashMap::new();
+    for replacement in &adjudications {
+        let Some(reference) = entry_str(replacement, "supersedes") else {
+            continue;
+        };
+        let Some(target) = adjudication_by_hash.get(chain_hash(reference)) else {
+            continue;
+        };
+        // Imported history gets the same grain check as the write surface.
+        if replacement.chain_position > target.chain_position
+            && entry_str(replacement, "axis") == entry_str(target, "axis")
+        {
+            superseded_by.insert(target.hash.as_str(), *replacement);
+        }
+    }
+    for correction in entries.iter().copied().filter(|e| {
+        e.event_type == "reversal"
+            && entry_str(e, "cause") == Some("corrected-adjudication")
             && is_member(entry_str(e, "subject_plugin_id"))
             && entry_str(e, "subject_role")
                 .map_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE, |r| r)
                 == role_lct
+            && e.event_data
+                .get("reported_by")
+                .and_then(|reporter| reporter.get("plugin_id"))
+                .and_then(Value::as_str)
+                .is_some_and(|reporter| !is_member(Some(reporter)))
     }) {
-        let Some(score) = e.event_data.get("score").and_then(Value::as_f64) else {
-            continue; // deferred: witnessed but right-censored
+        let Some(reference) = entry_str(correction, "ref") else {
+            continue;
         };
+        let Some(target) = adjudication_by_hash.get(chain_hash(reference)) else {
+            continue;
+        };
+        if correction.chain_position > target.chain_position {
+            superseded_by.insert(target.hash.as_str(), correction);
+        }
+    }
+
+    let mut adj_scores: [Vec<f64>; 3] = Default::default(); // [validity, veracity, valuation]
+    let mut adj_evidence: [Vec<Evidence>; 3] = Default::default();
+    for e in adjudications {
         let idx = match entry_str(e, "axis") {
             Some("validity") => 0,
             Some("veracity") => 1,
             Some("valuation") => 2,
             _ => continue,
+        };
+        if let Some(replacement) = superseded_by.get(e.hash.as_str()) {
+            adj_evidence[idx].push(Evidence {
+                chain_position: e.chain_position,
+                hash: e.hash.clone(),
+                event_type: e.event_type.clone(),
+                timestamp: e.timestamp,
+                contribution: format!(
+                    "EXCLUDED — superseded by {} #{}",
+                    replacement.event_type, replacement.chain_position
+                ),
+                reference: Some(format!("chain:{}", replacement.hash)),
+            });
+            continue;
+        }
+        let Some(score) = e.event_data.get("score").and_then(Value::as_f64) else {
+            continue; // deferred: witnessed but right-censored
         };
         adj_scores[idx].push(score);
         adj_evidence[idx].push(Evidence {
@@ -1654,6 +1721,57 @@ mod tests {
             signer_lct: "test".into(),
             timestamp: Utc::now() + Duration::minutes(ts_offset_min),
         }
+    }
+
+    #[test]
+    fn superseded_adjudication_is_receipted_but_not_double_counted() {
+        let role = "role:constellation:interactive-dev";
+        let original = entry(1, 0, "adjudication", json!({
+            "subject_plugin_id":"codex","subject_role":role,"axis":"validity",
+            "verdict":"refuted","score":0.0,"method":"review","ref":"pr:1"
+        }));
+        let replacement = entry(2, 1, "adjudication", json!({
+            "subject_plugin_id":"codex","subject_role":role,"axis":"validity",
+            "verdict":"upheld","score":1.0,"method":"review","ref":"ci:2",
+            "supersedes":"chain:hash-1","depends_on":["chain:hash-1"]
+        }));
+        let derived = derive("codex", role, &[original, replacement]);
+        assert_eq!(derived.validity.observations, 1);
+        assert_eq!(derived.validity.score, Some(0.75));
+        assert!(derived.validity.evidence.iter().any(|e| {
+            e.hash == "hash-1"
+                && e.contribution.contains("EXCLUDED — superseded by adjudication #2")
+                && e.reference.as_deref() == Some("chain:hash-2")
+        }));
+    }
+
+    #[test]
+    fn corrected_adjudication_reversal_tombstones_until_replacement() {
+        let role = "role:constellation:interactive-dev";
+        let original = entry(1, 0, "adjudication", json!({
+            "subject_plugin_id":"codex","subject_role":role,"axis":"veracity",
+            "verdict":"refuted","score":0.0,"method":"review","ref":"claim:1"
+        }));
+        let correction = entry(2, 1, "reversal", json!({
+            "subject_plugin_id":"codex","subject_role":role,"kind":"override",
+            "cause":"corrected-adjudication","ref":"chain:hash-1",
+            "reported_by":{"plugin_id":"claude-code"}
+        }));
+        let pending = derive("codex", role, &[original.clone(), correction.clone()]);
+        assert_eq!(pending.veracity.observations, 0);
+        assert!(pending.veracity.score.is_none());
+        assert!(pending.veracity.evidence.iter().any(|e| {
+            e.hash == "hash-1" && e.contribution.contains("EXCLUDED — superseded by reversal #2")
+        }));
+
+        let replacement = entry(3, 2, "adjudication", json!({
+            "subject_plugin_id":"codex","subject_role":role,"axis":"veracity",
+            "verdict":"upheld","score":1.0,"method":"review","ref":"claim:1",
+            "supersedes":"chain:hash-1","depends_on":["chain:hash-2"]
+        }));
+        let resolved = derive("codex", role, &[original, correction, replacement]);
+        assert_eq!(resolved.veracity.observations, 1);
+        assert_eq!(resolved.veracity.score, Some(0.75));
     }
 
     #[test]
