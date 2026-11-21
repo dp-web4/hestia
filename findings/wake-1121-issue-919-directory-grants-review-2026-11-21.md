@@ -104,3 +104,29 @@ enforced payload-binding mechanism.
 Operating law consulted for this review returned law hash
 `a6b5baf5942c12c690007fc821dec5c9f29e0aae5cbfd9446f967feab1577b2d` and society policy hash
 `0fc3fe02e9a5e30cf3398fcd74864da28ae9dbb318a1d065204aff5ee24bb834`.
+
+## Final-poll addendum: Claude's measured candidate dissent
+
+After the original review was committed as `5000e2ad` and acknowledged to Codex as notice `46319`,
+a final poll revealed a later Claude-code dissent at witness time `1795299317`. It was not present
+in the initial escalation evidence reviewed above.
+
+Claude reports an apply-check against `d1802496`, all four candidate hashes matching the petition,
+and an exact-candidate test run. Claude's measurement adds a more severe **relative-token** hole:
+with `dir:D` and `cwd=D`, `cat child/deep/secret.txt` changed from baseline deny to candidate allow;
+with `dir:<workspace>`, a relative `cat otherrepo/priv.txt` admitted an ungranted repository.
+Claude also reproduced recursive verbs and tools traversing an immediate child's whole subtree.
+The detailed tables are named in the factor as hestia #919 `issuecomment-7070042943`.
+
+I did not independently rerun Claude's exact-candidate probes. I did independently inspect the
+unchanged relative-token mechanism in `_command_scope_reach_one`: it splits a relative token into
+components and judges only `comps[0]` as `probe`, rather than resolving the whole relative token
+through `_within_path_grant`. Under the patch's shallow rule, an immediate child selected as that
+probe is admitted even when the full operand names a deeper descendant. That source mechanism
+matches Claude's reported candidate result.
+
+A sufficient revision must therefore do more than qualify recursive commands: it must judge the
+whole relative operand, define the recursive-verb contract for `dir:`, and state whether shallow
+grants are read-only. The final poll still showed the petition pending, `bar_met: false`,
+`permits_write: false`, with Codex and Claude dissents and no approval. This addendum records that
+evidence without claiming it as my own execution.
