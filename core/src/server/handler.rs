@@ -4039,7 +4039,6 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
         ));
     };
 
-    let chain_len = s.chain_len();
     let appeals = match s.chain_store.appeal_rows_for_pointer(&deny_hash) {
         Ok(rows) => rows,
         Err(e) => {
@@ -4073,14 +4072,13 @@ async fn tool_arbitrate_appeal(state: &SharedState, args: &Value) -> ToolResult 
     let Some(appeal) = appeals.iter().rev().find(|e| {
         e.event_type == "appeal"
             && e.event_data.get("deny_hash").and_then(Value::as_str) == Some(deny_hash.as_str())
-            && e.chain_position + APPEAL_CHAIN_WINDOW >= chain_len
     }) else {
         return Ok(hestia_error_envelope(
             "hestia.arbitration_no_appeal",
             &format!(
-                "no appeal against {deny_hash} within the last {APPEAL_CHAIN_WINDOW} entries \
-                 — an arbiter rules on a FILED appeal; ruling on an unfiled one would let a \
-                 third party move a member's score without the member ever disputing anything"
+                "no appeal against {deny_hash} — an arbiter rules on a FILED appeal; ruling on an \
+                 unfiled one would let a third party move a member's score without the member ever \
+                 disputing anything"
             ),
             None,
         ));
@@ -23656,6 +23654,18 @@ mod appeal_tests {
         let body = read_resource_body(&state, &format!("hestia://appeal/{stale_deny}")).await.unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["within_ruling_window"], json!(false), "{v}");
+
+        let codex_sid = seat(&state, "codex").await;
+        let old_ruling = tool_arbitrate_appeal(&state, &json!({
+            "deny_hash": stale_deny, "session_id": codex_sid.to_string(), "upheld": false,
+            "rationale": "fleet traffic cannot make this old appeal unruleable",
+        })).await.unwrap();
+        assert!(old_ruling.get("_hestia_error").is_none(),
+                "#610: an old unruled appeal must remain arbitrable: {old_ruling}");
+        let mine = tool_my_appeals(&state, &json!({"session_id": a_sid.to_string()})).await.unwrap();
+        let stale = mine["appeals"].as_array().unwrap().iter()
+            .find(|a| a["deny_hash"] == json!(stale_deny)).unwrap();
+        assert_eq!(stale["status"], "ruled");
     }
 
     /// A disposition is terminal: it answers a petition and awaits nothing, so it
