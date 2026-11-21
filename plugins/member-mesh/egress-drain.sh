@@ -116,6 +116,14 @@ print(json.dumps(out))
 PY
 }
 
+hub_kind_for() {
+  # Local and fleet names stay unchanged; only the transport spelling is translated.
+  case "$1" in
+    review_request) printf '%s\n' pr_review_request ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 drain_once() {
   local pending err
   err="$(mktemp)"
@@ -160,10 +168,11 @@ PY
     # name this script re-resolves. When the daemon has no LCT for the row it says
     # so, and the fallback to the name is NAMED in the log rather than silent —
     # hub-notify prefix-matches, so a name is an address that can change meaning.
-    "$HUB_NOTIFY" "$addr" "$kind" "$ptr" >/dev/null 2>&1; rc=$?
+    hub_kind="$(hub_kind_for "$kind")"
+    "$HUB_NOTIFY" "$addr" "$hub_kind" "$ptr" >/dev/null 2>&1; rc=$?
     if [ "$rc" -eq 0 ]; then
       if rpc hestia_egress_pending "{\"mark_forwarded\":$id}" >/dev/null 2>&1; then
-        say "FORWARDED id=$id -> $peer on=$is_lct kind=$kind"
+        say "FORWARDED id=$id -> $peer on=$is_lct kind=$kind hub_kind=$hub_kind"
       else
         # The hand-off landed but the row is still pending, so the next tick will
         # send it AGAIN. A duplicate is the honest outcome here and the log has to
