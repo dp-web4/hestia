@@ -63,6 +63,19 @@ pub struct PolicyOverride {
     pub enabled: Option<bool>,
 }
 
+/// Revision classes that trigger recompute-from-chain by default. Society-overridable.
+pub fn default_revision_events() -> Vec<String> {
+    [
+        "exoneration",
+        "exoneration_correction",
+        "amnesty",
+        "refutation",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 /// The policy section of the vault. Captures user choices that need to
 /// survive daemon restarts and travel with the user (when the vault is
 /// portable, i.e. in Hestia consumer mode).
@@ -76,6 +89,12 @@ pub struct VaultPolicyState {
     /// preset's defaults.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub overrides: HashMap<String, PolicyOverride>,
+
+    /// Witnessed event types that revise the evidence base and require the stored trust
+    /// scalar to be recomputed from the chain. An empty list deliberately disables
+    /// recomputation; it is serialized explicitly so that choice survives a round-trip.
+    #[serde(default = "default_revision_events")]
+    pub revision_events: Vec<String>,
 
     /// Extra rules layered on top of the preset's rules. Get sorted in
     /// alongside preset rules at evaluation time.
@@ -143,6 +162,7 @@ impl Default for VaultPolicyState {
         Self {
             active_preset: "safety".into(),
             overrides: HashMap::new(),
+            revision_events: default_revision_events(),
             custom_rules: Vec::new(),
             role_overlays: HashMap::new(),
             instance_overlays: HashMap::new(),
@@ -469,6 +489,20 @@ mod tests {
         let round: VaultPolicyState =
             serde_json::from_str(&serde_json::to_string(&s2).unwrap()).unwrap();
         assert_eq!(round.synthetic_persist_attempts(), 7);
+    }
+
+    #[test]
+    fn revision_events_default_for_old_vaults_and_preserve_an_explicit_opt_out() {
+        let old = r#"{"active_preset":"safety"}"#;
+        let s: VaultPolicyState = serde_json::from_str(old).unwrap();
+        assert_eq!(s.revision_events, default_revision_events());
+
+        let mut opted_out = VaultPolicyState::default();
+        opted_out.revision_events.clear();
+        let encoded = serde_json::to_string(&opted_out).unwrap();
+        assert!(encoded.contains(r#""revision_events":[]"#));
+        let round: VaultPolicyState = serde_json::from_str(&encoded).unwrap();
+        assert!(round.revision_events.is_empty());
     }
 
     #[test]
