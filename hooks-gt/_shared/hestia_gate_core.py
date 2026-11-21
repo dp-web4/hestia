@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 32b552ca804f90e65fdb3abd0d0147ea356c195232442ea607ab2b50b47422be  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -209,6 +209,12 @@ class Remedy:
 
 REMEDIES: dict[str, Remedy] = {
     # ── scope ────────────────────────────────────────────────────────────────────────────
+    "mrh.tool": Remedy(
+        "Use a tool or command head granted on the TOOLS axis, or ask with hestia_request_scope "
+        "for the specific executable. FILES grants authorize territory, not verbs; a tool grant "
+        "does not widen file territory.",
+        ("hestia_request_scope",),
+    ),
     "mrh.path": Remedy(
         "Adjust to work within scope. If the path is genuinely needed: when this refusal names "
         "a scope request id, the gate already opened it for you — a NOT-SAME peer decides it "
@@ -481,6 +487,11 @@ class AgentPolicy:
     #: "rwed". Consulted by evaluate() only for an act whose mode it can name, and only when
     #: every mode that act needs is in the grant's. A full-mode grant stays in `scope`.
     mode_scope: tuple = ()
+    #: True when the authority explicitly serves a TOOLS axis, including an empty list. Legacy
+    #: policies without that axis stay unmeasured; an explicit empty floor still yields evidence.
+    tools_configured: bool = False
+    #: A malformed advisory TOOLS axis is explicit uncertainty, never a reason to discard FILES.
+    tool_parse_error: bool = False
     #: Where this policy was resolved from, carried so a reader never has to guess which store
     #: won. A policy that cannot say where it came from is not auditable.
     source: str = "unresolved"
@@ -1204,7 +1215,7 @@ def detect_workspace(profile: HarnessProfile) -> str:
 #: `path:*` to the bare wildcard, so an operator writing what looks like "every repo" would
 #: have granted "everything, including outside the workspace" — UNSCOPED by emergent side
 #: effect rather than by decision. An unknown prefix is now dropped rather than guessed at.
-_SCOPE_PREFIXES = ("repo:", "path:")
+_SCOPE_PREFIXES = ("repo:", "path:", "tool:")
 
 
 def now_secs() -> int:
@@ -1238,7 +1249,10 @@ def _parse_scope_entries(entries) -> tuple:
                 # A prefixed wildcard is NOT unscoped. Dropped, loudly-by-absence: the operator
                 # who meant "everything" writes a bare "*", which is auditable as such.
                 if rest and rest != AgentPolicy.UNSCOPED and rest.strip("."):
-                    out.append(("path:" + rest) if prefix == "path:" else rest)
+                    if prefix == "path:":
+                        out.append("path:" + rest)
+                    else:
+                        out.append(("tool:" if prefix == "tool:" else "") + rest)
                 break
         else:
             # An UNRECOGNISED prefix is dropped, not kept (kimi #937, finding C, sharpened by
@@ -1336,7 +1350,7 @@ def _scope_parts(scopes, workspace: str) -> tuple:
     roots = []
     ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
     for scope in scopes:
-        if not isinstance(scope, str):
+        if not isinstance(scope, str) or scope.startswith("tool:"):
             continue
         if scope.startswith("path:" + UNPRICEABLE_PREFIX):
             continue                              # a once-only trial lift, never a root
@@ -1511,7 +1525,16 @@ def resolve_agent_policy(profile: HarnessProfile,
                     parsed = _parse_scope_entries(scope)
                 except Exception:
                     parsed = None
+                tool_parse_error = False
+                try:
+                    tool_entries = _parse_allowlist_tools(
+                        got.get("allowlist", {}).get("tools")
+                        if isinstance(got.get("allowlist"), dict) else None)
+                except Exception:
+                    tool_entries = ()
+                    tool_parse_error = True
                 if parsed is not None:
+                    parsed += tool_entries
                     # CERTIFICATION FIELDS, issued by the authority (Sprint F R1): the
                     # daemon's standing-store generation and its honor horizon ride the
                     # snapshot and are stamped onto the policy, so a caller (or a future
@@ -1541,6 +1564,9 @@ def resolve_agent_policy(profile: HarnessProfile,
                         generation=gen, expires_at=exp,
                         read_scope=tuple(read_parsed or ()),
                         mode_scope=_parse_mode_scope(got.get("in_scope_modes")),
+                        tools_configured=(isinstance(got.get("allowlist"), dict)
+                                          and isinstance(got["allowlist"].get("tools"), list)),
+                        tool_parse_error=tool_parse_error,
                     )
 
     # 2. Local replica — fail-closed fallback, marked stale.
@@ -3854,6 +3880,208 @@ def scope_roots_with_modes(policy: AgentPolicy, workspace: str) -> tuple:
     return tuple(out)
 
 
+_TOOL_WRAPPERS = frozenset({
+    "env", "sudo", "doas", "command", "exec", "nohup", "nice", "time", "timeout", "stdbuf",
+})
+_TOOL_WRAPPER_VALUE_OPTS = {
+    "env": frozenset({"-C", "--chdir", "-u", "--unset"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "exec": frozenset({"-a"}),
+    "time": frozenset({"-f", "--format", "-o", "--output"}),
+}
+_TOOL_WRAPPER_FLAGS = {
+    "env": frozenset({"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}),
+    "timeout": frozenset({"--preserve-status", "--foreground", "-v", "--verbose"}),
+    "exec": frozenset({"-c", "-l"}),
+    "command": frozenset({"-p", "-v", "-V"}),
+    "time": frozenset({"-p", "--portability"}),
+}
+_TOOL_OPAQUE = "<unmodelled>"
+
+
+def _tool_wrapped_head(toks: list, start: int) -> tuple:
+    """Index of a wrapper's executable, or of the token that ends the simple command."""
+    wrapper = os.path.basename(toks[start][1])
+    values = _TOOL_WRAPPER_VALUE_OPTS.get(wrapper, frozenset())
+    flags = _TOOL_WRAPPER_FLAGS.get(wrapper, frozenset())
+    duration_seen = False
+    options_done = False
+    i = start + 1
+    while i < len(toks):
+        kind, word, _uglob = toks[i]
+        if kind != "word":
+            return i, None
+        if wrapper == "env" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\+?=.*", word):
+            i += 1
+            continue
+        if wrapper == "timeout" and not duration_seen \
+                and re.fullmatch(r"\d+(?:\.\d+)?[smhd]?", word):
+            duration_seen = True
+            i += 1
+            continue
+        if word == "--" and not options_done:
+            options_done = True
+            i += 1
+            continue
+        if word.startswith("-") and len(word) > 1 and not options_done:
+            if wrapper == "command" and word in ("-v", "-V"):
+                while i < len(toks) and toks[i][0] == "word":
+                    i += 1
+                return i, None
+            name, eq, _value = word.partition("=")
+            if name in values:
+                if eq:
+                    i += 1
+                else:
+                    if i + 1 >= len(toks) or toks[i + 1][0] != "word":
+                        return i, f"`{wrapper}` option '{word}' lacks its value"
+                    i += 2
+                continue
+            attached = next((opt for opt in values
+                             if opt.startswith("-") and not opt.startswith("--")
+                             and word.startswith(opt) and len(word) > len(opt)), None)
+            if attached is not None or word in flags \
+                    or (wrapper == "nice" and re.fullmatch(r"-\d+", word)):
+                i += 1
+                continue
+            return i, f"`{wrapper}` option '{word}' is not modelled"
+        return i, None
+    return i, None
+
+
+def _command_heads(command: str) -> tuple:
+    """(executable basenames, uncertainty), using the shared substitution-aware shell lexer."""
+    try:
+        toks = _shell_words(_strip_data_heredocs(command))
+    except (_Unmodelled, ValueError) as why:
+        return [], str(why)
+    function_names = {i for i in range(len(toks) - 2)
+                      if toks[i][0] == "word" and toks[i + 1][1] == "("
+                      and toks[i + 2][1] == ")"}
+    heads = []
+    expect_head = True
+    redirect = False
+    heredoc = False
+    pending_heredocs = []
+    i = 0
+    while i < len(toks):
+        kind, word, uglob = toks[i]
+        if kind == "sep":
+            if word == "(" and expect_head and i + 1 < len(toks) \
+                    and toks[i + 1][0] == "sep" and toks[i + 1][1] == "(":
+                return heads, "arithmetic is not modelled by the TOOLS lexer"
+            expect_head = True
+            redirect = False
+            heredoc = False
+            i += 1
+            continue
+        if kind == "mark":
+            i += 1
+            continue
+        if kind == "op":
+            redirect = True
+            heredoc = word in ("<<", "<<-")
+            i += 1
+            continue
+        if redirect:
+            redirect = False
+            if heredoc:
+                pending_heredocs.append(word)
+                heredoc = False
+            i += 1
+            continue
+        if not expect_head:
+            i += 1
+            continue
+        if pending_heredocs and word == pending_heredocs[0]:
+            pending_heredocs.pop(0)
+            i += 1
+            continue
+        if i in function_names:
+            i += 1
+            continue
+        if word in ("for", "select", "case", "function", "coproc", "[["):
+            return heads, f"shell form '{word}' is not modelled by the TOOLS lexer"
+        base = os.path.basename(word)
+        if base in _TOOL_WRAPPERS:
+            next_i, uncertainty = _tool_wrapped_head(toks, i)
+            if uncertainty is not None:
+                return heads, uncertainty
+            i = next_i
+            continue
+        if base in _CODE_COMMANDS or base in _CODE_OPT_HEADS or _HEREDOC_SHELL.match(base):
+            return heads, f"`{base}` runs shell code not modelled by the TOOLS lexer"
+        if word in _SHELL_KEYWORDS or word == "]]":
+            i += 1
+            continue
+        if base in ("cd", "export", "local", "declare", "typeset", "readonly", "unset"):
+            expect_head = False
+            i += 1
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\+?=.*", word):
+            if word.endswith("=") and i + 1 < len(toks) and toks[i + 1][1] == "(":
+                return heads, "an array assignment is not modelled by the TOOLS lexer"
+            i += 1
+            continue
+        if uglob or not word or "$" in word or "`" in word or _DQ_REF in word \
+                or _BRACE in word or _ANSI_C_MARK in word:
+            return heads, "an expansion used as the program is not modelled"
+        heads.append(os.path.basename(word.replace(_LIT_DOLLAR, "$").replace(_LIT_TICK, "`")))
+        expect_head = False
+        i += 1
+    return heads, None
+
+
+def _parse_allowlist_tools(raw) -> tuple:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("allowlist.tools must be a list")
+    out = []
+    for entry in raw:
+        value = entry if isinstance(entry, str) else entry.get("value") if isinstance(entry, dict) else None
+        if not isinstance(value, str) or not value.strip() or any(c.isspace() for c in value.strip()):
+            raise ValueError("a TOOLS grant must be one nonempty command or harness name")
+        out.append("tool:" + value.strip())
+    return tuple(out)
+
+
+def _tool_grants(scopes) -> frozenset:
+    return frozenset(scope[len("tool:"):] for scope in scopes
+                     if isinstance(scope, str) and scope.startswith("tool:"))
+
+
+def _file_scopes(scopes) -> list:
+    return [scope for scope in scopes
+            if not isinstance(scope, str) or not scope.startswith("tool:")]
+
+
+def _tool_shadow_verdict(event: NormalizedEvent, grants: frozenset) -> Optional[Verdict]:
+    """The restrictive TOOLS verdict, computed for shadow telemetry and never returned."""
+    if event.tool != "Bash":
+        return None if event.tool in grants else _deny(
+            "mrh.tool", f"'{event.tool}' is outside the TOOLS grant "
+            f"({'+'.join(sorted(grants))}); FILES grants do not authorize a verb",
+            target=event.tool)
+    if "Bash" in grants:
+        return None
+    heads, uncertainty = _command_heads(event.command or "")
+    for head in heads:
+        if head not in grants:
+            return _deny(
+                "mrh.tool", f"'{event.tool}' names '{head}' outside the TOOLS grant "
+                f"({'+'.join(sorted(grants))}); FILES grants do not authorize a verb",
+                target=head)
+    if uncertainty is not None:
+        return _deny(
+            "mrh.tool", f"'{event.tool}' has an unresolved executable position ({uncertainty}); "
+            "a restrictive TOOLS evaluation cannot admit what it cannot read",
+            target=_TOOL_OPAQUE)
+    return None
+
+
 def evaluate(event: NormalizedEvent, profile: HarnessProfile,
              workspace: Optional[str] = None,
              policy: Optional[AgentPolicy] = None) -> Verdict:
@@ -3875,6 +4103,24 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
     read_scopes = list(getattr(pol, "read_scope", ()) or ())
     mode_scopes = list(getattr(pol, "mode_scope", ()) or ())
     forbidden = forbidden_tokens(profile)
+    tools = _tool_grants(scopes)
+    if tools or pol.tools_configured or pol.tool_parse_error:
+        if pol.tool_parse_error:
+            shadow = _deny("mrh.tool", "the TOOLS allowlist is malformed",
+                           target=_TOOL_OPAQUE)
+        else:
+            try:
+                shadow = _tool_shadow_verdict(event, tools)
+            except Exception as why:
+                shadow = _deny("mrh.tool",
+                               f"the TOOLS advisory parser raised {why.__class__.__name__}",
+                               target=_TOOL_OPAQUE)
+        record_allowlist_shadow(profile.member_id, event.tool, tools, shadow,
+                                generation=pol.generation)
+    scopes = _file_scopes(scopes)
+    read_scopes = _file_scopes(read_scopes)
+    mode_scopes = [(entry, modes) for entry, modes in mode_scopes
+                   if not isinstance(entry, str) or not entry.startswith("tool:")]
 
     # Gate 1a — innate egress/secret. Denied even inside a granted repo, always enforced.
     # Repo names are scanned too: an MCP call naming a forbidden token is still egress. So is
@@ -4324,6 +4570,43 @@ def record_gate_unavailable(member_id: str, tool: str, cause: str,
             os.replace(tmp, state_path)
         except Exception:
             pass
+        return True
+    except Exception:
+        return False
+
+
+ALLOWLIST_SHADOW_RELPATH = "telemetry/allowlist-shadow.jsonl"
+
+
+def record_allowlist_shadow(member_id: str, tool: str, grants: frozenset,
+                            shadow: Optional[Verdict], generation: Optional[int] = None,
+                            home: Optional[str] = None) -> bool:
+    """Append an advisory TOOLS decision; never raise and never change the live verdict."""
+    try:
+        root = home or os.environ.get("HESTIA_HOME") or os.path.expanduser("~/.hestia")
+        path = os.path.join(root, ALLOWLIST_SHADOW_RELPATH)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            if os.path.getsize(path) > GATE_TELEMETRY_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        rec = {
+            "ts": int(__import__("time").time()),
+            "member": member_id,
+            "tool": tool,
+            "axis": "tools",
+            "mode": "shadow",
+            "generation": generation,
+            "grants": sorted(grants),
+            "would_deny": shadow is not None,
+            "rule": shadow.rule if shadow is not None else "",
+            "target": shadow.target if shadow is not None else "",
+            "kind": "allowlist_shadow",
+            "note": "advisory measurement, NOT an enforced verdict",
+        }
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
         return True
     except Exception:
         return False
