@@ -1,0 +1,340 @@
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -187,6 +187,7 @@
+     notices: tuple = ()                   # informational lines (an approved closure write)
+     evidence_committed: bool = False
+     receipt_status: str = ""              # the record_decision status of THIS verdict
++    deny_hash: Optional[str] = None       # the committed deny row an appeal may name
+     supersedes_uncommitted: Optional[str] = None  # the permit gate.evidence_uncommitted replaced
+     budget_seconds: float = 0.0           # the deadline this verdict was reached inside
+ 
+@@ -834,14 +835,16 @@
+             f"[supersedes uncommitted {d.decision}:{d.rule}] {inv.attempted}")[:400])
+         _tally(inv, False)
+         return replace(denied, evidence_committed=second.committed,
+-                       receipt_status=second.status)
++                       receipt_status=second.status,
++                       deny_hash=second.entry_hash if second.committed else None)
+     _tally(inv, d.decision != "deny")
+     if receipt.committed:
+-        return replace(d, evidence_committed=True, receipt_status=receipt.status)
++        return replace(d, evidence_committed=True, receipt_status=receipt.status,
++                       deny_hash=receipt.entry_hash if d.decision == "deny" else None)
+     # A denial stays a denial without evidence; a read permit keeps the C11 read posture (allowed,
+     # its missing record surfaced as an anomaly).
+     return replace(d, evidence_committed=False, receipt_status=receipt.status,
+-                   anomaly=d.anomaly or d.decision != "deny")
++                   anomaly=True)
+ 
+ 
+ def _verdict_deny(v: core.Verdict, **kw) -> GateDecision:
+@@ -1591,7 +1594,8 @@
+ 
+     Empty for a silent allow. A daemon-composed message (it starts with `hestia:`) is shown as
+     the daemon wrote it — that is its steering text — followed by the remedy when it does not
+-    already carry it."""
++    already carry it. An unrecorded deny drops any hash-dependent remedy and says that appeal is
++    unavailable."""
+     lines = [str(n) for n in (getattr(decision, "notices", ()) or ()) if n]
+     verb = getattr(decision, "decision", "deny")
+     rule = getattr(decision, "rule", "") or ""
+@@ -1605,7 +1609,15 @@
+         text = reason
+     else:
+         text = f"hestia: {verb} [{rule}] — {reason}" if reason else f"hestia: {verb} [{rule}]"
++    deny_hash = getattr(decision, "deny_hash", None) if verb == "deny" else None
++    if verb == "deny" and not deny_hash and (
++            "chain hash" in remedy or "deny_hash" in remedy or "hestia_appeal" in remedy):
++        remedy = ""
+     if remedy and remedy not in text:
+         text = f"{text.rstrip('.')}. {remedy}"
+     lines.append(text)
++    if deny_hash:
++        lines.append(f"DENY {deny_hash} — appeal with this chain hash.")
++    elif verb == "deny":
++        lines.append("UNRECORDED — appeal unavailable.")
+     return "\n".join(lines)
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -188,6 +188,7 @@
+     notices: tuple = ()                   # informational lines (an approved closure write)
+     evidence_committed: bool = False
+     receipt_status: str = ""              # the record_decision status of THIS verdict
++    deny_hash: Optional[str] = None       # the committed deny row an appeal may name
+     supersedes_uncommitted: Optional[str] = None  # the permit gate.evidence_uncommitted replaced
+     budget_seconds: float = 0.0           # the deadline this verdict was reached inside
+ 
+@@ -835,14 +836,16 @@
+             f"[supersedes uncommitted {d.decision}:{d.rule}] {inv.attempted}")[:400])
+         _tally(inv, False)
+         return replace(denied, evidence_committed=second.committed,
+-                       receipt_status=second.status)
++                       receipt_status=second.status,
++                       deny_hash=second.entry_hash if second.committed else None)
+     _tally(inv, d.decision != "deny")
+     if receipt.committed:
+-        return replace(d, evidence_committed=True, receipt_status=receipt.status)
++        return replace(d, evidence_committed=True, receipt_status=receipt.status,
++                       deny_hash=receipt.entry_hash if d.decision == "deny" else None)
+     # A denial stays a denial without evidence; a read permit keeps the C11 read posture (allowed,
+     # its missing record surfaced as an anomaly).
+     return replace(d, evidence_committed=False, receipt_status=receipt.status,
+-                   anomaly=d.anomaly or d.decision != "deny")
++                   anomaly=True)
+ 
+ 
+ def _verdict_deny(v: core.Verdict, **kw) -> GateDecision:
+@@ -1592,7 +1595,8 @@
+ 
+     Empty for a silent allow. A daemon-composed message (it starts with `hestia:`) is shown as
+     the daemon wrote it — that is its steering text — followed by the remedy when it does not
+-    already carry it."""
++    already carry it. An unrecorded deny drops any hash-dependent remedy and says that appeal is
++    unavailable."""
+     lines = [str(n) for n in (getattr(decision, "notices", ()) or ()) if n]
+     verb = getattr(decision, "decision", "deny")
+     rule = getattr(decision, "rule", "") or ""
+@@ -1606,7 +1610,15 @@
+         text = reason
+     else:
+         text = f"hestia: {verb} [{rule}] — {reason}" if reason else f"hestia: {verb} [{rule}]"
++    deny_hash = getattr(decision, "deny_hash", None) if verb == "deny" else None
++    if verb == "deny" and not deny_hash and (
++            "chain hash" in remedy or "deny_hash" in remedy or "hestia_appeal" in remedy):
++        remedy = ""
+     if remedy and remedy not in text:
+         text = f"{text.rstrip('.')}. {remedy}"
+     lines.append(text)
++    if deny_hash:
++        lines.append(f"DENY {deny_hash} — appeal with this chain hash.")
++    elif verb == "deny":
++        lines.append("UNRECORDED — appeal unavailable.")
+     return "\n".join(lines)
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21",
++      "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
++  "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
++  "gt_version": "0702011b8141e5953204e2f39b3ea34742da6780b3f868bf7950c5779b307763"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
++  "gt_version": "fef124f09c273874a20f758e9eb2a4c4f9d2b45d0538b65c3dc78330b5d587fd"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
++  "gt_version": "8b9fb984c7a89a53093a8b360c4df811406ff5b46f2788a4a5ba39e733455fe7"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
++  "gt_version": "cc8e0af305ad0401c9d223f21efa9d1a9d525e92ffe21b1eae4d02d33f78a9a3"
+ }
+diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -481,6 +481,51 @@
+         stub.close()
+ 
+ 
++def test_the_deny_receipt_is_an_appealable_refusal_622(m, g, wc, home):
++    def decided(policy):
++        stub = Stub(policy)
++        try:
++            with _Env(m, stub.url, home):
++                d, _ = _decide(g, "codex", *_act(IN_SCOPE_EDIT), home)
++            return d, g.render(d)
++        finally:
++            stub.close()
++
++    d, rendered = decided(Policy(query=lambda a: "deny"))
++    check("committed-deny-hash", d.decision == "deny" and d.evidence_committed
++          and d.deny_hash == "e" * 64, d)
++    check("committed-deny-is-appealable",
++          f"DENY {'e' * 64} — appeal with this chain hash." in rendered, rendered)
++    check("committed-deny-is-not-unrecorded", "UNRECORDED" not in rendered, rendered)
++
++    d, rendered = decided(Policy(query=lambda a: "deny", witness="refuse-all"))
++    check("uncommitted-deny-has-no-hash", d.decision == "deny" and not d.evidence_committed
++          and d.receipt_status == "refused" and d.deny_hash is None, d)
++    check("uncommitted-deny-is-integrity-anomaly", d.anomaly and d.verdict_available, d)
++    check("uncommitted-deny-says-appeal-unavailable",
++          "UNRECORDED — appeal unavailable." in rendered and "DENY " not in rendered, rendered)
++    check("uncommitted-deny-drops-the-hash-dependent-remedy",
++          "chain hash" not in rendered and "hestia_appeal" not in rendered, rendered)
++
++    d, rendered = decided(Policy(witness="refuse-allow"))
++    check("committed-replacement-deny-hash", d.rule == "gate.evidence_uncommitted"
++          and d.evidence_committed and d.deny_hash == "b" * 64, d)
++    check("committed-replacement-deny-is-appealable",
++          f"DENY {'b' * 64} — appeal with this chain hash." in rendered, rendered)
++
++    d, rendered = decided(Policy(witness="refuse-all"))
++    check("uncommitted-replacement-deny-has-no-hash", d.rule == "gate.evidence_uncommitted"
++          and not d.evidence_committed and d.receipt_status == "refused" and d.deny_hash is None, d)
++    check("uncommitted-replacement-deny-is-integrity-anomaly", d.anomaly, d)
++    check("uncommitted-replacement-deny-says-appeal-unavailable",
++          "UNRECORDED — appeal unavailable." in rendered and "DENY " not in rendered, rendered)
++
++    d, rendered = decided(Policy())
++    check("allow-has-no-deny-hash", d.decision == "allow" and d.deny_hash is None, d)
++    check("allow-has-no-appeal-or-unrecorded-line",
++          "appeal with this chain hash" not in rendered and "UNRECORDED" not in rendered, rendered)
++
++
+ def test_the_key_from_the_raw_event_reaches_every_join(m, g, wc, home):
+     cases = (("kimi", "Bash", {"command": "ls"}), ("gemini", "Bash", {"command": "ls"}),
+              ("codex", "Bash", {"command": "ls"}), ("claude-code", "Bash", {"command": "ls"}))
+@@ -1825,6 +1870,7 @@
+ 
+ CONTRACT_TESTS = [
+     test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial,
++    test_the_deny_receipt_is_an_appealable_refusal_622,
+     test_the_key_from_the_raw_event_reaches_every_join,
+     test_the_gate_owns_no_cache_no_client_and_one_recorder,
+     test_one_deadline_bounds_the_whole_invocation,
+diff --git a/plugins/_shared/seat_gate_boundary_test.py b/plugins/_shared/seat_gate_boundary_test.py
+--- a/plugins/_shared/seat_gate_boundary_test.py
++++ b/plugins/_shared/seat_gate_boundary_test.py
+@@ -314,6 +314,8 @@
+             # write-position paths, which name the file even when the marker is a directory.
+             check(f"{seat}-claim-carries-resolved-target",
+                   claims and claims[0].get("resolved_targets") == [gate_file(fx, seat)], claims)
++            check(f"{seat}-denial-is-appealable",
++                  f"DENY {'b' * 64} — appeal with this chain hash." in text, text)
+             check(f"{seat}-witnessed", any(a.get("event_type") == "gate_self_access"
+                                            for a in stub.args("hestia_request_witness")), stub.calls)
+             check(f"{seat}-pre-daemon", "hestia_begin_action" not in stub.names(), stub.names())
+@@ -681,8 +683,12 @@
+ def test_daemon_down():
+     def arm(seat, fx):
+         home = fx.home(seat, DEAD)
+-        v, text, _ = run(seat, home, native(seat, "Write", {"file_path": gate_file(fx, seat), "content": "x"}))
++        v, text, channel = run(seat, home, native(seat, "Write", {"file_path": gate_file(fx, seat), "content": "x"}))
+         check(f"{seat}-gate-write-still-gate-self", v == "deny" and "gate.self_access" in text, text)
++        check(f"{seat}-unrecorded-deny-has-no-appeal-hash",
++              "UNRECORDED — appeal unavailable." in text and "DENY " not in text
++              and "chain hash" not in text and "hestia_appeal" not in text, text)
++        check(f"{seat}-unrecorded-deny-is-an-anomaly", channel == "exit2", channel)
+         target = os.path.join(fx.repo, "forum", "x", "post.md")
+         v, text, channel = run(seat, home, native(seat, "Write", {"file_path": target, "content": "x"}))
+         check(f"{seat}-ordinary-write-fails-closed", v == "deny" and "gate.degraded" in text, text)
