@@ -50,28 +50,74 @@ done < <(type -ap cargo 2>/dev/null || true)
 
 case "${1:-}" in
   build|b|test|t|check|c|clippy|bench|doc|d|install)
-    # Shared WARM target on ext4 (#387; kimi's IO channel). The dominant cost of a PR sweep is a
-    # COLD build reading thousands of source files off the /mnt/c 9p mount, saturating the drvfs
-    # read queue that every gate call also traverses — which is why timeouts appear at low CPU%.
-    # A target shared across a repo's worktrees makes each build INCREMENTAL (seconds, not a cold
-    # 8 minutes → far fewer source reads) and puts the target IO on ext4. Keyed on the git
-    # COMMON dir so all worktrees of ONE repo share a target while OTHER projects are untouched;
-    # skipped outside a git tree; a caller's own CARGO_TARGET_DIR always wins. flock (below)
+    # Shared WARM target on ext4 (#387; kimi's IO channel). The manifest, not the caller's
+    # cwd, selects it (#828). Cargo metadata names the actual path dependencies; canonicalizing
+    # those manifest paths collapses a worktree symlink to the same identity while keeping a
+    # genuinely different dependency population in a different target. Repository discovery or
+    # metadata failure is loud: silently falling back to a local target would hide the split.
+    # A caller's explicit CARGO_TARGET_DIR always wins and skips discovery. flock (below)
     # serializes, so the shared target is never written by two builds at once.
     if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-      _gcd="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-      if [ -n "$_gcd" ]; then
-        _gcd="$(cd "$_gcd" 2>/dev/null && pwd || echo "$_gcd")"
-        _key="$(printf '%s' "$_gcd" | cksum | cut -d' ' -f1)"
-        export CARGO_TARGET_DIR="${HESTIA_BUILD_TARGET:-$HOME/.cache/hestia-cargo-target}/$_key"
+      _manifest_args=()
+      _expect_manifest=0
+      for _arg in "$@"; do
+        if [ "$_expect_manifest" = 1 ]; then
+          _manifest_args+=("$_arg")
+          _expect_manifest=0
+          continue
+        fi
+        case "$_arg" in
+          --manifest-path)
+            _manifest_args+=("$_arg")
+            _expect_manifest=1 ;;
+          --manifest-path=*)
+            _manifest_args+=("$_arg") ;;
+        esac
+      done
+      if [ "$_expect_manifest" = 1 ]; then
+        echo "cargo build-lock: --manifest-path needs a value" >&2
+        exit 2
       fi
+      if ! _identity="$("$real" metadata --format-version 1 --offline "${_manifest_args[@]}" | python3 -c '
+import hashlib, json, os, sys
+m = json.load(sys.stdin)
+paths = sorted(os.path.realpath(p["manifest_path"]) for p in m["packages"]
+               if p.get("source") is None)
+identity = hashlib.sha256(chr(10).join(paths).encode()).hexdigest()[:16]
+print(os.path.realpath(m["workspace_root"]) + chr(9) + identity)
+')"; then
+        echo "cargo build-lock: cargo metadata failed; refusing to guess the dependency/target identity" >&2
+        exit 2
+      fi
+      IFS=$'\t' read -r _root _dep_id <<< "$_identity"
+      if [ -z "$_root" ] || [ -z "$_dep_id" ]; then
+        echo "cargo build-lock: metadata returned no usable dependency identity" >&2
+        exit 2
+      fi
+      if ! _gcd="$(git -C "$_root" rev-parse --git-common-dir 2>/dev/null)"; then
+        echo "cargo build-lock: $_root is not in a git worktree; refusing a local-target fallback" >&2
+        exit 2
+      fi
+      case "$_gcd" in
+        /*) ;;
+        *) _gcd="$_root/$_gcd" ;;
+      esac
+      if ! _gcd="$(cd "$_gcd" 2>/dev/null && pwd -P)"; then
+        echo "cargo build-lock: cannot resolve the git common directory" >&2
+        exit 2
+      fi
+      _key="$(printf '%s\n' "$_gcd" "$_dep_id" | cksum | cut -d' ' -f1)"
+      export CARGO_TARGET_DIR="${HESTIA_BUILD_TARGET:-$HOME/.cache/hestia-cargo-target}/$_key"
+      echo "cargo build-lock: manifest_root=$_root dependency_identity=$_dep_id target_dir=$CARGO_TARGET_DIR" >&2
     fi
     wait="${HESTIA_BUILD_LOCK_WAIT:-900}"
     if [ "$wait" = "0" ] || ! command -v flock >/dev/null 2>&1; then
       # Serialization disabled, or flock unavailable: fall back to nice-only (increment 1).
+      echo "cargo build-lock: lock=disabled" >&2
       exec nice -n 15 "$real" "$@"
     fi
     lock="${HESTIA_BUILD_LOCK:-${TMPDIR:-/tmp}/hestia-cargo-build.lock}"
+    echo "cargo build-lock: lock=$lock" >&2
     # Hold the lock via a dedicated FD, NOT `flock -E N cmd`. The -E form returns N when it cannot
     # acquire AND propagates the child's exit — so a legitimate `cargo` exit N (e.g. 99) reads as a
     # lock timeout and the build re-runs unsynchronized (GPT #392 review). With `flock -w <fd>`, the
