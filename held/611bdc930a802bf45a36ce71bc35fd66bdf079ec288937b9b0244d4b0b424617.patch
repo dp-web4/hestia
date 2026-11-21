@@ -1,0 +1,305 @@
+diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
+--- a/plugins/_shared/hestia_gate_mechanism.py
++++ b/plugins/_shared/hestia_gate_mechanism.py
+@@ -1636,7 +1636,7 @@
+ def claim_self_write(marker, tool_name, attempted, *,
+                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
+                      supersession=None, deadline=None, resolved_targets=None,
+-                     resolved_targets_complete=True):
++                     resolved_targets_complete=True, refusal_rule=None):
+     """Ask ONCE whether a human has already approved this exact (member, marker) write.
+     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
+ 
+@@ -1667,8 +1667,10 @@
+         # write. Presenting the act as though it were a rationale would look like the member had
+         # explained itself. A member that wants to state a why opens the escalation itself.
+         "reason": attempted or f"{tool_name} -> {marker}",
+-        "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
+-                   "because it did not choose to escalate. Approving authorises this one write."),
++        "detail": ("Auto-opened by the gate on a refused act"
++                   + (f" ({refusal_rule})" if refusal_rule else "")
++                   + "; the member stated no rationale because it did not choose to escalate. "
++                   + "Approving authorises this one write."),
+     }
+     # The claimed-row join key (reply-2005/reply-2006, 2026-08-12): of the three session-id
+     # namespaces in a claim window, only the per-wake host session appears on the outcome rows
+diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_single_gate.py
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -1113,7 +1113,8 @@
+             # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
+             # cut a filename out (or withhold the whole command); these are carried
+             # independently of it. An unenumerable write set is said as such, and priced highest.
+-            resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
++            resolved_targets=write_set[0], resolved_targets_complete=write_set[1],
++            refusal_rule=cv.rule)
+         if claimed is _LATE:
+             # Unknown, not "nothing happened": the daemon may have opened or matched an
+             # escalation after the bound (#1166). Re-issuing the identical act is safe.
+diff --git a/hooks-gt/_shared/hestia_gate_mechanism.py b/hooks-gt/_shared/hestia_gate_mechanism.py
+--- a/hooks-gt/_shared/hestia_gate_mechanism.py
++++ b/hooks-gt/_shared/hestia_gate_mechanism.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: b18f3e2d0116666af56ff388a32a4c1e1374a99c37e9b46f25a5ed394b3b912f  (published ground truth; manifest: hooks-gt)
+ """Shared in-process daemon-query mechanism — the society-safety verdict path.
+ 
+ PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
+@@ -1637,7 +1637,7 @@
+ def claim_self_write(marker, tool_name, attempted, *,
+                      plugin_id, role, client_name, host_session_id=None, invocation_key=None,
+                      supersession=None, deadline=None, resolved_targets=None,
+-                     resolved_targets_complete=True):
++                     resolved_targets_complete=True, refusal_rule=None):
+     """Ask ONCE whether a human has already approved this exact (member, marker) write.
+     Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
+ 
+@@ -1668,8 +1668,10 @@
+         # write. Presenting the act as though it were a rationale would look like the member had
+         # explained itself. A member that wants to state a why opens the escalation itself.
+         "reason": attempted or f"{tool_name} -> {marker}",
+-        "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
+-                   "because it did not choose to escalate. Approving authorises this one write."),
++        "detail": ("Auto-opened by the gate on a refused act"
++                   + (f" ({refusal_rule})" if refusal_rule else "")
++                   + "; the member stated no rationale because it did not choose to escalate. "
++                   + "Approving authorises this one write."),
+     }
+     # The claimed-row join key (reply-2005/reply-2006, 2026-08-12): of the three session-id
+     # namespaces in a claim window, only the per-wake host session appears on the outcome rows
+diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
+--- a/hooks-gt/_shared/hestia_single_gate.py
++++ b/hooks-gt/_shared/hestia_single_gate.py
+@@ -1,4 +1,4 @@
+-# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: a33e9913b7965f356797ee697b17b242552b01cc9c2878f6859658a6cefe0c63  (published ground truth; manifest: hooks-gt)
+ """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
+ 
+ One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
+@@ -1114,7 +1114,8 @@
+             # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
+             # cut a filename out (or withhold the whole command); these are carried
+             # independently of it. An unenumerable write set is said as such, and priced highest.
+-            resolved_targets=write_set[0], resolved_targets_complete=write_set[1])
++            resolved_targets=write_set[0], resolved_targets_complete=write_set[1],
++            refusal_rule=cv.rule)
+         if claimed is _LATE:
+             # Unknown, not "nothing happened": the daemon may have opened or matched an
+             # escalation after the bound (#1166). Re-issuing the identical act is safe.
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -12,7 +12,7 @@
+     },
+     {
+       "path": "hestia_gate_mechanism.py",
+-      "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2",
++      "sha256": "b18f3e2d0116666af56ff388a32a4c1e1374a99c37e9b46f25a5ed394b3b912f",
+       "source": "plugins/_shared/hestia_gate_mechanism.py"
+     },
+     {
+@@ -27,7 +27,7 @@
+     },
+     {
+       "path": "hestia_single_gate.py",
+-      "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21",
++      "sha256": "a33e9913b7965f356797ee697b17b242552b01cc9c2878f6859658a6cefe0c63",
+       "source": "plugins/_shared/hestia_single_gate.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
++  "gt_version": "18d455b5a40c32ee9ca3667d899d135ad10c16843f9e4e5f3eec5ba702b9c8d9"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "18d455b5a40c32ee9ca3667d899d135ad10c16843f9e4e5f3eec5ba702b9c8d9",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "b18f3e2d0116666af56ff388a32a4c1e1374a99c37e9b46f25a5ed394b3b912f"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "a33e9913b7965f356797ee697b17b242552b01cc9c2878f6859658a6cefe0c63"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
++  "gt_version": "5425eed9a235cd460c5ad9af9e02b0391aa4862bbed63deecfc71345bec24e82"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "18d455b5a40c32ee9ca3667d899d135ad10c16843f9e4e5f3eec5ba702b9c8d9",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "b18f3e2d0116666af56ff388a32a4c1e1374a99c37e9b46f25a5ed394b3b912f"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "a33e9913b7965f356797ee697b17b242552b01cc9c2878f6859658a6cefe0c63"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
++  "gt_version": "325ed2d2b3883854551ca868c14783a30f82910c5fae0e47bdb1e8e2b50f7cb5"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "18d455b5a40c32ee9ca3667d899d135ad10c16843f9e4e5f3eec5ba702b9c8d9",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "b18f3e2d0116666af56ff388a32a4c1e1374a99c37e9b46f25a5ed394b3b912f"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "a33e9913b7965f356797ee697b17b242552b01cc9c2878f6859658a6cefe0c63"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
++  "gt_version": "cf6ea221e2087351c0f532f2beeab787635eee6f4bd91681c0ac7766f802f673"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "18d455b5a40c32ee9ca3667d899d135ad10c16843f9e4e5f3eec5ba702b9c8d9",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -41,7 +41,7 @@
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+-        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
++        "sha256": "b18f3e2d0116666af56ff388a32a4c1e1374a99c37e9b46f25a5ed394b3b912f"
+       },
+       {
+         "path": "hestia_governance_closure.py",
+@@ -53,7 +53,7 @@
+       },
+       {
+         "path": "hestia_single_gate.py",
+-        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
++        "sha256": "a33e9913b7965f356797ee697b17b242552b01cc9c2878f6859658a6cefe0c63"
+       },
+       {
+         "path": "hestia_witness_core.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
++  "gt_version": "a511d963b7438c645d2a5b01529b48ff6d7042bb3e672ec00b803d26f0f85502"
+ }
+diff --git a/plugins/_shared/seat_gate_boundary_test.py b/plugins/_shared/seat_gate_boundary_test.py
+--- a/plugins/_shared/seat_gate_boundary_test.py
++++ b/plugins/_shared/seat_gate_boundary_test.py
+@@ -770,9 +770,36 @@
+     _each_seat(arm)
+ 
+ 
++def test_stated_detail_names_the_actual_refusal_rule_608():
++    def arm(seat, fx):
++        stub = Stub()
++        try:
++            home = fx.home(seat, stub.url)
++            target = gate_file(fx, seat)
++            v, text, _ = run(seat, home, native(seat, "Write", {"file_path": target, "content": "x"}))
++            check(f"{seat}-denied", v == "deny", text)
++            claims = stub.args("hestia_gate_escalation_claim")
++            detail = claims and claims[0].get("detail", "")
++            check(f"{seat}-real-write-rule", "governance-closure-write" in detail, detail)
++            check(f"{seat}-not-asserted-a-write", "refused write" not in detail, detail)
++
++            mark = len(stub.calls)
++            command = f"bash -c 'cat {target}'"
++            v2, text2, _ = run(seat, home, native(seat, "Bash", {"command": command}, n=2))
++            check(f"{seat}-read-loop-denied", v2 == "deny", text2)
++            followup = [a for n, a in stub.calls[mark:] if n == "hestia_gate_escalation_claim"]
++            detail2 = followup and followup[0].get("detail", "")
++            check(f"{seat}-read-fp-rule", "governance-closure-out-of-grammar" in detail2, detail2)
++            check(f"{seat}-read-fp-not-asserted-a-write", "refused write" not in detail2, detail2)
++        finally:
++            stub.close()
++    _each_seat(arm)
++
++
+ ALL = [
+     test_gate_file_write_refused_before_the_daemon,
+     test_gate_file_shell_write_refused,
++    test_stated_detail_names_the_actual_refusal_rule_608,
+     test_every_declared_member_is_exercised_here,
+     test_installed_gate_entry_witness_and_registration_refused,
+     test_installed_entry_claim_carries_the_resolved_location,
