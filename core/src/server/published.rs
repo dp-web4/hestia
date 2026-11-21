@@ -326,6 +326,8 @@ pub struct SessionIdent {
     pub assigned_role: String,
     pub constellation_role: String,
     pub role_basis: Option<String>,
+    pub identity_basis: crate::server::state::IdentityBasis,
+    pub canonical_principal: Option<String>,
     /// Unix millis of the latest connect seen for this session, including lock-free reuses.
     last_seen_ms: AtomicI64,
 }
@@ -340,6 +342,8 @@ impl SessionIdent {
             assigned_role: s.assigned_role.clone(),
             constellation_role: s.constellation_role.clone(),
             role_basis: s.role_basis.clone(),
+            identity_basis: s.identity_basis,
+            canonical_principal: s.canonical_principal.clone(),
             last_seen_ms: AtomicI64::new(s.connected_at.timestamp_millis()),
         }
     }
