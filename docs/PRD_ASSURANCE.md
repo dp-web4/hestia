@@ -145,7 +145,7 @@ faithfully.
 *Acceptance*: a third party cannot move an actor's standing by naming it, absent a valid
 authority reference and evidence.
 
-### FR-5 — Key custody and process isolation *(state: not started)*
+### FR-5 — Key custody and process isolation *(state: partial)*
 
 - No passphrase in the daemon's environment; child processes start from a cleared
   environment with a minimal allowlist.
@@ -156,6 +156,15 @@ authority reference and evidence.
   invitation to fall back to parsing a legacy plaintext format.
 - Vault and chain writes are atomic and interprocess-safe: either the old state or the new,
   never a partial commit.
+
+The shipped daemon and launchers read `$HESTIA_HOME/.passphrase` **in process** rather than
+exporting it through a shell. This keeps the passphrase out of `/proc/<pid>/environ` in the
+normal deployment, but does not make it inaccessible to a same-UID process: the file itself
+remains mode `0600`, and any process at that UID can read it. The credential rule is therefore
+an A1 cooperation boundary, not secret containment. If an operator explicitly supplies
+`HESTIA_PASSPHRASE` for automation, the value is also visible in that process's environment
+and must not be used for a long-lived daemon. Clearing the environment for child processes
+and stronger OS identity separation remain future work.
 
 ### FR-6 — Legibility of state *(state: partial — see per-bullet notes)*
 
