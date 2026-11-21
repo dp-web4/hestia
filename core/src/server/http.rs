@@ -11380,6 +11380,7 @@ mod disposition_tests {
 
     /// A failed vault commit leaves the chain holding the INTENT and no terminal record,
     /// and the store bit-identical — the record can never say reach changed when it did not.
+    #[cfg(unix)]
     #[tokio::test]
     async fn recursive_failed_commit_leaves_intent_only_and_store_untouched() {
         use std::os::unix::fs::PermissionsExt;
@@ -12486,6 +12487,7 @@ mod disposition_tests {
 
     /// Injected failure at the COMMIT stage: the chain holds the intent and no terminal
     /// record, and the store is byte-identical — both grants where they were.
+    #[cfg(unix)]
     #[tokio::test]
     async fn reassign_failed_commit_leaves_intent_only_and_store_untouched() {
         use std::os::unix::fs::PermissionsExt;
