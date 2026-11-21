@@ -8424,7 +8424,7 @@ fn deployed_gate_digests_from(path: &std::path::Path) -> Option<serde_json::Valu
     }))
 }
 
-fn deployed_gate_digests() -> Option<serde_json::Value> {
+pub(crate) fn deployed_gate_digests() -> Option<serde_json::Value> {
     let p = std::env::var_os("HESTIA_CURRENT_BUILD_FILE")?;
     deployed_gate_digests_from(std::path::Path::new(&p))
 }

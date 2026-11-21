@@ -12,6 +12,13 @@
 //! a day is how a real finding becomes background". Keyed per gate path, so one rewritten gate
 //! is one row, not a fleet-wide status flip that hides which file moved.
 //!
+//! COVERAGE BEYOND THE ENTRYPOINT (#923). Every deployed-only file in `current-build.json`,
+//! shared law modules included, is hashed by this same pass. Those rows are explicitly marked
+//! `basis: current-build`: deployment-drift evidence, not a vault-ratified gate verdict. A gate
+//! path covered by both keeps the stronger vault-backed verdict. This closes the command-text
+//! bypass class for installed artifacts without adding another lexical classifier or a hot-path
+//! inventory; source checkouts are deployment inputs, not the executing surface this watches.
+//!
 //! WHAT IS PROJECTED. Every pass writes `<home>/status/gate-integrity.json`: when it looked, what
 //! it hashed, what it concluded, and the chain hash of each open finding. That file is a
 //! readable projection, not an authority — anyone who can write `<home>` can edit it, exactly as
@@ -42,6 +49,8 @@ pub const STATUS_FILE: &str = "status/gate-integrity.json";
 /// The key for "the gate set itself could not be established" — a finding about coverage,
 /// which has no gate path of its own. Parenthesised so it can never collide with a real path.
 pub const COVERAGE_KEY: &str = "(coverage)";
+/// The deployment manifest was configured but could not supply a non-empty file set (#923).
+pub const DEPLOYMENT_COVERAGE_KEY: &str = "(deployment-coverage)";
 
 /// A finding that is open, as the daemon last witnessed it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +173,60 @@ fn coverage(reason: String) -> Observation {
         plugin_id: None,
         detail: json!({"reason": reason}),
     }
+}
+
+/// Deployed-only files, including the shared law engine, judged against the install record.
+/// Command spelling is irrelevant: a script, heredoc, editor, or git verb cannot hide a digest
+/// change from this pass (#923). A gate already judged above keeps its vault-backed verdict.
+fn deployed_observations(deployed: Option<&Value>, configured: bool, existing: &[Observation]) -> Vec<Observation> {
+    if !configured {
+        return Vec::new();
+    }
+    let files = deployed.and_then(|d| d.get("files")).and_then(|f| f.as_object());
+    let Some(files) = files.filter(|f| !f.is_empty()) else {
+        return vec![Observation {
+            key: DEPLOYMENT_COVERAGE_KEY.into(),
+            status: "unknown".into(),
+            found_sha256: None,
+            plugin_id: None,
+            detail: json!({"reason": "HESTIA_CURRENT_BUILD_FILE is configured but no readable, non-empty deployment file set could be established"}),
+        }];
+    };
+    let build_id = deployed.and_then(|d| d.get("build_id")).cloned().unwrap_or(Value::Null);
+    let mut rows: Vec<_> = files.iter().collect();
+    rows.sort_by_key(|(path, _)| *path);
+    rows.into_iter().filter_map(|(path, expected)| {
+        if existing.iter().any(|o| &o.key == path) {
+            return None;
+        }
+        let expected = expected.as_str().unwrap_or_default();
+        let (status, found, detail) = if !Path::new(path).is_file() {
+            ("missing", None, json!({}))
+        } else {
+            match hash_file(Path::new(path)) {
+                Ok(actual) if actual == expected => ("verified", Some(actual), json!({})),
+                Ok(actual) => ("modified", Some(actual), json!({})),
+                Err(e) => ("unreadable", None, json!({"error": e.to_string()})),
+            }
+        };
+        let mut observation_detail = json!({
+            "basis": "current-build",
+            "build_id": build_id,
+            "expected_sha256": expected,
+        });
+        if let (Some(obj), Some(extra)) = (observation_detail.as_object_mut(), detail.as_object()) {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        Some(Observation {
+            key: path.clone(),
+            status: status.into(),
+            found_sha256: found,
+            plugin_id: None,
+            detail: observation_detail,
+        })
+    }).collect()
 }
 
 /// A chain row this pass owes.
@@ -344,10 +407,22 @@ pub fn rehydrate(chain: &crate::storage::chain::SqliteChainStore) -> HashMap<Str
 /// (which only ever runs under the state lock) cannot start the inventory child while holding
 /// that lock (#1183: about 0.8 to 1.1 s of whole-daemon stall every 300 s).
 pub fn check(s: &mut super::state::ServerState, discovered: Result<Vec<(String, String)>, String>) -> Value {
+    let configured = std::env::var_os("HESTIA_CURRENT_BUILD_FILE").is_some();
+    let deployed = super::http::deployed_gate_digests();
+    check_with_deployed(s, discovered, configured, deployed.as_ref())
+}
+
+fn check_with_deployed(
+    s: &mut super::state::ServerState,
+    discovered: Result<Vec<(String, String)>, String>,
+    configured: bool,
+    deployed: Option<&Value>,
+) -> Value {
     let now = super::gate_escalation::now_secs();
     let exp = s.vault.gate_expectations();
     let discovered = discovered.map(|d| d.into_iter().map(|(_, p)| p).collect::<Vec<_>>());
-    let seen = observe(&exp, discovered);
+    let mut seen = observe(&exp, discovered);
+    seen.extend(deployed_observations(deployed, configured, &seen));
     let mut failures = 0usize;
     for t in transitions(&s.gate_findings_open, &seen, now) {
         match t {
@@ -411,6 +486,12 @@ mod tests {
         );
     }
 
+    fn deployed_manifest(rows: &[(&str, &str)]) -> Value {
+        let files: serde_json::Map<String, Value> =
+            rows.iter().map(|(path, sha)| (path.to_string(), json!(sha))).collect();
+        json!({"build_id": "build-test", "files": files})
+    }
+
     /// Apply transitions the way `check` does when every witness lands.
     fn apply(open: &mut HashMap<String, OpenGateFinding>, ts: &[Transition], now: u64) {
         for t in ts {
@@ -437,6 +518,102 @@ mod tests {
         let seen = observe(&e, Ok(vec![g]));
         assert_eq!(seen[0].status, "verified");
         assert!(transitions(&HashMap::new(), &seen, 1).is_empty(), "silence is the clean state");
+    }
+
+    #[test]
+    fn a_shared_engine_rewrite_opens_once_and_restoring_deployed_bytes_resolves() {
+        let d = tempfile::tempdir().unwrap();
+        let original = "shared law v1";
+        let engine = gate(&d, "hestia_gate_core.py", original);
+        let deployed = deployed_manifest(&[(&engine, &hash_file(Path::new(&engine)).unwrap())]);
+        let clean = deployed_observations(Some(&deployed), true, &[]);
+        assert_eq!(clean.len(), 1);
+        assert_eq!(clean[0].status, "verified");
+        assert!(transitions(&HashMap::new(), &clean, 1).is_empty());
+
+        std::fs::write(&engine, "shared law v2, written by an unmodelled script").unwrap();
+        let changed = deployed_observations(Some(&deployed), true, &[]);
+        assert_eq!(changed[0].status, "modified");
+        assert_eq!(changed[0].detail["basis"], "current-build");
+        assert_eq!(changed[0].detail["build_id"], "build-test");
+        let mut open = HashMap::new();
+        let opened = transitions(&open, &changed, 10);
+        assert!(matches!(&opened[..], [Transition::Open { .. }]), "{opened:?}");
+        apply(&mut open, &opened, 10);
+        assert!(transitions(&open, &changed, 20).is_empty(), "unchanged drift is not a new row");
+
+        std::fs::write(&engine, original).unwrap();
+        let repaired = deployed_observations(Some(&deployed), true, &[]);
+        let resolved = transitions(&open, &repaired, 30);
+        match &resolved[..] {
+            [Transition::Resolve { payload, .. }] => {
+                assert_eq!(payload["open_secs"], 20);
+                assert_eq!(payload["resolution"], "verified");
+            }
+            other => panic!("restoring deployed bytes must resolve the finding: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_witnesses_a_deployed_shared_engine_change_and_its_resolution() {
+        let d = tempfile::tempdir().unwrap();
+        let vault = crate::vault::Vault::init(d.path().join("v.enc"), "p".into()).unwrap();
+        let mut state = crate::server::state::ServerState::open(vault, d.path(), "p").unwrap();
+        let engine = gate(&d, "shared-law.py", "v1");
+        let deployed = deployed_manifest(&[(&engine, &hash_file(Path::new(&engine)).unwrap())]);
+
+        std::fs::write(&engine, "v2 through a path no command named").unwrap();
+        let doc = check_with_deployed(&mut state, Ok(vec![]), true, Some(&deployed));
+        let row = doc["gates"].as_array().unwrap().iter()
+            .find(|row| row["gate"] == engine).expect("deployed engine observation").clone();
+        assert_eq!(row["status"], "modified");
+        assert_eq!(row["detail"]["basis"], "current-build");
+        assert!(row["open_finding_chain_hash"].is_string(), "{row}");
+        let chain_len = state.chain_len();
+        let finding = state.recent_chain(20).into_iter().find(|entry| {
+            entry.event_type == FINDING_EVENT && entry.event_data["gate"] == engine
+        }).expect("shared-engine finding on the real chain");
+        assert_eq!(finding.event_data["basis"], "current-build");
+        assert_eq!(finding.event_data["build_id"], "build-test");
+
+        let second = check_with_deployed(&mut state, Ok(vec![]), true, Some(&deployed));
+        assert_eq!(second["gates"].as_array().unwrap().len(), 2, "coverage plus the engine");
+        assert_eq!(state.chain_len(), chain_len, "the same drift must not mint another row");
+
+        std::fs::write(&engine, "v1").unwrap();
+        check_with_deployed(&mut state, Ok(vec![]), true, Some(&deployed));
+        assert!(state.recent_chain(20).into_iter().any(|entry| {
+            entry.event_type == RESOLVED_EVENT && entry.event_data["gate"] == engine
+        }), "restoring deployed bytes must be witnessed as resolved");
+    }
+
+    #[test]
+    fn a_vault_backed_gate_verdict_is_not_duplicated_by_the_deploy_manifest() {
+        let d = tempfile::tempdir().unwrap();
+        let g = gate(&d, "gate.py", "v1");
+        let mut expectations = GateExpectations::new();
+        ratify(&mut expectations, &g);
+        let deployed = deployed_manifest(&[(&g, &hash_file(Path::new(&g)).unwrap())]);
+        let existing = observe(&expectations, Ok(vec![g.clone()]));
+        assert!(deployed_observations(Some(&deployed), true, &existing).is_empty());
+        std::fs::write(&g, "v2").unwrap();
+        let existing = observe(&expectations, Ok(vec![g.clone()]));
+        assert_eq!(existing.len(), 1);
+        assert_eq!(existing[0].status, "modified");
+        assert!(deployed_observations(Some(&deployed), true, &existing).is_empty());
+    }
+
+    #[test]
+    fn a_configured_but_unreadable_or_empty_deploy_manifest_is_unknown_not_clean() {
+        let empty = json!({"files": {}});
+        for deployed in [None, Some(&empty)] {
+            let seen = deployed_observations(deployed, true, &[]);
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].key, DEPLOYMENT_COVERAGE_KEY);
+            assert_eq!(seen[0].status, "unknown");
+            assert_eq!(status_document(&seen, &HashMap::new(), 1, 0)["status"], "UNKNOWN");
+        }
+        assert!(deployed_observations(None, false, &[]).is_empty());
     }
 
     #[test]
