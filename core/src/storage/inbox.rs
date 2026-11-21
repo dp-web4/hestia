@@ -364,6 +364,8 @@ impl SqliteInboxStore {
             // under the contract the act was made under, and so a binding that changes while
             // the row waits is detected rather than silently applied.
             ("transport_stamp", "TEXT"),
+            ("claimed_by_session", "TEXT"),
+            ("claim_expires_at", "TEXT"),
         ] {
             if !existing.iter().any(|c| c == col) {
                 conn.execute_batch(&format!(
@@ -1424,23 +1426,169 @@ impl SqliteInboxStore {
         })
     }
 
-    /// Consume-once drain of the notices addressed to `to_plugin` ONLY —
-    /// recipient-scoped (a member can never drain another member's mail).
-    /// Same at-least-once failure bias as the hub-notice drain.
-    ///
-    /// Consume-once is a MARK (`drained_at`), not a DELETE: the notice never
-    /// comes back from a second drain, but the fact that it was delivered
-    /// survives, so "queued and never answered" stays askable after the wake.
-    ///
-    /// **An empty drain is no longer a no-op.** It records a sighting
-    /// ([`Self::ensure_touch_schema`]) — the watcher polls on a cadence whether
-    /// or not there is mail, so the empty drains are precisely where the
-    /// liveness evidence lives. This is a semantic change to what an empty
-    /// drain *means*, wearing a recording change's clothes; the return value
-    /// and consume-once behaviour are untouched.
-    pub fn drain_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
+    /// Claim one queued notice for a proven daemon session. Only the recipient may claim it;
+    /// a different session's unexpired lease is a conflict, not an overwrite. The lease coordinates
+    /// consumption; it does not authenticate the member beyond the existing session resolution.
+    pub fn claim_member_notice(
+        &self,
+        id: u64,
+        to_plugin: &str,
+        session: Uuid,
+        lease_secs: i64,
+    ) -> Result<MemberNoticeClaimOutcome> {
         let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(lease_secs);
+        let session = session.to_string();
+        let mut conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting member notice claim")?;
+        let prior = tx
+            .query_row(
+                "SELECT drained_at, claimed_by_session, claim_expires_at
+                 FROM member_notices
+                 WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL",
+                params![id as i64, to_plugin],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("reading member notice claim")?;
+        let outcome = match prior {
+            None => MemberNoticeClaimOutcome::NotFound,
+            Some((Some(_), _, _)) => MemberNoticeClaimOutcome::AlreadyDrained,
+            Some((_, claimed_by, raw_expiry)) => {
+                let prior_expiry = raw_expiry
+                    .as_deref()
+                    .map(DateTime::parse_from_rfc3339)
+                    .transpose()
+                    .context("parsing member notice claim expiry")?
+                    .map(|t| t.with_timezone(&Utc));
+                let other_live_claim = claimed_by.as_deref().is_some_and(|owner| {
+                    owner != session && prior_expiry.map_or(true, |expiry| expiry > now)
+                });
+                if other_live_claim {
+                    MemberNoticeClaimOutcome::Conflict {
+                        claimed_by_session: claimed_by.expect("checked above"),
+                        claim_expires_at: prior_expiry,
+                    }
+                } else {
+                    let renewed = claimed_by.as_deref() == Some(session.as_str())
+                        && prior_expiry.is_some_and(|expiry| expiry > now);
+                    let superseded_expired_claim = claimed_by
+                        .as_deref()
+                        .is_some_and(|owner| owner != session && !other_live_claim);
+                    tx.execute(
+                        "UPDATE member_notices
+                         SET claimed_by_session = ?2, claim_expires_at = ?3
+                         WHERE id = ?1 AND to_plugin = ?4 AND drained_at IS NULL
+                           AND dest_peer IS NULL",
+                        params![id as i64, session, expires_at.to_rfc3339(), to_plugin],
+                    )
+                    .context("claiming member notice")?;
+                    MemberNoticeClaimOutcome::Claimed {
+                        claim_expires_at: expires_at,
+                        renewed,
+                        superseded_expired_claim,
+                    }
+                }
+            }
+        };
+        tx.commit().context("committing member notice claim")?;
+        Ok(outcome)
+    }
+
+    /// Release the caller's own claim. Releasing an unclaimed row is an idempotent no-op;
+    /// another session's claim, even an expired one, must be reclaimed rather than released.
+    pub fn release_member_notice(
+        &self,
+        id: u64,
+        to_plugin: &str,
+        session: Uuid,
+    ) -> Result<MemberNoticeClaimOutcome> {
+        let session = session.to_string();
+        let mut conn = self.write_conn()?;
+        Self::ensure_member_schema(&conn)?;
+        let tx = conn.transaction().context("starting member notice release")?;
+        let prior = tx
+            .query_row(
+                "SELECT drained_at, claimed_by_session, claim_expires_at
+                 FROM member_notices
+                 WHERE id = ?1 AND to_plugin = ?2 AND dest_peer IS NULL",
+                params![id as i64, to_plugin],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("reading member notice claim")?;
+        let outcome = match prior {
+            None => MemberNoticeClaimOutcome::NotFound,
+            Some((Some(_), _, _)) => MemberNoticeClaimOutcome::AlreadyDrained,
+            Some((_, claimed_by, raw_expiry)) => {
+                let claim_expires_at = raw_expiry
+                    .as_deref()
+                    .map(DateTime::parse_from_rfc3339)
+                    .transpose()
+                    .context("parsing member notice claim expiry")?
+                    .map(|t| t.with_timezone(&Utc));
+                match claimed_by {
+                    Some(owner) if owner != session => MemberNoticeClaimOutcome::Conflict {
+                        claimed_by_session: owner,
+                        claim_expires_at,
+                    },
+                    Some(_) => {
+                        tx.execute(
+                            "UPDATE member_notices
+                             SET claimed_by_session = NULL, claim_expires_at = NULL
+                             WHERE id = ?1 AND to_plugin = ?2 AND claimed_by_session = ?3
+                               AND drained_at IS NULL AND dest_peer IS NULL",
+                            params![id as i64, to_plugin, session],
+                        )
+                        .context("releasing member notice claim")?;
+                        MemberNoticeClaimOutcome::Released { was_claimed: true }
+                    }
+                    None => MemberNoticeClaimOutcome::Released { was_claimed: false },
+                }
+            }
+        };
+        tx.commit().context("committing member notice release")?;
+        Ok(outcome)
+    }
+
+    /// Consume-once drain of the notices addressed to `to_plugin` ONLY. This compatibility
+    /// entry point deliberately ignores claims; the production tool uses the session-aware arm.
+    pub fn drain_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
+        self.drain_member_inner(to_plugin, None)
+    }
+
+    /// Drain only notices this session may consume. A live claim by another session excludes
+    /// the row from BOTH the SELECT and the delivery mark; it is not drained-then-filtered.
+    pub fn drain_member_for_session(
+        &self,
+        to_plugin: &str,
+        session: Uuid,
+    ) -> Result<Vec<MemberNotice>> {
+        self.drain_member_inner(to_plugin, Some(session))
+    }
+
+    fn drain_member_inner(
+        &self,
+        to_plugin: &str,
+        session: Option<Uuid>,
+    ) -> Result<Vec<MemberNotice>> {
+        let now = Utc::now();
+        let now_rfc3339 = now.to_rfc3339();
         let cutoff = (now - chrono::Duration::seconds(INBOX_TTL_SECS)).to_rfc3339();
+        let session = session.map(|id| id.to_string()).unwrap_or_default();
         let mut conn = self.write_conn()?;
         Self::ensure_member_schema(&conn)?;
         let tx = conn.transaction().context("starting member drain")?;
@@ -1452,16 +1600,15 @@ impl SqliteInboxStore {
                      FROM member_notices
                      WHERE to_plugin = ?1 AND drained_at IS NULL
                        AND dest_peer IS NULL
-                       -- Undrained dispositions are exempt from the TTL *deletion*
-                       -- (see the prune in enqueue_member); that exemption would be
-                       -- hollow if the delivery window still hid the row. They are
-                       -- served until delivered, however old.
                        AND (queued_at >= ?2 OR kind = 'disposition')
+                       AND (?3 = '' OR claimed_by_session IS NULL
+                           OR claimed_by_session = ?3
+                           OR (claim_expires_at IS NOT NULL AND claim_expires_at <= ?4))
                      ORDER BY id ASC",
                 )
                 .context("preparing member drain SELECT")?;
             let rows = stmt
-                .query_map(params![to_plugin, cutoff], |row| {
+                .query_map(params![to_plugin, cutoff, session, now_rfc3339], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -1501,23 +1648,14 @@ impl SqliteInboxStore {
             }
             out
         };
-        // `dest_peer IS NULL` here is load-bearing twice over. This UPDATE is broader
-        // than the SELECT above (no `queued_at` cutoff), so unfiltered ONE local drain
-        // by member `m` marked EVERY parked forward bound for a remote `m` — including
-        // rows older than the TTL that the SELECT never returned and nobody was ever
-        // shown. And `drained_at` is the exact predicate `pending_egress` reads as
-        // "already handed to the fleet mesh", so the mark did not merely mislabel the
-        // rows, it cancelled the forwards: accepted, witnessed, enqueued, never sent,
-        // never reported, success code — the black hole this branch was built to close,
-        // reconstituted one plane up.
         tx.execute(
             "UPDATE member_notices SET drained_at = ?2
-             WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL",
-            params![to_plugin, now.to_rfc3339()],
+             WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL
+               AND (?3 = '' OR claimed_by_session IS NULL OR claimed_by_session = ?3
+                   OR (claim_expires_at IS NOT NULL AND claim_expires_at <= ?4))",
+            params![to_plugin, now_rfc3339, session, now_rfc3339],
         )
         .context("marking drained member notices")?;
-        // The heartbeat: recorded whether or not the drain returned anything,
-        // and in the same transaction as the delivery mark it accompanies.
         Self::touch_inbox(&tx, to_plugin, &now)?;
         tx.commit().context("committing member drain")?;
         Ok(notices)
@@ -1939,6 +2077,28 @@ impl SqliteInboxStore {
         }
         Ok(out)
     }
+}
+
+pub const MEMBER_NOTICE_CLAIM_DEFAULT_LEASE_SECS: i64 = 15 * 60;
+pub const MEMBER_NOTICE_CLAIM_MIN_LEASE_SECS: i64 = 30;
+pub const MEMBER_NOTICE_CLAIM_MAX_LEASE_SECS: i64 = 60 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberNoticeClaimOutcome {
+    Claimed {
+        claim_expires_at: DateTime<Utc>,
+        renewed: bool,
+        superseded_expired_claim: bool,
+    },
+    Released {
+        was_claimed: bool,
+    },
+    Conflict {
+        claimed_by_session: String,
+        claim_expires_at: Option<DateTime<Utc>>,
+    },
+    NotFound,
+    AlreadyDrained,
 }
 
 /// One member→member notice (the local-mesh wake signal).
@@ -3468,6 +3628,307 @@ mod tests {
         assert_eq!(store.member_pending("codex-cli").unwrap(), 1, "other member's mail untouched");
         // consume-once: second drain empty.
         assert!(store.drain_member("kimi-code").unwrap().is_empty());
+    }
+
+    #[test]
+    fn member_notice_claims_conflict_renew_release_and_protect_bystander_drains() {
+        let (_tmp, store) = fresh();
+        let id = store
+            .enqueue_member(
+                "kimi-code",
+                "claude-code",
+                "role:constellation:interactive-dev",
+                "review_request",
+                Some("forum/x.md#thread=t"),
+                "hash-claim",
+                None,
+            )
+            .unwrap();
+        let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+
+        let first = store
+            .claim_member_notice(id, "kimi-code", owner, 60)
+            .unwrap();
+        let first_expiry = match first {
+            MemberNoticeClaimOutcome::Claimed {
+                claim_expires_at,
+                renewed,
+                superseded_expired_claim,
+            } => {
+                assert!(!renewed);
+                assert!(!superseded_expired_claim);
+                claim_expires_at
+            }
+            other => panic!("first claim failed: {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .claim_member_notice(id, "kimi-code", bystander, 60)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Conflict { .. }
+        ));
+
+        match store
+            .claim_member_notice(id, "kimi-code", owner, 120)
+            .unwrap()
+        {
+            MemberNoticeClaimOutcome::Claimed {
+                claim_expires_at,
+                renewed,
+                ..
+            } => {
+                assert!(renewed);
+                assert!(claim_expires_at > first_expiry);
+            }
+            other => panic!("owner renewal failed: {other:?}"),
+        }
+
+        assert!(store
+            .drain_member_for_session("kimi-code", bystander)
+            .unwrap()
+            .is_empty());
+        let (drained_at, claimed_by): (Option<String>, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT drained_at, claimed_by_session FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(drained_at, None, "a skipped row was not observed");
+        assert_eq!(claimed_by, Some(owner.to_string()));
+
+        assert!(matches!(
+            store
+                .release_member_notice(id, "kimi-code", bystander)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Conflict { .. }
+        ));
+        assert_eq!(
+            store
+                .release_member_notice(id, "kimi-code", owner)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Released { was_claimed: true }
+        );
+        assert!(matches!(
+            store
+                .claim_member_notice(id, "kimi-code", bystander, 60)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Claimed { .. }
+        ));
+        assert_eq!(
+            store
+                .drain_member_for_session("kimi-code", bystander)
+                .unwrap()
+                .len(),
+            1,
+            "the claim owner can drain its own notice"
+        );
+    }
+
+    #[test]
+    fn an_expired_member_notice_claim_can_be_reclaimed() {
+        let (_tmp, store) = fresh();
+        let id = store
+            .enqueue_member(
+                "kimi-code",
+                "claude-code",
+                "role:constellation:interactive-dev",
+                "review_request",
+                Some("forum/x.md#thread=t"),
+                "hash-expiry",
+                None,
+            )
+            .unwrap();
+        let owner = Uuid::new_v4();
+        let successor = Uuid::new_v4();
+        assert!(matches!(
+            store
+                .claim_member_notice(id, "kimi-code", owner, 60)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Claimed { .. }
+        ));
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(), id as i64],
+            )
+            .unwrap();
+
+        match store
+            .claim_member_notice(id, "kimi-code", successor, 60)
+            .unwrap()
+        {
+            MemberNoticeClaimOutcome::Claimed {
+                renewed,
+                superseded_expired_claim,
+                ..
+            } => {
+                assert!(!renewed);
+                assert!(superseded_expired_claim);
+            }
+            other => panic!("expired claim was not reclaimable: {other:?}"),
+        }
+        assert!(matches!(
+            store
+                .claim_member_notice(id, "kimi-code", owner, 60)
+                .unwrap(),
+            MemberNoticeClaimOutcome::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn concurrent_claim_drain_and_expiry_reclaim_have_one_winner_and_one_drain() {
+        let (_tmp, store) = fresh();
+        let store = std::sync::Arc::new(store);
+        let id = store
+            .enqueue_member(
+                "kimi-code",
+                "claude-code",
+                "role:constellation:interactive-dev",
+                "review_request",
+                Some("forum/race.md#thread=t"),
+                "hash-race",
+                None,
+            )
+            .unwrap();
+        let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for session in [owner, bystander] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                (session, store.claim_member_notice(id, "kimi-code", session, 60))
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let claimed = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. }))
+        }).count();
+        let conflicts = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. }))
+        }).count();
+        assert_eq!((claimed, conflicts), (1, 1), "one live claim, one conflict: {outcomes:?}");
+        let winner = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. })).then_some(*session)
+        }).unwrap();
+        let loser = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. })).then_some(*session)
+        }).unwrap();
+        assert!(store.drain_member_for_session("kimi-code", loser).unwrap().is_empty());
+        let (drained_at, claimed_by): (Option<String>, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT drained_at, claimed_by_session FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(drained_at, None, "the losing session did not mark a live claim drained");
+        assert_eq!(claimed_by, Some(winner.to_string()));
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE member_notices SET claim_expires_at = ?1 WHERE id = ?2",
+                params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(), id as i64],
+            )
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for session in [owner, bystander] {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                (session, store.claim_member_notice(id, "kimi-code", session, 60))
+            }));
+        }
+        barrier.wait();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let claimed = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. }))
+        }).count();
+        let conflicts = outcomes.iter().filter(|(_, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. }))
+        }).count();
+        assert_eq!((claimed, conflicts), (1, 1), "expiry permits one successor, not two: {outcomes:?}");
+        let winner = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Claimed { .. })).then_some(*session)
+        }).unwrap();
+        let loser = outcomes.iter().find_map(|(session, outcome)| {
+            matches!(outcome, Ok(MemberNoticeClaimOutcome::Conflict { .. })).then_some(*session)
+        }).unwrap();
+        assert_eq!(store.drain_member_for_session("kimi-code", winner).unwrap().len(), 1);
+        assert!(store.drain_member_for_session("kimi-code", loser).unwrap().is_empty());
+        assert!(matches!(
+            store.claim_member_notice(id, "kimi-code", loser, 60).unwrap(),
+            MemberNoticeClaimOutcome::AlreadyDrained
+        ));
+    }
+
+    #[test]
+    fn a_live_claim_survives_restart_and_prelease_drain_contract_is_explicit() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("inbox.db");
+        let owner = Uuid::new_v4();
+        let bystander = Uuid::new_v4();
+        let id = {
+            let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+            let id = store
+                .enqueue_member(
+                    "kimi-code",
+                    "claude-code",
+                    "role:constellation:interactive-dev",
+                    "review_request",
+                    Some("forum/restart.md#thread=t"),
+                    "hash-restart",
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(
+                store.claim_member_notice(id, "kimi-code", owner, 60),
+                Ok(MemberNoticeClaimOutcome::Claimed { .. })
+            ));
+            id
+        };
+
+        let store = SqliteInboxStore::open(&path, [7u8; 32]).unwrap();
+        assert!(store.drain_member_for_session("kimi-code", bystander).unwrap().is_empty());
+        let (drained_at, claimed_by): (Option<String>, Option<String>) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT drained_at, claimed_by_session FROM member_notices WHERE id = ?1",
+                params![id as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(drained_at, None, "restart did not leak a bystander drain");
+        assert_eq!(claimed_by, Some(owner.to_string()));
+
+        // Pre-lease store callers retain the old drain behavior deliberately. Production uses
+        // drain_member_for_session; a lease coordinates work, never strengthens member identity.
+        assert_eq!(store.drain_member("kimi-code").unwrap().len(), 1);
+        assert!(matches!(
+            store.claim_member_notice(id, "kimi-code", owner, 60),
+            Ok(MemberNoticeClaimOutcome::AlreadyDrained)
+        ));
     }
 
     /// The queue cap must not be a cross-member denial channel: a sender
