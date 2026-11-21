@@ -4953,6 +4953,30 @@ async fn scope_grant(
         .grants
         .iter()
         .any(|g| g.member == plugin_id && g.path == path);
+    let coverage_overlaps: Vec<serde_json::Value> = s
+        .standing_scope
+        .grants
+        .iter()
+        .filter(|g| g.member == plugin_id && g.is_live(now) && g.path != path)
+        .filter_map(|g| {
+            let relation = if g.covers(&path) {
+                "existing_covers_new"
+            } else if recursive
+                && crate::server::standing_scope::covers_path(&path, true, &g.path)
+            {
+                "new_covers_existing"
+            } else {
+                return None;
+            };
+            Some(serde_json::json!({
+                "path": g.path,
+                "relation": relation,
+                "recursive": g.recursive,
+                "modes": g.modes.as_letters(),
+                "expires_at": g.expires_at,
+            }))
+        })
+        .collect();
 
     // ORDER: INTENT → COMMIT → SUCCESS, via the one function that owns it
     // (`witness_and_commit_standing_grant`). This used to append `scope_granted` and THEN
@@ -4982,6 +5006,7 @@ async fn scope_grant(
         "standing": true,
         "standing_expires_at": expires_at,
         "replaces_existing": replaces,
+        "coverage_overlaps": coverage_overlaps.clone(),
         "member_known": member_known,
         "durability": "STANDING — written to the vault's standing-scope document; survives \
                        restart; revocable via /api/scope/standing/revoke; identity.json is \
@@ -5056,6 +5081,7 @@ async fn scope_grant(
             "expires_at": expires_at,
             "generation": s.standing_scope.generation,
             "replaced_existing": replaces,
+            "coverage_overlaps": coverage_overlaps,
             // Surfaced so a typo is visible at the moment it is made, not at the moment the
             // grant fails to help someone.
             "member_known": member_known,
@@ -9607,6 +9633,43 @@ mod disposition_tests {
         let (st, _) = grant(&state, serde_json::json!({"plugin_id": "hub-being", "path": "/w/new",
             "reason": "fresh", "expected_existing": null})).await;
         assert_eq!(st, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn grants_report_replacement_and_live_coverage_without_merging() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, root) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root", "recursive": true, "reason": "root"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{root}");
+        assert!(root["coverage_overlaps"].as_array().unwrap().is_empty(), "{root}");
+
+        let (st, child) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root/child", "reason": "child"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{child}");
+        assert_eq!(child["coverage_overlaps"].as_array().unwrap().len(), 1, "{child}");
+        assert_eq!(child["coverage_overlaps"][0]["relation"], "existing_covers_new");
+        assert_eq!(child["coverage_overlaps"][0]["path"], "/w/root");
+        assert_eq!(child["replaced_existing"], serde_json::json!(false));
+
+        let (st, replaced) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root/child", "reason": "new reason"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{replaced}");
+        assert_eq!(replaced["replaced_existing"], serde_json::json!(true));
+        assert_eq!(replaced["coverage_overlaps"].as_array().unwrap().len(), 1);
+
+        let (st, wider) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w", "recursive": true, "reason": "wider"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{wider}");
+        let overlaps = wider["coverage_overlaps"].as_array().unwrap();
+        assert_eq!(overlaps.len(), 2, "{wider}");
+        assert!(overlaps.iter().all(|row| row["relation"] == "new_covers_existing"), "{wider}");
+        assert_eq!(state.lock().await.standing_scope.grants.len(), 3,
+                   "coverage is reported, never silently merged");
     }
 
     #[test]
