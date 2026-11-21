@@ -26658,6 +26658,19 @@ async fn tool_scope_status_with_counter(
         "added_by": f.added_by,
         "reason": f.reason,
     });
+    // #940: delivery and digest say the floor arrived intact, not that it points anywhere.
+    // Report resolution failures without changing the additive grant set or its digest.
+    let unresolvable_floor: Vec<Value> = s.standing_scope.floor.iter()
+        .filter_map(|f| match std::fs::metadata(&f.path) {
+            Ok(_) => None,
+            Err(e) => Some(json!({
+                "path": f.path,
+                "kind": if e.kind() == std::io::ErrorKind::NotFound { "missing" } else { "unreadable" },
+                "error": e.to_string(),
+            })),
+        })
+        .collect();
+    let unresolvable_floor_count = unresolvable_floor.len();
 
     Ok(json!({
         "plugin_id": plugin_id,
@@ -26746,6 +26759,12 @@ async fn tool_scope_status_with_counter(
             "added_by": f.added_by,
             "reason": f.reason,
         })).collect::<Vec<_>>(),
+        // Resolution is EVIDENCE ABOUT THE PATHS, never a filter on them (#940). An empty
+        // `society_floor` and a floor whose entries all fail to resolve must not look alike.
+        "society_floor_unresolvable": {
+            "count": unresolvable_floor_count,
+            "entries": unresolvable_floor,
+        },
         // Canonical over the path set, not presentation order or provenance. Combined with
         // `generation`, this lets two members prove they received the same society baseline
         // without learning anything about one another's personal expansions.
@@ -30288,6 +30307,36 @@ mod standing_scope_surface_tests {
         assert!(by_mode.iter().any(|f| f["path"] == "/w/governance/hestia" && f["modes"] == "r"));
         assert!(by_mode.iter().any(|f| f["path"] == "/w/shared" && f["modes"] == "rwed"));
         assert_eq!(out["society_floor_withheld"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn scope_status_reports_unresolvable_floor_entries_without_filtering_them() {
+        let (dir, state) = test_state().await;
+        let live = dir.path().join("live");
+        std::fs::create_dir(&live).unwrap();
+        let missing = dir.path().join("missing");
+        let live = live.to_string_lossy().into_owned();
+        let missing = missing.to_string_lossy().into_owned();
+        {
+            let mut s = state.lock().await;
+            s.standing_scope.floor_add(FloorEntry {
+                path: live.clone(), recursive: true, ..Default::default()
+            });
+            s.standing_scope.floor_add(FloorEntry {
+                path: missing.clone(), recursive: true, ..Default::default()
+            });
+        }
+        let out = tool_scope_status(&state, &json!({"plugin_id": "kimi-code"})).await.unwrap();
+        assert_eq!(out["society_floor"].as_array().map(Vec::len), Some(2),
+                   "reporting does not remove an entry from the additive floor");
+        let unresolved = &out["society_floor_unresolvable"];
+        assert_eq!(unresolved["count"], 1);
+        let rows = unresolved["entries"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["path"], missing);
+        assert_eq!(rows[0]["kind"], "missing");
+        assert!(!rows[0]["error"].as_str().unwrap().is_empty());
+        assert_eq!(out["society_floor_digest"], state.lock().await.standing_scope.floor_digest());
     }
 
     /// dp, 2026-10-23: "'floor' should not override the actual grants." A member whose own
