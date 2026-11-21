@@ -81,12 +81,22 @@ def typed_contract(mod) -> list[str]:
         bad.append("playwright filename is reach")
     if pt("ExitPlanMode", {"planFilePath": "/plan"}) != ["/plan"]:
         bad.append("ExitPlanMode.planFilePath is reach")
+    if pt("gitnexus__detect_changes", {"repo": "/repo"}) != ["/repo"]:
+        bad.append("the observed bare GitNexus name exposes its local repo path")
     if pt("mcp__gitnexus__detect_changes", {"repo": "/repo"}) != ["/repo"]:
         bad.append("the real MCP GitNexus name exposes its local repo path")
+    if pt("mcp__gitnexus__detect_changes", {"repo": "~/repo"}) != ["~/repo"]:
+        bad.append("a ~-prefixed GitNexus repo is a local path")
+    if any(pt("mcp__gitnexus__detect_changes", {"repo": value})
+           for value in ("notgranted", "../notgranted", "owner/repo")):
+        bad.append("a bare or relative GitNexus repo identity is NOT an absolute/~ local path")
     if pt("mcp__github__get_file", {"repo": "dp-web4/repo"}) != []:
         bad.append("a remote GitHub repo identity is NOT a filesystem path")
-    if pt("mcp__gitnexus__detect_changes_v2", {"repo": "/repo"}) != []:
-        bad.append("a tool-name prefix does NOT qualify for GitNexus repo extraction")
+    for tool in ("mcp__codex_apps__gitnexus__detect_changes",
+                 "mcp__github__gitnexus__detect_changes",
+                 "mcp__gitnexus__detect_changes_v2"):
+        if pt(tool, {"repo": "/repo"}) != []:
+            bad.append(f"an unobserved tool namespace does NOT qualify for repo extraction: {tool}")
     if pt("Write", "not-a-dict") != [] or pt(None, {"pattern": "/x"}) != []:
         bad.append("non-dict input and non-string tool name yield nothing")
     return bad
@@ -220,29 +230,43 @@ def test_behaviour_across_seats() -> None:
         os.makedirs(f"{ws}/notgranted/granted", exist_ok=True)
         rows = [
             ("glob-pattern-oos", "Glob",
-             {"pattern": f"{ws}/notgranted/**", "path": f"{ws}/granted"}, True),
+             {"pattern": f"{ws}/notgranted/**", "path": f"{ws}/granted"}, "mrh.path"),
             ("grep-pattern-oos-is-regex", "Grep",
-             {"pattern": f"{ws}/notgranted/**", "path": f"{ws}/granted"}, False),
+             {"pattern": f"{ws}/notgranted/**", "path": f"{ws}/granted"}, None),
             ("include-list-oos", "read_many_files",
-             {"include": [f"{ws}/notgranted/**"]}, True),
+             {"include": [f"{ws}/notgranted/**"]}, "mrh.path"),
             ("absolute-path-oos", "read_file",
-             {"absolute_path": f"{ws}/notgranted/x"}, True),
+             {"absolute_path": f"{ws}/notgranted/x"}, "mrh.path"),
             ("plan-path-oos", "ExitPlanMode",
-             {"planFilePath": f"{ws}/notgranted/plan.md"}, True),
+             {"planFilePath": f"{ws}/notgranted/plan.md"}, "mrh.path"),
             # Keep the repo NAME granted so this isolates local path scope from mrh.repo.
             ("repo-oos", "mcp__gitnexus__detect_changes",
-             {"repo": f"{ws}/notgranted/granted"}, True),
+             {"repo": f"{ws}/notgranted/granted"}, "mrh.path"),
+            ("repo-bare-name-still-denied", "mcp__gitnexus__detect_changes",
+             {"repo": "notgranted"}, "mrh.repo"),
+            ("repo-bare-name-tmp-still-denied", "mcp__gitnexus__detect_changes",
+             {"repo": "notgranted"}, "mrh.repo"),
+            ("repo-codex-shaped-namespace-still-denied", "mcp__codex_apps__gitnexus__detect_changes",
+             {"repo": "notgranted"}, "mrh.repo"),
+            ("repo-foreign-namespace-remote-still-denied", "mcp__github__gitnexus__detect_changes",
+             {"repo": f"{ws}/granted", "repository_full_name": "owner/notgranted"}, "mrh.repo"),
+            ("repo-independent-remote-still-denied", "mcp__gitnexus__detect_changes",
+             {"repo": f"{ws}/granted", "repository_full_name": "owner/notgranted"}, "mrh.repo"),
             ("remote-repo-still-denied", "mcp__github__get_file",
-             {"repo": "notgranted", "path": "README.md"}, True),
+             {"repo": "notgranted", "path": "README.md"}, "mrh.repo"),
         ]
-        for name, tool, tinput, want_deny in rows:
+        for name, tool, tinput, deny_rule in rows:
             for shim in ("claude", "kimi", "codex"):
-                rc, err = sf.run_hook(shim, ws, sf._event(tool, tinput), srv.endpoint)
-                scope_denied = rc == 2 and "notgranted" in err
-                if want_deny:
-                    check(scope_denied, f"[C] {name} {shim}: DENIED for scope (rc={rc}) {err[:100]!r}")
+                cwd = "/tmp" if name == "repo-bare-name-tmp-still-denied" else None
+                rc, err = sf.run_hook(shim, ws, sf._event(tool, tinput), srv.endpoint, cwd=cwd)
+                scope_denied = (rc == 2 and "notgranted" in err
+                                and (deny_rule is None or f"[{deny_rule}" in err))
+                if deny_rule:
+                    check(scope_denied, f"[C] {name} {shim}: DENIED by {deny_rule} "
+                                      f"(rc={rc}) {err[:100]!r}")
                 else:
-                    check(not scope_denied, f"[C] {name} {shim}: NOT denied for scope (rc={rc}) {err[:100]!r}")
+                    check(not scope_denied, f"[C] {name} {shim}: NOT denied for scope "
+                                          f"(rc={rc}) {err[:100]!r}")
     finally:
         srv.close()
         import shutil
