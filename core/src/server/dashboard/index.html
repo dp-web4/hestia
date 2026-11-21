@@ -5242,7 +5242,19 @@
             reason: reason.trim(),
           });
         } else {
-          polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+          const current = lastData?.policy || {};
+          const strictness = { 'permissive': 0, 'audit-only': 1, 'safety': 2, 'strict': 3 };
+          const currentRank = strictness[current.preset];
+          const targetRank = strictness[t.dataset.preset];
+          if (typeof currentRank !== 'number' || targetRank < currentRank) {
+            const from = `${current.preset || 'unknown'}${current.enforce ? '' : ' (audit)'}`;
+            if (!confirm(`Change SOCIETY policy from ${from} to ${t.dataset.preset}. This loosens every member. Continue?`)) return;
+            const reason = prompt('Reason (required — this loosening is recorded in the witness chain):');
+            if (!reason || !reason.trim()) return;
+            polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset, reason: reason.trim() });
+          } else {
+            polSend('PUT', '/api/policy/preset', { preset: t.dataset.preset });
+          }
         }
       }
       else if (t.dataset.revert) polSend('DELETE', `/api/policy/override/${encodeURIComponent(t.dataset.revert)}`);

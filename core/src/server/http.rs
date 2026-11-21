@@ -7205,18 +7205,41 @@ async fn policy_set_preset(
             Json(serde_json::json!({"error": format!("unknown preset: {preset}")})),
         );
     }
+    let reason = body
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let mut s = state.lock().await;
+    let loosening = s.is_loosening(&preset);
+    let from_preset = s.vault.policy().active_preset.clone();
+    if loosening && reason.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "reason is required to loosen the society preset — it applies to every member"
+            })),
+        );
+    }
+    let durability = "until explicitly changed — the society baseline has no expiry; per-member grants are the expiring exception path";
     match policy_edit_recorded(
         &mut s,
         |v| v.set_active_preset(&preset),
         |st, out| {
             let _ = out;
-            st.append_chain("policy_edit", stamp_gate(serde_json::json!({"change": "preset", "preset": preset}), &gate)).map(|_| ())
+            st.append_chain("policy_edit", stamp_gate(serde_json::json!({
+                "change": "preset", "from_preset": from_preset, "preset": preset,
+                "reason": reason, "durability": durability,
+            }), &gate)).map(|_| ())
         },
     ) {
         Ok(out) => {
             let _ = &out;
-            (StatusCode::OK, Json(serde_json::json!({"ok": true, "preset": preset})))
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true, "preset": preset, "from_preset": from_preset,
+                "reason": reason, "durability": durability,
+            })))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))),
     }
@@ -14920,19 +14943,50 @@ mod operator_vault_tests {
     // governed state looks like AFTER — not merely whether the call returned an error.
 
     #[tokio::test]
+    async fn society_loosening_requires_reason_and_tightening_does_not() {
+        let (_dir, state) = test_state().await;
+        state.lock().await.vault.set_active_preset("strict").unwrap();
+        let refused = policy_set_preset(State(state.clone()), None,
+            Json(serde_json::json!({"preset": "permissive"}))).await.into_response();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.lock().await.vault.policy().active_preset, "strict");
+
+        let accepted = policy_set_preset(State(state.clone()), None,
+            Json(serde_json::json!({"preset": "permissive", "reason": "incident review"})))
+            .await.into_response();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = body_json(accepted).await;
+        assert_eq!(body["from_preset"], "strict");
+        assert_eq!(body["reason"], "incident review");
+        assert!(body["durability"].as_str().unwrap().contains("no expiry"));
+        let entries = state.lock().await.recent_chain(8);
+        let edit = entries.iter().find(|entry| entry.event_type == "policy_edit")
+            .expect("the preset transition is witnessed");
+        assert_eq!(edit.event_data["from_preset"], "strict");
+        assert_eq!(edit.event_data["preset"], "permissive");
+        assert_eq!(edit.event_data["reason"], "incident review");
+
+        state.lock().await.vault.set_active_preset("permissive").unwrap();
+        let tightened = policy_set_preset(State(state.clone()), None,
+            Json(serde_json::json!({"preset": "strict"}))).await.into_response();
+        assert_eq!(tightened.status(), StatusCode::OK);
+        assert_eq!(state.lock().await.vault.policy().active_preset, "strict");
+    }
+
+    #[tokio::test]
     async fn a_law_edit_whose_record_fails_leaves_the_law_as_it_was() {
         let (dir, state) = test_state().await;
         let before = state.lock().await.vault.policy().active_preset.clone();
         let other = crate::policy::PRESET_NAMES.iter().find(|p| **p != before).unwrap().to_string();
         let conn = fail_appends_of(dir.path(), "policy_edit");
-        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other})))
+        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other, "reason": "test policy change"})))
             .await.into_response();
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body_json(r).await["error"].as_str().unwrap().contains("previous policy is restored"));
         assert_eq!(state.lock().await.vault.policy().active_preset, before, "the law changed unrecorded");
         // and the same edit, recordable, stands
         conn.execute_batch("DROP TRIGGER fail_vault_witness").unwrap();
-        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other})))
+        let r = policy_set_preset(State(state.clone()), None, Json(serde_json::json!({"preset": other, "reason": "test policy change"})))
             .await.into_response();
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(state.lock().await.vault.policy().active_preset, other);
