@@ -8835,7 +8835,11 @@ fn annotate_gate_verdicts(
             obj.insert("discovered".into(), serde_json::Value::Bool(is_discovered));
             // The daemon's judgement, rendered by the UIs as-is (#1156). Only a ratified
             // expectation can be forgotten at all.
-            let plugin_id = obj.get("plugin_id").and_then(|v| v.as_str()).map(str::to_string);
+            let plugin_id = obj.get("plugin_id").and_then(|v| v.as_str()).map(str::to_string)
+                .or_else(|| discovered.iter().find(|(_, d)| d == &path).map(|(id, _)| id.clone()));
+            if let Some(id) = plugin_id.as_ref() {
+                obj.insert("plugin_id".into(), serde_json::Value::String(id.clone()));
+            }
             let held = obj.get("status").and_then(|v| v.as_str()) != Some("unratified");
             let blocked = if held {
                 forget_blocked_reason(&path, plugin_id.as_deref(), discovered, declaring)
@@ -9869,6 +9873,7 @@ mod disposition_tests {
         assert_eq!(rows[0]["discovered"], true);
         assert_eq!(rows[0]["deployment"], "match");
         assert_eq!(rows[1]["deployment"], "differs");
+        assert_eq!(rows[1]["plugin_id"], "codex", "an unratified row names its discovered member");
         assert_eq!(rows[2]["discovered"], false, "a stale expectation must be offered for forget");
         assert_eq!(rows[0]["status"], "verified", "the verdict shape is kept");
         assert_eq!(bulk["allowed"], false);
