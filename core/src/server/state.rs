@@ -3232,6 +3232,7 @@ mod tests {
                         },
                         "recursive": id != "scope-shallow",
                         "shallow": id == "scope-shallow",
+                        "modes": if id == "scope-shallow" { "r" } else { "rwed" },
                         "peer_basis": {"independence": "cross_vendor"},
                     }),
                 )
@@ -3290,6 +3291,7 @@ mod tests {
         }));
         assert!(restored.scope_requests.get("scope-shallow").is_some_and(|r| {
             r.status(now) == "granted" && r.ext.shallow && !r.recursive
+                && r.ext.modes == crate::server::grant_modes::Modes::READ
         }));
         assert!(restored.scope_requests.get("scope-refused").is_some_and(|r| {
             r.status(now) == "refused" && r.decided_by.as_deref() == Some("codex")
