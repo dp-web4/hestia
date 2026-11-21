@@ -294,7 +294,7 @@ pub fn pending(
         None => println!("pending scope requests: (this daemon does not report them)"),
         Some(0) => println!("no pending scope requests"),
         Some(n) => {
-            println!("{n} pending scope request(s) — a daemon restart would drop them:");
+            println!("{n} pending scope request(s) — replayed from the chain while their windows stay open:");
             print_scope_requests(&r);
         }
     }

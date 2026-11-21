@@ -476,6 +476,216 @@ impl ScopeRequest {
     }
 }
 
+const SCOPE_REPLAY_EVENT_TYPES: &[&str] = &[
+    "scope_requested",
+    "scope_granted",
+    "scope_refused",
+    "scope_once_reserved",
+    "scope_once_spent",
+    "scope_once_released",
+    "scope_revoked",
+];
+
+fn scope_text(data: &serde_json::Value, key: &str) -> Option<String> {
+    data.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn scope_bool(data: &serde_json::Value, key: &str) -> bool {
+    data.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+fn scope_ids(data: &serde_json::Value, key: &str) -> Vec<String> {
+    match data.get(key) {
+        Some(serde_json::Value::String(id)) => vec![id.clone()],
+        Some(serde_json::Value::Array(ids)) => ids
+            .iter()
+            .filter_map(|id| id.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn scope_origin(data: &serde_json::Value) -> Option<GateDenyOrigin> {
+    if scope_text(data, "origin").as_deref() != Some("gate_deny")
+        && data.get("act_digest").is_none()
+        && data.get("request_key").is_none()
+    {
+        return None;
+    }
+    Some(GateDenyOrigin {
+        rule: scope_text(data, "rule").unwrap_or_default(),
+        tool: scope_text(data, "tool_name")
+            .or_else(|| scope_text(data, "tool"))
+            .unwrap_or_default(),
+        act: scope_text(data, "act").unwrap_or_default(),
+        act_digest: scope_text(data, "act_digest").unwrap_or_default(),
+        request_key: scope_text(data, "request_key").unwrap_or_default(),
+        host_session_id: scope_text(data, "host_session_id"),
+        subtree: scope_bool(data, "subtree"),
+        reissues: data.get("reissues").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        asker_basis: data
+            .get("asker_basis")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default(),
+        escalated_from: scope_text(data, "escalated_from"),
+        member_reason: scope_text(data, "member_reason"),
+    })
+}
+
+fn rehydrate_scope_requests(
+    chain: &SqliteChainStore,
+    now: u64,
+) -> (HashMap<String, ScopeRequest>, bool) {
+    let cutoff = DateTime::<Utc>::from_timestamp(
+        now.saturating_sub(SCOPE_REQUEST_TTL_SECS) as i64,
+        0,
+    )
+    .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    .to_rfc3339();
+    let mut window = match chain.read_recent_by_types(
+        Some(&cutoff),
+        SCOPE_REPLAY_EVENT_TYPES,
+        ESCALATION_REPLAY_SCAN,
+    ) {
+        Ok(window) => window,
+        Err(e) => {
+            tracing::error!("scope request replay read failed: {e}");
+            return (HashMap::new(), false);
+        }
+    };
+    window.reverse();
+    let mut restored: HashMap<String, ScopeRequest> = HashMap::new();
+    for entry in window {
+        let data = &entry.event_data;
+        let at = entry.timestamp.timestamp().max(0) as u64;
+        match entry.event_type.as_str() {
+            "scope_requested" => {
+                let (Some(id), Some(plugin_id), Some(path)) = (
+                    scope_text(data, "request_id"),
+                    scope_text(data, "plugin_id"),
+                    scope_text(data, "path"),
+                ) else {
+                    continue;
+                };
+                restored.insert(
+                    id.clone(),
+                    ScopeRequest {
+                        id,
+                        plugin_id,
+                        role: scope_text(data, "role").unwrap_or_default(),
+                        path,
+                        reason: scope_text(data, "reason")
+                            .or_else(|| scope_text(data, "requested_because"))
+                            .unwrap_or_default(),
+                        requested_at: data
+                            .get("requested_at")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(at),
+                        expires_at: data
+                            .get("expires_at")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(at + SCOPE_REQUEST_TTL_SECS),
+                        granted: None,
+                        decided_by: None,
+                        decided_at: None,
+                        decision_reason: None,
+                        recursive: false,
+                        revoked: None,
+                        ext: ScopeRequestExt {
+                            gate: scope_origin(data),
+                            invited_peers: scope_ids(data, "invited_peers"),
+                            asker_basis: data
+                                .get("asker_basis")
+                                .cloned()
+                                .and_then(|v| serde_json::from_value(v).ok()),
+                            ..Default::default()
+                        },
+                    },
+                );
+            }
+            "scope_granted" | "scope_refused" => {
+                let Some(id) = scope_text(data, "request_id") else {
+                    continue;
+                };
+                let Some(request) = restored.get_mut(&id) else {
+                    continue;
+                };
+                let granted = entry.event_type == "scope_granted";
+                request.granted = Some(granted);
+                request.decided_by = scope_text(data, "granted_by")
+                    .or_else(|| scope_text(data, "decided_by"));
+                request.decided_at = Some(at);
+                request.decision_reason = scope_text(data, "decision_reason");
+                if let Some(expires_at) = data.get("expires_at").and_then(|v| v.as_u64()) {
+                    request.expires_at = expires_at;
+                }
+                request.recursive = scope_bool(data, "recursive");
+                request.ext.modes = data
+                    .get("modes")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                request.ext.peer_basis = data.get("peer_basis").cloned();
+                if granted {
+                    request.ext.once = scope_bool(data, "once");
+                    request.ext.granted_path = scope_text(data, "grant_path")
+                        .filter(|path| path != &request.path);
+                }
+            }
+            "scope_once_reserved" => {
+                let Some(operation) = scope_text(data, "op_key") else {
+                    continue;
+                };
+                let until = data.get("reserved_until").and_then(|v| v.as_u64());
+                for id in scope_ids(data, "request_ids") {
+                    if let Some(request) = restored.get_mut(&id) {
+                        request.ext.reserved_by = Some(operation.clone());
+                        request.ext.reserved_until = until;
+                        request.ext.released_at = None;
+                    }
+                }
+            }
+            "scope_once_spent" | "scope_once_released" => {
+                let spent = entry.event_type == "scope_once_spent";
+                let ids = scope_ids(data, "request_ids");
+                let ids = if ids.is_empty() { scope_ids(data, "request_id") } else { ids };
+                for id in ids {
+                    if let Some(request) = restored.get_mut(&id) {
+                        if spent {
+                            request.ext.spent_at = Some(at);
+                        } else {
+                            request.ext.released_at = Some(at);
+                        }
+                    }
+                }
+            }
+            "scope_revoked" => {
+                let Some(id) = scope_text(data, "request_id") else {
+                    continue;
+                };
+                if let Some(request) = restored.get_mut(&id) {
+                    request.revoked = Some(ScopeRevocation {
+                        at,
+                        by: scope_text(data, "revoked_by").unwrap_or_else(|| "operator".into()),
+                        reason: scope_text(data, "reason")
+                            .or_else(|| scope_text(data, "decision_reason"))
+                            .unwrap_or_default(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (
+        restored
+            .into_iter()
+            .filter(|(_, request)| request.expires_at > now)
+            .collect(),
+        true,
+    )
+}
+
 /// The disposition projector's cursor row name (inbox.db `projection_cursors`).
 /// Lives here rather than in handler.rs because the cursor is initialized at
 /// state OPEN — `ServerState::open` — not at the worker's first pass.
@@ -493,8 +703,8 @@ pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
 /// | direction           | where it lives                      | survives restart |
 /// |---------------------|-------------------------------------|------------------|
 /// | TIGHTENING          | vault (`instance_overlays`)         | **yes**          |
-/// | LIVE loosening      | memory (`instance_grants`,          | **no**           |
-/// |                     |  `scope_requests`)                  |                  |
+/// | LIVE loosening      | memory (`instance_grants`)          | **no**           |
+/// | scope requests      | memory + chain replay               | **until expiry** |
 /// | EXPIRING loosening  | vault (`policy/expiring-grants`)    | **until expiry** |
 /// |                     |  + memory (`instance_grants`)       |                  |
 /// | STANDING loosening  | vault (`scope`/`standing` document) | **yes**          |
@@ -1293,7 +1503,8 @@ impl ServerState {
             // still does not survive a restart: restart is what ends a widening nobody revokes.
             // Escalations DO survive — see the rehydrate call after construction.
             instance_grants: crate::server::published::Watched::new(restored_grants),
-            // Same reasoning, same lifetime: a widening dies with the daemon.
+            // Replaced below with the chain projection: pending asks and once-approvals
+            // survive restart inside their recorded windows, rather than becoming durable grants.
             scope_requests: crate::server::published::Watched::new(HashMap::new()),
             // Refusals are the deny's memory, not asks: they die with the daemon.
             gate_refusals: HashMap::new(),
@@ -1355,6 +1566,17 @@ impl ServerState {
             }
         };
         window.reverse();
+        let (restored_scope_requests, scope_replay_ok) = rehydrate_scope_requests(&st.chain_store, now);
+        let restored_scope_count = restored_scope_requests.len();
+        st.scope_requests = crate::server::published::Watched::new(restored_scope_requests);
+        if scope_replay_ok {
+            eprintln!("[hestia] restored {restored_scope_count} scope request(s) from the chain");
+        } else {
+            eprintln!(
+                "[hestia] CRITICAL: scope request replay read FAILED — requests and unspent \
+                 one-time approvals were NOT restored. This is not an empty history."
+            );
+        }
         let restored = st.gate_escalations.rehydrate(&window, now);
         // Log the zero too. "restored 0" and "did not look" are different facts, and only one of
         // them used to be visible.
@@ -2927,6 +3149,153 @@ mod tests {
             state.trust_for_role("claude-code", mw).entity_id,
             mw_trust.entity_id
         );
+    }
+
+    #[test]
+    fn scope_requests_rehydrate_across_a_real_restart() {
+        let (dir, state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        let expires = now + 3600;
+        let open = |state: &ServerState, id: &str, plugin: &str, path: &str| {
+            state
+                .append_chain(
+                    "scope_requested",
+                    serde_json::json!({
+                        "request_id": id,
+                        "plugin_id": plugin,
+                        "role": "role:constellation:member",
+                        "path": path,
+                        "reason": format!("need {id}"),
+                        "expires_at": expires,
+                        "origin": "gate_deny",
+                        "rule": "mrh.path",
+                        "tool_name": "Edit",
+                        "act": format!("Edit -> {path}"),
+                        "act_digest": format!("digest-{id}"),
+                        "request_key": format!("key-{id}"),
+                        "host_session_id": "host-session",
+                        "invited_peers": ["codex"],
+                        "asker_basis": "session",
+                    }),
+                )
+                .unwrap();
+        };
+        for (id, path) in [
+            ("scope-pending", "/w/pending"),
+            ("scope-once", "/w/once"),
+            ("scope-live", "/w/live"),
+            ("scope-refused", "/w/refused"),
+            ("scope-reserved", "/w/reserved"),
+            ("scope-released", "/w/released"),
+            ("scope-spent", "/w/spent"),
+            ("scope-revoked", "/w/revoked"),
+        ] {
+            open(&state, id, "kimi-code", path);
+        }
+        state
+            .append_chain(
+                "scope_requested",
+                serde_json::json!({
+                    "request_id": "scope-expired",
+                    "plugin_id": "kimi-code",
+                    "path": "/w/expired",
+                    "reason": "already terminal",
+                    "expires_at": now - 1,
+                }),
+            )
+            .unwrap();
+        for id in ["scope-once", "scope-live", "scope-refused", "scope-reserved", "scope-released", "scope-spent", "scope-revoked"] {
+            state
+                .append_chain(
+                    if id == "scope-refused" { "scope_refused" } else { "scope_granted" },
+                    serde_json::json!({
+                        "request_id": id,
+                        "plugin_id": "kimi-code",
+                        "path": format!("/w/{}", id.trim_start_matches("scope-")),
+                        "granted_by": if id == "scope-refused" { "codex" } else { "dp" },
+                        "decision_reason": "reviewed",
+                        "expires_at": expires,
+                        "once": id != "scope-live" && id != "scope-refused" && id != "scope-revoked",
+                        "grant_path": if id == "scope-once" {
+                            "/w".to_string()
+                        } else {
+                            format!("/w/{}", id.trim_start_matches("scope-"))
+                        },
+                        "recursive": true,
+                        "peer_basis": {"independence": "cross_vendor"},
+                    }),
+                )
+                .unwrap();
+        }
+        state
+            .append_chain(
+                "scope_once_reserved",
+                serde_json::json!({
+                    "request_ids": ["scope-reserved", "scope-released"],
+                    "op_key": "operation-1",
+                    "reserved_until": now + 600,
+                }),
+            )
+            .unwrap();
+        state
+            .append_chain(
+                "scope_once_released",
+                serde_json::json!({"request_ids": ["scope-released"], "op_key": "operation-1"}),
+            )
+            .unwrap();
+        state
+            .append_chain(
+                "scope_once_spent",
+                serde_json::json!({"request_id": "scope-spent", "plugin_id": "kimi-code"}),
+            )
+            .unwrap();
+        state
+            .append_chain(
+                "scope_revoked",
+                serde_json::json!({
+                    "request_id": "scope-revoked",
+                    "plugin_id": "kimi-code",
+                    "revoked_by": "operator",
+                    "reason": "no longer needed",
+                }),
+            )
+            .unwrap();
+        drop(state);
+
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let restored = ServerState::open(vault, dir.path(), "p").unwrap();
+        assert!(restored.scope_requests.get("scope-pending").is_some_and(|r| {
+            r.status(now) == "pending"
+                && r.reason == "need scope-pending"
+                && r.ext.gate.as_ref().is_some_and(|g| g.act_digest == "digest-scope-pending")
+        }));
+        assert!(restored.scope_requests.get("scope-once").is_some_and(|r| {
+            r.once_spendable(now)
+                && r.ext.gate.as_ref().is_some_and(|g| g.act_digest == "digest-scope-once")
+                && r.ext.invited_peers == ["codex"]
+                && r.ext.granted_path.as_deref() == Some("/w")
+        }));
+        assert!(restored.scope_requests.get("scope-live").is_some_and(|r| {
+            r.status(now) == "granted" && r.grants("/w/live/child.txt", now)
+        }));
+        assert!(restored.scope_requests.get("scope-refused").is_some_and(|r| {
+            r.status(now) == "refused" && r.decided_by.as_deref() == Some("codex")
+        }));
+        assert!(restored.scope_requests.get("scope-reserved").is_some_and(|r| {
+            r.status(now) == "reserved"
+                && !r.once_spendable(now)
+                && r.ext.reserved_by.as_deref() == Some("operation-1")
+        }));
+        assert!(restored.scope_requests.get("scope-released").is_some_and(|r| {
+            r.once_spendable(now) && r.ext.released_at.is_some()
+        }));
+        assert!(restored.scope_requests.get("scope-spent").is_some_and(|r| {
+            r.status(now) == "spent" && !r.once_spendable(now)
+        }));
+        assert!(restored.scope_requests.get("scope-revoked").is_some_and(|r| {
+            r.status(now) == "revoked" && !r.grants("/w/revoked/child.txt", now)
+        }));
+        assert!(!restored.scope_requests.contains_key("scope-expired"));
     }
 
     #[test]

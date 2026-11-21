@@ -3246,7 +3246,7 @@ async fn policy_set_instance_grant(
         if expires_at.is_some() {
             "vault until its expiry — a daemon restart does not revoke it; it lapses at expires_at"
         } else {
-            "memory-only — a daemon restart revokes it (set an expiry to keep it across restarts)"
+            "memory-only — replayed from the chain until its expiry (a standing grant is the durable form)"
         }
     } else {
         // A tightening is expressed as the preset's own rules laid over this member, so it
@@ -3749,7 +3749,7 @@ pub(crate) async fn scope_decide_as(
                 "ONE-TIME — this act, once, inside the claim window; never served as policy; \
                  spent by the gate's hestia_scope_claim"
             } else {
-                "memory-only — a daemon restart revokes it; identity.json is untouched"
+                "memory-only — replayed from the chain until its expiry; identity.json is untouched"
             },
         }),
     );

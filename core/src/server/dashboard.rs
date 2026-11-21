@@ -1871,7 +1871,7 @@ impl ServerState {
                             "recursive": r.recursive,
                             // r / w / e / d, canonical letters (#1345).
                             "modes": r.ext.modes,
-                            "durability": "memory-only — the next daemon restart revokes this",
+                            "durability": "memory-only — replayed from the chain until its expiry",
                         })
                     })
                     .collect();
