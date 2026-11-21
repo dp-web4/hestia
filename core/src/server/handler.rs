@@ -2917,6 +2917,9 @@ const RESERVED_EVENT_TYPES: &[&str] = &[
     "reversal",
     "appeal",
     "adjudication",
+    // Sovereign-only amnesty and daemon-authored projection receipts.
+    "amnesty",
+    "trust_recomputed",
     // #1344: daemon-written only; a member must not forge a send or its failure record.
     "channel_send",
     "channel_send_unrecorded",
@@ -11307,6 +11310,65 @@ mod accountability_tests {
         assert_eq!(vs.event_data["role_lct"], "role:constellation:member");
     }
 
+    #[tokio::test]
+    async fn refutation_recomputes_and_empty_revision_law_keeps_append_only() {
+        let (_dir, state) = test_state().await;
+        let role = "role:constellation:member";
+        let subject = tool_connect(&state, &json!({
+            "plugin_id":"kimi-code","host_agent":"t","role":role
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let reporter = tool_connect(&state, &json!({
+            "plugin_id":"codex","host_agent":"t","role":role
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name":"Read","target":"a.md","session_id":subject
+        })).await.unwrap();
+        let outcome = tool_record_outcome(&state, &json!({
+            "action_id":begin["actionId"],"success":true,"magnitude":0.8
+        })).await.unwrap();
+        let revised = tool_request_witness(&state, &json!({
+            "event_type":"refutation",
+            "event_data":{"subject_plugin_id":"kimi-code","subject_role":role,
+                          "outcome_hash":outcome["witnessEntryHash"]},
+            "session_id":reporter
+        })).await.unwrap();
+        assert!(revised["_hestia_error"].is_null(), "{revised}");
+        {
+            let s = state.lock().await;
+            assert_eq!(s.trust_for_role("kimi-code", role).action_count, 0);
+            let receipt = s.recent_chain(10).into_iter()
+                .find(|entry| entry.event_type == "trust_recomputed")
+                .expect("a revision must leave its recompute receipt");
+            assert_eq!(receipt.event_data["trigger_entry"], revised["witnessEntryHash"]);
+            assert_eq!(receipt.event_data["actions_before"], 1);
+            assert_eq!(receipt.event_data["actions_after"], 0);
+        }
+
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name":"Read","target":"b.md","session_id":subject
+        })).await.unwrap();
+        let outcome = tool_record_outcome(&state, &json!({
+            "action_id":begin["actionId"],"success":true
+        })).await.unwrap();
+        {
+            let mut s = state.lock().await;
+            let mut law = s.vault.policy().clone();
+            law.revision_events.clear();
+            s.vault.set_policy(law).unwrap();
+        }
+        tool_request_witness(&state, &json!({
+            "event_type":"refutation",
+            "event_data":{"subject_plugin_id":"kimi-code","subject_role":role,
+                          "outcome_hash":outcome["witnessEntryHash"]},
+            "session_id":reporter
+        })).await.unwrap();
+        let s = state.lock().await;
+        assert_eq!(s.trust_for_role("kimi-code", role).action_count, 1);
+        assert_eq!(s.recent_chain(20).into_iter()
+            .filter(|entry| entry.event_type == "trust_recomputed").count(), 1);
+    }
+
     /// Regression pin for GPT 3rd-pass HST-003: `request_witness` is a gated,
     /// attributed act — reserved daemon event types can't be forged, an
     /// overlaid role can be denied the append entirely, and an allowed append
@@ -11315,18 +11377,20 @@ mod accountability_tests {
     async fn request_witness_gated_attributed_and_reserved() {
         let (_dir, state) = test_state().await;
         // Forging a daemon-authored event type is refused for anyone.
-        let forged = tool_request_witness(
-            &state,
-            &json!({
-                "event_type":"policy_decision","event_data":{"decision":"allow"}
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            forged["_hestia_error"]["code"],
-            "hestia.witness_reserved_event"
-        );
+        for event_type in ["policy_decision", "amnesty", "trust_recomputed"] {
+            let forged = tool_request_witness(
+                &state,
+                &json!({
+                    "event_type":event_type,"event_data":{"decision":"allow"}
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                forged["_hestia_error"]["code"],
+                "hestia.witness_reserved_event"
+            );
+        }
 
         // An overlaid unattended role is denied the append by law.
         {

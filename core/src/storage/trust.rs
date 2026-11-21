@@ -7,11 +7,12 @@
 //! is read transparently and re-sealed on the next write.
 //!
 //! THE CHAIN IS THE SOURCE OF TRUTH; THESE FILES ARE A CACHE (#1271, dp/coordinator 2026-10-07).
-//! Every trust change follows deterministically from one chain row's content: an `outcome`, a
-//! decision row's charge (`ChargeSpec`), an `adjudication`, a `reversal`, or a
-//! `decision_charge_settled`. The daemon applies it in the same critical section as the append,
-//! in chain order, keyed by the member LCT the row recorded and stamped with the row's timestamp
-//! and position. So:
+//! Every trust change follows deterministically from the chain. Ordinary changes come from one
+//! row's content: an `outcome`, a decision row's charge (`ChargeSpec`), an `adjudication`, a
+//! `reversal`, or a `decision_charge_settled`. A revision row instead rebuilds its affected
+//! grains from the eligible chain prefix through that row. The daemon applies changes in the
+//! same critical section as the append, in chain order, keyed by the member LCT the row recorded
+//! and stamped with the row's timestamp and position. So:
 //! - the files are written WITHOUT fsync (atomic rename only, for torn-write safety): a crash loses
 //!   only cache, never a fact;
 //! - each file records the chain position it is projected through (`through`), so applying a row
@@ -415,6 +416,37 @@ impl TrustStore {
             t.update_from_outcome(success, magnitude);
             Ok(())
         })
+    }
+
+    /// Rebuild an entity's outcome history at a witnessed revision row.
+    ///
+    /// The caller decides which outcomes remain chargeable. Storage replaces rather than patches
+    /// the cached value, preserves its original creation time, and marks it projected through the
+    /// revision so ordinary replay cannot apply the withdrawn rows again. Rebuilding the same row
+    /// twice is idempotent, just like applying any other chain projection.
+    pub fn rebuild_from_outcomes(
+        &self,
+        plugin_id: &str,
+        outcomes: &[(bool, f64)],
+        at: RowAt,
+    ) -> Result<Option<(EntityTrust, EntityTrust)>> {
+        let id = Self::entity_id(plugin_id);
+        if self
+            .load(&id)?
+            .is_some_and(|c| c.through.is_some_and(|through| through >= at.pos))
+        {
+            return Ok(None);
+        }
+        self.apply(plugin_id, Some(at), |trust| {
+            let created_at = trust.created_at;
+            *trust = EntityTrust::new(&id);
+            trust.created_at = created_at;
+            for (success, magnitude) in outcomes {
+                trust.update_from_outcome(*success, *magnitude);
+            }
+            Ok(())
+        })
+        .map(Some)
     }
 
     /// Apply an adjudicated V3 observation (no chain position).
@@ -1004,6 +1036,43 @@ mod tests {
         assert_eq!(after_repair.recover(11).unwrap(), (10, 10));
         after_repair.update_at("old", false, 0.5, at(10)).unwrap();
         assert_eq!(after_repair.get("old").unwrap().action_count, 8, "the baseline survived");
+    }
+
+    #[test]
+    fn a_rebuild_replaces_history_and_survives_sealed_reopen() {
+        let dir = TempDir::new().unwrap();
+        let store = TrustStore::open(dir.path(), KEY).unwrap();
+        store.update_at("kimi-code", true, 0.8, at(2)).unwrap();
+        store.update_at("kimi-code", false, 0.5, at(3)).unwrap();
+
+        let (before, after) = store
+            .rebuild_from_outcomes("kimi-code", &[(true, 0.8), (true, 0.7)], at(9))
+            .unwrap()
+            .unwrap();
+        assert_eq!((before.action_count, before.success_count), (2, 1));
+        assert_eq!((after.action_count, after.success_count), (2, 2));
+        assert_eq!(after.created_at, at(2).ts, "the entity was not born at its revision");
+        assert_eq!(after.last_action, Some(at(9).ts), "the revision is the projection clock");
+        assert!(store
+            .rebuild_from_outcomes("kimi-code", &[(false, 0.5)], at(9))
+            .unwrap()
+            .is_none());
+        assert!(store.update_at("kimi-code", true, 0.8, at(8)).unwrap().is_none());
+        store.update_at("kimi-code", false, 0.5, at(10)).unwrap();
+        store.persister().flush_blocking();
+
+        let path = store.entity_file("plugin:kimi-code");
+        let raw = std::fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&raw).is_err());
+        drop(store);
+        let reopened = TrustStore::open(dir.path(), KEY).unwrap();
+        let trust = reopened.get("kimi-code").unwrap();
+        assert_eq!((trust.action_count, trust.success_count), (3, 2));
+        assert_eq!(trust.created_at, at(2).ts);
+        assert!(reopened
+            .rebuild_from_outcomes("kimi-code", &[], at(9))
+            .unwrap()
+            .is_none());
     }
 
     /// A chain-projected update is idempotent by position, and takes its clock from the row.
