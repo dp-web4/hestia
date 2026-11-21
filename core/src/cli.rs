@@ -181,10 +181,10 @@ enum Command {
 
     /// Governance-surface escalations — the remedy every gate deny already names.
     ///
-    /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
-    /// subcommand was never written (#116). This is a client over tools the daemon
-    /// already ships — it adds no authority and can only reach verdicts the daemon
-    /// would already permit.
+    /// Stage 2 (#114) names `hestia gate approve <id>` for a governance-write
+    /// escalation; scope denials instead use `hestia_request_scope`. The subcommand
+    /// was never written (#116). This is a client over tools the daemon already ships —
+    /// it adds no authority and can only reach verdicts the daemon would already permit.
     Gate {
         #[command(subcommand)]
         cmd: GateCmd,
@@ -6534,4 +6534,25 @@ mod member_key_source_tests {
 
     // `expand_tilde` moved to `hestia::hub` with member_signing_keypair; its test
     // moved with it (hub.rs `expand_tilde_expands_leading_home`).
+}
+
+
+#[cfg(test)]
+mod gate_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn gate_help_distinguishes_governance_escalations_from_scope_requests() {
+        let mut gate = Cli::command()
+            .find_subcommand("gate")
+            .cloned()
+            .expect("gate subcommand");
+        let mut bytes = Vec::new();
+        gate.write_long_help(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("governance-write"), "{text}");
+        assert!(text.contains("hestia_request_scope"), "{text}");
+        assert!(!text.contains("on every refusal"), "{text}");
+    }
 }
