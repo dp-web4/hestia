@@ -1,0 +1,327 @@
+diff --git a/plugins/_shared/hestia_governance_closure.py b/plugins/_shared/hestia_governance_closure.py
+--- a/plugins/_shared/hestia_governance_closure.py
++++ b/plugins/_shared/hestia_governance_closure.py
+@@ -863,11 +863,16 @@
+     token beginning with `#` cannot be distinguished from a QUOTED one (`echo "#x"`), and
+     dropping on that guess would make everything after a quoted `#` invisible — trading a
+     false refusal for a silent write, which is the wrong direction for this module. Left in,
+-    a comment's words become an ordinary simple command whose head is `#`: harmless, and the
+-    following line is still seen. The residual cost is a comment containing a redirect
+-    (`# write with > here`) raising a phantom write target and refusing a benign command.
++    a comment's words become an ordinary simple command whose head is `#`: harmless when no
++    comment quote swallows the following line. The residual cost is a comment containing a
++    redirect (`# write with > here`) raising a phantom write target and refusing a benign command.
+     That is a false POSITIVE, it fails closed, and it is the direction this module prefers.
+     `a#b` is unaffected: shlex keeps a mid-word `#` attached, so it never opens anything.
++
++    A newline embedded in a token AFTER a #-led token is the different #485 case: a quote in
++    comment text made shlex consume a command boundary that Bash honors. Refuse to resolve two
++    different programs. A quoted hash followed by a multiline string can pay a false refusal for
++    this conservative test; the differential names that cost rather than hiding it.
+     """
+     lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT_CHARS)
+     lex.whitespace_split = True
+@@ -880,6 +885,14 @@
+         # Only runs shlex ITSELF resolved to unquoted punctuation are re-split, so shlex
+         # remains the sole quote model: a quoted word is never re-examined here.
+         out.extend(_split_operator_run(tok) if _is_punct(tok) else [tok])
++    comment = False
++    for tok in out:
++        if tok == "\n":
++            comment = False
++        elif tok.startswith("#"):
++            comment = True
++        elif comment and "\n" in tok:
++            raise _OutOfGrammar()
+     return out
+ 
+ 
+diff --git a/hooks-gt/_shared/hestia_governance_closure.py b/hooks-gt/_shared/hestia_governance_closure.py
+--- a/hooks-gt/_shared/hestia_governance_closure.py
++++ b/hooks-gt/_shared/hestia_governance_closure.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 32879019b85232bd2ce117065346ecd333f9184453f200ad6f866be316eb32e4  (published ground truth; manifest: hooks-gt)
+ """hestia_governance_closure — ONE governance-access classifier for every harness shim.
+ 
+ PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
+@@ -864,11 +864,16 @@
+     token beginning with `#` cannot be distinguished from a QUOTED one (`echo "#x"`), and
+     dropping on that guess would make everything after a quoted `#` invisible — trading a
+     false refusal for a silent write, which is the wrong direction for this module. Left in,
+-    a comment's words become an ordinary simple command whose head is `#`: harmless, and the
+-    following line is still seen. The residual cost is a comment containing a redirect
+-    (`# write with > here`) raising a phantom write target and refusing a benign command.
++    a comment's words become an ordinary simple command whose head is `#`: harmless when no
++    comment quote swallows the following line. The residual cost is a comment containing a
++    redirect (`# write with > here`) raising a phantom write target and refusing a benign command.
+     That is a false POSITIVE, it fails closed, and it is the direction this module prefers.
+     `a#b` is unaffected: shlex keeps a mid-word `#` attached, so it never opens anything.
++
++    A newline embedded in a token AFTER a #-led token is the different #485 case: a quote in
++    comment text made shlex consume a command boundary that Bash honors. Refuse to resolve two
++    different programs. A quoted hash followed by a multiline string can pay a false refusal for
++    this conservative test; the differential names that cost rather than hiding it.
+     """
+     lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT_CHARS)
+     lex.whitespace_split = True
+@@ -881,6 +886,14 @@
+         # Only runs shlex ITSELF resolved to unquoted punctuation are re-split, so shlex
+         # remains the sole quote model: a quoted word is never re-examined here.
+         out.extend(_split_operator_run(tok) if _is_punct(tok) else [tok])
++    comment = False
++    for tok in out:
++        if tok == "\n":
++            comment = False
++        elif tok.startswith("#"):
++            comment = True
++        elif comment and "\n" in tok:
++            raise _OutOfGrammar()
+     return out
+ 
+ 
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -17,7 +17,7 @@
+     },
+     {
+       "path": "hestia_governance_closure.py",
+-      "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc",
++      "sha256": "32879019b85232bd2ce117065346ecd333f9184453f200ad6f866be316eb32e4",
+       "source": "plugins/_shared/hestia_governance_closure.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
++  "gt_version": "6f12f9d3466f76b57ac89c405653de6d9b5edbb885618d59ce100f1af76abc20"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "6f12f9d3466f76b57ac89c405653de6d9b5edbb885618d59ce100f1af76abc20",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "32879019b85232bd2ce117065346ecd333f9184453f200ad6f866be316eb32e4"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
++  "gt_version": "cb0cee96c883440a186b6d6dfa6e2f021a057e4aee156b25ec22c8ab900837a5"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "6f12f9d3466f76b57ac89c405653de6d9b5edbb885618d59ce100f1af76abc20",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "32879019b85232bd2ce117065346ecd333f9184453f200ad6f866be316eb32e4"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
++  "gt_version": "934828c4f8a2454a776bc2f98fa7dff4e9d4c8516d05f779f6f1f1f00346d4fa"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "6f12f9d3466f76b57ac89c405653de6d9b5edbb885618d59ce100f1af76abc20",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "32879019b85232bd2ce117065346ecd333f9184453f200ad6f866be316eb32e4"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
++  "gt_version": "133435c6f44beceaa3924c96be84a395b728c0c4fe8f73ce2eda6a554a769cd8"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
++    "gt_version": "6f12f9d3466f76b57ac89c405653de6d9b5edbb885618d59ce100f1af76abc20",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
++        "sha256": "32879019b85232bd2ce117065346ecd333f9184453f200ad6f866be316eb32e4"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
++  "gt_version": "c001069524e802bf4fb918a3e4818a5fc7392e3ec571b988f9ed93209015fe88"
+ }
+diff --git a/tools/closure_comment_quote_test.py b/tools/closure_comment_quote_test.py
+new file mode 100755
+--- /dev/null
++++ b/tools/closure_comment_quote_test.py
+@@ -0,0 +1,108 @@
++#!/usr/bin/env python3
++"""Comment/quote desynchronization must fail closed before Bash hides a write (#485)."""
++import importlib.util
++import os
++import pathlib
++import subprocess
++import sys
++import tempfile
++
++ROOT = pathlib.Path(__file__).resolve().parent.parent
++MODULE = pathlib.Path(os.environ.get("CLOSURE_MODULE") or
++                      ROOT / "plugins" / "_shared" / "hestia_governance_closure.py")
++spec = importlib.util.spec_from_file_location("closure_comment_quote", MODULE)
++g = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = g
++spec.loader.exec_module(g)
++
++HOOK = "pre_" + "tool_use.py"
++TARGET = f"plugins/kimi/hooks/{HOOK}"
++WRITE = f"printf x > {TARGET}"
++CASES = [
++    ("single_quote_comment", f"echo x # it's\n{WRITE}\necho done # '", 0),
++    ("double_quote_comment", f"echo x # say \"hi\n{WRITE}\n: \"", 2),
++    ("arithmetic_then_comment", f"echo $(( 1 )) # it's\n{WRITE}\n: '", 2),
++]
++
++
++def check(name, condition, detail=""):
++    if not condition:
++        raise AssertionError(f"{name}: {detail}")
++
++
++def classify(command, cwd):
++    return g.classify("Bash", {"command": command}, cwd=cwd, closure=g.LITERAL_FLOOR)
++
++
++def test_comment_quote_desync_is_fail_closed_and_matches_bash():
++    for name, command, expected_rc in CASES:
++        with tempfile.TemporaryDirectory(prefix=f"closure-comment-{name}-") as raw:
++            root = pathlib.Path(raw)
++            hook = root / TARGET
++            hook.parent.mkdir(parents=True)
++            hook.write_text("orig\n", encoding="utf-8")
++            verdict = classify(command, root)
++            result = subprocess.run(["bash", "-c", command], cwd=root,
++                                    capture_output=True, text=True, timeout=30)
++            check(f"{name}: bash wrote", hook.read_text(encoding="utf-8") == "x",
++                  f"rc={result.returncode} stderr={result.stderr!r}")
++            check(f"{name}: bash rc", result.returncode == expected_rc, result.returncode)
++            check(f"{name}: classifier fails closed",
++                  verdict.classification == "write" and verdict.rule == g.RULE_OUT_OF_GRAMMAR,
++                  str(verdict))
++
++
++def test_midword_hash_is_not_a_comment():
++    with tempfile.TemporaryDirectory(prefix="closure-comment-midword-") as raw:
++        root = pathlib.Path(raw)
++        hook = root / TARGET
++        hook.parent.mkdir(parents=True)
++        hook.write_text("orig\n", encoding="utf-8")
++        command = f"echo a#'b'\n{WRITE}"
++        verdict = classify(command, root)
++        result = subprocess.run(["bash", "-c", command], cwd=root,
++                                capture_output=True, text=True, timeout=30)
++        check("midword: bash wrote", hook.read_text(encoding="utf-8") == "x", result.stderr)
++        check("midword: classifier write", verdict.classification == "write", str(verdict))
++
++
++def test_ordinary_comments_and_quoted_hashes_stay_readable():
++    for command in (
++        f"echo # plain comment\ncat {TARGET}",
++        f"echo \"#x\"\ncat {TARGET}",
++        f"echo a#b\ncat {TARGET}",
++    ):
++        with tempfile.TemporaryDirectory(prefix="closure-comment-control-") as raw:
++            verdict = classify(command, raw)
++            check(f"control stays read: {command!r}", verdict.classification != "write", str(verdict))
++
++
++def test_fallback_cost_for_a_quoted_hash_is_explicit():
++    command = f"echo \"#x\" \"a\nb\"\ncat {TARGET}"
++    with tempfile.TemporaryDirectory(prefix="closure-comment-cost-") as raw:
++        verdict = classify(command, raw)
++        check("quoted-hash fallback cost is visible",
++              verdict.classification == "write" and verdict.rule == g.RULE_OUT_OF_GRAMMAR,
++              str(verdict))
++
++
++ALL = [
++    test_comment_quote_desync_is_fail_closed_and_matches_bash,
++    test_midword_hash_is_not_a_comment,
++    test_ordinary_comments_and_quoted_hashes_stay_readable,
++    test_fallback_cost_for_a_quoted_hash_is_explicit,
++]
++
++if __name__ == "__main__":
++    failed = []
++    for test in ALL:
++        try:
++            test()
++            print("PASS", test.__name__)
++        except AssertionError as error:
++            failed.append(test.__name__)
++            print("FAIL", test.__name__, "::", error)
++    if failed:
++        print(f"FAILURES: {failed}")
++        sys.exit(1)
++    print(f"OK — {len(ALL)} comment/quote tests")
