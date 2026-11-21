@@ -12,7 +12,7 @@
     },
     {
       "path": "hooks/hooks.json",
-      "sha256": "6b1c103d29ab0a19227b2e409a3a8a2b0560e576d82cac9c35f980a7da46b5ca",
+      "sha256": "acdf9560c75b354a9b7773cb1dbda2eea639fa3f65882b7cd32d3a868f6ea0b4",
       "source": "plugins/claude-code/hooks/hooks.json"
     },
     {
@@ -33,7 +33,7 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
+    "gt_version": "d248208dca7dfde2fb20487f38944600406ec829f75f4f1ce8f154a425e4fd61",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -57,7 +57,7 @@
       },
       {
         "path": "hestia_witness_core.py",
-        "sha256": "750c7197cd4fc8d7188b53ef7351712c73bc8c034bb039b321e55c69534eb777"
+        "sha256": "2fd701a53ffca696d39e305a44b810515ae4195e42300216c028afac86a6bba1"
       }
     ]
   },
@@ -78,5 +78,5 @@
       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
     }
   ],
-  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
+  "gt_version": "236304cb256f787d54156d491a7f0cd6adb3e658de74c95566120c11cf62d98a"
 }
