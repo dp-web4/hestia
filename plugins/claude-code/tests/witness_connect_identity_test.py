@@ -77,15 +77,19 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def run_hook(home: Path, endpoint: str, host_session: str) -> subprocess.CompletedProcess:
+def run_hook(home: Path, endpoint: str, host_session: str,
+             event_name: str = "PostToolUse") -> subprocess.CompletedProcess:
     event = {
-        "hook_event_name": "PostToolUse",
+        "hook_event_name": event_name,
         "session_id": host_session,
         "tool_use_id": "tu-witness-1",
         "tool_name": "Bash",
         "tool_input": {"command": "echo hi"},
-        "tool_response": {"stdout": "hi"},
     }
+    if event_name == "PostToolUseFailure":
+        event["error"] = {"code": "internal", "message": "exit status 1"}
+    else:
+        event["tool_response"] = {"stdout": "hi"}
     env = {k: v for k, v in os.environ.items() if not k.startswith("HESTIA_")}
     # The witness logic is the shared core now, loaded only from an explicitly named engine
     # dir (never a checkout fallback) -- name the reviewed tree, as CI's hook job does.
@@ -103,6 +107,14 @@ def run_hook(home: Path, endpoint: str, host_session: str) -> subprocess.Complet
 
 
 def main() -> int:
+    for relative in (".claude-plugin/plugin.json", "hooks/hooks.json"):
+        document = json.loads((HERE.parent / relative).read_text())
+        registrations = document["hooks"].get("PostToolUseFailure", [])
+        commands = [hook.get("command", "") for group in registrations
+                    for hook in group.get("hooks", [])]
+        check(f"{relative} registers the shared witness on PostToolUseFailure",
+              any(command.endswith("/witness.py") for command in commands), json.dumps(commands))
+
     server = HTTPServer(("127.0.0.1", 0), Stub)
     endpoint = f"http://127.0.0.1:{server.server_port}/mcp"
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -147,6 +159,19 @@ def main() -> int:
             if record:
                 check("the outcome names a session", "session_id" in record[0]["args"],
                       json.dumps(record[0]["args"]))
+
+            CALLS.clear()
+            proc = run_hook(home, endpoint, host_session, "PostToolUseFailure")
+            check("the failure hook ran", proc.returncode == 0,
+                  f"rc={proc.returncode} stderr={proc.stderr[-200:]}")
+            failures = [c for c in CALLS if c["tool"] == "hestia_record_outcome"]
+            check("a failed tool call reaches the same outcome adapter", len(failures) == 1,
+                  json.dumps(CALLS))
+            if failures:
+                args = failures[0]["args"]
+                check("the terminal outcome is a failure, not success-by-default",
+                      args.get("success") is False and args.get("error") == "exit status 1",
+                      json.dumps(args))
     finally:
         server.shutdown()
 
