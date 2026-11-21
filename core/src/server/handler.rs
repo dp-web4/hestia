@@ -2214,6 +2214,8 @@ fn resolve_attributed_caller(
 }
 
 /// Keep a valid caller key, or derive the hook's act-bound key for an open-door refusal (#540).
+/// The basis says what the key can and cannot correlate; a derived key is not assumed to be
+/// hook-compatible, an act identity, or evidence that an act was even supplied.
 fn refusal_request_key(
     s: &super::state::ServerState,
     plugin_id: &str,
@@ -2221,19 +2223,30 @@ fn refusal_request_key(
     attempted_act: Option<&str>,
     session_id_arg: Option<&str>,
     supplied: Option<&str>,
-) -> String {
+    identity_mismatch: bool,
+) -> (String, &'static str) {
     if let Some(key) = supplied.filter(|key| super::gate_escalation::valid_request_key(key)) {
-        return key.to_string();
+        return (key.to_string(), "caller_supplied");
     }
     let host_session_id = session_id_arg
         .and_then(|raw| Uuid::parse_str(raw).ok())
         .and_then(|uuid| s.sessions.get(&uuid))
         .and_then(|session| session.host_session_id.as_deref());
-    super::gate_escalation::request_key_for_act(
-        plugin_id,
-        marker,
-        attempted_act.unwrap_or(""),
-        host_session_id,
+    let basis = if identity_mismatch {
+        "derived_identity_mismatch"
+    } else if attempted_act.unwrap_or("").is_empty() {
+        "derived_without_act"
+    } else {
+        "derived"
+    };
+    (
+        super::gate_escalation::request_key_for_act(
+            plugin_id,
+            marker,
+            attempted_act.unwrap_or(""),
+            host_session_id,
+        ),
+        basis,
     )
 }
 
@@ -2269,8 +2282,8 @@ fn refuse_asker_mismatch(
 ) -> anyhow::Error {
     let session = session_id_arg.unwrap_or("?");
     let session_prefix: String = session.chars().take(8).collect();
-    let attempt_key = refusal_request_key(
-        s, plugin_id, marker, attempted_act, session_id_arg, request_key,
+    let (attempt_key, basis) = refusal_request_key(
+        s, plugin_id, marker, attempted_act, session_id_arg, request_key, true,
     );
     let _ = s.append_chain(
         "gate_escalation_refused",
@@ -2278,7 +2291,7 @@ fn refuse_asker_mismatch(
             "plugin_id": plugin_id,
             "tool_name": tool_name,
             "marker": marker,
-            "request_key": attempt_key,
+            "request_key": attempt_key, "request_key_basis": basis,
             "why": "asker mismatch",
             "asserted_plugin_id": plugin_id,
             "proven_plugin_id": who.plugin_id,
@@ -2329,8 +2342,8 @@ fn refuse_host_session_mismatch(
     attempted_act: Option<&str>,
     request_key: Option<&str>,
 ) -> anyhow::Error {
-    let attempt_key = refusal_request_key(
-        s, plugin_id, marker, attempted_act, session_id_arg, request_key,
+    let (attempt_key, basis) = refusal_request_key(
+        s, plugin_id, marker, attempted_act, session_id_arg, request_key, true,
     );
     let _ = s.append_chain(
         "gate_escalation_refused",
@@ -2338,7 +2351,7 @@ fn refuse_host_session_mismatch(
             "plugin_id": plugin_id,
             "tool_name": tool_name,
             "marker": marker,
-            "request_key": attempt_key,
+            "request_key": attempt_key, "request_key_basis": basis,
             "why": "host session mismatch",
             "asserted_host_session_id": stated,
             "proven_host_session_id": proven,
@@ -18544,6 +18557,7 @@ mod tests {
         assert_eq!(row.event_data["proven_plugin_id"], "claude-code");
         assert_eq!(row.event_data["spent"], false);
         assert_eq!(row.event_data["request_key"], "a".repeat(64));
+        assert_eq!(row.event_data["request_key_basis"], "caller_supplied");
         // The chain is broadly readable; the session id is a live capability.
         let prefix = row.event_data["session_prefix"].as_str().unwrap();
         assert_eq!(prefix.len(), 8, "a prefix, not the whole session: {prefix}");
@@ -19852,6 +19866,7 @@ mod tests {
         assert_eq!(refused.event_data["proven_host_session_id"], "host-wake-proven");
         assert_eq!(refused.event_data["spent"], false);
         assert_eq!(refused.event_data["request_key"], "b".repeat(64));
+        assert_eq!(refused.event_data["request_key_basis"], "caller_supplied");
         assert!(
             !rows.iter().any(|e| e.event_type == "gate_escalation_claimed"),
             "a refused claim must mint NO claimed row — a spend recorded for a write that \
@@ -19977,11 +19992,32 @@ mod tests {
                 "codex", "pre_tool_use.py", "Edit -> pre_tool_use.py", None,
             )
         );
+        assert_eq!(row.event_data["request_key_basis"], "derived_identity_mismatch");
         // O: a denied act leaves state bit-identical — nothing was opened.
         assert!(
             !rows.iter().any(|e| e.event_type == "gate_escalation_opened"),
             "a refused open must not also open: {rows:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn refusal_request_key_basis_is_explicit() {
+        let (_dir, shared) = make_shared_state();
+        let s = shared.lock().await;
+        for (act, mismatch, expected) in [
+            (Some("Edit -> pre_tool_use.py"), false, "derived"),
+            (Some(""), false, "derived_without_act"),
+            (Some("Edit -> pre_tool_use.py"), true, "derived_identity_mismatch"),
+        ] {
+            let (key, basis) = refusal_request_key(
+                &s, "kimi-code", "pre_tool_use.py", act, None, None, mismatch);
+            assert!(crate::server::gate_escalation::valid_request_key(&key));
+            assert_eq!(basis, expected);
+        }
+        let supplied = "a".repeat(64);
+        let (_, basis) = refusal_request_key(
+            &s, "kimi-code", "pre_tool_use.py", Some(""), None, Some(&supplied), true);
+        assert_eq!(basis, "caller_supplied", "a caller key keeps its basis even across a mismatch");
     }
 
     #[tokio::test]
@@ -20028,6 +20064,12 @@ mod tests {
         );
         assert!(keys.contains(&derived), "the open refusal derives the same hook rule: {keys:?}");
         assert!(keys.iter().all(|key| crate::server::gate_escalation::valid_request_key(key)));
+        let open_row = rows.iter().find(|e| e.event_type == "gate_escalation_refused").unwrap();
+        assert_eq!(open_row.event_data["request_key_basis"], "derived_without_act");
+        assert!(rows.iter().all(|e| e.event_type != "gate_escalation_claimed"),
+                "#540 chain invariant: claimed without decided is zero");
+        assert!(rows.iter().all(|e| e.event_type != "gate_escalation_decided"),
+                "the fixture never decided an escalation");
     }
 
     /// Negative control for both tests above. A row that appears no matter what the guard
@@ -25844,8 +25886,8 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
         // returned as a bare error the caller might log and forget.
         Err(e) => {
-            let attempt_key = refusal_request_key(
-                &s, &plugin_id, &marker, act.as_deref(), session_id_arg.as_deref(), None,
+            let (attempt_key, basis) = refusal_request_key(
+                &s, &plugin_id, &marker, act.as_deref(), session_id_arg.as_deref(), None, false,
             );
             let _ = s.append_chain(
                 "gate_escalation_refused",
@@ -25853,7 +25895,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
                     "plugin_id": plugin_id,
                     "tool_name": tool_name,
                     "marker": marker,
-                    "request_key": attempt_key,
+                    "request_key": attempt_key, "request_key_basis": basis,
                     "why": e.to_string(),
                 }),
             );
@@ -29004,15 +29046,15 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
             }))
         }
         Err(e) => {
-            let attempt_key = refusal_request_key(
+            let (attempt_key, basis) = refusal_request_key(
                 &s, &plugin_id, &marker, attempted_act.as_deref(), session_id_arg.as_deref(),
-                request_key.as_deref(),
+                request_key.as_deref(), false,
             );
             let _ = s.append_chain(
                 "gate_escalation_refused",
                 json!({
                     "plugin_id": plugin_id, "tool_name": tool_name,
-                    "marker": marker, "request_key": attempt_key, "why": e.to_string(),
+                    "marker": marker, "request_key": attempt_key, "request_key_basis": basis, "why": e.to_string(),
                 }),
             );
             // Still a refusal of the write — reported as one rather than as a tool error the
