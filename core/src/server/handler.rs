@@ -20794,6 +20794,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn same_name_evidence_is_preserved_without_counting_toward_any_bar() {
+        let (_dir, shared) = make_shared_state();
+        let asker = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "h", "host_session_id": "self-wake"
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let opened = tool_gate_escalation_open(&shared, &json!({
+            "plugin_id": "claude-code", "session_id": asker,
+            "tool_name": "Edit", "marker": "law_inject.py", "act": "Edit -> law_inject.py",
+        })).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+
+        for stance in ["concur", "dissent"] {
+            let argument = format!("same-name {stance}: the complete reasoning, verbatim");
+            let response = tool_gate_escalation_corroborate(&shared, &json!({
+                "escalation_id": id,
+                "session_id": asker,
+                "stance": stance,
+                "argument": argument,
+            })).await.expect("same-name evidence remains recordable");
+            assert_eq!(response["recorded"], true, "{response}");
+            assert_eq!(response["self_evidence"], true, "{response}");
+            assert_eq!(response["corroborated"], false, "{response}");
+            assert_eq!(response["bar_met_if_decided_now"], false, "{response}");
+            let factor = response["factors_present"].as_array().unwrap().last().unwrap();
+            assert_eq!(factor["channel"], "self_evidence");
+            assert_eq!(factor["argument"], argument);
+            assert!(factor["independence"].is_null(), "{factor}");
+        }
+
+        let s = shared.lock().await;
+        let esc = s.gate_escalations.get(&id).unwrap();
+        assert_eq!(esc.factors.len(), 2);
+        assert!(!esc.bar_met(), "self evidence must not clear SingleApprover");
+        let participation = esc.peer_participation();
+        assert_eq!(participation.self_evidence, 2);
+        assert_eq!((participation.concurred, participation.dissented), (0, 0));
+        let rows: Vec<_> = s.chain_store.read_recent(30).unwrap().into_iter()
+            .filter(|e| e.event_type == "gate_escalation_corroborated")
+            .collect();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.event_data["channel"], "self_evidence");
+            assert_eq!(row.event_data["self_declared"], true);
+            assert_eq!(row.event_data["counts_toward_bar"], false);
+            assert!(row.event_data["argument"].as_str().unwrap().contains("complete reasoning"));
+        }
+        let mut entries = s.chain_store.read_recent(200).unwrap();
+        entries.reverse();
+        drop(s);
+
+        let mut replayed = crate::server::gate_escalation::EscalationStore::default();
+        replayed.rehydrate(&entries, crate::server::gate_escalation::now_secs());
+        let restored = replayed.get(&id).unwrap();
+        assert_eq!(restored.factors.len(), 2);
+        assert!(restored.factors.iter().all(|f| {
+            f.channel == crate::server::gate_escalation::Channel::SelfEvidence
+        }));
+        assert!(!restored.bar_met());
+        assert_eq!(restored.peer_participation().self_evidence, 2);
+    }
+
     /// Two members with live sessions and one escalation opened by the first — the fixture
     /// every corroborate-stance test below starts from. Returns (state, escalation_id,
     /// corroborator's session_id).
@@ -29941,23 +30003,30 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
         return Err(anyhow::anyhow!(escalation_miss_reason(&s, &escalation_id)));
     };
 
-    // NOT-SAME, same arbiter rules: a member may not corroborate its own ask, and the
-    // independence tier is recorded with the factor so a reader can weight it. Clause 0
-    // (#128): an asserted asker collects NO peer factor at all — corroborating an ask
-    // nobody proved would mint cross-vendor evidence against a forgeable name.
-    let independence = match eligibility(&AppealParties {
-        appellant: &esc.plugin_id,
-        appellant_basis: esc.asker_basis,
-        deny_adjudicator: None,
-        arbiter: &arb.plugin_id,
-    }) {
-        Eligibility::Eligible { independence } => independence,
-        other => {
-            return Err(anyhow::anyhow!(
-                "you may not corroborate this: {other:?}. Evidence about your own gate write \
-                 is not a second factor — it is the first one wearing a hat."
-            ));
-        }
+    // A session-proven asker may leave SELF-DECLARED evidence (#935), never a peer factor:
+    // the channel counts toward no bar. Other callers follow NOT-SAME arbiter rules, with the
+    // independence tier recorded so a reader can weight it. Clause 0 (#128): an asserted asker
+    // collects NO peer factor at all — corroborating an ask nobody proved would mint evidence
+    // against a forgeable name.
+    let self_evidence = esc.asker_basis != crate::arbiter::AskerBasis::Asserted
+        && arb.plugin_id == esc.plugin_id;
+    let independence = if self_evidence {
+        None
+    } else {
+        Some(match eligibility(&AppealParties {
+            appellant: &esc.plugin_id,
+            appellant_basis: esc.asker_basis,
+            deny_adjudicator: None,
+            arbiter: &arb.plugin_id,
+        }) {
+            Eligibility::Eligible { independence } => independence,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "you may not corroborate this: {other:?}. Evidence about your own gate write \
+                     is not a second factor — it is the first one wearing a hat."
+                ));
+            }
+        })
     };
 
     // The stance is the CALLER'S, verbatim — this used to be a hardcoded `false` ("this MCP
@@ -29982,15 +30051,27 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
         .and_then(|sess| sess.host_session_id.clone())
         .filter(|v| !v.trim().is_empty());
 
-    match s.gate_escalations.corroborate(
-        &escalation_id,
-        &arb.plugin_id,
-        &arb.role_lct,
-        Some(independence),
-        dissent,
-        argument.as_deref(),
-        now,
-    ) {
+    let updated = if self_evidence {
+        s.gate_escalations.corroborate_self(
+            &escalation_id,
+            &arb.plugin_id,
+            &arb.role_lct,
+            dissent,
+            argument.as_deref(),
+            now,
+        )
+    } else {
+        s.gate_escalations.corroborate(
+            &escalation_id,
+            &arb.plugin_id,
+            &arb.role_lct,
+            independence,
+            dissent,
+            argument.as_deref(),
+            now,
+        )
+    };
+    match updated {
         Ok(updated) => {
             let stance = if dissent { "dissent" } else { "concur" };
             let entry = s.append_chain(
@@ -30002,6 +30083,9 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                     "corroborated_role": arb.role_lct,
                     "corroborator_host_session_id": corroborator_host_session_id,
                     "independence": independence,
+                    "channel": if self_evidence { "self_evidence" } else { "peer_member" },
+                    "self_declared": self_evidence,
+                    "counts_toward_bar": !self_evidence,
                     // The peer's stance and argument, first-class on the event — a chain
                     // reader must never have to dig the only dissent out of a factor list
                     // to learn this entry was a disagreement.
@@ -30019,10 +30103,11 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
             Ok(json!({
                 "escalation_id": updated.id,
                 // `corroborated` keeps its original meaning — "your CONCURRENCE landed" —
-                // so existing concur callers read exactly what they always read. A dissent
-                // is recorded, not corroborated.
-                "corroborated": !dissent,
+                // so existing concur callers read exactly what they always read. A dissent or
+                // self-declared statement is evidence, not a peer corroboration (#935).
+                "corroborated": !dissent && !self_evidence,
                 "recorded": true,
+                "self_evidence": self_evidence,
                 "stance": stance,
                 "dissent": dissent,
                 "argument": argument,
@@ -30031,7 +30116,10 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
                 "bar": updated.bar,
                 "bar_met_if_decided_now": updated.bar_met(),
                 "witnessEntryHash": entry.ok().map(|e| e.hash),
-                "note": if dissent {
+                "note": if self_evidence {
+                    "your statement is ON THE RECORD as SELF-DECLARED evidence, not a peer \
+                     corroboration: it counts toward no approval bar"
+                } else if dissent {
                     "your dissent is ON THE RECORD as evidence for review — never a veto: \
                      the sovereign decision stands or lands regardless, with your argument \
                      visible to the decider"

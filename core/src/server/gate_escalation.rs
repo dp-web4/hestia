@@ -234,6 +234,10 @@ pub enum Channel {
     /// approval was looked at by something that is not the asker, and the record says how
     /// different that something is.
     PeerMember,
+    /// THE ASKER'S OWN statement about its request (#935). This is self-declared evidence,
+    /// never second-party review: `bar_met` counts it toward no bar and `peer_participation`
+    /// reports it separately rather than leaving "offered" indistinguishable from "silent".
+    SelfEvidence,
     /// THE ASKER ITSELF, refusing its own request. Not a review of any kind — the weakest
     /// thing in this enum, and deliberately its own name rather than a `PeerMember` with an
     /// absent `independence`.
@@ -1502,9 +1506,15 @@ impl Escalation {
             .iter()
             .filter(|f| f.channel == Channel::Invoked)
             .count();
+        let self_evidence = self
+            .factors
+            .iter()
+            .filter(|f| f.channel == Channel::SelfEvidence)
+            .count();
         PeerParticipation {
             invited: self.invited_peers.clone(),
             invoked,
+            self_evidence,
             concurred,
             dissented,
             // Absent is derived, never stored: a seat that has not answered YET is not the
@@ -1850,6 +1860,9 @@ pub struct PeerParticipation {
     /// "who looked at this" sees the filler's answer as the plane's own custodial act and
     /// not as a second party. Zero on every row written before the lean path existed.
     pub invoked: usize,
+    /// `Channel::SelfEvidence` factors present — the asker's own statements, preserved without
+    /// being counted as peer participation or as satisfying any approval bar (#935).
+    pub self_evidence: usize,
 }
 
 #[derive(Default)]
@@ -3730,6 +3743,32 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         by: &str,
         role: &str,
         independence: Option<crate::arbiter::Independence>,
+        dissent: bool,
+        argument: Option<&str>,
+        now: u64,
+    ) -> Result<Escalation, DecideError> {
+        self.corroborate_with_channel(id, by, role, independence, dissent, argument, now, Channel::PeerMember)
+    }
+
+    /// Preserve the asker's own statement without manufacturing a peer factor (#935).
+    pub fn corroborate_self(
+        &mut self,
+        id: &str,
+        by: &str,
+        role: &str,
+        dissent: bool,
+        argument: Option<&str>,
+        now: u64,
+    ) -> Result<Escalation, DecideError> {
+        self.corroborate_with_channel(id, by, role, None, dissent, argument, now, Channel::SelfEvidence)
+    }
+
+    fn corroborate_with_channel(
+        &mut self,
+        id: &str,
+        by: &str,
+        role: &str,
+        independence: Option<crate::arbiter::Independence>,
         // A peer that looked and DISAGREED. Recorded, surfaced, and never a veto — dp's
         // ruling makes dissent evidence for review rather than a brake on the sovereign.
         dissent: bool,
@@ -3737,6 +3776,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         // (the MCP door requires it for dissent); the store records what it is handed.
         argument: Option<&str>,
         now: u64,
+        channel: Channel,
     ) -> Result<Escalation, DecideError> {
         if by.trim().is_empty() {
             return Err(DecideError::AnonymousDecider);
@@ -3755,7 +3795,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             return Err(DecideError::Expired);
         }
         esc.factors.push(Factor {
-            channel: Channel::PeerMember,
+            channel,
             by: by.trim().to_string(),
             role: Some(role.trim().to_string()).filter(|r| !r.is_empty()),
             independence,
