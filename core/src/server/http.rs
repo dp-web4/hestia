@@ -4444,7 +4444,9 @@ async fn config_put_seat(
     let previous_role = previous.as_ref()
         .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok())
         .and_then(|old| old.env.get("HESTIA_ROLE").cloned());
-    if previous_role.as_ref() != cfg.env.get("HESTIA_ROLE") && cfg.note.trim().is_empty() {
+    let next_role = cfg.env.get("HESTIA_ROLE").cloned();
+    let role_changed = previous_role != next_role;
+    if role_changed && cfg.note.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -4461,6 +4463,9 @@ async fn config_put_seat(
         "member": member,
         "shared": writing_shared,
         "keys": cfg.env.keys().cloned().collect::<Vec<_>>(),
+        "previous_hestia_role": previous_role,
+        "next_hestia_role": next_role,
+        "role_changed": role_changed,
         "note": cfg.note,
         "replaces": existed,
         "decided_by": "operator",
@@ -10395,6 +10400,9 @@ mod disposition_tests {
         let intent = entries.iter().find(|entry| entry.event_type == "config_seat_write_intent")
             .expect("the role change is witnessed");
         assert_eq!(intent.event_data["note"], "review duty is deliberate");
+        assert_eq!(intent.event_data["previous_hestia_role"], serde_json::Value::Null);
+        assert_eq!(intent.event_data["next_hestia_role"], "role:constellation:reviewer");
+        assert_eq!(intent.event_data["role_changed"], true);
         assert!(intent.event_data["keys"].as_array().unwrap()
             .iter().any(|key| key == "HESTIA_ROLE"));
     }
