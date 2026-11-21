@@ -3051,6 +3051,79 @@
     return !!pol && (pol.preset === 'permissive' || !pol.enforce);
   }
 
+  function escalationView(e, pendingIds) {
+    const evidence = e.bar
+      ? `bar ${e.bar}${e.bar_met === true ? ' met' : e.bar_met === false ? ' not met' : ''}`
+      : '';
+    const via = [e.decided_via, evidence].filter(Boolean).join(', ');
+    const suffix = via ? ` (${via})` : '';
+    const ruler = e.decided_by || 'unattributed';
+    let status = 'info';
+    let statusClass = 'info';
+    let disposition;
+    if (e.event_type === 'gate_escalation_decided' && e.decided_via === 'self_withdrawn') {
+      status = 'withdrawn';
+      disposition = `withdrawn by ${ruler}${suffix}`;
+    } else if (e.event_type === 'gate_escalation_decided') {
+      status = e.granted === true ? 'approved' : e.granted === false ? 'denied' : 'decided';
+      statusClass = e.granted === true ? 'ok' : e.granted === false ? 'deny' : 'info';
+      disposition = `${status} by ${ruler}${suffix}`;
+    } else if (e.event_type === 'gate_escalation_withdrawn') {
+      status = 'withdrawn';
+      disposition = `withdrawn by ${ruler}${suffix}`;
+    } else if (e.event_type === 'gate_escalation_expired') {
+      status = 'expired';
+      statusClass = 'warn';
+      disposition = 'expired unruled';
+    } else if (e.event_type === 'gate_escalation_claimed') {
+      status = 'claimed';
+      statusClass = 'ok';
+      disposition = 'claimed (ruling outside this window)';
+    } else if (pendingIds.has(e.escalation_id)) {
+      status = 'pending';
+      disposition = 'pending';
+    } else {
+      status = 'off-record';
+      disposition = 'no longer on record';
+    }
+    return {
+      status,
+      statusClass,
+      detail: `${(e.escalation_id || '').slice(0, 8)}${e.marker ? ' ' + e.marker : ''} -> ${disposition}`,
+    };
+  }
+
+  function projectEscalations(entries, pendingIds) {
+    const groups = new Map();
+    for (const e of entries) {
+      if (!e.event_type.startsWith('gate_escalation_') || !e.escalation_id) continue;
+      if (!groups.has(e.escalation_id)) groups.set(e.escalation_id, []);
+      groups.get(e.escalation_id).push(e);
+    }
+    const projections = new Map();
+    for (const [id, events] of groups) {
+      const opened = events.find(e => e.event_type === 'gate_escalation_opened');
+      const representative =
+        events.find(e => e.event_type === 'gate_escalation_decided') ||
+        events.find(e => e.event_type === 'gate_escalation_withdrawn') ||
+        events.find(e => e.event_type === 'gate_escalation_expired') ||
+        events.find(e => e.event_type === 'gate_escalation_claimed') || opened || events[0];
+      const source = {
+        ...representative,
+        marker: representative.marker || opened?.marker,
+        plugin_id: opened?.plugin_id || representative.plugin_id,
+      };
+      projections.set(id, {source, view: escalationView(source, pendingIds)});
+    }
+    return entries.flatMap(e => {
+      if (!e.escalation_id) return [e];
+      const projection = projections.get(e.escalation_id);
+      if (!projection) return [e];
+      if (projection.source.chain_position !== e.chain_position) return [];
+      return [{...projection.source, escalation_view: projection.view}];
+    });
+  }
+
   function renderFeed(entries) {
     const root = $('feed');
     const title = $('feed-title');
@@ -3065,6 +3138,9 @@
         e.event_type === 'policy_decision' && e.decision === feedFilter
       );
     }
+    const pendingIds = new Set((lastData?.pending_escalations ?? [])
+      .map(e => e.escalation_id).filter(Boolean));
+    source = projectEscalations(source, pendingIds);
     let filtered = selectedOrch
       ? source.filter(e => e.plugin_id === selectedOrch)
       : source;
@@ -3184,8 +3260,15 @@
       let statusClass = 'info';
       let tool = '';
       let hover = null;   // hover text for the detail cell; null => fall back to `detail`
+      const escView = e.escalation_view;
+      const eventLabel = escView ? 'escalation' : e.event_type;
 
-      if (e.event_type === 'outcome') {
+      if (escView) {
+        detail = escView.detail;
+        status = escView.status;
+        statusClass = escView.statusClass;
+        hover = `${e.event_type}\n${detail}\n\nchain hash:\n${e.hash}`;
+      } else if (e.event_type === 'outcome') {
         tool = e.tool_name || '?';
         detail = e.target || '';
         if (e.success === true) { status = 'ok'; statusClass = 'ok'; }
@@ -3235,12 +3318,12 @@
         <div class="feed-row${isNew ? ' new' : ''}">
           <span class="feed-pos" title="${escapeHtml(posHover)}"><span class="feed-agent">${memberName(whoAgent)}</span>${whoPid}</span>
           <span class="feed-time" title="${escapeHtml(absTime)}">${fmt.relTime(e.timestamp)}</span>
-          <span class="feed-event ${escapeHtml(e.event_type)}" title="${escapeHtml(e.event_type)}">${escapeHtml(e.event_type)}</span>
+          <span class="feed-event ${escapeHtml(e.event_type)}" title="${escapeHtml(e.event_type)}">${escapeHtml(eventLabel)}</span>
           <span class="feed-detail" title="${escapeHtml(hover || detail)}">
             ${tool ? `<span class="feed-tool">${escapeHtml(tool)}</span> ` : ''}${escapeHtml(detail)}
           </span>
           <span class="feed-status ${statusClass}">${status}</span>
-          <span class="feed-hash">${fmt.short(e.hash)}…</span>
+          <span class="feed-hash" title="${escapeHtml(e.hash)}">${fmt.short(e.hash)}…</span>
         </div>
       `;
     }).join('');
