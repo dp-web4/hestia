@@ -1023,7 +1023,7 @@ retire_discharged_primers() {
 # lands in the woken session's own prompt). What is NOT done: firing a member
 # because it owes a response. Auto-waking a CLI is a consequential act; debt is
 # not a reason to spend one.
-UNANSWERED_EVERY="${UNANSWERED_EVERY:-3600}"   # journal cadence, seconds
+UNANSWERED_EVERY="${UNANSWERED_EVERY:-600}"    # journal cadence, seconds; ~3 level lines in a ~1900s retention window
 STALE_AFTER="${STALE_AFTER:-21600}"            # a notice is stale at 6h unbound
 
 # THE WATCHER IS NOT THE MEMBER (F3, CBP notice 699/701/702 thread, 2026-08-03).
