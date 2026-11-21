@@ -16,8 +16,8 @@
 //! THE RULE. A member's derivation is cached. It is re-derived when a DENY naming that member
 //! lands on the chain — and once more when that deny's retry window closes, because what the
 //! member did next (retried the act: 0.0; reached the same resource another way: 0.35;
-//! adapted: 0.85) is only fully on the chain then. Sparse adjudications and
-//! corrected-adjudication reversals also invalidate their subject: they change the active
+//! adapted: 0.85) is only fully on the chain then. Sparse adjudications, conduct
+//! confirmations, and corrected-adjudication reversals also invalidate their subject: they change the active
 //! evidence leaves immediately, and superseded observations cannot wait for a daily refresh.
 //! The rule is applied in `SqliteChainStore::append`, the one path every chain write takes.
 //!
@@ -198,7 +198,7 @@ impl DerivationCache {
 
     fn adjudication_subject(e: &ChainEntry) -> Option<&str> {
         match e.event_type.as_str() {
-            "adjudication" => flat_or_data(e, "subject_plugin_id"),
+            "adjudication" | "conduct_confirmation" => flat_or_data(e, "subject_plugin_id"),
             "reversal" if flat_or_data(e, "cause") == Some("corrected-adjudication") => {
                 flat_or_data(e, "subject_plugin_id")
             }
@@ -396,6 +396,9 @@ mod tests {
         s.append("reversal", json!({"subject_plugin_id": "codex", "cause": "corrected-adjudication"}), "lct:test").unwrap();
         past_coalesce(cache);
         assert_eq!(cache.refresh(&s), 1, "a correction re-derives exactly its subject");
+        s.append("conduct_confirmation", json!({"subject_plugin_id": "codex", "conduct": "self-correction"}), "lct:test").unwrap();
+        past_coalesce(cache);
+        assert_eq!(cache.refresh(&s), 1, "a confirmation re-derives exactly its subject");
 
         deny(&s, "kimi-code", "s-k", "/etc/b");
         past_coalesce(cache);
