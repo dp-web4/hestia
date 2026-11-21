@@ -14,15 +14,17 @@ Three arms, each with the sabotage that proves it can fail:
 
   A  TYPED ENGINE CONTRACT   core.path_targets: Glob.pattern is reach; Grep and
                              search_file_content .pattern are NOT; include/exclude/paths
-                             lists and strings; absolute_path/dir_path/notebook_path; and a
-                             self-check that empties PATTERN_REACH_TOOLS and requires the
-                             Glob arm to go red.
+                             lists and strings; absolute_path/dir_path/notebook_path;
+                             files/filename/planFilePath and the real MCP GitNexus repo name;
+                             and a self-check that empties PATTERN_REACH_TOOLS and requires
+                             the Glob arm to go red.
   B  LIVE SITE, NOT SUBSTRING  live_site_delegates() on every shipped seat, plus the exact
                              counterexample GPT named (dead engine call + local extractor
                              on the live path) must read NOT delegated.
   C  BEHAVIOUR ACROSS SEATS  through sprintF's stub-daemon harness: an out-of-scope Glob
                              pattern is DENIED on every seat, an out-of-scope Grep pattern
-                             is NOT denied for scope, an out-of-scope include list is denied.
+                             is NOT denied for scope, and out-of-scope include lists, plan
+                             paths and real-shape MCP GitNexus repo paths are denied.
                              This is the arm no static reading can fake.
 """
 from __future__ import annotations
@@ -73,6 +75,18 @@ def typed_contract(mod) -> list[str]:
         bad.append("paths/file_paths lists: strings only, blanks dropped")
     if pt("read_file", {"absolute_path": "/a", "notebook_path": "/n", "dir_path": "/d"}) != ["/a", "/n", "/d"]:
         bad.append("absolute_path/notebook_path/dir_path are reach")
+    if pt("SendUserFile", {"files": ["/f", 3, ""]}) != ["/f"]:
+        bad.append("SendUserFile.files is a path list")
+    if pt("mcp__playwright__browser_take_screenshot", {"filename": "/shot"}) != ["/shot"]:
+        bad.append("playwright filename is reach")
+    if pt("ExitPlanMode", {"planFilePath": "/plan"}) != ["/plan"]:
+        bad.append("ExitPlanMode.planFilePath is reach")
+    if pt("mcp__gitnexus__detect_changes", {"repo": "/repo"}) != ["/repo"]:
+        bad.append("the real MCP GitNexus name exposes its local repo path")
+    if pt("mcp__github__get_file", {"repo": "dp-web4/repo"}) != []:
+        bad.append("a remote GitHub repo identity is NOT a filesystem path")
+    if pt("mcp__gitnexus__detect_changes_v2", {"repo": "/repo"}) != []:
+        bad.append("a tool-name prefix does NOT qualify for GitNexus repo extraction")
     if pt("Write", "not-a-dict") != [] or pt(None, {"pattern": "/x"}) != []:
         bad.append("non-dict input and non-string tool name yield nothing")
     return bad
@@ -203,6 +217,7 @@ def test_behaviour_across_seats() -> None:
     stub = sf.StubDaemon()
     srv = sf.Server(stub)
     try:
+        os.makedirs(f"{ws}/notgranted/granted", exist_ok=True)
         rows = [
             ("glob-pattern-oos", "Glob",
              {"pattern": f"{ws}/notgranted/**", "path": f"{ws}/granted"}, True),
@@ -212,6 +227,13 @@ def test_behaviour_across_seats() -> None:
              {"include": [f"{ws}/notgranted/**"]}, True),
             ("absolute-path-oos", "read_file",
              {"absolute_path": f"{ws}/notgranted/x"}, True),
+            ("plan-path-oos", "ExitPlanMode",
+             {"planFilePath": f"{ws}/notgranted/plan.md"}, True),
+            # Keep the repo NAME granted so this isolates local path scope from mrh.repo.
+            ("repo-oos", "mcp__gitnexus__detect_changes",
+             {"repo": f"{ws}/notgranted/granted"}, True),
+            ("remote-repo-still-denied", "mcp__github__get_file",
+             {"repo": "notgranted", "path": "README.md"}, True),
         ]
         for name, tool, tinput, want_deny in rows:
             for shim in ("claude", "kimi", "codex"):
