@@ -86,6 +86,49 @@ impl Observation {
     }
 }
 
+pub const ENGINE_PLUGIN_ID: &str = "_shared";
+
+/// Add the installed decision engine to the same verification set as the shims that import it.
+/// A discovered shim with no readable engine record has unknown coverage, never a green verdict.
+pub fn with_deployed_engine(
+    discovered: Result<Vec<(String, String)>, String>,
+) -> Result<Vec<(String, String)>, String> {
+    let path = std::env::var_os("HESTIA_CURRENT_BUILD_FILE").map(PathBuf::from);
+    with_deployed_engine_at(discovered, path.as_deref())
+}
+
+fn with_deployed_engine_at(
+    discovered: Result<Vec<(String, String)>, String>,
+    current_build: Option<&Path>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut discovered = discovered?;
+    if discovered.is_empty() {
+        return Ok(discovered);
+    }
+    let path = current_build
+        .ok_or_else(|| "shared engine deployment record is not configured".to_string())?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("shared engine deployment record is unreadable: {e}"))?;
+    let document: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("shared engine deployment record is unparseable: {e}"))?;
+    let engine = document
+        .get("shared_engine")
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+        .ok_or_else(|| "shared engine deployment record names no engine files".to_string())?;
+    for row in engine {
+        let path = row
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| "shared engine deployment record has a file with no path".to_string())?;
+        if !discovered.iter().any(|(_, existing)| existing == path) {
+            discovered.push((ENGINE_PLUGIN_ID.into(), path.into()));
+        }
+    }
+    Ok(discovered)
+}
+
 /// One pass: verdicts from `vault::gate_integrity::verify` over the discovered gate set, or the
 /// reason the set could not be established.
 ///
@@ -409,6 +452,50 @@ mod tests {
                 note: "test".into(),
             },
         );
+    }
+
+    #[test]
+    fn shared_engine_mutation_flips_production_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = gate(&dir, "shim.py", "reviewed shim");
+        let engine = gate(&dir, "engine.py", "reviewed engine");
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, serde_json::json!({
+            "shared_engine": [{"file": "engine.py", "path": engine.clone(), "sha256": "recorded"}]
+        }).to_string()).unwrap();
+        let discovered = with_deployed_engine_at(
+            Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest));
+        assert_eq!(discovered.as_ref().unwrap().len(), 2);
+        assert_eq!(discovered.as_ref().unwrap()[1].0, ENGINE_PLUGIN_ID);
+
+        let mut expectations = GateExpectations::new();
+        ratify(&mut expectations, &shim);
+        ratify(&mut expectations, &engine);
+        let paths = |d: Result<Vec<(String, String)>, String>| {
+            d.map(|rows| rows.into_iter().map(|(_, path)| path).collect::<Vec<_>>())
+        };
+        let seen = observe(&expectations, paths(discovered.clone()));
+        assert!(seen.iter().all(|row| row.status == "verified"), "{seen:?}");
+        assert_eq!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "VERIFIED");
+
+        std::fs::write(&engine, "tampered engine").unwrap();
+        let seen = observe(&expectations, paths(discovered));
+        let engine_row = seen.iter().find(|row| row.key == engine).unwrap();
+        assert_eq!(engine_row.status, "modified");
+        assert_eq!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "MODIFIED");
+    }
+
+    #[test]
+    fn a_missing_engine_record_is_unknown_not_verified() {
+        let discovered = with_deployed_engine_at(
+            Ok(vec![("claude-code".into(), "/g/shim.py".into())]), None);
+        let seen = observe(&GateExpectations::new(), discovered.map(|rows| {
+            rows.into_iter().map(|(_, path)| path).collect::<Vec<_>>()
+        }));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].key, COVERAGE_KEY);
+        assert_eq!(seen[0].status, "unknown");
+        assert_eq!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "UNKNOWN");
     }
 
     /// Apply transitions the way `check` does when every witness lands.
