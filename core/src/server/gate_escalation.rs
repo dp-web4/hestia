@@ -844,6 +844,11 @@ pub struct Factor {
     /// never something that could have informed the decision. Older factors default false.
     #[serde(default)]
     pub post_claim: bool,
+    /// True when a ruling already existed at acceptance. This distinguishes retrospective
+    /// review from decision-relevant evidence; `post_claim` separately means the permit
+    /// was already spent. Historical factors default false rather than being reclassified.
+    #[serde(default)]
+    pub post_decision: bool,
 }
 
 /// Where an invoked factor came from. `by` on the `Factor` names the filler's durable
@@ -3675,6 +3680,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             argument: None,
             invocation: None,
             post_claim: false,
+            post_decision: false,
             at: now,
         });
         Ok(esc.clone())
@@ -3707,8 +3713,9 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
     /// A late factor still cannot dress up a ruling — `bar_met` is unmoved by it (see
     /// `a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could`) — so the protection
     /// the deleted sentence claimed comes from the PREDICATE, not from refusing the peer.
-    /// A factor created after `consumed_at` is explicitly `post_claim`, so preserved late
-    /// commentary cannot be misread as evidence that informed the already-spent ruling.
+    /// A factor created after the ruling is explicitly `post_decision`; one created after
+    /// `consumed_at` is also `post_claim`. Retrospective review and spent-permit commentary
+    /// therefore remain distinct from evidence that informed the original decision.
     ///
     /// The deleted sentence said the opposite ("it freezes the moment a decision lands").
     /// It outlived the 2026-08-06 cutover by 25 days and was filed twice (#510, and codex's
@@ -3758,6 +3765,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                 .filter(|a| !a.is_empty()),
             invocation: None,
             post_claim: esc.consumed_at.is_some(),
+            post_decision: esc.decided_at.is_some(),
             at: now,
         });
         Ok(esc.clone())
@@ -3822,6 +3830,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                 prompt_digest: invocation.prompt_digest.trim().to_string(),
             }),
             post_claim: false,
+            post_decision: esc.decided_at.is_some(),
             at: now,
         });
         Ok(esc.clone())
@@ -6952,6 +6961,54 @@ mod bar_factor_tests {
         assert_eq!(after.bar_met(), before, "a late factor MUST NOT change the bar verdict");
         assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
         assert_eq!(after.stored_status(), Status::Approved, "and the ruling is untouched");
+    }
+
+    #[test]
+    fn post_decision_review_is_typed_separately_from_post_claim_commentary() {
+        let (mut s, id) = open_with("law_inject.py");
+        let pending = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                    false, Some("before the ruling"), T0 + 1).unwrap();
+        assert!(!pending.factors[0].post_decision);
+        assert!(!pending.factors[0].post_claim);
+
+        let decided = s.decide(&id, true, "dp", "role:constellation:sovereign",
+                               Channel::OperatorSession, None, Some("reviewed"), T0 + 2).unwrap();
+        assert!(!decided.factors[0].post_decision, "the pending factor keeps its temporal meaning");
+        assert!(!decided.factors[1].post_decision, "the decider's own factor is not retrospective");
+
+        let reviewed = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                     true, Some("retrospective disagreement"), T0 + 3).unwrap();
+        let review = reviewed.factors.last().unwrap();
+        assert!(review.post_decision);
+        assert!(!review.post_claim, "decided need not mean spent");
+
+        let invoked = s.attach_invoked(
+            &id,
+            "lct:web4:filler:ollama-qwen3",
+            "role:constellation:classifier",
+            crate::arbiter::Independence::CrossVendor,
+            false,
+            Some("retrospective classification"),
+            invocation(),
+            T0 + 4,
+        ).unwrap();
+        let classification = invoked.factors.last().unwrap();
+        assert!(classification.post_decision);
+        assert!(!classification.post_claim);
+
+        s.claim("claude-code", "law_inject.py", Some("Edit -> act"), T0 + 5)
+            .expect("the approved act is spent before the final comment");
+        let commented = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                      false, Some("after the spend"), T0 + 6).unwrap();
+        let comment = commented.factors.last().unwrap();
+        assert!(comment.post_decision);
+        assert!(comment.post_claim);
+
+        let mut legacy = serde_json::to_value(comment).unwrap();
+        legacy.as_object_mut().unwrap().remove("post_decision");
+        let historical: Factor = serde_json::from_value(legacy).unwrap();
+        assert!(!historical.post_decision, "missing history is not reclassified");
+        assert!(historical.post_claim, "the independent older field is preserved");
     }
 
     #[test]
