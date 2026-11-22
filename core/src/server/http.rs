@@ -4042,8 +4042,9 @@ pub(crate) async fn scope_decide_as(
 /// So the whole act happens here, under one lock: verify emptiness, validate and render
 /// EVERY proposed document, then commit them as a single vault write. A failure before the
 /// commit leaves the namespace byte-identical; a concurrent writer makes this refuse cleanly
-/// with what it found. One intent row and one result row, not one pair per document — the
-/// chain should say "this box was initialised", because that is the act.
+/// with what it found. One intent row, one authority result row, and one projection-readiness
+/// observation, not one pair per document — the chain should say "this box was initialised",
+/// because that is the act.
 ///
 /// It seeds DESCRIPTION. Nothing here grants: the documents are seat layout and society
 /// facts, and every authority surface (scope, standing scope, operator sets) is untouched and
@@ -4319,8 +4320,9 @@ async fn config_seed_seats(
         );
     }
 
-    // Render immediately rather than waiting for the worker's next tick: an operator who just
-    // seeded a box expects its seats to be able to act, and the verdicts are the evidence.
+    // Render immediately rather than waiting for the worker's next tick. A projection failure
+    // does not undo the valid authority commit; the response and its own witness say which half
+    // succeeded instead of treating `config_seeded` as evidence that seats can act.
     let members: Vec<String> = parsed
         .iter()
         .map(|(m, _)| m.clone())
@@ -4331,13 +4333,32 @@ async fn config_seed_seats(
         &members,
         super::handler::ConfigPass::Author,
     );
+    let not_ready: Vec<_> = verdicts
+        .iter()
+        .filter(|v| !matches!(v, sc::ConfigVerdict::Verified { .. }))
+        .collect();
+    let ready = !members.is_empty() && verdicts.len() == members.len() && not_ready.is_empty();
+    if let Err(e) = s.append_chain(
+        "config_seed_readiness",
+        serde_json::json!({
+            "intent": intent.hash,
+            "authority_committed": true,
+            "ready": ready,
+            "verdicts": verdicts,
+        }),
+    ) {
+        tracing::warn!(error = %e, "seed projection readiness could not be witnessed");
+    }
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
+            "authority_committed": true,
+            "ready": ready,
             "seeded": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
             "verdict": verdicts,
+            "not_ready": not_ready,
             "intentEntryHash": intent.hash,
         })),
     )
@@ -9976,7 +9997,8 @@ mod disposition_tests {
         assert!(s.chain_store.len().unwrap() > before);
     }
 
-    /// Seeding an empty namespace is ONE act: all documents or none, one witness pair.
+    /// Seeding an empty namespace is ONE act: all documents or none, one authority witness pair
+    /// followed by a separate projection-readiness observation.
     ///
     /// The arms below are written against the failure the client-side version had (#987
     /// review): read-then-write-N leaves a half-configured namespace when anything fails
@@ -9997,6 +10019,11 @@ mod disposition_tests {
             super::config_seed_seats(axum::extract::State(state.clone()), axum::Json(seed)).await,
         );
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["authority_committed"], true);
+        assert_eq!(result["ready"], true, "{result}");
+        assert!(result["not_ready"].as_array().unwrap().is_empty(), "{result}");
 
         let s = state.lock().await;
         assert_eq!(
@@ -10019,6 +10046,14 @@ mod disposition_tests {
             .collect();
         assert_eq!(rows.iter().filter(|t| *t == "config_seed_intent").count(), 1, "{rows:?}");
         assert_eq!(rows.iter().filter(|t| *t == "config_seeded").count(), 1, "{rows:?}");
+        let readiness = s
+            .chain_store
+            .read_recent_by_types(None, &["config_seed_readiness"], 1)
+            .unwrap()
+            .pop()
+            .expect("projection readiness is a separate observation after the authority commit");
+        assert_eq!(readiness.event_data["authority_committed"], true);
+        assert_eq!(readiness.event_data["ready"], true);
         assert_eq!(
             rows.iter().filter(|t| *t == "config_seat_written").count(),
             0,
@@ -10035,6 +10070,77 @@ mod disposition_tests {
         let blob = serde_json::to_string(&intent.event_data).unwrap();
         assert!(blob.contains("HESTIA_PLUGIN_ID"), "keys are recorded: {blob}");
         assert!(!blob.contains("/w/ai"), "a VALUE reached the chain: {blob}");
+    }
+
+    #[tokio::test]
+    async fn seed_preserves_authority_when_a_projection_is_not_ready_and_can_be_repaired() {
+        use super::super::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let blocked = sc::render_path(dir.path(), "claude-code");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let seed = serde_json::json!({"documents": {
+            "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": "society facts"},
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+            "codex": {"env": {"HESTIA_PLUGIN_ID": "codex"}, "note": ""},
+        }});
+
+        let (status, text) = seed_json(&state, seed.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(result["authority_committed"], true);
+        assert_eq!(result["ready"], false, "{result}");
+        let not_ready = result["not_ready"].as_array().unwrap();
+        assert_eq!(not_ready.len(), 1, "{result}");
+        assert_eq!(not_ready[0]["member"], "claude-code");
+        assert_eq!(not_ready[0]["status"], "unreadable");
+        assert!(result["verdict"].as_array().unwrap().iter().any(|v| {
+            v["member"] == "codex" && v["status"] == "verified"
+        }), "one bad projection must not hide the ready seat: {result}");
+
+        let committed = {
+            let s = state.lock().await;
+            let documents: Vec<(String, Vec<u8>)> = ["_shared", "claude-code", "codex"]
+                .iter()
+                .map(|member| {
+                    (
+                        member.to_string(),
+                        s.vault.get_document(sc::SEAT_CONFIG_NS, member).unwrap().to_vec(),
+                    )
+                })
+                .collect();
+            let readiness = s
+                .chain_store
+                .read_recent_by_types(None, &["config_seed_readiness"], 1)
+                .unwrap()
+                .pop()
+                .expect("the post-commit readiness state is witnessed");
+            assert_eq!(readiness.event_data["authority_committed"], true);
+            assert_eq!(readiness.event_data["ready"], false);
+            assert!(readiness.event_data["verdicts"].as_array().unwrap().iter().any(|v| {
+                v["member"] == "claude-code" && v["status"] == "unreadable"
+            }));
+            documents
+        };
+
+        std::fs::remove_dir_all(&blocked).unwrap();
+        let repaired = {
+            let mut s = state.lock().await;
+            super::super::handler::render_and_verify_seat_configs_as(
+                &mut s,
+                &["claude-code".to_string(), "codex".to_string()],
+                super::super::handler::ConfigPass::Author,
+            )
+        };
+        assert_eq!(repaired.len(), 2);
+        assert!(repaired.iter().all(|v| matches!(v, sc::ConfigVerdict::Verified { .. })),
+            "repair needs only a re-render, not another seed: {repaired:?}");
+
+        let (status, _) = seed_json(&state, seed).await;
+        assert_eq!(status, StatusCode::CONFLICT, "the empty-only ratchet remains intact");
+        let s = state.lock().await;
+        for (member, bytes) in committed {
+            assert_eq!(s.vault.get_document(sc::SEAT_CONFIG_NS, &member).unwrap(), &bytes[..]);
+        }
     }
 
     /// A namespace that is not empty is refused, and says what occupies it.
