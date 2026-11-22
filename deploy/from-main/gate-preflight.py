@@ -133,14 +133,40 @@ def _load_registrar(repo: Path):
     return module if hasattr(module, "reconciled_commands") else None
 
 
+def _entry_targets(commands: Iterable[str], entry: str) -> list[str]:
+    """Absolute targets a registration invokes under this gate entrypoint's basename."""
+    import shlex
+    wanted = Path(entry).name
+    targets: list[str] = []
+    for command in commands:
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            tokens = command.split()
+        targets.extend(token for token in tokens
+                       if token.startswith("/") and Path(token).name == wanted)
+    return targets
+
+
+def _declared_entry_target(home: Path, dest: Any, entry: str) -> Path | None:
+    if not isinstance(dest, str) or not dest:
+        return None
+    expanded = home.joinpath(dest[2:]) if dest.startswith("~/") else Path(os.path.expanduser(dest))
+    return expanded / Path(entry).name
+
+
+def _foreign_targets(commands: Iterable[str], entry: str, expected: Path | None) -> list[str]:
+    """Registrations of the same entry outside the location the reconciler owns."""
+    if expected is None:
+        return []
+    owned = os.path.normpath(str(expected))
+    return sorted({os.path.normpath(target) for target in _entry_targets(commands, entry)
+                   if os.path.normpath(target) != owned})
+
+
 def _registered(commands: Iterable[str], entry: str) -> bool:
     """Whether a registration invokes exactly this gate entrypoint basename."""
-    wanted = Path(entry).name
-    for command in commands:
-        for token in command.split():
-            if token.startswith("/") and Path(token).name == wanted:
-                return True
-    return False
+    return bool(_entry_targets(commands, entry))
 
 
 def _render(value: Any, replacements: dict[str, str]) -> Any:
@@ -286,6 +312,25 @@ def _run_probes(
                 rows.append({"member": member, "status": "unmeasured", "reason": str(exc)})
                 good = False
                 continue
+        expected_target = _declared_entry_target(home, install.get("dest"), entry)
+        foreign = _foreign_targets(commands, entry, expected_target)
+        if foreign:
+            # #1255: never credit a same-basename FOREIGN line as this member's gate, and never
+            # probe only the owned half of a duplicate. The install would leave the other line in
+            # force, so refuse before running the candidate and name the actual repair.
+            shown = ", ".join(foreign[:3])
+            if len(foreign) > 3:
+                shown += f" (+{len(foreign) - 3} more)"
+            rows.append({
+                "member": member,
+                "status": "foreign",
+                "reason": (f"duplicate/foreign gate registration at {shown}, outside declared dest "
+                           f"{expected_target.parent}; the deploy will not rewrite it. Move the line "
+                           "under dest, or delete it and let the deploy register; resolve every "
+                           "duplicate before installing"),
+            })
+            good = False
+            continue
         if not _registered(commands, entry):
             rows.append({"member": member, "status": "not-registered"})
             continue

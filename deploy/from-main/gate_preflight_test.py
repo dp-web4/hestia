@@ -472,7 +472,69 @@ def test_the_preflight_refuses_exactly_what_the_installer_refuses():
             os.environ["HESTIA_ROLE"] = saved_role
 
 
+def _write_gate_registration(config: Path, targets: list[Path]) -> None:
+    config.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+        {"type": "command", "command": f"python3 {target}", "timeout": 10}
+        for target in targets
+    ]}]}}), encoding="utf-8")
+
+
+def test_a_foreign_gate_registration_is_refused_with_its_actual_cause():
+    import os
+    saved = os.environ.get("HESTIA_HOME")
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            repo, home = root / "repo", root / "home"
+            config = _templated_member(repo, home, "alpha")
+            foreign = home / ".alpha" / "other-plugin" / "hooks" / "pre_tool_use.py"
+            _write_gate_registration(config, [foreign])
+            os.environ["HESTIA_HOME"] = str(root / "deploy-home")
+            rows, good = gate_preflight.run_probes(
+                repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert not good, rows
+            assert rows[0]["status"] == "foreign", rows
+            reason = rows[0]["reason"]
+            assert str(foreign) in reason, reason
+            assert str(home / ".alpha" / "hooks") in reason, reason
+            assert "move the line under dest" in reason.lower(), reason
+            assert "delete it and let the deploy register" in reason.lower(), reason
+            assert "config.unbacked" not in reason, reason
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_HOME", None)
+        else:
+            os.environ["HESTIA_HOME"] = saved
+
+
+def test_an_owned_and_foreign_duplicate_is_refused_not_probed_selectively():
+    import os
+    saved = os.environ.get("HESTIA_HOME")
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            repo, home = root / "repo", root / "home"
+            config = _templated_member(repo, home, "alpha")
+            owned = home / ".alpha" / "hooks" / "pre_tool_use.py"
+            foreign = home / ".alpha" / "other-plugin" / "hooks" / "pre_tool_use.py"
+            _write_gate_registration(config, [owned, foreign])
+            os.environ["HESTIA_HOME"] = str(root / "deploy-home")
+            rows, good = gate_preflight.run_probes(
+                repo, home, "http://example.invalid", "/tmp/probe", "/tmp/hold")
+            assert not good, rows
+            assert rows[0]["status"] == "foreign", rows
+            assert str(foreign) in rows[0]["reason"], rows
+            assert "duplicate" in rows[0]["reason"], rows
+    finally:
+        if saved is None:
+            os.environ.pop("HESTIA_HOME", None)
+        else:
+            os.environ["HESTIA_HOME"] = saved
+
+
 if __name__ == "__main__":
+    test_a_foreign_gate_registration_is_refused_with_its_actual_cause()
+    test_an_owned_and_foreign_duplicate_is_refused_not_probed_selectively()
     test_the_preflight_refuses_exactly_what_the_installer_refuses()
     test_the_preflight_judges_the_rendered_line_not_the_stale_registered_one()
     test_registered_candidate_must_allow_the_declared_probe()
@@ -489,4 +551,4 @@ if __name__ == "__main__":
     test_a_projection_consumer_is_probed_under_the_launcher_env_not_the_deploy_units()
     test_a_projection_consuming_candidate_is_probed_against_the_candidate_engine()
     test_the_throwaway_projection_is_keyed_by_the_seat_id_not_the_plugin_dir()
-    print("ok: 15 gate-preflight checks")
+    print("ok: 17 gate-preflight checks")
