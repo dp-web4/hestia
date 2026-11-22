@@ -428,7 +428,7 @@ def find_launchers(launcher_re: str, units: list[Path]) -> tuple[list[dict], lis
         # `ExecStart=/usr/bin/env HESTIA_HOME=/x python3 -m ...` sets it too: assignments standing
         # BEFORE the entry point are environment; after it they are the being's own arguments.
         cmd_env = set().union(*(_env_names(c[:re.search(launcher_re, c).start()]) for c in starts))
-        members = sorted({m.group(1) for c in starts for m in [MEMBER_ARG.search(c)] if m})
+        members = sorted({m.group(1) for c in starts for m in MEMBER_ARG.finditer(c)})
         found.append({"unit": str(u), "member": members[0] if len(members) == 1 else None,
                       "members_in_unit": members,
                       # Replicated on two seats (agent-atlas PR #1): a launcher that sets none of
@@ -511,7 +511,46 @@ def inspect_being(atlas_id: str, roots: list[str], atlas: dict, units: list[Path
         rec["findings"].append(
             "UNPROVISIONED: daemon executable present, and no service unit launches the being's "
             "gateway -- cognition may be running, but nothing acts as a governed member")
+    if len(rec["members"]) > 1 and all(l["member"] for l in launchers):
+        # One launcher per member is unambiguous: project each actor separately instead of
+        # collapsing all of them into an unknown aggregate. Multi-member units stay unknown.
+        rows = []
+        for member in rec["members"]:
+            own = [l for l in launchers if l["member"] == member]
+            units = {l["unit"] for l in own}
+
+            def local(items):
+                out = []
+                for text in items:
+                    if text.startswith("more than one being id launched here"):
+                        continue
+                    if text.startswith(("launcher ", "LAW-SOURCE:", "LAUNCHER-NOT-ENABLED:")):
+                        if any(unit in text for unit in units):
+                            out.append(text)
+                    else:
+                        out.append(text)
+                return out
+
+            row = dict(rec)
+            row.update({
+                "member": member,
+                "plugin": member,
+                "members": [member],
+                "launchers": own,
+                "unknown": local(rec["unknown"]),
+                "findings": local(rec["findings"]),
+                "unprovisioned": False,
+            })
+            row["governed"] = bool(own) and gated and not row["unknown"]
+            rows.append(row)
+        rec["member_rows"] = rows
     return rec
+
+
+def expand_being_record(rec: dict) -> list[dict]:
+    """Flatten per-member being projections; all other records are already singular."""
+    return rec.get("member_rows") or [rec]
+
 
 CONFIG_FILES = ("settings.json", "config.toml", "config.yaml", "config.json",
                 "settings.local.json", "config.yml")
@@ -2213,7 +2252,7 @@ def main() -> int:
             "ungoverned agent that neither list names — so 'nothing ungoverned' is still "
             f"undistinguishable from 'could not look' (workspace from {WORKSPACE_SOURCE}; "
             "pass --workspace PATH, re-run install.sh, or clone agent-atlas)")
-    recs = [inspect(a, roots) for a in known]
+    recs = [row for a in known for row in expand_being_record(inspect(a, roots))]
     periodic_state, periodic_platform, periodic_paths = periodic_trigger()
     installed_bin = HOME / ".local" / "bin" / INSTALLED_BIN_NAME
     available = REGISTRY.harnesses()

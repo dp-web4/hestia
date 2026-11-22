@@ -161,7 +161,7 @@ export function Agents() {
               const isRetired = retired.includes(r.plugin);
               const retiredButLive = isRetired && (r.governed || r.wired);
               return (
-                <tr key={r.agent} data-agent={r.agent}>
+                <tr key={memberOf(r)} data-agent={memberOf(r)}>
                   <td>
                     {r.agent}
                     {r.kind === "being" && <span className="muted"> · being</span>}

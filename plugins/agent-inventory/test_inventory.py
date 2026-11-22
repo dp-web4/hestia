@@ -1534,6 +1534,20 @@ def _being_cases(d, U, being):
 
     r = being(U("sd", "pl"))
     check("being: two ids on one seat -> no id is picked", (r["plugin"], r["governed"], len(r["members"])), (None, False, 2))
+    rows = r["member_rows"]
+    check("being: two ids produce two independent member rows", len(rows), 2)
+    check("being: each row keeps its own member id and one launcher",
+          [(row["member"], row["plugin"], len(row["launchers"])) for row in rows],
+          [("legion-being", "legion-being", 1), ("mcnugget-being", "mcnugget-being", 1)])
+    check("being: two correct launchers both report governed", [row["governed"] for row in rows], [True, True])
+    check("being: law defects stay with the affected member",
+          [inventory.has_tag(row["findings"], "LAW-SOURCE") for row in rows], [False, True])
+    check("being: expansion is the inventory aggregation shape", inventory.expand_being_record(r), rows)
+    multi = d / "multi-member.service"
+    multi.write_text("ExecStart=python3 -m sage.gateway.heartbeat --member first-being --member second-being\n")
+    ambiguous = being([multi])
+    check("being: one unit with two members stays unknown, with no invented row",
+          (ambiguous["plugin"], ambiguous["governed"], "member_rows" in ambiguous), (None, False, False))
 
     r = being(U("other"))
     check("being: no launcher, no executable -> not installed, and silent",
