@@ -661,6 +661,58 @@ def test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly():
     check("control_an_ordinary_in_grant_link_allows", ok, f"denied, tok={tok!r}")
 
 
+def test_a_read_symlink_deny_names_the_resolved_target_not_the_granted_link():
+    """#1116: the boundary stays closed, but the reason names the resolved target."""
+    ws = _workspace()
+    outside = tempfile.mkdtemp(dir=os.path.dirname(ws))
+    interp = os.path.realpath(sys.executable)
+    venv_bin = os.path.join(ws, "proj", "venv", "bin")
+    os.makedirs(venv_bin, exist_ok=True)
+    link = os.path.join(venv_bin, "python")
+    os.symlink(interp, link)
+    rec = ["path:" + ws + G.RECURSIVE_SUFFIX]
+    prof = _profile(ws, rec)
+    verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[link], cwd=ws), prof, ws)
+    check("outside_link_still_denies", verdict.blocks and verdict.rule == "mrh.path", repr(verdict))
+    check("outside_reason_names_the_real_interpreter", interp in verdict.reason, verdict.reason)
+    check("outside_reason_says_symlink", "through a symlink" in verdict.reason, verdict.reason)
+    check("outside_reason_does_not_blame_the_granted_repo",
+          "'proj' is not granted" not in verdict.reason, verdict.reason)
+
+    for name in ("granted", "notgranted"):
+        os.makedirs(os.path.join(ws, name), exist_ok=True)
+    secret = os.path.join(ws, "notgranted", "data.txt")
+    open(secret, "w").close()
+    inlink = os.path.join(ws, "granted", "peek")
+    os.symlink(secret, inlink)
+    only = ["path:" + os.path.join(ws, "granted") + G.RECURSIVE_SUFFIX]
+    verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[inlink], cwd=ws),
+                         _profile(ws, only), ws)
+    check("in_workspace_link_still_denies", verdict.blocks and verdict.rule == "mrh.path",
+          repr(verdict))
+    check("in_workspace_reason_names_the_resolved_file", secret in verdict.reason, verdict.reason)
+    check("in_workspace_reason_says_symlink", "through a symlink" in verdict.reason,
+          verdict.reason)
+    check("in_workspace_reason_does_not_blame_the_link_repo",
+          "'granted' is not granted" not in verdict.reason, verdict.reason)
+
+    for proc in (f"/proc/{os.getpid()}/cwd", f"/proc/{os.getpid()}/exe"):
+        verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[proc], cwd=ws), prof, ws)
+        check(f"ungranted_proc_path_still_denies[{proc}]", verdict.blocks, verdict.rule)
+        check(f"ungranted_proc_target_is_not_disclosed[{proc}]",
+              os.path.realpath(proc) not in verdict.reason
+              and "through a symlink" not in verdict.reason, verdict.rule)
+    dangling = os.path.join(outside, "missing-target")
+    ungranted_link = os.path.join(ws, "notgranted", "dangling")
+    os.symlink(dangling, ungranted_link)
+    verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[ungranted_link], cwd=ws),
+                         _profile(ws, only), ws)
+    check("ungranted_dangling_link_still_denies", verdict.blocks, verdict.rule)
+    check("ungranted_dangling_target_is_not_disclosed",
+          dangling not in verdict.reason and "through a symlink" not in verdict.reason,
+          verdict.rule)
+
+
 def test_temp_root_is_a_path_boundary_not_a_prefix():
     """codex #169 finding 2. `startswith("/tmp")` admits `/tmp-other` — a SIBLING of the temp
     root, and a directory anyone can create. That would hand a member unconditional reach by
@@ -1352,6 +1404,7 @@ ALL_TESTS = [
     "test_path_grants_keep_their_type_and_match_resolved_boundaries",
     "test_a_being_gets_no_launch_cwd_grant_without_a_declared_launch_dir",
     "test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly",
+    "test_a_read_symlink_deny_names_the_resolved_target_not_the_granted_link",
     "test_temp_root_is_a_path_boundary_not_a_prefix",
     "test_shims_contain_no_policy",
     "test_unscoped_must_be_declared_never_inferred",
@@ -1432,6 +1485,7 @@ if __name__ == "__main__":
     test_path_grants_keep_their_type_and_match_resolved_boundaries()
     test_a_being_gets_no_launch_cwd_grant_without_a_declared_launch_dir()
     test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly()
+    test_a_read_symlink_deny_names_the_resolved_target_not_the_granted_link()
     test_temp_root_is_a_path_boundary_not_a_prefix()
     test_shims_contain_no_policy()
     test_unscoped_must_be_declared_never_inferred()
