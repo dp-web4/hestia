@@ -662,7 +662,7 @@ def test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly():
 
 
 def test_a_read_symlink_deny_names_the_resolved_target_not_the_granted_link():
-    """#1116: the boundary stays closed, but the reason names the resolved target."""
+    """#1116: denial text never resolves past the member's own readlink reach."""
     ws = _workspace()
     outside = tempfile.mkdtemp(dir=os.path.dirname(ws))
     interp = os.path.realpath(sys.executable)
@@ -686,8 +686,8 @@ def test_a_read_symlink_deny_names_the_resolved_target_not_the_granted_link():
     inlink = os.path.join(ws, "granted", "peek")
     os.symlink(secret, inlink)
     only = ["path:" + os.path.join(ws, "granted") + G.RECURSIVE_SUFFIX]
-    verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[inlink], cwd=ws),
-                         _profile(ws, only), ws)
+    only_prof = _profile(ws, only)
+    verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[inlink], cwd=ws), only_prof, ws)
     check("in_workspace_link_still_denies", verdict.blocks and verdict.rule == "mrh.path",
           repr(verdict))
     check("in_workspace_reason_names_the_resolved_file", secret in verdict.reason, verdict.reason)
@@ -697,20 +697,51 @@ def test_a_read_symlink_deny_names_the_resolved_target_not_the_granted_link():
           "'granted' is not granted" not in verdict.reason, verdict.reason)
 
     for proc in (f"/proc/{os.getpid()}/cwd", f"/proc/{os.getpid()}/exe"):
+        prof = _profile(ws, rec)
         verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[proc], cwd=ws), prof, ws)
-        check(f"ungranted_proc_path_still_denies[{proc}]", verdict.blocks, verdict.rule)
+        check(f"ungranted_proc_path_still_denies[{proc}]", verdict.blocks, verdict.reason)
         check(f"ungranted_proc_target_is_not_disclosed[{proc}]",
               os.path.realpath(proc) not in verdict.reason
-              and "through a symlink" not in verdict.reason, verdict.rule)
+              and "through a symlink" not in verdict.reason, verdict.reason)
+
+        granted_proc_link = os.path.join(ws, "proj", "link-to-" + os.path.basename(proc))
+        os.symlink(proc, granted_proc_link)
+        verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[granted_proc_link], cwd=ws),
+                             prof, ws)
+        check(f"granted_proc_link_still_denies[{proc}]", verdict.blocks, verdict.reason)
+        check(f"granted_proc_link_names_only_first_hop[{proc}]",
+              proc in verdict.reason and os.path.realpath(proc) not in verdict.reason,
+              verdict.reason)
+
+    only_prof = _profile(ws, only)
     dangling = os.path.join(outside, "missing-target")
     ungranted_link = os.path.join(ws, "notgranted", "dangling")
     os.symlink(dangling, ungranted_link)
     verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[ungranted_link], cwd=ws),
-                         _profile(ws, only), ws)
-    check("ungranted_dangling_link_still_denies", verdict.blocks, verdict.rule)
+                         only_prof, ws)
+    check("ungranted_dangling_link_still_denies", verdict.blocks, verdict.reason)
     check("ungranted_dangling_target_is_not_disclosed",
           dangling not in verdict.reason and "through a symlink" not in verdict.reason,
-          verdict.rule)
+          verdict.reason)
+
+    ungranted_real_link = os.path.join(ws, "notgranted", "real-link")
+    os.symlink(secret, ungranted_real_link)
+    verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[ungranted_real_link], cwd=ws),
+                         only_prof, ws)
+    check("ungranted_real_link_still_denies", verdict.blocks, verdict.reason)
+    check("ungranted_real_target_is_not_disclosed",
+          secret not in verdict.reason and "through a symlink" not in verdict.reason,
+          verdict.reason)
+
+    for label, second_hop in (("real", ungranted_real_link), ("dangling", ungranted_link)):
+        granted_chain = os.path.join(ws, "granted", "via-" + label)
+        os.symlink(second_hop, granted_chain)
+        verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[granted_chain], cwd=ws),
+                             only_prof, ws)
+        check(f"granted_{label}_chain_still_denies", verdict.blocks, verdict.reason)
+        check(f"granted_{label}_chain_names_only_first_hop",
+              second_hop in verdict.reason and dangling not in verdict.reason
+              and secret not in verdict.reason, verdict.reason)
 
 
 def test_temp_root_is_a_path_boundary_not_a_prefix():

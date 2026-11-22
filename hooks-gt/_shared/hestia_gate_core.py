@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 2580ca0931b098aef8dd1c5e2a7be4a1a3ce5852861788148d1c70cfbe4a3686  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: ea692c372bb73bfb0c6873930adeb6fb55b75060446534445c378cafe13c6c77  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -4020,15 +4020,18 @@ def evaluate(event: NormalizedEvent, profile: HarnessProfile,
             lexical_scopes = (list(scopes) + list(read_scopes)
                               + [entry for entry, _modes in mode_scopes])
             if _lexical_grant_contains(norm, lexical_scopes, ws):
-                resolved = os.path.realpath(norm).replace("\\", "/")
-                if resolved != norm:
-                    resolution = f"it resolves to '{_elide(resolved)}' through a symlink; "
+                try:
+                    first_hop = os.readlink(norm)
+                except (OSError, ValueError):
+                    pass
+                else:
+                    resolution = f"it resolves through a symlink to '{_elide(first_hop)}'; "
             # A narrowed grant that REACHES the path is a grant: the refusal must not open by
             # calling it "not granted" and then say it is narrowed (probe on #1383, point 2).
-            # When a symlink changes the target, name that target instead of blaming the
-            # granted lexical segment (#1116).
+            # Name only the hop the member could readlink itself; realpath would cross
+            # ungranted hops and disclose their targets (#1116).
             where = (resolution + "a grant reaches it, but not in the mode this act needs" if mode_hint
-                     else resolution + "the resolved target is outside your granted scope" if resolution
+                     else resolution + "the link target is outside your granted scope" if resolution
                      else f"'{seg}' is not granted" if seg else "it is outside the workspace")
             hint = _exact_grant_hint(absolute, scopes, ws) + mode_hint
             lead = "beyond your grant's modes" if mode_hint else "outside your granted scope"
