@@ -12292,6 +12292,32 @@ mod accountability_tests {
         );
     }
 
+    /// NOVA on #1551 at f767e874: the new `member_lct` site in `tool_query_policy` must name the
+    /// same authenticated session as the gate decision. Both rows of one enforced deny must
+    /// carry the same member, instance LCT, role and session.
+    #[tokio::test]
+    async fn the_resource_observation_names_the_same_member_as_the_deny_row() {
+        let (_dir, state, sid) = gated_session("enforce", u64::MAX).await;
+        let out = gate_bash(&state, &sid, "cargo-serial test").await;
+        assert_eq!(out["decision"], "deny");
+        let s = state.lock().await;
+        let chain = s.recent_chain(20);
+        let row = |kind: &str| {
+            chain
+                .iter()
+                .find(|e| e.event_type == kind)
+                .unwrap_or_else(|| panic!("no {kind} row"))
+                .event_data
+                .clone()
+        };
+        let (obs, pd) = (row("resource_observation"), row("policy_decision"));
+        assert_eq!(obs["plugin_id"], "kimi-code", "the session's member: {obs}");
+        for field in ["plugin_id", "instance_lct", "role_lct", "session_id", "action_id"] {
+            assert_eq!(obs[field], pd[field], "{field} differs: obs={obs} pd={pd}");
+        }
+        assert!(!obs["instance_lct"].is_null(), "a connected member is named: {obs}");
+    }
+
     #[tokio::test]
     async fn enforce_mode_routes_direct_cargo_to_the_runner_and_an_affordable_runner_act_passes() {
         let (_dir, state, sid) = gated_session("enforce", 0).await;

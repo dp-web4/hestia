@@ -303,7 +303,18 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // `tool_name` and `target`, never from this value, and the verdict is deliberately
     // unchanged either way — so a registry miss yields a `null` in the record and alters
     // no outcome. Naming, not Predicate, same class as its two siblings.
+    //
+    // FOURTH LINE ADDED 2026-11-22 (legion-claude, #1551 gated resources — the
+    // `resource_observation` entry; NOVA asked for this reading rather than a count refresh).
+    // (1) Does it change who gets named? No — it names the SAME `plugin_id_for_chain` (the
+    // session's plugin id, from `session_identity`) that the `policy_decision` row of the same
+    // call names, on a new entry kind. (2) Is any derived name COMPARED to decide control flow?
+    // No: `instance_lct` is serialised into the observation payload and read by nothing. The
+    // resource verdict is folded in phase 2, before the state lock and before this line runs,
+    // from the act and the probe readings only. Pinned by the handler test
+    // `the_resource_observation_names_the_same_member_as_the_deny_row`. Naming.
     ("server/handler.rs::tool_query_policy", &[
+        "let instance_lct = s.member_lct(&plugin_id_for_chain);",
         "let instance_lct = s.member_lct(&plugin_id_for_chain);",
         "let instance_lct = s.member_lct(&plugin_id_for_chain);",
         "let instance_lct = s.member_lct(&plugin_id_for_chain);",
