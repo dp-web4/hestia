@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: ace2896a21bc14f20378938dcde13c3ff039007863f6086bc24928e0b08ed830  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: e942caa3163c6560da3230af8eedf423fa97ac983649f6794f2366fe98a46f96  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1479,10 +1479,9 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
     if name == "touch":
         return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
     if name in ("python", "python3", "perl", "node", "ruby"):
-        # Direct script invocation is a WRITE floor: a governed path in argv may be opened for
-        # writing by the script. Flags/-c/stdin and heredoc bodies are separate grammar (#1146).
-        # args[0] is the SCRIPT: running it executes it, it does not write it. Only the argv
-        # handed TO the script is the floor (running a governed test suite stays a read).
+        # Direct script ARGV is a WRITE floor: governed paths handed TO the script may be written.
+        # Flags/-c/stdin and heredoc bodies are separate grammar (#1146). args[0] is the SCRIPT,
+        # not data handed to it; execution is not proven read-only (self-writers are separate work).
         if not args or args[0].startswith("-"):
             return []
         return _positionals(args[1:])
