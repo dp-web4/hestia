@@ -15,8 +15,9 @@ pub mod inbox;
 pub mod trust;
 
 pub use chain::{
-    ChainEntry, ChainSignatureRecord, ChainVerification, ChainWitnessSigner, SignatureState,
-    SqliteChainStore, WitnessInstall,
+    verify_chain_segment, ChainEntry, ChainSegment, ChainSegmentEntry, ChainSegmentStatus,
+    ChainSegmentVerification, ChainSignatureRecord, ChainVerification, ChainWitnessSigner,
+    SignatureState, SqliteChainStore, WitnessInstall, CHAIN_SEGMENT_FORMAT,
 };
 pub use inbox::{HubReceiptCustody, InboxNotice, RouterPacketState, SqliteInboxStore};
 pub use trust::TrustStore;

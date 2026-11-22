@@ -174,6 +174,17 @@ This is the part that runs every day and has the scars to prove it.
 | **Delegation** | Measured | Scoped by role+action, signed, revocable. |
 | **Plugin SDK** | Measured | Rust, TypeScript, Python — same interface. |
 
+**Portable chain segments (#1449):** an operator can export an inclusive range with
+`hestia chain-export --from 0 --to 42 > segment.json`. Anyone with the file can then run
+`hestia chain-verify segment.json` without a vault, database, passphrase or daemon. The verdict is
+`valid`, `tampered` or `unverifiable`; a missing signing key is the last, not evidence of either
+validity or tampering. The JSON report states the residual limits: it does not establish complete
+capture, non-bypass of the gate, truthful event semantics, authorized witness membership or key
+custody. A non-genesis segment also cannot recompute its chain id or prove pre-segment history.
+`fixtures/chain-segment/` carries valid, altered, swapped and missing-key examples. Regenerate them
+against a disposable daemon with `python3 tools/chain_segment_smoke.py --binary /path/to/hestia
+--fixtures-dir fixtures/chain-segment --write`; check them without the daemon by omitting `--write`.
+
 **Assurance ceiling, stated with it:** all of the above is profile **A1** — a cooperative
 gate running as the same UID as the operator. Tamper-**evident**, not tamper-proof.
 [`docs/GATE_BYPASS_CATALOG.md`](docs/GATE_BYPASS_CATALOG.md) catalogues the ways around it,

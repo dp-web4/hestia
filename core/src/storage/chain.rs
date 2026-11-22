@@ -360,6 +360,64 @@ impl ChainVerification {
     }
 }
 
+pub const CHAIN_SEGMENT_FORMAT: &str = "hestia-chain-segment:v1";
+
+/// One chain row as stored. `event_data_json` preserves the exact bytes the legacy hash covers;
+/// `event_data` makes the export convenient to read. Offline verification checks they agree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainSegmentEntry {
+    pub hash: String,
+    pub prev_hash: String,
+    pub timestamp: String,
+    pub event_type: String,
+    pub event_data: serde_json::Value,
+    pub event_data_json: String,
+    pub signer_lct: String,
+    pub chain_position: u64,
+}
+
+/// A portable proof object. Public keys ride inside each signature record; no vault or daemon is
+/// needed to check them. `society_lct` is exporter context, not a replacement for key custody.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainSegment {
+    pub format: String,
+    pub chain_id: String,
+    pub society_lct: String,
+    pub previous_hash: Option<String>,
+    pub signed_from_position: Option<u64>,
+    pub entries: Vec<ChainSegmentEntry>,
+    pub signatures: Vec<ChainSignatureRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainSegmentStatus {
+    Valid,
+    Tampered,
+    Unverifiable,
+}
+
+/// The offline verdict, including cases where absence of evidence must not read as either a pass
+/// or proof of tampering. Every failure string names its chain position when one is available.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChainSegmentVerification {
+    pub status: ChainSegmentStatus,
+    pub checked_entries: u64,
+    pub signed_valid: u64,
+    pub legacy_unsigned: u64,
+    pub link_intact: bool,
+    pub tampered: Vec<String>,
+    pub unverifiable: Vec<String>,
+    pub witnesses: BTreeMap<String, WitnessKeyUse>,
+    pub limitations: Vec<String>,
+}
+
+impl ChainSegmentVerification {
+    pub fn is_valid(&self) -> bool {
+        self.status == ChainSegmentStatus::Valid
+    }
+}
+
 /// What [`SqliteChainStore::install_witness_signer`] did with the chain it found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WitnessInstall {
@@ -2032,6 +2090,84 @@ impl SqliteChainStore {
         Ok(count)
     }
 
+    /// Export one inclusive range and its signature evidence from a single read snapshot.
+    /// `from == 0` anchors at the genesis sentinel; any other range anchors at the preceding
+    /// row's hash, so an offline reader can check the first link too.
+    pub fn export_segment(&self, from: u64, to: u64, society_lct: &str) -> Result<ChainSegment> {
+        anyhow::ensure!(from <= to, "segment start {from} is after end {to}");
+        anyhow::ensure!(!society_lct.trim().is_empty(), "segment society LCT is empty");
+        let conn = self.observed(&self.read_conn)?;
+        let previous_hash = if from == 0 {
+            GENESIS_PREV_HASH.to_string()
+        } else {
+            conn.query_row(
+                "SELECT hash FROM chain_entries WHERE chain_position = ?1",
+                params![(from - 1) as i64],
+                |row| row.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("segment anchor at position {} is absent", from - 1))?
+        };
+        let signed_from_position = signing_boundary(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
+                    e.signer_lct, e.timestamp,
+                    s.chain_position, s.row_hash, s.signature_version, s.chain_id, s.witness_lct,
+                    s.witness_public_key, s.policy_generation, s.signature
+               FROM chain_entries e
+               LEFT JOIN chain_signatures s ON s.chain_position = e.chain_position
+              WHERE e.chain_position BETWEEN ?1 AND ?2
+              ORDER BY e.chain_position ASC",
+        )?;
+        let mut rows = stmt.query(params![from as i64, to as i64])?;
+        let mut entries = Vec::new();
+        let mut signatures = Vec::new();
+        while let Some(row) = rows.next()? {
+            let chain_position = row.get::<_, i64>(0)? as u64;
+            let event_data_json: String = row.get(4)?;
+            let event_data = serde_json::from_str(&event_data_json)
+                .with_context(|| format!("position {chain_position}: malformed stored event JSON"))?;
+            entries.push(ChainSegmentEntry {
+                hash: row.get(1)?,
+                prev_hash: row.get(2)?,
+                event_type: row.get(3)?,
+                event_data,
+                event_data_json,
+                signer_lct: row.get(5)?,
+                timestamp: row.get(6)?,
+                chain_position,
+            });
+            if row.get::<_, Option<i64>>(7)?.is_some() {
+                signatures.push(ChainSignatureRecord {
+                    chain_position,
+                    row_hash: row.get(8)?,
+                    signature_version: row.get::<_, i64>(9)?.try_into().unwrap_or(u32::MAX),
+                    chain_id: row.get(10)?,
+                    witness_lct: row.get(11)?,
+                    witness_public_key: row.get(12)?,
+                    policy_generation: row.get(13)?,
+                    signature: row.get(14)?,
+                });
+            }
+        }
+        let expected = to - from + 1;
+        anyhow::ensure!(
+            entries.len() as u64 == expected,
+            "segment range {from}..={to} is not fully present (expected {expected} rows, got {})",
+            entries.len()
+        );
+        let chain_id = self.chain_id().context("cannot identify a segment without a genesis row")?;
+        Ok(ChainSegment {
+            format: CHAIN_SEGMENT_FORMAT.to_string(),
+            chain_id,
+            society_lct: society_lct.to_string(),
+            previous_hash: Some(previous_hash),
+            signed_from_position,
+            entries,
+            signatures,
+        })
+    }
+
     /// Both predicates — link integrity and signature authenticity (#339) — over one read
     /// snapshot, streamed (no `event_data` is parsed). Unlike [`Self::verify_integrity`] it does
     /// not stop at the first problem: a link break is recorded and the signature walk
@@ -2314,13 +2450,181 @@ fn compute_hash(
     event_type: &str,
     event_data_json: &str,
 ) -> String {
+    compute_hash_stored(prev_hash, &timestamp.to_rfc3339(), event_type, event_data_json)
+}
+
+fn compute_hash_stored(
+    prev_hash: &str,
+    timestamp: &str,
+    event_type: &str,
+    event_data_json: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prev_hash.as_bytes());
-    hasher.update(timestamp.to_rfc3339().as_bytes());
+    hasher.update(timestamp.as_bytes());
     hasher.update(event_type.as_bytes());
     hasher.update(event_data_json.as_bytes());
     let digest = hasher.finalize();
     digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Verify a portable segment without opening a vault, database or daemon. Absent anchors,
+/// signatures or keys are UNVERIFIABLE; altered rows, ordering and invalid signatures are TAMPERED.
+pub fn verify_chain_segment(segment: &ChainSegment) -> ChainSegmentVerification {
+    let mut out = ChainSegmentVerification {
+        status: ChainSegmentStatus::Valid,
+        checked_entries: 0,
+        signed_valid: 0,
+        legacy_unsigned: 0,
+        link_intact: true,
+        tampered: Vec::new(),
+        unverifiable: Vec::new(),
+        witnesses: BTreeMap::new(),
+        limitations: vec![
+            "complete capture and non-bypass of the gate are not established".into(),
+            "truthful event semantics and key custody are not established (A1)".into(),
+            "the society LCT is context; it does not prove this witness was authorised".into(),
+        ],
+    };
+    if segment.format != CHAIN_SEGMENT_FORMAT {
+        out.unverifiable.push(format!("unsupported segment format {:?}", segment.format));
+    }
+    if segment.chain_id.is_empty() {
+        out.unverifiable.push("segment chain_id is absent".into());
+    }
+    if segment.society_lct.trim().is_empty() {
+        out.unverifiable.push("segment society_lct is absent".into());
+    }
+    if segment.entries.is_empty() {
+        out.unverifiable.push("segment contains no entries".into());
+    }
+    if !segment.entries.iter().any(|e| e.chain_position == 0) {
+        out.limitations.push(
+            "a non-genesis segment cannot recompute its chain id or prove pre-segment history".into(),
+        );
+    }
+
+    let mut signatures: BTreeMap<u64, Vec<&ChainSignatureRecord>> = BTreeMap::new();
+    for rec in &segment.signatures {
+        let pos = rec.chain_position;
+        let records = signatures.entry(pos).or_default();
+        if !records.is_empty() {
+            out.tampered.push(format!("position {pos}: duplicate signature records"));
+        }
+        records.push(rec);
+        if rec.witness_public_key.trim().is_empty() {
+            out.unverifiable.push(format!("position {pos}: signing key is absent"));
+        }
+    }
+
+    let mut expected_position = segment.entries.first().map(|e| e.chain_position);
+    let mut previous_hash = segment.previous_hash.clone();
+    let mut seen_signed = false;
+    for entry in &segment.entries {
+        let pos = entry.chain_position;
+        out.checked_entries += 1;
+        if expected_position != Some(pos) {
+            out.tampered.push(format!(
+                "position {pos}: ordering mismatch (expected {})",
+                expected_position.map(|p| p.to_string()).unwrap_or_else(|| "none".into())
+            ));
+        }
+        expected_position = Some(pos.saturating_add(1));
+        match previous_hash.as_deref() {
+            Some(expected) if entry.prev_hash != expected => {
+                out.link_intact = false;
+                out.tampered.push(format!("position {pos}: prev_hash mismatch"));
+            }
+            None if pos == 0 => {
+                if entry.prev_hash != GENESIS_PREV_HASH {
+                    out.link_intact = false;
+                    out.tampered.push(format!("position {pos}: prev_hash is not the genesis sentinel"));
+                }
+            }
+            None => out.unverifiable.push(format!(
+                "position {pos}: preceding anchor hash is absent; the first link cannot be checked"
+            )),
+            _ => {}
+        }
+        let recomputed = compute_hash_stored(
+            &entry.prev_hash,
+            &entry.timestamp,
+            &entry.event_type,
+            &entry.event_data_json,
+        );
+        if recomputed != entry.hash {
+            out.link_intact = false;
+            out.tampered.push(format!("position {pos}: hash mismatch"));
+        }
+        match serde_json::from_str::<serde_json::Value>(&entry.event_data_json) {
+            Ok(raw) if raw != entry.event_data => out.tampered.push(format!(
+                "position {pos}: event_data and event_data_json describe different content"
+            )),
+            Err(e) => out.tampered.push(format!("position {pos}: malformed event_data_json: {e}")),
+            _ => {}
+        }
+        if pos == 0 {
+            let derived = chain_id_for_genesis(&entry.hash);
+            if segment.chain_id != derived {
+                out.tampered.push(format!(
+                    "position 0: chain_id {:?} does not match genesis-derived {derived}",
+                    segment.chain_id
+                ));
+            }
+        }
+
+        let records = signatures.remove(&pos).unwrap_or_default();
+        if records.is_empty() {
+            if seen_signed || segment.signed_from_position.is_some_and(|from| pos >= from) {
+                out.unverifiable.push(format!(
+                    "position {pos}: signature is absent at or after signing began"
+                ));
+            } else {
+                out.legacy_unsigned += 1;
+            }
+        }
+        for rec in records {
+            seen_signed = true;
+            if rec.witness_public_key.trim().is_empty() {
+                continue;
+            }
+            match verify_row_signature(
+                &segment.chain_id,
+                pos,
+                &entry.hash,
+                &entry.signer_lct,
+                rec,
+            ) {
+                Ok(()) => {
+                    out.signed_valid += 1;
+                    let witness = out.witnesses.entry(rec.witness_public_key.clone()).or_insert_with(|| {
+                        WitnessKeyUse {
+                            witness_lct: rec.witness_lct.clone(),
+                            rows: 0,
+                            first_position: pos,
+                            last_position: pos,
+                        }
+                    });
+                    witness.rows += 1;
+                    witness.last_position = pos;
+                }
+                Err(reason) => out.tampered.push(format!("position {pos}: {reason}")),
+            }
+        }
+        previous_hash = Some(entry.hash.clone());
+    }
+    for pos in signatures.keys() {
+        out.tampered.push(format!("position {pos}: signature has no corresponding chain entry"));
+    }
+    if out.checked_entries > 0 && out.signed_valid == 0 && out.tampered.is_empty() {
+        out.unverifiable.push("segment contains no valid signature evidence".into());
+    }
+    if !out.tampered.is_empty() {
+        out.status = ChainSegmentStatus::Tampered;
+    } else if !out.unverifiable.is_empty() {
+        out.status = ChainSegmentStatus::Unverifiable;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -3630,5 +3934,108 @@ mod tests {
             "dbfb719edc9ccc95830dd8cf0e37bff4bb05f700f099e73acb942ec6f176bbab\
              6eb7b9e9bb0b72c66fe933ccaa40b65df3e9ef1c9cf9992478a2f083d03d4a0c"
         );
+    }
+
+    fn smoke_segment(dir: &TempDir) -> ChainSegment {
+        let (_path, store, witness) = signed_store(dir);
+        witness.set_policy_generation("policy:sha256:segment-fixture");
+        store.append("scope_granted", json!({"request_id": "scope-smoke", "path": "/fixture"}), witness.witness_lct()).unwrap();
+        store.append("policy_allow", json!({"tool_name": "Read", "target": "/fixture"}), witness.witness_lct()).unwrap();
+        store.append("policy_decision", json!({"decision": "deny", "rule_id": "mrh.path", "target": "/outside"}), witness.witness_lct()).unwrap();
+        store.append("outcome", json!({"success": false, "target": "/outside"}), witness.witness_lct()).unwrap();
+        store.export_segment(0, 3, "lct:web4:mb32:bsociety").unwrap()
+    }
+
+    #[test]
+    fn a_signed_segment_round_trips_and_verifies_offline() {
+        let dir = TempDir::new().unwrap();
+        let segment = smoke_segment(&dir);
+        let encoded = serde_json::to_string_pretty(&segment).unwrap();
+        let decoded: ChainSegment = serde_json::from_str(&encoded).unwrap();
+        let report = verify_chain_segment(&decoded);
+        assert!(report.is_valid(), "{report:?}");
+        assert_eq!((report.checked_entries, report.signed_valid, report.legacy_unsigned), (4, 4, 0));
+        assert!(report.link_intact);
+        assert_eq!(report.witnesses.values().map(|w| w.rows).sum::<u64>(), 4);
+        assert!(report.limitations.iter().any(|s| s.contains("non-bypass")));
+    }
+
+    #[test]
+    fn altered_segment_content_fails_and_names_the_entry() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        segment.entries[1].event_data["target"] = json!("/altered");
+        segment.entries[1].event_data_json = serde_json::to_string(&segment.entries[1].event_data).unwrap();
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(report.tampered.iter().any(|s| s.contains("position 1: hash mismatch")), "{report:?}");
+    }
+
+    #[test]
+    fn swapped_segment_entries_fail_ordering() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        segment.entries.swap(1, 2);
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(report.tampered.iter().any(|s| s.contains("ordering mismatch")), "{report:?}");
+    }
+
+    #[test]
+    fn an_absent_signing_key_is_unverifiable_not_valid_or_tampered() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        segment.signatures[0].witness_public_key.clear();
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(report.tampered.is_empty(), "{report:?}");
+        assert!(report.unverifiable.iter().any(|s| s.contains("position 0: signing key is absent")));
+    }
+
+    #[test]
+    fn a_missing_signature_or_anchor_is_unverifiable() {
+        let dir = TempDir::new().unwrap();
+        let (_path, store, witness) = signed_store(&dir);
+        store.append("evt", json!({"i": 0}), witness.witness_lct()).unwrap();
+        store.append("evt", json!({"i": 1}), witness.witness_lct()).unwrap();
+        let mut missing = store.export_segment(0, 1, "lct:web4:mb32:bsociety").unwrap();
+        missing.signatures.remove(0);
+        let report = verify_chain_segment(&missing);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(report.unverifiable.iter().any(|s| s.contains("signature is absent")));
+
+        let mut no_anchor = store.export_segment(1, 1, "lct:web4:mb32:bsociety").unwrap();
+        no_anchor.previous_hash = None;
+        let report = verify_chain_segment(&no_anchor);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(report.tampered.is_empty(), "{report:?}");
+        assert!(report.unverifiable.iter().any(|s| s.contains("anchor hash is absent")));
+    }
+
+    #[test]
+    fn a_non_genesis_segment_verifies_its_supplied_anchor() {
+        let dir = TempDir::new().unwrap();
+        let (_path, store, witness) = signed_store(&dir);
+        for i in 0..3 {
+            store.append("evt", json!({"i": i}), witness.witness_lct()).unwrap();
+        }
+        let segment = store.export_segment(1, 2, "lct:web4:mb32:bsociety").unwrap();
+        let report = verify_chain_segment(&segment);
+        assert!(report.is_valid(), "{report:?}");
+        assert!(report.limitations.iter().any(|s| s.contains("non-genesis")));
+    }
+
+    #[test]
+    fn a_wholly_unsigned_segment_is_unverifiable() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        store.append("evt", json!({"legacy": true}), "lct:a").unwrap();
+        let segment = store.export_segment(0, 0, "lct:web4:mb32:bsociety").unwrap();
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert_eq!(report.legacy_unsigned, 1);
+        assert!(report.link_intact);
+        assert!(report.unverifiable.iter().any(|s| s.contains("no valid signature evidence")));
     }
 }
