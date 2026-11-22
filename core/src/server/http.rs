@@ -1740,9 +1740,13 @@ pub async fn serve_with_callback(
     bind: &str,
     callback_keypair: Option<web4_core::crypto::KeyPair>,
 ) -> Result<()> {
+    super::api_version::mark_process_started();
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parsing bind address '{}'", bind))?;
+    // The dry-run reuse lookup returns an existing daemon session id. Without caller
+    // ownership proof (#824), it must not become an oracle on a non-loopback listener.
+    state.lock().await.allow_connect_dry_run = addr.ip().is_loopback();
 
     // Bounded operator bootstrap (RWOA genesis window): on a fresh vault this
     // mints the first operator so the gated surface isn't a permanent lockout;
@@ -2134,7 +2138,7 @@ pub async fn serve_with_callback(
         // an operator establishes a session; issuing a challenge grants nothing).
         .route("/api/operator/challenge", post(operator_challenge))
         .route("/api/operator/session", post(operator_session))
-        // The app/daemon handshake (web4#904): {version, build_id, api_compat}. Open for the
+        // The app/daemon handshake (web4#904): {version, build_id, api_compat, started_at}. Open for the
         // same reason as the challenge — the app must learn whether it speaks this daemon's
         // API before it can sign in — and it reveals only what `hestia --version` prints.
         // Lock-free; see server/api_version.rs.
@@ -7777,9 +7781,9 @@ async fn agent_register(
 // member's registry LCT (`agent_key_for_lct`), never typed -- the same rule as register.
 
 /// The nine society roles a delegation may carry, spelled as `parse_role` accepts them. A
-/// closed set, offered as a picker: `parse_role` maps any other string to `Custom(..)`, which
-/// is a free-text role by another name, and this surface takes no free-text identity of any
-/// kind. tools/delegation_panel_contract_test.py pins the picker to this list.
+/// closed set, offered as a picker: `parse_role` rejects every other string, so this surface
+/// takes no free-text role identity. tools/delegation_panel_contract_test.py pins the picker to
+/// this list.
 pub const DELEGATION_ROLES: &[&str] = &[
     "sovereign", "law_oracle", "policy_entity", "treasurer", "administrator",
     "archivist", "citizen", "witness", "auditor",
@@ -8016,13 +8020,21 @@ const AGENT_ACT_EVENTS: &[&str] = &["policy_decision", "outcome"];
 fn agent_acts_since(s: &crate::server::state::ServerState, plugin_id: &str, cutoff: &str) -> Result<usize, String> {
     let want = plugin_id.trim().to_string();
     s.chain_store
-        .scan_recent(Some(cutoff), Some(AGENT_ACT_EVENTS), 50_000, |row| {
+        .scan_recent_page(Some(cutoff), Some(AGENT_ACT_EVENTS), None,
+                          crate::storage::chain::ROUTINE_CHAIN_MAX, |row| {
             serde_json::from_str::<serde_json::Value>(row.event_data)
                 .ok()
                 .and_then(|v| v.get("plugin_id").and_then(|p| p.as_str()).map(str::to_string))
         })
-        .map(|ids| ids.into_iter().filter(|id| *id == want).count())
         .map_err(|e| e.to_string())
+        .and_then(|page| {
+            if page.before_position.is_some() {
+                Err(format!("more than {} recent acts; this member is LIVE but the exact count is unmeasurable",
+                            crate::storage::chain::ROUTINE_CHAIN_MAX))
+            } else {
+                Ok(page.rows.into_iter().filter(|id| *id == want).count())
+            }
+        })
 }
 
 /// PURE: what the retire guard says, given what it could measure. `Err` (unmeasurable) is a
@@ -9115,22 +9127,27 @@ struct ChainQuery {
     /// a count-first window makes filtered views shrink as other signers
     /// churn (the filtered-window illusion).
     range: Option<String>,
+    /// Exclusive chain cursor returned by the previous page.
+    before_position: Option<u64>,
 }
 
 async fn chain_query(
     State(state): State<SharedState>,
     Query(q): Query<ChainQuery>,
 ) -> impl IntoResponse {
-    let s = state.lock().await;
+    let chain = {
+        let s = state.lock().await;
+        std::sync::Arc::clone(&s.chain_store)
+    };
     let now = chrono::Utc::now();
     let (cutoff, default_cap) = match q.range.as_deref() {
-        Some("hour") => (Some(now - chrono::Duration::hours(1)), 2_000),
-        Some("day") => (Some(now - chrono::Duration::days(1)), 5_000),
-        Some("week") => (Some(now - chrono::Duration::weeks(1)), 10_000),
-        Some("all") => (None, 10_000),
+        Some("hour") => (Some(now - chrono::Duration::hours(1)), crate::storage::chain::ROUTINE_CHAIN_PAGE),
+        Some("day") => (Some(now - chrono::Duration::days(1)), crate::storage::chain::ROUTINE_CHAIN_PAGE),
+        Some("week") => (Some(now - chrono::Duration::weeks(1)), crate::storage::chain::ROUTINE_CHAIN_PAGE),
+        Some("all") => (None, crate::storage::chain::ROUTINE_CHAIN_PAGE),
         _ => (None, 50), // legacy: no range → old count-window behavior
     };
-    let limit = q.limit.unwrap_or(default_cap);
+    let limit = q.limit.unwrap_or(default_cap).min(crate::storage::chain::ROUTINE_CHAIN_MAX);
     let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
     // A FAILED read must not render as an EMPTY chain. This is the third site of the defect fixed
     // in the dashboard snapshot on 2026-08-01 (stats) and 2026-08-02 (#190, the recent feed): a
@@ -9149,28 +9166,29 @@ async fn chain_query(
     // because it is a substring match on a projected field, which SQL cannot do for us
     // without reaching into the JSON.
     let type_filter: Option<Vec<&str>> = q.event_type.as_deref().map(|t| vec![t]);
-    let (entries, read_error) =
-        match s
-            .chain_store
-            .scan_recent(cutoff_str.as_deref(), type_filter.as_deref(), limit, |r| {
-                let e = super::dashboard::flatten_row(r);
-                if let Some(ref tf) = q.tool {
-                    match e.tool_name {
-                        Some(ref tn) if tn.contains(tf.as_str()) => {}
-                        // A row with no tool_name cannot match a tool filter. Dropping it
-                        // here is the same verdict the old post-filter reached.
-                        _ => return None,
-                    }
+    let (entries, before_position, read_error) = match chain.scan_recent_page(
+        cutoff_str.as_deref(), type_filter.as_deref(), q.before_position, limit, |r| {
+            let e = super::dashboard::flatten_row(r);
+            if let Some(ref tf) = q.tool {
+                match e.tool_name {
+                    Some(ref tn) if tn.contains(tf.as_str()) => {}
+                    // A row with no tool_name cannot match a tool filter. Dropping it
+                    // here is the same verdict the old post-filter reached.
+                    _ => return None,
                 }
-                Some(e)
-            }) {
-            Ok(v) => (v, None),
-            Err(e) => {
-                tracing::error!("chain query read failed: {e}");
-                (Vec::new(), Some(e.to_string()))
             }
-        };
-    Json(serde_json::json!({ "entries": entries, "read_error": read_error }))
+            Some(e)
+        },
+    ) {
+        Ok(p) => (p.rows, p.before_position, None),
+        Err(e) => {
+            tracing::error!("chain query read failed: {e}");
+            (Vec::new(), None, Some(e.to_string()))
+        }
+    };
+    Json(serde_json::json!({
+        "entries": entries, "before_position": before_position, "read_error": read_error
+    }))
 }
 
 /// `GET /api/governance/ledger?status=&range=&limit=` — the operator's ledger of ADMIN acts.
@@ -9224,36 +9242,41 @@ async fn governance_ledger(
         _ => Some(now_dt - chrono::Duration::days(30)),
     };
     let cutoff_str = cutoff.map(|c: chrono::DateTime<chrono::Utc>| c.to_rfc3339());
-    // The cap counts ADMIN ACTS, not chain entries — `read_recent_by_types` filters in SQL — so a
-    // wide range costs what its answer costs. Scanning the whole chain to discard member traffic
-    // would put the heaviest read in the daemon behind a UI panel.
-    const LEDGER_CAP: u64 = 5_000;
-
-    let (raw, read_error) = match chain.read_recent_by_types(
+    // A routine page is at most 500 selected admin acts by default, never more than 1,000.
+    // `before_position` makes older history an explicit follow-up rather than a 5,000-row read.
+    let chain_limit = q.limit.unwrap_or(crate::storage::chain::ROUTINE_CHAIN_PAGE)
+        .min(crate::storage::chain::ROUTINE_CHAIN_MAX);
+    let mut projection_error = None;
+    let scan = chain.scan_recent_page(
         cutoff_str.as_deref(),
-        gl::GOVERNANCE_EVENTS,
-        LEDGER_CAP,
-    ) {
-        Ok(v) => (v, None),
+        Some(gl::GOVERNANCE_EVENTS),
+        q.before_position,
+        chain_limit,
+        |row| match row.to_entry() {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                projection_error = Some(e.to_string());
+                None
+            }
+        },
+    );
+    let (raw, scanned, before_position, truncated, read_error) = match scan {
+        Ok(p) => {
+            let truncated = p.before_position.is_some();
+            (p.rows, p.scanned, p.before_position, truncated, projection_error)
+        }
         Err(e) => {
             tracing::error!("governance ledger chain read failed: {e}");
-            (Vec::new(), Some(e.to_string()))
+            (Vec::new(), 0, None, false, Some(e.to_string()))
         }
     };
-    let scanned = raw.len() as u64;
-    // The window FILLED. There may be older admin acts this page cannot see, and a reader must be
-    // told rather than shown a short list that looks complete.
-    let truncated = scanned >= LEDGER_CAP;
 
     let now = crate::server::gate_escalation::now_secs();
     let rows = gl::project(&raw, now);
-    let mut page = gl::page(
-        rows,
-        q.status.as_deref().unwrap_or("all"),
-        q.limit.unwrap_or(500).min(2_000) as usize,
-    );
+    let mut page = gl::page(rows, q.status.as_deref().unwrap_or("all"), chain_limit as usize);
     page.truncated = truncated;
     page.scanned = scanned;
+    page.before_position = before_position;
     page.read_error = read_error;
     Json(page)
 }
@@ -9265,6 +9288,8 @@ struct LedgerQuery {
     /// day | week | month (default) | all
     range: Option<String>,
     limit: Option<u64>,
+    /// Exclusive chain cursor returned by the previous page.
+    before_position: Option<u64>,
 }
 
 /// `POST /api/operator/gate-escalation` {id, approve, reason?} — the STRONG decision channel for
@@ -11896,6 +11921,25 @@ mod disposition_tests {
         assert!(retire_guard(&Ok(3), true).is_none());
     }
 
+    #[tokio::test]
+    async fn activity_beyond_the_routine_page_is_unmeasurable_not_truncated_488() {
+        let (_dir, state) = test_state().await;
+        {
+            let s = state.lock().await;
+            for _ in 0..=crate::storage::chain::ROUTINE_CHAIN_MAX {
+                s.append_chain("outcome", serde_json::json!({
+                    "plugin_id": "kimi-code", "success": true
+                })).unwrap();
+            }
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let s = state.lock().await;
+        let err = agent_acts_since(&s, "kimi-code", &cutoff).unwrap_err();
+        assert!(err.contains("unmeasurable"), "{err}");
+        let refusal = retire_guard(&Err(err), false).expect("overflow must fail closed");
+        assert_eq!(refusal["unmeasurable"], serde_json::json!(true));
+    }
+
     /// cbp, finding 5: `retired_member_connected` was documented and did not exist.
     #[tokio::test]
     async fn a_retired_id_that_connects_is_witnessed_not_hidden() {
@@ -12811,7 +12855,7 @@ mod disposition_tests {
 
     async fn claim(state: &SharedState, member: &str, path: &str, act: &str, spend: bool)
         -> serde_json::Value {
-        crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+        crate::server::handler::claim_and_escalate(state, &serde_json::json!({
             "plugin_id": member, "path": path, "rule": "mrh.command", "tool_name": "Bash",
             "act": act, "act_digest": digest_of(act), "spend": spend,
             "host_session_id": "sess-under-test",
@@ -12820,7 +12864,7 @@ mod disposition_tests {
 
     async fn batch(state: &SharedState, member: &str, op: &str, op_key: &str, paths: &[&str],
                    act: &str) -> serde_json::Value {
-        crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+        crate::server::handler::claim_and_escalate(state, &serde_json::json!({
             "plugin_id": member, "op": op, "op_key": op_key, "paths": paths,
             "act_digest": digest_of(act),
         })).await.expect("batch answers")
@@ -12843,21 +12887,21 @@ mod disposition_tests {
     #[tokio::test]
     async fn scope_claim_requires_a_complete_act_digest_and_binds_to_it() {
         let (_dir, state) = test_state().await;
-        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let r = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.command",
             "tool_name": "Write", "act": "Write -> /etc/review-probe"})).await.unwrap();
         assert_eq!(r["_hestia_error"]["code"], "hestia.scope_claim_act_digest_required", "{r}");
         assert!(state.lock().await.scope_requests.is_empty(), "nothing opened without a digest");
         // Same display summary, different complete act (Write contents): distinct digests.
         let summary = "Write -> /etc/review-probe";
-        let id = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let id = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
             "tool_name": "Write", "act": summary, "act_digest": digest_of("content: one"),
             "spend": false})).await.unwrap()["request_id"].as_str().unwrap().to_string();
         assert_eq!(decide(&state, serde_json::json!({
             "request_id": &id, "granted": true, "reason": "one write", "once": true})).await.0,
             StatusCode::OK);
-        let other = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let other = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": "/etc/review-probe", "rule": "mrh.path",
             "tool_name": "Write", "act": summary, "act_digest": digest_of("content: two"),
             "spend": true})).await.unwrap();
@@ -12879,7 +12923,7 @@ mod disposition_tests {
     /// Open a gate request as a PROVEN asker (session) and return (id, invited peers, response).
     async fn proven_claim(state: &SharedState, member: &str, sid: &str, path: &str)
         -> (String, Vec<String>, serde_json::Value) {
-        let r = crate::server::handler::tool_scope_claim(state, &serde_json::json!({
+        let r = crate::server::handler::claim_and_escalate(state, &serde_json::json!({
             "plugin_id": member, "session_id": sid, "path": path, "rule": "mrh.command",
             "tool_name": "Bash", "act": format!("cat {path}"), "act_digest": digest_of(&format!("cat {path}")),
             "spend": false,
@@ -13367,7 +13411,7 @@ mod disposition_tests {
         let p = f.to_str().unwrap().to_string();
         // A READ, refused standing: the refusal records `r`.
         let act = format!("Read {p}");
-        let r = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let r = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
             "act": &act, "act_digest": digest_of(&act), "spend": false,
             "host_session_id": "sess-under-test"})).await.unwrap();
@@ -13386,7 +13430,7 @@ mod disposition_tests {
                 "a w-only grant must not lift a refused read");
         assert_eq!(lifted_rows(&state).await, rows, "no lift row for a lift that did not happen");
         // The refused read is still answered from the record, not re-asked.
-        let again = crate::server::handler::tool_scope_claim(&state, &serde_json::json!({
+        let again = crate::server::handler::claim_and_escalate(&state, &serde_json::json!({
             "plugin_id": "codex", "path": &p, "rule": "mrh.path", "tool_name": "Read",
             "act": &act, "act_digest": digest_of(&act), "spend": false,
             "host_session_id": "sess-under-test"})).await.unwrap();
@@ -13606,6 +13650,103 @@ mod disposition_tests {
         assert_eq!(opened.len(), 1, "one chain row for one ask");
         assert_eq!(opened[0].event_data["origin"], "gate_deny");
         assert!(!s.has_scope_grant("kimi-code", "/outside/mail/profile.ini"), "asking is not receiving");
+    }
+
+    // ---- dp, 2026-11-05: "don't do gate-generated scope requests to the operator. instead,
+    // deny with option to escalate. if the agent really needs it, they can escalate as a
+    // deliberate act." ----
+
+    fn gate_claim_args(member: &str, path: &str, act: &str) -> serde_json::Value {
+        serde_json::json!({
+            "plugin_id": member, "path": path, "rule": "mrh.command", "tool_name": "Bash",
+            "act": act, "act_digest": digest_of(act), "spend": false,
+            "host_session_id": "sess-under-test",
+        })
+    }
+
+    /// The gate's claim alone opens NOTHING: no request, no chain row, nobody invited. It
+    /// records the refusal and names the deliberate way forward; a re-issue keeps the same id.
+    #[tokio::test]
+    async fn scope_claim_alone_opens_nothing_and_names_the_escalation() {
+        let (_dir, state) = test_state().await;
+        let args = gate_claim_args("claude-code", "/srv/probe/apt", "grep -n apt /srv/probe/apt");
+        let a = crate::server::handler::tool_scope_claim(&state, &args).await.unwrap();
+        assert_eq!(a["verdict"], "not_asked", "{a}");
+        assert_eq!(a["permits"], false);
+        let rid = a["refusal_id"].as_str().expect("a refusal id").to_string();
+        assert!(rid.starts_with("refusal-"), "{rid}");
+        let detail = a["detail"].as_str().unwrap();
+        assert!(detail.contains("nothing was sent to the operator or to any peer"), "{detail}");
+        assert!(a["escalate"]["cli"].as_str().unwrap()
+                    .contains(&format!("hestia scope escalate {rid} --as claude-code")), "{a}");
+        let b = crate::server::handler::tool_scope_claim(&state, &args).await.unwrap();
+        assert_eq!(b["refusal_id"], rid.as_str(), "a re-issue keeps the same refusal id");
+        let s = state.lock().await;
+        assert!(s.scope_requests.is_empty(), "the gate opened nothing");
+        assert!(!s.recent_chain(20).iter().any(|e| e.event_type == "scope_requested"),
+                "no ask was recorded, because nobody asked");
+        assert_eq!(s.gate_refusals[&rid].origin.reissues, 1);
+    }
+
+    /// The member's deliberate escalation opens the request: its own reason first, the gate's
+    /// record of the act beside it, linked to the refusal, decided as before (peers, operator
+    /// override). The refusal is consumed: escalating it again finds nothing.
+    #[tokio::test]
+    async fn scope_escalate_opens_with_the_members_reason_and_the_gates_act() {
+        let (_dir, state) = test_state().await;
+        let sid = connect(&state, "kimi-code").await;
+        let mut args = gate_claim_args("kimi-code", "/srv/data/report.csv", "cat /srv/data/report.csv");
+        args["session_id"] = serde_json::json!(sid);
+        let a = crate::server::handler::tool_scope_claim(&state, &args).await.unwrap();
+        let rid = a["refusal_id"].as_str().unwrap().to_string();
+        let why = "summarising last week's report for the operator; this is the source file";
+        let e = crate::server::handler::tool_scope_escalate(&state, &serde_json::json!({
+            "plugin_id": "kimi-code", "session_id": sid, "refusal_id": rid, "reason": why,
+        })).await.unwrap();
+        assert_eq!(e["verdict"], "opened", "{e}");
+        assert_eq!(e["escalated_from"], rid.as_str());
+        let id = e["request_id"].as_str().unwrap().to_string();
+        {
+            let s = state.lock().await;
+            let r = &s.scope_requests[&id];
+            assert!(r.reason.starts_with(why), "the member's words lead: {}", r.reason);
+            assert!(r.reason.contains("act: cat /srv/data/report.csv"), "{}", r.reason);
+            let g = r.ext.gate.as_ref().unwrap();
+            assert_eq!(g.member_reason.as_deref(), Some(why));
+            assert_eq!(g.escalated_from.as_deref(), Some(rid.as_str()));
+            assert_eq!(g.act_digest, digest_of("cat /srv/data/report.csv"),
+                       "a one-time approval still binds to exactly the refused act");
+            assert_eq!(g.asker_basis, crate::arbiter::AskerBasis::Session);
+            let row = s.recent_chain(10).into_iter().find(|e| e.event_type == "scope_requested").unwrap();
+            assert_eq!(row.event_data["origin"], "gate_deny");
+            assert_eq!(row.event_data["member_reason"], why);
+            assert!(!s.gate_refusals.contains_key(&rid), "the refusal is consumed");
+        }
+        let again = crate::server::handler::tool_scope_escalate(&state, &serde_json::json!({
+            "plugin_id": "kimi-code", "session_id": sid, "refusal_id": rid, "reason": why,
+        })).await.unwrap();
+        assert_eq!(again["_hestia_error"]["code"], "hestia.scope_refusal_unknown", "{again}");
+    }
+
+    /// Only the refused member escalates its refusal; a thin reason opens nothing; an unknown
+    /// id says how to get a fresh one.
+    #[tokio::test]
+    async fn scope_escalate_refuses_another_member_a_thin_reason_and_an_unknown_id() {
+        let (_dir, state) = test_state().await;
+        let a = crate::server::handler::tool_scope_claim(
+            &state, &gate_claim_args("codex", "/srv/x", "cat /srv/x")).await.unwrap();
+        let rid = a["refusal_id"].as_str().unwrap().to_string();
+        let esc = |member: &str, id: &str, reason: &str| serde_json::json!({
+            "plugin_id": member, "refusal_id": id, "reason": reason});
+        let other = crate::server::handler::tool_scope_escalate(
+            &state, &esc("kimi-code", &rid, "I would like to read that file please")).await.unwrap();
+        assert_eq!(other["_hestia_error"]["code"], "hestia.scope_escalate_not_yours", "{other}");
+        let thin = crate::server::handler::tool_scope_escalate(&state, &esc("codex", &rid, "need it")).await.unwrap();
+        assert_eq!(thin["_hestia_error"]["code"], "hestia.scope_escalate_reason_thin", "{thin}");
+        let unknown = crate::server::handler::tool_scope_escalate(
+            &state, &esc("codex", "refusal-000000000000", "reading the config to fix the build")).await.unwrap();
+        assert_eq!(unknown["_hestia_error"]["code"], "hestia.scope_refusal_unknown", "{unknown}");
+        assert!(state.lock().await.scope_requests.is_empty(), "none of these opened anything");
     }
 
     /// ONE-TIME: spent only by the act that was refused, once, and never served as policy.
@@ -14453,11 +14594,64 @@ mod tests {
     ///   order as wakeup latency); (b) amplifying with K queued readers
     ///   serialized the readers themselves on one worker — K x read even with
     ///   the fix — because nobody was awake to steal the woken waiters.
+    #[tokio::test]
+    async fn chain_query_returns_bounded_pages_and_continuation_488() {
+        let (_dir, state) = make_shared_state();
+        {
+            let s = state.lock().await;
+            for i in 0..1_005 {
+                s.append_chain("policy_edit", serde_json::json!({
+                    "change": "add_rule", "rule_id": format!("r{i}")
+                })).unwrap();
+            }
+        }
+        let expected = state.lock().await.chain_len() as usize;
+        let resp = chain_query(
+            State(state.clone()),
+            Query(ChainQuery {
+                range: Some("all".into()), limit: Some(500), ..Default::default()
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(first["entries"].as_array().map(Vec::len), Some(500));
+        assert!(first["read_error"].is_null());
+        let cursor = first["before_position"].as_u64().expect("older rows");
+
+        let resp = chain_query(
+            State(state.clone()),
+            Query(ChainQuery {
+                range: Some("all".into()), limit: Some(500), before_position: Some(cursor),
+                ..Default::default()
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["entries"].as_array().map(Vec::len), Some(500));
+        let cursor = second["before_position"].as_u64().expect("the final page");
+        assert!(second["read_error"].is_null());
+
+        let resp = chain_query(
+            State(state.clone()),
+            Query(ChainQuery {
+                range: Some("all".into()), limit: Some(500), before_position: Some(cursor),
+                ..Default::default()
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let third: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(third["entries"].as_array().map(Vec::len), Some(expected - 1_000));
+        assert_eq!(third["before_position"], serde_json::Value::Null);
+        assert!(third["read_error"].is_null());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn governance_ledger_read_does_not_hold_the_state_lock() {
-        // ~77MB of event_data in total: the read costs ~2s on the 2026-08 WSL
-        // dev box. ROWS stays well under LEDGER_CAP (5000) so every seeded act
-        // is scanned; the per-row pad is what the fetch + parse pays for.
+        // ~77MB of event_data in total: the first page costs ~2s on the 2026-08 WSL
+        // dev box. ROWS crosses the hard page cap, so the cursor is exercised too.
         const ROWS: usize = 1_200;
         const PAD: usize = 65_536;
 
@@ -14486,6 +14680,7 @@ mod tests {
                             status: None,
                             range: Some("all".into()),
                             limit: Some(2_000),
+                            before_position: None,
                         }),
                     )
                     .await
@@ -14495,9 +14690,8 @@ mod tests {
             (handle, started_rx)
         };
 
-        // Calibrate: one full ledger read — and check the answer while at it:
-        // every seeded admin act, no read error (the lock change must not
-        // change the ledger's semantics).
+        // Calibrate one page, then follow its cursor: every seeded admin act is returned,
+        // no page exceeds the hard cap, and no read error is hidden.
         let t = std::time::Instant::now();
         let (h, started) = spawn_handler(&state);
         started.await.unwrap();
@@ -14508,9 +14702,27 @@ mod tests {
             .await
             .unwrap();
         let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(page["scanned"].as_u64(), Some(ROWS as u64));
-        assert_eq!(page["rows"].as_array().map(Vec::len), Some(ROWS));
+        assert_eq!(page["scanned"].as_u64(), Some(1_000));
+        assert_eq!(page["rows"].as_array().map(Vec::len), Some(1_000));
+        assert_eq!(page["truncated"].as_bool(), Some(true));
         assert!(page.get("read_error").is_none());
+        let cursor = page["before_position"].as_u64().expect("an older page");
+        let resp = governance_ledger(
+            State(state.clone()),
+            Query(LedgerQuery {
+                status: None,
+                range: Some("all".into()),
+                limit: Some(2_000),
+                before_position: Some(cursor),
+            }),
+        ).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let older: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(older["scanned"].as_u64(), Some((ROWS - 1_000) as u64));
+        assert_eq!(older["rows"].as_array().map(Vec::len), Some(ROWS - 1_000));
+        assert_eq!(older["before_position"], serde_json::Value::Null);
+        assert!(older.get("read_error").is_none());
 
         // The spinners: keep every other worker awake and stealing, so the
         // woken waiter below is polled promptly (see the doc comment).

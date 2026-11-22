@@ -51,6 +51,14 @@ pub struct ChainEntry {
     pub chain_position: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryPage {
+    pub entries: Vec<ChainEntry>,
+    /// Exclusive cursor for the next older page; `None` means the filtered floor was reached.
+    pub before_position: Option<u64>,
+    pub scanned: u64,
+}
+
 /// One chain row, borrowed for the lifetime of a [`SqliteChainStore::scan_recent`]
 /// projection callback.
 ///
@@ -78,6 +86,31 @@ impl ChainRowRef<'_> {
     pub fn project<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
         serde_json::from_str(self.event_data).ok()
     }
+
+    /// Materialize a full entry only for a caller that genuinely needs every field.
+    pub fn to_entry(&self) -> Result<ChainEntry> {
+        Ok(ChainEntry {
+            hash: self.hash.to_string(),
+            prev_hash: self.prev_hash.to_string(),
+            timestamp: DateTime::parse_from_rfc3339(self.timestamp)?.with_timezone(&Utc),
+            event_type: self.event_type.to_string(),
+            event_data: serde_json::from_str(self.event_data)?,
+            signer_lct: self.signer_lct.to_string(),
+            chain_position: self.chain_position,
+        })
+    }
+}
+
+pub const ROUTINE_CHAIN_PAGE: u64 = 500;
+pub const ROUTINE_CHAIN_MAX: u64 = 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainScanPage<T> {
+    pub rows: Vec<T>,
+    /// Exclusive cursor for the next older page; `None` means this page reached the floor.
+    pub before_position: Option<u64>,
+    /// Selected chain rows examined, before projection. Never exceeds `ROUTINE_CHAIN_MAX`.
+    pub scanned: u64,
 }
 
 // ------------------------------------------------------------------ B2 signed witness (#339)
@@ -1362,6 +1395,86 @@ impl SqliteChainStore {
         Ok(out)
     }
 
+    /// One bounded backward page over a timeframe and optional event-type set (#488).
+    /// The timestamp predicate uses `idx_chain_timestamp`; `before_position` is exclusive.
+    /// Continuation is measured from selected rows, before projection, so dropping every
+    /// projected row cannot make older matches look absent.
+    pub fn scan_recent_page<T>(
+        &self,
+        cutoff_rfc3339: Option<&str>,
+        event_types: Option<&[&str]>,
+        before_position: Option<u64>,
+        limit: u64,
+        mut project: impl FnMut(ChainRowRef<'_>) -> Option<T>,
+    ) -> Result<ChainScanPage<T>> {
+        if matches!(event_types, Some(t) if t.is_empty()) {
+            return Ok(ChainScanPage { rows: Vec::new(), before_position: None, scanned: 0 });
+        }
+        let limit = limit.clamp(1, ROUTINE_CHAIN_MAX);
+        let conn = self.observed(&self.read_conn)?;
+        let mut where_parts: Vec<String> = Vec::new();
+        if let Some(types) = event_types {
+            where_parts.push(format!("event_type IN ({})", vec!["?"; types.len()].join(",")));
+        }
+        if cutoff_rfc3339.is_some() {
+            where_parts.push("timestamp >= ?".to_string());
+        }
+        where_parts.push("chain_position < ?".to_string());
+        let from_sql = if cutoff_rfc3339.is_some() {
+            "chain_entries INDEXED BY idx_chain_timestamp"
+        } else {
+            "chain_entries"
+        };
+        let sql = format!(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM {from_sql} WHERE {}
+             ORDER BY chain_position DESC LIMIT ?",
+            where_parts.join(" AND ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(types) = event_types {
+            for t in types {
+                binds.push(Box::new(t.to_string()));
+            }
+        }
+        if let Some(c) = cutoff_rfc3339 {
+            binds.push(Box::new(c.to_string()));
+        }
+        let before = before_position.unwrap_or(u64::MAX);
+        binds.push(Box::new(i64::try_from(before).unwrap_or(i64::MAX)));
+        binds.push(Box::new((limit + 1) as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+
+        let mut rows = stmt.query(refs.as_slice())?;
+        let mut out = Vec::new();
+        let mut scanned = 0u64;
+        let mut oldest_scanned = None;
+        let mut continuation = None;
+        while let Some(row) = rows.next()? {
+            let position = row.get::<_, i64>(0)? as u64;
+            if scanned == limit {
+                continuation = oldest_scanned;
+                break;
+            }
+            scanned += 1;
+            oldest_scanned = Some(position);
+            let row_ref = ChainRowRef {
+                chain_position: position,
+                hash: row.get_ref(1)?.as_str()?,
+                prev_hash: row.get_ref(2)?.as_str()?,
+                event_type: row.get_ref(3)?.as_str()?,
+                event_data: row.get_ref(4)?.as_str()?,
+                signer_lct: row.get_ref(5)?.as_str()?,
+                timestamp: row.get_ref(6)?.as_str()?,
+            };
+            if let Some(v) = project(row_ref) {
+                out.push(v);
+            }
+        }
+        Ok(ChainScanPage { rows: out, before_position: continuation, scanned })
+    }
+
     pub fn read_recent_by_types(
         &self,
         cutoff_rfc3339: Option<&str>,
@@ -1494,6 +1607,164 @@ impl SqliteChainStore {
     /// "ambiguous" or a wrong single hit. Empty would also conflate
     /// *you typed garbage* with *no such entry*, which is the distinction the
     /// caller most needs.
+    /// The newest act timestamp for one member, without materializing a chain window (#488).
+    /// This is the liveness projection: the actor may be flat or nested by adjudicator shape.
+    pub fn latest_actor_act(&self, plugin_id: &str) -> Result<Option<String>> {
+        let conn = self.observed(&self.read_conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT timestamp FROM chain_entries
+             WHERE event_type IN ('outcome', 'policy_decision', 'adjudication', 'appeal')
+               AND (json_extract(event_data, '$.plugin_id') = ?1
+                    OR json_extract(event_data, '$.adjudicator') = ?1
+                    OR json_extract(event_data, '$.adjudicated_by.plugin_id') = ?1)
+             ORDER BY chain_position DESC LIMIT 1",
+        )?;
+        Ok(stmt.query_row(params![plugin_id], |row| row.get(0)).optional()?)
+    }
+
+    /// The newest actor act of `plugin_id` at or after `since` (an RFC 3339 timestamp in the
+    /// chain's own format), or `None` if there is none in that window.
+    ///
+    /// BOUNDED (#1555). [`Self::latest_actor_act`] walks back from the head until it finds a
+    /// match, so for a member that has not acted it decrypts and JSON-parses every actor row
+    /// the chain has ever held. Escalation open/claim run it for every eligible peer under
+    /// the daemon's state lock, and on cbp on 2026-11-10 that held the lock 2-3.5 minutes per
+    /// escalation: every gate call on the box timed out behind it. Liveness only
+    /// distinguishes the last hour, the last day, and older, so nothing before the window can
+    /// change its answer. Positions grow with time, so the window's first position is one
+    /// seek on `idx_chain_timestamp`, and the scan stops there.
+    pub fn latest_actor_act_since(&self, plugin_id: &str, since: &str) -> Result<Option<String>> {
+        let conn = self.observed(&self.read_conn)?;
+        let floor: Option<i64> = conn
+            .query_row(
+                "SELECT chain_position FROM chain_entries WHERE timestamp >= ?1
+                 ORDER BY timestamp ASC LIMIT 1",
+                params![since],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(floor) = floor else {
+            return Ok(None);
+        };
+        // `+event_type` keeps the planner on the rowid range: the event_type index would
+        // visit every actor row in the chain again.
+        let mut stmt = conn.prepare(
+            "SELECT timestamp FROM chain_entries
+             WHERE chain_position >= ?2
+               AND +event_type IN ('outcome', 'policy_decision', 'adjudication', 'appeal')
+               AND (json_extract(event_data, '$.plugin_id') = ?1
+                    OR json_extract(event_data, '$.adjudicator') = ?1
+                    OR json_extract(event_data, '$.adjudicated_by.plugin_id') = ?1)
+             ORDER BY chain_position DESC LIMIT 1",
+        )?;
+        Ok(stmt.query_row(params![plugin_id, floor], |row| row.get(0)).optional()?)
+    }
+
+    /// Unruled appeals in the position window, newest first (#488). The anti-join
+    /// projects only the open queue rather than parsing every appeal and ruling.
+    /// Only a later adjudication closes an appeal; an earlier ruling must not hide a new one.
+    pub fn open_appeal_rows(&self, window: u64) -> Result<Vec<ChainEntry>> {
+        let conn = self.observed(&self.read_conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT a.chain_position, a.hash, a.prev_hash, a.event_type,
+                    a.event_data, a.signer_lct, a.timestamp
+             FROM chain_entries a
+             WHERE a.event_type = 'appeal'
+               AND a.chain_position > (SELECT COALESCE(MAX(chain_position), 0) - ?1 FROM chain_entries)
+               AND NOT EXISTS (
+                   SELECT 1 FROM chain_entries j
+                   WHERE j.event_type = 'adjudication'
+                     AND j.chain_position > a.chain_position
+                     AND json_extract(j.event_data, '$.about_deny_hash') =
+                         json_extract(a.event_data, '$.deny_hash')
+               )
+             ORDER BY a.chain_position DESC",
+        )?;
+        let rows = stmt.query_map(params![window as i64], |row| {
+            row_to_entry(row)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
+    /// One backward page of member-readable history (#497). All filters apply in SQL,
+    /// before the cap, so `hasMore` describes the filtered set rather than the raw tail.
+    pub fn scan_history_before(
+        &self,
+        before_position: Option<u64>,
+        event_types: Option<&[&str]>,
+        tool_name: Option<&str>,
+        plugin_id: Option<&str>,
+        limit: u64,
+    ) -> Result<HistoryPage> {
+        if matches!(event_types, Some(types) if types.is_empty()) {
+            return Ok(HistoryPage { entries: Vec::new(), before_position: None, scanned: 0 });
+        }
+        let limit = limit.clamp(1, 500);
+        let conn = self.observed(&self.read_conn)?;
+        let mut where_parts = vec!["chain_position < ?".to_string()];
+        if let Some(types) = event_types {
+            where_parts.push(format!("event_type IN ({})", vec!["?"; types.len()].join(",")));
+        }
+        if tool_name.is_some() {
+            where_parts.push("json_extract(event_data, '$.tool_name') = ?".to_string());
+        }
+        if plugin_id.is_some() {
+            where_parts.push(
+                "COALESCE(json_extract(event_data, '$.plugin_id'),
+                          json_extract(event_data, '$.from_plugin_id'),
+                          json_extract(event_data, '$.requested_by.plugin_id')) = ?".to_string(),
+            );
+        }
+        let from_sql = if event_types.is_some() {
+            "chain_entries INDEXED BY idx_chain_event_type"
+        } else {
+            "chain_entries"
+        };
+        let sql = format!(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM {from_sql} WHERE {}
+             ORDER BY chain_position DESC LIMIT ?",
+            where_parts.join(" AND ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let before = before_position.unwrap_or(u64::MAX);
+        binds.push(Box::new(i64::try_from(before).unwrap_or(i64::MAX)));
+        if let Some(types) = event_types {
+            for event_type in types {
+                binds.push(Box::new(event_type.to_string()));
+            }
+        }
+        if let Some(tool) = tool_name {
+            binds.push(Box::new(tool.to_string()));
+        }
+        if let Some(member) = plugin_id {
+            binds.push(Box::new(member.to_string()));
+        }
+        binds.push(Box::new((limit + 1) as i64));
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut rows = stmt.query_map(refs.as_slice(), row_to_entry)?;
+        let mut entries = Vec::new();
+        let mut oldest_scanned = None;
+        let mut scanned = 0u64;
+        let mut continuation = None;
+        while let Some(row) = rows.next() {
+            if scanned == limit {
+                continuation = oldest_scanned;
+                break;
+            }
+            let entry = row??;
+            scanned += 1;
+            oldest_scanned = Some(entry.chain_position);
+            entries.push(entry);
+        }
+        Ok(HistoryPage { entries, before_position: continuation, scanned })
+    }
+
     /// Every `appeal` and `adjudication` row about one deny, with no recency window (#164).
     ///
     /// `ptr` is a deny hash or an appeal entry hash, whole or as a prefix of at least 8 hex
@@ -2488,6 +2759,150 @@ mod tests {
 
         // An empty type list asks for nothing — same rule as read_recent_by_types.
         assert!(store.scan_recent(None, Some(&[]), 10, |_| Some(())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn timeframe_pages_are_capped_projected_and_cursor_complete_488() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        for i in 0..1_005 {
+            store.append(
+                if i % 2 == 0 { "outcome" } else { "policy_decision" },
+                json!({"n": i}), "lct:test",
+            ).unwrap();
+        }
+        let cutoff = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        store.conn.lock().unwrap().execute(
+            "UPDATE chain_entries SET timestamp = '2000-01-01T00:00:00Z' WHERE chain_position = 0",
+            [],
+        ).unwrap();
+
+        let mut before = None;
+        let mut positions = Vec::new();
+        let mut scans = Vec::new();
+        for _ in 0..3 {
+            let page = store.scan_recent_page(
+                Some(&cutoff), None, before, ROUTINE_CHAIN_PAGE,
+                |row| Some(row.chain_position),
+            ).unwrap();
+            scans.push(page.scanned);
+            before = page.before_position;
+            positions.extend(page.rows);
+            if before.is_none() {
+                break;
+            }
+        }
+        let expected: Vec<u64> = store.read_recent(2_000).unwrap().into_iter()
+            .filter(|entry| entry.timestamp.to_rfc3339() >= cutoff)
+            .map(|entry| entry.chain_position)
+            .collect();
+        assert_eq!(scans, [500, 500, expected.len() as u64 - 1_000]);
+        assert_eq!(positions, expected);
+        assert_eq!(before, None, "the cutoff floor was reached without another page");
+
+        let capped = store.scan_recent_page(
+            Some(&cutoff), None, None, 5_000, |_| Some(()),
+        ).unwrap();
+        assert_eq!(capped.scanned, ROUTINE_CHAIN_MAX);
+        assert_eq!(capped.before_position, Some(expected[999]));
+
+        let dropped = store.scan_recent_page(
+            Some(&cutoff), Some(&["outcome"]), None, 7, |_| None::<()>,
+        ).unwrap();
+        assert!(dropped.rows.is_empty());
+        assert_eq!(dropped.scanned, 7);
+        assert!(dropped.before_position.is_some(),
+                "projection must not hide continuation of the selected rows");
+
+        let empty = store.scan_recent_page(
+            Some(&cutoff), Some(&[]), None, ROUTINE_CHAIN_PAGE, |_| Some(()),
+        ).unwrap();
+        assert_eq!(empty, ChainScanPage { rows: Vec::new(), before_position: None, scanned: 0 });
+    }
+
+    /// #1555: the bounded liveness scan stays on the rowid range. If the planner took the
+    /// event_type index instead, it would visit every actor row in the chain again and the
+    /// window would bound nothing.
+    #[test]
+    fn bounded_liveness_scan_walks_a_rowid_range_1555() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap();
+        for i in 0..50 {
+            store.append("outcome", json!({"plugin_id": format!("m{i}")}), "lct:test").unwrap();
+        }
+        let conn = store.observed(&store.read_conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT timestamp FROM chain_entries
+                 WHERE chain_position >= ?2
+                   AND +event_type IN ('outcome', 'policy_decision', 'adjudication', 'appeal')
+                   AND (json_extract(event_data, '$.plugin_id') = ?1
+                        OR json_extract(event_data, '$.adjudicator') = ?1
+                        OR json_extract(event_data, '$.adjudicated_by.plugin_id') = ?1)
+                 ORDER BY chain_position DESC LIMIT 1",
+            )
+            .unwrap()
+            .query_map(params!["nobody", 10], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join(" | ");
+        assert!(plan.contains("INTEGER PRIMARY KEY (rowid>?)"), "{plan}");
+        assert!(!plan.contains("idx_chain_event_type"), "{plan}");
+        drop(conn);
+        assert_eq!(
+            store.latest_actor_act_since("m7", "1970-01-01T00:00:00+00:00").unwrap(),
+            store.latest_actor_act("m7").unwrap(),
+        );
+    }
+
+    #[test]
+    fn appeal_queue_and_liveness_use_projections_not_a_tail_materialization_488() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(&dir.path().join("w.db"), TEST_KEY).unwrap();
+        store.append("appeal", json!({"deny_hash": "a", "plugin_id": "kimi-code"}), "lct:test").unwrap();
+        store.append("outcome", json!({"plugin_id": "kimi-code", "success": true}), "lct:test").unwrap();
+        store.append("adjudication", json!({"about_deny_hash": "a", "adjudicator": "codex"}), "lct:test").unwrap();
+        store.append("appeal", json!({"deny_hash": "b", "plugin_id": "gemini"}), "lct:test").unwrap();
+        store.append("adjudication", json!({"about_deny_hash": "other", "adjudicated_by": {"plugin_id": "kimi-code"}}), "lct:test").unwrap();
+
+        let open = store.open_appeal_rows(20_000).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].event_data["deny_hash"], "b");
+        assert_eq!(open[0].event_data["plugin_id"], "gemini");
+        assert!(store.open_appeal_rows(0).unwrap().is_empty());
+
+        let latest = store.latest_actor_act("kimi-code").unwrap().unwrap();
+        let expected = store.read_recent(1).unwrap()[0].timestamp.to_rfc3339();
+        assert_eq!(latest, expected, "the nested adjudicator is an actor act");
+        assert_eq!(store.latest_actor_act("nobody").unwrap(), None);
+        // The bounded form agrees inside its window and finds nothing past it (#1555).
+        let day_ago = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        assert_eq!(
+            store.latest_actor_act_since("kimi-code", &day_ago).unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(store.latest_actor_act_since("nobody", &day_ago).unwrap(), None);
+        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(store.latest_actor_act_since("kimi-code", &future).unwrap(), None);
+
+        let later = store.append(
+            "appeal",
+            json!({"deny_hash": "a", "plugin_id": "kimi-code", "reason": "new evidence"}),
+            "lct:test",
+        ).unwrap();
+        let open = store.open_appeal_rows(20_000).unwrap();
+        assert_eq!(open.len(), 2, "the older ruling must not hide the later appeal");
+        assert!(open.iter().any(|e| e.hash == later.hash));
+
+        store.append(
+            "adjudication",
+            json!({"about_deny_hash": "a", "adjudicator": "codex"}),
+            "lct:test",
+        ).unwrap();
+        let open = store.open_appeal_rows(20_000).unwrap();
+        assert_eq!(open.len(), 1, "a later ruling closes the later appeal too");
+        assert_eq!(open[0].event_data["deny_hash"], "b");
     }
 
     /// A dashboard projection is allowed to be slow; it is not allowed to

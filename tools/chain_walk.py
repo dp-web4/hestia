@@ -59,6 +59,19 @@ from typing import Any, Dict, Iterator, Optional, Sequence
 DEFAULT_ENDPOINT = "http://127.0.0.1:7711/mcp"
 MAX_WINDOW = 500  # handler clamps with .min(500)
 
+# One outcome vocabulary for every census (#540). Corroboration is evidence and a claim is
+# post-decision consumption; neither is terminal. Rates over the ask channel count attempts,
+# not only the subset that minted an escalation id.
+ESCALATION_TERMINAL_EVENTS = frozenset({
+    "gate_escalation_decided",
+    "gate_escalation_expired",
+    "gate_escalation_withdrawn",
+})
+ESCALATION_ATTEMPT_EVENTS = frozenset({
+    "gate_escalation_opened",
+    "gate_escalation_refused",
+})
+
 # The only keys `filter` understands. Anything else is silently ignored, so we refuse
 # it here rather than let the daemon serve a confidently wrong answer (trap 1).
 _ALLOWED_FILTER_KEYS = frozenset({"limit", "tool_name", "hash"})

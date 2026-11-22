@@ -168,6 +168,17 @@ enum Command {
         key: PathBuf,
     },
 
+    /// The member-mesh CLI, carried in this binary (#1503): `peek`, `drain`, `send`, `unanswered`,
+    /// `kinds [term]`. Runs the `hestia-mesh.py` compiled into this release (needs `python3`), as the
+    /// member named in HESTIA_MESH_PLUGIN; `kinds` prints the embedded KINDS.md. Adds no authority:
+    /// every act is the daemon's member tools under a stated, unauthenticated identity (#63).
+    #[command(disable_help_flag = true)]
+    Mesh {
+        /// Passed to the mesh CLI as-is (`hestia mesh help` prints its usage)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Governance-surface escalations — the remedy every gate deny already names.
     ///
     /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
@@ -200,6 +211,26 @@ enum GateCmd {
     Pending {
         /// Emit the daemon's `{ "pending": [...] }` response as JSON on stdout.
         /// Identity and caveats remain on stderr so this can be piped to a fold.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Escalate ONE governance-write refusal into an escalation, as a deliberate act (dp,
+    /// 2026-11-05: the gate no longer opens escalations on its own). The deny names the
+    /// refusal id. Requires --as (only the refused member may escalate its refusal). A scope
+    /// refusal id is accepted too.
+    Escalate {
+        /// The refusal id from the deny text (refusal-xxxxxxxxxxxx)
+        refusal_id: String,
+        /// What you are doing, and why it needs this write. The decider has only this sentence
+        /// and the refused act.
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// List unruled appeals, oldest first, with designation and your eligibility
+    Appeals {
+        /// Emit the daemon's `{ "open": [...] }` response as JSON on stdout.
         #[arg(long)]
         json: bool,
     },
@@ -976,6 +1007,23 @@ enum PolicyCmd {
 
 #[derive(Subcommand, Debug)]
 enum ScopeCmd {
+    /// Escalate ONE refusal the gate recorded into a scope request, as a deliberate act (dp,
+    /// 2026-11-05: the gate no longer asks on your behalf). The deny names the refusal id. A
+    /// NOT-SAME peer decides it; the operator may override.
+    Escalate {
+        /// The refusal id from the deny text (refusal-xxxxxxxxxxxx)
+        refusal_id: String,
+        /// What you are doing, and why it needs this path. The decider has only this sentence
+        /// and the refused act.
+        #[arg(long)]
+        reason: String,
+        /// Your own member id: only the member the gate refused may escalate its refusal
+        #[arg(long = "as")]
+        as_member: String,
+        /// Daemon MCP endpoint
+        #[arg(long, default_value = "http://127.0.0.1:7711")]
+        endpoint: String,
+    },
     /// List pending scope requests, including the ones the GATE opened on a refused act (with
     /// the act). Read-only: the operator rules them on the dashboard or the app.
     Pending {
@@ -1187,9 +1235,13 @@ pub fn run() -> AnyResult<()> {
             hestia::gate_cli::scope_peer_decide(&endpoint, &as_member, &request_id, decision,
                                                 grant_path, recursive, modes, &reason)
         }
+        Command::Scope(ScopeCmd::Escalate { refusal_id, reason, as_member, endpoint }) => {
+            hestia::gate_cli::scope_escalate(&endpoint, &as_member, &refusal_id, &reason)
+        }
         Command::Scope(ScopeCmd::Pending { json, as_member, endpoint }) => {
             hestia::gate_cli::scope_pending(&endpoint, as_member, "role:constellation:member", json)
         }
+        Command::Mesh { args } => std::process::exit(hestia::mesh_cli::run(&args)),
         Command::Gate { cmd, endpoint, asserted_id, role } => {
             use hestia::gate_cli;
             match cmd {
@@ -1198,9 +1250,18 @@ pub fn run() -> AnyResult<()> {
                 GateCmd::Pending { json } => {
                     gate_cli::pending(&endpoint, asserted_id, &role, json)
                 }
+                GateCmd::Appeals { json } => {
+                    gate_cli::appeals(&endpoint, asserted_id, &role, json)
+                }
                 GateCmd::Poll { escalation_id, wait } => {
                     gate_cli::poll(&endpoint, &escalation_id, asserted_id, &role, wait)
                 }
+                GateCmd::Escalate { refusal_id, reason } => match asserted_id {
+                    Some(who) => gate_cli::gate_escalate(&endpoint, &who, &role, &refusal_id, &reason),
+                    None => anyhow::bail!(
+                        "hestia gate escalate needs --as <member>: only the member the gate refused may escalate its refusal"
+                    ),
+                },
                 GateCmd::Lookup { request_key } => {
                     gate_cli::lookup(&endpoint, &request_key, asserted_id, &role)
                 }

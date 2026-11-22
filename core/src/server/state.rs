@@ -326,7 +326,62 @@ pub struct GateDenyOrigin {
     /// asserted asker's request is the operator's. Rows written before this field are asserted.
     #[serde(default)]
     pub asker_basis: crate::arbiter::AskerBasis,
+    /// The recorded refusal this request was escalated from (dp, 2026-11-05: the gate no longer
+    /// opens requests; the member escalates one deliberately). `None` on rows the gate opened
+    /// under the 2026-10-05 auto-open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated_from: Option<String>,
+    /// The member's own reason for escalating: what the decider reads beside the act.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_reason: Option<String>,
 }
+
+/// A scope REFUSAL the gate recorded instead of opening a request (dp, 2026-11-05: "don't do
+/// gate-generated scope requests to the operator. instead, deny with option to escalate. if the
+/// agent really needs it, they can escalate as a deliberate act. 'opened by the gate on a
+/// refused bash' is noise.").
+///
+/// It holds what the gate knew (the act, the rule, the digest a one-time approval would bind to)
+/// so a DELIBERATE `hestia_scope_escalate` can open the request with the gate's evidence and the
+/// member's own reason. It sits in no queue, invites nobody and is shown to nobody: it is the
+/// deny's memory, not an ask. Memory-only and short-lived, like the requests it may become.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GateRefusal {
+    pub id: String,
+    pub plugin_id: String,
+    pub role: String,
+    /// The refused path as the gate sent it (a `/*` glob or the unenumerated sentinel kept).
+    pub raw_path: String,
+    pub path: String,
+    pub origin: GateDenyOrigin,
+    pub refused_at: u64,
+    pub expires_at: u64,
+}
+
+/// A GOVERNANCE-WRITE refusal the claim door recorded instead of opening an escalation (dp,
+/// 2026-11-05, extending the scope ruling: "auto escalation should be emergency-only (i can't
+/// think what, at the moment). all escalations should be deliberate acts by agent, with
+/// reason.").
+///
+/// `claim_args` is the gate's claim call verbatim (act, marker, resolved targets, payload hash,
+/// request key), so a DELIBERATE `hestia_gate_escalation_escalate` opens exactly the escalation
+/// the gate would have opened, priced and bound the same, with the member's reason added. Like
+/// `GateRefusal` it sits in no queue, invites nobody and is shown to nobody.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GovernanceRefusal {
+    pub id: String,
+    pub plugin_id: String,
+    pub marker: String,
+    pub claim_args: serde_json::Value,
+    pub reissues: u32,
+    pub refused_at: u64,
+    pub expires_at: u64,
+}
+
+/// How long a refusal stays escalatable. Re-issuing the act refreshes it.
+pub const GATE_REFUSAL_TTL_SECS: u64 = 2 * 3600;
+/// The most refusals held at once (all members); past it the oldest are dropped.
+pub const GATE_REFUSAL_MAX: usize = 512;
 
 /// What a retirement actually removed, by channel.
 #[derive(Debug, Default, Clone, serde::Serialize, PartialEq)]
@@ -546,6 +601,9 @@ pub struct ServerState {
     pub scope_tally: std::collections::HashMap<(String, String), (u64, u64)>,
     pub vault: Vault,
     pub sessions: crate::server::published::Sessions,
+    /// The dry-run session lookup returns a real bearer id for a claimed member/host pair,
+    /// so it is admitted only when the HTTP listener is loopback. Off-host ownership is #824.
+    pub allow_connect_dry_run: bool,
     pub actions: HashMap<Uuid, InFlightAction>,
     /// BEHIND AN `Arc` SO A HEAVY READ NEED NOT HOLD THE GLOBAL STATE LOCK.
     ///
@@ -648,6 +706,12 @@ pub struct ServerState {
     /// refused is as much of the account as the record of one that was granted, and a map
     /// keyed by target would let a re-ask overwrite a refusal.
     pub scope_requests: crate::server::published::Watched<HashMap<String, ScopeRequest>>,
+    /// Scope refusals the gate recorded (see `GateRefusal`), keyed by refusal id. Not published:
+    /// nothing reads them but `hestia_scope_escalate`.
+    pub gate_refusals: HashMap<String, GateRefusal>,
+    /// Governance-write refusals the claim door recorded (see `GovernanceRefusal`), keyed by
+    /// refusal id. Not published: nothing reads them but `hestia_gate_escalation_escalate`.
+    pub governance_refusals: HashMap<String, GovernanceRefusal>,
     /// STANDING scope grants — the third row of `POLICY_SCOPE_ASYMMETRY`: durable,
     /// operator-decided, vault-persisted (`scope`/`standing` document), generation-counted.
     /// Loaded at startup, written back through `persist_standing_scope` on every operator
@@ -906,6 +970,50 @@ pub enum StandingGrantFailure {
     },
 }
 
+fn warm_configured_members(
+    vault: &mut Vault,
+    registry: &mut crate::member_registry::MemberRegistry,
+    synthetic: &HashSet<String>,
+    home: &Path,
+    sovereign_lct_id: &str,
+    sovereign_anchor: &str,
+) {
+    let seats = home.join("seats");
+    let mut paths = match std::fs::read_dir(&seats) {
+        Ok(entries) => entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect::<Vec<_>>(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!("[hestia] WARNING: configured-member warm-up could not read {}: {e}", seats.display());
+            Vec::new()
+        }
+    };
+    paths.sort();
+    let before = registry.len();
+    for path in paths {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("env") {
+            continue;
+        }
+        let Some(plugin_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if plugin_id.starts_with('_') {
+            continue;
+        }
+        crate::member_registry::ensure_member(
+            vault,
+            registry,
+            plugin_id,
+            synthetic.contains(plugin_id),
+            sovereign_lct_id,
+            sovereign_anchor,
+        );
+    }
+    let minted = registry.len().saturating_sub(before);
+    if minted > 0 {
+        eprintln!("[hestia] warmed {minted} configured member LCT(s) at startup (#423)");
+    }
+}
+
 impl ServerState {
     /// Open all persistent stores rooted at `home` and prepare server state.
     /// `passphrase` is the vault passphrase — used to derive the storage key
@@ -1018,7 +1126,7 @@ impl ServerState {
             &sovereign.lct_id(),
         );
         // Custodial member LCTs, loaded from the vault (minted lazily on connect).
-        let member_registry = crate::member_registry::load_members(&vault);
+        let mut member_registry = crate::member_registry::load_members(&vault);
         let retired_members = crate::server::retirement::load(&vault);
         // Resolve the active policy from the vault. Falls back to the
         // safety preset if the vault's named preset isn't built-in.
@@ -1064,6 +1172,16 @@ impl ServerState {
                 "synthetic-plugin set unreadable — failing closed instead of treating it as empty",
             )?
         };
+        // Pay every configured member's first-LCT mint here, before the first request can take
+        // the state lock. Unknown future members still use ensure_member on first connect.
+        warm_configured_members(
+            &mut vault,
+            &mut member_registry,
+            &synthetic_plugins,
+            home,
+            &sovereign.lct_id(),
+            &sovereign_lct,
+        );
 
         // Standing scope grants (durable loosenings — POLICY_SCOPE_ASYMMETRY row 3).
         // Present-but-unparseable must abort startup like the synthetic set: collapsing a
@@ -1146,6 +1264,8 @@ impl ServerState {
             scope_tally: std::collections::HashMap::new(),
             vault,
             sessions: crate::server::published::Sessions::default(),
+            // In-process/IPC handlers are local; the HTTP bind may narrow this before serving.
+            allow_connect_dry_run: true,
             actions: HashMap::new(),
             // Rebuilt from the chain + settle record, so a late witness for an action from before
             // this restart finds its row and its charge state (one-gate stage A). Evaluated
@@ -1175,6 +1295,9 @@ impl ServerState {
             instance_grants: crate::server::published::Watched::new(restored_grants),
             // Same reasoning, same lifetime: a widening dies with the daemon.
             scope_requests: crate::server::published::Watched::new(HashMap::new()),
+            // Refusals are the deny's memory, not asks: they die with the daemon.
+            gate_refusals: HashMap::new(),
+            governance_refusals: HashMap::new(),
             // The deliberate exception (row 3): standing grants are durable and were just
             // loaded from the vault, so an operator's standing ruling survives the deploy.
             standing_scope: crate::server::published::Watched::new(standing_scope),
@@ -1248,18 +1371,15 @@ impl ServerState {
     /// Mark a plugin_id as synthetic and persist. Idempotent on membership;
     /// `Ok(true)` if this call added a new entry.
     ///
-    /// The persist is fail-closed and NOT guarded by novelty — the write-side
-    /// mirror of the corrupt-doc load rule. A best-effort save that failed
-    /// silently left the exclusion in memory only: durable member labels
-    /// would mint for this plugin after the next restart, and a novelty
-    /// guard meant no later re-join ever retried the write. The write is
-    /// retried up to `max_attempts` times (law-settable via the vault policy,
-    /// default 3 — see `VaultPolicyState::synthetic_persist_attempts`); if every
-    /// attempt fails the error reaches the caller (which must refuse the
-    /// request), the in-memory entry still stands so THIS run keeps the
-    /// exclusion, and the next declaring join retries the persist again.
+    /// The persist is fail-closed. A member already present was loaded from the vault or
+    /// persisted by an earlier call, so re-marking it writes nothing. If every attempt to
+    /// persist a NEW member fails, this call's insertion is rolled back: in-set therefore
+    /// always implies persisted, and the next connect must retry instead of being admitted.
     pub fn mark_synthetic(&mut self, plugin_id: &str, max_attempts: u32) -> anyhow::Result<bool> {
         let added = self.synthetic_plugins.insert(plugin_id.to_string());
+        if !added {
+            return Ok(false);
+        }
         let attempts = max_attempts.max(1);
         let mut last_err = None;
         for _ in 0..attempts {
@@ -1274,6 +1394,7 @@ impl ServerState {
                 Err(e) => last_err = Some(e),
             }
         }
+        self.synthetic_plugins.remove(plugin_id);
         Err(last_err
             .expect("attempts >= 1 so the loop ran at least once")
             .context(format!(
@@ -2610,6 +2731,81 @@ mod tests {
         (dir, state)
     }
 
+    #[test]
+    fn startup_warms_configured_member_lcts_before_any_connect() {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let mut initial = ServerState::open(vault, dir.path(), "p").unwrap();
+        initial.mark_synthetic("synthetic-seat", 1).unwrap();
+        drop(initial);
+        let seats = dir.path().join("seats");
+        std::fs::create_dir(&seats).unwrap();
+        for name in ["alpha-seat", "beta-seat", "_shared", "synthetic-seat"] {
+            std::fs::write(seats.join(format!("{name}.env")), "# fixture\n").unwrap();
+        }
+        std::fs::write(seats.join("not-a-seat.txt"), "# fixture\n").unwrap();
+
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = ServerState::open(vault, dir.path(), "p").unwrap();
+        let alpha = state.member_registry.get("alpha-seat").expect("alpha minted at startup");
+        let beta = state.member_registry.get("beta-seat").expect("beta minted at startup");
+        assert!(alpha.lct_id().starts_with("lct:web4:mb32:"));
+        assert!(beta.lct_id().starts_with("lct:web4:mb32:"));
+        assert!(state.member_registry.get("_shared").is_none());
+        assert!(state.member_registry.get("synthetic-seat").is_none());
+        assert!(state.member_registry.get("not-a-seat").is_none());
+    }
+
+    #[test]
+    fn policy_generation_binds_projection_verdict_not_verification_time() {
+        let (_dir, mut state) = make_state();
+        let audit = |verified_at| crate::server::standing_scope::ProjectionAudit {
+            verified_at,
+            matches: true,
+            runtime_generation: 7,
+            vault_generation: 7,
+            runtime_digest: "same-runtime".into(),
+            vault_digest: "same-vault".into(),
+            divergence: vec![],
+        };
+
+        state.standing_projection_audit = crate::server::published::Watched::new(Some(audit(100)));
+        let first = state.build_publication();
+        let first_generation = first.policy_generation();
+        state.standing_projection_audit = crate::server::published::Watched::new(Some(audit(900)));
+        let second = state.build_publication();
+        let second_generation = second.policy_generation();
+
+        assert_eq!(first.canonical()["standing_projection_audit"]["verified_at"].as_u64(),
+                   Some(100));
+        assert_eq!(second.canonical()["standing_projection_audit"]["verified_at"].as_u64(),
+                   Some(900));
+        assert_eq!(first_generation, second_generation);
+
+        let mut assert_moves = |changed: crate::server::standing_scope::ProjectionAudit| {
+            state.standing_projection_audit = crate::server::published::Watched::new(Some(changed));
+            assert_ne!(first_generation, state.build_publication().policy_generation());
+        };
+        let mut changed = audit(901);
+        changed.matches = false;
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.runtime_generation = 8;
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.vault_generation = 8;
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.runtime_digest = "changed-runtime".into();
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.vault_digest = "changed-vault".into();
+        assert_moves(changed);
+        let mut changed = audit(901);
+        changed.divergence = vec!["standing grant differs".into()];
+        assert_moves(changed);
+    }
+
     /// B2 (#339): the daemon's chain rows are witnessed by the Society key, name the real
     /// key-derived sovereign LCT rather than the placeholder anchor, and bind the published
     /// policy generation — which moves when the law does.
@@ -3124,6 +3320,30 @@ mod tests {
         assert!(state.is_synthetic("conformance-runner-py"));
         assert!(!state.is_synthetic("claude-code"));
         assert_eq!(state.synthetic_plugins.len(), 2);
+    }
+
+    #[test]
+    fn synthetic_mark_writes_once_and_rolls_back_a_failed_insert() {
+        let dir = TempDir::new().unwrap();
+        let vault_path = dir.path().join("v.enc");
+        let vault = Vault::init(vault_path.clone(), "p".into()).unwrap();
+        let mut state = ServerState::open(vault, dir.path(), "p").unwrap();
+        assert!(state.mark_synthetic("repeat-seat", 3).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let before = std::fs::metadata(&vault_path).unwrap().modified().unwrap();
+        for _ in 0..5 {
+            assert!(!state.mark_synthetic("repeat-seat", 3).unwrap());
+        }
+        let after = std::fs::metadata(&vault_path).unwrap().modified().unwrap();
+        assert_eq!(after, before, "an already-persisted id must not re-encrypt the vault");
+
+        state.vault.set_pre_save_barrier(std::sync::Arc::new(|| Err("injected save failure".into())));
+        let err = state.mark_synthetic("retry-seat", 2).expect_err("save must fail");
+        assert!(format!("{err:#}").contains("injected save failure"), "{err:#}");
+        assert!(!state.is_synthetic("retry-seat"), "the failed insert was not rolled back");
+        state.vault.set_pre_save_barrier(std::sync::Arc::new(|| Ok(())));
+        assert!(state.mark_synthetic("retry-seat", 1).unwrap(), "the next connect retries");
+        assert!(state.is_synthetic("retry-seat"));
     }
 
     #[test]

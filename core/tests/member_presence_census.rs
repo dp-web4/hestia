@@ -343,6 +343,9 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
         "let adjudicator_instance_lct = s.member_lct(&adjudicator.plugin_id);",
         "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
     ], SiteClass::Predicate),
+    ("server/handler.rs::tool_cross_chain_checkpoint", &[
+        "let Some(observer_lct) = s.member_lct(&caller.plugin_id) else {",
+    ], SiteClass::Naming),
     ("server/handler.rs::tool_witness_decision", &[
         "let instance_lct = s.member_lct(&plugin_id);",
     ], SiteClass::Naming),
@@ -519,7 +522,9 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // Was two identical lines; the duplicate was the hand-rolled fallback payload this
     // change deleted in favour of `opened_payload`. The remaining line is the claim
     // response's own attribution, which is not the chain entry and did not move.
-    ("server/handler.rs::tool_gate_escalation_claim", &[
+    // 2026-11-05: the body moved into `gate_escalation_claim_inner` (shared by the gate's claim
+    // and the member's deliberate escalation); the naming site is the same `claimed` row.
+    ("server/handler.rs::gate_escalation_claim_inner", &[
         "\"subject_instance_lct\": s.member_lct(&esc.plugin_id),",
     ], SiteClass::Naming),
     // ADDED 2026-09-29 (#1169, the reclaim of one lost claim answer, #1166/#774). Red on CI
@@ -593,7 +598,9 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     // attendance). (2) Compared to decide control flow? No — every decision keys on
     // `(plugin_id, path)` strings, the request id and the act digest; the derived LCT is
     // serialised into the entry and read by nothing. Naming.
-    ("server/handler.rs::tool_scope_claim", &[
+    // 2026-11-05: the body moved into `scope_claim_inner` (shared by the gate's claim and the
+    // member's deliberate `tool_scope_escalate`); same two lines, same Naming class.
+    ("server/handler.rs::scope_claim_inner", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
@@ -1333,8 +1340,14 @@ const REGISTRY_CENSUS: &[(&str, &[&str])] = &[
     ("server/handler.rs::tool_connect", &[
         "crate::member_registry::ensure_member(",
     ]),
+    // Startup preloading is a producer, not an authorization decision. It mints only the
+    // durable LCT that the member's first connect would mint later; synthetic and shared
+    // pseudo-seat exclusions stay explicit, and no session, role or grant is created.
+    ("server/state.rs::warm_configured_members", &[
+        "crate::member_registry::ensure_member(",
+    ]),
     ("server/state.rs::open", &[
-        "let member_registry = crate::member_registry::load_members(&vault);",
+        "let mut member_registry = crate::member_registry::load_members(&vault);",
     ]),
 ];
 

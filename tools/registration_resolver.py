@@ -58,34 +58,54 @@ def _result(state: str, **extra: Any) -> dict[str, Any]:
     return {"state": state, **extra}
 
 
-def _commands_from_json(obj: Any, out: list[str]) -> None:
+def _commands_from_json(obj: Any, out: list[tuple[str | None, str]], event: str | None = None) -> None:
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k == "command" and isinstance(v, str):
-                out.append(v)
+                out.append((event, v))
             else:
-                _commands_from_json(v, out)
+                next_event = k if event is None and k != "hooks" else event
+                _commands_from_json(v, out, next_event)
     elif isinstance(obj, list):
         for v in obj:
-            _commands_from_json(v, out)
+            _commands_from_json(v, out, event)
 
 
-def _commands_from_toml_text(text: str) -> list[str]:
-    """Read the command assignments used by Codex/Kimi registrations.
+def _commands_from_toml_text(text: str) -> list[tuple[str | None, str]]:
+    """Read event and command assignments used by Codex/Kimi registrations.
 
     This deliberately remains dependency-free rather than requiring Python 3.11's
     tomllib on operator hosts. A line that purports to declare `command = ...` but
     cannot be read by the supported quoted-string grammar is UNPARSEABLE, never
     silently ignored.
     """
-    out: list[str] = []
+    out: list[tuple[str | None, str]] = []
+    event = None
     for raw in text.splitlines():
+        table = re.match(r"^\s*\[\[([^\]]+)\]\]\s*$", raw)
+        if table:
+            name = table.group(1)
+            if name == "hooks":
+                event = "unparsed"
+            elif name.startswith("hooks."):
+                suffix = name[len("hooks."):]
+                if suffix.endswith(".hooks"):
+                    suffix = suffix[:-len(".hooks")]
+                if suffix != "hooks":
+                    event = suffix
+            else:
+                event = None
+            continue
+        assigned_event = re.match(r"^\s*event\s*=\s*(['\"])(.*?)\1\s*$", raw)
+        if assigned_event:
+            event = assigned_event.group(2)
+            continue
         if not re.match(r"^\s*command\s*=", raw):
             continue
         m = _TOML_COMMAND.match(raw)
         if not m:
             raise ValueError(f"unparseable command assignment: {raw!r}")
-        out.append(m.group(2))
+        out.append((event, m.group(2)))
     return out
 
 
@@ -95,7 +115,7 @@ def _kind(path: str) -> str:
     except FileNotFoundError:
         return "missing"
     except OSError:
-        return "other"
+        return "unreadable"
     if stat.S_ISREG(mode):
         return "file"
     if stat.S_ISDIR(mode):
@@ -279,7 +299,7 @@ def resolve_registration(
         )
 
     try:
-        commands: list[str] = []
+        commands: list[tuple[str | None, str]] = []
         if reader == "json-hook-commands":
             _commands_from_json(json.loads(text), commands)
         else:
@@ -288,23 +308,25 @@ def resolve_registration(
         targets: list[dict[str, Any]] = []
         discarded: list[dict[str, str]] = []
         unclassified: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for command in commands:
+        seen: set[tuple[str | None, str]] = set()
+        for event, command in commands:
             target, why = _command_target(command)
             if target is None:
-                unclassified.append({"command": command, "reason": why or "unclassified"})
+                unclassified.append({"event": event, "command": command, "reason": why or "unclassified"})
                 continue
             kind = _kind(target)
             if kind == "directory":
                 discarded.append(
-                    {"path": target, "reason": "existing directory is not a hook artifact"}
+                    {"event": event, "path": target, "reason": "existing directory is not a hook artifact"}
                 )
                 continue
-            if target in seen:
+            identity = (event, target)
+            if identity in seen:
                 continue
-            seen.add(target)
+            seen.add(identity)
             targets.append(
                 {
+                    "event": event,
                     "path": target,
                     "basename": os.path.basename(target),
                     "exists": kind != "missing",
@@ -327,7 +349,9 @@ def resolve_registration(
         expects=str(expects),
         reader=reader,
         registration_path=str(registration),
+        gate_events=manifest.get("gate") or [],
         commands_seen=len(commands),
+        events_seen=sorted({event for event, _ in commands if event is not None}),
         complete=(len(unclassified) == 0),
         targets=targets,
         discarded=discarded,
