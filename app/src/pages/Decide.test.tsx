@@ -166,24 +166,55 @@ describe("Decide", () => {
     expect(await screen.findByText(/One engine, several views/)).toBeTruthy();
   });
 
-  it("shows the asker as claimed, not as a proved identity", async () => {
-    getDashboard.mockResolvedValue({ pending_escalations: [escalation()] });
+  it("shows session attribution without claiming the harness was independently observed", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [escalation({ asker_basis: "session" })],
+    });
     operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
 
     render(<Decide />);
-    expect(await screen.findByText(/claimed, not proved/)).toBeTruthy();
+    expect(
+      await screen.findByText(/session-attributed; harness identity not independently observed/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/claimed, not proved/)).toBeNull();
+  });
+
+  it("marks an asserted escalation as unverified", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [escalation({ asker_basis: "asserted" })],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+
+    render(<Decide />);
+    expect(
+      await screen.findByText(/UNVERIFIED: caller-asserted; no live session attribution/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/claimed, not proved/)).toBeNull();
   });
 });
 
 describe("Decide — scope requests (Sprint 2)", () => {
-  it("shows the asker's reason whole, the one path, and the asker as claimed", async () => {
+  it("shows the asker's reason whole, the one path, and missing attribution as unverified", async () => {
     getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [scopeRequest()] });
     operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
 
     render(<Decide />);
     expect(await screen.findByText(/blocked since July/)).toBeTruthy();
     expect(screen.getAllByText(/hub_raising_session\.sh/).length).toBeGreaterThan(0);
-    expect(screen.getByText(/claimed, not proved/)).toBeTruthy();
+    expect(screen.getByText(/UNVERIFIED: no asker attribution recorded/)).toBeTruthy();
+  });
+
+  it("shows a gate scope request's asserted basis", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [gateScopeRequest({ asker_basis: "asserted" })],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+
+    render(<Decide />);
+    expect(
+      await screen.findByText(/UNVERIFIED: caller-asserted; no live session attribution/),
+    ).toBeTruthy();
   });
 
   it("offers NO grant or refuse control when signed out", async () => {

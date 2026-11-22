@@ -1699,6 +1699,7 @@ impl ServerState {
                             // claim as an identity — the operator is deciding
                             // partly ON this string, and it is not authenticated.
                             "claimed_by": e.plugin_id,
+                            "asker_basis": e.asker_basis,
                             "role": e.role,
                             "tool_name": e.tool_name,
                             "marker": e.marker,
@@ -2094,6 +2095,54 @@ mod tests {
         assert_eq!(s.society.chain_length, 0);
         assert!(s.trust.is_empty());
         assert!(s.recent.is_empty());
+    }
+
+    #[test]
+    fn pending_escalations_carry_their_recorded_asker_basis() {
+        let (_dir, mut state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        let session = state
+            .gate_escalations
+            .open(
+                "session-member",
+                "role:constellation:member",
+                "Edit",
+                "plugins/_shared",
+                Some("Edit -> a governance file"),
+                Some("test the attribution projection"),
+                None,
+                now,
+                600,
+            )
+            .unwrap();
+        assert!(state.gate_escalations.record_asker_basis(
+            &session.id,
+            crate::arbiter::AskerBasis::Session,
+        ));
+        let asserted = state
+            .gate_escalations
+            .open(
+                "asserted-member",
+                "role:constellation:member",
+                "Edit",
+                "plugins/_shared",
+                Some("Edit -> a governance file"),
+                Some("test the attribution projection"),
+                None,
+                now,
+                600,
+            )
+            .unwrap();
+
+        let snapshot = state.dashboard_snapshot(20);
+        for (id, basis) in [(session.id, "session"), (asserted.id, "asserted")] {
+            let row = snapshot
+                .pending_escalations
+                .iter()
+                .find(|row| row["id"] == id)
+                .expect("the pending fixture must be present");
+            assert_eq!(row["asker_basis"], basis, "the decision surface needs the recorded basis: {row}");
+        }
     }
 
     #[test]
