@@ -146,6 +146,24 @@ CASES = [
      f"cp -t {SHARED_DIR} /tmp/a.py", "write", WRT),
     ("cp_t_dir__benign",
      "cp -t /tmp/dest a.py", "none", None),
+    ("python_direct_script_governed_argv__closure",
+     f"python /tmp/x/f.py {SHARED_DIR}/{CORE}", "write", WRT),
+    ("python3_direct_script_governed_argv__closure",
+     f"python3 /tmp/x/f.py {SHARED_DIR}/{CORE}", "write", WRT),
+    ("python3_cd_direct_script_governed_argv__closure",
+     f"cd /tmp && python3 /tmp/x/f.py {SHARED_DIR}/{CORE}", "write", WRT),
+    ("python3_direct_script_absolute_governed_argv__closure",
+     f"python3 /tmp/x/f.py /tmp/symprobe/{SHARED_DIR}/{CORE}", "write", WRT),
+    ("perl_direct_script_governed_argv__closure",
+     f"perl /tmp/x/f.pl {SHARED_DIR}/{CORE}", "write", WRT),
+    ("node_direct_script_governed_argv__closure",
+     f"node /tmp/x/f.js {SHARED_DIR}/{CORE}", "write", WRT),
+    ("ruby_direct_script_governed_argv__closure",
+     f"ruby /tmp/x/f.rb {SHARED_DIR}/{CORE}", "write", WRT),
+    ("python3_direct_script_benign_argv",
+     "python3 /tmp/x/f.py /tmp/notes.txt", "none", None),
+    ("python3_c_flag_is_not_direct_script_floor",
+     f"python3 -c 'print(1)'", "not-write", None),
     ("ln_future_link_cp__closure",
      f"ln -sfn {SHARED_DIR} /tmp/freshlink && cp /tmp/a.py /tmp/freshlink/{HOOK}", "write", WRT),
     ("ln_future_link_redirect__closure",
@@ -395,8 +413,8 @@ def test_differential_against_real_shell():
 # the table and once for the comment explaining the table. That refusal is under appeal
 # (deny e7f64345, arbiter codex); harvesting is the honest way to need no exception.
 #
-# Seven real escalations feed the green arms, every one self-withdrawn by its own asker
-# within seconds, and each costing eight peer invitations:
+# These historical escalations feed the block arms. The two direct-interpreter rows move to the
+# write side under #1059; the rest stay read. Each was self-withdrawn and cost eight invitations:
 #   a3557a7f4f0ca71f 2026-09-04  python3 <shared test> | tail; for t in tests/*.py; do ...
 #   c83eccb2dc985f8a 2026-09-05  for r in <ranges>; do sed -n "${r}p" <shared file>; done
 #   0a850f87d37a908b 2026-09-05  for f in <deploy files>; do grep -n ... "$f"; done
@@ -410,10 +428,6 @@ def test_differential_against_real_shell():
 # whole wake on a co-seat. The cost of this FP is not bounded by the asker who pays it.
 _BLOCK_BODY_READS = [
     # (name, blocked form, the same body unblocked)
-    ("a3557a7f__interpreter_then_loop",
-     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3; echo "=== t ==="; '
-     f'for t in plugins/kimi/tests/*.py; do r=$(python3 "$t" 2>&1 | tail -1); echo "$r"; done',
-     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3'),
     ("c83eccb2__loop_sed_n_program_expansion",
      f'for r in 1-3 5-7; do echo "--- $r"; sed -n "${{r}}p" {SHARED_DIR}/{CORE}; done',
      f'sed -n "${{r}}p" {SHARED_DIR}/{CORE}'),
@@ -433,16 +447,25 @@ _BLOCK_BODY_READS = [
     ("71199e4b__loop_ls_over_config_paths",
      f'for p in {SHARED_DIR} {HOOKS}/{HOOK}; do echo "== $p"; ls -la $p; done',
      f'ls -la {SHARED_DIR} {HOOKS}/{HOOK}'),
-    ("ffcf0139__loop_running_these_very_suites",
-     f'for f in {SHARED_DIR}/shell_grammar_test.py {SHARED_DIR}/{CORE}; do '
-     f'timeout 600 python3 "$f" 2>&1 | tail -15; done',
-     f'timeout 600 python3 {SHARED_DIR}/shell_grammar_test.py 2>&1 | tail -15'),
     # Nesting and terminators: a block inside a block, and a redirect hanging off `done`
     # (harvested by _bash_write_targets BEFORE the segment is flushed, so stripping the
     # terminator must not lose it ─ the write arm for this shape is generated below).
     ("nested_blocks_read_only_body",
      f'for x in a; do if true; then grep -c def {SHARED_DIR}/{CORE}; fi; done',
      f'grep -c def {SHARED_DIR}/{CORE}'),
+]
+
+# Direct interpreter argv is a write floor under #1059, so these two historical read arms move
+# to the write side without changing their command text or weakening the block invariant.
+_BLOCK_BODY_WRITES = [
+    ("a3557a7f__interpreter_then_loop",
+     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3; echo "=== t ==="; '
+     f'for t in plugins/kimi/tests/*.py; do r=$(python3 "$t" 2>&1 | tail -1); echo "$r"; done',
+     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3'),
+    ("ffcf0139__loop_running_these_very_suites",
+     f'for f in {SHARED_DIR}/shell_grammar_test.py {SHARED_DIR}/{CORE}; do '
+     f'timeout 600 python3 "$f" 2>&1 | tail -15; done',
+     f'timeout 600 python3 {SHARED_DIR}/shell_grammar_test.py 2>&1 | tail -15'),
 ]
 
 
@@ -556,6 +579,7 @@ def test_block_and_its_unblocked_body_agree():
     """
     failures, coarser = [], []
     writes, unreached = _generated_write_pairs()
+    writes = _BLOCK_BODY_WRITES + writes
     if unreached:
         failures.append(f"no operand shape in _WRITE_SHAPES reaches the write position of "
                         f"{unreached} ─ those verbs are modelled by the classifier but "

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: e4c1cfbb6ee904f0951824cb35e3d38955b72f3d9af6fe084eb18f12e4c07eb7  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 31f86177cb8eff871a7edba71c599141a8075d8c2fd4a332128921befc15da03  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1478,6 +1478,12 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         return _positionals(args)
     if name == "touch":
         return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
+    if name in ("python", "python3", "perl", "node", "ruby"):
+        # Direct script invocation is a WRITE floor: a governed path in argv may be opened for
+        # writing by the script. Flags/-c/stdin and heredoc bodies are separate grammar (#1146).
+        if not args or args[0].startswith("-"):
+            return []
+        return _positionals(args)
     verb_out = _output_verb_write_targets(name, args, path_pinned)
     if verb_out is not None:
         return verb_out

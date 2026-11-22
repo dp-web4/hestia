@@ -1477,6 +1477,12 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
         return _positionals(args)
     if name == "touch":
         return _positionals(args, opts_with_value=("-d", "-t", "-r", "--date", "--reference"))
+    if name in ("python", "python3", "perl", "node", "ruby"):
+        # Direct script invocation is a WRITE floor: a governed path in argv may be opened for
+        # writing by the script. Flags/-c/stdin and heredoc bodies are separate grammar (#1146).
+        if not args or args[0].startswith("-"):
+            return []
+        return _positionals(args)
     verb_out = _output_verb_write_targets(name, args, path_pinned)
     if verb_out is not None:
         return verb_out
