@@ -901,6 +901,30 @@
       }
     },
     {
+      "id": "runtime-config-observed-roles",
+      "title": "Runtime config: observed role evidence and permitted-role picker",
+      "place": "me",
+      "kind": "read",
+      "risk": "low",
+      "routes": [
+        "GET /api/config/seat/:plugin_id/observed-roles"
+      ],
+      "rules": [
+        "member-id",
+        "signed-in-only",
+        "unknown-not-fine"
+      ],
+      "surfaces": {
+        "dashboard": {
+          "status": "required"
+        },
+        "app": {
+          "status": "excluded",
+          "why": "The observed-role picker is added to the web dashboard in #1125; the desktop config editor has no observed-role view yet."
+        }
+      }
+    },
+    {
       "id": "hub-read",
       "title": "Hub status and topics",
       "place": "communities",

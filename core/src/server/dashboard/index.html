@@ -6099,7 +6099,42 @@
       opts.unshift({ value: cur, label: `${cur}  ⚠ not a known role — the daemon treats this seat as "member"`, selected: true });
     return opts;
   }
+  // PURE (node-tested with capacityRoleOptions). The declared set is a checkbox list over the
+  // same closed vocabulary, annotated with outcome evidence. Unknown stored values are retained
+  // for the operator to repair, never silently dropped on open.
+  function permittedRoleChoices(current, observed) {
+    const selected = new Set(String(current == null ? '' : current).split(',').map(s => s.trim()).filter(Boolean));
+    const rows = (observed && observed.roles) || [];
+    const choices = CAPACITY_ROLES.map(value => {
+      const row = rows.find(r => r.role === value) || {};
+      return { value, label: value.replace('role:constellation:', ''),
+               selected: selected.has(value), count: row.count || 0,
+               last_seen_at: row.last_seen_at || '', outside_declared: !!row.outside_declared,
+               registered: true };
+    });
+    for (const value of selected) {
+      if (!CAPACITY_ROLES.includes(value))
+        choices.push({ value, label: `${value}  ⚠ not a known role`, selected: true,
+                       count: 0, last_seen_at: '', outside_declared: false, registered: false });
+    }
+    return choices;
+  }
+  function permittedRoleValue(choices) {
+    return choices.filter(o => o.selected).map(o => o.value).join(',');
+  }
   function cfgValueCell(r) {
+    if (String(r.key).trim() === 'HESTIA_ROLE_PERMITTED') {
+      const observed = r.observed || {};
+      const choices = permittedRoleChoices(r.value, observed);
+      const extra = observed.extra_observations || [];
+      return `<input type="hidden" class="cfg-value" value="${cfgEsc(r.value)}">`
+        + `<div class="cfg-permitted-roles">${choices.map(o =>
+          `<label class="cfg-role-choice${o.outside_declared ? ' cfg-role-drift' : ''}"><input type="checkbox" class="cfg-role-option" value="${cfgEsc(o.value)}"${o.selected ? ' checked' : ''}> ${cfgEsc(o.label)} — ${o.count} observed${o.last_seen_at ? ', last ' + cfgEsc(o.last_seen_at) : ', never seen'}</label>`).join('')}</div>`
+        + (observed.drift ? '<div class="grant-note cfg-role-drift">Observed a connection outside the declared set. Extend it or investigate the launcher; the seat is refusing that role.</div>' : '')
+        + (observed.error ? `<div class="grant-note cfg-role-drift">Observed-role evidence unavailable: ${cfgEsc(observed.error)}</div>` : '')
+        + (extra.length ? '<div class="grant-note">Unregistered observations (not offered for declaration): '
+          + extra.map(o => `${cfgEsc(o.role)} (${o.count})`).join(', ') + '</div>' : '');
+    }
     if (String(r.key).trim() !== 'HESTIA_ROLE')
       return `<input class="pol-input cfg-value" value="${cfgEsc(r.value)}">`;
     return `<select class="pol-input cfg-value" title="what this seat connects AS; anything outside this list is treated as member">${
@@ -6114,6 +6149,14 @@
         <td>${cfgValueCell(r)}</td>
         <td><button type="button" class="pol-btn pol-remove cfg-remove" title="remove this variable">×</button></td>
       </tr>`).join('');
+    document.querySelectorAll('#cfg-env-rows .cfg-role-option').forEach(box => {
+      box.addEventListener('change', () => {
+        const row = box.closest('tr');
+        const choices = Array.from(row.querySelectorAll('.cfg-role-option'))
+          .map(el => ({ value: el.value, selected: el.checked }));
+        row.querySelector('.cfg-value').value = permittedRoleValue(choices);
+      });
+    });
   }
 
   // Open one seat. A configured seat is INSPECTED (values revealed; the daemon witnesses it);
@@ -6132,7 +6175,13 @@
       if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
       const data = await res.json();
       const env = (data.config && data.config.env) || {};
-      cfgRows = Object.keys(env).sort().map(k => ({ key: k, value: env[k] }));
+      let observed = { roles: [], extra_observations: [] };
+      try {
+        const roleRes = await apiFetch(`/api/config/seat/${encodeURIComponent(member)}/observed-roles`);
+        if (!roleRes.ok) throw new Error((await roleRes.text()) || ('HTTP ' + roleRes.status));
+        observed = await roleRes.json();
+      } catch (e) { observed = { roles: [], extra_observations: [], error: e.message }; }
+      cfgRows = Object.keys(env).sort().map(k => ({ key: k, value: env[k], observed }));
       $('cfg-note').value = (data.config && data.config.note) || '';
       // INHERITED, READ-ONLY. The lines this seat gets from the shared set, with their values,
       // shown above its own rows so the whole projection is visible while only the seat's own
