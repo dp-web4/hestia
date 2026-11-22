@@ -1564,8 +1564,23 @@ impl SqliteInboxStore {
         Ok(outcome)
     }
 
-    /// Consume-once drain of the notices addressed to `to_plugin` ONLY. This compatibility
-    /// entry point deliberately ignores claims; the production tool uses the session-aware arm.
+    /// Consume-once drain of the notices addressed to `to_plugin` ONLY —
+    /// recipient-scoped (a member can never drain another member's mail).
+    /// Same at-least-once failure bias as the hub-notice drain.
+    ///
+    /// Consume-once is a MARK (`drained_at`), not a DELETE: the notice never
+    /// comes back from a second drain, but the fact that it was delivered
+    /// survives, so "queued and never answered" stays askable after the wake.
+    ///
+    /// **An empty drain is no longer a no-op.** It records a sighting
+    /// ([`Self::ensure_touch_schema`]) — the watcher polls on a cadence whether
+    /// or not there is mail, so the empty drains are precisely where the
+    /// liveness evidence lives. This is a semantic change to what an empty
+    /// drain *means*, wearing a recording change's clothes; the return value
+    /// and consume-once behaviour are untouched.
+    ///
+    /// This compatibility entry point deliberately ignores claims; the production
+    /// tool uses the session-aware arm ([`Self::drain_member_for_session`]).
     pub fn drain_member(&self, to_plugin: &str) -> Result<Vec<MemberNotice>> {
         self.drain_member_inner(to_plugin, None)
     }
@@ -1600,6 +1615,10 @@ impl SqliteInboxStore {
                      FROM member_notices
                      WHERE to_plugin = ?1 AND drained_at IS NULL
                        AND dest_peer IS NULL
+                       -- Undrained dispositions are exempt from the TTL *deletion*
+                       -- (see the prune in enqueue_member); that exemption would be
+                       -- hollow if the delivery window still hid the row. They are
+                       -- served until delivered, however old.
                        AND (queued_at >= ?2 OR kind = 'disposition')
                        AND (?3 = '' OR claimed_by_session IS NULL
                            OR claimed_by_session = ?3
@@ -1648,6 +1667,16 @@ impl SqliteInboxStore {
             }
             out
         };
+        // `dest_peer IS NULL` here is load-bearing twice over. This UPDATE is broader
+        // than the SELECT above (no `queued_at` cutoff), so unfiltered ONE local drain
+        // by member `m` marked EVERY parked forward bound for a remote `m` — including
+        // rows older than the TTL that the SELECT never returned and nobody was ever
+        // shown. And `drained_at` is the exact predicate `pending_egress` reads as
+        // "already handed to the fleet mesh", so the mark did not merely mislabel the
+        // rows, it cancelled the forwards: accepted, witnessed, enqueued, never sent,
+        // never reported, success code — the black hole this branch was built to close,
+        // reconstituted one plane up. The claim predicate below must stay identical to
+        // the SELECT's: a live claim by another session is neither returned nor marked.
         tx.execute(
             "UPDATE member_notices SET drained_at = ?2
              WHERE to_plugin = ?1 AND drained_at IS NULL AND dest_peer IS NULL
@@ -1656,6 +1685,8 @@ impl SqliteInboxStore {
             params![to_plugin, now_rfc3339, session, now_rfc3339],
         )
         .context("marking drained member notices")?;
+        // The heartbeat: recorded whether or not the drain returned anything,
+        // and in the same transaction as the delivery mark it accompanies.
         Self::touch_inbox(&tx, to_plugin, &now)?;
         tx.commit().context("committing member drain")?;
         Ok(notices)
