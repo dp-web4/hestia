@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -2256,12 +2256,23 @@ _GIT_GREP_SPEC = dict(_GREP_SPEC)
 #: Heads whose PATTERN operands the in-workspace passes of `command_scope_reach` do not read as
 #: reaches (#1241 recut, SAGE #368): the tool matches the text against what it reads and never
 #: opens it. Recorded by value in `_Found.patterns`, LITERAL words only (an expansion stays live).
-_PATTERN_HEADS = frozenset(("grep", "egrep", "fgrep", "rg", "git-grep"))
+_PATTERN_HEADS = frozenset(("grep", "egrep", "fgrep", "rg", "git-grep", "pgrep", "pkill"))
+#: `pgrep` / `pkill` (#1595): the first positional is a regex matched against process names or
+#: (`-f`) command lines; neither tool opens it. Their one FILE operand is `-F` / `--pidfile`.
+#: `signal_words`: pkill's `-HUP` / `-9` / `-SIGTERM` is a flag, not a cluster that hands `-U` or
+#: `-P` a value. Options are the union of the BSD (macOS) and procps (Linux) spellings.
+_PGREP_SPEC = {"pattern_first": True, "signal_words": True,
+               "file_opts": {"-F", "--pidfile"},
+               "value_opts": {"-G", "-g", "-P", "-s", "-t", "-U", "-u", "-d", "-c", "-O", "-r",
+                              "--delimiter", "--group", "--pgroup", "--parent", "--session",
+                              "--terminal", "--euid", "--uid", "--ns", "--nslist", "--signal",
+                              "--older", "--runstates", "--cgroup", "--env"}}
 _CMD_SPECS = {
     "tr": {"positional": "strings"},
     "echo": {"positional": "strings_noglob"},
     "printf": {"positional": "strings_noglob"},
     "grep": _GREP_SPEC, "egrep": _GREP_SPEC, "fgrep": _GREP_SPEC, "zgrep": _GREP_SPEC,
+    "pgrep": _PGREP_SPEC, "pkill": _PGREP_SPEC,
     "rg": {"pattern_first": True, "pattern_opts": {"-e", "--regexp"}, "file_opts": {"-f", "--file"},
            "value_opts": {"-g", "--glob", "-t", "--type", "-T", "--type-not", "-m", "--max-count",
                           "-A", "-B", "-C", "-j", "--threads", "-M", "--max-columns",
@@ -2982,6 +2993,9 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
             takes = (spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
                      | strs | spec.get("file_opts", set())
                      | spec.get("value_opts", set()) | spec.get("code_opts", set()))
+            if spec.get("signal_words") and w not in takes \
+                    and re.fullmatch(r"-(?:SIG)?[A-Z][A-Z0-9+-]*|-[0-9]+", w):
+                continue                                   # `pkill -HUP`, `-9`, `-SIGTERM` (#1595)
             if eq:
                 if name in spec.get("code_opts", ()):
                     code(val)
@@ -3028,9 +3042,28 @@ def _outside_candidates(cmd: str, cwd: str = "", depth: int = 0, found=None) -> 
                 continue
             run = re.match(r"-[A-Za-z0-9]+", w) if not w.startswith("--") and len(w) > 2 else None
             valued = spec.get("file_opts", set()) | spec.get("value_opts", set())
-            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued), None) if run else None
+            # Pattern and delimiter options only: string options are head-wide and some are booleans in
+            # another subcommand (`git checkout -m`), so a cluster ending in one keeps the old scan.
+            worded = spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
+            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued | worded), None) if run else None
             if fat is not None and head == "sed" and "i" in w[1:fat]:
                 fat = None          # GNU `sed -if S`: `-i` takes the rest as its backup suffix
+            if fat is not None and "-" + w[fat] in worded:
+                # A clustered option whose value is TEXT (`grep -nefoo`: `-e` takes `foo`, #1560): getopt
+                # hands it the rest of the word, or the next word, so the letters after it are its value,
+                # not options (before this the scan went on and judged `oo` as a `-f` program file). Its
+                # value is skipped as the attached spelling's is (`-efoo`), unless it carries an unquoted
+                # glob the shell expands. A pattern option still means every operand is a file.
+                opt = "-" + w[fat]
+                if opt in spec.get("pattern_opts", ()):
+                    state["pattern_given"] = True
+                if fat == len(w) - 1:
+                    state["pending"] = opt
+                elif uglob:
+                    emit(w[fat + 1:], uglob)
+                elif opt in spec.get("pattern_opts", ()):
+                    pattern(w[fat + 1:], judge=False)
+                continue
             if fat is not None:
                 # A clustered option that takes a value (`grep -rf P`, `grep -nfP`, `jq -rf F`,
                 # `jq -nL DIR`): getopt reads the letters before it as flags and hands it the rest of
@@ -3396,7 +3429,17 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     # (`cat <root>/lib/link/x`), because the exemption was lexical. A caller-controlled
     # environment must not become authority.
     patterns, judged_words = _grammar_patterns(cmd, cwd)
-    for after in cmd.split(workspace)[1:]:
+    # THE TEXT PASSES 1 AND 2 SCAN (#1594): the same text pass 3 judges, with every DATA heredoc
+    # body removed (`_strip_data_heredocs`). Before this they read the raw command, so prose in a
+    # quoted `cat > f <<'EOF'` body naming `<ws>/..` was refused and opened a scope request for the
+    # workspace's parent. A body the shell runs, an interpreter's path literals and every `$( )` in
+    # an unquoted-delimiter body are kept by that function, so they stay judged. A heredoc it cannot
+    # read leaves the raw text here: pass 3 refuses that act as unenumerated anyway.
+    try:
+        scan = _strip_data_heredocs(cmd)
+    except _Unmodelled:
+        scan = cmd
+    for after in scan.split(workspace)[1:]:
         # Resolve the whole token before reading a segment off it (kimi #940 B7). Taking the
         # head lexically let `cat <ws>/repo-a/../repo-b/secret` pass on `repo-a` while
         # resolving into an ungranted repo — path_in_scope's B5 one function over. A command's
@@ -3439,7 +3482,7 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
     oos_names = {r for r in _all_repos(workspace) if r not in repo_scopes}
     probes = 0
     seen2 = set()
-    for raw in re.split(r"""[\s;|&<>()'"`]+""", cmd):
+    for raw in re.split(r"""[\s;|&<>()'"`]+""", scan):
         for tok in raw.split("="):
             tok = tok.strip()
             if not tok or tok.startswith(("-", "/")) or ":" in tok or tok.strip(".") == "":
@@ -3557,7 +3600,14 @@ def _command_scope_reach_one(cmd: str, scopes, workspace: str, cwd: Optional[str
             probe = _glob_probe(cand) if globbed else cand
             if not _is_reach(probe.rstrip("*").rstrip("/") or "/"):
                 continue
-            if not os.path.lexists(os.path.dirname(probe.rstrip("*").rstrip("/")) or "/"):
+            # WHERE IT COULD NAME SOMETHING (#1317): a plain path when its parent exists; a glob
+            # only when its OWN directory does, since a glob expands inside that directory and a
+            # missing one leaves the word literal. Taking the dirname of a glob probe's `<dir>`
+            # climbed a level, so after `cd D &&` the event-cwd reading `<cwd>/tools/*` was refused
+            # while `<cwd>/tools` did not exist (McNugget, 2026-11-13 and 2026-11-16).
+            anchor = (probe[:-2] if globbed and probe.endswith("/*")
+                      else os.path.dirname(probe.rstrip("*").rstrip("/")))
+            if not os.path.lexists(anchor or "/"):
                 continue
             if cand == ws or cand.startswith(ws + "/"):
                 seg = cand[len(ws):].lstrip("/").split("/", 1)[0]
