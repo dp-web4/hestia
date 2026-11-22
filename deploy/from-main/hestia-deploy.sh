@@ -627,7 +627,7 @@ preflight_gate() {
         : >"$t2/probe"
         ev='{"session_id":"hestia-deploy-preflight","tool_name":"Read","tool_input":{"file_path":"'"$t2/probe"'"}}'
         _probe "read a \$TMPDIR scratch file" "$ev" || \
-          log "WARN gate does not recognise \$TMPDIR ($TMPDIR) as a temp root. TEMP_ROOTS is ('/tmp','/var/tmp') and _under_temp_root normpaths but never resolves symlinks, so darwin's per-uid /var/folders/<hash>/T denies — and so does /private/tmp, the realpath of /tmp, a LISTED root refused under its own canonical name. #169 fixed how the roots are compared (prefix -> boundary, correctly); neither the domain nor the normal form was fixed. NOT fatal to this preflight, which scratches in $tmp, and NOT grounds to refuse the install; it IS live for every member on this seat. Gate defect, tracked outside #698 — mcnugget 2026-08-29, findings 1-2."
+          log "WARN gate does not recognise \$TMPDIR ($TMPDIR) as a temp root. TEMP_ROOTS covers /tmp, /var/tmp and their darwin realpaths /private/tmp, /private/var/tmp, but not a per-user \$TMPDIR such as darwin's /var/folders/<hash>/T, so a member's tempfile.mkdtemp() / mktemp -d there is judged as an ordinary outside path. NOT fatal to this preflight, which scratches in $tmp, and NOT grounds to refuse the install; it IS live for every member on this seat (#1352, #1570)."
         rm -rf "$t2"
       fi ;;
   esac
