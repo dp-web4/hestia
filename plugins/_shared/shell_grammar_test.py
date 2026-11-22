@@ -2,14 +2,19 @@
 """REPAIR 2 acceptance — the explicit SUPPORTED-GRAMMAR contract for the closure classifier
 (GPT fleet-review blocker 1).
 
-The classifier resolves write positions for exactly ONE shape: simple commands with
-recognized verbs and LITERAL arguments, joined by `;` `&&` `||` `|` `&`, with a leading
-`cd <literal dir>` adjusting the effective cwd. Everything else is OUT OF GRAMMAR (a
-substitution/variable in a write position; a shell block/conditional; `bash -c`/`sh -c`/
-`eval`; `git apply`/`git am`/`patch`) and its write set is undecidable — so it is classified
-"write" (rule governance-closure-out-of-grammar) IFF closure vocabulary appears anywhere in
-the command, and "none" otherwise (a benign out-of-grammar command that names nothing
-closure-ish must NOT be refused — that re-creates the friction→bypass loop).
+The classifier resolves write positions for simple commands with recognized verbs and
+LITERAL arguments, joined by `;` `&&` `||` `|` `&`. Literal assignment positions contribute
+a UNION of possible values regardless of execution order, including branches, prefixes,
+pipelines, subshells and literal here-string reads; references resolve transitively. This
+is deliberately conservative about later and skipped assignments. Any IFS token and glob-bearing
+values make an expansion ambiguous: if it reaches a write position, the act
+is unconditionally opaque; double-quoted forms take the same path because quote boundaries
+are already erased, while read-only expansions stay benign. Other unresolved shapes are OUT
+OF GRAMMAR (an unresolved substitution/variable in a write position; an unmodelled shell
+block/conditional; `bash -c`/`sh -c`/`eval`) and their write set is undecidable — so they are
+classified "write" (rule governance-closure-out-of-grammar) IFF write-capable tokens carry
+closure vocabulary, and "none" otherwise. Unreadable patch input and expansion overflow are
+unconditionally opaque too.
 
 Two suites:
   1. EXPLICIT-ALL: every GPT bad shape as a named case, BOTH arms — a closure target => write,
@@ -123,6 +128,122 @@ CASES = [
      f"eval 'grep {HOOKS}/{HOOK}'", "not-write", None),
     ("unknown_writer_still_fails_closed",
      f"sh -c 'edit {CORE}'", "write", OOG),
+    # --- #1092 follow-up: order/context-blind assignment + read-head write flags ---
+    ("assign_decoy_argument__closure",
+     f"S={HOOKS}; echo S=/tmp; echo hi > $S/{HOOK}", "write", WRT),
+    ("assign_decoy_later_reassign__closure",
+     f"S={HOOKS}; echo hi > $S/{HOOK}; S=/tmp", "write", WRT),
+    ("assign_decoy_subshell__closure",
+     f"S={HOOKS}; (S=/tmp); echo hi > $S/{HOOK}", "write", WRT),
+    ("assign_decoy_prefix_scoped__closure",
+     f"S={HOOKS}; S=/tmp true; echo hi > $S/{HOOK}", "write", WRT),
+    ("assign_decoy_read__closure",
+     f"S=/tmp; read S <<< {HOOKS}; echo hi > $S/{HOOK}", "write", WRT),
+    ("assign_word_split__closure",
+     f"S=\"/tmp/e {HOOKS}/{HOOK}\"; cp $S", "write", WRT),
+    ("union_skipped_conditional_assignment_still_contributes",
+     "D=deploy; false && D=docs; echo x > $D/install-members.sh; D=deploy", "write", WRT),
+    ("union_transitive_reassignment_contributes",
+     "X=deploy; D=docs; D=$X; echo x > $D/install-members.sh; D=deploy", "write", WRT),
+    ("union_pipeline_assignment_contributes",
+     "D=deploy; D=docs | cat; echo x > $D/install-members.sh; D=deploy", "write", WRT),
+    ("union_assignment_shaped_argument_stays_data",
+     "D=/tmp; echo D=deploy; echo x > $D/install-members.sh", "none", None),
+    ("union_literal_assignment_argument_does_not_hide_write",
+     "D=deploy; echo D=/tmp; echo x > $D/install-members.sh", "write", WRT),
+    ("union_later_governed_assignment_is_deliberately_conservative",
+     "D=/tmp; echo x > $D/install-members.sh; D=deploy", "write", WRT),
+    ("union_here_string_read_contributes",
+     "D=/tmp; read D <<< deploy; echo x > $D/install-members.sh", "write", WRT),
+    ("union_unknown_read_does_not_leave_only_stale_literal",
+     "D=deploy; read D; echo x > $D/install-members.sh", "write", OOG),
+    ("union_variant_overflow_is_unconditionally_opaque",
+     "A=deploy; B=install-members.sh; X=a; X=b; printf $X $X $X $X $X $X $X $X $X; "
+     "echo hi > $A/$B", "write", OPQ),
+    ("union_ifs_colon_split_is_opaque",
+     f"IFS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_prefix_tee_is_opaque",
+     f"IFS=,; S=\"{HOOKS}/{HOOK},x\"; echo hi | tee $S", "write", OPQ),
+    ("union_ifs_export_is_opaque",
+     f"export IFS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_read_is_opaque",
+     f"read IFS <<< :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_read_only_expansion_stays_benign",
+     "IFS=:; S=\"a:b\"; echo $S", "none", None),
+    ("union_multi_name_here_string_read_is_opaque",
+     f"read A B <<< \"junk {HOOKS}/{HOOK}\"; printf x > \"$B\"", "write", OPQ),
+    ("union_three_name_here_string_read_is_opaque",
+     f"read A B C <<< \"junk {HOOKS}/{HOOK}\"; printf x > \"$C\"", "write", OPQ),
+    ("union_read_r_multi_name_here_string_is_opaque",
+     f"read -r A B <<< \"junk {HOOKS}/{HOOK}\"; printf x > \"$B\"", "write", OPQ),
+    ("union_array_here_string_read_is_opaque",
+     f"read -a A <<< \"junk {HOOKS}/{HOOK}\"; printf x > \"$A\"", "write", OPQ),
+    ("union_ifs_append_is_opaque",
+     f"IFS+=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_for_binding_is_opaque",
+     f"for IFS in :; do S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S; done", "write", OPQ),
+    ("union_ifs_printf_binding_is_opaque",
+     f"printf -v IFS :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_export_is_opaque",
+     f"export I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_declare_is_opaque",
+     f"declare I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_readonly_is_opaque",
+     f"readonly I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_typeset_is_opaque",
+     f"typeset I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_declare_global_is_opaque",
+     f"declare -g I\"\"FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_printf_is_opaque",
+     f"printf -v I\"\"FS :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_read_is_opaque",
+     f"read -r I\"\"FS <<< :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_nameref_is_opaque",
+     f"declare -n R=I\"\"FS; R=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_export_suffix_is_opaque",
+     f"export IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_declare_suffix_is_opaque",
+     f"declare IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_readonly_suffix_is_opaque",
+     f"readonly IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_typeset_suffix_is_opaque",
+     f"typeset IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_declare_global_suffix_is_opaque",
+     f"declare -g IF\"\"S=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_printf_suffix_is_opaque",
+     f"printf -v IF\"\"S :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_read_suffix_is_opaque",
+     f"read -r IF\"\"S <<< :; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_dequoted_nameref_suffix_is_opaque",
+     f"declare -n R=IF\"\"S; R=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_backslash_declare_is_opaque",
+     f"declare I\\FS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp $S", "write", OPQ),
+    ("union_ifs_name_boundary_does_not_overmatch",
+     "XIFS=:; S=deploy; echo x > $S/install-members.sh", "write", WRT),
+    ("union_ifs_double_quoted_expansion_is_conservative",
+     f"IFS=:; S=\"/tmp/e:{HOOKS}/{HOOK}\"; cp \"$S\"", "write", OPQ),
+    ("union_glob_value_is_opaque",
+     f"S=\"{HOOKS}/pre_*\"; cp /tmp/e $S", "write", OPQ),
+    ("union_glob_double_quoted_value_is_conservative",
+     f"S=\"{HOOKS}/pre_*\"; cp /tmp/e \"$S\"", "write", OPQ),
+    ("union_glob_read_only_expansion_stays_benign",
+     f"S=\"{HOOKS}/pre_*\"; echo $S", "none", None),
+    ("oog_sed_inplace_suffix__closure",
+     f"echo hi > $X/f; sed -i.bak s/a/b/ {SHARED_DIR}/{CORE}", "write", OOG),
+    ("oog_sed_inplace_long__closure",
+     f"echo hi > $X/f; sed --in-place s/a/b/ {SHARED_DIR}/{CORE}", "write", OOG),
+    ("oog_sed_inplace_cluster__closure",
+     f"echo hi > $X/f; sed -Ei s/a/b/ {SHARED_DIR}/{CORE}", "write", OOG),
+    ("sed_w_command__closure",
+     f"sed -n \"w {SHARED_DIR}/{CORE}\" /dev/null", "write", OOG),
+    ("oog_sed_s_w_flag__closure",
+     f"echo hi > $X/f; sed \"s/x/y/w {SHARED_DIR}/{CORE}\" /dev/null", "write", OOG),
+    ("oog_git_diff_output__closure",
+     f"echo hi > $X/f; git diff --output={SHARED_DIR}/{CORE}", "write", OOG),
+    ("oog_git_config_file__closure",
+     f"echo hi > $X/f; git config -f {SHARED_DIR}/{CORE} a.b c", "write", OOG),
+    ("oog_git_c_external_diff__closure",
+     f"echo hi > $X/f; git -c diff.external=/tmp/w.sh diff {SHARED_DIR}/{CORE}", "write", OOG),
 
     # --- cd <literal> && write-relative ---
     ("cd_then_write_relative__closure",
@@ -349,7 +470,7 @@ def _snapshot(root):
 
 def _setup_sandbox(root):
     """A fake closure layout the write-arm commands can safely touch."""
-    for sub in ("plugins/kimi/hooks", "plugins/_shared", "docs"):
+    for sub in ("plugins/kimi/hooks", "plugins/_shared", "docs", "deploy"):
         os.makedirs(os.path.join(root, sub), exist_ok=True)
     with open(os.path.join(root, "plugins/kimi/hooks", HOOK), "w") as fh:
         fh.write("orig\n")
@@ -377,6 +498,20 @@ _DIFF_CASES = [
     ("cp_into_shared", f"cp src.txt plugins/_shared/{CORE}", True),
     ("sed_bundled_in_place", f"sed -Ei 's/orig/edited/' plugins/kimi/hooks/{HOOK}", True),
     ("cd_then_relative", f"cd plugins/kimi/hooks && echo x > {HOOK}", True),
+    ("union_literal_deploy", "D=deploy; echo x > $D/install-members.sh", True),
+    ("union_skipped_conditional", "D=deploy; false && D=docs; echo x > $D/install-members.sh; D=deploy", True),
+    ("union_transitive_reassignment", "X=deploy; D=docs; D=$X; echo x > $D/install-members.sh; D=deploy", True),
+    ("union_pipeline_assignment", "D=deploy; D=docs | cat; echo x > $D/install-members.sh; D=deploy", True),
+    ("union_assignment_argument_does_not_hide", "D=deploy; echo D=docs; echo x > $D/install-members.sh", True),
+    ("union_literal_docs", "D=docs; echo x > $D/install-members.sh", False),
+    ("union_assignment_argument_stays_benign", "D=docs; echo D=deploy; echo x > $D/install-members.sh", False),
+    ("union_ifs_colon_split", f"IFS=:; S=\"src.txt:plugins/kimi/hooks/{HOOK}\"; cp $S", True),
+    ("union_multi_name_read", f"read A B <<< \"junk plugins/kimi/hooks/{HOOK}\"; printf x > \"$B\"", True),
+    ("union_multi_name_read_r", f"read -r A B <<< \"junk plugins/kimi/hooks/{HOOK}\"; printf x > \"$B\"", True),
+    ("union_ifs_append", f"IFS+=:; S=\"src.txt:plugins/kimi/hooks/{HOOK}\"; cp $S", True),
+    ("union_ifs_for_binding", f"for IFS in :; do S=\"src.txt:plugins/kimi/hooks/{HOOK}\"; cp $S; done", True),
+    ("union_ifs_printf_binding", f"printf -v IFS :; S=\"src.txt:plugins/kimi/hooks/{HOOK}\"; cp $S", True),
+    ("union_glob_value", f"S=\"plugins/kimi/hooks/pre_*\"; cp src.txt $S", True),
     ("redirect_benign", "echo hi > docs/readme.md", False),
     ("cp_benign", "cp src.txt docs/notes.txt", False),
 ]
