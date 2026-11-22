@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 7caaaeaad35cc35c308dbd99d73b7e582e674ef8f0dbc9ea77e0b9c97bf2d33e  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: f202a5b0afd3bc5e7a00ef4cb84a484f140fc453cc587605944ecd7eed964f03  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -865,10 +865,12 @@ def _tokenize(cmd: str) -> list:
     token beginning with `#` cannot be distinguished from a QUOTED one (`echo "#x"`), and
     dropping on that guess would make everything after a quoted `#` invisible — trading a
     false refusal for a silent write, which is the wrong direction for this module. Left in,
-    a comment's words become an ordinary simple command whose head is `#`: harmless, and the
-    following line is still seen. The residual cost is a comment containing a redirect
-    (`# write with > here`) raising a phantom write target and refusing a benign command.
-    That is a false POSITIVE, it fails closed, and it is the direction this module prefers.
+    after a separator, a comment's words become an ordinary simple command whose head is `#`;
+    a same-line trailing comment instead becomes extra positional arguments to the preceding
+    command. Last-positional write verbs therefore treat the whole set as write targets when a
+    `#` token appears, so a comment's last word cannot hide a governed source. The residual cost
+    is a comment containing a redirect (`# write with > here`) raising a phantom write target and
+    refusing a benign command. That is a false POSITIVE, it fails closed, and it is preferred.
     `a#b` is unaffected: shlex keeps a mid-word `#` attached, so it never opens anything.
     """
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=_PUNCT_CHARS)
@@ -1393,7 +1395,10 @@ def _last_positional_dest(pos: list) -> list:
     `cp G/x*`, `cp $X`, `set -- A B; cp "$@"` and `ln -f G/x*` all run as `CMD SRC DEST`, and DEST
     may be a closure file, so a non-literal lone word is out of grammar: a write iff closure
     vocabulary appears in the line (#1583). The test is inverted (allow plain, refuse the rest) so
-    no expansion form, in bash or zsh, needs listing."""
+    no expansion form, in bash or zsh, needs listing. A same-line comment becomes positionals too;
+    then only the union is safe, because the comment's last word must not hide a governed source."""
+    if any(isinstance(p, str) and p.startswith("#") for p in pos):
+        return pos
     if len(pos) == 1 and not _PLAIN_WORD.fullmatch(pos[0]):
         raise _OutOfGrammar()
     return [pos[-1]] if len(pos) >= 2 else []
