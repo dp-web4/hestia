@@ -89,6 +89,26 @@ def read_escalation(url, esc_id):
 
 
 ESC_ID = re.compile(r"Escalation ([0-9a-f]{8,}) is open")
+REFUSAL_ID = re.compile(r"\b(refusal-[0-9a-f]{8,})\b")
+
+
+def escalate(url, member, refusal_id):
+    """The member's deliberate act (dp, 2026-11-05): the gate records the refusal and opens
+    nothing; the member escalates it with a reason. The escalation carries the gate's own act,
+    marker and targets, so the bar it records is the one the gate's claim would have priced."""
+    sid, _ = _post(url, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2024-11-05", "capabilities": {},
+        "clientInfo": {"name": "escalation-bar-test", "version": "0"}}})
+    _post(url, {"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
+    _, out = _post(url, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+        "name": "hestia_gate_escalation_escalate", "arguments": {
+            "plugin_id": member, "refusal_id": refusal_id,
+            "reason": "escalation-bar test: price this refused write as the gate resolved it"}}}, sid)
+    content = ((out or {}).get("result") or {}).get("content") or []
+    try:
+        return json.loads(content[0]["text"]) if content else {"_raw": out}
+    except (KeyError, ValueError):
+        return {"_raw": out}
 
 
 def open_and_read(seat, home, event, label, shim_path=None):
@@ -100,9 +120,16 @@ def open_and_read(seat, home, event, label, shim_path=None):
         if "OUTCOME UNKNOWN" not in text:
             break
     check(f"{seat}-{label}-refused", v == "deny" and "gate.self_access" in text, text)
-    m = ESC_ID.search(text)
-    check(f"{seat}-{label}-escalation-opened", m, text)
-    return read_escalation(ENDPOINT, m.group(1)) if m else {}
+    # The deny opens nothing on its own: no "Escalation X is open" (a regression guard).
+    check(f"{seat}-{label}-deny-opened-nothing", not ESC_ID.search(text), text)
+    r = REFUSAL_ID.search(text)
+    check(f"{seat}-{label}-deny-names-refusal", r, text)
+    if not r:
+        return {}
+    opened = escalate(ENDPOINT, sb.SEATS[seat]["member"], r.group(1))
+    esc_id = opened.get("escalation_id")
+    check(f"{seat}-{label}-escalation-opened", esc_id, opened)
+    return read_escalation(ENDPOINT, esc_id) if esc_id else {}
 
 
 @reported
