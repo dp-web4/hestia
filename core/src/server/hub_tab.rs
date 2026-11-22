@@ -20,10 +20,12 @@ use axum::{extract::State, response::IntoResponse, Json};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::hub::{HubClient, JoinOutcome, SignedEnvelope, WithdrawOutcome};
+use crate::hub::{
+    ensure_member_identity, read_member_identity, HubClient, JoinOutcome, SignedEnvelope,
+    WithdrawOutcome,
+};
 use crate::server::state::SharedState;
 use crate::vault::{Vault, VaultEntry};
-use web4_core::crypto::KeyPair;
 
 /// Last-resort hub address, used only when neither `HESTIA_HUB_URL` nor a
 /// vault-stored known-hub list resolves one. Quick-tunnel hostnames are
@@ -186,55 +188,6 @@ fn abs_rest(base: &str, rest: &str) -> Result<String, String> {
         return Err(format!("non-http discovery endpoint refused: {rest}"));
     }
     Ok(format!("{}/{}", base.trim_end_matches('/'), rest.trim_matches('/')))
-}
-
-fn hex_to_32(s: &str) -> Option<[u8; 32]> {
-    let s = s.trim();
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
-    }
-    Some(out)
-}
-
-/// Read the member identity from the vault if provisioned (no side effects).
-fn read_member_identity(vault: &Vault) -> Option<(Uuid, KeyPair)> {
-    let lct_e = vault.get("ai_identity_lct_id")?;
-    let sec_e = vault.get("ai_identity_secret")?;
-    let lct = Uuid::parse_str(&lct_e.secret).ok()?;
-    let bytes = hex_to_32(&sec_e.secret)?;
-    Some((lct, KeyPair::from_secret_bytes(&bytes)))
-}
-
-/// Load-or-provision the member identity — mirror of the CLI's
-/// `ensure_member_identity` (same vault keys), so dashboard and CLI share
-/// one member LCT and the hub pins one key for both.
-fn ensure_member_identity(vault: &mut Vault) -> anyhow::Result<(Uuid, KeyPair)> {
-    if let Some(found) = read_member_identity(vault) {
-        return Ok(found);
-    }
-    let kp = KeyPair::generate();
-    let lct = Uuid::new_v4();
-    let secret_hex: String = kp
-        .secret_key_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    vault.add(
-        VaultEntry::new("ai_identity_lct_id", lct.to_string()).with_tags(vec!["identity".into()]),
-    )?;
-    vault.add(
-        VaultEntry::new("ai_identity_pubkey", kp.verifying_key().to_hex())
-            .with_tags(vec!["identity".into()]),
-    )?;
-    vault.add(
-        VaultEntry::new("ai_identity_secret", secret_hex)
-            .with_tags(vec!["identity".into(), "secret".into()]),
-    )?;
-    Ok((lct, kp))
 }
 
 fn err_json(status: axum::http::StatusCode, msg: String) -> axum::response::Response {

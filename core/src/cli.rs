@@ -6162,25 +6162,7 @@ fn cmd_hub_disconnect(home: &std::path::Path, target: &str) -> AnyResult<()> {
 fn ensure_member_identity(
     vault: &mut Vault,
 ) -> AnyResult<(uuid::Uuid, web4_core::crypto::KeyPair)> {
-    if let (Some(lct_e), Some(sec_e)) = (vault.get("ai_identity_lct_id"), vault.get("ai_identity_secret")) {
-        let lct = uuid::Uuid::parse_str(&lct_e.secret)
-            .context("ai_identity_lct_id is not a UUID")?;
-        let bytes = hex_to_32(&sec_e.secret)
-            .ok_or_else(|| anyhow::anyhow!("ai_identity_secret is not 32-byte hex"))?;
-        return Ok((lct, web4_core::crypto::KeyPair::from_secret_bytes(&bytes)));
-    }
-
-    // Provision a fresh member identity.
-    let kp = web4_core::crypto::KeyPair::generate();
-    let lct = uuid::Uuid::new_v4();
-    let secret_hex: String = kp.secret_key_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    vault.add(VaultEntry::new("ai_identity_lct_id", lct.to_string())
-        .with_tags(vec!["identity".into()]))?;
-    vault.add(VaultEntry::new("ai_identity_pubkey", kp.verifying_key().to_hex())
-        .with_tags(vec!["identity".into()]))?;
-    vault.add(VaultEntry::new("ai_identity_secret", secret_hex)
-        .with_tags(vec!["identity".into(), "secret".into()]))?;
-    Ok((lct, kp))
+    crate::hub::ensure_member_identity(vault)
 }
 
 fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> AnyResult<()> {
