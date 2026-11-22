@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "hestia-mesh.py",
-      "sha256": "dfb4ff4ac958a32bec763900a933f139e25ab9fffd3d8e4ce72428ed06e1ff21",
+      "sha256": "0d3892d100df7b63d2fabec3d94fa5fc6486641513a133c5077679810f61e6a9",
       "source": "plugins/member-mesh/hestia-mesh.py"
     },
     {
@@ -23,5 +23,5 @@
   ],
   "engine": null,
   "requires": [],
-  "gt_version": "ad7587780aee74caab965e19143447a2fa4b680e28f12697da5710b42063d58c"
+  "gt_version": "37e5f35e29f455d1f98151ae72edddab2609a4e6a83fbfe85fc06fd7f7861546"
 }
