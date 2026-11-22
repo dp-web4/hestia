@@ -233,7 +233,7 @@ def worker(idx, args, stop, out, lock):
                     raise RuntimeError(f"begin_action: {str(b)[:160]}")
                 step("query_policy", lambda: c.tool("hestia_query_policy", {"action_id": aid}))
                 step("record_outcome", lambda: c.tool("hestia_record_outcome", {
-                    "action_id": aid, "success": True, "magnitude": 0.1}))
+                    "action_id": aid, "session_id": sid, "success": True, "magnitude": 0.1}))
                 rec["witness"] = time.monotonic() - w0
             rec["ok"] = True
         except Exception as e:  # noqa: BLE001

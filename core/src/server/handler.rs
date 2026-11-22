@@ -401,7 +401,7 @@ fn hestia_tools() -> Vec<Tool> {
         t("hestia_begin_action", "Begin tracking an R6/R7 action. Optional `serves`: the goal or question id the act is for; its verdict's `feedback.serves` carries it (\"unknown\" when unstated)"),
         t(
             "hestia_record_outcome",
-            "Submit an action outcome with optional explicit closure claims",
+            "Submit an action outcome from the action's owning live session, with optional explicit closure claims",
         ),
         t(
             "hestia_record_reversal",
@@ -1391,7 +1391,7 @@ pub(crate) async fn tool_record_outcome(state: &SharedState, args: &Value) -> To
     };
 
     let mut s = state.lock().await;
-    let action = match s.actions.remove(&action_id) {
+    let action = match s.actions.get(&action_id).cloned() {
         Some(a) => a,
         None => {
             return Ok(hestia_error_envelope(
@@ -1401,6 +1401,47 @@ pub(crate) async fn tool_record_outcome(state: &SharedState, args: &Value) -> To
             ));
         }
     };
+
+    // Check before removal: a refused close leaves the action resident for its owner.
+    let caller_session_id = optional_session_id(args)
+        .and_then(|raw| Uuid::parse_str(&raw).ok());
+    let live_caller_session_id = caller_session_id
+        .filter(|id| s.sessions.contains_key(id));
+    if live_caller_session_id != Some(action.session_id) {
+        let caller_plugin_id = live_caller_session_id.and_then(|id| {
+            s.sessions.get(&id).map(|sess| sess.plugin_id.clone())
+        });
+        let action_plugin_id = s
+            .sessions
+            .get(&action.session_id)
+            .map(|sess| sess.plugin_id.clone());
+        let (reason, code) = if live_caller_session_id.is_some() {
+            (
+                "the caller's live session does not own this action",
+                "foreign_close",
+            )
+        } else {
+            (
+                "closing an outcome requires a resolvable live session that owns the action",
+                "owner_session_required",
+            )
+        };
+        let refusal = json!({
+            "action_id": action_id,
+            "caller_session_id": caller_session_id,
+            "action_session_id": action.session_id,
+            "caller_plugin_id": caller_plugin_id,
+            "action_plugin_id": action_plugin_id,
+            "reason": code,
+        });
+        s.append_chain("outcome_refused", refusal.clone())?;
+        return Ok(hestia_error_envelope(
+            "hestia.action_not_owned",
+            reason,
+            Some(refusal),
+        ));
+    }
+    let action = s.actions.remove(&action_id).expect("action remained after ownership check");
 
     let (plugin_id, role_lct, role_basis) = s
         .sessions
@@ -2907,6 +2948,7 @@ async fn tool_query_history(state: &SharedState, args: &Value) -> ToolResult {
 /// keeps that true if any reader is ever "fixed" to accept nesting.
 const RESERVED_EVENT_TYPES: &[&str] = &[
     "outcome",
+    "outcome_refused",
     "policy_decision",
     // The allow half of the one decision witness (one-gate stage A): daemon-written only.
     super::decision_witness::ALLOW_EVENT,
@@ -10624,6 +10666,210 @@ mod accountability_tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn outcome_close_requires_the_owning_live_session() {
+        let (_dir, state) = test_state().await;
+        let pre = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "shared-member",
+                "host_agent": "pre-process",
+                "host_session_id": "host-981"
+            }),
+        )
+        .await
+        .unwrap();
+        let owner_sid = pre["sessionId"].as_str().unwrap().to_string();
+        let foreign = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "shared-member",
+                "host_agent": "foreign-process",
+                "host_session_id": "other-host-981"
+            }),
+        )
+        .await
+        .unwrap();
+        let foreign_sid = foreign["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(foreign_sid, owner_sid);
+
+        let begin = tool_begin_action(
+            &state,
+            &json!({
+                "tool_name": "Bash",
+                "target": "make test",
+                "session_id": owner_sid,
+                "host_session_id": "host-981",
+                "intent": "verify the owning session"
+            }),
+        )
+        .await
+        .unwrap();
+        let action_id = begin["actionId"].as_str().unwrap().to_string();
+        let action_uuid = Uuid::parse_str(&action_id).unwrap();
+        let action_before = {
+            let s = state.lock().await;
+            format!("{:?}", s.actions.get(&action_uuid).unwrap())
+        };
+
+        let foreign_close = tool_record_outcome(
+            &state,
+            &json!({
+                "action_id": action_id,
+                "session_id": foreign_sid,
+                "success": false,
+                "magnitude": 1.0,
+                "error": "foreign sabotage"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            foreign_close["_hestia_error"]["code"],
+            "hestia.action_not_owned"
+        );
+        assert_eq!(
+            foreign_close["_hestia_error"]["data"]["reason"],
+            "foreign_close"
+        );
+
+        let missing_session = tool_record_outcome(
+            &state,
+            &json!({"action_id": action_id, "success": false}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            missing_session["_hestia_error"]["code"],
+            "hestia.action_not_owned"
+        );
+        let stale_sid = Uuid::new_v4();
+        let stale_session = tool_record_outcome(
+            &state,
+            &json!({
+                "action_id": action_id,
+                "session_id": stale_sid,
+                "success": false
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stale_session["_hestia_error"]["code"],
+            "hestia.action_not_owned"
+        );
+
+        {
+            let s = state.lock().await;
+            assert_eq!(
+                format!("{:?}", s.actions.get(&action_uuid).unwrap()),
+                action_before,
+                "every refused close must leave the original action unchanged"
+            );
+            let chain = s.recent_chain(100);
+            assert!(
+                chain.iter().all(|entry| entry.event_type != "outcome"),
+                "a refused close must not mint an outcome for the victim"
+            );
+            let refusals: Vec<_> = chain
+                .iter()
+                .filter(|entry| entry.event_type == "outcome_refused")
+                .collect();
+            assert_eq!(refusals.len(), 3);
+            let foreign_refusal = refusals
+                .iter()
+                .find(|entry| entry.event_data["reason"] == "foreign_close")
+                .unwrap();
+            assert_eq!(foreign_refusal.event_data["action_id"], action_id);
+            assert_eq!(
+                foreign_refusal.event_data["caller_session_id"],
+                foreign_sid
+            );
+            assert_eq!(
+                foreign_refusal.event_data["action_session_id"],
+                owner_sid
+            );
+            assert_eq!(
+                foreign_refusal.event_data["caller_plugin_id"],
+                "shared-member"
+            );
+            assert_eq!(
+                foreign_refusal.event_data["action_plugin_id"],
+                "shared-member"
+            );
+            assert!(refusals.iter().any(|entry| {
+                entry.event_data["reason"] == "owner_session_required"
+                    && entry.event_data["caller_session_id"].is_null()
+            }));
+            assert!(refusals.iter().any(|entry| {
+                entry.event_data["reason"] == "owner_session_required"
+                    && entry.event_data["caller_session_id"] == stale_sid.to_string()
+            }));
+        }
+        assert!(
+            sink_deltas(&state).await.is_empty(),
+            "a refused close must not score the action owner"
+        );
+
+        let post = tool_connect(
+            &state,
+            &json!({
+                "plugin_id": "shared-member",
+                "host_agent": "post-process",
+                "host_session_id": "host-981"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(post["reused"], true);
+        assert_eq!(post["sessionId"], owner_sid);
+        let recorded = tool_record_outcome(
+            &state,
+            &json!({
+                "action_id": action_id,
+                "session_id": post["sessionId"],
+                "success": true,
+                "magnitude": 0.8
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            recorded["witnessEntryHash"].is_string(),
+            "the rightful owner must still close after the sabotage attempt: {recorded}"
+        );
+        let forged_refusal = tool_request_witness(
+            &state,
+            &json!({
+                "event_type": "outcome_refused",
+                "event_data": {"action_id": action_id, "reason": "foreign_close"},
+                "session_id": post["sessionId"]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            forged_refusal["_hestia_error"]["code"],
+            "hestia.witness_reserved_event",
+            "a caller must not be able to forge the daemon's ownership refusal"
+        );
+
+        let s = state.lock().await;
+        assert!(!s.actions.contains_key(&action_uuid));
+        let outcomes: Vec<_> = s
+            .recent_chain(100)
+            .into_iter()
+            .filter(|entry| entry.event_type == "outcome")
+            .collect();
+        assert_eq!(outcomes.len(), 1);
+        let outcome = &outcomes[0].event_data;
+        assert_eq!(outcome["action_id"], action_id);
+        assert_eq!(outcome["session_id"], owner_sid);
+        assert_eq!(outcome["success"], true);
+        assert_eq!(outcome["magnitude"], 0.8);
+        assert!(outcome["error"].is_null());
+    }
+
     /// **The call-site classification guard (web4 #703 / R7a).**
     ///
     /// The builder-level tests prove `delta_from_change` carries whatever class
@@ -10647,7 +10893,7 @@ mod accountability_tests {
         })).await.unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
         tool_record_outcome(&state, &json!({
-            "action_id": aid, "success": false, "magnitude": 0.5,
+            "action_id": aid, "session_id": sid, "success": false, "magnitude": 0.5,
             "error": "connection refused"
         })).await.unwrap();
 
@@ -10761,7 +11007,7 @@ mod accountability_tests {
 
         tool_record_outcome(
             &state,
-            &json!({"action_id": aid, "success": true, "magnitude": 0.3}),
+            &json!({"action_id": aid, "session_id": sid, "success": true, "magnitude": 0.3}),
         )
         .await
         .unwrap();
@@ -10806,7 +11052,7 @@ mod accountability_tests {
             .await
             .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+        tool_record_outcome(&state, &json!({"action_id":aid,"session_id":sid,"success":true}))
             .await
             .unwrap();
         let s = state.lock().await;
@@ -10842,7 +11088,7 @@ mod accountability_tests {
         .await
         .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+        tool_record_outcome(&state, &json!({"action_id":aid,"session_id":sid,"success":true}))
             .await
             .unwrap();
         let begin2 = tool_begin_action(&state, &json!({
@@ -10853,7 +11099,7 @@ mod accountability_tests {
         .await
         .unwrap();
         let aid2 = begin2["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid2,"success":true}))
+        tool_record_outcome(&state, &json!({"action_id":aid2,"session_id":sid,"success":true}))
             .await
             .unwrap();
 
@@ -10891,7 +11137,7 @@ mod accountability_tests {
         let aid = begin["actionId"].as_str().unwrap().to_string();
         tool_record_outcome(
             &state,
-            &json!({"action_id":aid,"success":true,"client_ts":1788000000.25}),
+            &json!({"action_id":aid,"session_id":sid,"success":true,"client_ts":1788000000.25}),
         )
         .await
         .unwrap();
@@ -10900,7 +11146,7 @@ mod accountability_tests {
             .await
             .unwrap();
         let aid2 = begin2["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid2,"success":true}))
+        tool_record_outcome(&state, &json!({"action_id":aid2,"session_id":sid,"success":true}))
             .await
             .unwrap();
 
@@ -10943,6 +11189,7 @@ mod accountability_tests {
             &state,
             &json!({
                 "action_id": first_id,
+                "session_id": sid,
                 "success": true,
                 "result": {"summary": "tests pass"},
                 "closure_claims": [{
@@ -10967,6 +11214,7 @@ mod accountability_tests {
             &state,
             &json!({
                 "action_id": second_id,
+                "session_id": sid,
                 "success": true,
                 "result": {"summary": "this is not a closure claim"}
             }),
@@ -11014,6 +11262,7 @@ mod accountability_tests {
             &state,
             &json!({
                 "action_id": action_id,
+                "session_id": connected["sessionId"],
                 "success": true,
                 "closure_claims": [{
                     "claim_id": "unsupported",
@@ -11031,7 +11280,9 @@ mod accountability_tests {
             "hestia.invalid_closure_claims"
         );
 
-        let corrected = tool_record_outcome(&state, &json!({"action_id":action_id,"success":true}))
+        let corrected = tool_record_outcome(&state, &json!({
+            "action_id":action_id, "session_id":connected["sessionId"], "success":true
+        }))
             .await
             .unwrap();
         assert!(corrected.get("_hestia_error").is_none());
@@ -12016,7 +12267,7 @@ mod accountability_tests {
             .await
             .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+        tool_record_outcome(&state, &json!({"action_id":aid,"session_id":sid,"success":true}))
             .await
             .unwrap();
         let s = state.lock().await;
@@ -12390,7 +12641,7 @@ mod accountability_tests {
         .await
         .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&state, &json!({"action_id":aid,"success":true}))
+        tool_record_outcome(&state, &json!({"action_id":aid,"session_id":sid,"success":true}))
             .await
             .unwrap();
         let s = state.lock().await;
@@ -16199,7 +16450,7 @@ mod tests {
             .await
             .unwrap();
         let aid = begin["actionId"].as_str().unwrap().to_string();
-        tool_record_outcome(&shared, &json!({"action_id":aid,"success":true}))
+        tool_record_outcome(&shared, &json!({"action_id":aid,"session_id":sid,"success":true}))
             .await
             .unwrap();
         {
@@ -34867,7 +35118,7 @@ mod concurrency_battery {
                 for k in 0..3 {
                     let b = tool_begin_action(&st, &json!({"tool_name": "Read", "target": "/tmp/x",
                         "parameters": {"file_path": "/tmp/x"}, "session_id": sid})).await.unwrap();
-                    tool_record_outcome(&st, &json!({"action_id": b["actionId"],
+                    tool_record_outcome(&st, &json!({"action_id": b["actionId"], "session_id": sid,
                         "success": k != 1, "magnitude": 0.3 + 0.1 * k as f64})).await.unwrap();
                 }
                 let b = tool_begin_action(&st, &json!({"tool_name": "Bash", "target": DENY_CMD,

@@ -89,7 +89,8 @@ def main(argv=None) -> int:
         print(f"begin_action gave no actionId: {str(begun)[:300]}", file=sys.stderr)
         return 1
     c.tool("hestia_query_policy", {"action_id": aid})
-    out = c.tool("hestia_record_outcome", {"action_id": aid, "success": True, "magnitude": 0.1})
+    out = c.tool("hestia_record_outcome", {
+        "action_id": aid, "session_id": sid, "success": True, "magnitude": 0.1})
     print(f"seeded one witnessed {a.member} action (session {sid}, action {aid}): {str(out)[:200]}")
     return 0
 
