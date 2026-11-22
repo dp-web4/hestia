@@ -30096,6 +30096,32 @@ mod standing_scope_surface_tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_undecided_request_gets_one_day_while_a_grant_keeps_eight_hours() {
+        let (dir, state) = test_state().await;
+        let sid = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let now = crate::server::gate_escalation::now_secs();
+        let path = dir.path().join("ttl.txt");
+        std::fs::write(&path, "a real file the member may ask to read").unwrap();
+        let out = tool_request_scope(&state, &json!({
+            "plugin_id": "kimi-code", "session_id": sid, "path": path.to_string_lossy(),
+            "reason": "prove the ask survives one mesh round trip and an operator day"
+        })).await.unwrap();
+        let expires_at = out["expires_at"].as_u64().unwrap();
+        let delta = expires_at.saturating_sub(now);
+        assert!((86_395..=86_400).contains(&delta), "one day, not eight hours: {out}");
+        assert!(delta > 8 * 3600 + 39 * 60 + 36, "the measured 8h39m36s mesh lag must clear");
+        assert_eq!(crate::server::state::SCOPE_GRANT_TTL_SECS, 8 * 3600);
+        let id = out["request_id"].as_str().unwrap();
+        let s = state.lock().await;
+        assert_eq!(s.scope_requests[id].expires_at, expires_at);
+        let witnessed = s.recent_chain(10).into_iter()
+            .find(|e| e.event_type == "scope_requested" && e.event_data["request_id"] == id)
+            .expect("the 24h request is witnessed with the same expiry");
+        assert_eq!(witnessed.event_data["expires_at"], expires_at);
+    }
+
     /// (e) `hestia_scope_status` carries BOTH lists, additively: `live_grants` keeps its
     /// exact pre-existing shape (a consumer keyed on it must not notice this PR), and
     /// `standing_grants` + `generation` + `snapshot_expires_at` arrive beside it.

@@ -481,12 +481,13 @@ impl ScopeRequest {
 /// state OPEN — `ServerState::open` — not at the worker's first pass.
 pub(crate) const DISPOSITION_PROJECTION_CURSOR: &str = "disposition";
 
-/// How long an undecided scope request stays askable, and the default life of a grant.
-///
-/// Both are the same 8 hours, and that is not laziness: a request is a question about work
-/// happening NOW, and a grant is permission to do that same work. A window that outlives the
-/// task turns a scoped exception into a standing one by inattention.
-pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
+/// How long an undecided scope request stays askable. Twenty-four hours clears the measured
+/// 8h39m mesh round trip plus an operator's day (#956); an unanswered request still grants
+/// nothing, it only leaves the witnessed question open long enough to be answered.
+pub const SCOPE_REQUEST_TTL_SECS: u64 = 24 * 3600;
+/// The default life of a session grant. This stays shorter on purpose: permission to do the
+/// work, unlike the question asking for it, must not become a standing exception by inattention.
+pub const SCOPE_GRANT_TTL_SECS: u64 = 8 * 3600;
 
 /// THE ASYMMETRY, stated once so neither half drifts (dp, 2026-08-01; amended 2026-08-14):
 ///
