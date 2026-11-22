@@ -447,6 +447,14 @@ _BLOCK_BODY_READS = [
     ("71199e4b__loop_ls_over_config_paths",
      f'for p in {SHARED_DIR} {HOOKS}/{HOOK}; do echo "== $p"; ls -la $p; done',
      f'ls -la {SHARED_DIR} {HOOKS}/{HOOK}'),
+    ("a3557a7f__interpreter_then_loop",
+     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3; echo "=== t ==="; '
+     f'for t in plugins/kimi/tests/*.py; do r=$(python3 "$t" 2>&1 | tail -1); echo "$r"; done',
+     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3'),
+    ("ffcf0139__loop_running_these_very_suites",
+     f'for f in {SHARED_DIR}/shell_grammar_test.py {SHARED_DIR}/{CORE}; do '
+     f'timeout 600 python3 "$f" 2>&1 | tail -15; done',
+     f'timeout 600 python3 {SHARED_DIR}/shell_grammar_test.py 2>&1 | tail -15'),
     # Nesting and terminators: a block inside a block, and a redirect hanging off `done`
     # (harvested by _bash_write_targets BEFORE the segment is flushed, so stripping the
     # terminator must not lose it ─ the write arm for this shape is generated below).
@@ -458,14 +466,6 @@ _BLOCK_BODY_READS = [
 # Direct interpreter argv is a write floor under #1059, so these two historical read arms move
 # to the write side without changing their command text or weakening the block invariant.
 _BLOCK_BODY_WRITES = [
-    ("a3557a7f__interpreter_then_loop",
-     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3; echo "=== t ==="; '
-     f'for t in plugins/kimi/tests/*.py; do r=$(python3 "$t" 2>&1 | tail -1); echo "$r"; done',
-     f'python3 {SHARED_DIR}/{CORE} 2>&1 | tail -3'),
-    ("ffcf0139__loop_running_these_very_suites",
-     f'for f in {SHARED_DIR}/shell_grammar_test.py {SHARED_DIR}/{CORE}; do '
-     f'timeout 600 python3 "$f" 2>&1 | tail -15; done',
-     f'timeout 600 python3 {SHARED_DIR}/shell_grammar_test.py 2>&1 | tail -15'),
 ]
 
 
