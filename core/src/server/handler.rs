@@ -26303,13 +26303,20 @@ fn dispatcher_origin(
     let rule = d.get("rule_id").and_then(Value::as_str)?;
     let is_deny = entry.event_type == "policy_decision"
         && d.get("decision").and_then(Value::as_str) == Some("deny")
-        && d.get("enforced").and_then(Value::as_bool) != Some(false)
-        && rule.starts_with("mrh.");
+        && d.get("enforced").and_then(Value::as_bool) == Some(true)
+        && matches!(rule, "mrh.path" | "mrh.command")
+        && d.get("verdict_available").and_then(Value::as_bool) != Some(false)
+        && d.get("adjudicator")
+            .and_then(Value::as_str)
+            .is_some_and(|a| !a.trim().is_empty());
     if !is_deny {
         return None;
     }
-    let target = d.get("target").and_then(Value::as_str)?;
-    let subtree = target.trim_end().ends_with("/*");
+    let target = d.get("target").and_then(Value::as_str)?.trim();
+    if !target.starts_with('/') {
+        return None;
+    }
+    let subtree = target.ends_with("/*");
     let target = super::state::normalize_scope_path(target);
     let parent = std::path::Path::new(&target)
         .parent()
@@ -26321,7 +26328,9 @@ fn dispatcher_origin(
         return None;
     }
     let tool = d.get("tool_name").and_then(Value::as_str).unwrap_or("unknown");
-    let act = d.get("attempted").and_then(Value::as_str)?;
+    let act = d.get("attempted").and_then(Value::as_str).filter(|act| {
+        !act.trim().is_empty() && !act.trim_end().ends_with("…[truncated]")
+    })?;
     // A policy deny retains a display act, not the gate's complete-act authorization digest.
     // Keep that distinction explicit: session/standing rulings are available, ONCE is not.
     let act_digest = String::new();
@@ -30205,6 +30214,23 @@ mod dispatcher_origin_tests {
         state.lock().await.chain_store.read_by_hash(hash).unwrap().unwrap()
     }
 
+    async fn raw_deny_for(
+        state: &SharedState,
+        plugin: &str,
+        target: &str,
+        rule: &str,
+        mutate: impl FnOnce(&mut Value),
+    ) -> crate::storage::chain::ChainEntry {
+        let mut row = json!({
+            "plugin_id": plugin, "decision": "deny", "enforced": true,
+            "adjudicator": "test-gate", "rule_id": rule, "tool_name": "Read",
+            "target": target, "attempted": format!("Read -> {target}"),
+            "reason": "outside the member's grant", "verdict_available": true,
+        });
+        mutate(&mut row);
+        state.lock().await.append_chain("policy_decision", row).unwrap()
+    }
+
     async fn request(
         state: &SharedState,
         session: Option<&str>,
@@ -30251,6 +30277,12 @@ mod dispatcher_origin_tests {
         assert_eq!(chain.event_data["deny_witness"], deny.hash, "{chain:?}");
         assert_eq!(chain.event_data["origin"], "dispatcher_after_deny", "{chain:?}");
         assert_eq!(chain.event_data["act_digest"], "", "{chain:?}");
+        let projected = crate::server::governance_ledger::project(
+            std::slice::from_ref(&chain), crate::server::gate_escalation::now_secs());
+        assert_eq!(projected.len(), 1, "{projected:?}");
+        assert!(!projected[0].allowed_decisions.iter().any(|d| d == "once"));
+        assert!(projected[0].allowed_decisions.iter().any(|d| d == "session"));
+        assert!(projected[0].allowed_decisions.iter().any(|d| d == "standing"));
         assert!(opened["invited_peers"].as_array().unwrap().contains(&json!("codex")), "{opened}");
         assert!(state.lock().await.scope_requests.get(&request_id).unwrap().ext.gate.is_some());
         let status = tool_scope_status(&state, &json!({"plugin_id": "kimi-code", "session_id": asker}))
@@ -30355,6 +30387,89 @@ mod dispatcher_origin_tests {
         assert_eq!(widened["origin"], "member_request", "{widened}");
         let id = widened["request_id"].as_str().unwrap();
         assert!(state.lock().await.scope_requests[id].ext.gate.is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_or_unverified_dispatcher_evidence_stays_member_filed() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "kimi-code").await;
+        let path = evidence(_dir.path(), "child/evidence.txt");
+        let valid = deny_for(&state, "kimi-code", &path, "mrh.path").await;
+        let missing_enforced = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row.as_object_mut().unwrap().remove("enforced");
+        }).await;
+        let null_enforced = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["enforced"] = Value::Null;
+        }).await;
+        let unenforced = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["enforced"] = json!(false);
+        }).await;
+        let missing_adjudicator = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row.as_object_mut().unwrap().remove("adjudicator");
+        }).await;
+        let empty_adjudicator = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["adjudicator"] = json!("  ");
+        }).await;
+        let unavailable = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["verdict_available"] = json!(false);
+        }).await;
+        let truncated = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["attempted"] = json!(format!("Read -> {path}…[truncated]"));
+        }).await;
+        let empty_act = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["attempted"] = json!(" ");
+        }).await;
+        let wrong_rule = raw_deny_for(&state, "kimi-code", &path, "mrh.repo", |_| {}).await;
+        let not_denied = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["decision"] = json!("allow");
+        }).await;
+        let relative_target = raw_deny_for(
+            &state, "kimi-code", "relative/evidence.txt", "mrh.path", |_| {}).await;
+        let cases = vec![
+            ("missing enforced", missing_enforced.hash),
+            ("null enforced", null_enforced.hash),
+            ("unenforced", unenforced.hash),
+            ("missing adjudicator", missing_adjudicator.hash),
+            ("empty adjudicator", empty_adjudicator.hash),
+            ("no verdict", unavailable.hash),
+            ("truncated act", truncated.hash),
+            ("empty act", empty_act.hash),
+            ("non-scope rule", wrong_rule.hash),
+            ("not a deny", not_denied.hash),
+            ("relative target", relative_target.hash),
+        ];
+        let mut hashes: Vec<(&str, String)> = cases;
+        hashes.push(("nonexistent full hash", "0".repeat(64)));
+        hashes.push(("hash prefix", valid.hash[..16].to_string()));
+        for (name, hash) in hashes {
+            let opened = request(
+                &state, Some(&asker), &path, Some("dispatcher_after_deny"), Some(&hash)).await;
+            assert_eq!(opened["origin"], "member_request", "{name}: {opened}");
+            let id = opened["request_id"].as_str().unwrap();
+            assert!(state.lock().await.scope_requests[id].ext.gate.is_none(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_refusal_does_not_upgrade_a_member_filed_request() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "kimi-code").await;
+        let peer = connect(&state, "codex").await;
+        let path = evidence(_dir.path(), "child/evidence.txt");
+        let opened = request(&state, Some(&asker), &path, None, None).await;
+        assert_eq!(opened["origin"], "member_request", "{opened}");
+        let id = opened["request_id"].as_str().unwrap().to_string();
+        assert!(state.lock().await.scope_requests[&id].ext.gate.is_none());
+        let refused = tool_scope_peer_decide(&state, &json!({
+            "request_id": id, "session_id": peer,
+            "decision": "refuse", "reason": "the requested path is not needed for this work",
+        })).await.unwrap();
+        assert_eq!(refused["granted"], false, "{refused}");
+        assert_eq!(refused["peer_basis"]["origin"], "member_request", "{refused}");
+        let s = state.lock().await;
+        let req = s.scope_requests.get(&id).unwrap();
+        assert_eq!(req.granted, Some(false));
+        assert!(req.ext.gate.is_none());
     }
 }
 
