@@ -574,99 +574,23 @@ jobs:
           # newer than the engine it imports). Duplicate law is not preserved to
           # accommodate the deploy mechanism.
           #
-          # --max-pct is still the number that actually matters and still
-          # depends on a published vocabulary, so it is arguable -- which is a
-          # reason to print it every run, not a reason to leave it unpinned.
-          # 52.3, not 52.2. The cutover measured 52.2; the mandated fail-closed
-          # import guard (missing shared authority -> exit 2, proven by
-          # plugins/claude-code/tests/missing_shared_authority_blocks_test.py)
-          # added 11 law-bearing sloc to the seat and moved it to 52.3. Pinned at
-          # the MEASURED value. The alternative was writing terser refusal code to
-          # hit a round number, which is optimising the gauge instead of the thing.
-          # 52.8, not 52.3. Review of #747 found the negative test did not model
-          # an ABSENT install (an existing empty dir suppressed the repo fallback),
-          # so the fallback and two unconditional working-tree resolutions were
-          # deleted and replaced by ONE installed-only loader, BYTE-IDENTICAL to
-          # codex's (#742 head 03a0ba8), asserted by the staging script, not
-          # eyeballed. The loader is per-seat law the meter counts. It cannot
-          # live in shared authority because it IS the reach to shared authority.
-          # (An earlier version of this comment predicted the verbatim ratchet
-          # would trip when both seats carried one loader text. Wrong: that grade
-          # covers only names the SHARED ENGINE owns, and the loader is not one; a
-          # duplicated loader lands in the informational unshared-fork surface,
-          # as _load_mechanism already does. Recorded so the next reader does not
-          # inherit the prediction.)
-          #
-          # PER SEAT, NOT FLEET (#771). The fleet aggregate let one shim's added
-          # authority read as a fleet regression and let three lean adapters dilute
-          # one forked shim. Bounds are now one per discovered seat, at the MEASURED
-          # value on this head; a regression names its seat and moves no other
-          # seat's number. A pinned seat that is not discovered fails: unmeasurable
-          # is not compliant. The aggregate is still printed, labeled TREND, and
-          # decides nothing. Deployment readiness over RESIDENT bytes is the other
-          # instrument (tools/installed_seat_readiness.py); CI has no installed
-          # seats, so its self-test runs in the plugin-tests job instead.
-          #
-          # codex 25.0, not 23.9 (#742): the installed-only loader and its refusal
-          # path are per-seat mechanics the meter counts as law. Moved to the
-          # measured value on that head and no other seat's pin touched, which is
-          # the point of pinning per seat: the same change under the fleet gauge
-          # read as "the fleet regressed 0.1".
-          #
-          # Slice 3 (#796) moved the five codex/kimi gate-self bodies into the
-          # shared mechanism. Codex and kimi lose the duplicated bodies; the
-          # shared-law denominator grows for every seat, so all four measured
-          # percentages fall. Pin the exact post-move values in the same PR: a
-          # lower number left only in the PR prose is not a ratchet.
-          #
-          # claude-code 28.8 -> 28.9 (#944, the projection consumer). The seat now
-          # refuses before stdin when its vault-rendered config is missing or names a
-          # different home than the launcher supplied. That refusal is LAW, and it is
-          # per-seat only because each shim owns its own `main` -- SHIM_LEDGER's `main`
-          # row carries it as debt with #934's decide() as the retirement path. The
-          # explanatory comment was kept OUT of the function (the #950/#951 lesson),
-          # which is why this is +0.1 and not +0.2. Adjudicated, not absorbed: the
-          # alternative was to route the refusal through deny_no_verdict, whose
-          # remedies are about daemon reachability, and tell the operator to retry a
-          # daemon that is fine.
-          #
-          # claude-code 28.9 -> 29.0 (#944, liveness). One line in `_connect_session`
-          # presents the loaded projection's digest to the daemon on connect, beside
-          # the role it already presents from the same environment. The function is
-          # already SHIM_LEDGER debt (#844, the never-raise degrade rule), so its one
-          # new line of identity wiring counts as law under the meter's per-function
-          # attribution; the wiring itself has no legislative content. Adjudicated,
-          # not absorbed: the alternative was a second connect-args builder outside
-          # the debt function, which is more shim, not less.
-          #
-          # claude-code 29.0 -> 29.9 (#1084, the vault-bounded launch role). The LAW is in the
-          # shared engine: `hestia_gate_core.launch_role_verdict` owns the predicate, the
-          # unset-role exemption and the refusal's words (dp 2026-09-22: "all law goes into
-          # shared engine"; the first cut had it in the shim at 30.0). What stays in the seat is
-          # `_apply_launch_role`, ledgered as wiring: it loads the core, hands it the projection's
-          # set, and records the answer, plus the essential fail-closed when a declared set cannot
-          # be evaluated because the core is unreachable (which cannot live in the core). The meter
-          # counts it as law lexically ("gate" in the module name it loads); it decides nothing.
-          # Adjudicated, not absorbed, the same reading as the 28.9 -> 29.0 entry above: the
-          # alternative was renaming things to dodge the vocabulary, which is optimising the gauge.
-          # 29.9, not 29.7: codex's P1 review found the first cut called the core's verdict OUTSIDE
-          # its try, so a new hook against an old installed core raised at import and exited 1 --
-          # which Claude Code treats as non-blocking, i.e. fail-OPEN. The catch-all that fixes it
-          # is a few more lines in the same wiring function, and the meter counts them the same
-          # lexical way. Worth saying plainly: this number barely moved (30.0 in-shim -> 29.9),
-          # because the meter measures vocabulary in the seat, not where decisions live. What
-          # moved is in SHIM_LEDGER: the predicate, exemption and refusal words are the core's.
-          # One-gate stage C (2026-10-04): every seat is the certified template plus data plus
-          # three adapters, and every law-bearing step is the common gate's `decide`. Measured on
-          # the cutover bytes: claude-code 4.6, codex 4.6, gemini 5.3, kimi 4.6 (from 29.9 / 20.6
-          # / 10.3 / 16.8). What remains per seat is the byte-identical bootstrap (projection
-          # loader, authority loader with #747 sys.modules eviction, emergency block, main) and the
-          # adapters, which the meter counts lexically; gemini's extra 0.7 is its lineage
-          # translation and two-channel emit. Pinned at the measured values: the ratchet only falls.
-          python3 tools/gate_collapse_meter.py \
-            --max-divergent-forked 0 --max-verbatim-forked 0 \
-            --max-seat-pct claude-code=4.6 --max-seat-pct codex=4.6 \
-            --max-seat-pct gemini=5.3 --max-seat-pct kimi=4.6
+          # #1103: the lexical percentage above remains a printed trend, never a CI ceiling.
+          # It counts comments and vocabulary, so it cannot distinguish law from wiring. The
+          # blocking fidelity metrics are M1 (normalized template lines carried verbatim) and
+          # M2 (divergent or seat-only code lines / the same certified denominator). Comments,
+          # docstrings and blank lines do not move either number. Fleet M1 intersects all seats
+          # AND the template, so it cannot exceed 100%. Per-seat M2 names the actual exceptions.
+          # Pins below are the measured values on this head: M1 0.9818 fleet and per-seat;
+          # M2 0.1637 for claude-code/codex/kimi and 0.3394 for gemini. M1 only rises; M2 only
+          # falls. --home also requires the daemon's current VERIFIED integrity verdict before
+          # measuring deployed bytes; CI has no installed seats, so repo mode is the pin here.
+          python3 tools/gate_collapse_meter.py --max-divergent-forked 0 --max-verbatim-forked 0
+          python3 tools/shim_metrics.py \
+            --min-fleet-m1 0.9818 \
+            --min-seat-m1 claude-code=0.9818 --min-seat-m1 codex=0.9818 \
+            --min-seat-m1 gemini=0.9818 --min-seat-m1 kimi=0.9818 \
+            --max-seat-m2 claude-code=0.1637 --max-seat-m2 codex=0.1637 \
+            --max-seat-m2 gemini=0.3394 --max-seat-m2 kimi=0.1637
 
       - name: Do the forked predicates actually disagree with the engine?
         run: |
