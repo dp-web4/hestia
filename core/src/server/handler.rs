@@ -26063,14 +26063,27 @@ pub(crate) const READ_ONLY_PATH_TOOLS: &[&str] = &[
 ];
 
 /// The decider's reason belongs to the original act; this guidance belongs to the current one.
-fn standing_refusal_next(tool: &str) -> &'static str {
-    if tool == "search" {
-        "for a directory or inbox name, use memory_read path=<directory> with start_line paging \
-         instead of repeating this search; otherwise narrow the search to a directory you already \
-         hold"
+/// SAGE's paged directory `memory_read` is a cbp-being affordance (#1667, SAGE #707), not a
+/// fleet-wide verb. No concrete alternative path is invented from the display act: the member
+/// chooses a target its effective grants actually admit.
+fn standing_refusal_next(plugin_id: &str, tool: &str) -> &'static str {
+    if plugin_id == "cbp-being" {
+        if tool == "search" {
+            "use hestia_scope_status to choose a narrower directory whose effective grants include \
+             read, then memory_read path=<held-directory> with start_line paging instead of \
+             repeating this search at the refused path"
+        } else {
+            "use an existing route whose target your effective grants admit for this act; for a \
+             directory listing, memory_read path=<held-directory> with start_line paging. \
+             Re-issuing this path ask will not reopen it"
+        }
+    } else if tool == "search" {
+        "use hestia_scope_status to choose a narrower directory whose effective grants include \
+         read, then narrow the search to that directory instead of repeating it at the refused path"
     } else {
-        "use an existing in-scope route for this act; for a directory listing, use memory_read \
-         path=<directory> with start_line paging. Re-issuing this path ask will not reopen it"
+        "use an existing in-scope route for this act; for a directory listing, use your host's \
+         supported listing operation on a directory you already hold. Re-issuing this path ask \
+         will not reopen it"
     }
 }
 
@@ -26416,7 +26429,7 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
             "refused_by": r.refused_by,
             "refused_at": r.refused_at,
             "reason": r.reason,
-            "next": standing_refusal_next(""),
+            "next": standing_refusal_next(&plugin_id, ""),
             "note": "a standing refusal covers this path: nothing was filed and nothing reaches \
                      the operator's queue. It stands until the operator lifts it; the reason is \
                      the one recorded when it was refused",
@@ -27075,7 +27088,7 @@ async fn scope_claim_inner(state: &SharedState, args: &Value,
     // refusal lasted one window and the next act minted a fresh request and a fresh card.
     if unpriceable.is_none() {
         if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
-            let next = standing_refusal_next(&tool);
+            let next = standing_refusal_next(&plugin_id, &tool);
             return Ok(json!({
                 "verdict": "refused", "permits": false, "path": path, "request_key": key,
                 "standing": true, "refused_by": r.refused_by, "refused_at": r.refused_at,
@@ -30150,7 +30163,7 @@ mod standing_scope_surface_tests {
         assert_eq!(out["status"], "refused_standing", "{out}");
         assert_eq!(out["reason"], ORIGINAL_REFUSAL_REASON, "{out}");
         let next = out["next"].as_str().unwrap();
-        assert!(next.contains("memory_read path=<directory>"), "{out}");
+        assert!(next.contains("memory_read path=<held-directory>"), "{out}");
         assert!(next.contains("start_line"), "{out}");
         assert_eq!(shared.lock().await.chain_len(), chain_before);
     }
@@ -30175,7 +30188,7 @@ mod standing_scope_surface_tests {
         assert!(search["next"].as_str().unwrap().contains("repeating this search"), "{search}");
         let detail = search["detail"].as_str().unwrap();
         assert!(detail.contains(ORIGINAL_REFUSAL_REASON), "{search}");
-        assert!(detail.contains("memory_read path=<directory>"), "{search}");
+        assert!(detail.contains("memory_read path=<held-directory>"), "{search}");
         assert!(detail.contains("start_line"), "{search}");
 
         let read = tool_scope_claim(&shared, &claim("Read", "Read -> visible.txt"))
@@ -30185,6 +30198,92 @@ mod standing_scope_surface_tests {
         assert_ne!(read["next"], search["next"], "{read}");
         assert!(read["next"].as_str().unwrap().contains("for a directory listing"), "{read}");
         assert_eq!(shared.lock().await.chain_len(), chain_before);
+    }
+
+    #[tokio::test]
+    async fn standing_guidance_does_not_offer_sage_verbs_to_other_hosts() {
+        let (_dir, shared, path) = standing_refusal_fixture().await;
+        shared.lock().await.standing_scope.refusals.push(
+            crate::server::standing_scope::StandingRefusal {
+                member: "kimi-code".into(),
+                path: path.clone(),
+                recursive: false,
+                refused_at: 1,
+                refused_by: "operator".into(),
+                reason: ORIGINAL_REFUSAL_REASON.into(),
+                request_id: None,
+                modes: Some(crate::server::grant_modes::Modes::READ),
+            },
+        );
+        for tool in ["search", "Read"] {
+            let out = tool_scope_claim(&shared, &json!({
+                "plugin_id": "kimi-code", "path": path, "rule": "mrh.path",
+                "tool_name": tool, "act": format!("{tool} -> visible.txt"),
+                "act_digest": "a".repeat(64), "spend": false,
+            }))
+            .await
+            .unwrap();
+            assert_eq!(out["standing"], true, "{out}");
+            let next = out["next"].as_str().unwrap();
+            assert!(!next.contains("memory_read") && !next.contains("start_line"), "{out}");
+            assert!(!next.contains(&path), "the refused target is not the recovery target: {out}");
+            if tool == "search" {
+                assert!(next.contains("hestia_scope_status") && next.contains("narrower"), "{out}");
+            } else {
+                assert!(next.contains("your host's supported listing operation"), "{out}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_search_guidance_uses_held_targets_without_listing_secret_parents() {
+        let (_dir, shared) = test_state().await;
+        let parent = _dir.path().join("private-parent");
+        let held = parent.join("held");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("notes.txt"), "held").unwrap();
+        std::fs::write(parent.join("sibling-secret.txt"), "not for the next hint").unwrap();
+        let parent = parent.to_string_lossy().into_owned();
+        let held = held.to_string_lossy().into_owned();
+        {
+            let mut s = shared.lock().await;
+            s.standing_scope.refusals.push(crate::server::standing_scope::StandingRefusal {
+                member: "cbp-being".into(),
+                path: parent.clone(),
+                recursive: true,
+                refused_at: 1,
+                refused_by: "operator".into(),
+                reason: "the parent is not a member's search root".into(),
+                request_id: None,
+                modes: Some(crate::server::grant_modes::Modes::READ),
+            });
+            let mut grant = standing(
+                "cbp-being", &held, crate::server::gate_escalation::now_secs(), None);
+            grant.recursive = true;
+            s.standing_scope.add(grant);
+            assert!(s.has_scope_grant("cbp-being", &held));
+            assert!(!s.has_scope_grant("cbp-being", &parent));
+        }
+        let status = tool_scope_status(&shared, &json!({"plugin_id": "cbp-being"}))
+            .await
+            .unwrap();
+        assert!(status["grants_by_mode"].as_array().unwrap().iter().any(|g| {
+            g["path"] == held && g["modes"].as_str().is_some_and(|m| m.contains('r'))
+        }), "the hinted discovery route must expose the narrower held target: {status}");
+
+        let out = tool_scope_claim(&shared, &json!({
+            "plugin_id": "cbp-being", "path": parent, "rule": "mrh.path",
+            "tool_name": "search", "act": "search -> private-parent",
+            "act_digest": "a".repeat(64), "spend": false,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(out["standing"], true, "{out}");
+        let next = out["next"].as_str().unwrap();
+        assert!(next.contains("effective grants") && next.contains("<held-directory>"), "{out}");
+        assert!(!next.contains(&parent) && !next.contains(&held), "{out}");
+        assert!(!next.contains("private-parent") && !next.contains("sibling-secret.txt"), "{out}");
+        assert!(!out["detail"].as_str().unwrap().contains("sibling-secret.txt"), "{out}");
     }
 
     /// (e) `hestia_scope_status` carries BOTH lists, additively: `live_grants` keeps its
