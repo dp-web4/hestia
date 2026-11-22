@@ -12918,6 +12918,7 @@ mod disposition_tests {
         assert_eq!(v["path"], "/srv/view/a.txt");
         assert_eq!(v["act"], "cat /srv/view/a.txt", "the refused act is what a peer rules on: {v}");
         assert_eq!(v["origin"], "gate_deny");
+        assert_eq!(v["recursive"], false);
         assert_eq!(v["status"], "pending");
         assert_eq!(v["decidable"], true);
         assert_eq!(v["invited"], true);
@@ -12948,8 +12949,26 @@ mod disposition_tests {
         assert_eq!(inel["_hestia_error"]["code"], "hestia.scope_request_view_ineligible",
                    "no peer may rule an asserted asker's gate-opened ask, so none may read it: {inel}");
 
+        // A member-filed recursive ask discloses that reach BEFORE a peer records a standing
+        // refusal whose reach comes from the request. The gate's glob flag is a different field.
+        let member_root = _dir.path().join("member-recursive");
+        std::fs::create_dir_all(&member_root).unwrap();
+        let filed = crate::server::handler::tool_request_scope(&state, &serde_json::json!({
+            "plugin_id": "codex", "session_id": &asker, "path": member_root.to_str().unwrap(),
+            "recursive": true, "reason": "the peer must see the whole requested reach",
+        }))
+        .await
+        .unwrap();
+        let member_id = filed["request_id"].as_str().unwrap();
+        let member_view = view(&state, Some(&kimi), member_id).await;
+        assert_eq!(member_view["origin"], "member_request", "{member_view}");
+        assert_eq!(member_view["recursive"], true, "{member_view}");
+        assert_eq!(member_view["subtree"], false, "{member_view}");
+        assert_eq!(member_view["may_decide"], serde_json::json!(["refuse"]), "{member_view}");
+
         // Reading decides nothing.
         assert_eq!(state.lock().await.scope_requests[&id].granted, None);
+        assert_eq!(state.lock().await.scope_requests[member_id].granted, None);
     }
 
     /// #1470 review (Nova; second review): the audience is every member who may RULE the request,

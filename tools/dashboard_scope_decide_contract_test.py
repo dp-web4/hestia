@@ -119,7 +119,9 @@ async function renderOne(r, clickFirst, note) {
     for (const f of input.listeners.input || []) f();
     await buttons[0].click();
   }
-  return { buttons: buttons.map(b => b.textContent), selects, html: row.innerHTML, sent: SENT };
+  const breadth = els.find(e => e.className === 'scope-breadth');
+  return { buttons: buttons.map(b => b.textContent), selects, html: row.innerHTML,
+    breadth: breadth && breadth.value ? JSON.parse(breadth.value) : null, sent: SENT };
 }
 (async () => {
   const gate = { origin: 'gate_deny', invited_peers: [], act: 'for f in a b; do cat $f; done',
@@ -132,8 +134,8 @@ async function renderOne(r, clickFirst, note) {
     once_available: true, once_only: false, enumerable: true,
     allowed_decisions: ['once', 'session', 'standing', 'refuse'] }, false);
   out.member = await renderOne({ request_id: 'scope-m', origin: 'member_request', path: '/w/m.txt',
-    reason: 'need it', secs_remaining: 60, claimed_by: 'kimi-code', once_available: false,
-    enumerable: true, allowed_decisions: ['session', 'standing', 'refuse'] }, false);
+    reason: 'need it', recursive: true, secs_remaining: 60, claimed_by: 'kimi-code', once_available: false,
+    enumerable: true, allowed_decisions: ['session', 'standing', 'refuse'] }, true, 'requested reach');
   const lrow = (over) => ({ status: 'open', kind: 'scope_request', id: 'scope-u', event_type: 'scope_requested',
     opened_at: '2026-10-13T00:00:00Z', opened_hash: 'ab'.repeat(32), plugin_id: 'codex', ...over });
   const lu = lrow({ allowed_decisions: ['once', 'refuse'] });
@@ -296,6 +298,13 @@ process.stdout.write(JSON.stringify(out));
               p["buttons"] == ["grant", "refuse"] and p["selects"] == ["scope-duration", "scope-breadth"]
               and "decided by an expansion" not in p["html"], p)
         check("a member-filed request keeps grant and refuse", m["buttons"] == ["grant", "refuse"], m)
+        check("a recursive member ask is named on the member-filed row",
+              "member asks for this path and below" in m["html"], m["html"])
+        check("a recursive member ask selects the requested reach, not exact",
+              m["breadth"]["grant_path"] is None and m["breadth"]["recursive"] is True, m["breadth"])
+        check("granting a recursive member ask sends the selected recursive reach",
+              m["sent"] == {"request_id": "scope-m", "granted": True, "reason": "requested reach",
+                            "standing": False, "recursive": True}, m["sent"])
         lu, lp, le = ro["ledgerUnenum"], ro["ledgerPath"], ro["ledgerEsc"]
         check("ledger: an unenumerated scope row offers 'Approve once' and 'Refuse' with the why",
               "Approve once</button>" in lu and ">Refuse</button>" in lu and ">approve</button>" not in lu
