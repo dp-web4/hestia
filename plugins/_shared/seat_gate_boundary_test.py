@@ -678,6 +678,26 @@ def test_gate_file_read_allowed_and_witnessed():
     _each_seat(arm)
 
 
+def test_opaque_writer_text_offers_the_two_call_route():
+    def arm(seat, fx):
+        stub = Stub()
+        try:
+            home = fx.home(seat, stub.url)
+            command = "git diff > /tmp/sage-fix.patch && git apply /tmp/sage-fix.patch"
+            v, text, _ = run(seat, home, native(seat, "Bash", {"command": command}))
+            check(f"{seat}-opaque-writer-still-denied", v == "deny", text)
+            check(f"{seat}-opaque-writer-explains-unreadable-patch",
+                  "cannot read" in text and "sage-fix.patch" in text, text)
+            check(f"{seat}-opaque-writer-offers-two-call-route",
+                  "Create or expose the patch in its own call first" in text, text)
+            check(f"{seat}-opaque-writer-is-not-mislabelled-a-gate-edit",
+                  "a gate change" not in text and "An agent that can edit" not in text
+                  and "in its governance-closure-opaque-writer text" not in text, text)
+        finally:
+            stub.close()
+    _each_seat(arm)
+
+
 def test_daemon_down():
     def arm(seat, fx):
         home = fx.home(seat, DEAD)
@@ -783,6 +803,7 @@ ALL = [
     test_distinctive_names_govern_anywhere_hooks_only_names_do_not,
     test_ordinary_write_is_asked_allowed_and_recorded,
     test_gate_file_read_allowed_and_witnessed,
+    test_opaque_writer_text_offers_the_two_call_route,
     test_daemon_down,
     test_missing_and_poisoned_engine_block,
     test_decision_time_internal_error_denies_in_every_rollout,
