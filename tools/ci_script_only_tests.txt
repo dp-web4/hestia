@@ -95,6 +95,7 @@ tools/gate_differential_contract_test.py
 tools/gate_evaluate_test.py
 tools/gate_event_reach_test.py
 tools/gate_false_deny_test.py
+tools/governance_ledger_corroboration_test.py
 tools/gate_glob_after_cd_test.py
 tools/gate_grep_patterns_and_toolchain_grant_test.py
 tools/gate_heredoc_inside_passes_test.py

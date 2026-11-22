@@ -205,6 +205,18 @@ impl LedgerStatus {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Corroboration {
+    pub by: String,
+    pub stance: String,
+    pub independence: Option<String>,
+    pub at: String,
+    /// Bounded by 4,000 characters; chain_hash is the full-text evidence link.
+    pub argument: Option<String>,
+    pub argument_truncated: bool,
+    pub chain_hash: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LedgerRow {
     /// The join key for decidable rows (escalation_id / request_id); the chain hash for one-shots.
@@ -249,7 +261,7 @@ pub struct LedgerRow {
     pub secs_remaining: Option<u64>,
     /// Evidence added without deciding (#122 — approval accumulates as factors).
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub corroborations: Vec<String>,
+    pub corroborations: Vec<Corroboration>,
     /// Whether an approved escalation was actually spent. An approval nobody claimed is a
     /// different fact from one that was used.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -562,7 +574,25 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                         let who = s(d, "by")
                             .or_else(|| s(d, "corroborated_by"))
                             .unwrap_or_else(|| "unknown".into());
-                        row.corroborations.push(who);
+                        let stance = s(d, "stance").unwrap_or_else(|| {
+                            if d.get("dissent").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+                                "dissent".into()
+                            } else {
+                                "support".into()
+                            }
+                        });
+                        let argument = s(d, "argument");
+                        let truncated = argument.as_ref().map(|a| a.chars().count() > 4000)
+                            .unwrap_or(false);
+                        row.corroborations.push(Corroboration {
+                            by: who,
+                            stance,
+                            independence: s(d, "independence"),
+                            at: ts,
+                            argument: argument.map(|a| a.chars().take(4000).collect()),
+                            argument_truncated: truncated,
+                            chain_hash: e.hash.clone(),
+                        });
                     }
                 }
             }
@@ -987,8 +1017,31 @@ mod tests {
             T0 + 120,
         );
         assert_eq!(rows[0].status, LedgerStatus::Approved);
-        assert_eq!(rows[0].corroborations, vec!["kimi-code".to_string()]);
+        assert_eq!(rows[0].corroborations.len(), 1);
+        assert_eq!(rows[0].corroborations[0].by, "kimi-code");
+        assert_eq!(rows[0].corroborations[0].stance, "support");
         assert!(rows[0].claimed_at.is_some(), "a spent approval is a different fact from an unspent one");
+    }
+
+    /// #1163: dissent keeps its stance, argument, independence and full-text chain link.
+    #[test]
+    fn dissent_keeps_stance_argument_independence_and_chain_link() {
+        let long = "x".repeat(4500);
+        let rows = project(&[
+            opened(1, "abc", 0),
+            entry(2, 30, "gate_escalation_corroborated", serde_json::json!({
+                "escalation_id": "abc", "by": "codex", "stance": "dissent",
+                "independence": "cross_vendor", "argument": long,
+            })),
+        ], T0 + 120);
+        let factor = &rows[0].corroborations[0];
+        assert_eq!(factor.by, "codex");
+        assert_eq!(factor.stance, "dissent");
+        assert_eq!(factor.independence.as_deref(), Some("cross_vendor"));
+        assert_eq!(factor.argument.as_ref().unwrap().chars().count(), 4000);
+        assert!(factor.argument_truncated);
+        assert_eq!(factor.chain_hash, "hash2");
+        assert!(!factor.at.is_empty());
     }
 
     /// dp asked for law edits and grants in the same ledger. They are not decidable, so they are
