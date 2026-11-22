@@ -107,6 +107,7 @@ impl ServerHandler for HestiaServer {
             "hestia_scope_status" => tool_scope_status(&self.state, &args).await,
             "hestia_scope_claim" => tool_scope_claim(&self.state, &args).await,
             "hestia_scope_escalate" => tool_scope_escalate(&self.state, &args).await,
+            "hestia_scope_withdraw" => tool_scope_withdraw(&self.state, &args).await,
             "hestia_scope_peer_decide" => tool_scope_peer_decide(&self.state, &args).await,
             "hestia_scope_request_view" => tool_scope_request_view(&self.state, &args).await,
             "hestia_gate_escalation_open" => tool_gate_escalation_open(&self.state, &args).await,
@@ -326,6 +327,7 @@ pub(crate) fn reports_shared_state(name: &str) -> bool {
             // durable. A peer decide may report a request it did not write the same way.
             | "hestia_scope_claim"
             | "hestia_scope_escalate"
+            | "hestia_scope_withdraw"
             | "hestia_scope_peer_decide"
     )
 }
@@ -462,6 +464,22 @@ fn hestia_tools() -> Vec<Tool> {
         t(
             "hestia_scope_escalate",
             "Escalate ONE scope refusal the gate recorded (its deny names the refusal_id) into a scope request, as a deliberate act. Pass plugin_id, refusal_id and reason: what you are doing and why it needs this path (the decider has only that sentence and the refused act). The gate never asks on your behalf (dp, 2026-11-05); this is how you ask. The request carries the gate's record of the act, so a one-time approval binds to exactly that act; a NOT-SAME peer decides it, the operator may override, and you cannot decide it yourself. Only the member the gate refused may escalate its refusal. Watch it with hestia_scope_status and re-issue the identical act after it is ruled. CLI: hestia scope escalate <refusal_id> --as <member> --reason '...'",
+        ),
+        t_args(
+            "hestia_scope_withdraw",
+            "Withdraw YOUR OWN still-pending scope request because the probe was mistaken or is no longer needed (#1297). Pass your live session_id, the request_id and a reason. Only the proven asker may withdraw, only while pending, and it can never grant reach: the request becomes terminal withdrawn, peers see nothing left to decide, and the withdrawal is witnessed as scope_withdrawn. A retry is idempotent and writes no second record. CLI: hestia scope withdraw <request_id> --as <member> --reason '...'",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["request_id", "reason"],
+                "anyOf": [{"required": ["session_id"]}, {"required": ["sessionId"]}],
+                "properties": {
+                    "request_id": {"type": "string", "minLength": 1, "description": "Your own pending scope request id."},
+                    "reason": {"type": "string", "minLength": 8, "description": "Why this request is no longer needed."},
+                    "session_id": {"type": "string", "description": "Your own live session id from hestia_connect."},
+                    "sessionId": {"type": "string", "description": "Alternate spelling of session_id; snake_case wins when both are present."}
+                }
+            }),
         ),
         t(
             "hestia_gate_escalation_open",
@@ -8395,7 +8413,7 @@ pub(crate) struct DispositionProjection {
 /// carry no `about_deny_hash` and are skipped), an escalation's
 /// `gate_escalation_decided`, its lapse (`gate_escalation_expired`, recorded
 /// by `record_newly_lapsed`), AND ITS WITHDRAWAL, and a scope request's
-/// `scope_granted` / `scope_refused`. `scope_granted` with a NULL `request_id`
+/// `scope_granted` / `scope_refused` / `scope_withdrawn`. `scope_granted` with a NULL `request_id`
 /// is the operator-ORIGINATED grant (`/api/scope/grant`) — not a petition, no
 /// petitioner, deliberately skipped (#480 review change 5). A ruling row too
 /// thin to derive a recipient from is warned about and skipped — unprojectable
@@ -8460,6 +8478,13 @@ fn disposition_obligation(e: &crate::storage::chain::ChainEntry) -> Option<(Stri
             let rid = get("request_id")?;
             match get("plugin_id") {
                 Some(to) => Some((to.to_string(), format!("hestia://scope/{rid}#revoked"))),
+                None => thin("plugin_id"),
+            }
+        }
+        "scope_withdrawn" => {
+            let rid = get("request_id")?;
+            match get("plugin_id") {
+                Some(to) => Some((to.to_string(), format!("hestia://scope/{rid}#withdrawn"))),
                 None => thin("plugin_id"),
             }
         }
@@ -9904,8 +9929,8 @@ fn resolve_appeal_pointer(s: &super::state::ServerState, pointer: &str) -> Value
 ///
 /// The store is MEMORY-ONLY (state.rs's asymmetry table: live loosening dies with
 /// the daemon), so on a store miss this falls back to the witness chain (#480
-/// review, change 1) before saying UNKNOWN: a `scope_granted` / `scope_refused`
-/// naming the id IS the decision, and a `scope_requested` with no decision yet is
+/// review, change 1) before saying UNKNOWN: a `scope_granted` / `scope_refused` /
+/// `scope_withdrawn` naming the id IS the decision, and a `scope_requested` with no decision yet is
 /// the ask, still open or run out. Only when the chain window also misses is the
 /// answer "unknown" — and the not-found arm has to keep saying so, because the two
 /// failure readings are otherwise indistinguishable: "no such request" is the null
@@ -9934,6 +9959,9 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             "granted": req.granted,
             "decided_by": req.decided_by,
             "decision_reason": req.decision_reason,
+            "withdrawn_at": req.ext.withdrawn.as_ref().map(|w| w.at),
+            "withdrawn_by": req.ext.withdrawn.as_ref().map(|w| w.by.clone()),
+            "withdrawal_reason": req.ext.withdrawn.as_ref().map(|w| w.reason.clone()),
             "expires_at": req.expires_at,
             // A revocation is the terminal fact a `#revoked` disposition announces; the
             // pointer it carries must be able to show who withdrew the grant and why.
@@ -9949,7 +9977,7 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
     let scan = paged_chain_lookup(
         &s.chain_store,
         &|e| {
-            matches!(e.event_type.as_str(), "scope_granted" | "scope_refused")
+            matches!(e.event_type.as_str(), "scope_granted" | "scope_refused" | "scope_withdrawn")
                 && e.event_data.get("request_id").and_then(Value::as_str) == Some(ptr)
         },
         &|e| {
@@ -9994,7 +10022,7 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             "hestia.scope_pointer_not_found",
             &format!(
                 "no scope request with id '{ptr}' on this daemon, and no scope_requested / \
-                 scope_granted / scope_refused / scope_revoked naming it in {}. That is UNKNOWN, not \
+                 scope_granted / scope_refused / scope_withdrawn / scope_revoked naming it in {}. That is UNKNOWN, not \
                  refused: scope requests live in memory and do not survive a restart, so \
                  an absent id says nothing about whether any ask was granted or refused",
                 scan_coverage_note(searched, complete),
@@ -10005,6 +10033,7 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
     };
     let status = match &decision {
         _ if revocation.is_some() => "revoked",
+        Some(e) if e.event_type == "scope_withdrawn" => "withdrawn",
         Some(e) if e.event_type == "scope_granted" => "granted",
         Some(_) => "refused",
         // An ask with no decision yet keeps the store's own clock semantics: past
@@ -10048,6 +10077,15 @@ fn resolve_scope_pointer(s: &super::state::ServerState, pointer: &str) -> Value 
             .and_then(|e| e.event_data.get("granted_by"))
             .or_else(|| revocation.as_ref().and_then(|e| e.event_data.get("granted_by"))),
         "decision_reason": decision.as_ref().and_then(|e| e.event_data.get("decision_reason")),
+        "withdrawn_at": decision.as_ref()
+            .filter(|e| e.event_type == "scope_withdrawn")
+            .and_then(|e| e.event_data.get("withdrawn_at")),
+        "withdrawn_by": decision.as_ref()
+            .filter(|e| e.event_type == "scope_withdrawn")
+            .and_then(|e| e.event_data.get("withdrawn_by")),
+        "withdrawal_reason": decision.as_ref()
+            .filter(|e| e.event_type == "scope_withdrawn")
+            .and_then(|e| e.event_data.get("decision_reason")),
         "expires_at": anchor
             .event_data
             .get("expires_at")
@@ -10529,6 +10567,7 @@ const CONNECT_ACCEPTED_KEYS: &[&str] = &[
     "instance_name",
 ];
 const APPEAL_ACCEPTED_KEYS: &[&str] = &["deny_hash", "reason", "session_id", "sessionId"];
+const SCOPE_WITHDRAW_ACCEPTED_KEYS: &[&str] = &["request_id", "reason", "session_id", "sessionId"];
 const ESCALATION_CLAIM_ACCEPTED_KEYS: &[&str] = &[
     "plugin_id",
     "tool_name",
@@ -14608,6 +14647,9 @@ mod tests {
                     // dp 2026-11-05: ASKS (opens a request from the member's own refusal);
                     // decides nothing. Held by `scope_escalate_*`.
                     || l == "hestia_scope_escalate"
+                    // #1297: WITHDRAWS the asker's own still-pending request, which can only
+                    // narrow scope. Held by `an_asker_can_withdraw_a_pending_scope_request`.
+                    || l == "hestia_scope_withdraw"
                     // dp 2026-10-05: gate-opened scope requests go to NOT-SAME peers. Held by
                     // the behavioural tests `scope_peer_decide_*` (self refused in both
                     // directions, asserted asker refused, record names peer and basis).
@@ -14618,9 +14660,9 @@ mod tests {
                 "MCP tool `{n}` reaches the scope surface. Member-callable doors are ASKING \
                  (hestia_request_scope), READING (hestia_scope_status), and ruling ANOTHER \
                  member's request under an operator delegation (hestia_scope_arbitrate). \
-                 Deciding your own remains operator-only through the challenge-signed HTTP \
-                 surface. A member holding both halves is not governed by the control, it \
-                 operates it."
+                 Granting or refusing your own remains operator-only through the challenge-signed \
+                 HTTP surface; withdrawing your own pending ask only narrows (#1297). A member \
+                 holding both halves is not governed by the control, it operates it."
             );
         }
         // The delegated door must keep saying, in the text a member actually reads, the three
@@ -18620,6 +18662,150 @@ mod tests {
         r["sessionId"].as_str().unwrap().to_string()
     }
 
+    #[tokio::test]
+    async fn an_asker_can_withdraw_a_pending_scope_request() {
+        let (_dir, shared) = make_shared_state();
+        let asker = connect_as(&shared, "kimi-code").await;
+        let peer = connect_as(&shared, "codex").await;
+        let target = _dir.path().join("withdraw-me.txt");
+        std::fs::write(&target, "test").unwrap();
+        let path = target.to_string_lossy().into_owned();
+        let refused = tool_scope_claim(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code", "session_id": asker,
+                "path": path, "rule": "mrh.path", "tool_name": "Read",
+                "act": format!("Read -> {path}"), "act_digest": "a".repeat(64),
+                "spend": false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["verdict"], "not_asked", "{refused}");
+        let opened = tool_scope_escalate(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code", "session_id": asker,
+                "refusal_id": refused["refusal_id"],
+                "reason": "read this file before deciding whether the probe is needed",
+            }),
+        )
+        .await
+        .unwrap();
+        let request_id = opened["request_id"].as_str().unwrap().to_string();
+        assert_eq!(opened["verdict"], "opened", "{opened}");
+
+        let err = tool_scope_withdraw(
+            &shared,
+            &json!({"request_id": request_id, "reason": "the probe was mistaken"}),
+        )
+        .await
+        .expect_err("an asserted name is not the asker");
+        assert!(err.to_string().contains("live session_id"), "{err}");
+        let not_yours = tool_scope_withdraw(
+            &shared,
+            &json!({
+                "request_id": request_id, "session_id": peer,
+                "reason": "another member must not withdraw this",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            not_yours["_hestia_error"]["code"], "hestia.scope_withdraw_not_yours",
+            "{not_yours}"
+        );
+        assert!(shared.lock().await.recent_chain(50).iter()
+            .all(|e| e.event_type != "scope_withdrawn"));
+
+        let withdrawn = tool_scope_withdraw(
+            &shared,
+            &json!({
+                "request_id": request_id, "session_id": asker,
+                "reason": "the probe was a mistake and is no longer needed",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(withdrawn["status"], "withdrawn", "{withdrawn}");
+        assert_eq!(withdrawn["granted"], false, "{withdrawn}");
+        assert_eq!(withdrawn["decided_by"], "asker:kimi-code", "{withdrawn}");
+        assert!(withdrawn["witnessEntryHash"].as_str().is_some(), "{withdrawn}");
+        let chain_after = shared.lock().await.chain_len();
+        let again = tool_scope_withdraw(
+            &shared,
+            &json!({
+                "request_id": request_id, "session_id": asker,
+                "reason": "an idempotent retry must not mint another record",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again["already_withdrawn"], true, "{again}");
+        assert_eq!(shared.lock().await.chain_len(), chain_after);
+
+        let view = tool_scope_request_view(
+            &shared,
+            &json!({"request_id": request_id, "session_id": peer}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view["status"], "withdrawn", "{view}");
+        assert_eq!(view["decidable"], false, "{view}");
+        assert_eq!(view["may_decide"], json!([]), "{view}");
+        assert_eq!(view["decided_by"], "asker:kimi-code", "{view}");
+        assert_eq!(view["withdrawn_by"], "kimi-code", "{view}");
+        let decision = tool_scope_peer_decide(
+            &shared,
+            &json!({
+                "request_id": request_id, "session_id": peer,
+                "decision": "refuse", "reason": "a withdrawn request has nothing to decide",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            decision["_hestia_error"]["code"], "hestia.scope_peer_decide_refused",
+            "{decision}"
+        );
+        assert_eq!(decision["_hestia_error"]["data"]["status"], 409, "{decision}");
+
+        let own = tool_scope_status(
+            &shared,
+            &json!({"plugin_id": "kimi-code", "session_id": asker}),
+        )
+        .await
+        .unwrap();
+        let row = own["requests"].as_array().unwrap().iter()
+            .find(|r| r["request_id"] == request_id).unwrap();
+        assert_eq!(row["status"], "withdrawn", "{row}");
+        assert_eq!(row["withdrawn_by"], "kimi-code", "{row}");
+        let live = {
+            let s = shared.lock().await;
+            resolve_scope_pointer(&s, &request_id)
+        };
+        assert_eq!(live["status"], "withdrawn", "{live}");
+        assert_eq!(live["granted"], false, "{live}");
+        assert_eq!(live["source"], "live_store", "{live}");
+        let mail = shared.lock().await.inbox_store.drain_member("kimi-code").unwrap();
+        assert!(mail.iter().any(|n| {
+            n.kind == "disposition"
+                && n.pointer_uri.as_deref()
+                    == Some(format!("hestia://scope/{request_id}#withdrawn").as_str())
+        }), "the withdrawal disposition must be durable: {mail:?}");
+
+        shared.lock().await.scope_requests.clear();
+        let historical = {
+            let s = shared.lock().await;
+            resolve_scope_pointer(&s, &request_id)
+        };
+        assert_eq!(historical["source"], "witness_chain", "{historical}");
+        assert_eq!(historical["status"], "withdrawn", "{historical}");
+        assert_eq!(historical["granted"], false, "{historical}");
+        assert_eq!(historical["decided_by"], "asker:kimi-code", "{historical}");
+        assert_eq!(historical["withdrawn_by"], "kimi-code", "{historical}");
+    }
+
     /// The claim alone ASKS NOTHING: no escalation, no opened row, nobody invited. It answers
     /// `not_asked` with a refusal id and the deliberate door, and a re-issue keeps the id.
     #[tokio::test]
@@ -21139,6 +21325,11 @@ mod tests {
                 "hestia_gate_escalation_claim",
                 ESCALATION_CLAIM_ACCEPTED_KEYS,
                 &["plugin_id", "tool_name", "marker"][..],
+            ),
+            (
+                "hestia_scope_withdraw",
+                SCOPE_WITHDRAW_ACCEPTED_KEYS,
+                &["request_id", "reason"][..],
             ),
         ];
         let tools = hestia_tools();
@@ -26586,6 +26777,9 @@ async fn tool_scope_status_with_counter(
                 "decided_by": r.decided_by,
                 "decided_at": r.decided_at,
                 "decision_reason": r.decision_reason,
+                "withdrawn_at": r.ext.withdrawn.as_ref().map(|w| w.at),
+                "withdrawn_by": r.ext.withdrawn.as_ref().map(|w| w.by.clone()),
+                "withdrawal_reason": r.ext.withdrawn.as_ref().map(|w| w.reason.clone()),
                 // A revoked live grant says so, with who and why, so the member learns its
                 // reach narrowed and the reason in the same read (a bare "revoked" is a
                 // refusal with no way forward).
@@ -27485,6 +27679,125 @@ fn scope_peer_pool(s: &super::state::ServerState, asker: &str) -> Vec<String> {
         .collect()
 }
 
+/// `hestia_scope_withdraw` — the asker abandons its own still-pending request (#1297).
+/// This is deliberately NOT a decision on the requested reach: it can only narrow. A live
+/// session proves who is asking; nobody may withdraw another member's ask, and nothing may be
+/// withdrawn after a ruling. The terminal `scope_withdrawn` witness is part of the mutation:
+/// if it cannot be appended, the prior pending row is restored.
+pub(crate) async fn tool_scope_withdraw(state: &SharedState, args: &Value) -> ToolResult {
+    reject_unknown_keys(args, SCOPE_WITHDRAW_ACCEPTED_KEYS, "hestia_scope_withdraw")?;
+    let request_id = require_string(args, "request_id")?;
+    let reason = require_string(args, "reason")?.trim().to_string();
+    if reason.len() < 8 {
+        return Err(anyhow::anyhow!("reason is too thin — say why this request is no longer needed"));
+    }
+    let session_id_arg = optional_session_id(args);
+    let now = crate::server::gate_escalation::now_secs();
+    let mut s = state.lock().await;
+    let Some(who) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        return Err(anyhow::anyhow!(
+            "withdrawing a scope request requires the asker's live session_id from hestia_connect"
+        ));
+    };
+    let Some(req) = s.scope_requests.get(&request_id) else {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_request_unknown",
+            "no such scope request (memory-only: it may have expired or the daemon restarted)",
+            Some(json!({"request_id": request_id})),
+        ));
+    };
+    if req.plugin_id != who.plugin_id {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_withdraw_not_yours",
+            "only the asker may withdraw this scope request; nothing was changed",
+            Some(json!({"request_id": request_id, "asker": req.plugin_id})),
+        ));
+    }
+    if req.ext.withdrawn.is_some() {
+        return Ok(json!({
+            "ok": true,
+            "request_id": req.id,
+            "status": "withdrawn",
+            "granted": false,
+            "already_withdrawn": true,
+            "decided_by": req.decided_by,
+            "decision_reason": req.decision_reason,
+            "withdrawn_at": req.ext.withdrawn.as_ref().map(|w| w.at),
+            "note": "already withdrawn; no second witness was appended",
+        }));
+    }
+    let status = req.status(now);
+    if status != "pending" {
+        return Ok(hestia_error_envelope(
+            "hestia.scope_withdraw_not_pending",
+            "only a still-pending request can be withdrawn; nothing was changed",
+            Some(json!({"request_id": request_id, "status": status})),
+        ));
+    }
+
+    let prior = req.clone();
+    let plugin_id = req.plugin_id.clone();
+    let path = req.path.clone();
+    let requested_because = req.reason.clone();
+    let expires_at = req.expires_at;
+    let decided_by = format!("asker:{}", who.plugin_id);
+    if let Some(req) = s.scope_requests.get_mut(&request_id) {
+        req.granted = Some(false);
+        req.decided_by = Some(decided_by.clone());
+        req.decided_at = Some(now);
+        req.decision_reason = Some(reason.clone());
+        req.ext.withdrawn = Some(crate::server::state::ScopeRevocation {
+            at: now,
+            by: who.plugin_id.clone(),
+            reason: reason.clone(),
+        });
+    }
+    let entry = match s.append_chain(
+        "scope_withdrawn",
+        json!({
+            "request_id": request_id,
+            "plugin_id": plugin_id,
+            "subject_instance_lct": s.member_lct(&plugin_id),
+            "path": path,
+            "requested_because": requested_because,
+            "decision_reason": reason,
+            "granted_by": decided_by,
+            "withdrawn_by": who.plugin_id,
+            "withdrawn_at": now,
+            "via": "asker_withdrawal",
+            "expires_at": expires_at,
+            "origin": if prior.ext.gate.is_some() { "gate_deny" } else { "member_request" },
+            "assurance": "the proven asker abandoned a pending ask; this only narrows scope",
+        }),
+    ) {
+        Ok(entry) => entry,
+        Err(e) => {
+            if let Some(req) = s.scope_requests.get_mut(&request_id) {
+                *req = prior;
+            }
+            return Err(anyhow::anyhow!(
+                "withdrawal NOT applied — its witness append failed ({e}); the request is still pending"
+            ));
+        }
+    };
+    let pointer = format!("hestia://scope/{request_id}#withdrawn");
+    let disposition_notice_id = ensure_disposition(&s, &plugin_id, &pointer, &entry.hash);
+    Ok(json!({
+        "ok": true,
+        "request_id": request_id,
+        "status": "withdrawn",
+        "granted": false,
+        "decided_by": decided_by,
+        "withdrawn_by": who.plugin_id,
+        "withdrawn_at": now,
+        "decision_reason": reason,
+        "path": path,
+        "expires_at": expires_at,
+        "witnessEntryHash": entry.hash,
+        "disposition_notice_id": disposition_notice_id,
+    }))
+}
+
 /// `hestia_scope_peer_decide` — a NOT-SAME PEER rules another member's GATE-OPENED scope request
 /// (dp, 2026-10-05: "scope escalations should go to peers not to me").
 ///
@@ -27690,7 +28003,7 @@ pub(crate) async fn tool_scope_request_view(state: &SharedState, args: &Value) -
     }
     let gate = req.ext.gate.as_ref();
     // Eligibility is WHO may rule; whether anything is left to rule is the request's status.
-    // A decided, lapsed, spent or revoked request is served (the reader may want to know what
+    // A decided, lapsed, spent, withdrawn or revoked request is served (the reader may want to know what
     // happened) but offers no decision (Nova and the second review on #1470).
     let status = req.status(now);
     let decidable = status == "pending";
@@ -27713,6 +28026,9 @@ pub(crate) async fn tool_scope_request_view(state: &SharedState, args: &Value) -
         "decided_by": req.decided_by,
         "decided_at": req.decided_at,
         "decision_reason": req.decision_reason,
+        "withdrawn_at": req.ext.withdrawn.as_ref().map(|w| w.at),
+        "withdrawn_by": req.ext.withdrawn.as_ref().map(|w| w.by.clone()),
+        "withdrawal_reason": req.ext.withdrawn.as_ref().map(|w| w.reason.clone()),
         "invited": req.ext.invited_peers.contains(&viewer.plugin_id),
         "eligible_directions": may_decide,
         "may_decide": if decidable { may_decide } else { Vec::new() },
@@ -32412,6 +32728,10 @@ mod disposition_durability_tests {
                 entry("scope_refused", json!({"request_id": "r2", "plugin_id": to})),
                 Some((to.into(), "hestia://scope/r2".into())),
             ),
+            (
+                entry("scope_withdrawn", json!({"request_id": "r3", "plugin_id": to})),
+                Some((to.into(), "hestia://scope/r3#withdrawn".into())),
+            ),
             // The negative direction.
             (
                 entry("gate_escalation_opened", json!({"escalation_id": "esc9", "plugin_id": to})),
@@ -35460,6 +35780,7 @@ mod durable_reads_tests {
     fn the_scope_verbs_are_durable_reads() {
         assert!(reports_shared_state("hestia_scope_claim"));
         assert!(reports_shared_state("hestia_scope_peer_decide"));
+        assert!(reports_shared_state("hestia_scope_withdraw"));
         assert!(!reports_shared_state("hestia_begin_action"));
         assert!(!reports_shared_state("hestia_query_policy"));
     }

@@ -1024,6 +1024,21 @@ enum ScopeCmd {
         #[arg(long, default_value = "http://127.0.0.1:7711")]
         endpoint: String,
     },
+    /// Withdraw YOUR OWN still-pending scope request because the probe is no longer needed
+    /// (#1297). This only narrows: the request becomes terminal withdrawn, never a grant.
+    Withdraw {
+        /// Your own pending request id (from `scope pending` or hestia_scope_status)
+        request_id: String,
+        /// Why this request is no longer needed
+        #[arg(long)]
+        reason: String,
+        /// Your own member id; only the proven asker may withdraw the request
+        #[arg(long = "as")]
+        as_member: String,
+        /// Daemon MCP endpoint
+        #[arg(long, default_value = "http://127.0.0.1:7711")]
+        endpoint: String,
+    },
     /// List pending scope requests, including the ones the GATE opened on a refused act (with
     /// the act). Read-only: the operator rules them on the dashboard or the app.
     Pending {
@@ -1234,6 +1249,9 @@ pub fn run() -> AnyResult<()> {
             }
             hestia::gate_cli::scope_peer_decide(&endpoint, &as_member, &request_id, decision,
                                                 grant_path, recursive, modes, &reason)
+        }
+        Command::Scope(ScopeCmd::Withdraw { request_id, reason, as_member, endpoint }) => {
+            hestia::gate_cli::scope_withdraw(&endpoint, &as_member, &request_id, &reason)
         }
         Command::Scope(ScopeCmd::Escalate { refusal_id, reason, as_member, endpoint }) => {
             hestia::gate_cli::scope_escalate(&endpoint, &as_member, &refusal_id, &reason)

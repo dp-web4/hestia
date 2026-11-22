@@ -113,6 +113,7 @@ pub const GOVERNANCE_EVENTS: &[&str] = &[
     "scope_grant_intent",
     "scope_granted",
     "scope_refused",
+    "scope_withdrawn",
     "scope_attestation",
     // Society-wide permission mutations. Intent and terminal fact remain separate rows so a
     // failed durable change is visible without being mistaken for one that landed.
@@ -444,7 +445,7 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                     order.push(Row::Keyed(id));
                 }
             }
-            "gate_escalation_decided" | "scope_granted" | "scope_refused" => {
+            "gate_escalation_decided" | "scope_granted" | "scope_refused" | "scope_withdrawn" => {
                 let is_scope = e.event_type != "gate_escalation_decided";
                 let Some(id) = (if is_scope {
                     s(d, "request_id").or_else(|| s(d, "id"))
@@ -1165,6 +1166,29 @@ mod tests {
         assert_eq!(rows[0].kind, LedgerKind::ScopeRequest);
         assert_eq!(rows[0].status, LedgerStatus::Approved);
         assert_eq!(rows[0].subject.as_deref(), Some("/repo/x"));
+    }
+
+    #[test]
+    fn a_scope_withdrawal_closes_the_request_as_denied_by_its_asker() {
+        let rows = project(
+            &[
+                entry(1, 0, "scope_requested",
+                      serde_json::json!({"request_id": "r1", "plugin_id": "kimi-code",
+                                         "path": "/repo/x", "expires_at": T0 + 3600,
+                                         "reason": "an unnecessary probe"})),
+                entry(2, 60, "scope_withdrawn",
+                      serde_json::json!({"request_id": "r1", "plugin_id": "kimi-code",
+                                         "granted_by": "asker:kimi-code", "via": "asker_withdrawal",
+                                         "decision_reason": "the probe was mistaken"})),
+            ],
+            T0 + 120,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, LedgerKind::ScopeRequest);
+        assert_eq!(rows[0].status, LedgerStatus::Denied);
+        assert_eq!(rows[0].decided_by.as_deref(), Some("asker:kimi-code"));
+        assert_eq!(rows[0].decided_via.as_deref(), Some("asker_withdrawal"));
+        assert_eq!(rows[0].decision_reason.as_deref(), Some("the probe was mistaken"));
     }
 
     /// The society floor is the widest permission surface on the box. Its attempts and

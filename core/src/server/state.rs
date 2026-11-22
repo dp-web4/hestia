@@ -269,6 +269,9 @@ pub struct ScopeRequestExt {
     /// invited to rule a gate-opened request (mesh `review_request` notices).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invited_peers: Vec<String>,
+    /// The asker abandoned a still-pending request (#1297). This can only narrow scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn: Option<ScopeRevocation>,
     /// For a request a PEER decided: `{"arbiter", "asker", "asker_basis", "independence"}` — the
     /// NOT-SAME basis the ruling rested on. `None` for an operator ruling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -395,7 +398,7 @@ pub struct RetirementCommit {
     pub delegations: Vec<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScopeRevocation {
     pub at: u64,
     pub by: String,
@@ -453,6 +456,9 @@ impl ScopeRequest {
     /// channel already rules. Silence has to decide the same way everywhere or members will
     /// learn that waiting is a strategy.
     pub fn status(&self, now: u64) -> &'static str {
+        if self.ext.withdrawn.is_some() {
+            return "withdrawn";
+        }
         if self.revoked.is_some() {
             return "revoked";
         }
