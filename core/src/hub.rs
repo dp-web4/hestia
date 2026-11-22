@@ -639,23 +639,31 @@ impl HubClient {
     /// sealed to the hub, POSTed to `/v1/hubs/{hub_id}/channel`, and the sealed
     /// response is opened — nothing in the clear. `my` is the member's vault
     /// keypair; `my_lct_id` identifies which pinned pubkey the hub uses.
-    /// Resolve a member LCT by display name via the hub roster
-    /// (`GET {base}/tools/list_members`). Exact (case-insensitive) name match
-    /// first, then a unique prefix (`thor` → `thor-sage`); an ambiguous prefix
-    /// fails closed. Mirrors the mesh `hub-notify.sh` fallback so a peer name
-    /// resolves the same way whether the sender is the shell watcher or hestia.
-    pub async fn resolve_member_by_name(&self, base_url: &str, name: &str) -> Result<Uuid> {
-        let url = format!("{}/tools/list_members", base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .get(&url)
-            .send()
+    /// Resolve a member LCT by display name through the sealed `list_members` channel read.
+    /// Exact (case-insensitive) name match first, then a unique prefix (`thor` → `thor-sage`);
+    /// an ambiguous prefix fails closed. The public operator-only roster is never a fallback.
+    /// An external caller gets the membership remedy, not a misleading missing-route error.
+    pub async fn resolve_member_by_name(
+        &self,
+        rest_endpoint: &str,
+        channel: &HubChannel,
+        my: &KeyPair,
+        my_lct_id: Uuid,
+        name: &str,
+    ) -> Result<Uuid> {
+        let body = self
+            .channel_query(rest_endpoint, channel, my, my_lct_id, "list_members", serde_json::json!({}))
             .await
-            .with_context(|| format!("listing members at {url}"))?;
-        if !resp.status().is_success() {
-            anyhow::bail!("hub /tools/list_members returned HTTP {}", resp.status());
-        }
-        let body: serde_json::Value = resp.json().await.context("parsing list_members response")?;
+            .map_err(|e| {
+                let message = format!("{e:#}");
+                if message.contains("HTTP 403") || message.contains("HTTP 409") {
+                    anyhow::anyhow!(
+                        "hub membership is required before roster reads: request citizenship or a denial review ({message})"
+                    )
+                } else {
+                    anyhow::anyhow!("resolving member through sealed hub roster: {message}")
+                }
+            })?;
         let members = body
             .get("members")
             .and_then(|m| m.as_array())
@@ -1780,5 +1788,103 @@ mod tests {
             "a channel-key member signs with the seed file; resolving the vault identity \
              instead produces a key the hub does not pin for this member"
         );
+    }
+}
+
+
+#[cfg(test)]
+mod sealed_roster_tests {
+    use super::*;
+    use axum::{extract::{Json, State}, response::{IntoResponse, Response}, routing::post, Router};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct MockHub {
+        hub: KeyPair,
+        member: PublicKey,
+        pair_id: Uuid,
+        answer: Value,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn answer(State(mock): State<MockHub>, Json(req): Json<Value>) -> Response {
+        let sealed = Sealed::from_base64(req["sealed"].as_str().unwrap()).unwrap();
+        let plaintext = pair_channel::open(&mock.hub, &mock.member, mock.pair_id, &sealed).unwrap();
+        let request: Value = serde_json::from_slice(&plaintext).unwrap();
+        mock.calls.lock().unwrap().push(request["tool"].as_str().unwrap().to_string());
+        let sealed = pair_channel::seal(
+            &mock.hub,
+            &mock.member,
+            mock.pair_id,
+            &serde_json::to_vec(&mock.answer).unwrap(),
+        )
+        .unwrap();
+        Json(json!({"sealed": sealed.to_base64()})).into_response()
+    }
+
+    async fn unjoined() -> Response {
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            "external LCTs may only request citizenship or a denial review",
+        )
+            .into_response()
+    }
+
+    async fn serve(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{addr}/v1"), task)
+    }
+
+    #[tokio::test]
+    async fn a_joined_member_resolves_through_the_sealed_roster() {
+        let hub = KeyPair::generate();
+        let member = KeyPair::generate();
+        let hub_lct = Uuid::new_v4();
+        let member_lct = Uuid::new_v4();
+        let peer_lct = Uuid::new_v4();
+        let pair_id = Uuid::new_v4();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mock = MockHub {
+            hub: hub.clone(),
+            member: member.verifying_key(),
+            pair_id,
+            answer: json!({"members": [{"name": "Peer Example", "lct_id": peer_lct}]}),
+            calls: calls.clone(),
+        };
+        let (rest, task) = serve(Router::new().route("/v1/hubs/:id/channel", post(answer)).with_state(mock)).await;
+        let channel = HubChannel::new(hub_lct, pair_id, &hub.verifying_key().to_hex()).unwrap();
+        let client = HubClient::new();
+        let exact = client
+            .resolve_member_by_name(&rest, &channel, &member, member_lct, "Peer Example")
+            .await
+            .unwrap();
+        let prefix = client
+            .resolve_member_by_name(&rest, &channel, &member, member_lct, "Peer")
+            .await
+            .unwrap();
+        assert_eq!((exact, prefix), (peer_lct, peer_lct));
+        assert_eq!(calls.lock().unwrap().as_slice(), ["list_members", "list_members"]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unjoined_caller_gets_the_membership_remedy_not_a_404() {
+        let hub = KeyPair::generate();
+        let member = KeyPair::generate();
+        let pair_id = Uuid::new_v4();
+        let (rest, task) = serve(Router::new().route("/v1/hubs/:id/channel", post(unjoined))).await;
+        let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+        let err = HubClient::new()
+            .resolve_member_by_name(&rest, &channel, &member, Uuid::new_v4(), "peer")
+            .await
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("HTTP 403"), "{text}");
+        assert!(text.contains("request citizenship or a denial review"), "{text}");
+        assert!(!text.contains("404"), "{text}");
+        task.abort();
     }
 }

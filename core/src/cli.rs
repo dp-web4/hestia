@@ -3514,11 +3514,15 @@ fn cmd_hub_notify(
     let client = HubClient::new();
     let rt = tokio::runtime::Runtime::new()?;
 
-    // Peer: accept a raw LCT uuid, else resolve the display name via the hub roster.
+    let channel = rt
+        .block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))
+        .context("opening sealed channel to hub")?;
+
+    // Peer: accept a raw LCT uuid, else resolve the display name through the sealed hub roster.
     let peer_lct: uuid::Uuid = match uuid::Uuid::parse_str(peer) {
         Ok(u) => u,
         Err(_) => rt
-            .block_on(client.resolve_member_by_name(&conn.url, peer))
+            .block_on(client.resolve_member_by_name(&rest, &channel, &keypair, conn.our_lct_id, peer))
             .with_context(|| format!("resolving peer '{peer}' via hub roster"))?,
     };
 
@@ -3532,11 +3536,8 @@ fn cmd_hub_notify(
         "content_hash": content_hash,
     });
 
-    // Seal {tool: referenced_act, args} on a fresh channel and POST. channel_query
+    // Seal {tool: referenced_act, args} on the same channel and POST. channel_query
     // adds the nonce + issued_at freshness fields and opens the sealed response.
-    let channel = rt
-        .block_on(client.open_channel(&conn.url, uuid::Uuid::new_v4()))
-        .context("opening sealed channel to hub")?;
     let out = rt
         .block_on(client.channel_query(
             &rest, &channel, &keypair, conn.our_lct_id, "referenced_act", args,
