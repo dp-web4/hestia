@@ -1,0 +1,61 @@
+--- a/plugins/_shared/hestia_single_gate.py
++++ b/plugins/_shared/hestia_single_gate.py
+@@ -1402,16 +1402,18 @@
+     if d is not None:
+         return _finalize(inv, d, consequential=False)
+ 
+-    d = _governance_closure(inv)
+-    if d is not None:
+-        return _finalize(inv, d, consequential=False)
+-
+     d = _egress_precheck(inv, cprofile)
+     if d is not None:
+         return _finalize(inv, d, consequential=False)
+ 
+     nev = normalized_event(inv.event)
+     d, degraded = _local_law(inv, nev, cprofile)
++    if d is not None:
++        return _finalize(inv, d, consequential=False)
++
++    # Scope is deterministic and non-consuming, so it runs BEFORE the single-use self-access
++    # approval can be claimed (#965). A later mrh refusal can no longer burn that approval.
++    d = _governance_closure(inv)
+     if d is not None:
+         return _finalize(inv, d, consequential=False)
+ 
+--- a/tools/one_gate_decide_contract_test.py
++++ b/tools/one_gate_decide_contract_test.py
+@@ -1571,6 +1571,25 @@
+         stub.close()
+ 
+ 
++def test_scope_refusal_precedes_self_access_claim(m, g, wc, home):
++    """#965: scope denies this governance write; the original order claims approval first."""
++    stub = Stub(Policy(claim="approve"))
++    try:
++        target = "/etc/hestia_gate_core.py"
++        tool_input = {"file_path": target, "old_string": "a", "new_string": "b"}
++        cv = g.closure.classify("Edit", tool_input, cwd=str(REPO))
++        check("scope-refusal-fixture-is-governance-write", cv.classification == "write", cv)
++        with _Env(m, stub.url, home):
++            d, _ = _decide(g, "claude-code", "Edit", tool_input, home)
++        check("scope-refusal-is-not-self-access", d.decision == "deny" and d.rule == "mrh.path", d)
++        check("scope-refusal-never-claims-self-access",
++              stub.named("hestia_gate_escalation_claim") == [], stub.calls)
++        check("scope-refusal-has-no-approval-notice",
++              not any("gate write APPROVED" in n for n in d.notices), d.notices)
++    finally:
++        stub.close()
++
++
+ def test_an_internal_error_fails_closed_through_the_one_recorder(m, g, wc, home):
+     reached = []
+     orig = g.normalized_event
+@@ -1842,6 +1861,7 @@
+     test_no_snapshot_is_a_hard_stop_in_every_rollout_on_every_seat,
+     test_no_verdict_is_a_hard_stop_in_every_rollout_on_every_seat,
+     test_closure_approval_lifts_only_the_closure_bar,
++    test_scope_refusal_precedes_self_access_claim,
+     test_an_internal_error_fails_closed_through_the_one_recorder,
+     test_stage_c_wires_every_seat,
+     test_the_bound_is_the_real_registration,
