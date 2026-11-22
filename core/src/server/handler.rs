@@ -22724,6 +22724,53 @@ mod appeal_tests {
         .hash
     }
 
+    #[tokio::test]
+    async fn unattributed_arbiter_refusal_is_witnessed_before_lookup() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        for (raw_id, stale_session) in [
+            ("missing-first", None),
+            ("missing-second", Some(Uuid::new_v4().to_string())),
+        ] {
+            let before = state.lock().await.chain_len();
+            let args = match stale_session {
+                Some(sid) => json!({"escalation_id": raw_id, "approve": true, "session_id": sid}),
+                None => json!({"escalation_id": raw_id, "approve": true}),
+            };
+            let error = tool_gate_arbitrate_escalation(&state, &args)
+                .await
+                .expect_err("an unattributed arbiter must be refused");
+            assert!(error.to_string().contains("requires your own live session_id"), "{error}");
+            let s = state.lock().await;
+            assert_eq!(s.chain_len(), before + 1, "the refusal must be witnessed exactly once");
+            let refusal = s
+                .recent_chain(10)
+                .into_iter()
+                .find(|entry| entry.event_type == "gate_escalation_arbiter_refused")
+                .expect("the unattributed first guard must mint its row");
+            assert_eq!(refusal.event_data["escalation_id"], raw_id);
+            assert!(refusal.event_data["would_be_arbiter"].is_null());
+            assert!(refusal.event_data["why"]
+                .as_str()
+                .unwrap()
+                .contains("unattributed"));
+        }
+
+        let sid = seat(&state, "claude-code").await;
+        let before = state.lock().await.chain_len();
+        let _ = tool_gate_arbitrate_escalation(&state, &json!({
+            "escalation_id": "missing-attributed-control", "approve": true,
+            "session_id": sid.to_string()
+        }))
+        .await
+        .expect_err("an attributed caller still cannot rule an unknown escalation");
+        assert_eq!(
+            state.lock().await.chain_len(),
+            before,
+            "an attributed unknown-id lookup is outside this repair and must not add a row"
+        );
+    }
+
     /// dp's distinction, as a test: the doorbell and the answered door disagree, and the
     /// answered door is right.
     #[tokio::test]
@@ -29586,6 +29633,14 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
     // credited, and a decision that moves nobody's conduct score teaches the society nothing —
     // the same rule hestia_appeal enforces on appellants.
     let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
+        let _ = s.append_chain(
+            "gate_escalation_arbiter_refused",
+            json!({
+                "escalation_id": escalation_id,
+                "would_be_arbiter": Value::Null,
+                "why": "unattributed — no resolvable live session_id presented",
+            }),
+        );
         return Err(anyhow::anyhow!(
             "ruling on an escalation requires your own live session_id (from hestia_connect); \
              an unattributable arbiter cannot be credited and its ruling moves no conduct score"
