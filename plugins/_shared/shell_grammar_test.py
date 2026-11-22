@@ -71,6 +71,7 @@ RULE_W = WRT
 # Patch-content fixtures (GPT 2nd pass): a diff whose CONTENT targets the closure vs one
 # whose content is benign — the argv is identical in shape for both, which is the point.
 BENIGN_DIR = tempfile.mkdtemp(prefix="shell-grammar-patches-")
+REPO_DIR = tempfile.mkdtemp(prefix="shell-grammar-repos-")
 with open(os.path.join(BENIGN_DIR, "closure.patch"), "w", encoding="utf-8") as _fh:
     _fh.write("--- a/plugins/kimi/hooks/" + HOOK + chr(10)
               + "+++ b/plugins/kimi/hooks/" + HOOK + chr(10)
@@ -167,6 +168,36 @@ CASES = [
      f"git apply {BENIGN_DIR}/closure.patch", "write", RULE_W),
     ("git_apply__benign_content",
      f"git apply {BENIGN_DIR}/benign.patch", "none", None),
+    ("git_apply_cd_relative__benign",
+     f"cd {BENIGN_DIR} && git apply benign.patch", "none", None),
+    ("git_apply_cd_relative__closure",
+     f"cd {BENIGN_DIR} && git apply closure.patch", "write", RULE_W),
+    ("git_apply_cd_relative_stdin__benign",
+     f"cd {BENIGN_DIR} && git apply < benign.patch", "none", None),
+    ("git_apply_cd_relative_stdin__closure",
+     f"cd {BENIGN_DIR} && git apply < closure.patch", "write", RULE_W),
+    ("patch_cd_relative_input__benign",
+     f"cd {BENIGN_DIR} && patch -p1 -i benign.patch", "none", None),
+    ("patch_cd_relative_input__closure",
+     f"cd {BENIGN_DIR} && patch -p1 -i closure.patch", "write", RULE_W),
+    ("patch_cd_relative_stdin__benign",
+     f"cd {BENIGN_DIR} && patch -p1 < benign.patch", "none", None),
+    ("patch_cd_relative_stdin__closure",
+     f"cd {BENIGN_DIR} && patch -p1 < closure.patch", "write", RULE_W),
+    ("git_apply_dash_c_relative__benign",
+     f"git -C {BENIGN_DIR} apply benign.patch", "none", None),
+    ("git_apply_dash_c_relative__closure",
+     f"git -C {BENIGN_DIR} apply closure.patch", "write", RULE_W),
+    ("git_apply_dash_c_shell_stdin__benign",
+     f"cd {BENIGN_DIR} && git -C {REPO_DIR} apply < benign.patch", "none", None),
+    ("git_apply_dash_c_shell_stdin__closure",
+     f"cd {BENIGN_DIR} && git -C {REPO_DIR} apply < closure.patch", "write", RULE_W),
+    ("git_am_dash_c_relative__closure",
+     f"git -C {BENIGN_DIR} am closure.patch", "write", RULE_W),
+    ("git_apply_cd_check_closure__read_only",
+     f"cd {BENIGN_DIR} && git apply --check closure.patch", "none", None),
+    ("git_apply_dash_c_check_closure__read_only",
+     f"git -C {BENIGN_DIR} apply --check closure.patch", "none", None),
     ("git_apply__missing_patch_fails_closed",
      "git apply /tmp/definitely-missing-xyz.patch", "write", OPQ),
     ("git_apply__no_input_at_all_fails_closed",
@@ -540,8 +571,25 @@ def test_block_and_its_unblocked_body_agree():
     check("block_and_body_agree", not failures, "\n  ".join(failures))
 
 
+def test_patch_source_uses_classify_cwd():
+    cases = [
+        ("git_apply", "git apply benign.patch", "none", None),
+        ("git_apply_closure", "git apply closure.patch", "write", RULE_W),
+        ("git_apply_stdin", "git apply < benign.patch", "none", None),
+        ("git_apply_stdin_closure", "git apply < closure.patch", "write", RULE_W),
+        ("patch_input", "patch -p1 -i benign.patch", "none", None),
+        ("patch_input_closure", "patch -p1 -i closure.patch", "write", RULE_W),
+        ("patch_stdin", "patch -p1 < benign.patch", "none", None),
+        ("patch_stdin_closure", "patch -p1 < closure.patch", "write", RULE_W),
+    ]
+    for name, cmd, want_cls, want_rule in cases:
+        v = cls(cmd, cwd=BENIGN_DIR)
+        check(f"classify_cwd__{name}", (v.classification, v.rule) == (want_cls, want_rule), v)
+
+
 ALL = [
     test_explicit_all_grammar_cases,
+    test_patch_source_uses_classify_cwd,
     test_differential_against_real_shell,
     test_block_and_its_unblocked_body_agree,
     test_a_write_through_a_loop_variable_stays_refused,
