@@ -364,10 +364,10 @@ for script, stub, peer in CASES:
               "evil.example" not in (prompt or ""),
               f"prompt={str(prompt)[:300]!r}")
 
-    # B6. The second daemon kind (#459). A `disposition` — "the petition you filed
-    #     has been ruled" — ALONE must wake the member with its pointer intact:
-    #     withheld, a ruled appeal reads exactly like an open one and the member
-    #     keeps polling a question that already has an answer.
+    # B6. The second daemon kind (#459). A non-withdrawal `disposition` — "the
+    #     petition you filed has been ruled" — ALONE must wake the member with its
+    #     pointer intact: withheld, a ruled appeal reads exactly like an open one
+    #     and the member keeps polling a question that already has an answer.
     with tempfile.TemporaryDirectory() as tmp:
         ptr = "hestia://appeal/8bea2e21fa62eccd#ruled"
         r, prompt = fire(script, stub,
@@ -380,6 +380,42 @@ for script, stub, peer in CASES:
               "#ruled" in (prompt or ""),
               f"pointer stripped — the petitioner cannot follow it to the ruling; "
               f"prompt={str(prompt)[:300]!r}")
+
+    # B7. #1249: a self-withdrawal is terminal and already known to its asker. It
+    #     must not wake every co-seat, and the clean exit must not turn into a
+    #     retained-primer retry loop.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+        r, prompt = fire(script, stub,
+                         [notice(9, "hestia", kind="disposition", pointer=ptr)], tmp)
+        check(f"B7. {script}: a self-withdrawal alone exits 0 WITHOUT firing",
+              r.returncode == 0 and prompt is None,
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+
+    # B8. The quiet notice is not erased from a batch that has another reason to
+    #     wake: the next primer still carries its id and pointer.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+        r, prompt = fire(script, stub, [
+            notice(10, "hestia", kind="disposition", pointer=ptr),
+            notice(11, peer, pointer="shared-context/real.md"),
+        ], tmp)
+        check(f"B8. {script}: a real notice still fires beside a self-withdrawal",
+              prompt is not None and "id=11" in (prompt or ""),
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+        check(f"B8b. {script}: the mixed primer retains the withdrawal",
+              "id=10" in (prompt or "") and "#withdrawn" in (prompt or ""),
+              f"the quiet row was dropped instead of deferred; prompt={str(prompt)[:300]!r}")
+
+    # B9. Suppression is exact, never a substring claim about another terminal
+    #     state or a lookalike suffix.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn-lookalike"
+        r, prompt = fire(script, stub,
+                         [notice(12, "hestia", kind="disposition", pointer=ptr)], tmp)
+        check(f"B9. {script}: a withdrawal-lookalike suffix still fires",
+              prompt is not None and "id=12" in (prompt or ""),
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
 
 
 print()
