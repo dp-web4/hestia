@@ -20180,6 +20180,134 @@ mod tests {
         assert!(!err.to_string().contains("unknown ids"), "{err}");
     }
 
+    async fn poll_reaped_ruling(approve: bool) -> Value {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({"plugin_id": "codex", "host_agent": "h"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex", "session_id": session,
+                "tool_name": "Edit", "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let reason = if approve { "approved after review" } else { "refused after review" };
+
+        let (expected_bar, expected_factors) = {
+            let mut s = shared.lock().await;
+            let now = crate::server::gate_escalation::now_secs();
+            let decided = s
+                .gate_escalations
+                .decide(
+                    &id,
+                    approve,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some(reason),
+                    now,
+                )
+                .unwrap();
+            let expected_bar = decided.bar;
+            let expected_factors = decided.factors.clone();
+            let bar_met = decided.bar_met();
+            s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": id, "plugin_id": "codex",
+                    "status": decided.stored_status(),
+                    "decided_by": decided.decided_by,
+                    "decided_via": decided.decided_via,
+                    "reason": decided.reason,
+                    "bar": decided.bar,
+                    "bar_met": bar_met,
+                    "factors_present": decided.factors,
+                }),
+            )
+            .unwrap();
+            s.gate_escalations.reap(
+                now + 2 * crate::server::gate_escalation::REAP_KEEP_SECS,
+                crate::server::gate_escalation::REAP_KEEP_SECS,
+            );
+            assert!(s.gate_escalations.get(&id).is_none());
+            let rows = s.chain_store.escalation_rows(&id).unwrap();
+            assert!(rows.iter().any(|e| e.event_type == "gate_escalation_opened"));
+            assert!(rows.iter().any(|e| e.event_type == "gate_escalation_decided"));
+            (expected_bar, expected_factors)
+        };
+
+        let polled = tool_gate_escalation_poll(
+            &shared,
+            &json!({"escalation_id": id, "session_id": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled["source"], "witness_chain", "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["claim_window_secs_remaining"], 0, "{polled}");
+        assert_eq!(polled["observation_started_claim_window"], false, "{polled}");
+        assert_eq!(polled["decided_by"], "operator", "{polled}");
+        assert_eq!(polled["decided_via"], "operator_session", "{polled}");
+        assert_eq!(polled["reason"], reason, "{polled}");
+        assert_eq!(polled["bar"], json!(expected_bar), "{polled}");
+        assert_eq!(polled["bar_met"], true, "{polled}");
+        assert_eq!(polled["factors_present"], json!(expected_factors), "{polled}");
+        assert_eq!(polled["consumed_at"], Value::Null, "{polled}");
+        assert!(polled["note"].as_str().unwrap().contains("witness chain"), "{polled}");
+        polled
+    }
+
+    #[tokio::test]
+    async fn a_reaped_denial_polls_the_ruling_from_the_chain() {
+        let polled = poll_reaped_ruling(false).await;
+        assert_eq!(polled["status"], "denied", "{polled}");
+        assert_eq!(polled["reason"], "refused after review", "{polled}");
+    }
+
+    #[tokio::test]
+    async fn a_reaped_approval_polls_the_ruling_without_resurrecting_spend_authority() {
+        let polled = poll_reaped_ruling(true).await;
+        assert_eq!(polled["status"], "approved", "{polled}");
+        assert_eq!(polled["reason"], "approved after review", "{polled}");
+        assert_eq!(polled["bar_met"], true, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_poll_says_reaping_is_not_evidence_of_no_ruling() {
+        let (_dir, shared) = make_shared_state();
+        let polled = tool_gate_escalation_poll(
+            &shared,
+            &json!({"escalation_id": "deadbeefdeadbeef"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polled["status"], "expired", "{polled}");
+        assert_eq!(polled["source"], "live_store", "{polled}");
+        assert_eq!(polled["permits_write"], false, "{polled}");
+        assert_eq!(polled["granted"], false, "{polled}");
+        assert_eq!(polled["decided_by"], Value::Null, "{polled}");
+        assert_eq!(polled["reason"], Value::Null, "{polled}");
+        assert_eq!(
+            polled["note"],
+            "unknown to the live store: reaped (decided rows are kept about two hours after \
+             open) or lost to a restart; this is NOT evidence that no one ruled — check the \
+             chain before re-escalating.",
+            "{polled}"
+        );
+    }
+
     /// The positive control for the binding above, and the more important half of it: the fix
     /// must close the hole WITHOUT killing the feature. A guard that makes every invitation
     /// vanish would pass the test above while deleting the only production writer on the peer
@@ -28095,12 +28223,38 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         None => false,
     };
 
-    let status = s.gate_escalations.status_of(&id, now);
+    let live_status = s.gate_escalations.status_of(&id, now);
     let esc = s.gate_escalations.get(&id);
+    let historical = if esc.is_none() {
+        let answer = resolve_escalation_pointer(&s, &id);
+        (answer["source"] == "witness_chain"
+            && answer.get("settled_entry").is_some_and(|e| !e.is_null())
+            && matches!(answer["status"].as_str(), Some("approved") | Some("denied")))
+        .then_some(answer)
+    } else {
+        None
+    };
+    let historical_field = |key: &str| {
+        historical
+            .as_ref()
+            .and_then(|h| {
+                h["settled_entry"]["eventData"]
+                    .get(key)
+                    .or_else(|| h.get(key))
+            })
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let reply_status = historical
+        .as_ref()
+        .map(|h| h["status"].clone())
+        .unwrap_or_else(|| json!(live_status));
+    let granted = live_status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false);
 
     Ok(json!({
         "escalation_id": id,
-        "status": status,
+        "source": if historical.is_some() { "witness_chain" } else { "live_store" },
+        "status": reply_status,
         // Told, not inferred: if this poll is what started the claim fuse, the member should
         // know its window is now measured from THIS moment and not from the ruling.
         "observation_started_claim_window": observed,
@@ -28121,14 +28275,15 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // existing somewhere does not put it on the path anyone takes. It goes HERE, where
         // the wrong field already was.
         "permits_write": esc.map(|e| e.is_claimable(now)).unwrap_or(false),
-        "granted": status.permits_write() && esc.map(|e| e.bar_met()).unwrap_or(false),
+        "granted": granted,
         // THREE causes for `0`, one shape (#651) — and the fix is NOT to collapse all three
         // to `null`, because the two causes are not the same kind of thing.
         //
-        // UNKNOWN ID stays `0`. That is the deliberate policy stated on `note` below: an id
-        // this daemon has never seen is treated as EXPIRED, and the caller's only safe
-        // reading of "I do not know" is "no". An `and_then` here would have quietly widened
-        // the #651 repair into that contract and turned a fail-closed answer into `null`.
+        // NO LIVE ROW stays `0`, including a settled decision recovered from the chain. The
+        // recovered ruling is history, not renewed spend authority. With no settled chain
+        // decision the id remains EXPIRED, and the caller's only safe reading of "I do not
+        // know" is "no". An `and_then` here would have quietly widened the #651 repair into
+        // that contract and turned a fail-closed answer into `null`.
         //
         // PENDING becomes `null`, because it is the opposite situation: a KNOWN record whose
         // claim clock has not started. `0` there is not a safe "no", it is a false "your
@@ -28153,16 +28308,40 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // zero call sites, and the note stated the two-conjunct rule for six days after the
         // field it explains was moved to four. A peer auditing "which of these N approvals on
         // a shared marker was the one actually spent?" must not have to substring-match prose.
-        "consumed_at": esc.and_then(|e| e.consumed_at),
-        "bar": esc.map(|e| e.bar),
-        "bar_met": esc.map(|e| e.bar_met()),
-        "factors_present": esc.map(|e| e.factors.clone()),
+        "consumed_at": if esc.is_some() {
+            json!(esc.and_then(|e| e.consumed_at))
+        } else {
+            historical_field("consumed_at")
+        },
+        "bar": if esc.is_some() { json!(esc.map(|e| e.bar)) } else { historical_field("bar") },
+        "bar_met": if esc.is_some() {
+            json!(esc.map(|e| e.bar_met()))
+        } else {
+            historical_field("bar_met")
+        },
+        "factors_present": if esc.is_some() {
+            json!(esc.map(|e| e.factors.clone()))
+        } else {
+            historical_field("factors_present")
+        },
         "secs_remaining": esc.map(|e| e.secs_remaining(now)).unwrap_or(0),
-        "decided_by": esc.and_then(|e| e.decided_by.clone()),
-        "decided_via": esc.and_then(|e| e.decided_via),
-        "reason": esc.and_then(|e| e.reason.clone()),
-        // An id this daemon has never seen and an id whose window closed are the SAME answer on
-        // purpose. The caller's only safe reading of "I do not know" is "no".
+        "decided_by": if esc.is_some() {
+            json!(esc.and_then(|e| e.decided_by.clone()))
+        } else {
+            historical_field("decided_by")
+        },
+        "decided_via": if esc.is_some() {
+            json!(esc.and_then(|e| e.decided_via))
+        } else {
+            historical_field("decided_via")
+        },
+        "reason": if esc.is_some() {
+            json!(esc.and_then(|e| e.reason.clone()))
+        } else {
+            historical_field("reason")
+        },
+        // An id with no settled chain decision and an id whose window closed are the SAME
+        // answer on purpose. The caller's only safe reading of "I do not know" is "no".
         //
         // THE NOTE IS THE FIELD'S PROSE AND MUST TRACK THE SAME FOUR CONJUNCTS. It used to
         // read "authoritative as of now; only `approved` WITH the stated bar met permits the
@@ -28173,9 +28352,13 @@ async fn tool_gate_escalation_poll(state: &SharedState, args: &Value) -> ToolRes
         // value was not, because nothing compiles a string. It now comes from
         // `Escalation::claim_note`, the single answer `decision_reply` already reads.
         "note": match esc {
-            None => "unknown escalation_id — treated as expired (a restart drops the store, and \
-                     an in-flight escalation must then read as denied)",
             Some(e) => e.claim_note(now),
+            None if historical.is_some() => "settled decision recovered from the witness chain; \
+                                             permits_write stays false because a reaped approval \
+                                             cannot be claimed",
+            None => "unknown to the live store: reaped (decided rows are kept about two hours \
+                     after open) or lost to a restart; this is NOT evidence that no one ruled — \
+                     check the chain before re-escalating.",
         },
     }))
 }
