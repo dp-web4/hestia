@@ -441,7 +441,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_request_scope",
-            "Ask the operator for read access to ONE path outside your granted MRH. Requires an absolute path and a stated reason — the operator has only that sentence to rule on. This is the door the scope deny has been naming; it now exists. DIFFERENT CHANNEL FROM hestia_appeal, on purpose: an appeal asks whether a deny was WRONG and yields a verdict on conduct; this accepts the deny and asks for reach. An upheld appeal grants no access, and a granted request repairs no score. Any grant is MEMORY-ONLY and dies with the daemon — it never edits your identity file. Returns pending and permits nothing; no answer within the window is a refusal, not a retry",
+            "Ask for read access to ONE path outside your granted MRH. Requires an absolute path and a stated reason — the decider has only that sentence to rule on. A member-filed ask goes to the operator. A dispatcher filing after a deny may also pass origin=dispatcher_after_deny and deny_witness=<chain hash>; the daemon promotes that ask to the NOT-SAME peer tier only when the live session, member, enforced mrh deny, recorded act and exact-or-parent path all check out, and advertises this as supports=[request_origin] on hestia_scope_status. A policy deny carries no complete-act authorization digest, so these asks accept session/standing grants or refusal, never an unspendable one-time approval. DIFFERENT CHANNEL FROM hestia_appeal, on purpose: an appeal asks whether a deny was WRONG and yields a verdict on conduct; this accepts the deny and asks for reach. An upheld appeal grants no access, and a granted request repairs no score. Any grant is MEMORY-ONLY and dies with the daemon — it never edits your identity file. Returns pending and permits nothing; no answer within the window is a refusal, not a retry",
         ),
         t(
             "hestia_scope_status",
@@ -449,7 +449,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_scope_peer_decide",
-            "Rule ANOTHER member's gate-opened scope request as a NOT-SAME PEER (dp, 2026-10-05: scope escalations go to peers, the operator is the override). Pass your own live session_id, the request_id, decision = once | session | standing | refuse, a reason (the asker reads it), and for session/standing optionally grant_path (the asked path or a directory above it, never the root) with recursive=true, and modes (a string of r read, w write, e execute, d delete; default all four, #1345). Refused by name when: you are the asker (in either direction — the asker can never decide its own request); the asker was never proven against a session (NOT-SAME cannot peer-clear an asserted name, eligibility clause 0); you are not a recognised reasoner; the request was filed by the member rather than opened by the gate. The record names you (granted_by peer:<you>), the channel (peer_not_same) and your NOT-SAME basis",
+            "Rule ANOTHER member's gate-opened or verified dispatcher-after-deny scope request as a NOT-SAME PEER (dp, 2026-10-05: scope escalations go to peers, the operator is the override). Pass your own live session_id, the request_id, decision = once (only with a complete-act digest) | session | standing | refuse, a reason (the asker reads it), and for session/standing optionally grant_path (the asked path or a directory above it, never the root) with recursive=true, and modes (a string of r read, w write, e execute, d delete; default all four, #1345). Refused by name when: you are the asker (in either direction — the asker can never decide its own request); the asker was never proven against a session (NOT-SAME cannot peer-clear an asserted name, eligibility clause 0); you are not a recognised reasoner; a grant was requested for a member-filed ask (a peer may still REFUSE one). The record names you (granted_by peer:<you>), the channel (peer_not_same) and your NOT-SAME basis",
         ),
         t(
             "hestia_scope_request_view",
@@ -26280,6 +26280,66 @@ fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &s
     out
 }
 
+fn dispatcher_origin(
+    s: &super::state::ServerState,
+    plugin_id: &str,
+    path: &str,
+    reason: &str,
+    origin: Option<String>,
+    deny_witness: Option<String>,
+    asker_basis: crate::arbiter::AskerBasis,
+) -> Option<crate::server::state::GateDenyOrigin> {
+    if asker_basis != crate::arbiter::AskerBasis::Session
+        || origin.as_deref() != Some("dispatcher_after_deny")
+    {
+        return None;
+    }
+    let hash = deny_witness?;
+    let entry = s.chain_store.read_by_hash(&hash).ok().flatten()?;
+    let d = &entry.event_data;
+    if d.get("plugin_id").and_then(Value::as_str) != Some(plugin_id) {
+        return None;
+    }
+    let rule = d.get("rule_id").and_then(Value::as_str)?;
+    let is_deny = entry.event_type == "policy_decision"
+        && d.get("decision").and_then(Value::as_str) == Some("deny")
+        && d.get("enforced").and_then(Value::as_bool) != Some(false)
+        && rule.starts_with("mrh.");
+    if !is_deny {
+        return None;
+    }
+    let target = d.get("target").and_then(Value::as_str)?;
+    let subtree = target.trim_end().ends_with("/*");
+    let target = super::state::normalize_scope_path(target);
+    let parent = std::path::Path::new(&target)
+        .parent()
+        .map(|p| super::state::normalize_scope_path(&p.to_string_lossy()));
+    // A home-root ask needs evidence that the root is the member's home, not merely an ancestor
+    // the caller named. Neither this request nor the deny row carries that fact, so only the two
+    // containment shapes that need no such inference are promoted here.
+    if path != target && parent.as_deref() != Some(path) {
+        return None;
+    }
+    let tool = d.get("tool_name").and_then(Value::as_str).unwrap_or("unknown");
+    let act = d.get("attempted").and_then(Value::as_str)?;
+    // A policy deny retains a display act, not the gate's complete-act authorization digest.
+    // Keep that distinction explicit: session/standing rulings are available, ONCE is not.
+    let act_digest = String::new();
+    Some(crate::server::state::GateDenyOrigin {
+        rule: rule.to_string(),
+        tool: tool.to_string(),
+        act: act.to_string(),
+        act_digest,
+        request_key: scope_request_key(plugin_id, path),
+        host_session_id: d.get("host_session_id").and_then(Value::as_str).map(str::to_string),
+        subtree,
+        reissues: 0,
+        asker_basis,
+        escalated_from: Some(entry.hash),
+        member_reason: Some(reason.to_string()),
+    })
+}
+
 pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
     use crate::server::state::{normalize_scope_path, ScopeRequest, ScopeRequestExt, SCOPE_REQUEST_TTL_SECS};
@@ -26410,6 +26470,21 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
         }));
     }
 
+    let gate_origin = dispatcher_origin(
+        &s,
+        &plugin_id,
+        &path,
+        &reason,
+        optional_string(args, "origin"),
+        optional_string(args, "deny_witness"),
+        asker_basis,
+    );
+    let invited = if gate_origin.is_some() {
+        scope_peer_pool(&s, &plugin_id)
+    } else {
+        Vec::new()
+    };
+
     // Derived, not random — same construction as the escalation store, so an id is reproducible
     // from the record that minted it. The request count is in the digest so a member re-asking
     // for the same path in the same second gets a distinct record rather than overwriting its
@@ -26439,7 +26514,12 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
         decision_reason: None,
         recursive: false,
         revoked: None,
-        ext: ScopeRequestExt { asker_basis: Some(asker_basis), ..Default::default() },
+        ext: ScopeRequestExt {
+            gate: gate_origin.clone(),
+            asker_basis: Some(asker_basis),
+            invited_peers: invited.clone(),
+            ..Default::default()
+        },
     };
     s.scope_requests.insert(id.clone(), req);
 
@@ -26455,21 +26535,54 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
             "path": path,
             "path_as_asked": raw_path,
             "reason": reason,
+            "origin": if gate_origin.is_some() { "dispatcher_after_deny" } else { "member_request" },
+            "deny_witness": gate_origin.as_ref().and_then(|g| g.escalated_from.clone()),
+            "invited_peers": invited,
+            "asker_basis": asker_basis,
+            "decided_by_default": if gate_origin.is_none() || invited.is_empty() {
+                "operator (member-filed or no admissible peer)"
+            } else {
+                "a NOT-SAME peer (the operator may override)"
+            },
+            "rule": gate_origin.as_ref().map(|g| g.rule.clone()),
+            "tool_name": gate_origin.as_ref().map(|g| g.tool.clone()),
+            "act": gate_origin.as_ref().map(|g| g.act.clone()),
+            "act_digest": gate_origin.as_ref().map(|g| g.act_digest.clone()),
+            "request_key": gate_origin.as_ref().map(|g| g.request_key.clone()),
+            "subtree": gate_origin.as_ref().is_some_and(|g| g.subtree),
             "expires_at": now + SCOPE_REQUEST_TTL_SECS,
             "assurance": "A1 — the grant is recorded here and enforced by the plugin gate. \
                           Tamper-EVIDENT, not tamper-proof.",
         }),
     )?;
 
+    let pointer = format!("hestia://scope/{id}#peer-decide");
+    let mut invitations = Vec::new();
+    for peer in &invited {
+        match s.inbox_store.enqueue_member(peer, &plugin_id, &role, "review_request",
+                                           Some(pointer.as_str()), &entry.hash, None) {
+            Ok(qid) => invitations.push(json!({"peer": peer, "queued_id": qid})),
+            Err(e) => invitations.push(json!({"peer": peer, "queued_id": null,
+                                              "dispatch_error": e.to_string()})),
+        }
+    }
+
     Ok(json!({
         "request_id": id,
         "status": "pending",
         "path": path,
+        "origin": if gate_origin.is_some() { "dispatcher_after_deny" } else { "member_request" },
         "expires_at": now + SCOPE_REQUEST_TTL_SECS,
         "witnessEntryHash": entry.hash,
+        "invited_peers": invited,
+        "invitations": invitations,
         "permits_read": false,
         "on_timeout": "REFUSED — no answer within the window is a refusal, not a retry",
-        "next": "poll hestia_scope_status; a human decides this, out of band",
+        "next": if gate_origin.is_some() && !invited.is_empty() {
+            "poll hestia_scope_status; a NOT-SAME peer decides this, with operator override"
+        } else {
+            "poll hestia_scope_status; a human decides this, out of band"
+        },
         // Said here because this is exactly the moment a member is deciding which door to use,
         // and the two doors have been confused once already.
         "note": "this asks for REACH. If you believe the deny itself was wrong, that is \
@@ -26661,6 +26774,7 @@ async fn tool_scope_status_with_counter(
 
     Ok(json!({
         "plugin_id": plugin_id,
+        "supports": ["request_origin"],
         // #1450 phase 0: true when the session sent resolves to `plugin_id`; false for a read served on the
         // asserted name alone (no session, or one that no longer resolves). Step C refuses those.
         "caller_bound": caller_bound,
@@ -30042,6 +30156,205 @@ async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> 
             }))
         }
         Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_origin_tests {
+    use super::*;
+    use crate::vault::Vault;
+    use tempfile::TempDir;
+
+    async fn test_state() -> (TempDir, SharedState) {
+        let dir = TempDir::new().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let state = crate::server::build_state(vault, dir.path(), "p").unwrap();
+        (dir, state)
+    }
+
+    async fn connect(state: &SharedState, plugin: &str) -> String {
+        tool_connect(state, &json!({"plugin_id": plugin, "host_agent": "test"}))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn evidence(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "evidence").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    async fn deny_for(
+        state: &SharedState,
+        plugin: &str,
+        target: &str,
+        rule: &str,
+    ) -> crate::storage::chain::ChainEntry {
+        let out = tool_witness_decision(state, &json!({
+            "plugin_id": plugin, "decision": "deny", "adjudicator": "test-gate",
+            "rule_id": rule, "tool_name": "Read", "target": target,
+            "attempted": format!("Read -> {target}"), "reason": "outside the member's grant",
+        }))
+        .await
+        .unwrap();
+        let hash = out["witnessEntryHash"].as_str().unwrap();
+        state.lock().await.chain_store.read_by_hash(hash).unwrap().unwrap()
+    }
+
+    async fn request(
+        state: &SharedState,
+        session: Option<&str>,
+        path: &str,
+        origin: Option<&str>,
+        deny_witness: Option<&str>,
+    ) -> Value {
+        let mut args = json!({
+            "plugin_id": "kimi-code", "path": path,
+            "reason": "continue the work the dispatcher refused",
+        });
+        if let Some(sid) = session {
+            args["session_id"] = json!(sid);
+        }
+        if let Some(origin) = origin {
+            args["origin"] = json!(origin);
+        }
+        if let Some(hash) = deny_witness {
+            args["deny_witness"] = json!(hash);
+        }
+        tool_request_scope(state, &args).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_proven_dispatcher_deny_is_peer_decidable_in_both_directions() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "kimi-code").await;
+        let peer = connect(&state, "codex").await;
+        let path = evidence(_dir.path(), "child/evidence.txt");
+        let target = std::path::Path::new(&path).parent().unwrap().to_string_lossy().into_owned();
+        let deny = deny_for(&state, "kimi-code", &path, "mrh.path").await;
+        let proven = dispatcher_origin(
+            &*state.lock().await, "kimi-code", &path, "a sufficiently long test reason",
+            Some("dispatcher_after_deny".into()), Some(deny.hash.clone()),
+            crate::arbiter::AskerBasis::Session,
+        );
+        assert!(proven.is_some(), "the fixture must satisfy every deny predicate: {deny:?}");
+        let opened = request(&state, Some(&asker), &path, Some("dispatcher_after_deny"), Some(&deny.hash)).await;
+        let request_id = opened["request_id"].as_str().unwrap().to_string();
+        assert_eq!(opened["origin"], "dispatcher_after_deny", "{opened}");
+        let chain = state.lock().await.recent_chain(20).into_iter()
+            .find(|e| e.event_type == "scope_requested" && e.event_data["request_id"] == request_id)
+            .unwrap();
+        assert_eq!(chain.event_data["deny_witness"], deny.hash, "{chain:?}");
+        assert_eq!(chain.event_data["origin"], "dispatcher_after_deny", "{chain:?}");
+        assert_eq!(chain.event_data["act_digest"], "", "{chain:?}");
+        assert!(opened["invited_peers"].as_array().unwrap().contains(&json!("codex")), "{opened}");
+        assert!(state.lock().await.scope_requests.get(&request_id).unwrap().ext.gate.is_some());
+        let status = tool_scope_status(&state, &json!({"plugin_id": "kimi-code", "session_id": asker}))
+            .await
+            .unwrap();
+        assert_eq!(status["supports"], json!(["request_origin"]), "{status}");
+        let view = tool_scope_request_view(&state, &json!({"request_id": request_id, "session_id": peer}))
+            .await
+            .unwrap();
+        assert_eq!(view["decidable"], true, "{view}");
+        assert!(view["may_decide"].as_array().unwrap().contains(&json!("grant")), "{view}");
+        let decided = tool_scope_peer_decide(
+            &state,
+            &json!({
+                "request_id": request_id, "session_id": peer,
+                "decision": "session", "reason": "the proven deny covers this exact ask",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decided["granted"], true, "{decided}");
+        assert_eq!(decided["once"], false, "{decided}");
+        let sibling = evidence(_dir.path(), "child/sibling.txt");
+        {
+            let s = state.lock().await;
+            let req = &s.scope_requests[&request_id];
+            assert_eq!(req.path, path);
+            assert!(!req.ext.once);
+            assert_eq!(req.ext.gate.as_ref().unwrap().act_digest, "");
+            assert!(s.has_scope_grant("kimi-code", &path));
+            assert!(!s.has_scope_grant("kimi-code", &target));
+            assert!(!s.has_scope_grant("kimi-code", &sibling));
+            let allowed = crate::server::state::scope_allowed_decisions(
+                &path, !req.ext.gate.as_ref().unwrap().act_digest.is_empty());
+            assert!(!allowed.contains(&"once"));
+            assert!(allowed.contains(&"session") && allowed.contains(&"standing"));
+        }
+
+        let parent = request(&state, Some(&asker), &target,
+                             Some("dispatcher_after_deny"), Some(&deny.hash)).await;
+        assert_eq!(parent["origin"], "dispatcher_after_deny", "{parent}");
+        let parent_id = parent["request_id"].as_str().unwrap().to_string();
+        let unbound = tool_scope_peer_decide(&state, &json!({
+            "request_id": parent_id, "session_id": peer,
+            "decision": "once", "reason": "a display act is not an authorization digest",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(unbound["_hestia_error"]["code"], "hestia.scope_peer_decide_refused", "{unbound}");
+        let refused = tool_scope_peer_decide(&state, &json!({
+            "request_id": parent_id, "session_id": peer,
+            "decision": "refuse", "reason": "the parent ask is not needed for this work",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(refused["granted"], false, "{refused}");
+        assert_eq!(refused["decided_by"], "peer:codex", "{refused}");
+    }
+
+    #[tokio::test]
+    async fn invalid_dispatcher_provenance_stays_member_filed() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "kimi-code").await;
+        let peer = connect(&state, "codex").await;
+        let path = evidence(_dir.path(), "child/evidence.txt");
+        let deny = deny_for(&state, "kimi-code", &path, "mrh.path").await;
+        let other = deny_for(&state, "someone-else", &path, "mrh.path").await;
+        let foreign_path = deny_for(&state, "kimi-code", "/tmp/elsewhere", "mrh.path").await;
+        let non_scope = deny_for(&state, "kimi-code", &path, "egress.secret").await;
+        let invalid_session = "not-a-live-session".to_string();
+        for (session, origin, hash) in [
+            (None, Some("dispatcher_after_deny"), Some(&deny.hash)),
+            (Some(&invalid_session), Some("dispatcher_after_deny"), Some(&deny.hash)),
+            (Some(&asker), Some("dispatcher_after_deny"), Some(&other.hash)),
+            (Some(&asker), Some("dispatcher_after_deny"), Some(&foreign_path.hash)),
+            (Some(&asker), Some("dispatcher_after_deny"), Some(&non_scope.hash)),
+            (Some(&asker), Some("dispatcher_after_deny"), None),
+            (Some(&asker), None, None),
+        ] {
+            let opened = request(&state, session.map(String::as_str), &path, origin, hash.map(String::as_str)).await;
+            assert_eq!(opened["origin"], "member_request", "{opened}");
+            let id = opened["request_id"].as_str().unwrap().to_string();
+            assert!(state.lock().await.scope_requests.get(&id).unwrap().ext.gate.is_none());
+            let refused = tool_scope_peer_decide(
+                &state,
+                &json!({
+                    "request_id": id, "session_id": peer,
+                    "decision": "once", "reason": "invalid provenance must not change the tier",
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                refused["_hestia_error"]["code"], "hestia.scope_peer_decide_member_filed",
+                "{refused}"
+            );
+        }
+
+        let home = _dir.path().to_string_lossy().into_owned();
+        let widened = request(&state, Some(&asker), &home,
+                              Some("dispatcher_after_deny"), Some(&deny.hash)).await;
+        assert_eq!(widened["origin"], "member_request", "{widened}");
+        let id = widened["request_id"].as_str().unwrap();
+        assert!(state.lock().await.scope_requests[id].ext.gate.is_none());
     }
 }
 

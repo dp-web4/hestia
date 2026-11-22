@@ -1799,7 +1799,7 @@ impl ServerState {
                             // answers: the act the operator rules on, the rule, the tool, how
                             // often the member re-issued it, and whether only a recursive grant
                             // can cover it (a glob). `once_available` says whether "this act
-                            // once" is a choice: a member-filed ask names no act to bind.
+                            // once" has a complete-act authorization digest to bind.
                             "origin": if r.ext.gate.is_some() { "gate_deny" } else { "member_request" },
                             "rule": r.ext.gate.as_ref().map(|g| g.rule.clone()),
                             "tool": r.ext.gate.as_ref().map(|g| g.tool.clone()),
@@ -1808,7 +1808,7 @@ impl ServerState {
                             "member_reason": r.ext.gate.as_ref().and_then(|g| g.member_reason.clone()),
                             "escalated_from": r.ext.gate.as_ref().and_then(|g| g.escalated_from.clone()),
                             "subtree": r.ext.gate.as_ref().is_some_and(|g| g.subtree),
-                            "once_available": r.ext.gate.is_some(),
+                            "once_available": r.ext.gate.as_ref().is_some_and(|g| !g.act_digest.is_empty()),
                             // dp, 2026-10-10 (#1232 narrowed): an act the gate could not
                             // enumerate names no path — "this act once" is the ONLY grant.
                             "once_only": crate::server::state::is_unpriceable_scope_path(&r.path),
@@ -1817,7 +1817,7 @@ impl ServerState {
                             // exactly these, so no button is refused after the click.
                             "enumerable": !crate::server::state::is_unpriceable_scope_path(&r.path),
                             "allowed_decisions": crate::server::state::scope_allowed_decisions(
-                                &r.path, r.ext.gate.is_some()),
+                                &r.path, r.ext.gate.as_ref().is_some_and(|g| !g.act_digest.is_empty())),
                             // dp, 2026-10-05: NOT-SAME peers decide gate-opened requests; the
                             // operator surfaces show who was invited and offer the OVERRIDE.
                             "invited_peers": r.ext.invited_peers,
