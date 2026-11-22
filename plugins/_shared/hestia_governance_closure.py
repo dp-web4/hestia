@@ -1548,8 +1548,16 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
     if name == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
     if name == "patch":
-        if _help_call(args, ("--help", "--version", "-v")):
+        # With POSIXLY_CORRECT set (in the session env, invisible here, or as a prefix/export)
+        # getopt stops at the first operand: in `patch FILE -v`, `-v` is the PATCH FILE and
+        # FILE is written. Only a leading help token is certainly read-only. Operand-first help
+        # is unconditionally opaque: a readable stdin/-i patch does not replace that operand.
+        if args and args[0] in ("--help", "--version", "-v"):
             return []
+        for i, arg in enumerate(args[1:], 1):
+            if (arg in ("--help", "--version", "-v")
+                    and any(not prior.startswith("-") for prior in args[:i])):
+                raise _OpaqueWriter()
         # The write set lives inside the patch CONTENT. Resolve it: read the named input
         # (-i/--input or the `<` stdin source threaded by the caller) and extract its
         # targets. No readable input -> _OpaqueWriter -> unconditional fail-close.

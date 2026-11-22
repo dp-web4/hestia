@@ -321,6 +321,22 @@ CASES = [
      f"patch -p1 -B -v < {BENIGN_DIR}/closure.patch", "write", RULE_W),
     ("patch_stdin_suffix_long_version__write",
      f"patch -p1 -z --version < {BENIGN_DIR}/closure.patch", "write", RULE_W),
+    # POSIXLY_CORRECT: getopt stops at the first operand, so `-v` after FILE is the patch
+    # file operand and FILE is written; operand-first help fails closed (99b7445643970e85).
+    ("patch_dash_v_first_is_not_opaque",
+     "patch -v", "none", None),
+    ("patch_operand_then_dash_v__posix_operand_fails_closed",
+     "patch x.py -v", "write", OPQ),
+    ("patch_posixly_correct_operand_then_dash_v_fails_closed",
+     "POSIXLY_CORRECT=1 patch x.py -v", "write", OPQ),
+    ("patch_operand_then_long_help_fails_closed",
+     "patch x.py --help", "write", OPQ),
+    ("patch_operand_then_long_version_fails_closed",
+     "patch x.py --version", "write", OPQ),
+    ("patch_posix_operand_dash_v_ignores_readable_benign_stdin",
+     f"POSIXLY_CORRECT=1 patch {SHARED_DIR}/{CORE} -v < {BENIGN_DIR}/benign.patch", "write", OPQ),
+    ("patch_operand_dash_v_with_benign_stdin_is_conservative",
+     f"patch {SHARED_DIR}/{CORE} -v < {BENIGN_DIR}/benign.patch", "write", OPQ),
     ("git_apply_stat_reapply__rearms_write",
      f"git apply --stat --apply {BENIGN_DIR}/closure.patch", "write", RULE_W),
     ("git_am__mbox_with_closure_diff",
@@ -389,6 +405,10 @@ def _setup_sandbox(root):
         fh.write("orig\n")
     with open(os.path.join(root, "src.txt"), "w") as fh:
         fh.write("payload\n")
+    with open(os.path.join(root, "-v"), "w") as fh:
+        fh.write("--- a/plugins/_shared/" + CORE + "\n"
+                 + "+++ b/plugins/_shared/" + CORE + "\n"
+                 + "@@ -1 +1 @@\n-orig\n+patched\n")
 
 
 def _actually_touched_closure(root, before, after):
@@ -409,6 +429,8 @@ _DIFF_CASES = [
     ("cp_into_shared", f"cp src.txt plugins/_shared/{CORE}", True),
     ("sed_bundled_in_place", f"sed -Ei 's/orig/edited/' plugins/kimi/hooks/{HOOK}", True),
     ("cd_then_relative", f"cd plugins/kimi/hooks && echo x > {HOOK}", True),
+    ("posix_patch_operand_dash_v_with_benign_stdin",
+     f"POSIXLY_CORRECT=1 patch {SHARED_DIR}/{CORE} -v < {BENIGN_DIR}/benign.patch", True),
     ("redirect_benign", "echo hi > docs/readme.md", False),
     ("cp_benign", "cp src.txt docs/notes.txt", False),
 ]
