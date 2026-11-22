@@ -250,6 +250,74 @@ async fn discover_with_timeout(
         .map_err(|_| anyhow::anyhow!("hub discovery timed out after {:?}", NET_TIMEOUT))?
 }
 
+fn hub_urls_match(left: &str, right: &str) -> bool {
+    match (normalise_hub_url(left), normalise_hub_url(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn membership_row(entry: &HubUrlEntry, active: bool) -> serde_json::Value {
+    serde_json::json!({
+        "url": entry.url,
+        "label": entry.label,
+        "active": active,
+        "reachable": false,
+        "hub_lct_id": serde_json::Value::Null,
+        "hub_name": serde_json::Value::Null,
+        // `null` means UNASKED/UNKNOWN, never "no". Only an answered probe sets a bool.
+        "enrolled": serde_json::Value::Null,
+    })
+}
+
+async fn probe_membership(
+    entry: HubUrlEntry,
+    active: bool,
+    me: Option<Uuid>,
+    http: reqwest::Client,
+) -> Result<serde_json::Value, String> {
+    let mut row = membership_row(&entry, active);
+    if let Ok(info) = discover_with_timeout(&entry.url).await {
+        row["reachable"] = serde_json::json!(true);
+        row["hub_lct_id"] = serde_json::json!(info.hub_lct_id);
+        if let Some(h) = info.hubs.first() {
+            row["hub_name"] = serde_json::json!(h.name);
+        }
+        if let Some(me) = me {
+            let rest = abs_rest(&entry.url, &info.endpoints.rest)?;
+            let probe = format!(
+                "{}/hubs/{}/members/{}/pubkey",
+                rest.trim_end_matches('/'),
+                info.hub_lct_id, me
+            );
+            match tokio::time::timeout(NET_TIMEOUT, http.get(&probe).send()).await {
+                Ok(Ok(resp)) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        row["enrolled"] = serde_json::json!(true);
+                    } else if status.as_u16() == 404 {
+                        let body = crate::hub::bounded_error_text(resp).await;
+                        if body.contains("does not match this hub") {
+                            row["probe_error"] = serde_json::json!(
+                                "hub id mismatch — enrollment not determined");
+                        } else {
+                            row["enrolled"] = serde_json::json!(false);
+                        }
+                    } else {
+                        row["probe_error"] = serde_json::json!(format!("probe HTTP {status}"));
+                    }
+                }
+                Ok(Err(e)) => row["probe_error"] = serde_json::json!(format!("probe failed: {e}")),
+                Err(_) => row["probe_error"] = serde_json::json!("probe timed out"),
+            }
+        } else {
+            row["probe_error"] = serde_json::json!(
+                "this node has no member identity yet — apply to create one");
+        }
+    }
+    Ok(row)
+}
+
 /// GET /api/hub/memberships — every known hub, with whether this node is ACTUALLY
 /// ENROLLED in it, asked of the hub rather than inferred locally (recut of #787).
 ///
@@ -281,60 +349,41 @@ pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoRespo
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default();
-    let mut out = Vec::new();
-    for e in entries {
-        let mut row = serde_json::json!({
-            "url": e.url,
-            "label": e.label,
-            "active": e.url == active,
-            "reachable": false,
-            "hub_lct_id": serde_json::Value::Null,
-            "hub_name": serde_json::Value::Null,
-            // `null` means UNASKED/UNKNOWN, never "no". Only an answered probe sets a bool.
-            "enrolled": serde_json::Value::Null,
-        });
-        if let Ok(info) = discover_with_timeout(&e.url).await {
-            row["reachable"] = serde_json::json!(true);
-            row["hub_lct_id"] = serde_json::json!(info.hub_lct_id);
-            if let Some(h) = info.hubs.first() {
-                row["hub_name"] = serde_json::json!(h.name);
-            }
-            if let Some(me) = me {
-                let rest = match abs_rest(&e.url, &info.endpoints.rest) {
-                    Ok(rest) => rest,
-                    Err(error) => return err_json(axum::http::StatusCode::BAD_GATEWAY, error),
-                };
-                let probe = format!(
-                    "{}/hubs/{}/members/{}/pubkey",
-                    rest.trim_end_matches('/'),
-                    info.hub_lct_id, me
-                );
-                match tokio::time::timeout(NET_TIMEOUT, http.get(&probe).send()).await {
-                    Ok(Ok(resp)) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            row["enrolled"] = serde_json::json!(true);
-                        } else if status.as_u16() == 404 {
-                            let body = resp.text().await.unwrap_or_default();
-                            if body.contains("does not match this hub") {
-                                row["probe_error"] = serde_json::json!(
-                                    "hub id mismatch — enrollment not determined");
-                            } else {
-                                row["enrolled"] = serde_json::json!(false);
-                            }
-                        } else {
-                            row["probe_error"] = serde_json::json!(format!("probe HTTP {status}"));
-                        }
-                    }
-                    Ok(Err(e)) => row["probe_error"] = serde_json::json!(format!("probe failed: {e}")),
-                    Err(_) => row["probe_error"] = serde_json::json!("probe timed out"),
+    // Start every hub's discovery + pubkey probe before awaiting any of them. Awaiting in input
+    // order preserves the response shape; it does not serialize the requests themselves. Each
+    // task also has one overall bound covering both network steps, not only a bound per step.
+    let mut tasks = Vec::new();
+    for entry in entries {
+        let is_active = hub_urls_match(&entry.url, &active);
+        let mut fallback = membership_row(&entry, is_active);
+        let http = http.clone();
+        tasks.push(tokio::spawn(async move {
+            match tokio::time::timeout(
+                NET_TIMEOUT.saturating_mul(2),
+                probe_membership(entry, is_active, me, http),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    fallback["probe_error"] = serde_json::json!("membership probe timed out");
+                    Ok(fallback)
                 }
-            } else {
-                row["probe_error"] = serde_json::json!(
-                    "this node has no member identity yet — apply to create one");
+            }
+        }));
+    }
+    let mut out = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(Ok(row)) => out.push(row),
+            Ok(Err(error)) => return err_json(axum::http::StatusCode::BAD_GATEWAY, error),
+            Err(error) => {
+                return err_json(
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    format!("membership probe task failed: {error}"),
+                )
             }
         }
-        out.push(row);
     }
 
     Json(serde_json::json!({
@@ -966,6 +1015,81 @@ mod tests {
             .expect_err("redirect must be refused, not followed");
         server.abort();
         assert!(format!("{error:#}").contains("302"), "{error:#}");
+    }
+
+    async fn spawn_membership_hub(
+        id: Uuid,
+        name: &str,
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let name = name.to_string();
+        let app = axum::Router::new().fallback(move || {
+            let barrier = barrier.clone();
+            let name = name.clone();
+            async move {
+                barrier.wait().await;
+                Json(serde_json::json!({
+                    "hub_lct_id": id,
+                    "endpoints": {"rest": format!("http://{addr}/v1"), "mcp": ""},
+                    "hubs": [{"id": id, "name": name, "public": true}],
+                }))
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, server)
+    }
+
+    #[tokio::test]
+    async fn membership_probes_overlap_and_active_is_url_normalised() {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let (addr_a, server_a) = spawn_membership_hub(Uuid::new_v4(), "alpha", barrier.clone()).await;
+        let (addr_b, server_b) = spawn_membership_hub(Uuid::new_v4(), "beta", barrier.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
+        let mut state = crate::server::state::ServerState::open(vault, dir.path(), "p").unwrap();
+        ensure_member_identity(&mut state.vault).unwrap();
+        let active = format!("http://{addr_a}");
+        HubUrls {
+            active: Some(active.clone()),
+            entries: vec![
+                HubUrlEntry { url: format!("{active}/"), label: Some("alpha".into()), added_at: None },
+                HubUrlEntry { url: format!("http://{addr_b}"), label: Some("beta".into()), added_at: None },
+            ],
+        }
+        .store(&mut state.vault)
+        .unwrap();
+        let shared = std::sync::Arc::new(crate::server::state_lock::StateCell::new(state));
+        let call = tokio::spawn(hub_memberships(State(shared)));
+        for stage in ["discovery", "pubkey"] {
+            tokio::time::timeout(std::time::Duration::from_secs(2), barrier.wait())
+                .await
+                .unwrap_or_else(|_| panic!("{stage} requests did not overlap"));
+        }
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+            .await
+            .unwrap()
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_response().into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        server_a.abort();
+        server_b.abort();
+        let hubs = body["hubs"].as_array().unwrap();
+        assert_eq!(hubs.len(), 2);
+        assert!(hubs.iter().all(|row| row["reachable"] == true), "{hubs:?}");
+        assert!(hubs.iter().all(|row| row["enrolled"] == true), "{hubs:?}");
+        assert_eq!(hubs[0]["active"], true, "a trailing slash must not hide active: {hubs:?}");
+        assert_eq!(hubs[1]["active"], false);
+    }
+
+    #[test]
+    fn active_compare_normalises_both_urls_and_never_matches_two_invalid_values() {
+        assert!(hub_urls_match(" https://example.com/ ", "https://example.com"));
+        assert!(!hub_urls_match("https://example.com/", "https://other.example"));
+        assert!(!hub_urls_match("not a url", "also not a url"));
     }
 
     #[test]
