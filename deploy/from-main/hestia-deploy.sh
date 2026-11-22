@@ -184,6 +184,15 @@ cleanup_deploy() {
     write_check_result failed || true
   fi
   finish_update_status "$rc"
+  # A request that arrived after this run's startup claim must not wait for the next timer.
+  # Re-enter once through the current installed script; its own guard prevents an immediate loop.
+  if [ "$MODE" = full ] && [ "${HESTIA_DEPLOY_FOLLOWUP:-0}" != "1" ]; then
+    local claimed="$UPDATE_REQUEST_ID"
+    if read_update_request_id && [ "$UPDATE_REQUEST_ID" != "$claimed" ]; then
+      trap - EXIT
+      HESTIA_DEPLOY_FOLLOWUP=1 exec "$SELF_INSTALL" full
+    fi
+  fi
 }
 
 # The parenthesised `git describe` string from a version line, e.g.
