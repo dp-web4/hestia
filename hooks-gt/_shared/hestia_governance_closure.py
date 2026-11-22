@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: f202a5b0afd3bc5e7a00ef4cb84a484f140fc453cc587605944ecd7eed964f03  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: e4c1cfbb6ee904f0951824cb35e3d38955b72f3d9af6fe084eb18f12e4c07eb7  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -1608,8 +1608,25 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
     return []
 
 
+def _future_link_target(eff, cwd, target, links):
+    compare_base = eff or cwd or ""
+    for index in range(len(links) - 1, -1, -1):
+        dest, src, link_base = links[index]
+        root = os.path.abspath(os.path.expanduser(_join_eff(link_base, dest)))
+        candidate = os.path.abspath(os.path.expanduser(_join_eff(compare_base, target)))
+        if candidate != root and not candidate.startswith(root.rstrip(os.sep) + os.sep):
+            continue
+        source = os.path.abspath(os.path.expanduser(_join_eff(link_base, src)))
+        suffix = candidate[len(root):].lstrip(os.sep)
+        mapped = os.path.normpath(os.path.join(source, suffix)) if suffix else source
+        # Resolve chains recursively. Dropping the link just used guarantees termination, even
+        # when two destinations point at one another.
+        return _future_link_target(link_base, "", mapped, links[:index])
+    return _join_eff(eff, target)
+
+
 def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None,
-                          path_pinned: bool = False, cwd=None) -> str:
+                          path_pinned: bool = False, cwd=None, future_ln=None) -> str:
     """Resolve ONE simple command: detect out-of-grammar heads (shell block, `bash -c`,
     `eval`, `git apply`/`patch` — the last two via _command_write_targets), track `cd` into
     the effective cwd, else append this command's cd-resolved write targets. Returns the
@@ -1660,7 +1677,26 @@ def _flush_simple_command(words: list, eff: str, targets: list, stdin_src=None,
     for tg in _command_write_targets(words, stdin_src, path_pinned, cwd=eff or cwd):  # may raise
         if _has_subst(tg):
             raise _OutOfGrammar()  # substitution in a write position
-        targets.append(_join_eff(eff, tg))
+        targets.append(_future_link_target(eff, cwd, tg, future_ln or []))
+    if base == "ln" and future_ln is not None:
+        args = stripped[1:]
+        pos = _positionals(args, opts_with_value=("-t", "--target-directory", "-S", "--suffix"))
+        tdir = _opt_value(args, "-t", "--target-directory")
+        sources = pos if tdir else (pos[:-1] or pos)
+        if tdir:
+            destinations = [os.path.join(tdir, os.path.basename(src)) for src in sources]
+        elif len(pos) == 1:
+            destinations = [os.path.basename(pos[0])]
+        elif len(pos) == 2:
+            destinations = [pos[-1]]
+        else:
+            destinations = [os.path.join(pos[-1], os.path.basename(src)) for src in sources]
+        for src, dest in zip(sources, destinations):
+            if _has_subst(src) or _has_subst(dest):
+                raise _OutOfGrammar()
+            # A link created now cannot be realpath'd yet. Later targets under its destination
+            # resolve to the source; unrelated later targets stay ordinary writes.
+            future_ln.append((dest, src, eff or cwd or ""))
     return eff
 
 
@@ -1703,6 +1739,7 @@ def _bash_write_targets(command: str, cwd=None) -> list:
     # unconditionally) still decides. Raising at the first one let `tar -x ... && git apply
     # <unreadable>` resolve to the weaker, vocabulary-conditional posture (#1348 replay).
     deferred_oog = False
+    future_ln = []
     stdin_src = None  # `< file` source for the current simple command (patch input)
     eff = ""  # relative cwd accumulator; cd within this command line adjusts it
     # A bare name run by find -exec / xargs is found through PATH; trust it only when no word of
@@ -1723,7 +1760,7 @@ def _bash_write_targets(command: str, cwd=None) -> list:
         if t in _SEPARATORS:
             if cur:
                 try:
-                    eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned, cwd=cwd)
+                    eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned, cwd=cwd, future_ln=future_ln)
                 except _OutOfGrammar:
                     deferred_oog = True
                 cur = []
@@ -1741,7 +1778,7 @@ def _bash_write_targets(command: str, cwd=None) -> list:
                 if nxt is not None and nxt not in _SEPARATORS and not _is_punct(nxt):
                     if _has_subst(nxt):
                         raise _OutOfGrammar()  # substitution in a redirect (write) position
-                    targets.append(_join_eff(eff, nxt))
+                    targets.append(_future_link_target(eff, cwd, nxt, future_ln))
                     i += 2
                     continue
                 i += 1
@@ -1757,7 +1794,7 @@ def _bash_write_targets(command: str, cwd=None) -> list:
         i += 1
     if cur:
         try:
-            eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned, cwd=cwd)
+            eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned, cwd=cwd, future_ln=future_ln)
         except _OutOfGrammar:
             deferred_oog = True
     if deferred_oog:

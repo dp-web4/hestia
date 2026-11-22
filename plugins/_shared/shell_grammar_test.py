@@ -146,6 +146,22 @@ CASES = [
      f"cp -t {SHARED_DIR} /tmp/a.py", "write", WRT),
     ("cp_t_dir__benign",
      "cp -t /tmp/dest a.py", "none", None),
+    ("ln_future_link_cp__closure",
+     f"ln -sfn {SHARED_DIR} /tmp/freshlink && cp /tmp/a.py /tmp/freshlink/{HOOK}", "write", WRT),
+    ("ln_future_link_redirect__closure",
+     f"ln -sfn {SHARED_DIR} /tmp/freshlink2; cat /tmp/a.py > /tmp/freshlink2/{HOOK}", "write", WRT),
+    ("ln_standalone_recon__read_only",
+     f"ln -sfn {SHARED_DIR} /tmp/recon-link", "not-write", None),
+    ("ln_multiple_sources_directory__closure",
+     f"ln -sfn {SHARED_DIR} /tmp/ordinary /tmp/bundle && cp /tmp/payload /tmp/bundle/_shared/notes.txt",
+     "write", WRT),
+    ("ln_one_arg_creates_basename_link__closure",
+     f"cd /tmp && ln -sfn {SHARED_DIR} && cp /tmp/payload /tmp/_shared/notes.txt", "write", WRT),
+    ("ln_target_directory_flag__closure",
+     f"ln -sfn {SHARED_DIR} -t /tmp/bundle && cp /tmp/payload /tmp/bundle/_shared/notes.txt",
+     "write", WRT),
+    ("ln_unrelated_later_write_stays_unrelated",
+     f"ln -sfn {SHARED_DIR} /tmp/recon && echo ok > /tmp/log", "not-write", None),
     ("cp_trailing_comment_spaced__closure",
      f"cp /tmp/a.py {HOOKS}/{HOOK}  # note", "write", WRT),
     ("cp_trailing_comment_fused__closure",
@@ -603,10 +619,34 @@ def test_patch_source_uses_classify_cwd():
         check(f"classify_cwd__{name}", (v.classification, v.rule) == (want_cls, want_rule), v)
 
 
+def test_same_call_link_chain_matches_real_shell():
+    sandbox = tempfile.mkdtemp(prefix="sym1047-chain-")
+    try:
+        gov = os.path.join(sandbox, "repo", "plugins", "_shared")
+        os.makedirs(gov)
+        payload = os.path.join(sandbox, "payload.txt")
+        with open(payload, "w", encoding="utf-8") as fh:
+            fh.write("witness\n")
+        a, b = os.path.join(sandbox, "a"), os.path.join(sandbox, "b")
+        cmd = f"ln -s {gov} {a} && ln -s {a} {b} && cp {payload} {b}/note.txt"
+        v = cls(cmd, cwd=sandbox)
+        p = subprocess.run(["bash", "-c", cmd], cwd=sandbox,
+                           capture_output=True, text=True, timeout=30)
+        check("real_link_chain_write_succeeds", p.returncode == 0, p.stderr)
+        with open(os.path.join(gov, "note.txt"), encoding="utf-8") as fh:
+            check("real_link_chain_reaches_governed_file", fh.read() == "witness\n")
+        check("classifier_follows_the_whole_link_chain",
+              v.classification == "write" and v.rule == WRT, v)
+    finally:
+        import shutil
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
 ALL = [
     test_explicit_all_grammar_cases,
     test_patch_source_uses_classify_cwd,
     test_differential_against_real_shell,
+    test_same_call_link_chain_matches_real_shell,
     test_block_and_its_unblocked_body_agree,
     test_a_write_through_a_loop_variable_stays_refused,
 ]

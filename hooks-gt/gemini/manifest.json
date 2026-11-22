@@ -33,7 +33,7 @@
   ],
   "engine": {
     "unit": "_shared",
-    "gt_version": "6474b4cdcc86273fb209037fe95d8ba0d76b64c6148f666537c2cccb66b30e97",
+    "gt_version": "0404af853b91e6cbe934420003cec33c3dc78dc091c810620f16cc6afbc1ffc8",
     "files": [
       {
         "path": "hestia_gate_core.py",
@@ -45,7 +45,7 @@
       },
       {
         "path": "hestia_governance_closure.py",
-        "sha256": "f202a5b0afd3bc5e7a00ef4cb84a484f140fc453cc587605944ecd7eed964f03"
+        "sha256": "e4c1cfbb6ee904f0951824cb35e3d38955b72f3d9af6fe084eb18f12e4c07eb7"
       },
       {
         "path": "hestia_shell_classifier.py",
@@ -62,5 +62,5 @@
     ]
   },
   "requires": [],
-  "gt_version": "aec3da880f09554c46299f754990c2ec10660aac4ed0d8c6b523949c562fb110"
+  "gt_version": "76d5ecdd33b0cea0a9da737197b1e1849b4aa4c28f847ed4c278fcbd5379c979"
 }
