@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: d1a09ad4f456e834c1430d17b68c79447901be74fc124645e0c44a8399e1346f  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 0a8f1cd8204d0996a3b2991c5a1fdf6ceacec3bdf3e9f466ee83f4fba29e1da4  (published ground truth; manifest: hooks-gt)
 """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
 
 dp, 2026-08-02:
@@ -1595,11 +1595,15 @@ def resolve_agent_policy(profile: HarnessProfile,
 # Declared RED in the Sprint F notes; this bridge dies the day the certified snapshot
 # carries an explicit launch-cwd grant.
 def launch_cwd_repo(profile: HarnessProfile, workspace: str) -> list:
-    """The repo the member is launched in is always in scope (dp 2026-07-21: 'whatever cwd we
-    launch it in') — a per-launch dynamic grant on top of the static allowlist, so a
-    task-specific launch dir is reachable for that session without widening the standing
-    grant. This is the precedent `hestia_request_scope` generalises."""
+    """An interactive seat's launch repo is in scope (dp 2026-07-21: 'whatever cwd we launch
+    it in') — a per-launch dynamic grant on top of the static allowlist, so a task-specific
+    launch dir is reachable without widening the standing grant. A member named by the
+    `<machine>-being` convention gets no implicit grant from its process cwd (#1098): its
+    service WorkingDirectory is not launch evidence. Only an explicitly set launch_cwd_env
+    declares that dir for a being; interactive seats keep the original cwd fallback."""
     env = os.environ.get(profile.launch_cwd_env) if profile.launch_cwd_env else None
+    if not env and profile.member_id.endswith("-being"):
+        return []
     cwd = (env or os.getcwd()).replace("\\", "/")
     if workspace in cwd:
         rest = cwd.split(workspace, 1)[1].lstrip("/")
