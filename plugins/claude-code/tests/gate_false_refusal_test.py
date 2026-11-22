@@ -1433,26 +1433,22 @@ def test_a_help_call_to_a_patch_writer_is_refused_as_opaque_is_pinned_open():
 
 
 def test_a_variable_redirect_binds_to_an_unrelated_governed_mention_is_pinned_open():
-    """PINNED OPEN — #1092, the discriminator of FP6's class, measured to a minimal pair.
+    """CLOSED by destination resolution — #1092, the discriminator of FP6's class.
 
-    NOT A NEW CLASS. FP6 above (`diff {g} other.py > /tmp/out`) and #765 (a governance path
-    anywhere in the text binds to a redirect that targets somewhere else) are this. What
-    these rows add is the exact trigger, because the working note on it was wrong: it said
-    "a curly-brace group", and braces are irrelevant. The trigger is a `$VAR` in ANY redirect
-    destination, plus a governance path mentioned ANYWHERE in the command, even as a grep
-    argument. A literal destination with the same mention reads correctly.
+    FP6 above (`diff {g} other.py > /tmp/out`) and #765 (a governance path anywhere in the
+    text binds to a redirect that targets somewhere else) are this. The trigger is a `$VAR`
+    in a redirect destination, not a curly-brace group. A literal destination with the same
+    mention reads correctly.
 
-    Hit twice live on 2026-09-21 (claude-code, CBP; escalations ec297a03…, 33ba52cf…) while
-    testing the installer for #1085. Both commands had assigned the variable a literal `/tmp`
-    path at the start of the SAME command, so the destination was knowable without
-    executing anything; the classifier does not resolve in-command assignments.
+    Live on 2026-09-21 (claude-code, CBP; escalations ec297a03…, 33ba52cf…), both commands
+    assigned the variable a literal `/tmp` path at the start of the SAME command, so the
+    destination was knowable without executing anything. Literal assignments now resolve,
+    and a governed path appearing only as a read argument no longer makes an unrelated
+    destination a write. Unknown commands still fail closed.
 
     Asserted at `classify()`, the layer that decided both denies
-    (`governance-closure-out-of-grammar`). Goes red when #1092 closes; invert the rows then.
-
-    THE OTHER SIGN is already pinned: `test_marker_evasion_by_path_assembly_is_pinned_open`
-    holds `D=…; F=…; cp evil.py $D$F`. Resolving in-command assignments would close that row
-    and these together, which is why #1092 argues they are one fix."""
+    (`governance-closure-out-of-grammar`). The paired evasion test proves the other sign:
+    a path assembled from literal assignments is still seen as a governance write."""
     mod = _load_gate()
     if getattr(mod, "_closure_classify", None) is None:
         skip("variable_redirect_binds_to_mention",
@@ -1469,8 +1465,8 @@ def test_a_variable_redirect_binds_to_an_unrelated_governed_mention_is_pinned_op
         ("sed_read_into_var_dest", f"sed -n '1,5p' {HOOK} > $S/copy.py"),
     ):
         got = classified(cmd)
-        check(f"var_redirect_still_refused__{name}", got == "write",
-              f"now {got!r}. If 'read', #1092 closed: invert this row and name the fix")
+        check(f"var_redirect_is_not_a_write__{name}", got != "write",
+              f"now {got!r}; a read-only mention must not make the destination governed")
 
     # CONTROLS: the same mention with a LITERAL destination reads, and the same variable
     # destination with no mention is not governed at all. Together they make the pair the

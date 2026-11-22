@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# hestia-gt-sha256: 31f86177cb8eff871a7edba71c599141a8075d8c2fd4a332128921befc15da03  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 98eb8f371ad99e61c0516ddbb821ccaae138e38565e5548216c1a566ae839a18  (published ground truth; manifest: hooks-gt)
 """hestia_governance_closure — ONE governance-access classifier for every harness shim.
 
 PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
@@ -812,15 +812,89 @@ def _join_eff(eff: str, target: str) -> str:
     return os.path.normpath(os.path.join(eff, target))
 
 
+_OOG_GIT_READS = frozenset({
+    "show", "diff", "log", "rev-list", "grep", "ls-files", "cat-file", "rev-parse",
+    "status", "describe", "branch", "remote", "config",
+})
+_OOG_READ_HEADS = frozenset({
+    "grep", "cat", "diff", "head", "tail", "ls", "echo", "printf", "pwd", "test",
+    "true", "false", "cd",
+})
+_OOG_WRITE_HEADS = frozenset({
+    "cp", "mv", "install", "rsync", "ln", "tee", "dd", "truncate", "chmod", "chown",
+    "chgrp", "touch", "rm", "unlink", "rmdir", "shred", "sed", "git",
+})
+
+
+def _oog_redirects(words: list) -> list:
+    out = []
+    for i, t in enumerate(words[:-1]):
+        nxt = words[i + 1]
+        if ">" in t and "<" not in t and not _is_punct(nxt) and not nxt.isdigit():
+            command_sub = ("$(" in nxt or "`" in nxt
+                           or (nxt == "$" and i + 2 < len(words) and words[i + 2] == "("))
+            if command_sub:
+                out.extend(t for t in words if not _is_punct(t))
+            else:
+                out.append(nxt)
+    return out
+
+
+def _oog_simple_targets(words: list) -> list:
+    stripped = _strip_wrappers(words)
+    if not stripped:
+        return []
+    head = os.path.basename(stripped[0])
+    if head in _SUBSHELL_CMDS or head == "eval":
+        return []
+    if head in _OOG_READ_HEADS:
+        return []
+    if head == "sed" and "-i" not in stripped[1:]:
+        return []
+    if head == "git":
+        i = 0
+        args = stripped[1:]
+        while i < len(args):
+            if args[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+                i += 2
+                continue
+            if args[i].startswith("-"):
+                i += 1
+                continue
+            break
+        if i < len(args) and args[i] in _OOG_GIT_READS:
+            return []
+    out = _command_write_targets(words)
+    if any(isinstance(t, str) and t.startswith("$") and "/" not in t for t in out):
+        return [t for t in words if not _is_punct(t)] + out
+    if out or head in _OOG_WRITE_HEADS:
+        return out
+    return [t for t in words if not _is_punct(t)]
+
+
+def _oog_tokens(toks: list) -> list:
+    out, cur = [], []
+    for t in toks:
+        if t in _SEPARATORS:
+            out.extend(_oog_redirects(cur))
+            out.extend(_oog_simple_targets(cur))
+            cur = []
+        else:
+            cur.append(t)
+    out.extend(_oog_redirects(cur))
+    out.extend(_oog_simple_targets(cur))
+    return out
+
+
 def _vocab_tokens(command: str) -> list:
-    """Every token to scan for closure vocabulary on the out-of-grammar path — the outer
-    tokens PLUS the re-tokenized contents of any `-c`/`eval` string operand, so a bare
-    closure filename named inside an opaque string is still visible to the scan."""
+    """Write-capable tokens for the out-of-grammar path, not every read-only mention."""
     try:
         toks = _tokenize(command)
     except Exception:
         return command.split()
-    out = [t for t in toks if not _is_punct(t)]
+    if "$(" in command or "`" in command:
+        return [t for t in toks if not _is_punct(t)]
+    out = _oog_tokens(toks)
     for i, t in enumerate(toks):
         base = os.path.basename(t) if isinstance(t, str) else ""
         if base in _SUBSHELL_CMDS or base == "eval":
@@ -829,11 +903,36 @@ def _vocab_tokens(command: str) -> list:
                     continue
                 if isinstance(s, str) and s:
                     try:
-                        out.extend(_tokenize(s))
+                        out.extend(_oog_tokens(_tokenize(s)))
                     except Exception:
                         out.append(s)
                 break
     return out
+
+
+_LITERAL_VAR = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def _resolve_literal_tokens(command: str, toks: list) -> list:
+    """Resolve literal NAME=value assignments without executing or guessing quoted text."""
+    if "'" in command:
+        return toks
+    assignments = {}
+    for tok in toks:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", tok)
+        if not m:
+            continue
+        name, value = m.groups()
+        if value and not any(c in value for c in "$`*?[{"):
+            assignments[name] = value
+    if not assignments:
+        return toks
+    def resolve(tok):
+        if _ASSIGN_RE.match(tok):
+            return tok
+        return _LITERAL_VAR.sub(
+            lambda m: assignments.get(m.group(1) or m.group(2), m.group(0)), tok)
+    return [resolve(t) for t in toks]
 
 
 def _tokenize(cmd: str) -> list:
@@ -1738,7 +1837,7 @@ def _bash_write_targets(command: str, cwd=None) -> list:
     simple command's write positions, each resolved against the cd-tracked effective cwd.
     Raises on tokenizer failure (caller -> unparseable posture) and raises _OutOfGrammar on
     any out-of-grammar construct (caller -> out-of-grammar posture)."""
-    toks = _tokenize(_strip_heredoc_bodies(command))
+    toks = _resolve_literal_tokens(command, _tokenize(_strip_heredoc_bodies(command)))
     targets, cur = [], []
     # An out-of-grammar SIMPLE command is remembered, not raised on the spot: the walk goes on,
     # so a later opaque writer (an unreadable `git apply` / `patch`, which refuses
