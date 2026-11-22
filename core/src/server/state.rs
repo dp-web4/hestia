@@ -373,6 +373,9 @@ pub struct GovernanceRefusal {
     pub plugin_id: String,
     pub marker: String,
     pub claim_args: serde_json::Value,
+    /// The daemon-resolved MCP session that recorded this refusal, when it was proven.
+    /// Kept apart from `claim_args`, whose session belongs to a later deliberate escalation.
+    pub asker_session_id: Option<String>,
     pub reissues: u32,
     pub refused_at: u64,
     pub expires_at: u64,

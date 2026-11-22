@@ -18639,6 +18639,14 @@ mod tests {
         refused["refusal_id"].as_str().unwrap().to_string()
     }
 
+    fn manual_open_args(session: &str, marker: &str, act: &str) -> Value {
+        json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Bash", "marker": marker, "act": act,
+            "reason": "review this exact refused act before I re-issue it",
+        })
+    }
+
     #[tokio::test]
     async fn a_manual_open_refuses_a_bare_command_when_the_refusal_has_the_gate_act() {
         let (_dir, shared) = make_shared_state();
@@ -18677,6 +18685,14 @@ mod tests {
         let opened = tool_gate_escalation_open(&shared, &open(canonical)).await.unwrap();
         assert!(opened["escalation_id"].as_str().is_some(), "{opened}");
         assert_eq!(opened["marker_recognised"], true, "{opened}");
+        assert_eq!(opened["binding_status"], "exact_refusal", "{opened}");
+        assert_eq!(opened["binding_verified"], true, "{opened}");
+        assert_eq!(opened["bound_refusal_id"], refusal_id, "{opened}");
+        let row = shared.lock().await.recent_chain(50).into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened"
+                && e.event_data["escalation_id"] == opened["escalation_id"])
+            .expect("the exact open is witnessed");
+        assert_eq!(row.event_data["escalated_from"], refusal_id, "{row:?}");
     }
 
     #[tokio::test]
@@ -18686,7 +18702,7 @@ mod tests {
         let marker = "plugins/_shared";
         let wrong_marker = "hestia_governance_closure.py";
         let canonical = "Bash: cp /tmp/fix.py /repo/plugins/_shared/hestia_gate_mechanism.py";
-        record_bash_refusal(&shared, &session, marker, canonical).await;
+        let refusal_id = record_bash_refusal(&shared, &session, marker, canonical).await;
         let open = |act: &str| {
             json!({
                 "plugin_id": "kimi-code", "session_id": session,
@@ -18724,6 +18740,146 @@ mod tests {
         let opened = tool_gate_escalation_open(&shared, &exact).await.unwrap();
         assert!(opened["escalation_id"].as_str().is_some(), "{opened}");
         assert_eq!(opened["marker_recognised"], true, "{opened}");
+        assert_eq!(opened["binding_status"], "exact_refusal", "{opened}");
+        assert_eq!(opened["binding_verified"], true, "{opened}");
+        assert_eq!(opened["bound_refusal_id"], refusal_id, "{opened}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_open_disambiguates_same_act_refusals_by_marker_and_session() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let canonical = "Bash: echo patch | sha256sum";
+        let first_marker = "pre_tool_use.py";
+        let second_marker = "plugins/_shared";
+        let first = record_bash_refusal(&shared, &session, first_marker, canonical).await;
+        let second = record_bash_refusal(&shared, &session, second_marker, canonical).await;
+
+        let mismatch = tool_gate_escalation_open(
+            &shared, &manual_open_args(&session, "third.marker", canonical)).await.unwrap();
+        let data = &mismatch["_hestia_error"]["data"];
+        assert_eq!(mismatch["_hestia_error"]["code"], "hestia.escalation_open_binding_mismatch");
+        assert_eq!(data["expected"], Value::Null, "no arbitrary expected refusal: {mismatch}");
+        assert_eq!(data["refusal_id"], Value::Null, "{mismatch}");
+        let alternatives = data["alternatives"].as_array().unwrap();
+        assert_eq!(alternatives.len(), 2, "{mismatch}");
+        assert!(alternatives.iter().any(|r| r["refusal_id"] == first));
+        assert!(alternatives.iter().any(|r| r["refusal_id"] == second));
+        assert!(alternatives.iter().all(|r| r["act"] == canonical));
+
+        for (marker, refusal_id) in [(first_marker, first), (second_marker, second)] {
+            let opened = tool_gate_escalation_open(
+                &shared, &manual_open_args(&session, marker, canonical)).await.unwrap();
+            assert_eq!(opened["binding_status"], "exact_refusal", "{opened}");
+            assert_eq!(opened["binding_verified"], true, "{opened}");
+            assert_eq!(opened["bound_refusal_id"], refusal_id, "{opened}");
+        }
+
+        let sibling = connect_as(&shared, "kimi-code").await;
+        assert_ne!(sibling, session);
+        let independent = tool_gate_escalation_open(
+            &shared, &manual_open_args(&sibling, first_marker, "Bash: echo independent"))
+            .await
+            .unwrap();
+        assert_eq!(independent["binding_status"], "marker_history_only", "{independent}");
+        assert_eq!(independent["binding_verified"], false, "{independent}");
+        assert_eq!(independent["bound_refusal_id"], Value::Null, "{independent}");
+        assert!(independent.get("expected").is_none(), "no other session's act: {independent}");
+
+        let other = connect_as(&shared, "codex").await;
+        let forged = tool_gate_escalation_open(
+            &shared, &manual_open_args(&other, first_marker, "echo a different command"))
+            .await
+            .expect_err("a codex session cannot claim kimi-code's refusal");
+        assert!(!forged.to_string().contains(canonical), "no cross-member act disclosure: {forged}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_open_with_no_marker_evidence_is_explicitly_unverified() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let opened = tool_gate_escalation_open(
+            &shared, &manual_open_args(&session, "new.marker", "Edit -> new.marker"))
+            .await
+            .unwrap();
+        assert_eq!(opened["marker_recognised"], Value::Null, "{opened}");
+        assert!(opened["known_gate_markers"].as_array().unwrap().is_empty(), "{opened}");
+        assert_eq!(opened["binding_status"], "unverified", "{opened}");
+        assert_eq!(opened["binding_verified"], false, "{opened}");
+        assert_eq!(opened["bound_refusal_id"], Value::Null, "{opened}");
+        assert!(opened["marker_note"].as_str().unwrap().contains("UNVERIFIED"), "{opened}");
+        let row = shared.lock().await.recent_chain(50).into_iter()
+            .find(|e| e.event_type == "gate_escalation_opened"
+                && e.event_data["escalation_id"] == opened["escalation_id"])
+            .expect("the unverified open is witnessed");
+        assert!(row.event_data.get("escalated_from").is_none(), "{row:?}");
+    }
+
+    #[tokio::test]
+    async fn a_manual_open_does_not_bind_spent_or_withdrawn_refusals() {
+        let (_dir, shared) = make_shared_state();
+        let session = connect_as(&shared, "kimi-code").await;
+        let marker = "pre_tool_use.py";
+        let spent_act = "Bash: echo approval | sha256sum";
+        let spent_refusal = record_bash_refusal(&shared, &session, marker, spent_act).await;
+        let opened = tool_gate_escalation_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session, "refusal_id": spent_refusal,
+            "reason": "review and then spend this exact governance approval",
+        }))
+        .await
+        .unwrap();
+        let escalation_id = opened["escalation_id"].as_str().unwrap().to_string();
+        assert!(!shared.lock().await.governance_refusals.contains_key(&spent_refusal));
+        shared.lock().await.gate_escalations.decide(
+            &escalation_id,
+            true,
+            "operator",
+            "role:constellation:sovereign",
+            crate::server::gate_escalation::Channel::OperatorSession,
+            None,
+            Some("approved for this exact act"),
+            crate::server::gate_escalation::now_secs(),
+        )
+        .unwrap();
+        let claimed = tool_gate_escalation_claim(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Bash", "marker": marker, "act": spent_act, "reason": spent_act,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(claimed["claimed"], true, "{claimed}");
+        let after_spend = tool_gate_escalation_open(
+            &shared, &manual_open_args(&session, marker, "Bash: echo after-spend"))
+            .await
+            .unwrap();
+
+        let withdrawn_act = "Bash: echo withdrawal | sha256sum";
+        let withdrawn_refusal = record_bash_refusal(&shared, &session, marker, withdrawn_act).await;
+        let opened = tool_gate_escalation_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session, "refusal_id": withdrawn_refusal,
+            "reason": "open this exact refusal before withdrawing it",
+        }))
+        .await
+        .unwrap();
+        assert!(!shared.lock().await.governance_refusals.contains_key(&withdrawn_refusal));
+        tool_gate_arbitrate_escalation(&shared, &json!({
+            "escalation_id": opened["escalation_id"], "approve": false,
+            "session_id": session, "reason": "self-withdraw: this independent ask is not needed",
+        }))
+        .await
+        .unwrap();
+        let after_withdraw = tool_gate_escalation_open(
+            &shared, &manual_open_args(&session, marker, "Bash: echo after-withdraw"))
+            .await
+            .unwrap();
+
+        for out in [after_spend, after_withdraw] {
+            assert_eq!(out["binding_status"], "marker_history_only", "{out}");
+            assert_eq!(out["binding_verified"], false, "{out}");
+            assert_eq!(out["bound_refusal_id"], Value::Null, "{out}");
+            assert!(out.get("expected").is_none(), "no stale refusal disclosure: {out}");
+            assert!(out["marker_note"].as_str().unwrap().contains("UNVERIFIED"), "{out}");
+        }
     }
 
     /// The claim alone ASKS NOTHING: no escalation, no opened row, nobody invited. It answers
@@ -25940,11 +26096,18 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // mint is too late: peers may already have ruled on a permit no re-issue can spend. Refuse a
     // mismatch against a live refusal BEFORE anything is opened, and name the refusal-linked door
     // that copies both fields instead of asking the member to retype them.
+    let asking_session_id = proven_session_uuid.map(|uuid| uuid.to_string());
+    let mut bound_refusal_id = None;
     if let Some(presented_act) = act.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
         let candidates: Vec<(String, String, String, u64)> = s
             .governance_refusals
             .values()
-            .filter(|r| r.plugin_id == plugin_id && r.expires_at > now)
+            .filter(|r| {
+                r.plugin_id == plugin_id
+                    && r.expires_at > now
+                    && asking_session_id.is_some()
+                    && r.asker_session_id.as_deref() == asking_session_id.as_deref()
+            })
             .filter_map(|r| {
                 let a = r
                     .claim_args
@@ -25958,36 +26121,48 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             .collect();
         let exact = candidates
             .iter()
-            .any(|(_, a, m, _)| a.as_str() == presented_act && m == &marker);
-        if !exact {
-            let mismatch = candidates
+            .find(|(_, a, m, _)| a.as_str() == presented_act && m == &marker);
+        if exact.is_none() {
+            let mut mismatch: Vec<_> = candidates
                 .iter()
                 .filter(|(_, a, _, _)| a.as_str() == presented_act)
-                .max_by_key(|(_, _, _, at)| *at)
-                .or_else(|| {
-                    candidates
-                        .iter()
-                        .filter(|(_, _, m, _)| m == &marker)
-                        .max_by_key(|(_, _, _, at)| *at)
-                });
-            if let Some((refusal_id, expected_act, expected_marker, _)) = mismatch {
+                .collect();
+            if mismatch.is_empty() {
+                mismatch = candidates
+                    .iter()
+                    .filter(|(_, _, m, _)| m == &marker)
+                    .collect();
+            }
+            if !mismatch.is_empty() {
+                mismatch.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
+                let expected = (mismatch.len() == 1).then(|| mismatch[0]);
+                let alternatives: Vec<Value> = mismatch
+                    .iter()
+                    .map(|(id, a, m, at)| {
+                        json!({"refusal_id": id, "act": a, "marker": m, "refused_at": at})
+                    })
+                    .collect();
                 return Ok(hestia_error_envelope(
                     "hestia.escalation_open_binding_mismatch",
                     "the act or marker does not match the gate's recorded refusal, so an approval \
                      would be unclaimable. Escalate the refusal by id to copy its exact act and \
                      marker; nothing was opened",
                     Some(json!({
-                        "refusal_id": refusal_id,
+                        "refusal_id": expected.map(|(id, _, _, _)| id.clone()),
                         "presented": {"act": presented_act, "marker": marker},
-                        "expected": {"act": expected_act, "marker": expected_marker},
+                        "expected": expected
+                            .map(|(_, a, m, _)| json!({"act": a, "marker": m}))
+                            .unwrap_or(Value::Null),
+                        "alternatives": alternatives,
                         "escalate": {
                             "tool": "hestia_gate_escalation_escalate",
-                            "refusal_id": refusal_id,
+                            "refusal_id": expected.map(|(id, _, _, _)| id.clone()),
                         },
                     })),
                 ));
             }
         }
+        bound_refusal_id = exact.map(|(id, _, _, _)| id.clone());
     }
     let marker_recognised = s.gate_escalations.marker_is_recognised(&plugin_id, &marker);
     let known_markers = s.gate_escalations.known_gate_markers(&plugin_id);
@@ -25999,6 +26174,14 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
             Some(json!({"marker": marker, "known_gate_markers": known_markers.clone()})),
         ));
     }
+    let binding_verified = bound_refusal_id.is_some();
+    let binding_status = if binding_verified {
+        "exact_refusal"
+    } else if marker_recognised == Some(true) {
+        "marker_history_only"
+    } else {
+        "unverified"
+    };
 
     let opened = match s
         .gate_escalations
@@ -26096,17 +26279,18 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
     // entry point and the hook calls the other one.
     let inv = resolve_invitation(&mut s, &esc, asker_is_proven);
 
-    let entry = s.append_chain(
-        "gate_escalation_opened",
-        opened_payload(
-            &s,
-            &esc,
-            &inv,
-            asker_is_proven,
-            answers_deny.as_deref(),
-            DEFAULT_TTL_SECS,
-        ),
-    )?;
+    let mut payload = opened_payload(
+        &s,
+        &esc,
+        &inv,
+        asker_is_proven,
+        answers_deny.as_deref(),
+        DEFAULT_TTL_SECS,
+    );
+    if let Some(refusal_id) = &bound_refusal_id {
+        payload["escalated_from"] = json!(refusal_id);
+    }
+    let entry = s.append_chain("gate_escalation_opened", payload)?;
     shadow_adjudicate(&mut s, &esc.id);
 
     let invited = inv.invited;
@@ -26117,13 +26301,20 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         "status": esc.stored_status(),
         "bar": esc.bar,
         // null = nothing known yet (say so, do not reassure); false = gates have used OTHER
-        // spellings for this member and not this one.
+        // spellings for this member and not this one. Marker history alone is not refusal proof.
         "marker_recognised": marker_recognised,
         "known_gate_markers": known_markers,
-        "marker_note": match marker_recognised {
-            Some(true) => "this marker matches one your gate has presented; an approval will be claimable",
-            Some(false) => "WARNING: your gate has never presented this marker. An approval against it                             will very likely be UNCLAIMABLE — the marker is a join key, not a label.                             Re-file using one of known_gate_markers.",
-            None => "no gate has claimed for this member yet, so nothing is known about this marker                      — this is 'unknown', not 'fine'",
+        "binding_verified": binding_verified,
+        "binding_status": binding_status,
+        "bound_refusal_id": bound_refusal_id,
+        "marker_note": if binding_verified {
+            "the exact act and marker match a live refusal recorded for this session; the approval binds to that refusal"
+        } else {
+            match marker_recognised {
+                Some(true) => "UNVERIFIED: this marker appears in gate history, but no live refusal for this session verifies this exact act; this is a new ask, not an exact-refusal binding",
+                Some(false) => "WARNING: your gate has never presented this marker. An approval against it                                 will very likely be UNCLAIMABLE — the marker is a join key, not a label.                                 Re-file using one of known_gate_markers.",
+                None => "UNVERIFIED: no gate has claimed for this member yet and no live refusal verifies this exact act — this is 'unknown', not 'fine'",
+            }
         },
         "expires_at": esc.expires_at,
         "ttl_secs": DEFAULT_TTL_SECS,
@@ -28935,6 +29126,10 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
             act_digest: attempted_act_digest.as_deref().unwrap_or(""),
             payload_sha256: attempted_payload.as_deref(),
             claim_args: args,
+            asker_session_id: proven_asker
+                .as_ref()
+                .and_then(|who| who.session_uuid)
+                .map(|uuid| uuid.to_string()),
             request_key: request_key.as_deref(),
             reclaim_refused,
             bar_shortfall,
@@ -29199,6 +29394,7 @@ struct GovernanceRefusalDraft<'a> {
     act_digest: &'a str,
     payload_sha256: Option<&'a str>,
     claim_args: &'a Value,
+    asker_session_id: Option<String>,
     request_key: Option<&'a str>,
     reclaim_refused: Option<&'static str>,
     bar_shortfall: Option<Value>,
@@ -29241,6 +29437,7 @@ fn record_governance_refusal(s: &mut super::state::ServerState, now: u64, d: Gov
         plugin_id: d.plugin_id.to_string(),
         marker: d.marker.to_string(),
         claim_args,
+        asker_session_id: d.asker_session_id,
         reissues,
         refused_at: now,
         expires_at,
