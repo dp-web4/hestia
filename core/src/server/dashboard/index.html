@@ -3910,7 +3910,8 @@
              ? 'escalated by the member from a gate refusal'
              : 'opened by the gate; the member stated no reason'}${
              (r.reissues ?? 0) > 0 ? ` · re-issued ${Number(r.reissues)}×` : ''}${
-             r.subtree ? ' · a glob over this directory: only a recursive grant covers it' : ''}</div>
+             r.subtree ? ' · a glob over this directory: only a recursive grant covers it' : ''}${
+             r.recursive && !r.subtree ? ' · member asks for this path and below' : ''}</div>
            <div class="esc-meta scope-route">${scopeRouteText(r)}</div>`
         : `<div class="esc-why">why: ${why ? escapeHtml(why) : '(none stated)'}</div>`;
       row.innerHTML = `
@@ -3954,6 +3955,9 @@
         o.value = JSON.stringify(opt); o.textContent = opt.label;
         breadth.appendChild(o);
       }
+      const askedReach = scopeBreadthOptions(path, !!r.subtree)
+        .find(opt => opt.grant_path === null && opt.recursive === !!r.recursive);
+      if (askedReach) breadth.value = JSON.stringify(askedReach);
       const syncBreadth = () => { breadth.disabled = duration.value === 'once'; };
       const chosenDuration = () => (onceOnly ? 'once' : duration.value);
       duration.addEventListener('change', syncBreadth);

@@ -3489,9 +3489,10 @@ pub(crate) async fn scope_decide_as(
         .trim()
         .to_string();
     let standing = body.get("standing").and_then(|v| v.as_bool()).unwrap_or(false);
-    // Exact by default (dp, 2026-09-08). Recursion is the operator's explicit choice at
-    // decide time, never something the asking member can set: a request names ONE path.
-    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Exact by default (dp, 2026-09-08). A member may ASK for a subtree; the decider must say
+    // whether to honor that or narrow it to exact. Omitting the flag never infers a widening.
+    let recursive_arg = body.get("recursive").and_then(|v| v.as_bool());
+    let recursive = recursive_arg.unwrap_or(false);
     // ONE-TIME (2026-10-05; PRD_ALLOWLISTS §5's first duration): approve exactly the act the
     // gate refused, once, inside the claim window. Not a grant of reach — never served as
     // policy; only `hestia_scope_claim` spends it, and only for that act.
@@ -3602,6 +3603,16 @@ pub(crate) async fn scope_decide_as(
     }
     let (plugin_id, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
     let gate_origin = req.ext.gate.clone();
+    if granted && !once && recursive_arg.is_none() && req.recursive {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "this request asks for recursive reach; set recursive:true to honor it \
+                          or recursive:false to narrow it to the exact path"
+            })),
+        );
+    }
+    let recursive = recursive_arg.unwrap_or(if granted { false } else { req.recursive });
     // WHICH KINDS this request accepts comes from `scope_allowed_decisions` — the same function
     // every operator surface reads its offer from (`allowed_decisions` on the snapshot, the
     // request listing and the ledger), so a button the UI renders is one this check admits

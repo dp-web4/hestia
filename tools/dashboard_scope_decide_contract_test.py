@@ -157,6 +157,10 @@ def main() -> int:
     check("re-issues are shown", "r.reissues" in g)
     check("a glob reach says only a recursive grant covers it", "r.subtree" in g and "only a recursive grant" in g)
     check("duration and breadth controls exist", "scope-duration" in g and "scope-breadth" in g)
+    check("the member's requested reach is explicit and selected",
+          "member asks for this path and below" in g
+          and "opt.grant_path === null && opt.recursive === !!r.recursive" in g
+          and "breadth.value = JSON.stringify(askedReach)" in g)
     check("breadth is disabled for a one-time approval", "breadth.disabled = duration.value === 'once'" in g)
     check("one decide call carries duration and breadth",
           g.count("apiFetch('/api/scope/decide'") == 1 and "scopeDecideBody(r, granted" in g)
