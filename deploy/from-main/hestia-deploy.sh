@@ -874,21 +874,29 @@ sync_atlas() {
 inventory=""
 install_inventory() {
   inventory="skipped"
-  [ "${HESTIA_DEPLOY_INVENTORY:-1}" = "1" ] || { inventory="skipped(HESTIA_DEPLOY_INVENTORY=0)"; return 0; }
+  [ "${HESTIA_DEPLOY_INVENTORY:-1}" = "1" ] || { inventory="SKIPPED(HESTIA_DEPLOY_INVENTORY=0)"; return 0; }
   if [ -n "${CLAUDECODE:-}" ] || [ -n "${HESTIA_ROLE:-}" ]; then
     inventory="refused(governed session)"; return 0
   fi
   local src="$DEPLOY_ROOT/hestia/plugins/agent-inventory" bin="$HOME/.local/bin/hestia-agent-inventory"
   local at="$DEPLOY_ROOT/agent-atlas/talk-to" enum
-  [ -f "$src/install.sh" ] || { inventory="skipped(no installer in the checkout)"; return 0; }
-  # No guess. Without it install.sh derives the workspace from `git --git-common-dir`, which
+  [ -f "$src/install.sh" ] || { inventory="SKIPPED(no installer in the checkout)"; return 0; }
+  # No guess. The fleet installer writes a one-line pointer for older hand-installed units.
+  # Read it only when the unit supplies nothing; an empty or multi-line pointer grants no root.
+  if [ -z "${HESTIA_WORKSPACE:-}" ] && [ -r "$HESTIA_HOME/workspace" ]; then
+    HESTIA_WORKSPACE="$(cat "$HESTIA_HOME/workspace")"
+  fi
+  case "${HESTIA_WORKSPACE:-}" in
+    *$'\n'*) inventory="SKIPPED(workspace pointer is not one line)"; return 0 ;;
+  esac
+  # Without it install.sh derives the workspace from `git --git-common-dir`, which
   # from THIS checkout is ~/.hestia/deploy -- a directory with no harness plugins a seat uses
   # and no working repos, pinned into three triggers as if somebody had chosen it.
-  [ -n "${HESTIA_WORKSPACE:-}" ] || { inventory="skipped(no HESTIA_WORKSPACE in the deploy unit)"; return 0; }
+  [ -n "${HESTIA_WORKSPACE:-}" ] || { inventory="SKIPPED(no HESTIA_WORKSPACE in the deploy unit)"; return 0; }
   # Set but not a directory: an unrendered template placeholder, a typo, or an unmounted
   # volume. install.sh would pin it regardless, and every trigger would then answer UNKNOWN
   # about a place that is not there.
-  [ -d "$HESTIA_WORKSPACE" ] || { inventory="skipped(HESTIA_WORKSPACE is not a directory)"; return 0; }
+  [ -d "$HESTIA_WORKSPACE" ] || { inventory="SKIPPED(HESTIA_WORKSPACE is not a directory)"; return 0; }
   [ -d "$at" ] || at=""
   # Current means the WHOLE installed surface is this checkout's, not just inventory.py: the
   # wrapper body, the launchd plist / systemd unit and the SessionStart registration are all

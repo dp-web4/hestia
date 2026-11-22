@@ -107,7 +107,8 @@ preflight and refuses identically, so there is nothing for the seat to retry.
 
 **On a checkout install, `deploy/fleet/install.sh` now does this for you** (`step_deploy_supervisor`):
 it clones the two deploy checkouts over https, installs `hestia-deploy` and both units with
-`HESTIA_WORKSPACE` rendered, and leaves the **timer off**. The dashboard's update button works
+`HESTIA_WORKSPACE` rendered, and writes the same root as a one-line `$HESTIA_HOME/workspace`
+pointer for older hand-installed units. The deploy **timer stays off**. The dashboard's update button works
 straight away. Scheduled deploys stay off until the operator switches them on, either with the
 dashboard toggle (#1334) or with `HESTIA_AUTO_UPDATE=1` at install time. It also installs the
 **update check** (`hestia-deploy-check.{service,timer}`) and switches its timer on: every 4h, at
@@ -345,13 +346,14 @@ remembering to clone agent-atlas and run `plugins/agent-inventory/install.sh` by
   It is the deploy's own clone on purpose — `<workspace>/agent-atlas` is a working tree that
   seats add descriptors to, and this script hard-resets what it owns.
 - **The inventory step** runs wherever the members' install runs, and on the ordinary
-  `CURRENT` cycle. It reports `inventory=ok(current)`, `ok(<enumeration>)`, `skipped(<why>)`,
+  `CURRENT` cycle. It reports `inventory=ok(current)`, `ok(<enumeration>)`, `SKIPPED(<why>)`,
   `refused(governed session)` or `FAILED(<why>)`. Its post-condition is the installed bytes
   matching the checkout's `inventory.py`, not the installer's exit code.
-- **It needs `HESTIA_WORKSPACE` in the deploy unit** — the directory holding the seat's repos.
-  Both unit templates carry the key EMPTY: render it from explicit operator configuration. With
-  it empty the step says `skipped(no HESTIA_WORKSPACE in the deploy unit)`; set to something
-  that is not a directory it says so too. It never guesses one, because `install.sh` would pin
+- **It needs `HESTIA_WORKSPACE` in the deploy unit or the one-line `$HESTIA_HOME/workspace`
+  pointer** — the directory holding the seat's repos. Both unit templates carry the key EMPTY;
+  `deploy/fleet/install.sh` renders it and writes the pointer for older hand-installed units.
+  With neither the step says `SKIPPED(no HESTIA_WORKSPACE in the deploy unit)`; a non-directory
+  or a multi-line pointer is refused too. It never guesses one, because `install.sh` would pin
   the guess into three triggers. `HESTIA_DEPLOY_INVENTORY=0` switches the step off.
 
 `inventory_step_test.py` runs both functions under `set -euo pipefail` through every failure

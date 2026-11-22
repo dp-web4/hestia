@@ -211,8 +211,29 @@ def _install_inventory_cases(fn: str, tmp: Path) -> None:
     root, home = seat("no-ws")
     rc, st = run(prelude + fn, "install_inventory", root, clean_env(HOME=str(home)), "inventory")
     check("H no workspace: rc", rc, 0)
-    check("H no workspace: says what is missing and where", st, "skipped(no HESTIA_WORKSPACE in the deploy unit)")
+    check("H no workspace: says what is missing and where", st, "SKIPPED(no HESTIA_WORKSPACE in the deploy unit)")
     check("H no workspace: the installer did not run", ran(home), "")
+
+    # H3. The fleet installer's one-line pointer supplies an older hand-installed unit, without
+    #     allowing a second line to become another authority root.
+    root, home = seat("pointer-ws")
+    (home / ".hestia").mkdir()
+    (home / ".hestia" / "workspace").write_text(ws + "\n")
+    rc, st = run(prelude + fn, "install_inventory", root,
+                 clean_env(HOME=str(home), HESTIA_HOME=str(home / ".hestia")), "inventory")
+    check("H3 pointer: rc", rc, 0)
+    check("H3 pointer: installs for the pointed workspace", st, "ok(agent-atlas)")
+    check("H3 pointer: the installer received that workspace",
+          ran(home), f"ran ws={ws} atlas={root}/agent-atlas/talk-to")
+
+    root, home = seat("pointer-multiline")
+    (home / ".hestia").mkdir()
+    (home / ".hestia" / "workspace").write_text(ws + "\n" + str(tmp / "other") + "\n")
+    rc, st = run(prelude + fn, "install_inventory", root,
+                 clean_env(HOME=str(home), HESTIA_HOME=str(home / ".hestia")), "inventory")
+    check("H4 multi-line pointer: rc", rc, 0)
+    check("H4 multi-line pointer: refused, not guessed", st, "SKIPPED(workspace pointer is not one line)")
+    check("H4 multi-line pointer: the installer did not run", ran(home), "")
 
     # H2. Set, but not a directory. The unit templates ship the key EMPTY, but an installer that
     #     renders placeholders and misses one leaves `__HESTIA_WORKSPACE__` behind, and a typo
@@ -223,7 +244,7 @@ def _install_inventory_cases(fn: str, tmp: Path) -> None:
         rc, st = run(prelude + fn, "install_inventory", root,
                      clean_env(HOME=str(home), HESTIA_WORKSPACE=bogus), "inventory")
         check(f"H2 {bogus[:22]}: rc", rc, 0)
-        check(f"H2 {bogus[:22]}: refused, not pinned", st, "skipped(HESTIA_WORKSPACE is not a directory)")
+        check(f"H2 {bogus[:22]}: refused, not pinned", st, "SKIPPED(HESTIA_WORKSPACE is not a directory)")
         check(f"H2 {bogus[:22]}: the installer did not run", ran(home), "")
 
     # J. Nothing installed yet -> the installer runs, scoped to the seat's workspace and the
@@ -340,7 +361,7 @@ def _install_inventory_cases(fn: str, tmp: Path) -> None:
     root, home = seat("off")
     rc, st = run(prelude + fn, "install_inventory", root,
                  clean_env(HOME=str(home), HESTIA_WORKSPACE=ws, HESTIA_DEPLOY_INVENTORY="0"), "inventory")
-    check("L switched off", (rc, st, ran(home)), (0, "skipped(HESTIA_DEPLOY_INVENTORY=0)", ""))
+    check("L switched off", (rc, st, ran(home)), (0, "SKIPPED(HESTIA_DEPLOY_INVENTORY=0)", ""))
 
 
 def test_script_is_strict() -> None:

@@ -138,6 +138,8 @@ exit 0
             "check_units": all((home / ".config/systemd/user" / u).exists()
                                for u in ("hestia-deploy-check.service", "hestia-deploy-check.timer")),
             "script": (home / ".local/bin/hestia-deploy").exists(),
+            "pointer": ((home / ".hestia/workspace").read_text()
+                        if (home / ".hestia/workspace").exists() else None),
             "ws": ws,
         }
 
@@ -151,6 +153,8 @@ check("timer unit installed", r["timer"], r["out"])
 check("HESTIA_WORKSPACE rendered into the unit",
       r["unit"] is not None and systemd_environment(r["unit"]).get("HESTIA_WORKSPACE") == r["ws"],
       r["unit"])
+check("workspace pointer written for older hand-installed units", r["pointer"] == r["ws"] + "\n",
+      r["pointer"])
 check("units reloaded", "--user daemon-reload" in r["calls"], r["calls"])
 check("deploy timer NOT enabled by default",
       not any("enable" in c and "is-enabled" not in c and "hestia-deploy.timer" in c for c in r["calls"]),
@@ -178,6 +182,7 @@ check("says it left it on", "already ON" in r["out"], r["out"])
 # 4. Release install (no checkout): skipped with the reason, nothing written.
 r = run(workspace="")
 check("release install skips", r["rc"] == 0 and r["unit"] is None and not r["script"], r["out"])
+check("release install writes no workspace pointer", r["pointer"] is None, r["pointer"])
 check("release install says why", "release install" in r["out"], r["out"])
 
 # 5. No cargo: skipped with the reason, nothing written.
@@ -198,6 +203,8 @@ for name in ("My Projects", 'a "q" b', "back\\slash", "100% ws", "pipe|amp&x", "
     got = systemd_environment(r["unit"] or "").get("HESTIA_WORKSPACE")
     check(f"workspace {name!r} survives systemd parsing", r["rc"] == 0 and got == r["ws"],
           f"rc={r['rc']} got={got!r} want={r['ws']!r}\n{r['out']}")
+    check(f"workspace {name!r} survives the pointer byte-for-byte", r["pointer"] == r["ws"] + "\n",
+          r["pointer"])
     check(f"workspace {name!r} adds no stray variable",
           set(systemd_environment(r["unit"] or "")) <= {"HESTIA_HOME", "HESTIA_WORKSPACE", "PATH"},
           r["unit"])
