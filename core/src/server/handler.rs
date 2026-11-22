@@ -20429,6 +20429,140 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn peer_arbitration_respects_sovereign_plus_peer_bar() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["kimi-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        let opened = tool_gate_escalation_open(
+            &shared,
+            &json!({
+                "plugin_id": "codex",
+                "session_id": session_of["codex"],
+                "tool_name": "Edit",
+                "marker": "pre_tool_use.py",
+                "act": "Edit -> pre_tool_use.py",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened["bar"], "sovereign_plus_peer");
+        let esc_id = opened["escalation_id"].as_str().unwrap().to_string();
+
+        let err = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "peer review cannot supply the sovereign factor",
+                "session_id": session_of["kimi-code"],
+            }),
+        )
+        .await
+        .expect_err("a peer approval must not close a sovereign-required ask");
+        let msg = err.to_string();
+        assert!(msg.contains("sovereign") && msg.contains("corroborate"), "{msg}");
+        assert!(msg.contains("pending"), "the remedy must say the ask remains open: {msg}");
+        {
+            let s = shared.lock().await;
+            let esc = s.gate_escalations.get(&esc_id).unwrap();
+            assert_eq!(esc.stored_status(), crate::server::gate_escalation::Status::Pending);
+            assert!(esc.factors.is_empty(), "a refused ruling adds no evidence: {esc:?}");
+        }
+
+        tool_gate_escalation_corroborate(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "session_id": session_of["kimi-code"],
+                "stance": "concur",
+                "argument": "peer evidence, explicitly not a sovereign ruling",
+            }),
+        )
+        .await
+        .unwrap();
+        let decided = {
+            let mut s = shared.lock().await;
+            s.gate_escalations
+                .decide(
+                    &esc_id,
+                    true,
+                    "operator",
+                    "role:constellation:sovereign",
+                    crate::server::gate_escalation::Channel::OperatorSession,
+                    None,
+                    Some("the sovereign factor decides after peer corroboration"),
+                    crate::server::gate_escalation::now_secs(),
+                )
+                .expect("peer corroboration leaves the sovereign decision available")
+        };
+        assert_eq!(decided.stored_status(), crate::server::gate_escalation::Status::Approved);
+        assert!(decided.bar_met());
+        assert!(decided.is_claimable(crate::server::gate_escalation::now_secs()));
+
+        let late = tool_gate_arbitrate_escalation(
+            &shared,
+            &json!({
+                "escalation_id": esc_id,
+                "approve": true,
+                "reason": "a late peer ruling cannot replace the terminal authority",
+                "session_id": session_of["kimi-code"],
+            }),
+        )
+        .await
+        .expect_err("a terminal sovereign ruling stays single-shot");
+        assert!(late.to_string().contains("already decided"), "{late}");
+    }
+
+    #[tokio::test]
+    async fn peer_arbitration_keeps_eligible_approvals_and_all_denials_terminal() {
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["kimi-code", "codex"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await
+                .unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+
+        for (marker, bar, approve, expected) in [
+            ("seat_gate_boundary_test.py", "single_approver", true, "approved"),
+            ("pre_tool_use.py", "sovereign_plus_peer", false, "denied"),
+        ] {
+            let opened = tool_gate_escalation_open(
+                &shared,
+                &json!({
+                    "plugin_id": "codex",
+                    "session_id": session_of["codex"],
+                    "tool_name": "Edit",
+                    "marker": marker,
+                    "act": format!("Edit -> {marker}"),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(opened["bar"], bar);
+            let decided = tool_gate_arbitrate_escalation(
+                &shared,
+                &json!({
+                    "escalation_id": opened["escalation_id"],
+                    "approve": approve,
+                    "reason": "an eligible peer approval remains valid",
+                    "session_id": session_of["kimi-code"],
+                }),
+            )
+            .await
+            .expect("the bar guard must not block an eligible approval or any peer denial");
+            assert_eq!(decided["status"], expected);
+            assert_eq!(decided["bar_met"], approve, "a peer denial authorises nothing: {decided}");
+        }
+    }
+
     /// The positive control, and the more important half: closing the hole must not delete
     /// the feature. Same registry, same marker, varying ONLY whether the open carried a
     /// session — the proven asker is still peer-clearable, at the same tier as before.
@@ -29628,7 +29762,7 @@ fn escalation_miss_reason(s: &super::state::ServerState, escalation_id: &str) ->
 
 async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> ToolResult {
     use crate::arbiter::{eligibility_for, AppealParties, Disposition, Eligibility};
-    use crate::server::gate_escalation::{now_secs, Channel};
+    use crate::server::gate_escalation::{now_secs, Channel, Status};
 
     let escalation_id = require_string(args, "escalation_id")?;
     let approve = args
@@ -29720,6 +29854,23 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
             "internal: a self-directed APPROVAL was admitted as a withdrawal — refusing. A \
              member granting itself a governance write is the one thing this path exists to \
              prevent"
+        ));
+    }
+
+    // A peer approval that cannot meet the bar must not consume the sovereign's only chance
+    // to decide. Keep this preflight ahead of `decide`; denials and terminal-row errors retain
+    // their existing single-shot semantics.
+    if approve
+        && via == Channel::PeerMember
+        && esc.status_at(now) == Status::Pending
+        && !esc.peer_ruling_suffices()
+    {
+        return Err(anyhow::anyhow!(
+            "this peer APPROVAL cannot meet the required {:?} bar: the sovereign conjunct is \
+             still missing. Nothing has been decided: the escalation is still pending. Use \
+             hestia_gate_escalation_corroborate to record your evidence, then ask the operator \
+             to decide. A peer DENY remains available through this tool.",
+            esc.bar
         ));
     }
 
@@ -29906,11 +30057,11 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
 const CORROBORATE_ACCEPTED_KEYS: &[&str] =
     &["escalation_id", "session_id", "sessionId", "stance", "argument"];
 
-/// Add a peer's evidence to a PENDING escalation WITHOUT deciding it — the accumulation half
-/// of the constellation model (dp 2026-07-30: "many-factor preponderance of evidence";
+/// Add a peer's evidence WITHOUT deciding the escalation — the accumulation half of the
+/// constellation model (dp 2026-07-30: "many-factor preponderance of evidence";
 /// claude-code: "approval shouldn't be a boolean from whichever channel answered first. It
-/// should accumulate"). A corroboration permits nothing by itself; it is witnessed separately
-/// so it cannot be laundered into a ruling; and it freezes at decision time.
+/// should accumulate"). A corroboration permits nothing by itself and is witnessed separately.
+/// Evidence may also arrive after a ruling, but cannot change its terminal authority.
 async fn tool_gate_escalation_corroborate(state: &SharedState, args: &Value) -> ToolResult {
     use crate::arbiter::{eligibility, AppealParties, Eligibility};
     use crate::server::gate_escalation::now_secs;
