@@ -1055,6 +1055,19 @@ manifest_build_id() {
   sed -n 's/.*"build_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$HESTIA_HOME/current-build.json" | head -1
 }
 
+warn_current_build_env() {
+  [ "$MODE" = full ] || return 0
+  [ "$OS" = Linux ] || return 0
+  [ -r "$HESTIA_HOME/current-build.json" ] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local expected="$HESTIA_HOME/current-build.json" actual
+  actual="$(systemctl --user show "$UNIT" -p Environment --value 2>/dev/null || true)"
+  case "$actual" in
+    *"$expected"*) ;;
+    *) log "WARN deployment authority: $UNIT does not export HESTIA_CURRENT_BUILD_FILE=$expected; the dashboard will read deployment: unknown" ;;
+  esac
+}
+
 # What a hooks value means for the exit code, and how the tail is worded. ONE table for the
 # three places that end a cycle with a hooks value (DEPLOYED, CURRENT-with-repair, HOOKS-ONLY).
 #   ok, or skipped by explicit HESTIA_DEPLOY_HOOKS=0            -> 0
@@ -1306,6 +1319,7 @@ if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
     install_inventory
     install_mesh
     run_post_deploy "$target"
+    warn_current_build_env
     log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory mesh=$mesh seats=$seats post_deploy=$post_deploy"
     case "$hooks" in
       ok) exit 0 ;;
@@ -1316,6 +1330,7 @@ if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
   # one, and the inventory's source moves without the daemon's binary moving with it.
   if [ "$MODE" = "full" ]; then install_inventory; install_mesh; run_post_deploy "$target"; fi
   secret_hygiene
+  warn_current_build_env
   log "CURRENT $target${inventory:+ inventory=$inventory}${mesh:+ mesh=$mesh}${post_deploy:+ post_deploy=$post_deploy}"
   exit 0
 fi
@@ -1380,6 +1395,7 @@ ls -1t "$HESTIA_HOME"/hestia.prev-* 2>/dev/null | tail -n +"$(( KEEP_BACKUPS + 1
 done
 
 secret_hygiene
+warn_current_build_env
 log "DEPLOYED ${running:-none} -> $newv (hestia $target_sha, web4 $web4_sha, atlas $atlas) hooks=$hooks inventory=$inventory mesh=$mesh seats=$seats post_deploy=$post_deploy in $(( $(date +%s) - T0 ))s"
 # The new binary is live, so this box now runs the latest main: no update is available.
 running="$newv"
