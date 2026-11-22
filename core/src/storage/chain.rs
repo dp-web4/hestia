@@ -1622,6 +1622,44 @@ impl SqliteChainStore {
         Ok(stmt.query_row(params![plugin_id], |row| row.get(0)).optional()?)
     }
 
+    /// The newest actor act of `plugin_id` at or after `since` (an RFC 3339 timestamp in the
+    /// chain's own format), or `None` if there is none in that window.
+    ///
+    /// BOUNDED (#1555). [`Self::latest_actor_act`] walks back from the head until it finds a
+    /// match, so for a member that has not acted it decrypts and JSON-parses every actor row
+    /// the chain has ever held. Escalation open/claim run it for every eligible peer under
+    /// the daemon's state lock, and on cbp on 2026-11-10 that held the lock 2-3.5 minutes per
+    /// escalation: every gate call on the box timed out behind it. Liveness only
+    /// distinguishes the last hour, the last day, and older, so nothing before the window can
+    /// change its answer. Positions grow with time, so the window's first position is one
+    /// seek on `idx_chain_timestamp`, and the scan stops there.
+    pub fn latest_actor_act_since(&self, plugin_id: &str, since: &str) -> Result<Option<String>> {
+        let conn = self.observed(&self.read_conn)?;
+        let floor: Option<i64> = conn
+            .query_row(
+                "SELECT chain_position FROM chain_entries WHERE timestamp >= ?1
+                 ORDER BY timestamp ASC LIMIT 1",
+                params![since],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(floor) = floor else {
+            return Ok(None);
+        };
+        // `+event_type` keeps the planner on the rowid range: the event_type index would
+        // visit every actor row in the chain again.
+        let mut stmt = conn.prepare(
+            "SELECT timestamp FROM chain_entries
+             WHERE chain_position >= ?2
+               AND +event_type IN ('outcome', 'policy_decision', 'adjudication', 'appeal')
+               AND (json_extract(event_data, '$.plugin_id') = ?1
+                    OR json_extract(event_data, '$.adjudicator') = ?1
+                    OR json_extract(event_data, '$.adjudicated_by.plugin_id') = ?1)
+             ORDER BY chain_position DESC LIMIT 1",
+        )?;
+        Ok(stmt.query_row(params![plugin_id, floor], |row| row.get(0)).optional()?)
+    }
+
     /// Unruled appeals in the position window, newest first (#488). The anti-join
     /// projects only the open queue rather than parsing every appeal and ruling.
     /// Only a later adjudication closes an appeal; an earlier ruling must not hide a new one.
@@ -2782,6 +2820,42 @@ mod tests {
         assert_eq!(empty, ChainScanPage { rows: Vec::new(), before_position: None, scanned: 0 });
     }
 
+    /// #1555: the bounded liveness scan stays on the rowid range. If the planner took the
+    /// event_type index instead, it would visit every actor row in the chain again and the
+    /// window would bound nothing.
+    #[test]
+    fn bounded_liveness_scan_walks_a_rowid_range_1555() {
+        let dir = TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), TEST_KEY).unwrap();
+        for i in 0..50 {
+            store.append("outcome", json!({"plugin_id": format!("m{i}")}), "lct:test").unwrap();
+        }
+        let conn = store.observed(&store.read_conn).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT timestamp FROM chain_entries
+                 WHERE chain_position >= ?2
+                   AND +event_type IN ('outcome', 'policy_decision', 'adjudication', 'appeal')
+                   AND (json_extract(event_data, '$.plugin_id') = ?1
+                        OR json_extract(event_data, '$.adjudicator') = ?1
+                        OR json_extract(event_data, '$.adjudicated_by.plugin_id') = ?1)
+                 ORDER BY chain_position DESC LIMIT 1",
+            )
+            .unwrap()
+            .query_map(params!["nobody", 10], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let plan = plan.join(" | ");
+        assert!(plan.contains("INTEGER PRIMARY KEY (rowid>?)"), "{plan}");
+        assert!(!plan.contains("idx_chain_event_type"), "{plan}");
+        drop(conn);
+        assert_eq!(
+            store.latest_actor_act_since("m7", "1970-01-01T00:00:00+00:00").unwrap(),
+            store.latest_actor_act("m7").unwrap(),
+        );
+    }
+
     #[test]
     fn appeal_queue_and_liveness_use_projections_not_a_tail_materialization_488() {
         let dir = TempDir::new().unwrap();
@@ -2802,6 +2876,15 @@ mod tests {
         let expected = store.read_recent(1).unwrap()[0].timestamp.to_rfc3339();
         assert_eq!(latest, expected, "the nested adjudicator is an actor act");
         assert_eq!(store.latest_actor_act("nobody").unwrap(), None);
+        // The bounded form agrees inside its window and finds nothing past it (#1555).
+        let day_ago = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        assert_eq!(
+            store.latest_actor_act_since("kimi-code", &day_ago).unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(store.latest_actor_act_since("nobody", &day_ago).unwrap(), None);
+        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(store.latest_actor_act_since("kimi-code", &future).unwrap(), None);
 
         let later = store.append(
             "appeal",

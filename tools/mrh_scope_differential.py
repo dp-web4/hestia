@@ -107,7 +107,7 @@ PINS = {
     ('0902.exec-in-heredoc-body', 'right', 'repo'): ('allow', None),
     ('0902.exec-in-heredoc-body', 'right', 'root'): ('allow', None),
     ('0902.exec-in-heredoc-body', 'wrong', 'repo'): ('allow', None),
-    ('0902.exec-in-heredoc-body', 'wrong', 'root'): ('deny', 'exec'),
+    ('0902.exec-in-heredoc-body', 'wrong', 'root'): ('allow', None),   # #1594 (held #1600, applied 4a729670): a quoted data heredoc body is no longer scanned by passes 1-2
     ('0902.glob-under-wrong-root', 'right', 'repo'): ('allow', None),
     ('0902.glob-under-wrong-root', 'right', 'root'): ('allow', None),
     ('0902.glob-under-wrong-root', 'wrong', 'repo'): ('deny', '*'),
