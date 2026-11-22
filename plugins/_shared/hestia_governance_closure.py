@@ -1502,6 +1502,24 @@ def _last_positional_dest(pos: list) -> list:
     return [pos[-1]] if len(pos) >= 2 else []
 
 
+def _help_call(args, help_tokens) -> bool:
+    """True only when `args` is a help/version call that writes nothing (#1094).
+
+    A help token counts ONLY when every token before it is a plain operand: no `--` and no
+    other dash option precedes it. Option ARITY is the trap: `patch -B -v -i P` and
+    `git apply --exclude -h P` hand `-v`/`-h` to the preceding option as its VALUE and then
+    apply P; `git apply -- -h` applies a FILE named `-h`; git also accepts abbreviated long
+    options (`--exc -h`), so no deny-list of value-taking options is complete. Any other
+    dash token before the help token falls through to the normal write-set resolution
+    (fail closed). Kept: `git apply -h`, `git apply -h P`, `git apply P -h`, `patch -v`."""
+    for a in args:
+        if a in help_tokens:
+            return True
+        if a.startswith("-"):
+            return False
+    return False
+
+
 def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False,
                            cwd=None) -> list:
     """Write-position arguments of ONE simple command. Unknown commands contribute NONE —
@@ -1530,6 +1548,8 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
     if name == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
     if name == "patch":
+        if _help_call(args, ("--help", "--version", "-v")):
+            return []
         # The write set lives inside the patch CONTENT. Resolve it: read the named input
         # (-i/--input or the `<` stdin source threaded by the caller) and extract its
         # targets. No readable input -> _OpaqueWriter -> unconditional fail-close.
@@ -1608,6 +1628,8 @@ def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = Fals
             return []
         sub, rest = args[i], args[i + 1:]
         if sub in ("apply", "am"):
+            if _help_call(rest, ("-h", "--help")):
+                return []
             if sub == "apply":
                 # --stat/--numstat/--summary/--check never write: they inspect the patch and
                 # turn apply mode OFF, so the patch content is not a write set at all, and an

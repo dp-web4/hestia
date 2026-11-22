@@ -1387,17 +1387,15 @@ def teardown_module(module):
 
 @asserting
 def test_a_help_call_to_a_patch_writer_is_refused_as_opaque_is_pinned_open():
-    """PINNED OPEN: #1094. A help or version call to `git apply` / `git am` / `patch` names
-    no patch, so `_command_write_targets` raises _OpaqueWriter. `classify()` then returns
-    `write / governance-closure-opaque-writer` before any closure match. There is no
-    governed path and no cwd dependence, and the resource is `stdin`.
+    """CLOSED by help/version early return — #1094. A help or version call to `git apply` /
+    `git am` / `patch` writes nothing, so it returns before the no-patch opaque-writer
+    fail-close. There is no governed path and no cwd dependence.
 
-    Hit live twice on 2026-09-21: codex (escalation e0e3d60b…, `git apply -h; rg …`) and
+    Live evidence on 2026-09-21: codex (escalation e0e3d60b…, `git apply -h; rg …`) and
     claude-code (ce2e83e9…, a bare `patch --version`). git itself was measured in a scratch
     repo: `git apply -h P` and `git apply P -h` both exit 129 and leave the tree unchanged.
 
-    Goes red when #1094 closes. Invert the rows then. The controls must stay refused: a
-    fix keyed on "no patch named" instead of on the help flag would open stdin."""
+    Bare stdin and unreadable patches stay refused; `--apply` still re-arms a write."""
     mod = _load_gate()
     if getattr(mod, "_closure_classify", None) is None:
         skip("help_call_to_patch_writer",
@@ -1417,8 +1415,8 @@ def test_a_help_call_to_a_patch_writer_is_refused_as_opaque_is_pinned_open():
         ("codex_live_shape", f"git apply -h; rg -n opaque {HOOK}"),
     ):
         got = verdict(cmd)
-        check(f"help_call_still_opaque__{name}", got == opaque,
-              f"now {got!r}. If not opaque-writer, #1094 closed: invert this row")
+        check(f"help_call_is_not_a_write__{name}", got != opaque,
+              f"now {got!r}; help/version must return before the opaque-writer fail-close")
 
     # CONTROLS: a patch arriving on stdin, and a patch file that cannot be read, are the
     # opaque writers the rule exists for. Both must survive the fix.
