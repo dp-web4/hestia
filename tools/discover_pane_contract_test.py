@@ -78,18 +78,18 @@ def source_contract() -> None:
     # TWO requests of the pane's own: the inventory read, and register (#1101), which is the one
     # write built inline here -- retire and reinstate go through the retire block's reviewed
     # functions instead. Pinned by route and method, not by count alone.
-    # And two more since 2026-09-28, the gate BYPASS and RESTORE (dp: "in discover, for every
-    # registered harness add a 'bypass' button (that turns into 'restore')"), each a POST to the
-    # member's own route. They are template literals -- the spelling the operator-surfaces checker
-    # reads -- so the single-quote scan above does not see them; they are pinned by exact spelling
-    # here, and the total of template-literal requests in the block is pinned too, so a fifth
-    # request of either kind still turns this red.
-    GATE_ACTS = ["apiFetch(`/api/agents/${encodeURIComponent(member)}/bypass`, {\n        method: 'POST'",
-                 "apiFetch(`/api/agents/${encodeURIComponent(member)}/restore`, {\n        method: 'POST'"]
-    for act in GATE_ACTS:
-        check(f"the gate act is a POST on the member's own route: {act.split(',')[0]}", block.count(act), 1)
-    check("the only template-literal requests in the block are the two gate acts",
-          len(re.findall(r"apiFetch\(\s*`", block)), 2)
+    # The gate BYPASS and RESTORE arrived on 2026-09-28; UNGOVERN (#998) completes the set. Each is
+    # a POST to the member's own route. They are template literals -- the spelling the
+    # operator-surfaces checker reads -- so the single-quote scan above does not see them; they are
+    # pinned by exact spelling here, and the total of template-literal requests in the block is
+    # pinned too, so a fourth request of either kind still turns this red.
+    TEMPLATE_ACTS = ["apiFetch(`/api/agents/${encodeURIComponent(member)}/bypass`, {\n        method: 'POST'",
+                     "apiFetch(`/api/agents/${encodeURIComponent(member)}/restore`, {\n        method: 'POST'",
+                     "apiFetch(`/api/agents/${encodeURIComponent(member)}/ungovern`, {\n        method: 'POST'"]
+    for act in TEMPLATE_ACTS:
+        check(f"the member act is a POST on the member's own route: {act.split(',')[0]}", block.count(act), 1)
+    check("the only template-literal requests in the block are bypass, restore and ungovern",
+          len(re.findall(r"apiFetch\(\s*`", block)), 3)
     check("exactly two single-quoted requests in the Discover block: the read and register", len(fetches), 2)
     reads = [f for f in fetches if "method" not in f[1]]
     writes = [f for f in fetches if "method" in f[1]]
@@ -117,10 +117,13 @@ def source_contract() -> None:
                       # dp, 2026-09-28: a fail-open recovery switch for a member its own gate has
                       # locked out, and its undo. Reason on bypass; the confirm names what is off.
                       "data-gate-bypass": "bypass a member's gate (fail-open recovery)",
-                      "data-gate-restore": "restore a bypassed gate exactly"}
-    found = set(re.findall(r"\bdata-(?:retire-all|retire|reinstate|register|gate-bypass|gate-restore|delete|revoke|grant|merge-alias)(?![\w-])", block))
-    check("the write-capable controls in this pane are exactly the reviewed six",
+                      "data-gate-restore": "restore a bypassed gate exactly",
+                      "data-ungovern": "remove authority, owned hooks and projection in one act (#998)"}
+    found = set(re.findall(r"\bdata-(?:retire-all|retire|reinstate|register|gate-bypass|gate-restore|ungovern|delete|revoke|grant|merge-alias)(?![\w-])", block))
+    check("the write-capable controls in this pane are exactly the reviewed seven",
           sorted(found), sorted(WRITE_CONTROLS))
+    check("unwire has its own deliberate dispatch",
+          "closest('[data-ungovern]')" in UI and "ungovernAgent(b.dataset.ungovern)" in UI)
     check("retire and reinstate are dispatched by the retire block's own delegated handler",
           "closest('[data-retire],[data-reinstate],[data-retire-all],#disc-show-retired,#disc-hide-retired')" in UI)
     # THE BULK ACT MUST NOT BE THE WAY AROUND THE LIVE-MEMBER GUARD. retireNeverActed sends each id
@@ -214,6 +217,9 @@ def behaviour() -> None:
     check("fails_open false -> closed", rows["gemini"]["failure"], "closed")
     check("fails_open ABSENT -> unknown, NOT closed and NOT open", rows["codex"]["failure"], "unknown")
     check("no plugin -> no governance id, rather than echoing the atlas id", rows["aider"]["governanceId"], "")
+    check("only a governed harness is offered the one-act unwire",
+          (rows["claude"]["canUngovern"], rows["codex"]["canUngovern"], rows["aider"]["canUngovern"]),
+          (True, False, False))
     check("scope carries where the atlas came from", m["scope"]["atlasSource"], "env")
 
     # UNKNOWN that still saw things: the banner AND the rows. The inventory deliberately keeps

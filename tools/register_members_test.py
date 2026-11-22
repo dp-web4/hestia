@@ -2078,7 +2078,113 @@ def test_shipped_member_templates_register_the_mesh_pair_pinned():
             assert (REPO / "plugins" / "member-mesh" / b).is_file(), b
 
 
+def _desired_targets(tmp: Path, plugins: Path, member: str) -> list[str]:
+    spec = json.loads((plugins / member / "expects.json").read_text())["install"]
+    template = json.loads((plugins / member / "hooks" / "hooks.json").read_text())
+    loaded = RM._load(member, spec, template, str(tmp), env={"HESTIA_HOME": _hh(tmp)},
+                      source=str(plugins / member))
+    assert isinstance(loaded, RM.Loaded), loaded
+    desired = {os.path.normpath(d.target) for d in loaded.desired if d.target}
+    return sorted({os.path.normpath(r.target)
+                   for r in RM.index_hooks(loaded.hooks, loaded.layout == "flat")
+                   if r.target and os.path.normpath(r.target) in desired})
+
+
+def _remove(tmp: Path, plugins: Path, member: str, targets: list[str],
+            env: dict | None = None) -> subprocess.CompletedProcess:
+    args = ["--remove", "--member", member, "--json"]
+    for target in targets:
+        args += ["--owned-target", target]
+    return _run(tmp, plugins, *args, env=env)
+
+
+def test_unregistration_removes_only_owned_json_hooks_and_backs_up_the_exact_bytes():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp, ("claude-code",))
+        _install(tmp, "claude-code", *_CC_FILES, *_MESH_FILES)
+        assert _run(tmp, plugins, "--member", "claude-code").returncode == 0
+        cfg = tmp / ".claude" / "settings.json"
+        data = json.loads(cfg.read_text())
+        foreign = {"type": "command", "command": "node /elsewhere/foreign.js", "timeout": 17}
+        data["hooks"]["PreToolUse"].append({"matcher": "Read", "hooks": [foreign]})
+        data["unrelated"] = {"keep": [1, 2, 3]}
+        cfg.write_text(json.dumps(data, indent=2) + "\n")
+        before = cfg.read_text()
+        targets = _desired_targets(tmp, plugins, "claude-code")
+        r = _remove(tmp, plugins, "claude-code", targets)
+        result = json.loads(r.stdout)
+        assert r.returncode == 0 and result["status"] == "unregistered", (r.returncode, r.stdout)
+        assert result["hooks_removed"] > len(targets), "repeated events must each lose their owned entry"
+        after = json.loads(cfg.read_text())
+        assert after["unrelated"] == {"keep": [1, 2, 3]}
+        assert foreign in after["hooks"]["PreToolUse"][-1]["hooks"]
+        remaining = {os.path.normpath(reg.target) for reg in RM.index_hooks(after["hooks"], False)
+                     if reg.target}
+        assert not remaining.intersection(map(os.path.normpath, targets)), remaining
+        assert Path(result["backup"]).read_text() == before
+
+
+def test_unregistration_proves_nested_and_flat_toml_and_preserves_foreign_hooks():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        for member, files in (("codex", ("pre_tool_use.py", "observe.sh", "witness.py", "hydrate.sh")),
+                              ("kimi", ("pre_tool_use.py", "observe.sh", "witness.py", "hydrate.sh"))):
+            plugins = _plugins(tmp, (member,))
+            _install(tmp, member, *files, *_MESH_FILES)
+            cfg = tmp.joinpath(*DEST[member]).parent / ("config.toml" if member != "claude-code" else "settings.json")
+            if member == "codex":
+                cfg.write_text(CODEX_TOML)
+            else:
+                cfg.write_text(KIMI_TOML.replace("/HOME", str(tmp))
+                               + '\n[[hooks]]\nevent = "PreToolUse"\ncommand = "/elsewhere/other.py"\n')
+            assert _run(tmp, plugins, "--member", member).returncode == 0, (member, cfg.read_text())
+            before = cfg.read_text()
+            targets = _desired_targets(tmp, plugins, member)
+            r = _remove(tmp, plugins, member, targets)
+            result = json.loads(r.stdout)
+            assert r.returncode == 0 and result["status"] == "unregistered", (member, r.stdout)
+            import tomllib
+            document = tomllib.loads(cfg.read_text())
+            layout = "flat" if member == "kimi" else "toml"
+            hooks = document.get("hooks", [] if layout == "flat" else {})
+            remaining = {os.path.normpath(reg.target)
+                         for reg in RM.index_hooks(hooks, layout == "flat") if reg.target}
+            assert not remaining.intersection(map(os.path.normpath, targets)), (member, remaining)
+            if member == "codex":
+                assert document["approval_policy"] == "on-request"
+                assert document["sandbox_mode"] == "workspace-write"
+                assert "state" in document["hooks"], "the non-hook TOML state must survive"
+                assert "observe.sh" in cfg.read_text(), "the foreign original observe line stays"
+            else:
+                assert "other.py" in cfg.read_text(), "the foreign flat hook stays"
+            assert Path(result["backup"]).read_text() == before
+
+
+def test_unregistration_refuses_a_stale_target_set_and_dry_run_writes_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp, ("codex",))
+        _install(tmp, "codex", "pre_tool_use.py", "observe.sh", "witness.py", "hydrate.sh", *_MESH_FILES)
+        cfg = tmp / ".codex" / "config.toml"
+        cfg.write_text(CODEX_TOML)
+        assert _run(tmp, plugins, "--member", "codex").returncode == 0
+        before = cfg.read_text()
+        targets = _desired_targets(tmp, plugins, "codex")
+        r = _remove(tmp, plugins, "codex", targets + [str(tmp / "not-registered.py")])
+        assert r.returncode == 7 and json.loads(r.stdout)["status"] == "refused", (r.returncode, r.stdout)
+        assert cfg.read_text() == before
+        r = _remove(tmp, plugins, "codex", targets, env={"DRY_RUN": "1"})
+        result = json.loads(r.stdout)
+        assert r.returncode == 0 and result["dry_run"] is True, (r.returncode, r.stdout)
+        assert result["hooks_removed"] > 0 and result["backup"] is None
+        assert cfg.read_text() == before
+
+
 TESTS = [
+    test_unregistration_removes_only_owned_json_hooks_and_backs_up_the_exact_bytes,
+    test_unregistration_proves_nested_and_flat_toml_and_preserves_foreign_hooks,
+    test_unregistration_refuses_a_stale_target_set_and_dry_run_writes_nothing,
     test_thor_case_registers_only_the_missing_witness,
     test_kimi_flat_layout_registers_the_failure_witness_and_reconciles_owned_lines,
     test_ensure_adds_the_feature_flag_when_absent,

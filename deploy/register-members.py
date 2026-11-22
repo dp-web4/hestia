@@ -83,6 +83,12 @@ The renderer is shared: `deploy/from-main/gate-preflight.py` loads this file and
 candidate gate under `reconciled_commands()` — the registration this install WILL write — not the
 one currently on disk (which the install is about to rewrite).
 
+`--remove --member MEMBER [--owned-target ABSOLUTE_PATH ...]` is the inverse act. It drops only
+the named, exactly matching targets (or the template's current targets when none are named), using
+the same structural edit and TOML proof. A stale target set refuses before any write. A real write
+gets a unique `.hestia-unregister.*` backup of the exact bytes this run read, never the older
+`.pre-register.bak`. `--json` returns the outcome for the daemon's witnessed ungovern act.
+
 Exit: 0 clean; 6 a write failed validation and was restored; 7 refused (an unrendered placeholder,
 HESTIA_HOME unset, or a config that cannot be verified; that member skipped, others proceed);
 8 a FOREIGN registration is narrower than the template; 9 pending; 10 a FOREIGN registration's
@@ -96,6 +102,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -1240,6 +1247,108 @@ def register_member(member: str, spec: dict, template: dict, home: str, dry: boo
     return done("ok", lines)
 
 
+def prepare_unregistration(member: str, spec: dict, template: dict, home: str, *,
+                           owned_targets=None, env=None, source=None):
+    got = _load(member, spec, template, home, env, source=source)
+    if not isinstance(got, Loaded):
+        return got
+    L = got
+    flat = L.layout == "flat"
+    norm = lambda p: os.path.normpath(p) if p else p  # noqa: E731
+    targets = {norm(t) for t in (owned_targets if owned_targets is not None
+                                else [d.target for d in L.desired]) if t}
+    regs = index_hooks(L.hooks, flat)
+    found = {norm(r.target) for r in regs if r.target}
+    missing = sorted(targets - found)
+    if missing:
+        return "refused", [f"{L.cfg}: the inventory's owned targets are not all registered "
+                           f"({', '.join(missing)}); the registration changed since it was read, "
+                           "so nothing was removed"]
+    P = Plan()
+    for r in regs:
+        if r.target and norm(r.target) in targets:
+            P.ops.append(("drop", r))
+            P.changes.append(("remove", f"{r.event}/{r.base}: {r.hook.get('command')}"))
+    if not P.ops:
+        return Prepared(L, P, [], None, L.hooks)
+    if L.layout == "json":
+        data = copy.deepcopy(L.data)
+        data["hooks"] = apply_structural(L.hooks, P.ops, "json")
+        new = json.dumps(data, indent=2) + "\n"
+        if json.loads(new) != data:
+            return "failed", [f"rendered {L.cfg} does not reload; nothing written"]
+        return Prepared(L, P, [f"{verb} {text}" for verb, text in P.changes], new, data["hooks"])
+    expected = apply_structural(L.hooks, P.ops, L.layout)
+    try:
+        new = apply_toml_text(L.raw, L.hooks, P.ops, L.layout, member)
+    except Unlocatable as e:
+        return "refused", [f"{L.cfg}: the removal cannot be placed on this file's text ({e}); "
+                           "nothing written"]
+    why = verify_toml_edit(L.raw, new, expected, flat)
+    if why:
+        return "refused", [f"{L.cfg}: the removal could not be proved ({why}); nothing written"]
+    err = validate_toml(new)
+    if err:
+        return "failed", [f"rendered {L.cfg} would not parse ({err}); nothing written"]
+    return Prepared(L, P, [f"{verb} {text}" for verb, text in P.changes], new, expected)
+
+
+def _backup_unregistration(path: str, raw: str) -> str:
+    fd, backup = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.hestia-unregister.",
+                                  dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        shutil.copymode(path, backup)
+        with open(backup, encoding="utf-8", errors="replace") as fh:
+            if fh.read() != raw:
+                raise OSError("the unregistration backup did not read back exactly")
+    except Exception:
+        try:
+            os.remove(backup)
+        except OSError:
+            pass
+        raise
+    return backup
+
+
+def unregister_member(member: str, spec: dict, template: dict, home: str, dry: bool, *,
+                      owned_targets=None, env=None, source=None) -> dict:
+    got = prepare_unregistration(member, spec, template, home, owned_targets=owned_targets,
+                                 env=env, source=source)
+    if not isinstance(got, Prepared):
+        verdict, lines = got
+        return {"status": verdict, "hooks_removed": 0, "error": "; ".join(lines)}
+    L, P, changes = got.L, got.P, got.changes
+    result = {"status": "unregistered" if changes else "ok",
+              "hooks_removed": len(P.ops), "changes": changes, "config": L.cfg,
+              "backup": None, "error": None}
+    if got.new is None or dry:
+        return result
+    try:
+        if L.raw:
+            result["backup"] = _backup_unregistration(L.cfg, L.raw)
+        _write_atomic(L.cfg, got.new)
+    except (OSError, ValueError) as e:
+        result.update(status="failed", hooks_removed=0,
+                      error=f"{L.cfg}: the removal was not written ({e})")
+        return result
+    if L.layout != "json":
+        with open(L.cfg, encoding="utf-8", errors="replace") as fh:
+            back = fh.read()
+        err = validate_toml(back)
+        if err:
+            if L.raw:
+                _write_atomic(L.cfg, L.raw)
+            else:
+                os.remove(L.cfg)
+            result.update(status="failed", hooks_removed=0,
+                          error=f"{L.cfg} failed to parse after write ({err}); restored as it was")
+    return result
+
+
 # ---------------------------------------------------------------- main -------------------
 _VERB = {"add": "REGISTERED", "rewrite": "REWROTE", "remove": "REMOVED", "ensure": "REGISTERED"}
 _NOTES = ("NARROW ", "PENDING ", "SHORT ", "INERT ", "FOREIGN ")
@@ -1251,6 +1360,9 @@ def main(argv: list[str]) -> int:
     global FORCE_LINE_SCAN
     only = None
     plan = False
+    remove = False
+    machine = False
+    owned_targets = []
     # --raise-timeouts: an accepted no-op alias since the reconcile (dp 2026-10-06) sets every owned
     # timeout to the template's value.
     argv = [a for a in argv if a != "--raise-timeouts"]
@@ -1267,12 +1379,25 @@ def main(argv: list[str]) -> int:
             only = next(it)
         elif a == "--plan":
             plan = True
+        elif a == "--remove":
+            remove = True
+        elif a == "--json":
+            machine = True
+        elif a == "--owned-target":
+            owned_targets.append(next(it))
         elif a in ("-h", "--help"):
             print(__doc__)
             return 0
     dry = ENV.get("DRY_RUN") == "1"
+    if remove and not only:
+        print("register-members: --remove requires --member", file=sys.stderr)
+        return 2
+    if (machine or owned_targets) and not remove:
+        print("register-members: --json and --owned-target require --remove", file=sys.stderr)
+        return 2
     rc = 0
-    if not plan:
+    acted = False
+    if not plan and not (remove and machine):
         log(f"register-members: plugins={plugins} home={home}{' DRY RUN' if dry else ''}")
     for member in sorted(os.listdir(plugins)):
         if only and member != only:
@@ -1294,6 +1419,28 @@ def main(argv: list[str]) -> int:
             continue
         with open(tpl, encoding="utf-8") as fh:
             template = json.load(fh)
+        if remove:
+            acted = True
+            result = unregister_member(member, spec, template, home, dry,
+                                       owned_targets=owned_targets or None,
+                                       source=os.path.join(plugins, member))
+            result.update(member=member, dry_run=dry)
+            if machine:
+                print(json.dumps(result))
+            else:
+                for line in result.get("changes") or []:
+                    log(f"  {'would ' if dry else ''}{line}")
+                if result.get("error"):
+                    log(f"  {result['status'].upper()} {member}: {result['error']}")
+                else:
+                    log(f"  {result['status'].upper()} {member}: "
+                        f"{result['hooks_removed']} owned hook(s) removed"
+                        + (f"; backup {result['backup']}" if result.get("backup") else ""))
+            if result["status"] in ("failed",):
+                rc = 6
+            elif result["status"] not in ("ok", "unregistered"):
+                rc = rc or 7
+            continue
         verdict, lines = register_member(member, spec, template, home, dry, plan=plan,
                                          source=os.path.join(plugins, member))
         if plan:
@@ -1330,6 +1477,13 @@ def main(argv: list[str]) -> int:
         else:
             log(f"  FAILED {member} — {'; '.join(lines)}")
             rc = 6
+    if remove and not acted:
+        if machine:
+            print(json.dumps({"status": "refused", "member": only, "hooks_removed": 0,
+                              "error": "member has no readable expects.json and hooks template"}))
+        else:
+            log(f"  REFUSED {only} — member has no readable expects.json and hooks template")
+        return 2
     return rc
 
 

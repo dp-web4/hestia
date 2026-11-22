@@ -5513,6 +5513,7 @@
       bypassable: !!(x.member || x.plugin) && (Array.isArray(x.hook_targets) ? x.hook_targets : [])
         .some(t => t && t.is_gate === true && t.owned_by_hestia === true),
       bypass: null,
+      canUngovern: groupKey === 'governed' && !!(x.member || x.plugin),
     };
   }
 
@@ -5589,6 +5590,8 @@
                   title="Undo the retirement. The authority revoked at retirement is NOT restored.">reinstate</button>`
               : `<button type="button" class="pol-btn pol-remove" data-retire="${escapeHtml(r.governanceId)}"
                   title="Stop this id being a party on this seat: revokes its standing, live and delegated authority. Not deletion — the chain keeps every act it made, and it is reversible.">retire…</button>`}
+            ${r.canUngovern ? `<button type="button" class="pol-btn pol-remove" data-ungovern="${escapeHtml(r.governanceId)}"
+              title="Remove this member's seat authority and Hestia-owned hooks, and quarantine its rendered projection in one witnessed act. The chain keeps its history.">unwire…</button>` : ''}
             ${r.bypass ? `${badge('red', 'BYPASSED', 'gate bypassed by the operator at ' + r.bypass.at + ' — ' + r.bypass.reason + '. This member acts UNGOVERNED until restored.')}
               <button type="button" class="pol-btn-add" data-gate-restore="${escapeHtml(r.governanceId)}"
                 title="Put this member's gate back exactly as it was registered. Witnessed.">restore gate</button>`
@@ -5626,6 +5629,31 @@
     if (!b) return;
     e.stopPropagation();
     registerDiscovered(b.dataset.register);
+  }, true);
+
+  async function ungovernAgent(member) {
+    if (!confirm(`UNWIRE "${member}"?\n\n` +
+        `This removes its seat authority and every Hestia-owned hook, and quarantines its rendered ` +
+        `projection in ONE act. The projection and chain history are preserved, but the member will ` +
+        `no longer be configured or gated after it restarts.\n\nContinue?`)) return;
+    const reason = prompt(`Why remove ${member}'s governance wiring? (recorded on the chain)`);
+    if (!reason || !reason.trim()) return;
+    try {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(member)}/ungovern`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason }),
+      });
+      const out = await res.json();
+      if (!res.ok) throw new Error(out?.error || `HTTP ${res.status}`);
+      alert(out.message + (out.recorded === false ? `\n\nWARNING: the act landed but its terminal witness failed: ${out.recordError}` : ''));
+      discoverLoad();
+    } catch (e) { alert(`unwire refused: ${e.message}`); }
+  }
+  document.addEventListener('click', e => {
+    const b = e.target && e.target.closest && e.target.closest('[data-ungovern]');
+    if (!b) return;
+    e.stopPropagation();
+    ungovernAgent(b.dataset.ungovern);
   }, true);
 
   // BYPASS / RESTORE a member's gate (dp, 2026-09-28): "useful for instances when an update locks
