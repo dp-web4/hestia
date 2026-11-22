@@ -26062,6 +26062,18 @@ pub(crate) const READ_ONLY_PATH_TOOLS: &[&str] = &[
     "read_file", "read_many_files", "search", "search_file_content",
 ];
 
+/// The decider's reason belongs to the original act; this guidance belongs to the current one.
+fn standing_refusal_next(tool: &str) -> &'static str {
+    if tool == "search" {
+        "for a directory or inbox name, use memory_read path=<directory> with start_line paging \
+         instead of repeating this search; otherwise narrow the search to a directory you already \
+         hold"
+    } else {
+        "use an existing in-scope route for this act; for a directory listing, use memory_read \
+         path=<directory> with start_line paging. Re-issuing this path ask will not reopen it"
+    }
+}
+
 /// The roots this member's grants and the society floor name: every live and standing grant
 /// root plus every floor root. Where a member's asks are judged to be "about its own space"
 /// (`in_members_space`) and where a did-you-mean candidate may be re-rooted.
@@ -26404,6 +26416,7 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
             "refused_by": r.refused_by,
             "refused_at": r.refused_at,
             "reason": r.reason,
+            "next": standing_refusal_next(""),
             "note": "a standing refusal covers this path: nothing was filed and nothing reaches \
                      the operator's queue. It stands until the operator lifts it; the reason is \
                      the one recorded when it was refused",
@@ -27062,11 +27075,14 @@ async fn scope_claim_inner(state: &SharedState, args: &Value,
     // refusal lasted one window and the next act minted a fresh request and a fresh card.
     if unpriceable.is_none() {
         if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+            let next = standing_refusal_next(&tool);
             return Ok(json!({
                 "verdict": "refused", "permits": false, "path": path, "request_key": key,
                 "standing": true, "refused_by": r.refused_by, "refused_at": r.refused_at,
+                "reason": r.reason,
+                "next": next,
                 "detail": format!("refused, standing (by {}): {}. Re-issuing opens no request; \
-                                   only the operator can lift this",
+                                   only the operator can lift this. For this act: {next}",
                                   r.refused_by, if r.reason.is_empty() { "no reason given" } else { &r.reason }),
             }));
         }
@@ -30094,6 +30110,81 @@ mod standing_scope_surface_tests {
         recursive: false,
         modes: crate::server::grant_modes::Modes::ALL,
         }
+    }
+
+    const ORIGINAL_REFUSAL_REASON: &str = "the original act concerned a different file";
+
+    async fn standing_refusal_fixture() -> (TempDir, SharedState, String) {
+        let (dir, shared) = test_state().await;
+        let target = dir.path().join("visible.txt");
+        std::fs::write(&target, "visible").unwrap();
+        let path = target.to_string_lossy().into_owned();
+        shared.lock().await.standing_scope.refusals.push(
+            crate::server::standing_scope::StandingRefusal {
+                member: "cbp-being".into(),
+                path: path.clone(),
+                recursive: false,
+                refused_at: 1,
+                refused_by: "peer:claude-code".into(),
+                reason: ORIGINAL_REFUSAL_REASON.into(),
+                request_id: None,
+                modes: Some(crate::server::grant_modes::Modes::READ),
+            },
+        );
+        (dir, shared, path)
+    }
+
+    #[tokio::test]
+    async fn a_standing_scope_refusal_separates_the_frozen_reason_from_the_next_step() {
+        let (_dir, shared, path) = standing_refusal_fixture().await;
+        let chain_before = shared.lock().await.chain_len();
+        let out = tool_request_scope(
+            &shared,
+            &json!({
+                "plugin_id": "cbp-being", "path": path,
+                "reason": "find the notes directory for this task",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["status"], "refused_standing", "{out}");
+        assert_eq!(out["reason"], ORIGINAL_REFUSAL_REASON, "{out}");
+        let next = out["next"].as_str().unwrap();
+        assert!(next.contains("memory_read path=<directory>"), "{out}");
+        assert!(next.contains("start_line"), "{out}");
+        assert_eq!(shared.lock().await.chain_len(), chain_before);
+    }
+
+    #[tokio::test]
+    async fn a_standing_gate_refusal_computes_next_from_the_current_act() {
+        let (_dir, shared, path) = standing_refusal_fixture().await;
+        let chain_before = shared.lock().await.chain_len();
+        let claim = |tool: &str, act: &str| {
+            json!({
+                "plugin_id": "cbp-being", "path": path, "rule": "mrh.path",
+                "tool_name": tool, "act": act, "act_digest": "a".repeat(64),
+                "spend": false,
+            })
+        };
+        let search = tool_scope_claim(&shared, &claim("search", "search -> visible.txt"))
+            .await
+            .unwrap();
+        assert_eq!(search["verdict"], "refused", "{search}");
+        assert_eq!(search["standing"], true, "{search}");
+        assert_eq!(search["reason"], ORIGINAL_REFUSAL_REASON, "{search}");
+        assert!(search["next"].as_str().unwrap().contains("repeating this search"), "{search}");
+        let detail = search["detail"].as_str().unwrap();
+        assert!(detail.contains(ORIGINAL_REFUSAL_REASON), "{search}");
+        assert!(detail.contains("memory_read path=<directory>"), "{search}");
+        assert!(detail.contains("start_line"), "{search}");
+
+        let read = tool_scope_claim(&shared, &claim("Read", "Read -> visible.txt"))
+            .await
+            .unwrap();
+        assert_eq!(read["reason"], search["reason"], "{read}");
+        assert_ne!(read["next"], search["next"], "{read}");
+        assert!(read["next"].as_str().unwrap().contains("for a directory listing"), "{read}");
+        assert_eq!(shared.lock().await.chain_len(), chain_before);
     }
 
     /// (e) `hestia_scope_status` carries BOTH lists, additively: `live_grants` keeps its
