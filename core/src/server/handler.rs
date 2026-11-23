@@ -441,7 +441,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t(
             "hestia_request_scope",
-            "Ask the operator for read access to ONE path outside your granted MRH. Requires an absolute path and a stated reason — the operator has only that sentence to rule on. This is the door the scope deny has been naming; it now exists. DIFFERENT CHANNEL FROM hestia_appeal, on purpose: an appeal asks whether a deny was WRONG and yields a verdict on conduct; this accepts the deny and asks for reach. An upheld appeal grants no access, and a granted request repairs no score. Any grant is MEMORY-ONLY and dies with the daemon — it never edits your identity file. Returns pending and permits nothing; no answer within the window is a refusal, not a retry",
+            "Ask the operator for read access to ONE path outside your granted MRH. Requires an absolute path and a stated reason — the operator has only that sentence to rule on. recursive=true asks for the subtree too; the decider may honor that or narrow it to exact. This is the door the scope deny has been naming; it now exists. DIFFERENT CHANNEL FROM hestia_appeal, on purpose: an appeal asks whether a deny was WRONG and yields a verdict on conduct; this accepts the deny and asks for reach. An upheld appeal grants no access, and a granted request repairs no score. A grant may be once, session, or standing, chosen by the decider — never by the asking member. A session grant dies with the daemon; a standing grant persists. Returns pending and permits nothing; no answer within the window is a refusal, not a retry",
         ),
         t(
             "hestia_scope_status",
@@ -26478,6 +26478,50 @@ fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &s
     out
 }
 
+fn scope_grant_covers_request(
+    s: &crate::server::state::ServerState,
+    plugin_id: &str,
+    path: &str,
+    recursive: bool,
+) -> bool {
+    if !recursive {
+        return s.has_scope_grant(plugin_id, path);
+    }
+    let now = crate::server::gate_escalation::now_secs();
+    use crate::server::standing_scope::covers_path;
+    let overlaps = |root: &str, reach: bool| {
+        covers_path(root, reach, path) || covers_path(path, true, root)
+    };
+    let live: Vec<_> = s
+        .scope_requests
+        .values()
+        .filter(|r| r.plugin_id == plugin_id && r.is_live(now))
+        .collect();
+    let own = s.standing_scope.live_for(plugin_id, now);
+    // A recursive answer covers every descendant, not merely the root. Any overlapping narrowed
+    // grant vetoes the dedup: an extra request is safe, while `already_granted` must not hide a
+    // narrower exact root or descendant behind an all-mode floor or wider grant.
+    if live.iter().any(|r| overlaps(r.reach_path(), r.recursive) && !r.ext.modes.is_all())
+        || own.iter().any(|g| overlaps(&g.path, g.recursive) && !g.modes.is_all())
+    {
+        return false;
+    }
+    if live.iter().any(|r| {
+        r.recursive && r.ext.modes.is_all() && covers_path(r.reach_path(), true, path)
+    }) || own.iter().any(|g| g.recursive && g.modes.is_all() && g.covers(path)) {
+        return true;
+    }
+    let narrowed: Vec<(String, bool, crate::server::grant_modes::Modes)> = live
+        .iter()
+        .filter(|r| !r.ext.modes.is_all())
+        .map(|r| (r.reach_path().to_string(), r.recursive, r.ext.modes))
+        .chain(own.iter().filter(|g| !g.modes.is_all())
+               .map(|g| (g.path.clone(), g.recursive, g.modes)))
+        .collect();
+    let floor = s.standing_scope.floor_for(&narrowed);
+    floor.reach.iter().any(|f| f.recursive && f.covers(path))
+}
+
 pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> ToolResult {
     use crate::server::gate_escalation::now_secs;
     use crate::server::state::{normalize_scope_path, ScopeRequest, ScopeRequestExt, SCOPE_REQUEST_TTL_SECS};
@@ -26493,6 +26537,7 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
     let reason = require_string(args, "reason")?;
 
     let path = normalize_scope_path(&raw_path);
+    let recursive = args.get("recursive").and_then(Value::as_bool).unwrap_or(false);
     // ONE FILE, stated as a rule rather than left to good manners. A member asking for `/` and
     // being granted it would be a scope grab wearing a request's clothes — and it would carry
     // the operator's genuine approval, which is worse than an ungoverned read because it looks
@@ -26583,22 +26628,35 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
         }
     }
 
-    // An already-live grant answers the ask without a second act. Told plainly rather than
-    // silently deduplicated, so a member never wonders whether its request went nowhere.
-    if s.has_scope_grant(&plugin_id, &path) {
+    // An already-live grant answers the ask without a second act. Compare the REACH, not merely
+    // the root: an exact grant on this directory cannot answer a request for its whole subtree.
+    if scope_grant_covers_request(&s, &plugin_id, &path, recursive) {
         return Ok(json!({
             "status": "already_granted",
             "path": path,
-            "note": "you already hold a live grant for this exact path; no new request was filed",
+            "recursive": recursive,
+            "note": "you already hold a live grant for this reach; no new request was filed",
         }));
     }
 
-    // A STANDING REFUSAL covering the path (hestia#1417): the door is closed until the operator
-    // lifts it, so the ask is not filed and the member is told why, in the decider's words.
-    if let Some(r) = s.standing_scope.refusal_for(&plugin_id, &path) {
+    // A STANDING REFUSAL covering the asked root OR the requested subtree (hestia#1417): the
+    // door is closed until the operator lifts it. An exact root refusal must not be bypassed by
+    // spelling the same ask as a recursive one; a refusal below the root blocks overlap too.
+    let refusal = s.standing_scope.refusal_for(&plugin_id, &path).or_else(|| {
+        if recursive {
+            s.standing_scope.refusals.iter().find(|r| {
+                r.member == plugin_id
+                    && crate::server::standing_scope::covers_path(&path, true, &r.path)
+            })
+        } else {
+            None
+        }
+    });
+    if let Some(r) = refusal {
         return Ok(json!({
             "status": "refused_standing",
             "path": path,
+            "recursive": recursive,
             "refused_by": r.refused_by,
             "refused_at": r.refused_at,
             "reason": r.reason,
@@ -26635,7 +26693,7 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
         decided_by: None,
         decided_at: None,
         decision_reason: None,
-        recursive: false,
+        recursive,
         revoked: None,
         ext: ScopeRequestExt { asker_basis: Some(asker_basis), ..Default::default() },
     };
@@ -26652,6 +26710,7 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
             // ever diverge in a way that surprises someone, the record shows where.
             "path": path,
             "path_as_asked": raw_path,
+            "recursive": recursive,
             "reason": reason,
             "expires_at": now + SCOPE_REQUEST_TTL_SECS,
             "assurance": "A1 — the grant is recorded here and enforced by the plugin gate. \
@@ -26663,6 +26722,7 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
         "request_id": id,
         "status": "pending",
         "path": path,
+        "recursive": recursive,
         "expires_at": now + SCOPE_REQUEST_TTL_SECS,
         "witnessEntryHash": entry.hash,
         "permits_read": false,
@@ -27765,7 +27825,7 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
             "origin": if req.ext.gate.is_some() { "gate_deny" } else { "member_request" },
             "eligibility": "arbiter::eligibility_for (NOT-SAME)",
         });
-        let req_subtree = req.ext.gate.as_ref().is_some_and(|g| g.subtree);
+        let req_subtree = req.ext.gate.as_ref().is_some_and(|g| g.subtree) || req.recursive;
         (arb.plugin_id, req.plugin_id.clone(), basis, req_subtree)
     };
     let mut body = json!({ "request_id": request_id, "reason": reason });
@@ -27774,8 +27834,8 @@ pub(crate) async fn tool_scope_peer_decide(state: &SharedState, args: &Value) ->
             body["granted"] = json!(false);
             // A peer may make a refusal STANDING (hestia#1417): it widens nothing. Lifting
             // one stays the operator's. Its REACH is the request's, never the peer's (Nova on
-            // #1418): a peer refuses the ask presented, exact unless the gate-opened act was
-            // itself a subtree glob, and cannot invent a broader durable prohibition.
+            // #1418): a peer refuses the ask presented, exact unless the request itself asked
+            // for subtree reach, and cannot invent a broader durable prohibition.
             if args.get("standing").and_then(Value::as_bool).unwrap_or(false) {
                 body["standing"] = json!(true);
                 body["recursive"] = json!(req_subtree);
@@ -27898,6 +27958,7 @@ pub(crate) async fn tool_scope_request_view(state: &SharedState, args: &Value) -
         "asker_basis": asker_basis,
         "path": req.path,
         "reason": req.reason,
+        "recursive": req.recursive,
         "origin": if gate.is_some() { "gate_deny" } else { "member_request" },
         "act": gate.map(|g| g.act.clone()),
         "rule": gate.map(|g| g.rule.clone()),
@@ -36357,6 +36418,232 @@ mod existence_first_tests {
         let r = tool_request_scope(&state, &json!({"plugin_id": "cbp-being", "session_id": sid,
             "path": f.to_str().unwrap(), "reason": "to read an existing file"})).await.unwrap();
         assert_eq!(r["status"], "pending", "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_recursive_request_survives_an_exact_grant_and_the_decider_chooses_the_reach() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        let root = dir.path().join("home-root");
+        std::fs::create_dir_all(&root).unwrap();
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.to_str().unwrap().into(), granted_at: 0,
+            granted_by: "operator".into(), reason: "exact root only".into(), expires_at: None,
+            request_id: None, recursive: false, modes: crate::server::grant_modes::Modes::ALL,
+        });
+        let asked = tool_request_scope(&state, &json!({
+            "plugin_id": "cbp-being", "session_id": sid, "path": root.to_str().unwrap(),
+            "recursive": true, "reason": "to read the journal below this directory",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(asked["status"], "pending", "{asked}");
+        assert_eq!(asked["recursive"], true);
+        let request_id = asked["request_id"].as_str().unwrap().to_string();
+        {
+            let s = state.lock().await;
+            assert_eq!(s.scope_requests[&request_id].recursive, true);
+            let row = s
+                .chain_store
+                .read_recent_by_types(None, &["scope_requested"], 1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(row.event_data["recursive"], true);
+        }
+        let snapshot = state.lock().await.dashboard_snapshot(20);
+        let pending = snapshot.pending_scope_requests.iter()
+            .find(|r| r["request_id"] == request_id.as_str())
+            .expect("the dashboard serves the pending recursive ask");
+        assert_eq!(pending["recursive"], true, "the browser receives the asked reach");
+        drop(snapshot);
+        state.lock().await.standing_scope.grants.push(crate::server::standing_scope::StandingGrant {
+            member: "cbp-being".into(), path: root.join("*").to_str().unwrap().into(), granted_at: 0,
+            granted_by: "operator".into(), reason: "a literal star is not recursive reach".into(),
+            expires_at: None, request_id: None, recursive: false,
+            modes: crate::server::grant_modes::Modes::ALL,
+        });
+        let literal_star = tool_request_scope(&state, &json!({
+            "plugin_id": "cbp-being", "session_id": sid, "path": root.to_str().unwrap(),
+            "recursive": true, "reason": "a literal star file must not satisfy the subtree",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(literal_star["status"], "pending", "{literal_star}");
+
+        let (status, axum::Json(refusal)) = crate::server::http::scope_decide_as(
+            state.clone(),
+            json!({"request_id": request_id, "granted": true, "standing": true,
+                   "reason": "the requested subtree is justified"}),
+            crate::server::http::ScopeDecider::operator(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{refusal}");
+        assert!(refusal["error"].as_str().unwrap().contains("set recursive:true"));
+        assert_eq!(
+            state.lock().await.scope_requests[&request_id]
+                .status(crate::server::gate_escalation::now_secs()),
+            "pending"
+        );
+
+        let (status, axum::Json(decision)) = crate::server::http::scope_decide_as(
+            state.clone(),
+            json!({"request_id": request_id, "granted": true, "standing": true,
+                   "recursive": true, "reason": "the requested subtree is justified"}),
+            crate::server::http::ScopeDecider::operator(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{decision}");
+        assert_eq!(decision["recursive"], true);
+        {
+            let s = state.lock().await;
+            assert_eq!(s.scope_requests[&request_id].recursive, true);
+            assert!(s.has_scope_grant("cbp-being", root.join("journal/today.md").to_str().unwrap()));
+        }
+        let deduped = tool_request_scope(&state, &json!({
+            "plugin_id": "cbp-being", "session_id": sid, "path": root.to_str().unwrap(),
+            "recursive": true, "reason": "the same subtree is already granted",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(deduped["status"], "already_granted", "{deduped}");
+
+        let narrower = dir.path().join("narrower");
+        std::fs::create_dir_all(&narrower).unwrap();
+        let asked = tool_request_scope(&state, &json!({
+            "plugin_id": "cbp-being", "session_id": sid, "path": narrower.to_str().unwrap(),
+            "recursive": true, "reason": "ask for breadth but let the operator narrow it",
+        }))
+        .await
+        .unwrap();
+        let request_id = asked["request_id"].as_str().unwrap().to_string();
+        let (status, axum::Json(decision)) = crate::server::http::scope_decide_as(
+            state.clone(),
+            json!({"request_id": request_id, "granted": true, "recursive": false,
+                   "reason": "exact is enough for this request"}),
+            crate::server::http::ScopeDecider::operator(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{decision}");
+        assert_eq!(decision["recursive"], false);
+        assert_eq!(state.lock().await.scope_requests[&request_id].recursive, false);
+
+        let refused_path = dir.path().join("peer-refused-recursive");
+        std::fs::create_dir_all(&refused_path).unwrap();
+        let asked = tool_request_scope(&state, &json!({
+            "plugin_id": "cbp-being", "session_id": sid, "path": refused_path.to_str().unwrap(),
+            "recursive": true, "reason": "a standing refusal must preserve the asked reach",
+        }))
+        .await
+        .unwrap();
+        let request_id = asked["request_id"].as_str().unwrap().to_string();
+        let peer = tool_connect(&state, &json!({"plugin_id": "claude-code", "host_agent": "peer"}))
+            .await
+            .unwrap();
+        let view = tool_scope_request_view(&state, &json!({
+            "request_id": request_id, "session_id": peer["sessionId"],
+        }))
+        .await
+        .unwrap();
+        assert_eq!(view["origin"], "member_request", "{view}");
+        assert_eq!(view["recursive"], true, "the peer sees the reach it refuses: {view}");
+        assert_eq!(view["subtree"], false, "a member ask is not a gate glob: {view}");
+        assert_eq!(view["may_decide"], json!(["refuse"]), "{view}");
+        let decision = tool_scope_peer_decide(&state, &json!({
+            "request_id": request_id, "decision": "refuse", "standing": true,
+            "session_id": peer["sessionId"], "reason": "refuse the recursive ask, not its reach",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(decision["granted"], false, "{decision}");
+        let s = state.lock().await;
+        assert_eq!(s.scope_requests[&request_id].recursive, true);
+        let refusal = s.standing_scope.refusals.iter()
+            .find(|r| r.path == refused_path.to_str().unwrap())
+            .expect("the standing refusal is stored");
+        assert_eq!(refusal.recursive, true);
+    }
+
+    #[tokio::test]
+    async fn recursive_grant_dedup_respects_modes_and_own_grant_precedence() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let mut s = state.lock().await;
+        s.standing_scope.floor.push(crate::server::standing_scope::FloorEntry {
+            path: "/a".into(), added_at: 0, added_by: "operator".into(),
+            reason: "exact floor first".into(), recursive: false,
+            modes: crate::server::grant_modes::Modes::ALL,
+        });
+        assert!(!scope_grant_covers_request(&s, "cbp-being", "/a/child", false));
+        s.standing_scope.floor[0].recursive = true;
+        assert!(scope_grant_covers_request(&s, "cbp-being", "/a", true));
+        let own = |path: &str, recursive: bool, modes: &str| {
+            crate::server::standing_scope::StandingGrant {
+                member: "cbp-being".into(), path: path.into(), granted_at: 0,
+                granted_by: "operator".into(), reason: "a narrower overlap must stay visible".into(),
+                expires_at: None, request_id: None, recursive,
+                modes: crate::server::grant_modes::Modes::parse(modes).unwrap(),
+            }
+        };
+        s.standing_scope.grants.push(own("/a", false, "w"));
+        assert!(!scope_grant_covers_request(&s, "cbp-being", "/a", true),
+            "an exact write-only root narrows the asked root even with an all-mode floor");
+        s.standing_scope.grants.clear();
+        s.standing_scope.grants.push(own("/a/child", false, "w"));
+        assert!(!scope_grant_covers_request(&s, "cbp-being", "/a", true),
+            "an exact write-only descendant is a hole in whole-subtree coverage");
+        s.standing_scope.grants.clear();
+        s.standing_scope.grants.push(own("/a", true, "w"));
+        assert!(!scope_grant_covers_request(&s, "cbp-being", "/a", true),
+            "a recursive narrowed own grant wins over the all-mode floor");
+        s.standing_scope.grants.clear();
+        s.standing_scope.grants.push(own("/a/sibling", false, "r"));
+        assert!(!scope_grant_covers_request(&s, "cbp-being", "/a/target", true),
+            "a narrowed sibling withholds the parent floor from the gate, so the raw floor \
+             must not dedup a recursive ask for an otherwise uncovered target");
+        s.standing_scope.grants.clear();
+        s.standing_scope.grants.push(own("/b", false, "w"));
+        assert!(scope_grant_covers_request(&s, "cbp-being", "/a", true),
+            "a disjoint narrowed grant does not block a covered request");
+        s.standing_scope.grants.clear();
+        s.standing_scope.grants.push(own("/a/child", false, "rwed"));
+        assert!(scope_grant_covers_request(&s, "cbp-being", "/a", true),
+            "an all-mode overlap does not invent a coverage hole");
+    }
+
+    #[tokio::test]
+    async fn a_recursive_request_cannot_reopen_a_standing_refusal() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = session(&state).await;
+        for (name, refusal_path, recursive) in [
+            ("exact-root", "exact-root", false),
+            ("nested-refusal", "nested-refusal/child", true),
+            ("exact-child", "exact-child/child", false),
+        ] {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            let refusal_path = dir.path().join(refusal_path);
+            state.lock().await.standing_scope.refusals.push(
+                crate::server::standing_scope::StandingRefusal {
+                    member: "cbp-being".into(), path: refusal_path.to_str().unwrap().into(),
+                    recursive, refused_at: 0, refused_by: "operator".into(),
+                    reason: "the standing refusal must hold".into(), request_id: None, modes: None,
+                },
+            );
+            let asked = tool_request_scope(&state, &json!({
+                "plugin_id": "cbp-being", "session_id": sid, "path": root.to_str().unwrap(),
+                "recursive": true, "reason": "this must not reopen the standing refusal",
+            }))
+            .await
+            .unwrap();
+            assert_eq!(asked["status"], "refused_standing", "{asked}");
+            assert_eq!(asked["reason"], "the standing refusal must hold");
+            assert!(state.lock().await.scope_requests.is_empty());
+        }
+        assert!(state.lock().await.chain_store.read_recent_by_types(
+            None, &["scope_requested"], 1).unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -917,6 +917,14 @@ step_deploy_supervisor() {
   [ -f "$unit_dir/hestia-deploy-check.timer" ] || check_fresh=1
   install -m 0644 "$src/hestia-deploy-check.service" "$unit_dir/hestia-deploy-check.service"
   install -m 0644 "$src/hestia-deploy-check.timer" "$unit_dir/hestia-deploy-check.timer"
+  # Older hand-installed units carry no HESTIA_WORKSPACE. The deploy's fallback is this
+  # one-line pointer, written with the same resolved root and verified like the unit itself.
+  local workspace_pointer="$HESTIA_HOME/workspace"
+  printf '%s\n' "$HESTIA_WORKSPACE" > "$workspace_pointer"
+  if [ "$(cat "$workspace_pointer")" != "$HESTIA_WORKSPACE" ]; then
+    c_err "workspace pointer was not written correctly: $workspace_pointer"
+    return 1
+  fi
   # Read back, as the other steps do: a zero exit is not evidence the bytes landed.
   if ! grep -qxF -- "$env_line" "$unit_dir/hestia-deploy.service"; then
     c_err "hestia-deploy.service was written without HESTIA_WORKSPACE: $unit_dir/hestia-deploy.service"

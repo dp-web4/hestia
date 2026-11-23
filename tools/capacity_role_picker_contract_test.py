@@ -68,6 +68,14 @@ def source_contract() -> None:
           bool(re.search(r"async function openSeatFor\(member\) \{.*?await cfgLoadList\(\);.*?cfgOpen\(member,", UI, re.S)))
     check("HESTIA_ROLE rows render the picker; other rows stay free text",
           "if (String(r.key).trim() !== 'HESTIA_ROLE')" in UI)
+    check("observed roles come from the daemon endpoint",
+          "`/api/config/seat/${encodeURIComponent(member)}/observed-roles`" in UI)
+    check("HESTIA_ROLE_PERMITTED is a checkbox set, not another text field",
+          "String(r.key).trim() === 'HESTIA_ROLE_PERMITTED'" in UI
+          and 'class="cfg-role-option"' in UI)
+    check("checkbox changes only assemble the form value; no declaration is auto-written",
+          "row.querySelector('.cfg-value').value = permittedRoleValue(choices)" in UI
+          and "box.addEventListener('change', () => {" in UI)
 
 
 def behaviour() -> None:
@@ -89,12 +97,40 @@ def behaviour() -> None:
               (opts[0]["value"], opts[0]["selected"], sum(o["selected"] for o in opts)) if opts else None, ("", True, 1))
 
 
+def observed_behaviour() -> None:
+    current = "role:constellation:interactive-dev,role:constellation:member"
+    observed = {"roles": [
+        {"role": "role:constellation:interactive-dev", "count": 1, "last_seen_at": "t1"},
+        {"role": "role:constellation:mesh-worker", "count": 2, "last_seen_at": "t2",
+         "outside_declared": True},
+    ]}
+    choices = run("permittedRoleChoices(A.current, A.observed)",
+                  {"current": current, "observed": observed}) or []
+    check("permitted roles: registry order and only the declared two selected",
+          ([o["value"] for o in choices], [o["value"] for o in choices if o["selected"]]),
+          (law_roles(), current.split(",")))
+    mesh = choices[1]
+    check("observed count, last-seen and out-of-set flag reach the checkbox",
+          (mesh["count"], mesh["last_seen_at"], mesh["outside_declared"]), (2, "t2", True))
+    check("the form value is assembled, not typed",
+          run("permittedRoleValue(A)", choices), current)
+
+    unknown = "role:constellation:interactive_dev"
+    choices = run("permittedRoleChoices(A, {})", unknown) or []
+    check("an unknown DECLARED value is retained for repair, not silently dropped",
+          (choices[-1]["value"], choices[-1]["selected"], choices[-1]["registered"]),
+          (unknown, True, False))
+    check("the retained unknown survives assembly too",
+          run("permittedRoleValue(A)", choices), unknown)
+
+
 def test_capacity_role_picker_contract() -> None:
     """pytest's entry: the same checks, and a failure it can see."""
     FAILS.clear()
     source_contract()
     if shutil.which("node"):
         behaviour()
+        observed_behaviour()
     assert not FAILS, "\n".join(FAILS)
 
 

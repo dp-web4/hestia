@@ -520,12 +520,13 @@ def _no_verdict(plugin_id: str, tool_name: str, cause: str, detail: str) -> Safe
                     "minutes, report to your operator."),
         "refused": ("Nothing is listening on the daemon endpoint, so no action can be approved. "
                     "Report this to your operator and wait — retrying will not help."),
-    }.get(cause, ("The gate could not obtain a verdict and cannot tell whether the daemon is down "
-                  "or slow. Retry once with backoff; if it repeats, report to your operator."))
-    msg = (f"hestia: no verdict [fail-closed] — the policy daemon did not return a usable decision "
-           f"({detail}; cause={cause}). This is NOT a policy boundary and NOT a tool failure — the "
-           f"referee is unreachable or its answer was unusable, so the gate fails closed for "
-           f"safety. {remedy}")
+    }.get(cause, ("This may be transient. Retry once with backoff. A later usable verdict "
+                  "(including a policy deny) means the condition has cleared; if no-verdict "
+                  "repeats, report the cause and detail to your operator."))
+    msg = (f"hestia: no verdict [fail-closed] — the local Hestia decision path did not return a "
+           f"usable decision ({detail}; cause={cause}). This is NOT a policy boundary and NOT a "
+           f"tool failure — the decision path was unavailable or its answer was unusable, so the "
+           f"gate fails closed for safety. {remedy}")
     try:
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:

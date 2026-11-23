@@ -10,6 +10,7 @@ here silently un-governs a fail-open member.
 check() RAISES on failure so pytest sees each case (GPT #CI-b); the __main__ runner collects.
 Run: python3 -m pytest <thisdir> -q   or   python3 hestia_gate_mechanism_test.py
 """
+import http.client
 import os
 import sys
 import time
@@ -475,6 +476,37 @@ def _with_captured_telemetry(fn):
     return cap.records
 
 
+def test_no_verdict_unknown_says_what_clears_without_inventing_a_component():
+    class Truncated(FakeClient):
+        def initialize(self):
+            raise http.client.IncompleteRead(b"")
+
+    seen = []
+
+    def run():
+        seen.append(_drive(Truncated()))
+
+    _with_captured_telemetry(run)
+    v = seen[0]
+    check("unknown_no_verdict_still_fails_closed",
+          not v.allow and not v.decided and v.cause == "unknown", str(v))
+    check("unknown_no_verdict_keeps_the_actual_exception",
+          "IncompleteRead" in v.message, v.message)
+    check("no_verdict_invents_no_policy_daemon", "policy daemon" not in v.message, v.message)
+    check("no_verdict_names_the_real_decision_path",
+          "local Hestia decision path" in v.message, v.message)
+    check("unknown_no_verdict_says_it_may_be_transient",
+          "This may be transient" in v.message, v.message)
+    check("unknown_no_verdict_keeps_the_cheap_next_step",
+          "Retry once with backoff" in v.message, v.message)
+    check("unknown_no_verdict_names_the_clearing_signal",
+          "later usable verdict (including a policy deny) means the condition has cleared"
+          in v.message, v.message)
+    check("unknown_no_verdict_says_what_to_report",
+          "if no-verdict repeats, report the cause and detail to your operator"
+          in v.message, v.message)
+
+
 def test_snapshot_timeout_is_recorded_as_timeout_at_its_stage():
     class Starved(FakeClient):
         def call_tool(self, name, args):
@@ -750,6 +782,7 @@ ALL = [
     test_cached_snapshot_refused_after_bounded_horizon,
     test_exhausted_deadline_refuses_request,
     test_bad_budget_env_defaults_not_raises,
+    test_no_verdict_unknown_says_what_clears_without_inventing_a_component,
     test_snapshot_timeout_is_recorded_as_timeout_at_its_stage,
     test_snapshot_refused_is_recorded_as_refused_at_initialize,
     test_verdict_and_snapshot_share_one_cause_classifier,

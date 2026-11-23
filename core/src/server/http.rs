@@ -1845,6 +1845,7 @@ pub async fn serve_with_callback(
         .route("/api/config/seed", post(config_seed_seats))
         .route("/api/config/seat", put(config_put_seat).get(config_list_seats))
         .route("/api/config/seat/:plugin_id", get(config_get_seat))
+        .route("/api/config/seat/:plugin_id/observed-roles", get(config_observed_roles))
         // DISPLAY ALIASES (#998): what the console CALLS a member. Operator-only like every
         // other write here, but — by dp's ruling — NOT witnessed and NOT an artifact of
         // record: the chain, the projections and every `plugin_id` field keep naming the id.
@@ -3489,9 +3490,10 @@ pub(crate) async fn scope_decide_as(
         .trim()
         .to_string();
     let standing = body.get("standing").and_then(|v| v.as_bool()).unwrap_or(false);
-    // Exact by default (dp, 2026-09-08). Recursion is the operator's explicit choice at
-    // decide time, never something the asking member can set: a request names ONE path.
-    let recursive = body.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Exact by default (dp, 2026-09-08). A member may ASK for a subtree; the decider must say
+    // whether to honor that or narrow it to exact. Omitting the flag never infers a widening.
+    let recursive_arg = body.get("recursive").and_then(|v| v.as_bool());
+    let recursive = recursive_arg.unwrap_or(false);
     // ONE-TIME (2026-10-05; PRD_ALLOWLISTS §5's first duration): approve exactly the act the
     // gate refused, once, inside the claim window. Not a grant of reach — never served as
     // policy; only `hestia_scope_claim` spends it, and only for that act.
@@ -3602,6 +3604,16 @@ pub(crate) async fn scope_decide_as(
     }
     let (plugin_id, path, ask) = (req.plugin_id.clone(), req.path.clone(), req.reason.clone());
     let gate_origin = req.ext.gate.clone();
+    if granted && !once && recursive_arg.is_none() && req.recursive {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "this request asks for recursive reach; set recursive:true to honor it \
+                          or recursive:false to narrow it to the exact path"
+            })),
+        );
+    }
+    let recursive = recursive_arg.unwrap_or(if granted { false } else { req.recursive });
     // WHICH KINDS this request accepts comes from `scope_allowed_decisions` — the same function
     // every operator surface reads its offer from (`allowed_decisions` on the snapshot, the
     // request listing and the ledger), so a button the UI renders is one this check admits
@@ -4747,6 +4759,158 @@ async fn config_get_seat(
             "effective": effective.env,
             "summary": summary,
         })),
+    )
+}
+
+/// The observed-role picker reads outcomes, never launcher configuration, and always covers the
+/// hub-pinned vocabulary. Unknown observed roles stay visible rather than disappearing from the
+/// evidence. Declaration remains the operator's separate PUT; this response only reports evidence.
+fn observed_role_payload(
+    member: &str,
+    mut observations: std::collections::BTreeMap<String, (u64, String)>,
+    declared_csv: Option<String>,
+) -> serde_json::Value {
+    let declared: std::collections::BTreeSet<String> = declared_csv
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(str::to_string)
+        .collect();
+    let has_declaration = declared_csv.is_some();
+    let known = crate::reputation::KNOWN_CONSTELLATION_ROLES;
+    let roles: Vec<serde_json::Value> = known
+        .iter()
+        .map(|role| {
+            let (count, last_seen_at) = observations
+                .remove(*role)
+                .unwrap_or((0, String::new()));
+            let outside = has_declaration && !declared.contains(*role);
+            serde_json::json!({
+                "role": role,
+                "registered": true,
+                "count": count,
+                "last_seen_at": last_seen_at,
+                "selected": declared.contains(*role),
+                "outside_declared": outside,
+            })
+        })
+        .collect();
+    let drift = roles.iter().any(|row| row["outside_declared"] == true)
+        || observations.keys().any(|role| has_declaration && !declared.contains(role));
+    let extra: Vec<serde_json::Value> = observations
+        .into_iter()
+        .map(|(role, (count, last_seen_at))| {
+            let outside = has_declaration && !declared.contains(&role);
+            serde_json::json!({
+                "role": role,
+                "registered": false,
+                "count": count,
+                "last_seen_at": last_seen_at,
+                "selected": declared.contains(&role),
+                "outside_declared": outside,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "member": member,
+        "roles": roles,
+        "extra_observations": extra,
+        "declared": declared,
+        "has_declaration": has_declaration,
+        "drift": drift,
+    })
+}
+
+/// `GET /api/config/seat/:plugin_id/observed-roles` — outcome-derived role evidence for the
+/// config picker. The chain scan runs off the state lock; a read error is an error, not an empty
+/// census. No declaration is written by this read-only endpoint.
+async fn config_observed_roles(
+    State(state): State<SharedState>,
+    axum::extract::Path(plugin_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    use super::seat_config as sc;
+    let member = plugin_id.trim().to_string();
+    if !seat_id_is_a_plain_name(&member) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "plugin_id names one document and may not contain a path separator, a \
+                          parent reference, or a leading dot"
+            })),
+        );
+    }
+    let (chain, declared_csv) = {
+        let s = state.lock().await;
+        let cfg: Option<sc::SeatConfig> = s
+            .vault
+            .get_document(sc::SEAT_CONFIG_NS, &member)
+            .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok());
+        let shared_ok: Option<sc::SeatConfig> = match sc::load_shared(&s.vault) {
+            Some(Ok(c)) => Some(c),
+            _ => None,
+        };
+        let effective = cfg
+            .map(|c| sc::effective_for(&member, shared_ok.as_ref(), &c).0)
+            .unwrap_or_default();
+        (
+            std::sync::Arc::clone(&s.chain_store),
+            effective.env.get("HESTIA_ROLE_PERMITTED").cloned(),
+        )
+    };
+    let mut observations: std::collections::BTreeMap<String, (u64, String)> =
+        std::collections::BTreeMap::new();
+    let mut before = None;
+    loop {
+        let page = chain.scan_recent_page(
+            None,
+            Some(&["outcome"]),
+            before,
+            crate::storage::chain::ROUTINE_CHAIN_MAX,
+            |row| {
+                let data = serde_json::from_str::<serde_json::Value>(row.event_data).ok()?;
+                if data.get("plugin_id").and_then(|v| v.as_str()) != Some(member.as_str()) {
+                    return None;
+                }
+                Some((
+                    data.get("role_lct")?.as_str()?.to_string(),
+                    row.timestamp.to_string(),
+                ))
+            },
+        );
+        match page {
+            Ok(page) => {
+                for (role, timestamp) in page.rows {
+                    observations
+                        .entry(role)
+                        .and_modify(|(count, last): &mut (u64, String)| {
+                            *count += 1;
+                            if timestamp > *last {
+                                *last = timestamp.clone();
+                            }
+                        })
+                        .or_insert((1, timestamp));
+                }
+                if page.before_position.is_none() {
+                    break;
+                }
+                before = page.before_position;
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("could not derive observed roles: {error}"),
+                        "member": member,
+                    })),
+                );
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(observed_role_payload(&member, observations, declared_csv)),
     )
 }
 
@@ -10380,6 +10544,72 @@ mod disposition_tests {
         assert!(v["config"]["env"].get("HESTIA_PLUGIN_ID").is_none(), "{v}");
     }
 
+    /// #1125: the picker derives from outcomes, preserves registry order, and names drift.
+    #[tokio::test]
+    async fn observed_roles_come_from_outcomes_and_flag_out_of_set_roles() {
+        use crate::server::seat_config as sc;
+        let (_dir, state) = test_state().await;
+        let put = axum::response::IntoResponse::into_response(
+            super::config_put_seat(
+                axum::extract::State(state.clone()),
+                axum::Json(serde_json::json!({
+                    "plugin_id": "kimi-code",
+                    "config": {"env": {
+                        "HESTIA_ROLE_PERMITTED": "role:constellation:interactive-dev,role:constellation:member"
+                    }, "note": ""},
+                })),
+            )
+            .await,
+        );
+        assert_eq!(put.status(), StatusCode::OK);
+        for (member, role) in [
+            ("kimi-code", "role:constellation:interactive-dev"),
+            ("kimi-code", "role:constellation:mesh-worker"),
+            ("kimi-code", "role:constellation:mesh-worker"),
+            ("codex", "role:constellation:reviewer"),
+            ("kimi-code", "role:constellation:future-role"),
+        ] {
+            let mut s = state.lock().await;
+            s.append_chain("outcome", serde_json::json!({
+                "plugin_id": member, "role_lct": role, "tool_name": "Bash",
+                "success": true, "magnitude": 0.1,
+            })).unwrap();
+        }
+        let resp = axum::response::IntoResponse::into_response(
+            super::config_observed_roles(
+                axum::extract::State(state.clone()),
+                axum::extract::Path("kimi-code".to_string()),
+            )
+            .await,
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let roles = v["roles"].as_array().unwrap();
+        assert_eq!(roles.len(), crate::reputation::KNOWN_CONSTELLATION_ROLES.len());
+        assert_eq!(roles[0]["role"], "role:constellation:interactive-dev");
+        assert_eq!(roles[0]["count"], 1);
+        assert_eq!(roles[0]["selected"], true);
+        assert_eq!(roles[1]["role"], "role:constellation:mesh-worker");
+        assert_eq!(roles[1]["count"], 2);
+        assert_eq!(roles[1]["selected"], false);
+        assert_eq!(roles[1]["outside_declared"], true);
+        assert!(!roles[1]["last_seen_at"].as_str().unwrap().is_empty());
+        assert_eq!(roles[2]["count"], 0);
+        assert_eq!(roles[4]["selected"], true);
+        assert_eq!(v["drift"], true);
+        assert_eq!(v["extra_observations"][0]["role"], "role:constellation:future-role");
+        assert_eq!(v["extra_observations"][0]["registered"], false);
+        let bad = axum::response::IntoResponse::into_response(
+            super::config_observed_roles(
+                axum::extract::State(state),
+                axum::extract::Path("../escape".to_string()),
+            )
+            .await,
+        );
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// THE SHARED SET (dp, 2026-09-05). Written through the same door under the reserved id;
     /// inherited by every seat with shared winning; a seat that restates a shared key is refused
     /// at the door; a shared write re-renders every seat in the same act; the list names the
@@ -12930,6 +13160,7 @@ mod disposition_tests {
         assert_eq!(v["path"], "/srv/view/a.txt");
         assert_eq!(v["act"], "cat /srv/view/a.txt", "the refused act is what a peer rules on: {v}");
         assert_eq!(v["origin"], "gate_deny");
+        assert_eq!(v["recursive"], false);
         assert_eq!(v["status"], "pending");
         assert_eq!(v["decidable"], true);
         assert_eq!(v["invited"], true);
@@ -12960,8 +13191,26 @@ mod disposition_tests {
         assert_eq!(inel["_hestia_error"]["code"], "hestia.scope_request_view_ineligible",
                    "no peer may rule an asserted asker's gate-opened ask, so none may read it: {inel}");
 
+        // A member-filed recursive ask discloses that reach BEFORE a peer records a standing
+        // refusal whose reach comes from the request. The gate's glob flag is a different field.
+        let member_root = _dir.path().join("member-recursive");
+        std::fs::create_dir_all(&member_root).unwrap();
+        let filed = crate::server::handler::tool_request_scope(&state, &serde_json::json!({
+            "plugin_id": "codex", "session_id": &asker, "path": member_root.to_str().unwrap(),
+            "recursive": true, "reason": "the peer must see the whole requested reach",
+        }))
+        .await
+        .unwrap();
+        let member_id = filed["request_id"].as_str().unwrap();
+        let member_view = view(&state, Some(&kimi), member_id).await;
+        assert_eq!(member_view["origin"], "member_request", "{member_view}");
+        assert_eq!(member_view["recursive"], true, "{member_view}");
+        assert_eq!(member_view["subtree"], false, "{member_view}");
+        assert_eq!(member_view["may_decide"], serde_json::json!(["refuse"]), "{member_view}");
+
         // Reading decides nothing.
         assert_eq!(state.lock().await.scope_requests[&id].granted, None);
+        assert_eq!(state.lock().await.scope_requests[member_id].granted, None);
     }
 
     /// #1470 review (Nova; second review): the audience is every member who may RULE the request,

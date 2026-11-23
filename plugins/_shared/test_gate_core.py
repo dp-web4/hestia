@@ -373,6 +373,9 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
     real_root = "path:" + os.path.realpath(ws)
     check("exact_root_deny_names_the_exact_grant_and_the_recursive_spelling",
           real_root + " is EXACT" in v.reason and real_root + "/**" in v.reason, v.reason)
+    check("exact_root_deny_names_the_members_recursive_request",
+          f"hestia_request_scope(path={os.path.realpath(ws)}, recursive=true, reason=...)" in v.reason
+          and "operator or delegate" in v.reason and "only an operator" not in v.reason, v.reason)
     v = G.evaluate(G.NormalizedEvent(tool="Bash", command=f"cat {deep}/note.md", cwd=ws),
                    root_exact, ws)
     check("exact_root_shell_deny_names_the_exact_grant",
@@ -506,6 +509,40 @@ def test_path_grants_keep_their_type_and_match_resolved_boundaries():
             check(f"non_plain_identity_refused_{bad!r}", v.blocks, v.reason)
 
 
+def test_a_being_gets_no_launch_cwd_grant_without_a_declared_launch_dir():
+    """#1098: a service WorkingDirectory is not authority for a being's whole launch repo."""
+    with tempfile.TemporaryDirectory() as ws:
+        repo = os.path.join(ws, "SAGE")
+        os.makedirs(repo)
+        old_cwd = os.getcwd()
+        old_launch = os.environ.get("HESTIA_BEING_LAUNCH_CWD")
+        try:
+            os.chdir(repo)
+            being = G.HarnessProfile(member_id="pub-being", identity_path="/nonexistent/identity.json")
+            check("being_without_launch_declaration_gets_no_repo",
+                  G.launch_cwd_repo(being, ws) == [], G.launch_cwd_repo(being, ws))
+            declared = G.HarnessProfile(member_id="pub-being", identity_path="/nonexistent/identity.json",
+                                        launch_cwd_env="HESTIA_BEING_LAUNCH_CWD")
+            os.environ["HESTIA_BEING_LAUNCH_CWD"] = repo
+            check("being_explicit_launch_dir_is_granted",
+                  G.launch_cwd_repo(declared, ws) == ["SAGE"], G.launch_cwd_repo(declared, ws))
+            del os.environ["HESTIA_BEING_LAUNCH_CWD"]
+            check("being_declared_but_unset_launch_dir_gets_no_repo",
+                  G.launch_cwd_repo(declared, ws) == [], G.launch_cwd_repo(declared, ws))
+            os.environ["HESTIA_BEING_LAUNCH_CWD"] = ""
+            check("being_empty_launch_dir_gets_no_repo",
+                  G.launch_cwd_repo(declared, ws) == [], G.launch_cwd_repo(declared, ws))
+            seat = G.HarnessProfile(member_id="claude-code", identity_path="/nonexistent/identity.json")
+            check("interactive_seat_keeps_cwd_fallback",
+                  G.launch_cwd_repo(seat, ws) == ["SAGE"], G.launch_cwd_repo(seat, ws))
+        finally:
+            os.chdir(old_cwd)
+            if old_launch is None:
+                os.environ.pop("HESTIA_BEING_LAUNCH_CWD", None)
+            else:
+                os.environ["HESTIA_BEING_LAUNCH_CWD"] = old_launch
+
+
 def test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly():
     """#953 (third instance: thor 2026-09-30, a venv interpreter under the recursive workspace grant).
 
@@ -622,6 +659,58 @@ def test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly():
     os.symlink(plain, plink)
     ok, tok, _ = G.command_scope_reach(f"cat {plink}", rec, ws, ws)
     check("control_an_ordinary_in_grant_link_allows", ok, f"denied, tok={tok!r}")
+
+
+def test_a_read_symlink_deny_names_the_resolved_target_not_the_granted_link():
+    """#1116: the boundary stays closed, but the reason names the resolved target."""
+    ws = _workspace()
+    outside = tempfile.mkdtemp(dir=os.path.dirname(ws))
+    interp = os.path.realpath(sys.executable)
+    venv_bin = os.path.join(ws, "proj", "venv", "bin")
+    os.makedirs(venv_bin, exist_ok=True)
+    link = os.path.join(venv_bin, "python")
+    os.symlink(interp, link)
+    rec = ["path:" + ws + G.RECURSIVE_SUFFIX]
+    prof = _profile(ws, rec)
+    verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[link], cwd=ws), prof, ws)
+    check("outside_link_still_denies", verdict.blocks and verdict.rule == "mrh.path", repr(verdict))
+    check("outside_reason_names_the_real_interpreter", interp in verdict.reason, verdict.reason)
+    check("outside_reason_says_symlink", "through a symlink" in verdict.reason, verdict.reason)
+    check("outside_reason_does_not_blame_the_granted_repo",
+          "'proj' is not granted" not in verdict.reason, verdict.reason)
+
+    for name in ("granted", "notgranted"):
+        os.makedirs(os.path.join(ws, name), exist_ok=True)
+    secret = os.path.join(ws, "notgranted", "data.txt")
+    open(secret, "w").close()
+    inlink = os.path.join(ws, "granted", "peek")
+    os.symlink(secret, inlink)
+    only = ["path:" + os.path.join(ws, "granted") + G.RECURSIVE_SUFFIX]
+    verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[inlink], cwd=ws),
+                         _profile(ws, only), ws)
+    check("in_workspace_link_still_denies", verdict.blocks and verdict.rule == "mrh.path",
+          repr(verdict))
+    check("in_workspace_reason_names_the_resolved_file", secret in verdict.reason, verdict.reason)
+    check("in_workspace_reason_says_symlink", "through a symlink" in verdict.reason,
+          verdict.reason)
+    check("in_workspace_reason_does_not_blame_the_link_repo",
+          "'granted' is not granted" not in verdict.reason, verdict.reason)
+
+    for proc in (f"/proc/{os.getpid()}/cwd", f"/proc/{os.getpid()}/exe"):
+        verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[proc], cwd=ws), prof, ws)
+        check(f"ungranted_proc_path_still_denies[{proc}]", verdict.blocks, verdict.rule)
+        check(f"ungranted_proc_target_is_not_disclosed[{proc}]",
+              os.path.realpath(proc) not in verdict.reason
+              and "through a symlink" not in verdict.reason, verdict.rule)
+    dangling = os.path.join(outside, "missing-target")
+    ungranted_link = os.path.join(ws, "notgranted", "dangling")
+    os.symlink(dangling, ungranted_link)
+    verdict = G.evaluate(G.NormalizedEvent(tool="Read", paths=[ungranted_link], cwd=ws),
+                         _profile(ws, only), ws)
+    check("ungranted_dangling_link_still_denies", verdict.blocks, verdict.rule)
+    check("ungranted_dangling_target_is_not_disclosed",
+          dangling not in verdict.reason and "through a symlink" not in verdict.reason,
+          verdict.rule)
 
 
 def test_temp_root_is_a_path_boundary_not_a_prefix():
@@ -1313,7 +1402,9 @@ ALL_TESTS = [
     "test_path_and_command_scope",
     "test_path_grant_reaches_a_sibling_of_the_repos",
     "test_path_grants_keep_their_type_and_match_resolved_boundaries",
+    "test_a_being_gets_no_launch_cwd_grant_without_a_declared_launch_dir",
     "test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly",
+    "test_a_read_symlink_deny_names_the_resolved_target_not_the_granted_link",
     "test_temp_root_is_a_path_boundary_not_a_prefix",
     "test_shims_contain_no_policy",
     "test_unscoped_must_be_declared_never_inferred",
@@ -1353,7 +1444,7 @@ def test_every_test_is_registered():
     check("every_test_is_registered", not missing,
           f"defined but not in ALL_TESTS, so never run: {missing}")
 
-    src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    src = open(os.environ.get("TEST_SOURCE", os.path.abspath(__file__)), encoding="utf-8").read()
     main_block = src.split('if __name__ ==', 1)[-1]
     uncalled = sorted(t for t in ALL_TESTS if f"{t}()" not in main_block)
     check("every_registered_test_is_called_by_the_bare_runner", not uncalled,
@@ -1392,7 +1483,9 @@ if __name__ == "__main__":
     test_path_and_command_scope()
     test_path_grant_reaches_a_sibling_of_the_repos()
     test_path_grants_keep_their_type_and_match_resolved_boundaries()
+    test_a_being_gets_no_launch_cwd_grant_without_a_declared_launch_dir()
     test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly()
+    test_a_read_symlink_deny_names_the_resolved_target_not_the_granted_link()
     test_temp_root_is_a_path_boundary_not_a_prefix()
     test_shims_contain_no_policy()
     test_unscoped_must_be_declared_never_inferred()
