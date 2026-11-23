@@ -24513,6 +24513,9 @@ mod appeal_tests {
             let s = state.lock().await;
             let esc = s.gate_escalations.get(&esc_id).expect("the prior escalation remains");
             assert!(esc.factors.is_empty(), "the failed factor never became live: {esc:?}");
+            // NOVA (#1650): the bar this factor WOULD meet (asserted after the retry) is not
+            // met by the transient one — an evidence append failure has no approval effect.
+            assert!(!esc.bar_met(), "an unwitnessed factor does not meet the bar: {esc:?}");
             assert!(s.chain_store.read_recent(500).unwrap().iter()
                 .all(|e| e.event_type != "gate_escalation_corroborated"),
                 "the failed append left no canonical factor event");
@@ -24523,6 +24526,8 @@ mod appeal_tests {
         assert!(recorded["witnessEntryHash"].is_string(), "the retry is durable: {recorded}");
         assert_eq!(recorded["factors_present"].as_array().unwrap().len(), 1);
         let s = state.lock().await;
+        assert!(s.gate_escalations.get(&esc_id).unwrap().bar_met(),
+                "the same factor, once witnessed, meets the bar the failed attempt did not");
         let mut chain = s.chain_store.read_recent(500).unwrap();
         chain.reverse();
         let events: Vec<_> = chain.iter()
