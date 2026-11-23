@@ -359,6 +359,24 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
         "let adjudicator_instance_lct = s.member_lct(&adjudicator.plugin_id);",
         "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
     ], SiteClass::Predicate),
+    // #689 (2026-11-23, hub-claude second pass on #1632): `tool_confirm_self_correction`, a
+    // new tool. A second party confirms that a subject's self-correction was real conduct.
+    //
+    // READING, both questions. (1) Who gets named? Two parties, each once, in the
+    // `conduct_confirmation` entry: the SUBJECT as `subject_instance_lct` and the CONFIRMER
+    // inside `confirmed_by.instance_lct`, beside its plugin_id, role and session. Neither
+    // displaces the other, so a reader can always tell who was credited from who vouched.
+    // (2) Is any derived name COMPARED to decide control flow? YES. The two names are compared
+    // to refuse `hestia.conduct_confirmation_self`: the credit must be confirmed by someone
+    // other than the subject. Same two-conjunct shape as `adjudication_self` and
+    // `corrected_adjudication_self` — plugin_id strings first, then the name-gate, with the
+    // `is_some()` guard so two unnameable parties are not refused as "self". The same caveat
+    // holds: for a synthetic or empty subject id the refusal rests on the string compare alone.
+    // Predicate; comparison pinned below.
+    ("server/handler.rs::tool_confirm_self_correction", &[
+        "let confirmer_instance_lct = s.member_lct(&confirmer.plugin_id);",
+        "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
+    ], SiteClass::Predicate),
     ("server/handler.rs::tool_cross_chain_checkpoint", &[
         "let Some(observer_lct) = s.member_lct(&caller.plugin_id) else {",
     ], SiteClass::Naming),
@@ -911,6 +929,10 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // site above: plugin_id strings first (not this census's symbol), then the name-gate.
     ("server/handler.rs::tool_record_reversal", &[
         "|| (subject_instance_lct.is_some() && subject_instance_lct == reporter_instance_lct)",
+    ]),
+    // The `hestia.conduct_confirmation_self` refusal (#689), same shape again.
+    ("server/handler.rs::tool_confirm_self_correction", &[
+        "|| (subject_instance_lct.is_some() && subject_instance_lct == confirmer_instance_lct)",
     ]),
 ];
 
