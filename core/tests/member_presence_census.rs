@@ -610,6 +610,13 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::scope_claim_settle", &[
         "\"subject_instance_lct\": s.member_lct(&plugin_id),",
     ], SiteClass::Naming),
+    // #1297 (2026-11-23): `tool_scope_withdraw` NAMES the asker on its `scope_withdrawn` row.
+    // Naming only. Who may withdraw is decided earlier, by plain equality of the session's
+    // resolved `plugin_id` with the request's (`hestia.scope_withdraw_not_yours`), not by a
+    // derived name: an alias of the asker cannot withdraw, which is the narrow direction.
+    ("server/handler.rs::tool_scope_withdraw", &[
+        "\"subject_instance_lct\": s.member_lct(&plugin_id),",
+    ], SiteClass::Naming),
     // READING for `scope_peer_pool` and `tool_scope_peer_decide` (dp, 2026-10-05: "scope
     // escalations should go to peers not to me"). Both COMPARE names, so both are Predicate.
     // `scope_peer_pool` is `resolve_invitation`'s arm for a scope request: a candidate who is the
