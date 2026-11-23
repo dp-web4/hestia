@@ -7,12 +7,15 @@ Usage:
   python3 tools/prd_readiness.py check --remote
 
 The JSON is the editable source. The Markdown report and its blocker index are derived
-artifacts. A rung names the strongest evidence, not a product-completion verdict.
+artifacts. A rung names the strongest evidence, not a product-completion verdict. A successful
+`check --remote` stamps that verification into the JSON and rewrites the report; a failed check
+changes nothing.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import pathlib
 import re
@@ -34,7 +37,9 @@ GAP_TYPES = {
 }
 
 
-def load(root: pathlib.Path = REPO) -> dict:
+def load(root: pathlib.Path | None = None) -> dict:
+    if root is None:
+        root = REPO
     return json.loads((root / DATA).read_text(encoding="utf-8"))
 
 
@@ -49,8 +54,20 @@ def validate(data: dict, root: pathlib.Path = REPO) -> list[str]:
     baseline = data.get("baseline", {})
     if baseline.get("ref") != "origin/main":
         problems.append("baseline.ref must be origin/main")
-    if not re.fullmatch(r"[0-9a-f]{40}", baseline.get("commit", "")):
+    commit = baseline.get("commit", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
         problems.append("baseline.commit must be a full lowercase Git commit id")
+    else:
+        head = subprocess.run(["git", "rev-parse", "origin/main"], cwd=root,
+                              capture_output=True, text=True, check=False)
+        if head.returncode != 0:
+            problems.append("origin/main could not be resolved")
+        elif commit != head.stdout.strip():
+            problems.append("baseline.commit is not current origin/main")
+        exists = subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=root,
+                                capture_output=True, text=True, check=False)
+        if exists.returncode != 0:
+            problems.append("baseline.commit does not exist")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", baseline.get("measured_at", "")):
         problems.append("baseline.measured_at must be a UTC ISO timestamp")
 
@@ -197,7 +214,7 @@ def render(data: dict) -> str:
 
 def _open_numbers(root: pathlib.Path, noun: str, runner) -> tuple[set[int], str | None]:
     result = runner(
-        ["gh", noun, "list", "--state", "open", "--limit", "500", "--json", "number",
+        ["gh", noun, "list", "--state", "open", "--limit", "1000", "--json", "number",
          "--jq", "[.[].number]"],
         cwd=root, capture_output=True, text=True, timeout=30, check=False,
     )
@@ -234,8 +251,14 @@ def main(argv: list[str] | None = None) -> int:
     problems = validate(data)
     if args.remote:
         problems.extend(remote_problems(data))
+    if args.remote and not problems:
+        data["remote_verified_at"] = (datetime.now(timezone.utc).replace(microsecond=0)
+                                      .isoformat().replace("+00:00", "Z"))
     rendered = render(data)
     report = REPO / REPORT
+    if args.remote and not problems:
+        (REPO / DATA).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        report.write_text(rendered, encoding="utf-8")
     if args.command == "generate" and not problems:
         report.write_text(rendered, encoding="utf-8")
     elif args.command == "check":

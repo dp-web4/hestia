@@ -35,6 +35,11 @@ class ReadinessTest(unittest.TestCase):
         broken["rows"] = [row for row in broken["rows"] if row["id"] != "5.5"]
         self.assertIn("missing required PRD row: 5.5", PR.validate(broken))
 
+    def test_stale_baseline_is_rejected(self):
+        broken = copy.deepcopy(self.data)
+        broken["baseline"]["commit"] = "7f0a9da8f910b7d5505278e072bf3e4f4d79103f"
+        self.assertIn("baseline.commit is not current origin/main", PR.validate(broken))
+
     def test_rung_cannot_exceed_named_evidence(self):
         broken = copy.deepcopy(self.data)
         broken["rows"][0]["rung"] = "public"
@@ -84,6 +89,25 @@ class ReadinessTest(unittest.TestCase):
 
         self.assertEqual(PR.remote_problems(self.data, runner=runner), [])
 
+    def test_remote_check_stamps_success_into_json_and_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "docs").mkdir()
+            (root / PR.DATA).write_text(json.dumps(self.data), encoding="utf-8")
+            old_repo, old_validate, old_remote = PR.REPO, PR.validate, PR.remote_problems
+            PR.REPO = root
+            PR.validate = lambda _data: []
+            PR.remote_problems = lambda _data, **_kwargs: []
+            try:
+                self.assertEqual(PR.main(["check", "--remote"]), 0)
+                written = json.loads((root / PR.DATA).read_text(encoding="utf-8"))
+                stamp = written["remote_verified_at"]
+                self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+                self.assertIn(f"Open work remotely verified:** `{stamp}`",
+                              (root / PR.REPORT).read_text(encoding="utf-8"))
+            finally:
+                PR.REPO, PR.validate, PR.remote_problems = old_repo, old_validate, old_remote
+
     def test_remote_check_rejects_closed_or_missing_references(self):
         def runner(args, **_kwargs):
             if args[1] == "issue":
@@ -111,9 +135,16 @@ class ReadinessTest(unittest.TestCase):
             updated = copy.deepcopy(self.data)
             updated["rows"][0]["unknown"] = "A new measurement is still owed."
             (root / PR.DATA).write_text(json.dumps(updated), encoding="utf-8")
-            loaded = PR.load(root)
-            self.assertEqual(PR.validate(loaded, ROOT), [])
-            self.assertIn("A new measurement is still owed.", PR.render(loaded))
+            old_repo, old_validate = PR.REPO, PR.validate
+            PR.REPO = root
+            PR.validate = lambda _data: []
+            try:
+                self.assertEqual(PR.main(["generate"]), 0)
+                report = root / PR.REPORT
+                self.assertTrue(report.exists())
+                self.assertIn("A new measurement is still owed.", report.read_text(encoding="utf-8"))
+            finally:
+                PR.REPO, PR.validate = old_repo, old_validate
 
 
 if __name__ == "__main__":
