@@ -844,6 +844,14 @@ pub struct Factor {
     /// never something that could have informed the decision. Older factors default false.
     #[serde(default)]
     pub post_claim: bool,
+    /// True when a ruling already existed at acceptance. This distinguishes retrospective
+    /// review from decision-relevant evidence; `post_claim` separately means the permit
+    /// was already spent. Historical factors default false rather than being reclassified.
+    /// So `false` on a REPLAYED legacy factor (written before this field existed) means
+    /// "not recorded", NOT "came before the ruling": it does not prove pre-ruling provenance,
+    /// and no reader may infer from it that the factor informed the decision.
+    #[serde(default)]
+    pub post_decision: bool,
 }
 
 /// Where an invoked factor came from. `by` on the `Factor` names the filler's durable
@@ -1355,6 +1363,34 @@ impl Escalation {
                 .iter()
                 .map(|f| f.channel)
                 .chain(std::iter::once(Channel::OperatorSession)),
+        )
+    }
+
+    /// Would a NOT-SAME peer's approval, ON ITS OWN, carry this escalation over its bar?
+    ///
+    /// The peer-side twin of `operator_alone_suffices`, asked by the INVITED PEER rather than
+    /// by the operator's button, and derived the same way: the real predicate over the factor
+    /// set as it would stand once `hestia_gate_arbitrate_escalation` appends its
+    /// `PeerMember` factor. So it cannot drift from what the ruling actually does.
+    ///
+    /// WHY IT EXISTS, measured 2026-11-12 (dp: "make sure that not-same peer review can work
+    /// without waiting on a human"): kimi-code routed four escalations to claude-code
+    /// overnight; claude-code answered every one with `corroborate` (evidence, never a
+    /// ruling), so none was approved and all expired, including a `single_approver` test-file
+    /// write that the peer's RULING alone would have granted. The invitation pointer says
+    /// `#corroborate-or-dissent` on every bar and the law text only describes corroboration,
+    /// so a peer had no way to learn from what it reads that its ruling would decide.
+    ///
+    /// Answers the BAR question only. Whether this peer may rule at all (NOT-SAME, the asker
+    /// basis clause #128, an open status) is the arbitrate door's to enforce, and the
+    /// invitation reports those separately.
+    pub fn peer_ruling_suffices(&self) -> bool {
+        Self::bar_met_over(
+            self.bar,
+            self.factors
+                .iter()
+                .map(|f| f.channel)
+                .chain(std::iter::once(Channel::PeerMember)),
         )
     }
 
@@ -1961,6 +1997,18 @@ pub const SUPERSESSION_HARD_STOP: &str = "hard_stop";
 /// name rather than stored, so a key can never smuggle an arbitrary string into the chain.
 pub fn valid_request_key(k: &str) -> bool {
     k.len() == 64 && k.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The hook's request-key rule: member, marker, exact attempted act and host session (#540).
+/// Open-door refusals use this to name the same attempt when no caller key was supplied.
+pub fn request_key_for_act(
+    plugin_id: &str,
+    marker: &str,
+    attempted_act: &str,
+    host_session_id: Option<&str>,
+) -> String {
+    let fields = [plugin_id, marker, attempted_act, host_session_id.unwrap_or("")];
+    format!("{:x}", Sha256::digest(fields.join("\x1f").as_bytes()))
 }
 
 pub fn now_secs() -> u64 {
@@ -2611,6 +2659,33 @@ impl EscalationStore {
                                            stated_reason, stated_detail, None, now, ttl_secs)
     }
 
+    /// The pending escalation an ask for this act would FOLD into, if one exists: the twin
+    /// `open_or_coalesce_with_payload` hands back instead of minting. Read-only, so the claim
+    /// door can tell "already asked, still pending" (answer with that id) from "never asked"
+    /// (record the refusal and open nothing) before anything is minted.
+    pub fn coalesce_target(
+        &self,
+        plugin_id: &str,
+        marker: &str,
+        act: Option<&str>,
+        resolved_targets: &[String],
+        binding: Option<&PayloadBinding>,
+        now: u64,
+    ) -> Option<&Escalation> {
+        let a = act.map(str::trim).filter(|v| !v.is_empty())?;
+        let digest = Self::act_digest_of(a);
+        // A FOLD MUST NOT LOWER THE PRICE. The twin was priced from what ITS ask carried; an
+        // ask for the same act that prices HIGHER (a resolved target the first ask lacked —
+        // an old hook then a new one, across an upgrade) is not folded into the weaker row,
+        // or coalescing would be the one path on which the target could not strengthen.
+        let (asked_bar, _) = price(
+            marker.trim(), Some(a),
+            &normalize_resolved_targets(resolved_targets.iter().map(String::as_str)));
+        self.pending_twin_bound(
+            plugin_id.trim(), marker.trim(), &digest,
+            binding.and_then(|b| b.sha256.as_deref()), now, asked_bar)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn open_or_coalesce_with_payload(
         &mut self,
@@ -2626,21 +2701,8 @@ impl EscalationStore {
         now: u64,
         ttl_secs: u64,
     ) -> Result<Opened, OpenError> {
-        if let Some(a) = act.map(str::trim).filter(|v| !v.is_empty()) {
-            let digest = Self::act_digest_of(a);
-            // A FOLD MUST NOT LOWER THE PRICE. The twin was priced from what ITS ask carried; an
-            // ask for the same act that prices HIGHER (a resolved target the first ask lacked —
-            // an old hook then a new one, across an upgrade) is not folded into the weaker row,
-            // or coalescing would be the one path on which the target could not strengthen.
-            let (asked_bar, _) = price(
-                marker.trim(), Some(a),
-                &normalize_resolved_targets(resolved_targets.iter().map(String::as_str)));
-            if let Some(twin) = self.pending_twin_bound(
-                plugin_id.trim(), marker.trim(), &digest,
-                binding.and_then(|b| b.sha256.as_deref()), now, asked_bar)
-            {
-                return Ok(Opened::Coalesced(twin.clone()));
-            }
+        if let Some(twin) = self.coalesce_target(plugin_id, marker, act, resolved_targets, binding, now) {
+            return Ok(Opened::Coalesced(twin.clone()));
         }
         self.open_with_payload(plugin_id, role, tool_name, marker, act, resolved_targets,
                                stated_reason, stated_detail, binding, now, ttl_secs)
@@ -3615,12 +3677,20 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             by: decided_by.trim().to_string(),
             role: esc.decided_role.clone(),
             independence,
-            // A decision is concurrence with itself. Dissent is a PEER verb, and the
-            // decision's own rationale already lives on `reason`.
-            dissent: false,
+            // A decision is concurrence with itself, for the operator's channels. Dissent is
+            // a PEER verb, and the decision's own rationale already lives on `reason`.
+            //
+            // BUT A PEER CAN NOW BE THE DECIDER (#1578, `peer_answer`), and its factor rides
+            // `Channel::PeerMember`, which `peer_participation()` counts. Hardcoded `false`
+            // published a peer's DENY as `concurred` (#1633). Measured three times on
+            // 2026-11-21: codex dissented, claude-code peer-ruled deny, and the record read
+            // `concurred: 1, dissented: 1`, a split where both peers refused. A peer's ruling
+            // is its stance, so a peer deny is a dissent and a peer approval a concurrence.
+            dissent: via == Channel::PeerMember && !approve,
             argument: None,
             invocation: None,
             post_claim: false,
+            post_decision: false,
             at: now,
         });
         Ok(esc.clone())
@@ -3653,8 +3723,9 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
     /// A late factor still cannot dress up a ruling — `bar_met` is unmoved by it (see
     /// `a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could`) — so the protection
     /// the deleted sentence claimed comes from the PREDICATE, not from refusing the peer.
-    /// A factor created after `consumed_at` is explicitly `post_claim`, so preserved late
-    /// commentary cannot be misread as evidence that informed the already-spent ruling.
+    /// A factor created after the ruling is explicitly `post_decision`; one created after
+    /// `consumed_at` is also `post_claim`. Retrospective review and spent-permit commentary
+    /// therefore remain distinct from evidence that informed the original decision.
     ///
     /// The deleted sentence said the opposite ("it freezes the moment a decision lands").
     /// It outlived the 2026-08-06 cutover by 25 days and was filed twice (#510, and codex's
@@ -3704,6 +3775,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                 .filter(|a| !a.is_empty()),
             invocation: None,
             post_claim: esc.consumed_at.is_some(),
+            post_decision: esc.decided_at.is_some(),
             at: now,
         });
         Ok(esc.clone())
@@ -3768,6 +3840,7 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
                 prompt_digest: invocation.prompt_digest.trim().to_string(),
             }),
             post_claim: false,
+            post_decision: esc.decided_at.is_some(),
             at: now,
         });
         Ok(esc.clone())
@@ -3998,6 +4071,18 @@ mod tests {
         table.sort();
         assert!(declared.len() >= 4, "found {declared:?}");
         assert_eq!(table, declared, "MEMBER_GATE_ENTRIES drifted from plugins/*/expects.json");
+    }
+
+    #[test]
+    fn request_key_for_act_matches_the_hook_rule() {
+        assert_eq!(
+            request_key_for_act("claude-code", "plugins/_shared", "Bash: true", Some("wake-1")),
+            "24251c2de7e2bbcae020a004921fd02a32be73f6e105cfe45e34c68f055fb1d2"
+        );
+        let absent = request_key_for_act("claude-code", "plugins/_shared", "Bash: true", None);
+        assert!(valid_request_key(&absent));
+        assert_ne!(absent, request_key_for_act("claude-code", "plugins/_shared", "Bash: false", None));
+        assert_ne!(absent, request_key_for_act("claude-code", "plugins/_shared", "Bash: true", Some("wake-1")));
     }
 
     /// #774/#1169: a reclaim is recovery of one lost answer. Every conjunct is exercised on its
@@ -4491,6 +4576,62 @@ mod tests {
         assert!(!esc.is_claimable(T0 + 60));
         assert_eq!(esc.peer_participation().invoked, 1);
         assert_eq!(esc.peer_participation().concurred, 0);
+    }
+
+    /// NOVA 11-22: an old `gate_escalation_corroborated` event, written before
+    /// `post_decision` existed, replays as `false` even when its own `at` is AFTER the
+    /// ruling. That is "not recorded", not "pre-ruling" (see the field's doc). A current
+    /// event that carries the key is believed.
+    #[test]
+    fn replay_of_a_legacy_corroboration_without_post_decision_loads_false_not_reclassified() {
+        let opened = chain_entry(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": "old1", "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Edit",
+                "marker": "law_inject.py", "opened_at": T0, "expires_at": T0 + 3600,
+            }),
+        );
+        let decided = chain_entry(
+            "gate_escalation_decided",
+            serde_json::json!({
+                "escalation_id": "old1", "status": "denied", "decided_by": "operator",
+                "decided_via": "operator_session",
+                "factors_present": [{"channel": "operator_session", "by": "operator",
+                                     "role": null, "independence": null, "at": T0 + 10}],
+            }),
+        );
+        let factors = |with_key: bool| {
+            let mut late = serde_json::json!({
+                "channel": "peer_member", "by": "codex", "role": "role:constellation:member",
+                "independence": "cross_vendor", "at": T0 + 20, "dissent": true,
+                "argument": "after the fact", "post_claim": false,
+            });
+            if with_key {
+                late["post_decision"] = serde_json::json!(true);
+            }
+            serde_json::json!([
+                {"channel": "operator_session", "by": "operator", "role": null,
+                 "independence": null, "at": T0 + 10},
+                late,
+            ])
+        };
+        let corroborated = |with_key: bool| chain_entry(
+            "gate_escalation_corroborated",
+            serde_json::json!({"escalation_id": "old1", "factors_present": factors(with_key)}),
+        );
+
+        let mut legacy = EscalationStore::default();
+        legacy.rehydrate(&[opened.clone(), decided.clone(), corroborated(false)], T0 + 60);
+        let row = legacy.get("old1").expect("restored");
+        assert_eq!(row.factors.len(), 2, "the legacy factor must still load, not be dropped");
+        assert!(row.factors[1].at > row.decided_at.unwrap(), "fixture: the factor is late");
+        assert!(!row.factors[1].post_decision, "missing history is not reclassified on replay");
+        assert!(row.factors[1].dissent, "the rest of the legacy factor survives");
+
+        let mut current = EscalationStore::default();
+        current.rehydrate(&[opened, decided, corroborated(true)], T0 + 60);
+        assert!(current.get("old1").unwrap().factors[1].post_decision, "a recorded key is believed");
     }
 
     /// #128, the restore half. A `gate_escalation_opened` entry written before `asker_basis`
@@ -6666,6 +6807,58 @@ mod bar_factor_tests {
     }
 
     #[test]
+    fn the_peer_is_told_truly_whether_its_ruling_decides() {
+        // The peer-side twin of the operator promise above, pinned the same way: as a
+        // property over the markers `bar_for` routes, never as a transcription of today's
+        // bar. `peer_ruling_suffices()` is what the invitation's `peer_answer` shows about
+        // an eligible NOT-SAME peer; that peer then rules through the arbitrate door, which
+        // appends a `PeerMember` decision. Whatever the prediction said must be what happens.
+        for marker in ["law_inject.py", "pre_tool_use.py", "witness.py", "hestia_gate_mechanism.py",
+                       "seat_gate_boundary_test.py"]
+        {
+            let (mut s, id) = open_with(marker);
+            let promised = s.get(&id).unwrap().peer_ruling_suffices();
+            let e = s
+                .decide(&id, true, "claude-code", "role:constellation:member", Channel::PeerMember,
+                        Some(crate::arbiter::Independence::CrossVendor), Some("reviewed"), T0 + 5)
+                .expect("a not-same peer rules");
+            assert_eq!(
+                e.bar_met(),
+                promised,
+                "{marker}: told the peer `peer_ruling_suffices = {promised}`, then its ruling \
+                 produced bar_met = {}",
+                e.bar_met()
+            );
+            assert_eq!(e.is_claimable(T0 + 6), promised, "{marker}: and the write follows it");
+        }
+        // The two cases the overnight escalations of 2026-11-12 actually hit, by name.
+        let (s, id) = open_with("seat_gate_boundary_test.py");
+        assert!(s.get(&id).unwrap().peer_ruling_suffices(),
+                "a single-approver test file: the peer's ruling alone decides");
+        let (s, id) = open_with("hestia_single_gate.py");
+        assert!(!s.get(&id).unwrap().peer_ruling_suffices(),
+                "the common gate is sovereign_plus_peer: no peer ruling meets it");
+
+        // A peer DENIAL is a terminal ruling too. Its factor meets the evidence bar on a
+        // single-approver ask, but a denied status never becomes a grant, and a later approval
+        // cannot rewrite it after a reader has acted on the earlier answer.
+        let (mut s, id) = open_with("seat_gate_boundary_test.py");
+        assert!(s.get(&id).unwrap().peer_ruling_suffices());
+        let denied = s
+            .decide(&id, false, "codex", "role:constellation:member", Channel::PeerMember,
+                    Some(crate::arbiter::Independence::CrossVendor), None, T0 + 5)
+            .expect("a not-same peer may deny");
+        assert_eq!(denied.stored_status(), Status::Denied);
+        assert!(denied.bar_met(), "the peer factor still meets the single-approver evidence bar");
+        assert!(!denied.is_claimable(T0 + 6), "a denial is never a grant");
+        let raced = s
+            .decide(&id, true, "codex", "role:constellation:member", Channel::PeerMember,
+                    Some(crate::arbiter::Independence::CrossVendor), Some("too late"), T0 + 6)
+            .expect_err("a settled denial cannot be upgraded by a raced approval");
+        assert_eq!(raced, DecideError::AlreadyDecided(Status::Denied));
+    }
+
+    #[test]
     fn relaxing_a_bar_cannot_leave_the_operator_surface_asserting_the_old_one() {
         // The regression test for the CAUSE, not just the symptom. Both operator-facing
         // fields are derived from `bar_met_over`, so there is no second copy of the bar to
@@ -6837,6 +7030,101 @@ mod bar_factor_tests {
     }
 
     #[test]
+    fn post_decision_review_is_typed_separately_from_post_claim_commentary() {
+        let (mut s, id) = open_with("law_inject.py");
+        let pending = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                    false, Some("before the ruling"), T0 + 1).unwrap();
+        assert!(!pending.factors[0].post_decision);
+        assert!(!pending.factors[0].post_claim);
+
+        let decided = s.decide(&id, true, "dp", "role:constellation:sovereign",
+                               Channel::OperatorSession, None, Some("reviewed"), T0 + 2).unwrap();
+        assert!(!decided.factors[0].post_decision, "the pending factor keeps its temporal meaning");
+        assert!(!decided.factors[1].post_decision, "the decider's own factor is not retrospective");
+
+        let reviewed = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                     true, Some("retrospective disagreement"), T0 + 3).unwrap();
+        let review = reviewed.factors.last().unwrap();
+        assert!(review.post_decision);
+        assert!(!review.post_claim, "decided need not mean spent");
+
+        let invoked = s.attach_invoked(
+            &id,
+            "lct:web4:filler:ollama-qwen3",
+            "role:constellation:classifier",
+            crate::arbiter::Independence::CrossVendor,
+            false,
+            Some("retrospective classification"),
+            invocation(),
+            T0 + 4,
+        ).unwrap();
+        let classification = invoked.factors.last().unwrap();
+        assert!(classification.post_decision);
+        assert!(!classification.post_claim);
+
+        s.claim("claude-code", "law_inject.py", Some("Edit -> act"), T0 + 5)
+            .expect("the approved act is spent before the final comment");
+        let commented = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                      false, Some("after the spend"), T0 + 6).unwrap();
+        let comment = commented.factors.last().unwrap();
+        assert!(comment.post_decision);
+        assert!(comment.post_claim);
+
+        let mut legacy = serde_json::to_value(comment).unwrap();
+        legacy.as_object_mut().unwrap().remove("post_decision");
+        let historical: Factor = serde_json::from_value(legacy).unwrap();
+        assert!(!historical.post_decision, "missing history is not reclassified");
+        assert!(historical.post_claim, "the independent older field is preserved");
+    }
+
+    /// NOVA 11-22: the same-second ruling boundary. `post_decision` is keyed on whether the
+    /// ruling EXISTED when the factor was accepted, not on comparing seconds, so a factor
+    /// filed in the ruling's own second reads by order: before the ruling false, after true.
+    #[test]
+    fn a_factor_in_the_same_second_as_the_ruling_is_labelled_by_order_not_by_clock() {
+        let (mut s, id) = open_with("law_inject.py");
+        let ruling_second = T0 + 2;
+        s.corroborate(&id, "codex", "role:constellation:member", None,
+                      false, Some("just before"), ruling_second).unwrap();
+        s.decide(&id, true, "dp", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("ok"), ruling_second).unwrap();
+        let after = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                  true, Some("just after"), ruling_second).unwrap();
+        assert_eq!(after.decided_at, Some(ruling_second));
+        assert!(!after.factors[0].post_decision, "filed before the ruling, same second");
+        assert!(after.factors[2].post_decision, "filed after the ruling, same second");
+        assert!(!after.factors[2].post_claim);
+    }
+
+    /// NOVA 11-22: a late `attach_invoked` on a DENIED row (operator deny, and a
+    /// self-withdrawal, which is a deny via `SelfWithdrawn`) lands, is typed
+    /// `post_decision`, is not `post_claim` (nothing was spent), and moves nothing.
+    #[test]
+    fn a_late_invoked_factor_on_a_denied_or_withdrawn_row_is_post_decision_and_inert() {
+        for via in [Channel::OperatorSession, Channel::SelfWithdrawn] {
+            let (mut s, id) = open_with("law_inject.py");
+            s.decide(&id, false, "claude-code", "role:constellation:member",
+                     via, None, Some("no"), T0 + 2).unwrap();
+            let late = s.attach_invoked(
+                &id,
+                "lct:web4:filler:ollama-qwen3",
+                "role:constellation:classifier",
+                crate::arbiter::Independence::CrossVendor,
+                false,
+                Some("late classification"),
+                invocation(),
+                T0 + 3,
+            ).unwrap_or_else(|e| panic!("{via:?}: a denied row takes late evidence: {e:?}"));
+            let f = late.factors.last().unwrap();
+            assert_eq!(f.channel, Channel::Invoked);
+            assert!(f.post_decision, "{via:?}: late invoked factor not typed post_decision");
+            assert!(!f.post_claim, "{via:?}: a denied row was never spent");
+            assert_eq!(late.stored_status(), Status::Denied, "{via:?}: the ruling is untouched");
+            assert!(!late.is_claimable(T0 + 3), "{via:?}: nothing became claimable");
+        }
+    }
+
+    #[test]
     fn a_late_factor_cannot_move_the_bar_on_the_surface_where_it_could() {
         // The sibling test above uses a `law_inject.py` fixture, which `bar_for` maps to
         // SingleApprover — where `sovereign || peer` is already true from the decider's own
@@ -6867,6 +7155,48 @@ mod bar_factor_tests {
             "and it MUST NOT turn an unclaimable approval into a claimable one"
         );
         assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
+    }
+
+    #[test]
+    fn a_peer_deny_is_counted_as_dissent_not_concurrence() {
+        // #1633. `law_inject.py` is SingleApprover, the bar on which a NOT-SAME peer's ruling
+        // decides. codex dissents first, then a second peer rules DENY. Both refused, so the
+        // record must show two dissents. Before the fix it read `concurred: 1, dissented: 1`.
+        let (mut s, id) = open_with("law_inject.py");
+        assert_eq!(s.get(&id).unwrap().bar, Bar::SingleApprover);
+        s.corroborate(&id, "codex", "role:constellation:member", None, true, Some("cannot see the act"), T0 + 2)
+            .expect("peer dissent lands while pending");
+        let e = s
+            .decide(&id, false, "claude-code", "role:constellation:member", Channel::PeerMember, None, Some("refused"), T0 + 4)
+            .expect("a peer may rule on single_approver");
+        assert_eq!(e.stored_status(), Status::Denied);
+        let decider = e.factors.last().expect("the decider's factor is recorded");
+        assert_eq!(decider.channel, Channel::PeerMember);
+        assert!(decider.dissent, "a peer's deny is its dissent");
+        let p = e.peer_participation();
+        assert_eq!((p.concurred, p.dissented), (0, 2), "both peers refused; the record must say so");
+    }
+
+    #[test]
+    fn a_peer_approval_still_counts_as_concurrence_and_operator_rulings_are_unchanged() {
+        // The other three cells of (channel x ruling). A peer approve concurs. An operator
+        // ruling (approve OR deny) keeps `dissent: false` and is not a peer factor at all.
+        let (mut s, id) = open_with("law_inject.py");
+        let e = s
+            .decide(&id, true, "kimi-code", "role:constellation:member", Channel::PeerMember, None, Some("ok"), T0 + 4)
+            .expect("peer approve");
+        assert!(!e.factors.last().unwrap().dissent);
+        assert_eq!((e.peer_participation().concurred, e.peer_participation().dissented), (1, 0));
+
+        for approve in [true, false] {
+            let (mut s, id) = open_with("law_inject.py");
+            let e = s
+                .decide(&id, approve, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 4)
+                .expect("operator ruling");
+            assert!(!e.factors.last().unwrap().dissent, "operator factors stay dissent:false (approve={approve})");
+            let p = e.peer_participation();
+            assert_eq!(p.concurred + p.dissented, 0, "an operator ruling is not peer participation");
+        }
     }
 
     #[test]

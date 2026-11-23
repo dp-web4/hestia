@@ -271,8 +271,9 @@ it was what made the question unaskable.
 
 **Something must ask.** A queryable quantity nobody queries is the defect that `f2e0d1f`
 fixed one level down (an alarm written to a directory nobody reads). `hestia-watch-member.sh`
-announces unanswered rows to the journal at startup and hourly (`UNANSWERED_EVERY`), and —
-the asker that actually lands — folds them into every fire primer, so the question arrives
+announces unanswered rows to the journal at startup and hourly (`UNANSWERED_EVERY`, independently
+of the ARTIFACT/DAEMON gauge's `LEVEL_EVERY`), and — the asker that actually lands — folds them
+into every fire primer, so the question arrives
 inside a wake that was happening anyway. Deliberately NOT done: firing a member *because*
 it owes a response. Auto-waking a CLI is a consequential act; debt is not a reason to spend
 one.
@@ -399,7 +400,11 @@ witnessed `member_notice` chain event *and* in the send response; `unknown`/`dor
 `recipient_note` that names the route rather than just the gap. `member_unanswered` carries
 it on `owed_to_me` rows (not `i_owe` — there the recipient is the caller, who just proved
 its own liveness by asking), so the fire primer can distinguish *live and unanswered* from
-*never seen locally — misrouted?*. Both fire templates render the distinction.
+*never seen locally*. The fire templates render that as a fact about the name, with no
+instruction: an unanswered row's recipient was not chosen by the reader (escalation
+invitations name test fixtures and model ids), so there is no route for the reader to fix
+(hestia#1604). The send-time `recipient_note` still names the route, since there the
+sender chose the name.
 
 **Four things stated so the mark is not overread:**
 
