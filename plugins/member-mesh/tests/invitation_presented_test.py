@@ -15,6 +15,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 CLI = os.environ.get("HESTIA_MESH_CLI") or str(HERE.parent / "hestia-mesh.py")
 CALLS = []
 FAIL_ON = set()
+NOT_INVITED_ON = set()
 
 
 class Stub(BaseHTTPRequestHandler):
@@ -37,9 +38,13 @@ class Stub(BaseHTTPRequestHandler):
         if name == "hestia_gate_escalation_presented":
             args = body["params"]["arguments"]
             CALLS.append(args)
+            if args["escalation_id"] in NOT_INVITED_ON:
+                return self._sse(body["id"], {"_hestia_error": {
+                    "code": "hestia.test.not_invited",
+                    "message": f"{args['escalation_id']} was not invited to escalation; refusing an unbound observation"}})
             if args["escalation_id"] in FAIL_ON:
                 return self._sse(body["id"], {"_hestia_error": {
-                    "code": "hestia.test.unbound", "message": "invitation was not presented"}})
+                    "code": "hestia.test.transport", "message": "transport failed"}})
             return self._sse(body["id"], {
                 "escalation_id": args["escalation_id"], "recorded": True,
                 "observed": True, "witnessEntryHash": "witness"})
@@ -83,6 +88,7 @@ class PresentedTest(unittest.TestCase):
     def setUp(self):
         CALLS.clear()
         FAIL_ON.clear()
+        NOT_INVITED_ON.clear()
 
     def run_cli(self, text):
         env = dict(os.environ, HESTIA_ENDPOINT=self.endpoint,
@@ -129,6 +135,16 @@ class PresentedTest(unittest.TestCase):
         self.assertEqual(payload["observations"][0]["escalation_id"], a)
         self.assertIn("_hestia_error", payload)
         self.assertEqual(len(CALLS), 2)
+
+    def test_not_invited_disposition_does_not_drop_later_invitations(self):
+        own = "aaaaaaaaaaaaaaaa"
+        invited = "bbbbbbbbbbbbbbbb"
+        NOT_INVITED_ON.add(own)
+        rc, out, err = self.run_cli(f"hestia://escalation/{own}#decided hestia://escalation/{invited}#review")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([call["escalation_id"] for call in CALLS], [own, invited])
+        payload = json.loads(out)
+        self.assertEqual([row["escalation_id"] for row in payload["observations"]], [invited])
 
     def run_fire(self, script, executable, sender, member, member_rc):
         escalation_id = "0123456789abcdef"

@@ -694,6 +694,8 @@ def act(cmd):
             result = rpc(h, "hestia_gate_escalation_presented",
                          {"session_id": s, "escalation_id": escalation_id})
             if failed(result):
+                if "not invited" in json.dumps(result):
+                    continue
                 out = dict(result, observations=observations)
                 break
             observations.append(result)

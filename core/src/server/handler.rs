@@ -29957,7 +29957,7 @@ async fn tool_gate_escalation_presented(state: &SharedState, args: &Value) -> To
             "presented_to": caller.plugin_id,
             "presented_role": caller.role_lct,
             "presenter_host_session_id": host_session_id,
-            "evidence": "member_cli_wake_completed",
+            "evidence": "fire_script_rc0_member_wake",
         }),
     )?;
     if !s.gate_escalations.record_presented(&escalation_id, &caller.plugin_id) {
