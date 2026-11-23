@@ -1,7 +1,16 @@
 //! Governance Twin shadow evaluation, ratified activation, and learning evidence.
 //!
-//! Candidates never block an act and never mutate active policy. Only an exact,
-//! ratified projection can be returned for activation by the caller.
+//! Candidates never block an act and never mutate active policy. Only a
+//! projection whose hash matches its ratification reference, inside the
+//! reference's effective window, is returned for activation by the caller.
+//!
+//! ASSURANCE: the activation check is UNAUTHENTICATED (A0). `RatificationRef`
+//! carries no signature and no key, operator LCT or sovereign identity is
+//! consulted, so the check proves only that the reference names these bytes.
+//! Anyone holding a candidate can compute its hash and write any authority
+//! string. `activate_local` / `activate_society` MUST NOT be wired to live
+//! enforcement until a signature over the reference is verified (#1408, #1629);
+//! `activation_has_no_caller_outside_this_module` holds that line.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,13 +40,20 @@ pub struct InstitutionalSourceRef {
     pub provenance: Option<String>,
 }
 
+/// A caller-supplied pointer to a ratification act. It is a REFERENCE, not a
+/// proof: nothing here is signed and nothing is verified against a key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RatificationRef {
+    /// Free text naming who ratified. Not authenticated.
     pub authority: String,
+    /// Free text naming where the ratification is recorded. Not resolved.
     pub reference: String,
+    /// RFC 3339 instants; an unparseable value refuses activation.
     pub effective_from: Option<String>,
     pub effective_to: Option<String>,
-    pub signed_projection_sha256: String,
+    /// SHA-256 of the projection this reference names. A plain digest any
+    /// holder of the candidate can compute; it is not a signature.
+    pub projection_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +172,14 @@ pub fn shadow_society(
     })
 }
 
+fn parse_instant(label: &str, value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|error| anyhow::anyhow!("{label} {value:?} is not an RFC 3339 timestamp: {error}"))
+}
+
+/// UNAUTHENTICATED (A0): checks that the reference is filled in, names this
+/// projection's hash, and is inside its effective window. It verifies no
+/// signature. See the module doc before calling this from a live path.
 fn validate_ratification(
     ratification: Option<&RatificationRef>,
     expected_hash: &str,
@@ -164,16 +188,21 @@ fn validate_ratification(
     let ratification = ratification.ok_or_else(|| anyhow::anyhow!("a ratification reference is required"))?;
     ensure!(!ratification.authority.trim().is_empty(), "ratification authority is required");
     ensure!(!ratification.reference.trim().is_empty(), "ratification reference is required");
-    ensure!(ratification.signed_projection_sha256 == expected_hash, "signed projection hash does not match the Lawbook projection");
+    ensure!(ratification.projection_sha256 == expected_hash, "the ratification reference names a different projection hash than the Lawbook projection");
+    // Instants, not strings: `Z`, `+00:00` and a local offset are three
+    // spellings that do not sort against each other. A date that cannot be
+    // read refuses activation; it is never compared.
+    let valid_at = parse_instant("valid_at", valid_at)?;
     if let Some(from) = &ratification.effective_from {
-        ensure!(valid_at >= from.as_str(), "the ratified projection is not yet effective");
+        ensure!(valid_at >= parse_instant("effective_from", from)?, "the ratified projection is not yet effective");
     }
     if let Some(to) = &ratification.effective_to {
-        ensure!(valid_at <= to.as_str(), "the ratified projection is expired or superseded");
+        ensure!(valid_at <= parse_instant("effective_to", to)?, "the ratified projection is expired or superseded");
     }
     Ok(())
 }
 
+/// UNAUTHENTICATED (A0) — not for live enforcement; see the module doc.
 pub fn activate_local(candidate: &CandidateProjection, valid_at: &str) -> Result<LocalProjection> {
     let projection = candidate.lawbook.compile()?;
     validate_ratification(
@@ -184,6 +213,7 @@ pub fn activate_local(candidate: &CandidateProjection, valid_at: &str) -> Result
     Ok(projection)
 }
 
+/// UNAUTHENTICATED (A0) — not for live enforcement; see the module doc.
 pub fn activate_society(candidate: &SocietyCandidateProjection, valid_at: &str) -> Result<LawGate> {
     let hash = candidate.lawbook.projection_hash()?;
     validate_ratification(candidate.ratification.as_ref(), &hash, valid_at)?;
@@ -448,7 +478,7 @@ mod tests {
 
     fn candidate() -> CandidateProjection {
         let lawbook = candidate_book();
-        let signed_projection_sha256 = lawbook.compile().unwrap().source_projection_hash;
+        let projection_sha256 = lawbook.compile().unwrap().source_projection_hash;
         CandidateProjection {
             lawbook,
             institutional_sources: sources(),
@@ -457,7 +487,7 @@ mod tests {
                 reference: "ratifications/2026-10-03-deploy".into(),
                 effective_from: Some("2026-10-01T00:00:00Z".into()),
                 effective_to: Some("2026-12-31T23:59:59Z".into()),
-                signed_projection_sha256,
+                projection_sha256,
             }),
         }
     }
@@ -528,8 +558,122 @@ mod tests {
         missing.ratification = None;
         assert!(activate_local(&missing, "2026-11-01T00:00:00Z").is_err());
         let mut wrong_hash = candidate.clone();
-        wrong_hash.ratification.as_mut().unwrap().signed_projection_sha256 = "0".repeat(64);
+        wrong_hash.ratification.as_mut().unwrap().projection_sha256 = "0".repeat(64);
         assert!(activate_local(&wrong_hash, "2026-11-01T00:00:00Z").is_err());
+    }
+
+    fn windowed(from: Option<&str>, to: Option<&str>) -> CandidateProjection {
+        let mut candidate = candidate();
+        let ratification = candidate.ratification.as_mut().unwrap();
+        ratification.effective_from = from.map(str::to_string);
+        ratification.effective_to = to.map(str::to_string);
+        candidate
+    }
+
+    /// mcnugget-claude's second item on #1696: the window was compared as
+    /// strings, which orders correctly only when every timestamp has one exact
+    /// spelling. Two of these three cases were fail-OPEN under string order.
+    #[test]
+    fn the_effective_window_compares_instants_not_strings() {
+        let candidate = windowed(Some("2026-10-01T00:00:00Z"), Some("2026-12-31T23:59:59Z"));
+        // 2027-01-01T04:30Z: expired, though its local spelling sorts inside the window.
+        let error = activate_local(&candidate, "2026-12-31T23:30:00-05:00").unwrap_err();
+        assert!(error.to_string().contains("expired"), "{error}");
+        // 2026-09-30T22:30Z: not yet effective, though its local spelling sorts after `from`.
+        let error = activate_local(&candidate, "2026-10-01T00:30:00+02:00").unwrap_err();
+        assert!(error.to_string().contains("not yet effective"), "{error}");
+        // 2026-12-31T23:30Z: inside the window, though its local spelling sorts after `to`.
+        activate_local(&candidate, "2027-01-01T00:30:00+01:00").unwrap();
+        // The same instant in two spellings is the same instant, at both bounds.
+        activate_local(&candidate, "2026-12-31T23:59:59+00:00").unwrap();
+        activate_local(&candidate, "2026-10-01T02:00:00+02:00").unwrap();
+        // Controls on the plain form.
+        activate_local(&candidate, "2026-11-01T00:00:00Z").unwrap();
+        assert!(activate_local(&candidate, "2027-01-01T00:00:00Z").is_err());
+        assert!(activate_local(&candidate, "2026-09-30T23:59:59Z").is_err());
+    }
+
+    /// A date that cannot be read is refused, never compared.
+    #[test]
+    fn an_unparseable_date_fails_closed() {
+        let good = windowed(Some("2026-10-01T00:00:00Z"), Some("2026-12-31T23:59:59Z"));
+        for valid_at in ["2026-11-23 10:00", "2026-11-23", "", "now"] {
+            let error = activate_local(&good, valid_at).unwrap_err();
+            assert!(error.to_string().contains("RFC 3339"), "valid_at {valid_at:?}: {error}");
+        }
+        // No window at all does not make an unreadable clock acceptable.
+        assert!(activate_local(&windowed(None, None), "2026-11-23 10:00").is_err());
+        activate_local(&windowed(None, None), "2026-11-23T10:00:00Z").unwrap();
+
+        let bad_to = windowed(Some("2026-10-01T00:00:00Z"), Some("never"));
+        let error = activate_local(&bad_to, "2026-11-01T00:00:00Z").unwrap_err();
+        assert!(error.to_string().contains("effective_to"), "{error}");
+        let bad_from = windowed(Some(""), Some("2026-12-31T23:59:59Z"));
+        let error = activate_local(&bad_from, "2026-11-01T00:00:00Z").unwrap_err();
+        assert!(error.to_string().contains("effective_from"), "{error}");
+    }
+
+    /// What the activation check does NOT prove. Any holder of a candidate can
+    /// hash it and name any authority; that activates. This test pins the A0
+    /// behaviour so nobody reads the check as signed ratification: when a
+    /// signature is verified (#1408, #1629) this test must start failing and be
+    /// replaced by the forged-signature refusal.
+    #[test]
+    fn activation_is_unauthenticated_and_must_not_gate_live_enforcement_until_signatures_exist() {
+        let mut forged = candidate();
+        let self_computed = forged.lawbook.compile().unwrap().source_projection_hash;
+        forged.ratification = Some(RatificationRef {
+            authority: "nobody in particular".into(),
+            reference: "made-up".into(),
+            effective_from: None,
+            effective_to: None,
+            projection_sha256: self_computed,
+        });
+        assert!(
+            activate_local(&forged, "2026-11-01T00:00:00Z").is_ok(),
+            "a self-computed hash with an invented authority activates: the check is A0"
+        );
+    }
+
+    fn activation_callers(root: &Path, own: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") && path != own {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    if text.contains("activate_local") || text.contains("activate_society") {
+                        found.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// The "not for live enforcement" line, held mechanically: no source file
+    /// other than this one may name the activation functions while they are A0.
+    #[test]
+    fn activation_has_no_caller_outside_this_module() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let own = src.join("policy").join("governance_twin.rs");
+        assert!(own.is_file(), "the guard must be looking at the real tree: {}", own.display());
+        let callers = activation_callers(&src, &own);
+        assert!(
+            callers.is_empty(),
+            "activate_* is unauthenticated (A0) and must not be wired up until a signature is verified: {callers:?}"
+        );
+
+        // The scan can see a caller: a seeded one is found, and this file is excluded only by path.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("server")).unwrap();
+        let seeded = dir.path().join("server").join("live.rs");
+        std::fs::write(&seeded, "fn wire() { governance_twin::activate_society(&c, now); }").unwrap();
+        std::fs::write(dir.path().join("quiet.rs"), "fn nothing() {}").unwrap();
+        assert_eq!(activation_callers(dir.path(), &own), vec![seeded.display().to_string()]);
     }
 
     #[test]
@@ -594,7 +738,7 @@ mod tests {
         let mut society_provenance = provenance();
         society_provenance.authority_domain = AuthorityDomain::SocietyHub;
         let society = SocietyLawbook::new(society_provenance, law).unwrap();
-        let signed_projection_sha256 = society.projection_hash().unwrap();
+        let projection_sha256 = society.projection_hash().unwrap();
         let candidate = SocietyCandidateProjection {
             lawbook: society,
             institutional_sources: sources(),
@@ -603,7 +747,7 @@ mod tests {
                 reference: "ratifications/2026-10-03-society".into(),
                 effective_from: Some("2026-10-01T00:00:00Z".into()),
                 effective_to: Some("2026-12-31T23:59:59Z".into()),
-                signed_projection_sha256,
+                projection_sha256,
             }),
         };
         let decision = shadow_society(&candidate, &PolicyConfig {
