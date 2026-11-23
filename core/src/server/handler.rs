@@ -26399,6 +26399,15 @@ fn act_mentions_path_token(act: &str, target: &str) -> bool {
     })
 }
 
+/// How old a deny may be and still back a dispatcher-after-deny ask: the grant window. The
+/// gate's own asks are opened at the moment of the deny; this is the dispatcher's allowance for
+/// filing afterwards. A timestamp ahead of the daemon's clock by more than a minute is not fresh.
+fn deny_is_fresh(deny_unix: i64, now: u64) -> bool {
+    let now = now as i64;
+    deny_unix <= now + 60
+        && now - deny_unix <= crate::server::state::SCOPE_REQUEST_TTL_SECS as i64
+}
+
 fn dispatcher_origin(
     s: &super::state::ServerState,
     plugin_id: &str,
@@ -26415,6 +26424,13 @@ fn dispatcher_origin(
     }
     let hash = deny_witness?;
     let entry = s.chain_store.read_by_hash(&hash).ok().flatten()?;
+    // A deny is evidence about work happening NOW. An old one proves the path was refused once,
+    // not that the dispatcher was just refused, and it would let any deny ever witnessed for
+    // this member open a peer-decidable ask. It also bounds the "latest decision" scan below
+    // to the same window.
+    if !deny_is_fresh(entry.timestamp.timestamp(), crate::server::gate_escalation::now_secs()) {
+        return None;
+    }
     let d = &entry.event_data;
     if d.get("plugin_id").and_then(Value::as_str) != Some(plugin_id) {
         return None;
@@ -26617,6 +26633,40 @@ pub(crate) async fn tool_request_scope(state: &SharedState, args: &Value) -> Too
         optional_string(args, "deny_witness"),
         asker_basis,
     );
+    // ONE DENY BACKS ONE ASK. Without this, one witnessed deny could be presented again and
+    // again, each time opening a fresh peer-decidable request and waking every invited peer; and
+    // a deny a peer had already ruled on could be presented to a different peer for a second
+    // ruling. Still pending for this path: the member gets that request back and nothing new is
+    // filed. Already ruled, or already used for another path: this ask is member-filed, which the
+    // operator decides. (The check reads the live request table, so it does not see asks from
+    // before a daemon restart; the freshness bound in `dispatcher_origin` is what limits those.)
+    let gate_origin = match gate_origin {
+        None => None,
+        Some(origin) => {
+            // Every request this deny already backs. More than one can exist (an expired one
+            // and a later one), so the open same-path request is looked for first.
+            let backed: Vec<(String, bool, u64)> = s.scope_requests.iter()
+                .filter(|(_, r)| r.plugin_id == plugin_id
+                    && r.ext.gate.as_ref().is_some_and(|g| g.escalated_from == origin.escalated_from))
+                .map(|(id, r)| (id.clone(), r.path == path && r.status(now) == "pending", r.expires_at))
+                .collect();
+            if let Some((id, _, expires_at)) = backed.iter().find(|(_, open_here, _)| *open_here) {
+                return Ok(json!({
+                    "request_id": id,
+                    "status": "pending",
+                    "already_open": true,
+                    "path": path,
+                    "origin": "dispatcher_after_deny",
+                    "expires_at": expires_at,
+                    "permits_read": false,
+                    "note": "this deny already backs an open request for this path; nothing \
+                             new was filed and no peer was invited again. Poll \
+                             hestia_scope_status for its answer",
+                }));
+            }
+            if backed.is_empty() { Some(origin) } else { None }
+        }
+    };
     let invited = if gate_origin.is_some() {
         scope_peer_pool(&s, &plugin_id)
     } else {
@@ -30383,6 +30433,78 @@ mod dispatcher_origin_tests {
         tool_request_scope(state, &args).await.unwrap()
     }
 
+    /// One witnessed deny backs one ask. Presenting it again files nothing and wakes nobody;
+    /// presenting it for a second path, or after it was ruled, is a member-filed ask.
+    #[tokio::test]
+    async fn one_deny_backs_one_ask_and_cannot_be_replayed_for_a_second_ruling() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "kimi-code").await;
+        let peer = connect(&state, "codex").await;
+        let path = evidence(_dir.path(), "child/evidence.txt");
+        let parent = std::path::Path::new(&path).parent().unwrap().to_string_lossy().into_owned();
+        let deny = deny_for(&state, "kimi-code", &path, "mrh.path").await;
+        let origin = Some("dispatcher_after_deny");
+
+        let first = request(&state, Some(&asker), &path, origin, Some(&deny.hash)).await;
+        assert_eq!(first["origin"], "dispatcher_after_deny", "{first}");
+        let id = first["request_id"].as_str().unwrap().to_string();
+        let invitations = |state: &SharedState| {
+            let state = state.clone();
+            async move {
+                state.lock().await.recent_chain(200).into_iter()
+                    .filter(|e| e.event_type == "scope_requested"
+                        && e.event_data["origin"] == "dispatcher_after_deny")
+                    .count()
+            }
+        };
+        // Two statements: a guard taken inside a tuple lives to the end of the statement and
+        // would still be held when `invitations` locks.
+        let requests_before = state.lock().await.scope_requests.len();
+        let peer_asks_before = invitations(&state).await;
+
+        // Replayed while pending: the same request comes back, nothing is filed or witnessed.
+        for _ in 0..5 {
+            let again = request(&state, Some(&asker), &path, origin, Some(&deny.hash)).await;
+            assert_eq!(again["request_id"], id.as_str(), "{again}");
+            assert_eq!(again["already_open"], true, "{again}");
+            assert!(again.get("invited_peers").is_none(), "no peer is invited again: {again}");
+        }
+        assert_eq!(state.lock().await.scope_requests.len(), requests_before);
+        assert_eq!(invitations(&state).await, peer_asks_before);
+
+        // The same deny for the PARENT path: a real ask, but not a second peer-decidable one.
+        let widened = request(&state, Some(&asker), &parent, origin, Some(&deny.hash)).await;
+        assert_eq!(widened["origin"], "member_request", "{widened}");
+        assert_eq!(widened["invited_peers"], json!([]), "{widened}");
+
+        // A peer refuses. The deny cannot be presented again for another peer's ruling.
+        let refused = tool_scope_peer_decide(&state, &json!({
+            "session_id": peer, "request_id": id, "decision": "refuse",
+            "reason": "the dispatcher does not need this file",
+        })).await.unwrap();
+        assert_eq!(refused["granted"], false, "{refused}");
+        let after = request(&state, Some(&asker), &path, origin, Some(&deny.hash)).await;
+        assert_ne!(after["request_id"], id.as_str(), "{after}");
+        assert_eq!(after["origin"], "member_request", "a ruled deny opens no second peer ask: {after}");
+        assert_eq!(after["invited_peers"], json!([]), "{after}");
+        assert_eq!(invitations(&state).await, peer_asks_before);
+    }
+
+    /// The freshness window, as a table: the bound is the request window, and a deny dated
+    /// ahead of the clock is not evidence.
+    #[test]
+    fn only_a_recent_deny_backs_a_dispatcher_ask() {
+        let now = 1_800_000_000_u64;
+        let ttl = crate::server::state::SCOPE_REQUEST_TTL_SECS as i64;
+        let n = now as i64;
+        for (deny, want) in [
+            (n, true), (n - 1, true), (n - ttl, true), (n - ttl - 1, false),
+            (n - 30 * 86_400, false), (0, false), (n + 60, true), (n + 61, false),
+        ] {
+            assert_eq!(deny_is_fresh(deny, now), want, "deny at now{:+}", deny - n);
+        }
+    }
+
     #[tokio::test]
     async fn a_proven_dispatcher_deny_is_peer_decidable_in_both_directions() {
         let (_dir, state) = test_state().await;
@@ -30450,8 +30572,14 @@ mod dispatcher_origin_tests {
             assert!(allowed.contains(&"session") && allowed.contains(&"standing"));
         }
 
-        let parent = request(&state, Some(&asker), &target,
+        // The parent ask needs its own witnessed deny: the first one is spent (one deny backs
+        // one ask), and reusing it here would be a second, wider ruling on the same evidence.
+        let reused = request(&state, Some(&asker), &target,
                              Some("dispatcher_after_deny"), Some(&deny.hash)).await;
+        assert_eq!(reused["origin"], "member_request", "{reused}");
+        let sibling_deny = deny_for(&state, "kimi-code", &sibling, "mrh.path").await;
+        let parent = request(&state, Some(&asker), &target,
+                             Some("dispatcher_after_deny"), Some(&sibling_deny.hash)).await;
         assert_eq!(parent["origin"], "dispatcher_after_deny", "{parent}");
         let parent_id = parent["request_id"].as_str().unwrap().to_string();
         let unbound = tool_scope_peer_decide(&state, &json!({
