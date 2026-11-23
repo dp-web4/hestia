@@ -276,8 +276,9 @@ it was what made the question unaskable.
 
 **Something must ask.** A queryable quantity nobody queries is the defect that `f2e0d1f`
 fixed one level down (an alarm written to a directory nobody reads). `hestia-watch-member.sh`
-announces unanswered rows to the journal at startup and hourly (`UNANSWERED_EVERY`), and —
-the asker that actually lands — folds them into every fire primer, so the question arrives
+announces unanswered rows to the journal at startup and hourly (`UNANSWERED_EVERY`, independently
+of the ARTIFACT/DAEMON gauge's `LEVEL_EVERY`), and — the asker that actually lands — folds them
+into every fire primer, so the question arrives
 inside a wake that was happening anyway. Deliberately NOT done: firing a member *because*
 it owes a response. Auto-waking a CLI is a consequential act; debt is not a reason to spend
 one.
