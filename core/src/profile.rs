@@ -720,9 +720,9 @@ mod tests {
             .with_expiry(now);
         assert!(!link.is_current(now), "expiry at this instant is no longer current");
         link.expires_at = Some(now - chrono::Duration::nanoseconds(1));
-        assert!(!link.is_current(now), "one nanosecond before expiry is already expired");
+        assert!(!link.is_current(now), "expiry one nanosecond before now is already expired");
         link.expires_at = Some(now + chrono::Duration::nanoseconds(1));
-        assert!(link.is_current(now), "one nanosecond after expiry is still current");
+        assert!(link.is_current(now), "expiry one nanosecond after now is still current");
         link.expires_at = None;
         assert!(link.is_current(now));
         link.revoke(now);
