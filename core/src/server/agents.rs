@@ -103,6 +103,10 @@ pub struct UngovernPlan {
     pub member: String,
     pub registrar: Option<PathBuf>,
     pub owned_targets: Vec<String>,
+    /// Hook targets the inventory reads for this member and does NOT attribute to hestia. They
+    /// are never removed. They are carried so the act can say what it left in force: "0 hooks
+    /// removed" beside a foreign gate line is not an unwired member.
+    pub unowned_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -150,6 +154,17 @@ pub fn ungovern_plan_from_inventory(id: &str, report: &Value) -> Result<Ungovern
         .collect();
     owned_targets.sort();
     owned_targets.dedup();
+    let mut unowned_targets: Vec<String> = rec
+        .get("hook_targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|target| target.get("owned_by_hestia").and_then(Value::as_bool) != Some(true))
+        .filter_map(|target| target.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    unowned_targets.sort();
+    unowned_targets.dedup();
     let registrar = if owned_targets.is_empty() {
         None
     } else {
@@ -166,7 +181,53 @@ pub fn ungovern_plan_from_inventory(id: &str, report: &Value) -> Result<Ungovern
             .ok_or_else(|| anyhow::anyhow!("the inventory names no workspace for the registrar"))?;
         Some(PathBuf::from(workspace).join("hestia/deploy/register-members.py"))
     };
-    Ok(UngovernPlan { member, registrar, owned_targets })
+    Ok(UngovernPlan { member, registrar, owned_targets, unowned_targets })
+}
+
+/// The caller holds the daemon's state lock across the registrar (the act must not interleave
+/// with another change to the same seat), so a registrar that never returns would stop every
+/// gate on the machine. It gets this long.
+const REGISTRAR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `Command::output` with a deadline. On the deadline the child is killed and the error says the
+/// outcome is NOT known: the registrar writes its edit by an atomic rename, so the config is
+/// either as it was or fully edited, and only a fresh inventory can say which.
+fn output_within(mut command: Command, limit: std::time::Duration) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    // Drain both pipes off-thread so a chatty child cannot block on a full pipe while we wait.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "the registrar did not finish within {limit:?} and was stopped; whether the harness \
+                 config was edited is NOT known — run the inventory before anything else"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
 }
 
 /// Execute the same ownership-proved registrar the operator installer uses, rather than keeping a
@@ -189,7 +250,8 @@ pub(crate) fn ungovern_at(
         .as_ref()
         .filter(|path| path.is_file())
         .ok_or_else(|| anyhow::anyhow!("the member registrar is not installed; nothing was changed"))?;
-    let out = Command::new("python3")
+    let mut command = Command::new("python3");
+    command
         .arg(registrar)
         .arg("--remove")
         .arg("--member")
@@ -198,8 +260,8 @@ pub(crate) fn ungovern_at(
         .arg("--home")
         .arg(operator_home)
         .args(plan.owned_targets.iter().flat_map(|target| ["--owned-target", target.as_str()]))
-        .env("HESTIA_HOME", hestia_home)
-        .output()?;
+        .env("HESTIA_HOME", hestia_home);
+    let out = output_within(command, REGISTRAR_TIMEOUT)?;
     let value: Value = serde_json::from_slice(&out.stdout).map_err(|e| {
         anyhow::anyhow!(
             "the registrar returned no readable result ({e}): {}",
@@ -250,8 +312,28 @@ mod tests {
             "/h/.kimi-code/hooks/witness.py".to_string(),
         ]);
         assert_eq!(plan.registrar.unwrap(), PathBuf::from("/w/hestia/deploy/register-members.py"));
+        assert_eq!(plan.unowned_targets, [
+            "/also-mine-but-not-inventoried.py".to_string(),
+            "/elsewhere/foreign.py".to_string(),
+        ], "what is not proved owned is reported as left in place, never as removable");
         report["detail"][0]["unknown"] = serde_json::json!(["config scope is incomplete"]);
         assert!(ungovern_plan_from_inventory("kimi-code", &report).is_err());
+    }
+
+    #[test]
+    fn a_registrar_that_never_returns_is_stopped_and_reported_as_unknown() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let started = std::time::Instant::now();
+        let error = output_within(command, std::time::Duration::from_millis(150)).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(error.to_string().contains("NOT known"), "{error}");
+        // control: a child that finishes is read in full
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf out; printf err >&2; exit 3"]);
+        let out = output_within(command, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!((out.status.code(), out.stdout.as_slice(), out.stderr.as_slice()),
+                   (Some(3), b"out".as_slice(), b"err".as_slice()));
     }
 
     #[test]
@@ -260,6 +342,7 @@ mod tests {
             member: "codex".into(),
             registrar: None,
             owned_targets: Vec::new(),
+            unowned_targets: Vec::new(),
         };
         let outcome = ungovern(&plan, Path::new("/not-read")).unwrap();
         assert_eq!(outcome.hooks_removed, 0);

@@ -1255,8 +1255,19 @@ def prepare_unregistration(member: str, spec: dict, template: dict, home: str, *
     L = got
     flat = L.layout == "flat"
     norm = lambda p: os.path.normpath(p) if p else p  # noqa: E731
+    owned = {norm(d.target) for d in L.desired if d.target}
     targets = {norm(t) for t in (owned_targets if owned_targets is not None
                                 else [d.target for d in L.desired]) if t}
+    # OWNERSHIP IS THIS FILE'S RULE, NOT THE CALLER'S WORD. A named target is removable only if it
+    # is one this member's template renders under its declared dest (the reconciler's definition
+    # of an owned line, point 3 of the header). Without this, `--owned-target` removed whatever
+    # path it was handed, and a FOREIGN line was safe only as long as every caller's own notion
+    # of "owned" agreed with this one.
+    not_owned = sorted(targets - owned)
+    if not_owned:
+        return "refused", [f"{L.cfg}: not a target this member's template owns under its declared "
+                           f"dest ({', '.join(not_owned)}); a FOREIGN line is never removed here, "
+                           "so nothing was removed"]
     regs = index_hooks(L.hooks, flat)
     found = {norm(r.target) for r in regs if r.target}
     missing = sorted(targets - found)

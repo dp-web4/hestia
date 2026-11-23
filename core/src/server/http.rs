@@ -8264,6 +8264,31 @@ fn restore_ungovern_projection(
     errors
 }
 
+/// The newest ungovern row for `id`, when it is an intent with no terminal row after it: an
+/// attempt the daemon began and did not finish (it died, or its failure record itself failed).
+fn dangling_ungovern_intent(s: &super::state::ServerState, id: &str) -> Option<String> {
+    let rows = s
+        .chain_store
+        .read_recent_by_types(
+            None,
+            &["agent_ungovern_intent", "agent_ungovern", "agent_ungovern_failed"],
+            200,
+        )
+        .ok()?;
+    let newest = rows.iter().find(|row| row.event_data["agent"] == id)?;
+    (newest.event_type == "agent_ungovern_intent").then(|| newest.hash.clone())
+}
+
+/// NOT ATOMIC, and it does not claim to be: vault, projection, harness config and chain are four
+/// stores. What it guarantees instead, per stopping point:
+///   - before the intent: nothing changed, nothing recorded;
+///   - after the intent, before the hooks: the gate is still registered but its seat authority
+///     and projection are gone, so the member is REFUSED (fail closed), never silently ungoverned;
+///   - after the hooks, before the record: the member is unwired and the chain holds the intent
+///     only. The next call finds that intent (`dangling_ungovern_intent`) and its terminal row
+///     names it in `completes_intent`.
+/// A retry from any of these states is safe: each step is a no-op when its work is already done.
+///
 /// REASON -> INTENT -> AUTHORITY/PROJECTION -> HOOKS -> RECORD. Any hook-edit refusal restores the
 /// authority and projection; the registrar itself either writes its proved edit or restores the
 /// harness config it read. The intent remains as the record of the refused attempt.
@@ -8282,8 +8307,28 @@ fn ungovern_ordered(
                       to say why enforcement was taken away",
         })));
     }
+    // THE CHAIN IS THE RECOVERY LEDGER (NOVA's hold on #1666). Vault, projection, harness config
+    // and chain cannot commit together, so a daemon that died part-way leaves an
+    // `agent_ungovern_intent` with no terminal row after it. `completes` is that intent: this
+    // run is then the retry that finishes it, and its terminal row says so.
+    let completes = dangling_ungovern_intent(s, id);
+    let projection_present = sc::render_path(&s.home, id).exists();
+    let document_present = s.vault.get_document(sc::SEAT_CONFIG_NS, id).is_some();
+    if plan.owned_targets.is_empty() && !projection_present && !document_present && completes.is_none() {
+        // Nothing hestia owns is left, and no earlier attempt is waiting to be closed. Refuse
+        // before the intent: a no-op must not put "an agent was ungoverned" on the chain.
+        return Err((StatusCode::CONFLICT, serde_json::json!({
+            "error": format!(
+                "nothing to unwire for '{id}': no hestia-owned hook is registered, and it has no \
+                 seat authority and no live projection. Nothing was changed or recorded."
+            ),
+            "hooks_left_unowned": plan.unowned_targets,
+        })));
+    }
     let intent = s
-        .append_chain("agent_ungovern_intent", serde_json::json!({"agent": id, "reason": reason}))
+        .append_chain("agent_ungovern_intent", serde_json::json!({
+            "agent": id, "reason": reason, "completes_intent": completes,
+        }))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({
             "error": format!("witnessing intent: {e}. Nothing was changed."),
         })))?
@@ -8342,7 +8387,7 @@ fn ungovern_ordered(
                 previous_quarantine.as_deref(),
             ));
             let error = e.to_string();
-            let _ = s.append_chain(
+            let failed = s.append_chain(
                 "agent_ungovern_failed",
                 serde_json::json!({
                     "agent": id,
@@ -8355,6 +8400,10 @@ fn ungovern_ordered(
                 "error": error,
                 "rollback_errors": rollback_errors,
                 "intentEntryHash": intent,
+                // A refusal whose own record failed leaves the intent with no terminal row. Say
+                // so: the next attempt will find it and report itself as completing it.
+                "failureRecorded": failed.is_ok(),
+                "failureRecordError": failed.as_ref().err().map(|e| e.to_string()),
             })));
         }
     };
@@ -8367,21 +8416,48 @@ fn ungovern_ordered(
             "backup": outcome.backup,
             "seat_config_removed": authority_removed,
             "projection_quarantined_to": quarantined_to,
+            "hooks_left_unowned": plan.unowned_targets,
+            "completes_intent": completes,
             "reason": reason,
             "intent": intent,
         }),
     );
+    // Say what happened, not what was asked for. "0 hooks removed" beside a hook the inventory
+    // does not attribute to hestia is a member that may still be gated (and now has no authority
+    // to be gated WITH), so it is named.
+    let mut message = if outcome.hooks_removed > 0 {
+        format!("{} hestia-owned hook(s) were removed from {id}.", outcome.hooks_removed)
+    } else {
+        format!("No hestia-owned hook was registered for {id}, so no hook was removed.")
+    };
+    message.push_str(match (authority_removed, quarantined_to.is_some()) {
+        (true, true) => " Its seat authority was removed and its live projection quarantined (kept, not deleted).",
+        (true, false) => " Its seat authority was removed; it had no live projection.",
+        (false, true) => " It had no seat authority; its live projection was quarantined (kept, not deleted).",
+        (false, false) => " It had no seat authority and no live projection.",
+    });
+    if !plan.unowned_targets.is_empty() {
+        message.push_str(&format!(
+            " {} hook(s) the inventory does not attribute to hestia were LEFT IN PLACE: {}. If one \
+             of them is a hestia gate registered outside its declared location, {id} is still gated \
+             by it and must be unwired by hand.",
+            plan.unowned_targets.len(),
+            plan.unowned_targets.iter().take(3).cloned().collect::<Vec<_>>().join(", "),
+        ));
+    }
+    if completes.is_some() {
+        message.push_str(" This run completed an earlier attempt that had stopped part-way.");
+    }
+    message.push_str(&format!(" Restart {id} for this to take effect."));
     Ok(serde_json::json!({
         "ok": true,
         "hooks_removed": outcome.hooks_removed,
         "backup": outcome.backup,
         "seat_config_removed": authority_removed,
         "projection_quarantined_to": quarantined_to,
-        "message": format!(
-            "{} hestia hook(s), the seat authority and its live projection were removed from {id}. \
-             The projection was quarantined, not deleted. Restart {id} for this to take effect.",
-            outcome.hooks_removed
-        ),
+        "hooks_left_unowned": plan.unowned_targets,
+        "completes_intent": completes,
+        "message": message,
         "intentEntryHash": intent,
         "recorded": entry.is_ok(),
         "witnessEntryHash": entry.as_ref().ok(),
@@ -15219,6 +15295,7 @@ mod operator_vault_tests {
             member: "claude-code".into(),
             registrar: None,
             owned_targets: Vec::new(),
+            unowned_targets: Vec::new(),
         }
     }
 
@@ -15240,6 +15317,15 @@ mod operator_vault_tests {
             .unwrap_err()
         };
         assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        // Something to unwire, so the call reaches the intent (a member with nothing left is
+        // refused earlier, as a no-op, and never gets as far as the record).
+        {
+            let mut s = state.lock().await;
+            let document = serde_json::to_vec(&super::super::seat_config::SeatConfig::default()).unwrap();
+            s.vault
+                .put_document(super::super::seat_config::SEAT_CONFIG_NS, "claude-code", document)
+                .unwrap();
+        }
         let _c = fail_appends_of(dir.path(), "agent_ungovern_intent");
         let e = {
             let mut s = state.lock().await;
@@ -15251,6 +15337,12 @@ mod operator_vault_tests {
         };
         assert_eq!(e.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!touched.get(), "a gate was removed with no reason or no intent record");
+        assert!(
+            state.lock().await.vault
+                .get_document(super::super::seat_config::SEAT_CONFIG_NS, "claude-code")
+                .is_some(),
+            "the seat authority was removed although the intent could not be recorded"
+        );
     }
 
     #[tokio::test]
@@ -15285,6 +15377,7 @@ mod operator_vault_tests {
             member: "claude-code".into(),
             registrar: Some(registrar),
             owned_targets: vec![pre.display().to_string(), witness.display().to_string()],
+            unowned_targets: vec!["/elsewhere/foreign.js".into()],
         };
         let document = serde_json::to_vec(&sc::SeatConfig {
             env: std::collections::BTreeMap::from([("A".into(), "one".into())]),
@@ -15331,6 +15424,86 @@ mod operator_vault_tests {
         ]);
         assert_eq!(rows[0].event_data["projection_quarantined_to"], quarantine.display().to_string());
         assert_eq!(rows[0].event_data["seat_config_removed"], true);
+        // what was left in force is on the record and in the operator's message
+        assert_eq!(rows[0].event_data["hooks_left_unowned"], serde_json::json!(["/elsewhere/foreign.js"]));
+        assert!(rows[0].event_data["completes_intent"].is_null());
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("2 hestia-owned hook(s) were removed"), "{message}");
+        assert!(message.contains("LEFT IN PLACE: /elsewhere/foreign.js"), "{message}");
+    }
+
+    /// The states a stopped run leaves, re-invoked. Nothing to do and nothing pending: refused with
+    /// no row. Stopped after the hooks and before the record: the retry closes that intent.
+    #[tokio::test]
+    async fn ungovern_from_a_partly_unwired_state_is_a_safe_retry_and_a_no_op_writes_nothing() {
+        use super::super::seat_config as sc;
+        let (dir, state) = test_state().await;
+        let plan = test_ungovern_plan();
+        let count = |s: &crate::server::state::ServerState| {
+            s.chain_store
+                .read_recent_by_types(None, &["agent_ungovern_intent", "agent_ungovern", "agent_ungovern_failed"], 50)
+                .unwrap()
+                .len()
+        };
+        let called = std::cell::Cell::new(0);
+        let run = |s: &mut crate::server::state::ServerState| {
+            ungovern_ordered(s, "claude-code", "retire this harness", &plan, |_, _| {
+                called.set(called.get() + 1);
+                Ok(crate::server::agents::UngovernOutcome { hooks_removed: 0, backup: None })
+            })
+        };
+
+        // 1. Never wired, nothing pending: a refusal, and the chain does not gain a row.
+        {
+            let mut s = state.lock().await;
+            let error = run(&mut s).unwrap_err();
+            assert_eq!(error.0, StatusCode::CONFLICT);
+            assert!(error.1["error"].as_str().unwrap().contains("nothing to unwire"), "{error:?}");
+            assert_eq!((count(&s), called.get()), (0, 0), "a no-op recorded an ungovern");
+        }
+
+        // 2. Stopped after the vault delete, before the hooks (the fail-closed window): the
+        //    projection is quarantined and no document is left. A retry is not a no-op as long as
+        //    anything of the seat remains; here the projection came back from a re-render.
+        std::fs::create_dir_all(sc::render_path(dir.path(), "claude-code").parent().unwrap()).unwrap();
+        std::fs::write(sc::render_path(dir.path(), "claude-code"), "stale projection").unwrap();
+        {
+            let mut s = state.lock().await;
+            let value = run(&mut s).unwrap();
+            assert_eq!(value["seat_config_removed"], false);
+            assert!(value["projection_quarantined_to"].is_string(), "{value}");
+            assert!(value["message"].as_str().unwrap().starts_with("No hestia-owned hook was registered"), "{value}");
+            assert!(value["completes_intent"].is_null());
+            assert_eq!(count(&s), 2);
+        }
+
+        // 3. Stopped after the hooks, before the record: an intent with nothing after it. Nothing
+        //    is left to remove, but the retry is NOT refused as a no-op: it closes that intent.
+        let dangling = {
+            let s = state.lock().await;
+            s.append_chain("agent_ungovern_intent", serde_json::json!({"agent": "claude-code", "reason": "died here"}))
+                .unwrap()
+                .hash
+        };
+        {
+            let mut s = state.lock().await;
+            let value = run(&mut s).unwrap();
+            assert_eq!(value["completes_intent"], dangling.as_str());
+            assert!(value["message"].as_str().unwrap().contains("completed an earlier attempt"), "{value}");
+            let rows = s.chain_store.read_recent_by_types(None, &["agent_ungovern"], 1).unwrap();
+            assert_eq!(rows[0].event_data["completes_intent"], dangling.as_str());
+            // closed: the next call is the plain no-op again
+            let error = run(&mut s).unwrap_err();
+            assert!(error.1["error"].as_str().unwrap().contains("nothing to unwire"), "{error:?}");
+        }
+
+        // 4. Another member's dangling intent is not this member's to complete.
+        {
+            let mut s = state.lock().await;
+            s.append_chain("agent_ungovern_intent", serde_json::json!({"agent": "kimi-code", "reason": "x"})).unwrap();
+            let error = run(&mut s).unwrap_err();
+            assert!(error.1["error"].as_str().unwrap().contains("nothing to unwire"), "{error:?}");
+        }
     }
 
     #[tokio::test]

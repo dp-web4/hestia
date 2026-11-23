@@ -220,6 +220,13 @@ def behaviour() -> None:
     check("only a governed harness is offered the one-act unwire",
           (rows["claude"]["canUngovern"], rows["codex"]["canUngovern"], rows["aider"]["canUngovern"]),
           (True, False, False))
+    # The route refuses a record the inventory could not fully classify, so no button is offered.
+    unclassified = dict(ok_report, detail=[
+        dict(d, unknown=["config scope is incomplete"]) if d["agent"] == "claude" else d
+        for d in ok_report["detail"]])
+    urows = {r["atlasId"]: r for g in run_model(unclassified)["groups"] for r in g["rows"]}
+    check("a governed harness the inventory could not classify is NOT offered unwire",
+          urows["claude"]["canUngovern"], False)
     check("scope carries where the atlas came from", m["scope"]["atlasSource"], "env")
 
     # UNKNOWN that still saw things: the banner AND the rows. The inventory deliberately keeps

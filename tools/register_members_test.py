@@ -2125,6 +2125,38 @@ def test_unregistration_removes_only_owned_json_hooks_and_backs_up_the_exact_byt
         assert Path(result["backup"]).read_text() == before
 
 
+def test_unregistration_refuses_a_named_target_the_template_does_not_own():
+    """`--owned-target` is a claim, and the registrar checks it against its own ownership rule. A
+    FOREIGN line named as owned (a wrong inventory, a hand-typed call) refuses the whole removal:
+    the foreign line stays, the owned lines stay, and no backup is written."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        plugins = _plugins(tmp, ("claude-code",))
+        _install(tmp, "claude-code", *_CC_FILES, *_MESH_FILES)
+        assert _run(tmp, plugins, "--member", "claude-code").returncode == 0
+        cfg = tmp / ".claude" / "settings.json"
+        data = json.loads(cfg.read_text())
+        # same basename as the gate, outside dest: exactly what the reconciler calls FOREIGN
+        foreign_gate = str(tmp / ".claude" / "elsewhere" / "pre_tool_use.py")
+        data["hooks"]["PreToolUse"].append({"matcher": "Read", "hooks": [
+            {"type": "command", "command": f"python3 {foreign_gate}", "timeout": 17},
+            {"type": "command", "command": "node /elsewhere/foreign.js", "timeout": 17}]})
+        cfg.write_text(json.dumps(data, indent=2) + "\n")
+        before = cfg.read_text()
+        owned = _desired_targets(tmp, plugins, "claude-code")
+        for named in ([foreign_gate], ["/elsewhere/foreign.js"], owned + [foreign_gate]):
+            r = _remove(tmp, plugins, "claude-code", named)
+            result = json.loads(r.stdout)
+            assert r.returncode == 7 and result["status"] == "refused", (named, r.returncode, r.stdout)
+            assert result["hooks_removed"] == 0 and "FOREIGN" in result["error"], result
+            assert cfg.read_text() == before, f"a refused removal wrote the config ({named})"
+        assert not list(cfg.parent.glob(".settings.json.hestia-unregister.*")), "a refusal left a backup"
+        # control: the owned targets alone are still removable, and the foreign gate line survives
+        r = _remove(tmp, plugins, "claude-code", owned)
+        assert r.returncode == 0 and json.loads(r.stdout)["status"] == "unregistered", r.stdout
+        assert foreign_gate in cfg.read_text() and "foreign.js" in cfg.read_text()
+
+
 def test_unregistration_proves_nested_and_flat_toml_and_preserves_foreign_hooks():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
@@ -2183,6 +2215,7 @@ def test_unregistration_refuses_a_stale_target_set_and_dry_run_writes_nothing():
 
 TESTS = [
     test_unregistration_removes_only_owned_json_hooks_and_backs_up_the_exact_bytes,
+    test_unregistration_refuses_a_named_target_the_template_does_not_own,
     test_unregistration_proves_nested_and_flat_toml_and_preserves_foreign_hooks,
     test_unregistration_refuses_a_stale_target_set_and_dry_run_writes_nothing,
     test_thor_case_registers_only_the_missing_witness,
