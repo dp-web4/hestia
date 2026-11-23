@@ -271,13 +271,40 @@ fn hex_to_32(s: &str) -> Option<[u8; 32]> {
 }
 
 /// Read a complete member identity without changing the vault.
+///
+/// Complete means coherent, not merely present: the stored `ai_identity_pubkey` is what a hub may
+/// have pinned, so a secret that derives a different key is not this member's identity. Returning
+/// it would sign as a key the hub does not know while every surface reports the pinned one.
 pub fn read_member_identity(vault: &crate::vault::Vault) -> Option<(Uuid, KeyPair)> {
     let lct_e = vault.get("ai_identity_lct_id")?;
-    vault.get("ai_identity_pubkey")?;
+    let pub_e = vault.get("ai_identity_pubkey")?;
     let sec_e = vault.get("ai_identity_secret")?;
     let lct = Uuid::parse_str(&lct_e.secret).ok()?;
     let bytes = hex_to_32(&sec_e.secret)?;
-    Some((lct, KeyPair::from_secret_bytes(&bytes)))
+    let kp = KeyPair::from_secret_bytes(&bytes);
+    if !kp.verifying_key().to_hex().eq_ignore_ascii_case(pub_e.secret.trim()) {
+        return None;
+    }
+    Some((lct, kp))
+}
+
+/// Why three present identity entries do not form an identity. For the operator's repair message.
+fn member_identity_defect(vault: &crate::vault::Vault) -> &'static str {
+    let entry = |name| vault.get(name).map(|e| e.secret.trim().to_string()).unwrap_or_default();
+    if Uuid::parse_str(&entry("ai_identity_lct_id")).is_err() {
+        return "ai_identity_lct_id is not a UUID";
+    }
+    let Some(bytes) = hex_to_32(&entry("ai_identity_secret")) else {
+        return "ai_identity_secret is not 32 hex-encoded bytes";
+    };
+    let stored = entry("ai_identity_pubkey");
+    if hex_to_32(&stored).is_none() {
+        return "ai_identity_pubkey is not 32 hex-encoded bytes";
+    }
+    if !KeyPair::from_secret_bytes(&bytes).verifying_key().to_hex().eq_ignore_ascii_case(&stored) {
+        return "ai_identity_secret does not derive the stored ai_identity_pubkey";
+    }
+    "entries are unreadable"
 }
 
 /// Load or provision the member identity shared by the CLI and dashboard.
@@ -287,7 +314,10 @@ pub fn ensure_member_identity(vault: &mut crate::vault::Vault) -> Result<(Uuid, 
     let has_secret = vault.get("ai_identity_secret").is_some();
     if has_lct && has_pubkey && has_secret {
         return read_member_identity(vault)
-            .ok_or_else(|| anyhow::anyhow!("member identity entries are malformed; operator repair required"));
+            .ok_or_else(|| anyhow::anyhow!(
+                "member identity entries are malformed ({}); operator repair required — refusing to sign or remint",
+                member_identity_defect(vault)
+            ));
     }
     if has_pubkey || has_secret {
         if has_pubkey && !has_secret {
@@ -1477,6 +1507,49 @@ mod tests {
         assert_eq!(pinned.get("ai_identity_pubkey").map(|e| e.secret.as_str()), Some(before.as_str()));
         assert!(pinned.get("ai_identity_lct_id").is_none());
         assert!(pinned.get("ai_identity_secret").is_none());
+    }
+
+    /// A secret for key S beside a stored public key P is not a complete identity: a hub may have
+    /// pinned P. The reader refuses it, `ensure` names the mismatch and changes nothing.
+    #[test]
+    fn a_secret_that_does_not_derive_the_stored_pubkey_is_not_an_identity() {
+        let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let build = |file: &str, pubkey: String, secret: String| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut v = crate::vault::Vault::init(dir.path().join(file), "p".into()).unwrap();
+            v.add(crate::vault::VaultEntry::new("ai_identity_lct_id", Uuid::new_v4().to_string())).unwrap();
+            v.add(crate::vault::VaultEntry::new("ai_identity_pubkey", pubkey)).unwrap();
+            v.add(crate::vault::VaultEntry::new("ai_identity_secret", secret)).unwrap();
+            (dir, v)
+        };
+        let snapshot = |v: &crate::vault::Vault| {
+            ["ai_identity_lct_id", "ai_identity_pubkey", "ai_identity_secret"]
+                .map(|n| v.get(n).map(|e| e.secret.clone()))
+        };
+        let pinned = KeyPair::generate();
+        let other = KeyPair::generate();
+
+        // Positive control: the matching pair reads, in either hex case.
+        let (_d, ok) = build("ok.enc", pinned.verifying_key().to_hex().to_uppercase(), hex(&pinned.secret_key_bytes()));
+        assert!(read_member_identity(&ok).is_some(), "a matching pair must read");
+
+        for (label, pubkey, want) in [
+            ("mismatch", pinned.verifying_key().to_hex(), "does not derive the stored ai_identity_pubkey"),
+            ("malformed", "not-a-key".to_string(), "ai_identity_pubkey is not 32 hex-encoded bytes"),
+        ] {
+            let (_d, mut v) = build("bad.enc", pubkey, hex(&other.secret_key_bytes()));
+            let before = snapshot(&v);
+            assert!(
+                read_member_identity(&v).is_none(),
+                "{label}: read_member_identity accepted a secret whose public key != stored ai_identity_pubkey"
+            );
+            let error = match ensure_member_identity(&mut v) {
+                Ok(_) => panic!("{label}: ensure_member_identity returned a signer"),
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(error.contains(want), "{label}: {error}");
+            assert_eq!(snapshot(&v), before, "{label}: a refused identity must not be rewritten");
+        }
     }
 
     // [retired 2026-07-20] sealed_secret_roundtrips_e2e_and_fails_closed tested the
