@@ -136,6 +136,11 @@ pub fn chain_id_for_genesis(genesis_hash: &str) -> String {
 
 const META_SUBJECTS_BACKFILLED_THROUGH: &str = "subjects_backfilled_through";
 const META_SUBJECTS_DEFINITION_SHA256: &str = "subjects_definition_sha256";
+/// Bump this on ANY change to what `derivation_subjects` extracts that the lists below do not
+/// express: the digest covers the type and key lists, not the extraction logic (the `data.`
+/// nesting and the `requested_by.plugin_id` paths). Without a bump, rows indexed under the old
+/// logic keep a current watermark and are never re-indexed, so they silently drop out of
+/// subject windows. `subject_index_definition_digest_is_a_versioned_ratchet` pins both.
 const SUBJECT_INDEX_DEFINITION_VERSION: u64 = 1;
 const DERIVATION_SUBJECT_KEYS: &[&str] = &["plugin_id", "subject_plugin_id"];
 const DERIVATION_GLOBAL_EVENT_TYPES: &[&str] = &["identity_alias", "amnesty", "exoneration"];
@@ -3037,6 +3042,32 @@ mod tests {
         assert_eq!(
             subject_index_definition_digest(),
             "7235e9785b54b461d8cd2815434d1ae2d33e2ff1e2afd7128c5e6b79ef753d5f"
+        );
+        // The digest cannot see the extraction logic, so pin it here: one distinct id on each
+        // path `derivation_subjects` reads, plus ids on paths it must NOT read. If this assert
+        // has to change, bump SUBJECT_INDEX_DEFINITION_VERSION (and the two pins above) so
+        // existing chains re-index.
+        assert_eq!(
+            derivation_subjects(&json!({
+                "plugin_id": "top-plugin",
+                "subject_plugin_id": "top-subject",
+                "requested_by": {"plugin_id": "top-requester", "subject_plugin_id": "not-read-a"},
+                "other": {"plugin_id": "not-read-b"},
+                "data": {
+                    "plugin_id": "data-plugin",
+                    "subject_plugin_id": "data-subject",
+                    "requested_by": {"plugin_id": "data-requester"},
+                    "data": {"plugin_id": "not-read-c"}
+                }
+            })),
+            vec![
+                "top-plugin",
+                "data-plugin",
+                "top-subject",
+                "data-subject",
+                "top-requester",
+                "data-requester"
+            ]
         );
     }
 
