@@ -2,7 +2,7 @@
 
 | file | sha256 |
 |---|---|
-| `94dec1752a9c80bcdedfdc2a103c42a33a2f39111672daa6b1c650ce80996ac4.patch` | `94dec1752a9c80bcdedfdc2a103c42a33a2f39111672daa6b1c650ce80996ac4` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
+| `57df05dc2f78ba0777cd1e48841be04fa99c5c3b4e8e68c1c59f7faa85a35586.patch` | `57df05dc2f78ba0777cd1e48841be04fa99c5c3b4e8e68c1c59f7faa85a35586` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
 
 ## The defect
 
@@ -17,24 +17,28 @@ subdirectory or make it disappear.
   an ancestor of the launch cwd. It no longer treats cwd as the denial domain.
 - A valid environment override or marker preserves the existing resolution behavior. An explicitly unscoped `*`
   member keeps its current bypass of MRH scope (after the innate egress check).
-- Absolute command candidates come from `_outside_candidates`, are normalized, and are compared at the workspace
-  separator. The old command-text split is gone.
+- The original lexical workspace-split pass remains as a floor, including on `_Unmodelled` or when normalized
+  parsing finds no candidate. `_outside_candidates` then adds normalized absolute spellings at the workspace
+  separator. The rewrite only adds coverage; it cannot remove a prior refusal or let an unenumerated one-time
+  approval widen to literal ungranted repositories.
 
-**Behavior change:** a bounded session with no valid workspace configuration now denies instead of evaluating
-against whatever directory the hook happened to inherit. That is the intended fail-closed posture, not an
-assertion that existing configured sessions must change.
+**Behavior change:** a bounded session with no valid workspace configuration now denies **every tool call**, including
+no-path tools, instead of evaluating against whatever directory the hook happened to inherit. That is the intended
+fail-closed posture, not an assertion that existing configured sessions must change. Deployment requires a pre-flight
+of hook environments and markers so configured sessions do not stop unexpectedly.
 
 ## Verification
 
 On base `59f2478e`, with the generated core loaded from a faithful scratch `plugins/_shared` layout:
 
 - `test_gate_core.py`: **ALL CHECKS PASS**, including no-env/no-marker denial, valid env override, marker
-  resolution from a child cwd, stale-env fallback, absolute-path refusal at root and other cwds, bare-token root
-  control, and workspace-prefix sibling denial.
-- The unpatched control fails at the missing `UNRESOLVED_WORKSPACE` constant.
+  resolution, stale-env fallback, absolute-path refusal at root and other cwds, and prefix-sibling denial. New
+  discriminating controls cover sed writes, `PYTHONPATH`, data operands, and unenumerated-lift widening.
+- `public_boundary_test.py`: **PASS**. `hestia_gate_mechanism_test.py`: **PASS, 35 tests**, including marker-based
+  discovery and explicit unmarked-workspace resolution. The previously red grep/toolchain suite also passes.
 - `one_gate_decide_contract_test.py`: **PASS, 25 tests + 31x4 shim-parity cells** with the core overlay.
-- `gate_evaluate_test.py`: **PASS, zero failures**.
-- The builder strictly reproduces all eight patch files, including the hooks-gt copy and five manifests.
+  `gate_evaluate_test.py`: **PASS, zero failures**.
+- The builder strictly reproduces all 12 patch files, including two hooks-gt source mirrors and five manifests.
   `git apply --check` passes. Ruff is unavailable (`No module named ruff`).
 - No live daemon, launcher, or real worktree was changed; scope decisions use local fixtures.
 
