@@ -484,6 +484,9 @@ const SCOPE_REPLAY_EVENT_TYPES: &[&str] = &[
     "scope_once_spent",
     "scope_once_released",
     "scope_revoked",
+    // Written by the asker's withdrawal (#1297). Named here before that door exists on this
+    // branch, so the two changes are safe in either merge order.
+    "scope_withdrawn",
 ];
 
 fn scope_text(data: &serde_json::Value, key: &str) -> Option<String> {
@@ -561,6 +564,8 @@ struct ScopeReplay {
 ///   back more than the operator's last ruling.
 ///
 /// Nothing is inferred from a missing field: a row with no recorded `expires_at` is not restored.
+///
+/// A WITHDRAWN ask (`scope_withdrawn`, #1297) is terminal and is not restored in any form.
 fn rehydrate_scope_requests(chain: &SqliteChainStore, now: u64) -> ScopeReplay {
     // The oldest `scope_requested` that can still matter: a request lives at most its TTL
     // undecided, and a one-time approval given at the last moment lives one claim window more.
@@ -586,6 +591,8 @@ fn rehydrate_scope_requests(chain: &SqliteChainStore, now: u64) -> ScopeReplay {
     window.reverse();
     let mut restored: HashMap<String, ScopeRequest> = HashMap::new();
     let mut grants_not_restored = 0usize;
+    // Ids the asker withdrew. Terminal: no later row (and no earlier one) restores them.
+    let mut withdrawn: HashSet<String> = HashSet::new();
     for entry in window {
         let data = &entry.event_data;
         let at = entry.timestamp.timestamp().max(0) as u64;
@@ -598,6 +605,9 @@ fn rehydrate_scope_requests(chain: &SqliteChainStore, now: u64) -> ScopeReplay {
                 ) else {
                     continue;
                 };
+                if withdrawn.contains(&id) {
+                    continue;
+                }
                 // The recorded expiry or nothing: a default here would be today's constant,
                 // not the window the request was witnessed with (#956 changes that constant).
                 let Some(expires_at) = data.get("expires_at").and_then(|v| v.as_u64()) else {
@@ -695,6 +705,14 @@ fn rehydrate_scope_requests(chain: &SqliteChainStore, now: u64) -> ScopeReplay {
                     }
                 }
             }
+            "scope_withdrawn" => {
+                // The asker abandoned the ask. It is not pending, not a refusal anyone ruled,
+                // and never a one-time approval: the row is dropped and the id stays dead.
+                if let Some(id) = scope_text(data, "request_id") {
+                    restored.remove(&id);
+                    withdrawn.insert(id);
+                }
+            }
             "scope_revoked" => {
                 let Some(id) = scope_text(data, "request_id") else {
                     continue;
@@ -715,7 +733,7 @@ fn rehydrate_scope_requests(chain: &SqliteChainStore, now: u64) -> ScopeReplay {
     ScopeReplay {
         requests: restored
             .into_iter()
-            .filter(|(_, request)| request.expires_at > now)
+            .filter(|(id, request)| request.expires_at > now && !withdrawn.contains(id))
             .collect(),
         grants_not_restored,
         ok: true,
@@ -3504,6 +3522,42 @@ mod tests {
         // And one claim window further on, it is gone.
         let gone = rehydrate_scope_requests(&state.chain_store, later + 301);
         assert!(!gone.requests.contains_key("scope-late"));
+    }
+
+    /// #1297 (PR #1709) lets the asker withdraw a pending ask and witnesses it as
+    /// `scope_withdrawn`. That row is terminal: a restart must not bring the ask back as pending
+    /// (and so approvable), in whichever order the two changes land. The row is in the shape
+    /// `tool_scope_withdraw` writes.
+    #[test]
+    fn a_withdrawn_request_is_not_restored_as_pending() {
+        let (dir, state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        scope_open(&state, "scope-withdrawn", "/w/withdrawn", Some(now + 3600));
+        scope_open(&state, "scope-kept", "/w/kept", Some(now + 3600));
+        state.append_chain("scope_withdrawn", serde_json::json!({
+            "request_id": "scope-withdrawn", "plugin_id": "kimi-code", "path": "/w/withdrawn",
+            "requested_because": "need it", "decision_reason": "the probe was mistaken",
+            "granted_by": "asker:kimi-code", "withdrawn_by": "kimi-code", "withdrawn_at": now,
+            "via": "asker_withdrawal", "expires_at": now + 3600, "origin": "gate_deny",
+        })).unwrap();
+        // A ruling that names the id AFTER the withdrawal (a late or replayed decide) revives nothing.
+        state.append_chain("scope_granted", serde_json::json!({
+            "request_id": "scope-withdrawn", "plugin_id": "kimi-code", "path": "/w/withdrawn",
+            "granted_by": "dp", "expires_at": now + 600, "standing": false, "recursive": false,
+            "modes": "rwed", "once": true, "grant_path": "/w/withdrawn",
+        })).unwrap();
+        let restored = restart(&dir, state);
+        // Nothing to rule on: the decide doors look the id up in this map and refuse an unknown one.
+        assert!(
+            !restored.scope_requests.contains_key("scope-withdrawn"),
+            "a withdrawn ask came back: status {:?}",
+            restored.scope_requests.get("scope-withdrawn").map(|r| r.status(now))
+        );
+        assert!(!restored.scope_requests.values().any(|r| {
+            r.path == "/w/withdrawn" && (r.status(now) == "pending" || r.once_spendable(now))
+        }));
+        // The control: an ask nobody withdrew is still pending.
+        assert!(restored.scope_requests.get("scope-kept").is_some_and(|r| r.status(now) == "pending"));
     }
 
     /// Nothing is inferred from a missing field: a request with no recorded expiry is not
