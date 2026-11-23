@@ -13,7 +13,9 @@ export function firstRunState(input: {
   error: string | null;
 }): FirstRunState {
   if (input.incompatible) return "incompatible";
-  if (input.hasSnapshot) return "ready";
+  // A snapshot alone is not current evidence: useDashboard keeps the last good one across a
+  // sign-out, a session expiry and a daemon loss. Only the poll that just succeeded makes "ready".
+  if (input.hasSnapshot && input.online && input.signedIn && !input.error) return "ready";
   if (!input.signedIn && input.online) return "sign-in";
   if (!input.online && input.error) return "offline";
   return "checking";
@@ -40,11 +42,11 @@ export function Start() {
       <section className="section" aria-live="polite">
         <h2>Your connection</h2>
         {state === "ready" && <p>Connected and signed in. Your local governance record is available.</p>}
-        {state === "sign-in" && <p>Hestia is reachable, but you need to sign in using the sidebar before viewing your agents or decisions. No private data has been loaded.</p>}
+        {state === "sign-in" && <p>Hestia is reachable, but you need to sign in using the sidebar before viewing your agents or decisions. This page shows no private data.</p>}
         {state === "offline" && <p>The daemon could not be reached. Open Dashboard to check the configured daemon URL or connect to an existing installation. This does not mean your agents are governed.</p>}
         {state === "incompatible" && <p>The daemon is reachable but incompatible with this app. Update the app and daemon as a compatible pair before using governance controls. {handshake?.message}</p>}
         {state === "checking" && <p>Checking your Hestia daemon. No governance status has been established yet.</p>}
-        {error && state !== "ready" && <p className="error-banner">{error}</p>}
+        {error && <p className="error-banner">{error}</p>}
         <button type="button" onClick={() => refresh()}>Check again</button>
       </section>
       <section className="section">
