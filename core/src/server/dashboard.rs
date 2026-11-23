@@ -1049,8 +1049,12 @@ pub struct RecentEntry {
     pub decided_via: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bar: Option<String>,
+    /// An escalation ruling's outcome as its writers record it: `"approved"` / `"denied"`
+    /// (`esc.stored_status()` at the operator decide in `http.rs` and the peer decide in
+    /// `handler.rs`). The ruling row has no `granted` key; that name exists only on the
+    /// caller's reply (`EscalationStore::decision_reply`), which never reaches the chain.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub granted: Option<bool>,
+    pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bar_met: Option<bool>,
 }
@@ -1109,7 +1113,7 @@ pub fn flatten_entry(e: crate::storage::ChainEntry) -> RecentEntry {
             .and_then(|v| v.as_str())
             .map(String::from),
         bar: d.get("bar").and_then(|v| v.as_str()).map(String::from),
-        granted: d.get("granted").and_then(|v| v.as_bool()),
+        status: d.get("status").and_then(|v| v.as_str()).map(String::from),
         bar_met: d.get("bar_met").and_then(|v| v.as_bool()),
     }
 }
@@ -1144,8 +1148,26 @@ struct EventFields {
     decided_by: Option<String>,
     decided_via: Option<String>,
     bar: Option<String>,
-    granted: Option<bool>,
+    #[serde(default, deserialize_with = "str_or_none")]
+    status: Option<String>,
     bar_met: Option<bool>,
+}
+
+/// `status` is a generic key. Escalation rulings write a string, but a row of another kind
+/// that wrote anything else must not blank every other field of its streamed projection
+/// (`project().unwrap_or_default()` drops the whole struct on one type mismatch), and must
+/// project as `flatten_entry` does: a non-string `status` is simply absent.
+fn str_or_none<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StrOrOther {
+        Str(String),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match <StrOrOther as serde::Deserialize>::deserialize(d)? {
+        StrOrOther::Str(s) => Some(s),
+        StrOrOther::Other(_) => None,
+    })
 }
 
 /// `flatten_entry`'s sibling, fed by a streaming row instead of a parsed entry.
@@ -1182,7 +1204,7 @@ pub fn flatten_row(r: crate::storage::chain::ChainRowRef<'_>) -> RecentEntry {
         decided_by: f.decided_by,
         decided_via: f.decided_via,
         bar: f.bar,
-        granted: f.granted,
+        status: f.status,
         bar_met: f.bar_met,
     }
 }
@@ -2422,6 +2444,10 @@ mod tests {
 
     #[test]
     fn escalation_fields_survive_both_feed_projections() {
+        // The ruling row's keys as both decide writers record them (`http.rs` operator decide,
+        // `handler.rs` peer decide): the outcome is `status`, there is no `granted`. The
+        // end-to-end shape is pinned against the real writers in
+        // `handler::tests::the_dashboard_feed_fixture_matches_what_the_daemon_writes`.
         let data = json!({
             "escalation_id": "0123456789abcdef",
             "plugin_id": "kimi-code",
@@ -2429,7 +2455,7 @@ mod tests {
             "decided_by": "dp",
             "decided_via": "operator_session",
             "bar": "single_approver",
-            "granted": true,
+            "status": "approved",
             "bar_met": true,
         });
         let parsed = flatten_entry(crate::storage::ChainEntry {
@@ -2459,12 +2485,43 @@ mod tests {
             assert_eq!(projected.decided_by.as_deref(), Some("dp"));
             assert_eq!(projected.decided_via.as_deref(), Some("operator_session"));
             assert_eq!(projected.bar.as_deref(), Some("single_approver"));
-            assert_eq!(projected.granted, Some(true));
+            assert_eq!(projected.status.as_deref(), Some("approved"));
             assert_eq!(projected.bar_met, Some(true));
             let wire = serde_json::to_value(projected).unwrap();
-            for key in ["escalation_id", "marker", "decided_by", "decided_via", "bar", "granted", "bar_met"] {
+            for key in ["escalation_id", "marker", "decided_by", "decided_via", "bar", "status", "bar_met"] {
                 assert!(wire.get(key).is_some(), "{key} must reach the browser");
             }
+        }
+    }
+
+    /// `status` is a generic key: a row of another kind that wrote a non-string `status` must
+    /// keep every other field in the streamed projection, exactly as the parsed one does.
+    #[test]
+    fn a_non_string_status_does_not_blank_a_streamed_row() {
+        let data = json!({"plugin_id": "kimi-code", "status": {"code": 3}});
+        let parsed = flatten_entry(crate::storage::ChainEntry {
+            hash: "h".into(),
+            prev_hash: "p".into(),
+            timestamp: Utc::now(),
+            event_type: "outcome".into(),
+            event_data: data.clone(),
+            signer_lct: "signer".into(),
+            chain_position: 9,
+        });
+        let raw = data.to_string();
+        let timestamp = Utc::now().to_rfc3339();
+        let streamed = flatten_row(crate::storage::chain::ChainRowRef {
+            chain_position: 9,
+            hash: "h",
+            prev_hash: "p",
+            event_type: "outcome",
+            event_data: &raw,
+            signer_lct: "signer",
+            timestamp: &timestamp,
+        });
+        for projected in [parsed, streamed] {
+            assert_eq!(projected.plugin_id.as_deref(), Some("kimi-code"));
+            assert_eq!(projected.status, None);
         }
     }
 

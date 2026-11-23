@@ -3071,8 +3071,10 @@
       status = 'withdrawn';
       disposition = `withdrawn by ${ruler}${suffix}`;
     } else if (e.event_type === 'gate_escalation_decided') {
-      status = e.granted === true ? 'approved' : e.granted === false ? 'denied' : 'decided';
-      statusClass = e.granted === true ? 'ok' : e.granted === false ? 'deny' : 'info';
+      // Both decide writers record the outcome as `status` ("approved" / "denied"); the
+      // ruling row has no `granted` key (that is the caller's reply, not the chain's).
+      status = e.status === 'approved' || e.status === 'denied' ? e.status : 'decided';
+      statusClass = e.status === 'approved' ? 'ok' : e.status === 'denied' ? 'deny' : 'info';
       disposition = `${status} by ${ruler}${suffix}`;
     } else if (e.event_type === 'gate_escalation_withdrawn') {
       status = 'withdrawn';
@@ -3097,6 +3099,11 @@
       statusClass,
       detail: `${(e.escalation_id || '').slice(0, 8)}${e.marker ? ' ' + e.marker : ''} -> ${disposition}`,
     };
+  }
+
+  // The snapshot's pending items name their escalation `id` (dashboard.rs), not `escalation_id`.
+  function livePendingIds(data) {
+    return new Set((data?.pending_escalations ?? []).map(e => e.id).filter(Boolean));
   }
 
   function projectEscalations(entries, pendingIds) {
@@ -3144,9 +3151,7 @@
         e.event_type === 'policy_decision' && e.decision === feedFilter
       );
     }
-    const pendingIds = new Set((lastData?.pending_escalations ?? [])
-      .map(e => e.escalation_id).filter(Boolean));
-    source = projectEscalations(source, pendingIds);
+    source = projectEscalations(source, livePendingIds(lastData));
     let filtered = selectedOrch
       ? source.filter(e => e.plugin_id === selectedOrch)
       : source;
