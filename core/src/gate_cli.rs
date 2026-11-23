@@ -32,6 +32,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// The identity asserted when the operator does not name one. Deliberately not a member
@@ -711,6 +712,82 @@ pub fn corroborate(
     Ok(())
 }
 
+fn ratify_body(verify: &Value, reason: &str, paths: &[String]) -> Result<Value> {
+    if reason.trim().is_empty() || reason.len() > 512 || reason.chars().any(char::is_control) {
+        bail!("ratify requires a non-empty single-line --reason of at most 512 bytes");
+    }
+    let current = verify
+        .pointer("/evidence/current")
+        .and_then(Value::as_object)
+        .filter(|current| !current.is_empty())
+        .ok_or_else(|| {
+            anyhow!("gate verification returned no discovered bytes; refusing to ratify UNKNOWN coverage")
+        })?;
+    let check_digest = |path: &String, digest: &Value| -> Result<()> {
+        let Some(hex) = digest.as_str() else {
+            bail!("refusing to ratify: {path} is unreadable");
+        };
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("refusing to ratify: {path} does not carry a 64-hex digest");
+        }
+        Ok(())
+    };
+    if paths.is_empty() {
+        for (path, digest) in current {
+            check_digest(path, digest)?;
+        }
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        for path in paths {
+            if !seen.insert(path) {
+                bail!("refusing to ratify: duplicate --path {path}");
+            }
+            let digest = current
+                .get(path)
+                .ok_or_else(|| anyhow!("refusing to ratify: {path} is not in the verified gate set"))?;
+            check_digest(path, digest)?;
+        }
+    }
+    let mut body = json!({"reason": reason, "expected": current});
+    if !paths.is_empty() {
+        body["paths"] = json!(paths);
+    }
+    Ok(body)
+}
+
+/// Ratify the exact bytes the daemon just verified. Bulk covers every discovered gate and is
+/// accepted only when all match the deploy record; repeated --path selects a per-gate merge.
+pub fn ratify(
+    endpoint: &str,
+    key_path: &Path,
+    reason: &str,
+    paths: &[String],
+    json_output: bool,
+) -> Result<()> {
+    let session = crate::member_cli::OperatorSession::open(endpoint, key_path)?;
+    let verify = session.get("/api/gates/verify")?;
+    let body = ratify_body(&verify, reason, paths)?;
+    let answer = session.post("/api/gates/ratify", body)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&answer)?);
+    } else {
+        let count = answer["ratified"].as_array().map_or(0, Vec::len);
+        println!(
+            "ratified {count} gate(s) in {} mode (operator session as {})",
+            answer["mode"].as_str().unwrap_or("unknown"),
+            session.operator,
+        );
+        for row in answer["ratified"].as_array().into_iter().flatten() {
+            println!(
+                "  {} — {}",
+                row["path"].as_str().unwrap_or("?"),
+                row["deployment"].as_str().unwrap_or("unknown"),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -932,6 +1009,40 @@ mod tests {
         let err = session_from_connect(&json!({"assignedRole": "citizen"}))
             .expect_err("no session id must not silently become an unattributed caller");
         assert!(err.to_string().contains("unattributed"), "{err}");
+    }
+
+    #[test]
+    fn ratify_binds_the_verified_bytes_and_named_paths() {
+        let verify = json!({"evidence": {"current": {"/g/a.py": "a".repeat(64), "/g/b.py": "b".repeat(64)}}});
+        let body = ratify_body(&verify, "reviewed the deploy", &["/g/b.py".into()]).unwrap();
+        assert_eq!(body["expected"], verify["evidence"]["current"]);
+        assert_eq!(body["paths"], json!(["/g/b.py"]));
+        assert_eq!(body["reason"], "reviewed the deploy");
+        let bulk = ratify_body(&verify, "reviewed the deploy", &[]).unwrap();
+        assert!(bulk.get("paths").is_none(), "no --path means the daemon's bulk arm");
+    }
+
+    #[test]
+    fn ratify_per_path_ignores_unreadable_unselected_gate_and_rejects_bad_inputs() {
+        let verify = json!({"evidence": {"current": {"/g/a.py": "a".repeat(64), "/g/b.py": null}}});
+        let body = ratify_body(&verify, "reviewed", &["/g/a.py".into()]).unwrap();
+        assert_eq!(body["paths"], json!(["/g/a.py"]));
+        assert!(ratify_body(&verify, "reviewed", &[]).is_err(), "bulk still checks every gate");
+        assert!(ratify_body(&verify, "reviewed", &["/g/a.py".into(), "/g/a.py".into()]).is_err());
+        let malformed = json!({"evidence": {"current": {"/g/a.py": "aaa"}}});
+        assert!(ratify_body(&malformed, "reviewed", &["/g/a.py".into()]).is_err());
+    }
+
+    #[test]
+    fn ratify_refuses_unknown_unreadable_and_unreviewed_coverage() {
+        assert!(ratify_body(&json!({"evidence": {"current": {}}}), "reviewed", &[]).is_err());
+        let verify = json!({"evidence": {"current": {"/g/a.py": "a".repeat(64), "/g/b.py": null}}});
+        assert!(ratify_body(&verify, "reviewed", &[]).is_err(), "an unreadable gate is not ratifiable");
+        let verify = json!({"evidence": {"current": {"/g/a.py": "a".repeat(64)}}});
+        assert!(ratify_body(&verify, "reviewed", &["/g/other.py".into()]).is_err());
+        assert!(ratify_body(&verify, "", &[]).is_err());
+        assert!(ratify_body(&verify, &"x".repeat(513), &[]).is_err());
+        assert!(ratify_body(&verify, "bad\u{7}bell", &[]).is_err());
     }
 
     /// Approving needs a stated reason; refusing does not. Same asymmetry the daemon
