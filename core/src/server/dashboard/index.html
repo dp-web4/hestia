@@ -5873,19 +5873,40 @@
   })();
 
   // ---- GATE INTEGRITY overview banner (#1378) ------------------------------------------------
-  let gateIntegrityBusy = false;
+  // A read that never answers (a hung daemon, a sign-in left pending) must not keep the last
+  // state: the read is bounded, and once the last answer is older than two polls the banner says
+  // the set is unverified and since when, instead of staying silent on an old VERIFIED (#1575).
+  const GATE_INTEGRITY_POLL_MS = 30000, GATE_INTEGRITY_TIMEOUT_MS = 15000;
+  let gateIntegrityBusy = false, gateIntegrityVerifiedAt = 0;
   function gateIntegrityHealthy(r) {
     return r.status === 'VERIFIED'
       && !(r.gates || []).some(g => g.status !== 'verified' || g.not_registered === true || g.deployment === 'differs');
   }
+  function gateIntegrityStale(text, banner, why) {
+    const since = gateIntegrityVerifiedAt ? new Date(gateIntegrityVerifiedAt).toLocaleTimeString() : 'this page opened';
+    text.textContent = `Gate integrity unverified — stale since ${since}${why ? ` (${why})` : ''}`;
+    banner.hidden = false;
+  }
   async function gateIntegrityLoad() {
     const banner = $('gate-integrity-banner'), text = $('gate-integrity-banner-text');
-    if (gateIntegrityBusy) return;
+    if (gateIntegrityBusy) {
+      if (Date.now() - gateIntegrityVerifiedAt > 2 * GATE_INTEGRITY_POLL_MS) gateIntegrityStale(text, banner, 'the last read has not answered');
+      return;
+    }
     gateIntegrityBusy = true;
+    const ctl = new AbortController();
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => { ctl.abort(); reject(new Error(`no answer after ${GATE_INTEGRITY_TIMEOUT_MS / 1000}s`)); },
+        GATE_INTEGRITY_TIMEOUT_MS);
+    });
     try {
-      const res = await apiFetch('/api/gates/verify', { cache: 'no-store' });
-      if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
-      const r = await res.json();
+      const r = await Promise.race([timeout, (async () => {
+        const res = await apiFetch('/api/gates/verify', { cache: 'no-store', signal: ctl.signal });
+        if (!res.ok) throw new Error((await res.text()) || ('HTTP ' + res.status));
+        return res.json();
+      })()]);
+      gateIntegrityVerifiedAt = Date.now();
       if (gateIntegrityHealthy(r)) { banner.hidden = true; return; }
       if (r.status === 'UNKNOWN') {
         text.textContent = `Gate integrity UNKNOWN — ${r.reason || 'the gate set could not be established'}`;
@@ -5913,9 +5934,10 @@
       text.textContent = `Gate integrity: ${rows.length} gate${rows.length === 1 ? '' : 's'}: ${parts.join(' · ')}${shown ? ` — ${shown}` : ''}`;
       banner.hidden = false;
     } catch (e) {
-      text.textContent = `Gate integrity could not be read — ${e.message}`;
-      banner.hidden = false;
+      if (gateIntegrityVerifiedAt) gateIntegrityStale(text, banner, e.message);
+      else { text.textContent = `Gate integrity could not be read — ${e.message}`; banner.hidden = false; }
     } finally {
+      clearTimeout(timer);
       gateIntegrityBusy = false;
     }
   }
@@ -6991,11 +7013,11 @@
   // CPU (measured 2026-09-17). Coming back to the tab refreshes at once, so nothing is stale
   // when it is actually read.
   setInterval(() => { if (!document.hidden) tick(); }, REFRESH_MS);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { tick(); gateIntegrityLoad(); } });
 
   $('gate-integrity-banner-btn').addEventListener('click', () => { setView('govern', true); governShow('gates'); });
   gateIntegrityLoad();
-  setInterval(() => { if (!document.hidden) gateIntegrityLoad(); }, 30000);
+  setInterval(() => { if (!document.hidden) gateIntegrityLoad(); }, GATE_INTEGRITY_POLL_MS);
 
   // Display alias editor (#998). Set and clear are operator acts on the console's own
   // presentation store; neither is witnessed, by ruling. The picker's value is the id.

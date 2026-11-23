@@ -37,37 +37,81 @@ function healthy(report: GateReport): boolean {
     && !(report.gates || []).some((v) => v.status !== "verified" || v.not_registered === true || v.deployment === "differs");
 }
 
+// A verify read that never answers must not keep the last state (#1575): each read is bounded,
+// and once the last answer is older than two polls the banner says the set is unverified and
+// since when, instead of staying silent on an old VERIFIED. `invoke` takes no AbortSignal, so the
+// bound is a race; an answer that lands after it is dropped and the next poll reads again.
+const POLL_MS = 15000;
+const TIMEOUT_MS = 15000;
+const STALE_MS = 2 * POLL_MS;
+
+function bounded<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = window.setTimeout(() => reject(new Error(`no answer after ${ms / 1000}s`)), ms);
+    p.then(
+      (v) => { window.clearTimeout(t); resolve(v); },
+      (e) => { window.clearTimeout(t); reject(e); },
+    );
+  });
+}
+
 export function GateIntegrityBanner() {
   const [report, setReport] = useState<GateReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [verifiedAt, setVerifiedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     let stopped = false;
+    let inFlight = false;
     let timer: number | undefined;
     const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      if (timer !== undefined) window.clearTimeout(timer);
       try {
-        const next = await gatesVerify();
+        const next = await bounded(gatesVerify(), TIMEOUT_MS);
         if (!stopped) {
           setReport(next);
           setError(null);
+          setVerifiedAt(Date.now());
         }
       } catch (e) {
         if (!stopped) setError(String(e));
       } finally {
-        if (!stopped) timer = window.setTimeout(load, 15000);
+        inFlight = false;
+        if (!stopped) timer = window.setTimeout(load, POLL_MS);
       }
     };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void load();
+    };
+    const clock = window.setInterval(() => setNow(Date.now()), 5000);
+    document.addEventListener("visibilitychange", onVisible);
     void load();
     return () => {
       stopped = true;
       if (timer !== undefined) window.clearTimeout(timer);
+      window.clearInterval(clock);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
 
+  const since = verifiedAt !== null ? new Date(verifiedAt).toLocaleTimeString() : null;
   if (error) {
     return (
       <div className="error-panel gate-integrity-banner" role="alert">
-        <strong>Gate integrity could not be read.</strong> {error}
+        {since
+          ? <strong>Gate integrity unverified — stale since {since}.</strong>
+          : <strong>Gate integrity could not be read.</strong>} {error}
+        <Link to="/gates">Inspect in Gates</Link>
+      </div>
+    );
+  }
+  if (verifiedAt !== null && now - verifiedAt > STALE_MS) {
+    return (
+      <div className="error-panel gate-integrity-banner" role="alert">
+        <strong>Gate integrity unverified — stale since {since}.</strong> The last read has not answered.
         <Link to="/gates">Inspect in Gates</Link>
       </div>
     );
