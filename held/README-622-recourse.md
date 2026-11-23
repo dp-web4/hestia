@@ -2,7 +2,7 @@
 
 | file | sha256 |
 |---|---|
-| `6ca57e8110870f33660fec97320e247728639928d16b4274b89025ef599b2f0b.patch` | `6ca57e8110870f33660fec97320e247728639928d16b4274b89025ef599b2f0b` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
+| `2048c0e9f9dd5997ef6e46d5aae49846569d4d9ce37ce0fcf4470eb3f3d13aad.patch` | `2048c0e9f9dd5997ef6e46d5aae49846569d4d9ce37ce0fcf4470eb3f3d13aad` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
 
 ## The defect
 
@@ -15,9 +15,11 @@ not acquire a fabricated hash or a remedy that promises one.
 - `GateDecision.deny_hash` carries the exact `DecisionReceipt.entry_hash` for a committed deny, including the
   replacement denial when C11 rejects an uncommitted permit. Allows and warns never receive a deny hash.
 - The common renderer emits `DENY <hash> — appeal with this chain hash.` only for a committed deny.
-- An uncommitted deny is an integrity anomaly and renders `UNRECORDED — appeal unavailable.` A remedy that asks
-  for a chain hash or `hestia_appeal` is withheld in that case rather than contradicting the unrecorded status.
-- The deny still stands when recording fails; this patch does not create a synthetic appeal route.
+- An uncommitted deny is an integrity anomaly and renders `UNRECORDED — the deny stands.` followed by retry
+  guidance. Only remedy sentences that require a chain hash or `deny_hash` are withheld; hash-free scope routes
+  and legitimate warnings not to appeal remain visible.
+- The deny still stands when recording fails; this patch does not create a synthetic appeal route. A later
+  committed record can supply a real appeal hash after the member retries.
 
 ## Verification
 
@@ -25,7 +27,9 @@ On base `59f2478e`, with the generated gate supplied through the tests' document
 
 - `one_gate_decide_contract_test.py`: **PASS, 26 contract tests + 31x4 shim-parity cells**. New cases cover a
   direct committed deny, a direct uncommitted deny, both C11 replacement-deny receipt outcomes, and an allow.
-  Without the overlay, the revised suite fails at the missing `GateDecision.deny_hash` attribute.
+  An unrecorded `mrh.path` rendering retains `hestia_request_scope`, `hestia_scope_status`, and its explicit
+  negative appeal guidance while fabricating no hash. Without the overlay, the revised suite fails at the
+  missing `GateDecision.deny_hash` attribute.
 - `seat_gate_boundary_test.py`: **PASS, 17 tests x 4 seats**. Every real shim exposes a committed deny hash;
   daemon-down denials say unrecorded, contain no hash-dependent appeal remedy, and use the anomaly channel.
 - The isolated real-daemon arm was not run (`HESTIA_DECIDE_CONTRACT_ENDPOINT` unset); no live daemon was touched.

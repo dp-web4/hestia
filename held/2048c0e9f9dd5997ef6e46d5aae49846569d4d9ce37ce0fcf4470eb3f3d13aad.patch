@@ -34,33 +34,34 @@ diff --git a/plugins/_shared/hestia_single_gate.py b/plugins/_shared/hestia_sing
      Empty for a silent allow. A daemon-composed message (it starts with `hestia:`) is shown as
      the daemon wrote it — that is its steering text — followed by the remedy when it does not
 -    already carry it."""
-+    already carry it. An unrecorded deny drops any hash-dependent remedy and says that appeal is
-+    unavailable."""
++    already carry it. An unrecorded deny drops only hash-dependent remedy sentences, preserves
++    other recourse, and explains how a later committed record supplies an appeal hash."""
      lines = [str(n) for n in (getattr(decision, "notices", ()) or ()) if n]
      verb = getattr(decision, "decision", "deny")
      rule = getattr(decision, "rule", "") or ""
-@@ -1605,7 +1609,15 @@
+@@ -1605,7 +1609,16 @@
          text = reason
      else:
          text = f"hestia: {verb} [{rule}] — {reason}" if reason else f"hestia: {verb} [{rule}]"
 +    deny_hash = getattr(decision, "deny_hash", None) if verb == "deny" else None
-+    if verb == "deny" and not deny_hash and (
-+            "chain hash" in remedy or "deny_hash" in remedy or "hestia_appeal" in remedy):
-+        remedy = ""
++    if verb == "deny" and not deny_hash:
++        remedy = " ".join(
++            sentence for sentence in re.split(r"(?<=[.!?])\s+", remedy)
++            if "chain hash" not in sentence and "deny_hash" not in sentence)
      if remedy and remedy not in text:
          text = f"{text.rstrip('.')}. {remedy}"
      lines.append(text)
 +    if deny_hash:
 +        lines.append(f"DENY {deny_hash} — appeal with this chain hash.")
 +    elif verb == "deny":
-+        lines.append("UNRECORDED — appeal unavailable.")
++        lines.append("UNRECORDED — the deny stands. Retry once the record is reachable to get an appeal hash.")
      return "\n".join(lines)
 diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
 --- a/hooks-gt/_shared/hestia_single_gate.py
 +++ b/hooks-gt/_shared/hestia_single_gate.py
 @@ -1,4 +1,4 @@
 -# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
-+# hestia-gt-sha256: b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: c7db31d3d1b0c3bc38da41353fdee4a5c865f93703d4fd1270f4216a16bc6b58  (published ground truth; manifest: hooks-gt)
  """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
  
  One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -97,26 +98,27 @@ diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_si
      Empty for a silent allow. A daemon-composed message (it starts with `hestia:`) is shown as
      the daemon wrote it — that is its steering text — followed by the remedy when it does not
 -    already carry it."""
-+    already carry it. An unrecorded deny drops any hash-dependent remedy and says that appeal is
-+    unavailable."""
++    already carry it. An unrecorded deny drops only hash-dependent remedy sentences, preserves
++    other recourse, and explains how a later committed record supplies an appeal hash."""
      lines = [str(n) for n in (getattr(decision, "notices", ()) or ()) if n]
      verb = getattr(decision, "decision", "deny")
      rule = getattr(decision, "rule", "") or ""
-@@ -1606,7 +1610,15 @@
+@@ -1606,7 +1610,16 @@
          text = reason
      else:
          text = f"hestia: {verb} [{rule}] — {reason}" if reason else f"hestia: {verb} [{rule}]"
 +    deny_hash = getattr(decision, "deny_hash", None) if verb == "deny" else None
-+    if verb == "deny" and not deny_hash and (
-+            "chain hash" in remedy or "deny_hash" in remedy or "hestia_appeal" in remedy):
-+        remedy = ""
++    if verb == "deny" and not deny_hash:
++        remedy = " ".join(
++            sentence for sentence in re.split(r"(?<=[.!?])\s+", remedy)
++            if "chain hash" not in sentence and "deny_hash" not in sentence)
      if remedy and remedy not in text:
          text = f"{text.rstrip('.')}. {remedy}"
      lines.append(text)
 +    if deny_hash:
 +        lines.append(f"DENY {deny_hash} — appeal with this chain hash.")
 +    elif verb == "deny":
-+        lines.append("UNRECORDED — appeal unavailable.")
++        lines.append("UNRECORDED — the deny stands. Retry once the record is reachable to get an appeal hash.")
      return "\n".join(lines)
 diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
 --- a/hooks-gt/_shared/manifest.json
@@ -126,7 +128,7 @@ diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
      {
        "path": "hestia_single_gate.py",
 -      "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21",
-+      "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68",
++      "sha256": "c7db31d3d1b0c3bc38da41353fdee4a5c865f93703d4fd1270f4216a16bc6b58",
        "source": "plugins/_shared/hestia_single_gate.py"
      },
      {
@@ -135,7 +137,7 @@ diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
    "engine": null,
    "requires": [],
 -  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
-+  "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a"
++  "gt_version": "1096004e1ab0cab14276a2eba2208f0e8f6c3c110ed5a4960daa00d05efaf934"
  }
 diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
 --- a/hooks-gt/claude-code/manifest.json
@@ -145,7 +147,7 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a",
++    "gt_version": "1096004e1ab0cab14276a2eba2208f0e8f6c3c110ed5a4960daa00d05efaf934",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -154,7 +156,7 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
        {
          "path": "hestia_single_gate.py",
 -        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
-+        "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68"
++        "sha256": "c7db31d3d1b0c3bc38da41353fdee4a5c865f93703d4fd1270f4216a16bc6b58"
        },
        {
          "path": "hestia_witness_core.py",
@@ -163,7 +165,7 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
      }
    ],
 -  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
-+  "gt_version": "0702011b8141e5953204e2f39b3ea34742da6780b3f868bf7950c5779b307763"
++  "gt_version": "b1570e863e164397caab665d0abea6a16b382fe577e324a6404d130164d73ad6"
  }
 diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
 --- a/hooks-gt/codex/manifest.json
@@ -173,7 +175,7 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a",
++    "gt_version": "1096004e1ab0cab14276a2eba2208f0e8f6c3c110ed5a4960daa00d05efaf934",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -182,7 +184,7 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
        {
          "path": "hestia_single_gate.py",
 -        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
-+        "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68"
++        "sha256": "c7db31d3d1b0c3bc38da41353fdee4a5c865f93703d4fd1270f4216a16bc6b58"
        },
        {
          "path": "hestia_witness_core.py",
@@ -191,7 +193,7 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
      }
    ],
 -  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
-+  "gt_version": "fef124f09c273874a20f758e9eb2a4c4f9d2b45d0538b65c3dc78330b5d587fd"
++  "gt_version": "2b67c873b18b1543997dceba1bcd29b88f30619b86026fd68d02435211f49dc0"
  }
 diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
 --- a/hooks-gt/gemini/manifest.json
@@ -201,7 +203,7 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a",
++    "gt_version": "1096004e1ab0cab14276a2eba2208f0e8f6c3c110ed5a4960daa00d05efaf934",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -210,7 +212,7 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
        {
          "path": "hestia_single_gate.py",
 -        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
-+        "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68"
++        "sha256": "c7db31d3d1b0c3bc38da41353fdee4a5c865f93703d4fd1270f4216a16bc6b58"
        },
        {
          "path": "hestia_witness_core.py",
@@ -219,7 +221,7 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
    },
    "requires": [],
 -  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
-+  "gt_version": "8b9fb984c7a89a53093a8b360c4df811406ff5b46f2788a4a5ba39e733455fe7"
++  "gt_version": "f6ca525361bf8d392bddf9867e927279ca7be6c2d2ac5c1210b638b45b7b29a7"
  }
 diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
 --- a/hooks-gt/kimi/manifest.json
@@ -229,7 +231,7 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "b9c50355929ff7d965cfa41b291de5c75ee78ecaa52aa4d8d8a4fe276509c94a",
++    "gt_version": "1096004e1ab0cab14276a2eba2208f0e8f6c3c110ed5a4960daa00d05efaf934",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -238,7 +240,7 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
        {
          "path": "hestia_single_gate.py",
 -        "sha256": "3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21"
-+        "sha256": "b36f1df3218fe31741a4980922f654417e440edc81bb19464e9e4cac42464c68"
++        "sha256": "c7db31d3d1b0c3bc38da41353fdee4a5c865f93703d4fd1270f4216a16bc6b58"
        },
        {
          "path": "hestia_witness_core.py",
@@ -247,12 +249,12 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
      }
    ],
 -  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
-+  "gt_version": "cc8e0af305ad0401c9d223f21efa9d1a9d525e92ffe21b1eae4d02d33f78a9a3"
++  "gt_version": "0ee58d173563d0a4d09a24e8130f9a1a3678e83ecc6dd29c8e5a1f87d4875821"
  }
 diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_contract_test.py
 --- a/tools/one_gate_decide_contract_test.py
 +++ b/tools/one_gate_decide_contract_test.py
-@@ -481,6 +481,51 @@
+@@ -481,6 +481,64 @@
          stub.close()
  
  
@@ -277,10 +279,23 @@ diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_cont
 +    check("uncommitted-deny-has-no-hash", d.decision == "deny" and not d.evidence_committed
 +          and d.receipt_status == "refused" and d.deny_hash is None, d)
 +    check("uncommitted-deny-is-integrity-anomaly", d.anomaly and d.verdict_available, d)
-+    check("uncommitted-deny-says-appeal-unavailable",
-+          "UNRECORDED — appeal unavailable." in rendered and "DENY " not in rendered, rendered)
++    check("uncommitted-deny-says-record-is-unavailable",
++          "UNRECORDED — the deny stands." in rendered and "DENY " not in rendered, rendered)
++    check("uncommitted-deny-offers-retry",
++          "Retry once the record is reachable to get an appeal hash." in rendered, rendered)
 +    check("uncommitted-deny-drops-the-hash-dependent-remedy",
 +          "chain hash" not in rendered and "hestia_appeal" not in rendered, rendered)
++
++    scope = g.GateDecision("deny", rule="mrh.path", reason="outside the granted roots",
++                           remedy=g.core.REMEDIES["mrh.path"].text)
++    rendered = g.render(scope)
++    check("uncommitted-scope-keeps-hash-free-recourse",
++          "Adjust to work within scope" in rendered
++          and "hestia_request_scope" in rendered and "hestia_scope_status" in rendered, rendered)
++    check("uncommitted-scope-keeps-negative-appeal-guidance",
++          "Do NOT appeal this" in rendered and "hestia_appeal" in rendered, rendered)
++    check("uncommitted-scope-has-no-fabricated-hash",
++          "chain hash" not in rendered and "UNRECORDED — the deny stands." in rendered, rendered)
 +
 +    d, rendered = decided(Policy(witness="refuse-allow"))
 +    check("committed-replacement-deny-hash", d.rule == "gate.evidence_uncommitted"
@@ -293,7 +308,7 @@ diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_cont
 +          and not d.evidence_committed and d.receipt_status == "refused" and d.deny_hash is None, d)
 +    check("uncommitted-replacement-deny-is-integrity-anomaly", d.anomaly, d)
 +    check("uncommitted-replacement-deny-says-appeal-unavailable",
-+          "UNRECORDED — appeal unavailable." in rendered and "DENY " not in rendered, rendered)
++          "UNRECORDED — the deny stands." in rendered and "DENY " not in rendered, rendered)
 +
 +    d, rendered = decided(Policy())
 +    check("allow-has-no-deny-hash", d.decision == "allow" and d.deny_hash is None, d)
@@ -304,7 +319,7 @@ diff --git a/tools/one_gate_decide_contract_test.py b/tools/one_gate_decide_cont
  def test_the_key_from_the_raw_event_reaches_every_join(m, g, wc, home):
      cases = (("kimi", "Bash", {"command": "ls"}), ("gemini", "Bash", {"command": "ls"}),
               ("codex", "Bash", {"command": "ls"}), ("claude-code", "Bash", {"command": "ls"}))
-@@ -1825,6 +1870,7 @@
+@@ -1825,6 +1883,7 @@
  
  CONTRACT_TESTS = [
      test_c11_the_real_recorder_turns_an_uncommitted_permit_into_a_denial,
@@ -332,7 +347,7 @@ diff --git a/plugins/_shared/seat_gate_boundary_test.py b/plugins/_shared/seat_g
 +        v, text, channel = run(seat, home, native(seat, "Write", {"file_path": gate_file(fx, seat), "content": "x"}))
          check(f"{seat}-gate-write-still-gate-self", v == "deny" and "gate.self_access" in text, text)
 +        check(f"{seat}-unrecorded-deny-has-no-appeal-hash",
-+              "UNRECORDED — appeal unavailable." in text and "DENY " not in text
++              "UNRECORDED — the deny stands." in text and "DENY " not in text
 +              and "chain hash" not in text and "hestia_appeal" not in text, text)
 +        check(f"{seat}-unrecorded-deny-is-an-anomaly", channel == "exit2", channel)
          target = os.path.join(fx.repo, "forum", "x", "post.md")

@@ -52,24 +52,25 @@ def patch_gate(src):
     src = once(src, '''    the daemon wrote it — that is its steering text — followed by the remedy when it does not
     already carry it."""
 ''', '''    the daemon wrote it — that is its steering text — followed by the remedy when it does not
-    already carry it. An unrecorded deny drops any hash-dependent remedy and says that appeal is
-    unavailable."""
+    already carry it. An unrecorded deny drops only hash-dependent remedy sentences, preserves
+    other recourse, and explains how a later committed record supplies an appeal hash."""
 ''')
     return once(src, """    if remedy and remedy not in text:
         text = f"{text.rstrip('.')}. {remedy}"
     lines.append(text)
     return "\\n".join(lines)
 """, """    deny_hash = getattr(decision, "deny_hash", None) if verb == "deny" else None
-    if verb == "deny" and not deny_hash and (
-            "chain hash" in remedy or "deny_hash" in remedy or "hestia_appeal" in remedy):
-        remedy = ""
+    if verb == "deny" and not deny_hash:
+        remedy = " ".join(
+            sentence for sentence in re.split(r"(?<=[.!?])\\s+", remedy)
+            if "chain hash" not in sentence and "deny_hash" not in sentence)
     if remedy and remedy not in text:
         text = f"{text.rstrip('.')}. {remedy}"
     lines.append(text)
     if deny_hash:
         lines.append(f"DENY {deny_hash} — appeal with this chain hash.")
     elif verb == "deny":
-        lines.append("UNRECORDED — appeal unavailable.")
+        lines.append("UNRECORDED — the deny stands. Retry once the record is reachable to get an appeal hash.")
     return "\\n".join(lines)
 """)
 
@@ -97,10 +98,23 @@ def patch_test(src):
     check("uncommitted-deny-has-no-hash", d.decision == "deny" and not d.evidence_committed
           and d.receipt_status == "refused" and d.deny_hash is None, d)
     check("uncommitted-deny-is-integrity-anomaly", d.anomaly and d.verdict_available, d)
-    check("uncommitted-deny-says-appeal-unavailable",
-          "UNRECORDED — appeal unavailable." in rendered and "DENY " not in rendered, rendered)
+    check("uncommitted-deny-says-record-is-unavailable",
+          "UNRECORDED — the deny stands." in rendered and "DENY " not in rendered, rendered)
+    check("uncommitted-deny-offers-retry",
+          "Retry once the record is reachable to get an appeal hash." in rendered, rendered)
     check("uncommitted-deny-drops-the-hash-dependent-remedy",
           "chain hash" not in rendered and "hestia_appeal" not in rendered, rendered)
+
+    scope = g.GateDecision("deny", rule="mrh.path", reason="outside the granted roots",
+                           remedy=g.core.REMEDIES["mrh.path"].text)
+    rendered = g.render(scope)
+    check("uncommitted-scope-keeps-hash-free-recourse",
+          "Adjust to work within scope" in rendered
+          and "hestia_request_scope" in rendered and "hestia_scope_status" in rendered, rendered)
+    check("uncommitted-scope-keeps-negative-appeal-guidance",
+          "Do NOT appeal this" in rendered and "hestia_appeal" in rendered, rendered)
+    check("uncommitted-scope-has-no-fabricated-hash",
+          "chain hash" not in rendered and "UNRECORDED — the deny stands." in rendered, rendered)
 
     d, rendered = decided(Policy(witness="refuse-allow"))
     check("committed-replacement-deny-hash", d.rule == "gate.evidence_uncommitted"
@@ -113,7 +127,7 @@ def patch_test(src):
           and not d.evidence_committed and d.receipt_status == "refused" and d.deny_hash is None, d)
     check("uncommitted-replacement-deny-is-integrity-anomaly", d.anomaly, d)
     check("uncommitted-replacement-deny-says-appeal-unavailable",
-          "UNRECORDED — appeal unavailable." in rendered and "DENY " not in rendered, rendered)
+          "UNRECORDED — the deny stands." in rendered and "DENY " not in rendered, rendered)
 
     d, rendered = decided(Policy())
     check("allow-has-no-deny-hash", d.decision == "allow" and d.deny_hash is None, d)
@@ -140,7 +154,7 @@ def patch_seat(src):
 """, """        v, text, channel = run(seat, home, native(seat, "Write", {"file_path": gate_file(fx, seat), "content": "x"}))
         check(f"{seat}-gate-write-still-gate-self", v == "deny" and "gate.self_access" in text, text)
         check(f"{seat}-unrecorded-deny-has-no-appeal-hash",
-              "UNRECORDED — appeal unavailable." in text and "DENY " not in text
+              "UNRECORDED — the deny stands." in text and "DENY " not in text
               and "chain hash" not in text and "hestia_appeal" not in text, text)
         check(f"{seat}-unrecorded-deny-is-an-anomaly", channel == "exit2", channel)
 """)
