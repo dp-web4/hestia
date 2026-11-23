@@ -4456,6 +4456,24 @@ async fn config_put_seat(
         .or_else(|| previous_cfg.as_ref().and_then(|old| old.env.get("HESTIA_ROLE").cloned()));
     let next_role = inherited_role.clone().or_else(|| cfg.env.get("HESTIA_ROLE").cloned());
     let role_changed = previous_role != next_role;
+    // A SHARED write moves the effective role of every seat that inherits it, so its receipt
+    // names each seat whose effective role moves (NOVA, #1648 updated-head review): a seat's own
+    // HESTIA_ROLE stands only where the shared set states none (`sc::effective`).
+    let seat_role_transitions: Vec<serde_json::Value> = if !writing_shared { Vec::new() } else {
+        sc::declared_members(&s.vault).into_iter()
+            .filter(|m| !sc::is_shared(m))
+            .filter_map(|m| {
+                let own = s.vault.get_document(sc::SEAT_CONFIG_NS, &m)
+                    .and_then(|bytes| serde_json::from_slice::<sc::SeatConfig>(bytes).ok())
+                    .and_then(|c| c.env.get("HESTIA_ROLE").cloned());
+                let before = previous_role.clone().or_else(|| own.clone());
+                let after = next_role.clone().or(own);
+                (before != after).then(|| serde_json::json!({
+                    "member": m, "previous_hestia_role": before, "next_hestia_role": after,
+                }))
+            })
+            .collect()
+    };
     // The reason is for THIS act. `note` is stored in the document and the editor opens with it,
     // so the stored note re-sent unchanged is the last change's reason, not this one's.
     let previous_note = previous_cfg.as_ref().map(|old| old.note.trim()).unwrap_or("");
@@ -4481,6 +4499,7 @@ async fn config_put_seat(
         "next_hestia_role": next_role,
         "role_changed": role_changed,
         "hestia_role_inherited": inherited_role.is_some(),
+        "seat_role_transitions": seat_role_transitions,
         "note": cfg.note,
         "replaces": existed,
         "decided_by": "operator",
@@ -10485,6 +10504,10 @@ mod disposition_tests {
         let rec = last_intent(state.clone()).await;
         assert_eq!((rec["shared"].clone(), rec["previous_hestia_role"].clone(), rec["next_hestia_role"].clone(), rec["role_changed"].clone()),
                    (serde_json::json!(true), serde_json::Value::Null, serde_json::json!("role:constellation:member"), serde_json::json!(true)), "{rec}");
+        // ...and the receipt names the seat whose EFFECTIVE role the shared write moved
+        assert_eq!(rec["seat_role_transitions"], serde_json::json!([{"member": "claude-code",
+            "previous_hestia_role": "role:constellation:reviewer",
+            "next_hestia_role": "role:constellation:member"}]), "{rec}");
         // ...and a stale shared note is no reason for the next shared change
         let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
             "config": {"env": {"HESTIA_ROLE": "role:constellation:witness"}, "note": "society floor"}})).await;
@@ -10509,6 +10532,16 @@ mod disposition_tests {
         let rec = last_intent(state.clone()).await;
         assert_eq!((rec["previous_hestia_role"].clone(), rec["next_hestia_role"].clone(), rec["role_changed"].clone()),
                    (serde_json::json!("role:constellation:member"), serde_json::json!("role:constellation:member"), serde_json::json!(false)), "{rec}");
+        // the shared set DROPPING its role moves every inheriting seat to no role: the receipt
+        // names each one, not only `_shared`'s own transition
+        let (st, out) = put(serde_json::json!({"plugin_id": "_shared",
+            "config": {"env": {}, "note": "no society floor"}})).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        let rec = last_intent(state.clone()).await;
+        assert_eq!(rec["seat_role_transitions"], serde_json::json!([
+            {"member": "claude-code", "previous_hestia_role": "role:constellation:member", "next_hestia_role": null},
+            {"member": "kimi-code", "previous_hestia_role": "role:constellation:member", "next_hestia_role": null},
+        ]), "{rec}");
     }
 
     /// THE SHARED SET (dp, 2026-09-05). Written through the same door under the reserved id;
