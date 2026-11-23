@@ -204,6 +204,33 @@ describe("Decide — scope requests (Sprint 2)", () => {
     expect(screen.getByText(/UNVERIFIED: no asker attribution recorded/)).toBeTruthy();
   });
 
+  it("shows a member-filed scope request's session attribution, not a missing-attribution alarm", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [scopeRequest({ origin: "member_request", asker_basis: "session" })],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+
+    render(<Decide />);
+    expect(
+      await screen.findByText(/session-attributed; harness identity not independently observed/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/UNVERIFIED/)).toBeNull();
+  });
+
+  it("marks an asserted member-filed scope request as unverified", async () => {
+    getDashboard.mockResolvedValue({
+      pending_escalations: [],
+      pending_scope_requests: [scopeRequest({ origin: "member_request", asker_basis: "asserted" })],
+    });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+
+    render(<Decide />);
+    expect(
+      await screen.findByText(/UNVERIFIED: caller-asserted; no live session attribution/),
+    ).toBeTruthy();
+  });
+
   it("shows a gate scope request's asserted basis", async () => {
     getDashboard.mockResolvedValue({
       pending_escalations: [],
