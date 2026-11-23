@@ -404,7 +404,11 @@ witnessed `member_notice` chain event *and* in the send response; `unknown`/`dor
 `recipient_note` that names the route rather than just the gap. `member_unanswered` carries
 it on `owed_to_me` rows (not `i_owe` — there the recipient is the caller, who just proved
 its own liveness by asking), so the fire primer can distinguish *live and unanswered* from
-*never seen locally — misrouted?*. Both fire templates render the distinction.
+*never seen locally*. The fire templates render that as a fact about the name, with no
+instruction: an unanswered row's recipient was not chosen by the reader (escalation
+invitations name test fixtures and model ids), so there is no route for the reader to fix
+(hestia#1604). The send-time `recipient_note` still names the route, since there the
+sender chose the name.
 
 **Four things stated so the mark is not overread:**
 

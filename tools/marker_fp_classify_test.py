@@ -22,7 +22,7 @@ CASES = [
      "plugins/_shared", "Bash", "READ_ONLY"),
     # the chain record flattens newlines, collapsing a script into one cd-headed segment
     ("newline-flattened script still finds the write",
-     "cd /mnt/c/x/.wt/585 chmod +x plugins/kimi/hooks/t.py git add plugins/kimi/hooks/t.py",
+     "cd /opt/x/.wt/585 chmod +x plugins/kimi/hooks/t.py git add plugins/kimi/hooks/t.py",
      "plugins/*/hooks", "Bash", "WRITE"),
     # gate 1a is a raw substring match, so it trips on paths named inside quoted data
     ("marker named inside a heredoc body is not a write",
@@ -41,14 +41,14 @@ CASES = [
     # stated_reason has a DIFFERENT GRAMMAR per tool -- parsing Edit rows as shell
     # manufactured spurious READ_ONLY verdicts and broke the negative control
     ("Edit reason is a bare destination, not a command",
-     "/mnt/c/x/plugins/kimi/hooks/t.py", "plugins/*/hooks", "Edit", "WRITE"),
+     "/opt/x/plugins/kimi/hooks/t.py", "plugins/*/hooks", "Edit", "WRITE"),
     ("Edit destination under /tmp is a lookalike",
      "/tmp/585new/plugins/kimi/hooks/t.py", "plugins/*/hooks", "Edit", "READ_ONLY"),
     ("apply_patch reason is patch text; the header names the destination",
-     "*** Begin Patch\n*** Update File: /mnt/c/x/plugins/_shared/gate.py\n@@ -a\n+b",
+     "*** Begin Patch\n*** Update File: /opt/x/plugins/_shared/gate.py\n@@ -a\n+b",
      "plugins/_shared", "apply_patch", "WRITE"),
     ("apply_patch marker matching only the diff BODY is an FP",
-     "*** Begin Patch\n*** Update File: /mnt/c/x/tools/z.py\n@@\n+ see plugins/_shared/gate.py\n",
+     "*** Begin Patch\n*** Update File: /opt/x/tools/z.py\n@@\n+ see plugins/_shared/gate.py\n",
      "plugins/_shared", "apply_patch", "READ_ONLY"),
     ("redaction is its own stratum, never silently an FP",
      "Bash [REDACTED — names a credential-shaped token; 243 chars withheld]",
