@@ -432,17 +432,34 @@ for target in result["targets"]:
     [ -n "$reg_base" ] || continue
     registered["$reg_base"]="${registered[$reg_base]:-}${reg_path}"$'\n'
   done <<< "$reg_out"
+  if [ -f "$REPO_ROOT/plugins/$member/instance/identity.seed.json" ] && [ -n "${registered[hydrate.sh]:-}" ]; then
+    declare -A hydrate_seed_roots=()
+    mapfile -t hydrate_targets < <(printf '%s' "${registered[hydrate.sh]}")
+    for hydrate_target in "${hydrate_targets[@]}"; do
+      hydrate_seed_root="$(dirname "$(dirname "$hydrate_target")")"
+      hydrate_seed_roots["$hydrate_seed_root"]=1
+    done
+    if [ "${#hydrate_seed_roots[@]}" -gt 1 ]; then
+      die "$member has hydrate.sh targets with distinct identity-seed roots: ${!hydrate_seed_roots[*]}; refusing to choose one consumer"
+    fi
+  fi
   for reg_base in "${!registered[@]}"; do
-    [ "$reg_base" != "hydrate.sh" ] || continue
     mapfile -t same_base_targets < <(printf '%s' "${registered[$reg_base]}")
     [ "${#same_base_targets[@]}" -gt 1 ] || continue
-    ownership_err="$(python3 - "$AUTHORITY" "$member" "$reg_base" "${same_base_targets[@]}" <<'PY'
+    ownership_err="$(python3 - "$AUTHORITY" "$expects" "$member" "$reg_base" "${same_base_targets[@]}" <<'PY'
+import filecmp
 import json
+import os
 import sys
 
-authority, member, base, *targets = sys.argv[1:]
+authority, expects, member, base, *targets = sys.argv[1:]
 targets = sorted(set(targets))
 if len(targets) < 2:
+    raise SystemExit(0)
+install = (json.load(open(expects, encoding="utf-8")).get("install") or {})
+sources = [os.path.join(os.path.dirname(expects), rel)
+           for rel in install.get("files", []) if os.path.basename(rel) == base]
+if not sources:
     raise SystemExit(0)
 try:
     with open(authority, encoding="utf-8") as fh:
@@ -456,7 +473,28 @@ owned = {
     for row in entry.get("files", [])
     if row.get("file") == base
 }
-unproven = [target for target in targets if target not in owned]
+declared = os.path.expanduser(install.get("dest") or "")
+declared_target = os.path.normpath(os.path.join(declared, base)) if declared else None
+
+def matches_source(target):
+    for source in sources:
+        try:
+            if filecmp.cmp(source, target, shallow=False):
+                return True
+        except OSError:
+            pass
+    return False
+
+unproven = []
+for target in targets:
+    if target in owned:
+        continue
+    if base != "hydrate.sh":
+        unproven.append(target)
+    elif (os.path.lexists(target)
+          and os.path.normpath(target) != declared_target
+          and not matches_source(target)):
+        unproven.append(target)
 if unproven:
     print(f"{member}/{base}: registered targets not proven hestia-owned: {', '.join(unproven)}. "
           "Refusing to overwrite an ambiguous same-basename registration before any write. "
@@ -467,17 +505,6 @@ if unproven:
 PY
 )" || die "$ownership_err"
   done
-  if [ -f "$REPO_ROOT/plugins/$member/instance/identity.seed.json" ] && [ -n "${registered[hydrate.sh]:-}" ]; then
-    declare -A hydrate_seed_roots=()
-    mapfile -t hydrate_targets < <(printf '%s' "${registered[hydrate.sh]}")
-    for hydrate_target in "${hydrate_targets[@]}"; do
-      hydrate_seed_root="$(dirname "$(dirname "$hydrate_target")")"
-      hydrate_seed_roots["$hydrate_seed_root"]=1
-    done
-    if [ "${#hydrate_seed_roots[@]}" -gt 1 ]; then
-      die "$member has hydrate.sh targets with distinct identity-seed roots: ${!hydrate_seed_roots[*]}; refusing to choose one consumer"
-    fi
-  fi
 done
 
 for expects in "$REPO_ROOT"/plugins/*/expects.json; do

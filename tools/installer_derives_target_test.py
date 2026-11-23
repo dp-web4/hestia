@@ -529,6 +529,54 @@ printf '%s\\n' "$0" >> "$HOME/hydrated"
                   "both registered hydrate consumers did not execute successfully")
 
 
+def test_foreign_hydrate_duplicate_is_refused_before_any_write():
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        first = os.path.join(home, ".shared", "first-hooks", "hydrate.sh")
+        foreign = os.path.join(home, ".shared", "other-project", "hydrate.sh")
+        root, home, env = build(
+            tmp,
+            expects={
+                "dest": "~/.harness/hooks",
+                "registration": {"reader": "json-hook-commands",
+                                 "path": [".harness", "settings.json"]},
+                "files": ["hooks/hydrate.sh"],
+            },
+            files=("hydrate.sh",),
+            reg_name=os.path.join(".harness", "settings.json"),
+            registration=json.dumps({"hooks": {"SessionEnd": [{"hooks": [
+                {"type": "command", "command": f"bash {first}"},
+                {"type": "command", "command": f"bash {foreign}"},
+            ]}]}}),
+        )
+        os.makedirs(os.path.dirname(first))
+        os.makedirs(os.path.dirname(foreign))
+        with open(foreign, "w") as fh:
+            fh.write("foreign project bytes\n")
+        seed_dir = os.path.join(root, "plugins", "m", "instance")
+        os.makedirs(seed_dir)
+        with open(os.path.join(seed_dir, "identity.seed.json"), "w") as fh:
+            fh.write('{"entity":"m"}\n')
+        os.makedirs(os.path.join(home, ".hestia", "shared.builds", "old"))
+        os.symlink("shared.builds/old", os.path.join(home, ".hestia", "shared"))
+
+        for label, run_env in (("dry-run", env), ("normal", normal(env))):
+            rc, out = run(root, run_env)
+            check(rc != 0, f"{label}: foreign hydrate duplicate was accepted: {out}")
+            check("not proven hestia-owned" in out,
+                  f"{label}: foreign hydrate ownership was not named: {out}")
+            with open(foreign) as fh:
+                check(fh.read() == "foreign project bytes\n",
+                      f"{label}: foreign hydrate was overwritten")
+            check(not os.path.exists(foreign + ".pre-install.bak"),
+                  f"{label}: foreign hydrate was backed up before refusal")
+            check(not os.path.exists(first), f"{label}: hestia hydrate was written before refusal")
+            check(os.readlink(os.path.join(home, ".hestia", "shared")) == "shared.builds/old",
+                  f"{label}: shared engine moved before refusal")
+            check(not os.path.exists(os.path.join(home, ".hestia", "current-build.json")),
+                  f"{label}: ambiguous hydrate install was recorded as authoritative")
+
+
 def test_later_member_failure_happens_before_any_member_write():
     for state in ("unparseable", "unclassified", "ambiguous-hydrate"):
         with tempfile.TemporaryDirectory() as tmp:
@@ -696,6 +744,7 @@ TESTS = [
     test_unparseable_and_unreadable_registrations_are_fatal_without_writes,
     test_duplicate_hydrate_targets_with_distinct_seed_roots_are_fatal,
     test_duplicate_hydrate_targets_with_shared_seed_root_serve_both_consumers,
+    test_foreign_hydrate_duplicate_is_refused_before_any_write,
     test_later_member_failure_happens_before_any_member_write,
     test_missing_resolver_is_fatal_not_an_empty_registration,
     test_resolver_crash_is_fatal_not_an_empty_registration,
