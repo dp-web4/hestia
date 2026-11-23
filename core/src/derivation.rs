@@ -1246,7 +1246,29 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         .iter()
         .map(|entry| (entry.hash.as_str(), *entry))
         .collect();
+    // What retires a verdict is the EARLIEST valid entry that targets it, whatever its kind.
+    // Keeping the earliest (rather than whichever was inserted last) makes the displayed
+    // provenance a function of the chain and not of loop order.
     let mut superseded_by: HashMap<&str, &ChainEntry> = HashMap::new();
+    fn retire<'a>(
+        map: &mut HashMap<&'a str, &'a ChainEntry>,
+        target: &'a ChainEntry,
+        by: &'a ChainEntry,
+    ) {
+        let slot = map.entry(target.hash.as_str()).or_insert(by);
+        if by.chain_position < slot.chain_position {
+            *slot = by;
+        }
+    }
+    // THE FORK RULE. One verdict has at most one replacement: the earliest valid one. A
+    // later adjudication naming the same target is a losing fork and is itself excluded —
+    // otherwise two replacements of one overturned verdict both stay active and one
+    // overturn becomes two observations. To revise a replacement, supersede the
+    // replacement, not the verdict it already retired.
+    let mut replacement_of: HashMap<&str, &ChainEntry> = HashMap::new(); // target -> winner
+    // loser -> (target, winner)
+    let mut lost_fork: HashMap<&str, (&ChainEntry, &ChainEntry)> = HashMap::new();
+    let mut candidates: Vec<(&ChainEntry, &ChainEntry)> = Vec::new(); // (replacement, target)
     for replacement in &adjudications {
         let Some(reference) = entry_str(replacement, "supersedes") else {
             continue;
@@ -1254,11 +1276,33 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
         let Some(target) = adjudication_by_hash.get(chain_hash(reference)) else {
             continue;
         };
-        // Imported history gets the same grain check as the write surface.
+        // Imported history gets the same checks as the write surface: later in the chain,
+        // same axis, and not adjudicated by the subject it judges. The write surface refuses
+        // a self-adjudication; a row that arrived another way must not retire a verdict
+        // against its own author either.
+        let by_subject = replacement
+            .event_data
+            .get("adjudicated_by")
+            .and_then(|by| by.get("plugin_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|by| is_member(Some(by)));
         if replacement.chain_position > target.chain_position
             && entry_str(replacement, "axis") == entry_str(target, "axis")
+            && !by_subject
         {
-            superseded_by.insert(target.hash.as_str(), *replacement);
+            candidates.push((*replacement, *target));
+        }
+    }
+    candidates.sort_by_key(|(replacement, _)| replacement.chain_position);
+    for (replacement, target) in candidates {
+        match replacement_of.get(target.hash.as_str()) {
+            Some(winner) => {
+                lost_fork.insert(replacement.hash.as_str(), (target, *winner));
+            }
+            None => {
+                replacement_of.insert(target.hash.as_str(), replacement);
+                retire(&mut superseded_by, target, replacement);
+            }
         }
     }
     for correction in entries.iter().copied().filter(|e| {
@@ -1281,7 +1325,7 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             continue;
         };
         if correction.chain_position > target.chain_position {
-            superseded_by.insert(target.hash.as_str(), correction);
+            retire(&mut superseded_by, target, correction);
         }
     }
 
@@ -1305,6 +1349,20 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
                     replacement.event_type, replacement.chain_position
                 ),
                 reference: Some(format!("chain:{}", replacement.hash)),
+            });
+            continue;
+        }
+        if let Some((target, winner)) = lost_fork.get(e.hash.as_str()) {
+            adj_evidence[idx].push(Evidence {
+                chain_position: e.chain_position,
+                hash: e.hash.clone(),
+                event_type: e.event_type.clone(),
+                timestamp: e.timestamp,
+                contribution: format!(
+                    "EXCLUDED — lost fork: adjudication #{} was already replaced by adjudication #{}",
+                    target.chain_position, winner.chain_position
+                ),
+                reference: Some(format!("chain:{}", winner.hash)),
             });
             continue;
         }
@@ -1861,6 +1919,100 @@ mod tests {
             e.hash == "hash-1"
                 && e.contribution.contains("EXCLUDED — superseded by adjudication #2")
                 && e.reference.as_deref() == Some("chain:hash-2")
+        }));
+    }
+
+    /// Legion's probe on #1631: A refuted, then B and C both upheld naming A. Before the fork
+    /// rule both replacements stayed active (observations=2, score=0.864): one overturned
+    /// verdict had become two positive observations.
+    #[test]
+    fn two_replacements_of_one_verdict_count_once() {
+        let role = "role:constellation:interactive-dev";
+        let adj = |pos: u64, verdict: &str, score: f64, supersedes: Option<&str>| {
+            let mut data = json!({
+                "subject_plugin_id":"codex","subject_role":role,"axis":"validity",
+                "verdict":verdict,"score":score,"method":"review","ref":"pr:1",
+                "adjudicated_by":{"plugin_id":"claude-code"}
+            });
+            if let Some(target) = supersedes {
+                data["supersedes"] = json!(target);
+            }
+            entry(pos, pos as i64, "adjudication", data)
+        };
+        let a = adj(1, "refuted", 0.0, None);
+        let b = adj(2, "upheld", 1.0, Some("chain:hash-1"));
+        let c = adj(3, "upheld", 1.0, Some("hash-1"));
+        let derived = derive("codex", role, &[a.clone(), b.clone(), c.clone()]);
+        assert_eq!(derived.validity.observations, 1, "one overturn is one observation");
+        assert_eq!(derived.validity.score, Some(0.75));
+        assert!(derived.validity.evidence.iter().any(|e| {
+            e.hash == "hash-3"
+                && e.contribution.contains(
+                    "EXCLUDED — lost fork: adjudication #1 was already replaced by adjudication #2")
+                && e.reference.as_deref() == Some("chain:hash-2")
+        }), "the losing fork is receipted, not silently dropped");
+        // The winner is the earliest in the CHAIN, not the first in the window.
+        let reordered = derive("codex", role, &[c.clone(), b.clone(), a.clone()]);
+        assert_eq!(reordered.validity.observations, 1);
+        assert!(reordered.validity.evidence.iter().any(|e| {
+            e.hash == "hash-3" && e.contribution.contains("lost fork")
+        }));
+        // Revising the replacement is still possible: supersede the replacement.
+        let d = adj(4, "refuted", 0.0, Some("chain:hash-2"));
+        let revised = derive("codex", role, &[a, b, c, d]);
+        assert_eq!(revised.validity.observations, 1, "only #4 is active");
+        assert!(revised.validity.evidence.iter().any(|e| {
+            e.hash == "hash-2" && e.contribution.contains("EXCLUDED — superseded by adjudication #4")
+        }));
+    }
+
+    /// The write surface refuses a self-adjudication. A row that reached the chain another
+    /// way must not let the subject retire a verdict against itself at read time.
+    #[test]
+    fn a_replacement_adjudicated_by_the_subject_retires_nothing() {
+        let role = "role:constellation:interactive-dev";
+        let original = entry(1, 0, "adjudication", json!({
+            "subject_plugin_id":"codex","subject_role":role,"axis":"validity",
+            "verdict":"refuted","score":0.0,"method":"review","ref":"pr:1",
+            "adjudicated_by":{"plugin_id":"claude-code"}
+        }));
+        let by_subject = entry(2, 1, "adjudication", json!({
+            "subject_plugin_id":"codex","subject_role":role,"axis":"validity",
+            "verdict":"upheld","score":1.0,"method":"review","ref":"pr:1",
+            "supersedes":"chain:hash-1","adjudicated_by":{"plugin_id":"codex"}
+        }));
+        let derived = derive("codex", role, &[original, by_subject]);
+        assert!(
+            !derived.validity.evidence.iter().any(|e| e.hash == "hash-1"
+                && e.contribution.contains("EXCLUDED")),
+            "the original verdict stays active"
+        );
+        assert_eq!(derived.validity.observations, 2);
+    }
+
+    /// A correction and a replacement can both name one verdict. The receipt names the
+    /// earlier of the two, whatever order the fold met them in.
+    #[test]
+    fn exclusion_provenance_names_the_earliest_retiring_entry() {
+        let role = "role:constellation:interactive-dev";
+        let original = entry(1, 0, "adjudication", json!({
+            "subject_plugin_id":"codex","subject_role":role,"axis":"veracity",
+            "verdict":"refuted","score":0.0,"method":"review","ref":"claim:1"
+        }));
+        let correction = entry(2, 1, "reversal", json!({
+            "subject_plugin_id":"codex","subject_role":role,"kind":"override",
+            "cause":"corrected-adjudication","ref":"chain:hash-1",
+            "reported_by":{"plugin_id":"claude-code"}
+        }));
+        let replacement = entry(3, 2, "adjudication", json!({
+            "subject_plugin_id":"codex","subject_role":role,"axis":"veracity",
+            "verdict":"upheld","score":1.0,"method":"review","ref":"claim:1",
+            "supersedes":"chain:hash-1"
+        }));
+        let derived = derive("codex", role, &[original, correction, replacement]);
+        assert_eq!(derived.veracity.observations, 1);
+        assert!(derived.veracity.evidence.iter().any(|e| {
+            e.hash == "hash-1" && e.contribution.contains("EXCLUDED — superseded by reversal #2")
         }));
     }
 
