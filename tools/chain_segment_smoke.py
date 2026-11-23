@@ -169,11 +169,28 @@ def variants(valid: dict) -> dict[str, dict]:
     return {"valid": valid, "altered": altered, "swapped": swapped, "missing-key": missing}
 
 
+def anchor_args(segment: dict) -> list[str]:
+    args = ["--expect-chain-id", segment["chain_id"],
+            "--expect-previous-hash", segment["previous_hash"],
+            "--expect-end-hash", segment["entries"][-1]["hash"]]
+    for key in sorted({rec["witness_public_key"] for rec in segment["signatures"]}):
+        args.extend(["--trusted-witness-key", key])
+    return args
+
+
 def check(binary: Path, fixtures: Path, isolated_home: Path) -> None:
+    isolated_home.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, HESTIA_HOME=str(isolated_home))
     for name in NAMES:
         path = fixtures / f"{name}.json"
-        result = run([str(binary), "chain-verify", str(path)], env)
+        segment = json.loads(path.read_text(encoding="utf-8"))
+        if name == "valid":
+            unanchored = run([str(binary), "chain-verify", str(path)], env)
+            report = json.loads(unanchored.stdout)
+            if (report.get("status") != "unverifiable" or report.get("complete") is not False
+                    or report.get("provenance") != "unanchored"):
+                raise RuntimeError(f"unanchored segment was presented as authenticated: {report}")
+        result = run([str(binary), "chain-verify", str(path)] + anchor_args(segment), env)
         expected, nonzero = EXPECTED[name]
         try:
             report = json.loads(result.stdout)
@@ -189,6 +206,17 @@ def check(binary: Path, fixtures: Path, isolated_home: Path) -> None:
             raise RuntimeError(f"swapped fixture did not name its ordering failure: {report}")
         if name == "missing-key" and not any("signing key is absent" in s for s in report.get("unverifiable", [])):
             raise RuntimeError(f"missing-key fixture did not name its absent key: {report}")
+
+    oversized = isolated_home / "oversized.json"
+    oversized.write_text(" " * (16 * 1024 * 1024 + 1), encoding="utf-8")
+    result = run([str(binary), "chain-verify", str(oversized)], env)
+    if result.returncode == 0 or "exceeding the" not in result.stderr:
+        raise RuntimeError(f"oversized segment was not bounded: {result.stdout}\n{result.stderr}")
+    recursive = isolated_home / "recursive.json"
+    recursive.write_text("[" * 200 + "]" * 200, encoding="utf-8")
+    result = run([str(binary), "chain-verify", str(recursive)], env)
+    if result.returncode == 0 or json.loads(result.stdout).get("status") != "unverifiable":
+        raise RuntimeError(f"recursive JSON was not rejected safely: {result.stdout}\n{result.stderr}")
 
 
 def main() -> int:

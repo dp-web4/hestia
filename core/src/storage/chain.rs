@@ -29,7 +29,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -399,9 +399,26 @@ pub enum ChainSegmentStatus {
 
 /// The offline verdict, including cases where absence of evidence must not read as either a pass
 /// or proof of tampering. Every failure string names its chain position when one is available.
+#[derive(Debug, Clone, Default)]
+pub struct ChainSegmentTrustAnchor {
+    pub chain_id: Option<String>,
+    pub previous_hash: Option<String>,
+    pub end_hash: Option<String>,
+    pub trusted_witness_keys: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainSegmentProvenance {
+    Anchored,
+    Unanchored,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChainSegmentVerification {
     pub status: ChainSegmentStatus,
+    pub provenance: ChainSegmentProvenance,
+    pub complete: bool,
     pub checked_entries: u64,
     pub signed_valid: u64,
     pub legacy_unsigned: u64,
@@ -415,6 +432,8 @@ pub struct ChainSegmentVerification {
 impl ChainSegmentVerification {
     pub fn is_valid(&self) -> bool {
         self.status == ChainSegmentStatus::Valid
+            && self.complete
+            && self.provenance == ChainSegmentProvenance::Anchored
     }
 }
 
@@ -2471,8 +2490,18 @@ fn compute_hash_stored(
 /// Verify a portable segment without opening a vault, database or daemon. Absent anchors,
 /// signatures or keys are UNVERIFIABLE; altered rows, ordering and invalid signatures are TAMPERED.
 pub fn verify_chain_segment(segment: &ChainSegment) -> ChainSegmentVerification {
+    verify_chain_segment_with_anchor(segment, None)
+}
+
+pub fn verify_chain_segment_with_anchor<'a>(
+    segment: &ChainSegment,
+    anchor: impl Into<Option<&'a ChainSegmentTrustAnchor>>,
+) -> ChainSegmentVerification {
+    let anchor = anchor.into();
     let mut out = ChainSegmentVerification {
         status: ChainSegmentStatus::Valid,
+        provenance: ChainSegmentProvenance::Unanchored,
+        complete: false,
         checked_entries: 0,
         signed_valid: 0,
         legacy_unsigned: 0,
@@ -2486,6 +2515,25 @@ pub fn verify_chain_segment(segment: &ChainSegment) -> ChainSegmentVerification 
             "the society LCT is context; it does not prove this witness was authorised".into(),
         ],
     };
+    if let Some(anchor) = anchor {
+        out.provenance = ChainSegmentProvenance::Anchored;
+        if anchor.chain_id.as_deref() != Some(segment.chain_id.as_str()) {
+            out.unverifiable.push("external chain-id anchor does not match the segment".into());
+        }
+        if segment.entries.first().is_some_and(|e| e.chain_position != 0)
+            && anchor.previous_hash != segment.previous_hash
+        {
+            out.unverifiable.push(
+                "a non-genesis segment needs an external pre-segment hash anchor".into(),
+            );
+        }
+        if anchor.end_hash.as_deref() != segment.entries.last().map(|e| e.hash.as_str()) {
+            out.unverifiable.push("external terminal hash does not match the segment".into());
+        }
+        if anchor.trusted_witness_keys.is_empty() {
+            out.unverifiable.push("external anchor names no trusted witness keys".into());
+        }
+    }
     if segment.format != CHAIN_SEGMENT_FORMAT {
         out.unverifiable.push(format!("unsupported segment format {:?}", segment.format));
     }
@@ -2597,6 +2645,11 @@ pub fn verify_chain_segment(segment: &ChainSegment) -> ChainSegmentVerification 
             ) {
                 Ok(()) => {
                     out.signed_valid += 1;
+                    if anchor.is_some_and(|a| !a.trusted_witness_keys.contains(&rec.witness_public_key)) {
+                        out.unverifiable.push(format!(
+                            "position {pos}: signing key is not externally trusted"
+                        ));
+                    }
                     let witness = out.witnesses.entry(rec.witness_public_key.clone()).or_insert_with(|| {
                         WitnessKeyUse {
                             witness_lct: rec.witness_lct.clone(),
@@ -2623,6 +2676,14 @@ pub fn verify_chain_segment(segment: &ChainSegment) -> ChainSegmentVerification 
         out.status = ChainSegmentStatus::Tampered;
     } else if !out.unverifiable.is_empty() {
         out.status = ChainSegmentStatus::Unverifiable;
+    } else if anchor.is_none() {
+        out.limitations.push(
+            "unanchored cryptographic self-consistency only; authenticated society provenance and range completeness require an external chain-id, trusted-key, and terminal-hash anchor".into(),
+        );
+        out.status = ChainSegmentStatus::Unverifiable;
+    } else {
+        out.complete = true;
+        out.status = ChainSegmentStatus::Valid;
     }
     out
 }
@@ -3946,13 +4007,26 @@ mod tests {
         store.export_segment(0, 3, "lct:web4:mb32:bsociety").unwrap()
     }
 
+    fn anchor_for(segment: &ChainSegment) -> ChainSegmentTrustAnchor {
+        ChainSegmentTrustAnchor {
+            chain_id: Some(segment.chain_id.clone()),
+            previous_hash: segment.previous_hash.clone(),
+            end_hash: segment.entries.last().map(|e| e.hash.clone()),
+            trusted_witness_keys: segment
+                .signatures
+                .iter()
+                .map(|s| s.witness_public_key.clone())
+                .collect(),
+        }
+    }
+
     #[test]
     fn a_signed_segment_round_trips_and_verifies_offline() {
         let dir = TempDir::new().unwrap();
         let segment = smoke_segment(&dir);
         let encoded = serde_json::to_string_pretty(&segment).unwrap();
         let decoded: ChainSegment = serde_json::from_str(&encoded).unwrap();
-        let report = verify_chain_segment(&decoded);
+        let report = verify_chain_segment_with_anchor(&decoded, &anchor_for(&decoded));
         assert!(report.is_valid(), "{report:?}");
         assert_eq!((report.checked_entries, report.signed_valid, report.legacy_unsigned), (4, 4, 0));
         assert!(report.link_intact);
@@ -4020,9 +4094,99 @@ mod tests {
             store.append("evt", json!({"i": i}), witness.witness_lct()).unwrap();
         }
         let segment = store.export_segment(1, 2, "lct:web4:mb32:bsociety").unwrap();
-        let report = verify_chain_segment(&segment);
+        let report = verify_chain_segment_with_anchor(&segment, &anchor_for(&segment));
         assert!(report.is_valid(), "{report:?}");
         assert!(report.limitations.iter().any(|s| s.contains("non-genesis")));
+    }
+
+    #[test]
+    fn unanchored_self_consistency_is_not_authenticated_provenance() {
+        let dir = TempDir::new().unwrap();
+        let segment = smoke_segment(&dir);
+        let report = verify_chain_segment(&segment);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert_eq!(report.provenance, ChainSegmentProvenance::Unanchored);
+        assert!(!report.complete && !report.is_valid());
+        assert!(report.limitations.iter().any(|s| s.contains("unanchored cryptographic self-consistency")));
+        let anchored = verify_chain_segment_with_anchor(&segment, &anchor_for(&segment));
+        assert!(anchored.is_valid(), "{anchored:?}");
+        assert!(anchored.complete);
+    }
+
+    #[test]
+    fn a_substituted_key_and_resigned_chain_is_not_the_original_witness() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        let original = anchor_for(&segment);
+        let kp = KeyPair::generate();
+        let public_key = hex::encode(kp.verifying_key().to_bytes());
+        let witness_lct = web4_core::derive_lct_id(&kp.verifying_key());
+        for rec in &mut segment.signatures {
+            rec.witness_lct = witness_lct.clone();
+            rec.witness_public_key = public_key.clone();
+            let entry = &segment.entries[rec.chain_position as usize];
+            let pre = signature_preimage(
+                &segment.chain_id,
+                rec.chain_position,
+                &entry.hash,
+                &entry.signer_lct,
+                &rec.witness_lct,
+                &rec.witness_public_key,
+                &rec.policy_generation,
+            );
+            rec.signature = kp.sign(&pre).to_hex();
+        }
+        let report = verify_chain_segment_with_anchor(&segment, &original);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+        assert!(report.unverifiable.iter().any(|s| s.contains("not externally trusted")));
+        let substituted = verify_chain_segment_with_anchor(&segment, &anchor_for(&segment));
+        assert!(substituted.is_valid(), "{substituted:?}");
+    }
+
+    #[test]
+    fn non_genesis_omissions_and_anchor_mismatches_never_read_as_complete() {
+        let dir = TempDir::new().unwrap();
+        let (_path, store, witness) = signed_store(&dir);
+        for i in 0..3 {
+            store.append("evt", json!({"i": i}), witness.witness_lct()).unwrap();
+        }
+        let segment = store.export_segment(1, 2, "lct:web4:mb32:bsociety").unwrap();
+        let mut missing = anchor_for(&segment);
+        missing.previous_hash = None;
+        let report = verify_chain_segment_with_anchor(&segment, &missing);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+
+        let mut wrong_chain = anchor_for(&segment);
+        wrong_chain.chain_id = Some("0".repeat(64));
+        let report = verify_chain_segment_with_anchor(&segment, &wrong_chain);
+        assert_eq!(report.status, ChainSegmentStatus::Unverifiable, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+
+        let anchor = anchor_for(&segment);
+        let mut truncated = segment.clone();
+        truncated.entries.pop();
+        let report = verify_chain_segment_with_anchor(&truncated, &anchor);
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+
+        let mut headless = segment.clone();
+        headless.entries.remove(0);
+        let report = verify_chain_segment_with_anchor(&headless, &anchor);
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(!report.complete && !report.is_valid());
+    }
+
+    #[test]
+    fn pretty_event_data_cannot_substitute_for_different_raw_bytes() {
+        let dir = TempDir::new().unwrap();
+        let mut segment = smoke_segment(&dir);
+        segment.entries[0].event_data["target"] = json!("/pretty-only-change");
+        let report = verify_chain_segment_with_anchor(&segment, &anchor_for(&segment));
+        assert_eq!(report.status, ChainSegmentStatus::Tampered, "{report:?}");
+        assert!(report.tampered.iter().any(|s| s.contains("describe different content")));
+        assert!(!report.complete && !report.is_valid());
     }
 
     #[test]

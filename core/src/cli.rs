@@ -81,6 +81,18 @@ enum Command {
         /// A hestia-chain-segment:v1 JSON file to verify offline.
         #[arg(value_name = "SEGMENT")]
         segment: Option<PathBuf>,
+        /// Externally trusted Ed25519 witness public key (hex). Repeat for each trusted key.
+        #[arg(long = "trusted-witness-key", value_name = "HEX")]
+        trusted_witness_key: Vec<String>,
+        /// Externally expected chain id (genesis hash), required for authenticated verification.
+        #[arg(long)]
+        expect_chain_id: Option<String>,
+        /// Externally expected hash before a non-genesis segment.
+        #[arg(long)]
+        expect_previous_hash: Option<String>,
+        /// Externally expected hash of the segment's terminal entry, required for completeness.
+        #[arg(long)]
+        expect_end_hash: Option<String>,
     },
 
     /// Run the MCP server daemon
@@ -1224,7 +1236,11 @@ pub fn run() -> AnyResult<()> {
         Command::Init { force, ai } => cmd_init(&home, force, ai),
         Command::Info => cmd_info(&home),
         Command::ChainExport { from, to } => cmd_chain_export(&home, from, to),
-        Command::ChainVerify { segment } => cmd_chain_verify(&home, segment.as_deref()),
+        Command::ChainVerify { segment, trusted_witness_key, expect_chain_id,
+                               expect_previous_hash, expect_end_hash } => {
+            cmd_chain_verify(&home, segment.as_deref(), trusted_witness_key,
+                             expect_chain_id, expect_previous_hash, expect_end_hash)
+        }
         Command::Serve { bind, allow_remote, callback } => cmd_serve(&home, &bind, allow_remote, callback),
         Command::Dashboard { endpoint } => hestia::tui::run(&endpoint),
         Command::Scope(ScopeCmd::Arbitrate { request_id, grant, deny, reason, as_member, endpoint, target }) => {
@@ -5129,8 +5145,24 @@ fn cmd_chain_export(home: &std::path::Path, from: u64, to: u64) -> AnyResult<()>
     Ok(())
 }
 
-fn cmd_chain_verify(home: &std::path::Path, segment: Option<&std::path::Path>) -> AnyResult<()> {
+const MAX_CHAIN_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+fn cmd_chain_verify(
+    home: &std::path::Path,
+    segment: Option<&std::path::Path>,
+    trusted_witness_key: Vec<String>,
+    expect_chain_id: Option<String>,
+    expect_previous_hash: Option<String>,
+    expect_end_hash: Option<String>,
+) -> AnyResult<()> {
     if let Some(path) = segment {
+        let bytes = std::fs::metadata(path)
+            .with_context(|| format!("reading chain segment metadata {}", path.display()))?
+            .len();
+        anyhow::ensure!(
+            bytes <= MAX_CHAIN_SEGMENT_BYTES,
+            "chain segment is {bytes} bytes, exceeding the {MAX_CHAIN_SEGMENT_BYTES}-byte limit"
+        );
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading chain segment {}", path.display()))?;
         let segment: hestia::storage::ChainSegment = match serde_json::from_str(&raw) {
@@ -5149,7 +5181,20 @@ fn cmd_chain_verify(home: &std::path::Path, segment: Option<&std::path::Path>) -
                 anyhow::bail!("chain segment is unverifiable");
             }
         };
-        let report = hestia::storage::verify_chain_segment(&segment);
+        let anchor = hestia::storage::ChainSegmentTrustAnchor {
+            chain_id: expect_chain_id,
+            previous_hash: expect_previous_hash,
+            end_hash: expect_end_hash,
+            trusted_witness_keys: trusted_witness_key.into_iter().collect(),
+        };
+        let has_anchor = anchor.chain_id.is_some()
+            || anchor.previous_hash.is_some()
+            || anchor.end_hash.is_some()
+            || !anchor.trusted_witness_keys.is_empty();
+        let report = hestia::storage::verify_chain_segment_with_anchor(
+            &segment,
+            has_anchor.then_some(&anchor),
+        );
         println!("{}", serde_json::to_string_pretty(&report)?);
         anyhow::ensure!(
             report.is_valid(),
