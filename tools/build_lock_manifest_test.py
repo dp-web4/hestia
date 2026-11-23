@@ -14,11 +14,19 @@ FAKE_CARGO = """#!/usr/bin/env bash
 if [ "${1:-}" = metadata ]; then
   if [ -n "${FAKE_METADATA_LOG:-}" ]; then printf '%s\\n' "$*" > "$FAKE_METADATA_LOG"; fi
   if [ -n "${FAKE_METADATA_ERROR:-}" ]; then exit 1; fi
+  case " $* " in
+    *" --filter-platform "*) ;;
+    # Real `--offline` metadata wants every platform's deps cached unless filtered to the host.
+    *) if [ -n "${FAKE_METADATA_UNFILTERED_FAILS:-}" ]; then exit 101; fi ;;
+  esac
   cat "$FAKE_METADATA"
   exit $?
 fi
 printf 'CARGO_TARGET_DIR=%s\\n' "${CARGO_TARGET_DIR:-}"
 printf 'CARGO_ARGS=%s\\n' "$*"
+"""
+FAKE_RUSTC = """#!/usr/bin/env bash
+printf 'rustc 1.0.0\\nhost: x86_64-fake-linux\\n'
 """
 
 
@@ -30,7 +38,7 @@ def check(name, condition, detail):
 
 def main():
     with tempfile.TemporaryDirectory(prefix="build-lock-manifest-") as raw:
-        parent = Path(raw)
+        parent = Path(raw).resolve()  # macOS: /var/folders -> /private/var/folders
         home = parent / "home"
         shim_dir = parent / "shim"
         real_bin = parent / "real-bin"
@@ -40,6 +48,9 @@ def main():
         fake = real_bin / "cargo"
         fake.write_text(FAKE_CARGO, encoding="utf-8")
         fake.chmod(0o755)
+        fake_rustc = real_bin / "rustc"
+        fake_rustc.write_text(FAKE_RUSTC, encoding="utf-8")
+        fake_rustc.chmod(0o755)
         target_root = parent / "target-root"
         metadata = parent / "metadata.json"
         metadata_log = parent / "metadata-args.log"
@@ -68,7 +79,8 @@ def main():
             }
             metadata.write_text(json.dumps(document), encoding="utf-8")
 
-        def run(cwd, *args, explicit_target=False, metadata_error=False):
+        def run(cwd, *args, explicit_target=False, metadata_error=False, subcommand="build",
+                unfiltered_fails=False):
             env = os.environ.copy()
             env.update({
                 "HOME": str(home),
@@ -85,7 +97,14 @@ def main():
                 env["FAKE_METADATA_ERROR"] = "1"
             else:
                 env.pop("FAKE_METADATA_ERROR", None)
-            return subprocess.run([str(SHIM), "build", *args], cwd=cwd, env=env,
+            env.pop("RUSTC", None)
+            if unfiltered_fails:
+                env["FAKE_METADATA_UNFILTERED_FAILS"] = "1"
+            else:
+                env.pop("FAKE_METADATA_UNFILTERED_FAILS", None)
+            if metadata_log.exists():
+                metadata_log.unlink()
+            return subprocess.run([str(SHIM), subcommand, *args], cwd=cwd, env=env,
                                   capture_output=True, text=True, timeout=20)
 
         canonical_dependency = parent / "canonical" / "web4-core"
@@ -129,6 +148,39 @@ def main():
               explicit.returncode == 0
               and "CARGO_TARGET_DIR=" + str(parent / "explicit-target") in explicit.stdout,
               f"rc={explicit.returncode}, stdout={explicit.stdout}, stderr={explicit.stderr}")
+
+        # An unprimed non-host platform dep must not refuse a cached host build (sweep finding 1).
+        write_metadata(main_repo, canonical_dependency)
+        host_only = run(main_repo / "core", unfiltered_fails=True)
+        check("metadata is filtered to the host platform",
+              host_only.returncode == 0
+              and "--filter-platform x86_64-fake-linux" in metadata_log.read_text(encoding="utf-8"),
+              f"rc={host_only.returncode}, stderr={host_only.stderr}")
+
+        # Outside git there is no shared target to split: pass through as before #828.
+        write_metadata(non_git, canonical_dependency)
+        plain = run(non_git)
+        check("a non-git crate builds untouched",
+              plain.returncode == 0 and "CARGO_TARGET_DIR=\n" in plain.stdout,
+              f"rc={plain.returncode}, stdout={plain.stdout}, stderr={plain.stderr}")
+        plain_fail = run(non_git, metadata_error=True)
+        check("outside git a metadata failure is not refused",
+              plain_fail.returncode == 0 and "CARGO_TARGET_DIR=\n" in plain_fail.stdout,
+              f"rc={plain_fail.returncode}, stdout={plain_fail.stdout}, stderr={plain_fail.stderr}")
+
+        # A registry install (no --path) has no local manifest: never discovered, even in git.
+        listed = run(worktree, "--list", subcommand="install", metadata_error=True)
+        check("install without --path skips discovery",
+              listed.returncode == 0 and not metadata_log.exists(),
+              f"rc={listed.returncode}, stdout={listed.stdout}, stderr={listed.stderr}")
+        write_metadata(worktree, canonical_dependency)
+        local = run(non_git, "--path", str(worktree / "core"), subcommand="install")
+        local_target = local.stdout.split("CARGO_TARGET_DIR=", 1)[1].splitlines()[0]
+        check("install --path is identified by that crate's manifest",
+              local.returncode == 0 and local_target == main_target
+              and f"--manifest-path {worktree / 'core' / 'Cargo.toml'}"
+              in metadata_log.read_text(encoding="utf-8"),
+              f"rc={local.returncode}, {main_target} != {local_target}, stderr={local.stderr}")
 
     print("all build-lock manifest identity checks pass")
 

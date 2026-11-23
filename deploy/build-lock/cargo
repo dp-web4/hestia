@@ -19,7 +19,9 @@
 #      concurrent cold builds — `nice` alone protects the daemon's share of a saturated CPU, which
 #      is not enough when N builds saturate all of it). FAIL-OPEN on a stuck lock: if the lock is
 #      held past the wait budget (a hung build), run un-serialized rather than block the fleet's
-#      builds forever — an un-serialized build beats no build.
+#      builds forever — an un-serialized build beats no build. The lock is ONE file for all targets
+#      on purpose (#828): independent graphs wait on each other, and that throughput cost is the
+#      CPU cap #387 measured as necessary — keying it per target would restore N cold builds.
 # Every other cargo invocation passes straight through, untouched.
 #
 # INSTALL: place this as `cargo` in a PATH directory that PRECEDES the real cargo (e.g.
@@ -53,32 +55,66 @@ case "${1:-}" in
     # Shared WARM target on ext4 (#387; kimi's IO channel). The manifest, not the caller's
     # cwd, selects it (#828). Cargo metadata names the actual path dependencies; canonicalizing
     # those manifest paths collapses a worktree symlink to the same identity while keeping a
-    # genuinely different dependency population in a different target. Repository discovery or
+    # genuinely different dependency population in a different target. Inside a git tree,
     # metadata failure is loud: silently falling back to a local target would hide the split.
     # A caller's explicit CARGO_TARGET_DIR always wins and skips discovery. flock (below)
     # serializes, so the shared target is never written by two builds at once.
     if [ -z "${CARGO_TARGET_DIR:-}" ]; then
       _manifest_args=()
+      _manifest_dir=.
       _expect_manifest=0
+      _expect_path=0
+      # `install` builds from the registry unless --path names a local crate; only that local
+      # crate has a manifest (and a shared target) to identify, so forward --path as its manifest.
+      _discover=1
+      [ "$1" = install ] && _discover=0
       for _arg in "$@"; do
         if [ "$_expect_manifest" = 1 ]; then
           _manifest_args+=("$_arg")
+          _manifest_dir="$(dirname "$_arg")"
           _expect_manifest=0
           continue
         fi
-        case "$_arg" in
-          --manifest-path)
+        if [ "$_expect_path" = 1 ]; then
+          _manifest_args+=(--manifest-path "$_arg/Cargo.toml")
+          _manifest_dir="$_arg"
+          _discover=1
+          _expect_path=0
+          continue
+        fi
+        case "$1:$_arg" in
+          install:--path)
+            _expect_path=1 ;;
+          install:--path=*)
+            _manifest_args+=(--manifest-path "${_arg#--path=}/Cargo.toml")
+            _manifest_dir="${_arg#--path=}"
+            _discover=1 ;;
+          *:--manifest-path)
             _manifest_args+=("$_arg")
             _expect_manifest=1 ;;
-          --manifest-path=*)
-            _manifest_args+=("$_arg") ;;
+          *:--manifest-path=*)
+            _manifest_args+=("$_arg")
+            _manifest_dir="$(dirname "${_arg#--manifest-path=}")" ;;
         esac
       done
-      if [ "$_expect_manifest" = 1 ]; then
-        echo "cargo build-lock: --manifest-path needs a value" >&2
+      if [ "$_expect_manifest" = 1 ] || [ "$_expect_path" = 1 ]; then
+        echo "cargo build-lock: --manifest-path/--path needs a value" >&2
         exit 2
       fi
-      if ! _identity="$("$real" metadata --format-version 1 --offline "${_manifest_args[@]}" | python3 -c '
+      # Outside a git tree there is no repo-wide shared target to split, so the shim leaves the
+      # build alone exactly as before #828; only a failure INSIDE a git tree is refused below.
+      if [ "$_discover" = 1 ] && ! git -C "$_manifest_dir" rev-parse --git-common-dir >/dev/null 2>&1; then
+        echo "cargo build-lock: $_manifest_dir is not in a git worktree; no shared target" >&2
+        _discover=0
+      fi
+    fi
+    if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "$_discover" = 1 ]; then
+      # Resolve the graph for the HOST platform only: unfiltered `--offline` metadata wants every
+      # platform's deps (e.g. android_system_properties) cached and refuses a fully-cached host build.
+      _filter=()
+      _host="$("${RUSTC:-rustc}" -vV 2>/dev/null | sed -n 's/^host: //p')"
+      [ -n "$_host" ] && _filter=(--filter-platform "$_host")
+      if ! _identity="$("$real" metadata --format-version 1 --offline "${_filter[@]}" "${_manifest_args[@]}" | python3 -c '
 import hashlib, json, os, sys
 m = json.load(sys.stdin)
 paths = sorted(os.path.realpath(p["manifest_path"]) for p in m["packages"]
@@ -87,6 +123,7 @@ identity = hashlib.sha256(chr(10).join(paths).encode()).hexdigest()[:16]
 print(os.path.realpath(m["workspace_root"]) + chr(9) + identity)
 ')"; then
         echo "cargo build-lock: cargo metadata failed; refusing to guess the dependency/target identity" >&2
+        echo "cargo build-lock: prime the graph with \`cargo fetch\`, or set CARGO_TARGET_DIR to choose a target yourself" >&2
         exit 2
       fi
       IFS=$'\t' read -r _root _dep_id <<< "$_identity"
