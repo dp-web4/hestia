@@ -432,6 +432,41 @@ for target in result["targets"]:
     [ -n "$reg_base" ] || continue
     registered["$reg_base"]="${registered[$reg_base]:-}${reg_path}"$'\n'
   done <<< "$reg_out"
+  for reg_base in "${!registered[@]}"; do
+    [ "$reg_base" != "hydrate.sh" ] || continue
+    mapfile -t same_base_targets < <(printf '%s' "${registered[$reg_base]}")
+    [ "${#same_base_targets[@]}" -gt 1 ] || continue
+    ownership_err="$(python3 - "$AUTHORITY" "$member" "$reg_base" "${same_base_targets[@]}" <<'PY'
+import json
+import sys
+
+authority, member, base, *targets = sys.argv[1:]
+targets = sorted(set(targets))
+if len(targets) < 2:
+    raise SystemExit(0)
+try:
+    with open(authority, encoding="utf-8") as fh:
+        ledger = json.load(fh)
+except (OSError, ValueError):
+    ledger = {}
+owned = {
+    row.get("path")
+    for entry in ledger.get("members", [])
+    if entry.get("member") == member
+    for row in entry.get("files", [])
+    if row.get("file") == base
+}
+unproven = [target for target in targets if target not in owned]
+if unproven:
+    print(f"{member}/{base}: registered targets not proven hestia-owned: {', '.join(unproven)}. "
+          "Refusing to overwrite an ambiguous same-basename registration before any write. "
+          "On a fresh host, remove the non-hestia duplicate registration; if both targets are "
+          "hestia's, install one target first to establish current-build.json, then register "
+          "the other and rerun.")
+    raise SystemExit(1)
+PY
+)" || die "$ownership_err"
+  done
   if [ -f "$REPO_ROOT/plugins/$member/instance/identity.seed.json" ] && [ -n "${registered[hydrate.sh]:-}" ]; then
     declare -A hydrate_seed_roots=()
     mapfile -t hydrate_targets < <(printf '%s' "${registered[hydrate.sh]}")

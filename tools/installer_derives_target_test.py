@@ -275,6 +275,12 @@ def test_duplicate_basenames_keep_every_registered_target():
         )
         os.makedirs(os.path.dirname(first))
         os.makedirs(os.path.dirname(second))
+        os.makedirs(os.path.join(home, ".hestia"))
+        with open(os.path.join(home, ".hestia", "current-build.json"), "w") as fh:
+            json.dump({"members": [{"member": "m", "files": [
+                {"file": "pre_tool_use.py", "path": first},
+                {"file": "pre_tool_use.py", "path": second},
+            ]}]}, fh)
         rc, out = run(root, env)
         actions = [ln for ln in out.splitlines()
                    if ln.lstrip().startswith(("would ", "ok    ", "wrote "))]
@@ -300,6 +306,53 @@ def test_duplicate_basenames_keep_every_registered_target():
         rows = [f for m in authority["members"] if m["member"] == "m" for f in m["files"]]
         check(sorted(f["path"] for f in rows) == sorted([first, second]),
               f"authority did not record both full targets: {rows}")
+
+
+def test_foreign_duplicate_basename_is_refused_before_any_write():
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        declared = os.path.join(home, ".a", "hooks", "pre_tool_use.py")
+        foreign = os.path.join(home, ".foreign", "pre_tool_use.py")
+        root, home, env = build(
+            tmp,
+            expects={
+                "dest": "~/.a/hooks",
+                "registration": {"reader": "json-hook-commands",
+                                 "path": [".a", "settings.json"]},
+                "files": ["hooks/pre_tool_use.py"],
+            },
+            files=("pre_tool_use.py",),
+            reg_name=os.path.join(".a", "settings.json"),
+            registration=json.dumps({"hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": f"python3 {declared}"},
+                {"type": "command", "command": f"python3 {foreign}"},
+            ]}]}}),
+        )
+        for label, target, contents in (
+            ("declared", declared, "operator hestia bytes\n"),
+            ("foreign", foreign, "foreign project bytes\n"),
+        ):
+            os.makedirs(os.path.dirname(target))
+            with open(target, "w") as fh:
+                fh.write(contents)
+        os.makedirs(os.path.join(home, ".hestia", "shared.builds", "old"))
+        os.symlink("shared.builds/old", os.path.join(home, ".hestia", "shared"))
+
+        for label, run_env in (("dry-run", env), ("normal", normal(env))):
+            rc, out = run(root, run_env)
+            check(rc != 0, f"{label}: foreign duplicate was accepted: {out}")
+            check("not proven hestia-owned" in out,
+                  f"{label}: ambiguous ownership was not named: {out}")
+            for target, expected in ((declared, "operator hestia bytes\n"),
+                                     (foreign, "foreign project bytes\n")):
+                with open(target) as fh:
+                    check(fh.read() == expected, f"{label}: {target} changed before refusal")
+                check(not os.path.exists(target + ".pre-install.bak"),
+                      f"{label}: {target} was backed up before refusal")
+            check(os.readlink(os.path.join(home, ".hestia", "shared")) == "shared.builds/old",
+                  f"{label}: shared engine moved before refusal")
+            check(not os.path.exists(os.path.join(home, ".hestia", "current-build.json")),
+                  f"{label}: ambiguous install was recorded as authoritative")
 
 
 def test_unclassified_registration_blocks_a_partial_install():
@@ -638,6 +691,7 @@ TESTS = [
     test_unknown_reader_is_fatal_not_empty,
     test_governed_session_is_refused_but_dry_run_is_not,
     test_duplicate_basenames_keep_every_registered_target,
+    test_foreign_duplicate_basename_is_refused_before_any_write,
     test_unclassified_registration_blocks_a_partial_install,
     test_unparseable_and_unreadable_registrations_are_fatal_without_writes,
     test_duplicate_hydrate_targets_with_distinct_seed_roots_are_fatal,
