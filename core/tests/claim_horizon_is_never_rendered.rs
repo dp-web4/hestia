@@ -210,7 +210,8 @@ fn approve_at(s: &mut EscalationStore, id: &str, at: u64) {
 fn the_advertised_retry_deadline_is_attainable_in_no_history() {
     // Bind to the PRODUCER first. If this line ever moves or changes, everything below is
     // arithmetic about a number nobody emits.
-    let body = production_body("server/handler.rs", "tool_gate_escalation_claim");
+    let body = // dp 2026-11-05: the claim door's body moved into its inner fn (deliberate escalation).
+    production_body("server/handler.rs", "gate_escalation_claim_inner");
     assert!(
         !body.contains(RETIRED_RETRY_EXPR),
         "REGRESSION PIN 1: the retired retry countdown returned. \
@@ -286,7 +287,8 @@ fn the_advertised_retry_deadline_is_attainable_in_no_history() {
 #[test]
 fn the_over_report_grows_as_the_decision_gets_faster() {
     // Same producer binding as PIN 1: the magnitudes below are about an emitted number.
-    let body = production_body("server/handler.rs", "tool_gate_escalation_claim");
+    let body = // dp 2026-11-05: the claim door's body moved into its inner fn (deliberate escalation).
+    production_body("server/handler.rs", "gate_escalation_claim_inner");
     assert!(
         !body.contains(RETIRED_RETRY_EXPR),
         "REGRESSION PIN 2: the retired open-time deadline returned; the emitting site \
