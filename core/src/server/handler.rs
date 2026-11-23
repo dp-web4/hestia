@@ -31771,6 +31771,71 @@ mod disposition_durability_tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_failed_moot_update_rolls_back_and_rebuilds_after_restart() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox, ruling_hash, ruling_pos) = {
+            let mut s = state.lock().await;
+            let handles = (s.chain_store.clone(), s.inbox_store.clone());
+            assert_eq!(project_dispositions(&handles.0, &handles.1).unwrap().projected, 0);
+            s.inbox_store.enqueue_member(
+                "kimi-code", "claude-code", "role:constellation:interactive-dev",
+                "review_request", Some("hestia://escalation/esc-rollback#corroborate-or-dissent"),
+                "ask-rollback", None,
+            ).unwrap();
+            let e = s.append_chain(
+                "gate_escalation_decided",
+                json!({
+                    "escalation_id": "esc-rollback", "plugin_id": "kimi-code",
+                    "tool_name": "policy_edit", "status": "approved", "decided_by": "operator",
+                }),
+            ).unwrap();
+            (handles.0, handles.1, e.hash, e.chain_position)
+        };
+
+        let injected = raw_inbox_conn(&dir);
+        injected.execute_batch(
+            "CREATE TRIGGER fail_moot_update BEFORE UPDATE OF mooted_at, moot_reason ON member_notices
+             BEGIN SELECT RAISE(FAIL, 'injected moot update'); END;",
+        ).unwrap();
+        {
+            let s = state.lock().await;
+            assert_eq!(
+                ensure_disposition(&s, "kimi-code", "hestia://escalation/esc-rollback#decided", &ruling_hash),
+                None,
+            );
+        }
+        assert_eq!(count_dispositions(&injected, false), 0, "the disposition insert rolled back");
+        let mooted_at: Option<String> = injected.query_row(
+            "SELECT mooted_at FROM member_notices WHERE chain_hash = 'ask-rollback'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(mooted_at.is_none(), "the failed moot update rolled back too");
+        injected.execute_batch("DROP TRIGGER fail_moot_update").unwrap();
+        assert_eq!(inbox.projection_cursor("disposition").unwrap(), Some(ruling_pos));
+
+        let pass = project_dispositions(&chain, &inbox).unwrap();
+        assert_eq!(pass.projected, 1);
+        assert_eq!(pass.advanced_to, ruling_pos + 1);
+        drop(injected);
+        drop(state);
+
+        let state = super::inbox_tests::open_state(&dir);
+        let (chain, inbox) = {
+            let s = state.lock().await;
+            (s.chain_store.clone(), s.inbox_store.clone())
+        };
+        assert_eq!(project_dispositions(&chain, &inbox).unwrap().projected, 0);
+        let conn = raw_inbox_conn(&dir);
+        assert_eq!(count_dispositions(&conn, false), 1);
+        let moot_reason: String = conn.query_row(
+            "SELECT moot_reason FROM member_notices WHERE chain_hash = 'ask-rollback'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(moot_reason.contains(&ruling_hash), "the rebuilt moot evidence lost its ruling: {moot_reason}");
+    }
+
     /// Reviewer test 2: a restart between the ruling and the projection — the
     /// cursor lives in inbox.db, so the new daemon resumes it and inserts exactly
     /// one disposition.
