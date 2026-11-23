@@ -1886,6 +1886,23 @@ fn vault_rules_for_add(
     Ok((release, presentation))
 }
 
+/// The `release rule:` line `hestia vault add` prints.
+///
+/// `exposed` is the runtime read condition, not the recorded rule: `tool_vault_get` skips the
+/// consumer check for an empty `allowed_consumers` list (HST-001), and nothing reads `release`
+/// yet. A recorded rule on such a row is intent only, so the line must not read as protection.
+fn release_rule_line(recorded: bool, exposed: bool) -> String {
+    let rule = if recorded { "recorded" } else { "unrecorded (legacy consumer list decides)" };
+    if exposed {
+        format!(
+            "{rule} — NOT ENFORCED: the consumer list is empty, so this entry is EXPOSED \
+             (readable by ANY attributed caller, HST-001); pass --consumer to restrict it"
+        )
+    } else {
+        rule.to_string()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_vault_add(
     home: &std::path::Path,
@@ -1920,12 +1937,10 @@ fn cmd_vault_add(
     }
     let recorded_release = entry.release.is_some();
     let recorded_present = entry.presentation.is_some();
+    let exposed = entry.allowed_consumers.is_empty();
     vault.add(entry)?;
     println!("✓ Added '{name}' to vault");
-    println!(
-        "  release rule:      {}",
-        if recorded_release { "recorded" } else { "unrecorded (legacy consumer list decides)" }
-    );
+    println!("  release rule:      {}", release_rule_line(recorded_release, exposed));
     println!(
         "  presentation rule: {}",
         if recorded_present { "recorded" } else { "UNRECORDED — presenting escalates to you (§7.1)" }
@@ -1984,6 +1999,17 @@ mod vault_add_tests {
             false, &[], &verifier, Some("fixed"), None, None,
         ).unwrap();
         assert!(uncapped.unwrap().is_self_sufficient());
+    }
+
+    #[test]
+    fn an_exposed_add_does_not_report_its_release_rule_as_protection() {
+        let exposed = release_rule_line(true, true);
+        assert!(exposed.contains("EXPOSED"), "an empty consumer list must be named: {exposed}");
+        assert!(exposed.contains("NOT ENFORCED"), "a recorded rule nothing reads is intent only: {exposed}");
+        assert!(release_rule_line(false, true).contains("EXPOSED"));
+        // Negative control: a restricted row gets no exposure warning.
+        assert_eq!(release_rule_line(true, false), "recorded");
+        assert!(!release_rule_line(false, false).contains("EXPOSED"));
     }
 }
 
