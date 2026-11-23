@@ -75,6 +75,30 @@ cause label alone cannot prove them.
 Legacy reversal events without a classified cause are retained but are not
 silently treated as invalid-result events by the calibration exporter.
 
+### Per-cause emission and lineage contract
+
+The reversal says that an earlier operational decision changed. An
+adjudication says what evidence establishes about one V3 axis. They are
+separate events linked explicitly:
+
+| Cause | Automatic adjudication | Required lineage | Projection effect |
+|---|---|---|---|
+| `invalid-result` | `validity: refuted`, method `reversal` | emitted adjudication `depends_on` the reversal | negative validity evidence; legacy judgment also moves |
+| `changed-requirements` | none | follow-up verdicts SHOULD `depends_on` the reversal and new requirement evidence | neutral |
+| `new-evidence` | none | a replacement verdict MUST `supersedes` the prior same-axis adjudication and SHOULD `depends_on` the reversal/evidence | neutral until separately adjudicated |
+| `corrected-adjudication` | none | reversal `ref` MUST identify the prior same-grain adjudication; it tombstones that verdict. A replacement MUST `supersedes` the prior verdict and SHOULD `depends_on` the reversal | removes the corrected verdict at read time; replacement folds normally |
+| `self-correction` | none | future positive conduct evidence MUST link to the reversal | neutral today; no automatic Temperament |
+| `obsolescence` | none | follow-up verdicts SHOULD `depends_on` the reversal and obsolescence evidence | neutral |
+
+`supersedes` accepts a raw witness hash or `chain:<hash>` and is canonicalized
+to the raw hash in the event. It is valid only for an earlier adjudication of
+the same subject, role, and axis. The immutable original remains receipt
+visible but is excluded from the active score. A
+`corrected-adjudication` reversal provides the same read-time exclusion while
+a replacement verdict is pending. Because that exclusion changes the
+subject's active score, the subject cannot issue it about itself; it requires
+an attributable, law-authorized independent witness.
+
 ## Accountability self-audit
 
 ```text
@@ -108,9 +132,7 @@ verdict: PASS
   In-tree callers are updated; update any runbooks/operator habits.
 - Aggregate closure-claims payload is capped at 64 KB serialized per outcome
   (`MAX_CLOSURE_CLAIMS_TOTAL_BYTES`) — large evidence goes behind pointers, not inline.
-- Reconciliation items for Codex's return (7/30), recorded in the plan errata:
-  (1) this spec's reading that `self-correction` earns Temperament only via adjudication
-  (not automatically) is accepted as anti-gaming but diverges from synthesis amendment 1's
-  letter — plan text to be aligned; (2) the per-cause adjudication-emission table
-  (supersedes/depends_on hooks for `corrected-adjudication` etc.) is still thin — CBP's
-  Stage-1 adjudication event will define it; Codex reviews on return.
+- `self-correction` remains neutral until independently witnessed conduct
+  confirmation lands; the per-cause emission and lineage contract above is
+  explicit, and the daemon validates and derives `supersedes`, `depends_on`,
+  and corrected-adjudication tombstones accordingly.
