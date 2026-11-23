@@ -723,14 +723,29 @@ fn ratify_body(verify: &Value, reason: &str, paths: &[String]) -> Result<Value> 
         .ok_or_else(|| {
             anyhow!("gate verification returned no discovered bytes; refusing to ratify UNKNOWN coverage")
         })?;
-    for (path, digest) in current {
-        if digest.as_str().is_none() {
+    let check_digest = |path: &String, digest: &Value| -> Result<()> {
+        let Some(hex) = digest.as_str() else {
             bail!("refusing to ratify: {path} is unreadable");
+        };
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("refusing to ratify: {path} does not carry a 64-hex digest");
         }
-    }
-    for path in paths {
-        if !current.contains_key(path) {
-            bail!("refusing to ratify: {path} is not in the verified gate set");
+        Ok(())
+    };
+    if paths.is_empty() {
+        for (path, digest) in current {
+            check_digest(path, digest)?;
+        }
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        for path in paths {
+            if !seen.insert(path) {
+                bail!("refusing to ratify: duplicate --path {path}");
+            }
+            let digest = current
+                .get(path)
+                .ok_or_else(|| anyhow!("refusing to ratify: {path} is not in the verified gate set"))?;
+            check_digest(path, digest)?;
         }
     }
     let mut body = json!({"reason": reason, "expected": current});
@@ -998,7 +1013,7 @@ mod tests {
 
     #[test]
     fn ratify_binds_the_verified_bytes_and_named_paths() {
-        let verify = json!({"evidence": {"current": {"/g/a.py": "aaa", "/g/b.py": "bbb"}}});
+        let verify = json!({"evidence": {"current": {"/g/a.py": "a".repeat(64), "/g/b.py": "b".repeat(64)}}});
         let body = ratify_body(&verify, "reviewed the deploy", &["/g/b.py".into()]).unwrap();
         assert_eq!(body["expected"], verify["evidence"]["current"]);
         assert_eq!(body["paths"], json!(["/g/b.py"]));
@@ -1008,11 +1023,22 @@ mod tests {
     }
 
     #[test]
+    fn ratify_per_path_ignores_unreadable_unselected_gate_and_rejects_bad_inputs() {
+        let verify = json!({"evidence": {"current": {"/g/a.py": "a".repeat(64), "/g/b.py": null}}});
+        let body = ratify_body(&verify, "reviewed", &["/g/a.py".into()]).unwrap();
+        assert_eq!(body["paths"], json!(["/g/a.py"]));
+        assert!(ratify_body(&verify, "reviewed", &[]).is_err(), "bulk still checks every gate");
+        assert!(ratify_body(&verify, "reviewed", &["/g/a.py".into(), "/g/a.py".into()]).is_err());
+        let malformed = json!({"evidence": {"current": {"/g/a.py": "aaa"}}});
+        assert!(ratify_body(&malformed, "reviewed", &["/g/a.py".into()]).is_err());
+    }
+
+    #[test]
     fn ratify_refuses_unknown_unreadable_and_unreviewed_coverage() {
         assert!(ratify_body(&json!({"evidence": {"current": {}}}), "reviewed", &[]).is_err());
-        let verify = json!({"evidence": {"current": {"/g/a.py": "aaa", "/g/b.py": null}}});
+        let verify = json!({"evidence": {"current": {"/g/a.py": "a".repeat(64), "/g/b.py": null}}});
         assert!(ratify_body(&verify, "reviewed", &[]).is_err(), "an unreadable gate is not ratifiable");
-        let verify = json!({"evidence": {"current": {"/g/a.py": "aaa"}}});
+        let verify = json!({"evidence": {"current": {"/g/a.py": "a".repeat(64)}}});
         assert!(ratify_body(&verify, "reviewed", &["/g/other.py".into()]).is_err());
         assert!(ratify_body(&verify, "", &[]).is_err());
         assert!(ratify_body(&verify, &"x".repeat(513), &[]).is_err());
