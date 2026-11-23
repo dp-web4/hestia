@@ -1540,18 +1540,30 @@ fn read_passphrase_file(home: &std::path::Path) -> AnyResult<Option<String>> {
     Ok(Some(pp))
 }
 
+/// The daemon's passphrase: `HESTIA_PASSPHRASE`, then `$HESTIA_HOME/.passphrase` read
+/// in-process, then the TTY. ONLY `cmd_serve` may call this. The file exists on every
+/// installed seat, so reading it in the shared `prompt_passphrase` let any same-UID
+/// CLI call (`vault get`, `vault remove`, `policy set`) unlock the vault with no env
+/// and no TTY (hestia#1587 hold; pinned by tests/passphrase_file_is_serve_only.rs).
+fn serve_passphrase(home: &std::path::Path, prompt: &str) -> AnyResult<String> {
+    if std::env::var_os("HESTIA_PASSPHRASE").is_none() {
+        if let Some(pp) = read_passphrase_file(home)? {
+            return Ok(pp);
+        }
+    }
+    prompt_passphrase(prompt)
+}
+
 /// Resolve a passphrase. Order:
 /// 1. `HESTIA_PASSPHRASE` env var (for automation; not recommended for daily use)
-/// 2. `$HESTIA_HOME/.passphrase`, read in-process rather than exported through a shell
-/// 3. Prompt the TTY via rpassword
-fn prompt_passphrase(home: &std::path::Path, prompt: &str) -> AnyResult<String> {
+/// 2. Prompt the TTY via rpassword
+///
+/// Never reads `.passphrase`: a CLI command needs env or a human (see `serve_passphrase`).
+fn prompt_passphrase(prompt: &str) -> AnyResult<String> {
     if let Ok(pp) = std::env::var("HESTIA_PASSPHRASE") {
         if pp.is_empty() {
             anyhow::bail!("HESTIA_PASSPHRASE is set but empty");
         }
-        return Ok(pp);
-    }
-    if let Some(pp) = read_passphrase_file(home)? {
         return Ok(pp);
     }
     let pp = rpassword::prompt_password(prompt).context("reading passphrase")?;
@@ -1735,7 +1747,7 @@ fn cmd_serve(home: &std::path::Path, bind: &str, allow_remote: bool, callback: b
             path.display()
         );
     }
-    let passphrase = prompt_passphrase(home, "Vault passphrase: ")?;
+    let passphrase = serve_passphrase(home, "Vault passphrase: ")?;
     let vault = hestia::Vault::open(path, passphrase.clone())?;
     println!("Vault unlocked. Starting Hestia MCP server on {bind}...");
 
@@ -2166,7 +2178,7 @@ fn cmd_witness_confer(
         return Ok(());
     }
 
-    let passphrase = prompt_passphrase(home, "Vault passphrase: ")?;
+    let passphrase = prompt_passphrase("Vault passphrase: ")?;
     let path = vault_path(home);
     if !path.exists() {
         anyhow::bail!("no vault at {} — run `hestia init` first", path.display());
@@ -2539,7 +2551,7 @@ fn open_vault_with_passphrase(home: &std::path::Path) -> AnyResult<(Vault, Strin
             path.display()
         );
     }
-    let passphrase = prompt_passphrase(home, "Vault passphrase: ")?;
+    let passphrase = prompt_passphrase("Vault passphrase: ")?;
     let vault = Vault::open(path, passphrase.clone())?;
     Ok((vault, passphrase))
 }

@@ -157,8 +157,9 @@ authority reference and evidence.
 - Vault and chain writes are atomic and interprocess-safe: either the old state or the new,
   never a partial commit.
 
-The shipped daemon and launchers read `$HESTIA_HOME/.passphrase` **in process** rather than
-exporting it through a shell. This keeps the passphrase out of `/proc/<pid>/environ` in the
+The daemon (`hestia serve`, and only `serve`) reads `$HESTIA_HOME/.passphrase` **in
+process**, and the shipped launchers no longer export it through a shell. Every other CLI
+command still needs `HESTIA_PASSPHRASE` or a TTY: it never reads the file. This keeps the passphrase out of `/proc/<pid>/environ` in the
 normal deployment, but does not make it inaccessible to a same-UID process: the file itself
 remains mode `0600`, and any process at that UID can read it. The credential rule is therefore
 an A1 cooperation boundary, not secret containment. If an operator explicitly supplies
