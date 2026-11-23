@@ -229,7 +229,7 @@ def liveness(x):
     ev = x.get("recipient_liveness_evidence") or {}
     if not isinstance(ev, dict) or not ev:
         # No liveness record at all — not a dormancy verdict, an absence of one.
-        return ("; recipient NEVER SEEN on this mesh — likely misrouted, try the hub mesh"
+        return ("; recipient NEVER SEEN on this mesh (no liveness record: no watcher here has read that name's mailbox)"
                 if live == "unknown" else "")
     bits = []
     age = _age_secs(ev.get("last_inbox_touch"))
