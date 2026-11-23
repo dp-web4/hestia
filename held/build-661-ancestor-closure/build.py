@@ -27,7 +27,7 @@ def once(text, old, new):
 
 
 def patch_core(src):
-    return once(src, r'''    def match(self, target: str, *, cwd: Optional[str] = None,
+    src = once(src, r'''    def match(self, target: str, *, cwd: Optional[str] = None,
               position: str = "write") -> Optional[str]:
         """The matched closure element, or None, over every form in `forms`."""
         for c in self.forms(target, cwd=cwd):
@@ -36,23 +36,26 @@ def patch_core(src):
                 return hit
         return None
 ''', r'''    def _match_ancestor(self, candidate: str) -> Optional[str]:
-        """A directory the candidate CONTAINS, when this is a relocating/write act.
-
-        `plugins` and `plugins/kimi` prefix `plugins/*/hooks`; an existing repo root is also
-        checked for the marker's literal leading directory, which covers `git checkout -- .`.
-        """
-        segs = _segments(candidate)
+        """A proper marker prefix in normalized, case-folded absolute or relative form."""
+        expanded = os.path.expanduser(candidate)
+        absolute = os.path.isabs(expanded)
+        real = (os.path.realpath(expanded) if absolute
+                else os.path.normpath(expanded)).replace("\\", "/")
+        segs = tuple(segment.casefold() for segment in _segments(real))
         for pat in self.dir_markers:
-            if segs and len(segs) < len(pat) and all(
-                    pat[i] == "*" or pat[i] == segs[i] for i in range(len(segs))):
-                return "/".join(pat)
-            if os.path.isabs(candidate):
+            folded = tuple(segment.casefold() for segment in pat)
+            for width in range(1, len(folded)):
+                if width <= len(segs) and all(
+                        folded[i] == "*" or folded[i] == segs[len(segs) - width + i]
+                        for i in range(width)):
+                    return "/".join(pat)
+            if absolute:
                 literal = []
                 for segment in pat:
                     if segment == "*":
                         break
                     literal.append(segment)
-                if literal and os.path.isdir(os.path.join(candidate, *literal)):
+                if literal and os.path.isdir(os.path.join(real, *literal)):
                     return "/".join(pat)
         return None
 
@@ -69,6 +72,27 @@ def patch_core(src):
                     return hit
         return None
 ''')
+    src = once(src, """        sub, rest = args[i], args[i + 1:]
+""", """        sub, rest = args[i], args[i + 1:]
+        git_c = args[args.index("-C") + 1] if "-C" in args[:i] else None
+""")
+    return once(src, """        if sub == "checkout":
+            # Only explicit pathspec overwrite (`checkout [-|tree-ish] -- paths`); a branch
+            # switch is not a targeted closure write.
+            if "--" in rest:
+                return rest[rest.index("--") + 1:]
+            return []
+""", """        if sub == "checkout":
+            # Only explicit pathspec overwrite (`checkout [-|tree-ish] -- paths`); a branch
+            # switch is not a targeted closure write. `git -C` roots relative pathspecs there,
+            # not at the shell's cwd.
+            if "--" in rest:
+                targets = rest[rest.index("--") + 1:]
+                if git_c:
+                    return [t if os.path.isabs(t) else os.path.join(git_c, t) for t in targets]
+                return targets
+            return []
+""")
 
 
 def patch_test(src):
@@ -89,6 +113,30 @@ def patch_test(src):
     check("repo-root-checkout-is-write", v.classification == "write", str(v))
     v = cls("Bash", {"command": "ls"}, cwd=root)
     check("repo-root-read-is-not-write", v.classification != "write", str(v))
+
+    for label, command in (
+            ("absolute", f"mv {root}/plugins /tmp/x"),
+            ("absolute-rm", f"rm -rf {root}/plugins"),
+            ("case-fold", f"mv {root}/PLUGINS /tmp/x"),
+            ("normalized-dotdot", f"mv {root}/plugins/kimi/../kimi /tmp/x"),
+            ("git-C-root", f"git -C {root} checkout -- ."),
+            ("git-C-case-fold", f"git -C {root} checkout -- PLUGINS")):
+        v = cls("Bash", {"command": command}, cwd="/")
+        check(f"absolute-ancestor-{label}-is-write", v.classification == "write", str(v))
+
+    linked = tempfile.mkdtemp(prefix="hgc-ancestor-links-")
+    root_link = os.path.join(linked, "root-link")
+    plugins_link = os.path.join(linked, "plugins-link")
+    os.symlink(root, root_link)
+    os.symlink(os.path.join(root, "plugins"), plugins_link)
+    for label, command in (
+            ("root-link", f"mv {root_link}/plugins /tmp/x"),
+            ("through-link", f"mv {plugins_link}/kimi /tmp/x")):
+        v = cls("Bash", {"command": command}, cwd="/")
+        check(f"symlinked-ancestor-{label}-is-write", v.classification == "write", str(v))
+
+    v = cls("Bash", {"command": "mv /tmp/ordinary-a /tmp/ordinary-b"}, cwd="/")
+    check("ordinary-absolute-move-is-not-invented", v.classification != "write", str(v))
     empty = tempfile.mkdtemp(prefix="hgc-ancestor-empty-")
     v = cls("Bash", {"command": "git checkout -q origin/main -- ."}, cwd=empty)
     check("unrelated-root-is-not-invented", v.classification != "write", str(v))
@@ -114,6 +162,9 @@ def hunks(section):
             m = re.match(r"@@ -(\d+)(?:,(\d+))?", line)
             cur = {"start": int(m.group(1)) - 1, "old": [], "new": []}
             out.append(cur)
+        elif cur is not None and not line.strip():
+            cur["old"].append(line)
+            cur["new"].append(line)
         elif cur is not None and line[:1] in " +-" and not line.startswith(("--- ", "+++ ")):
             if line[0] in " -":
                 cur["old"].append(line[1:])
@@ -165,6 +216,7 @@ def main():
     print(f"hooks_gt emitted {n} files")
 
     body = diff(CORE, blob(CORE), core) + gt_out.read_text(encoding="utf-8") + diff(TEST, blob(TEST), test_new)
+    body = re.sub(r"(?m)^ $", "", body)
     gt_out.unlink()
     sha = hashlib.sha256(body.encode()).hexdigest()
     (OUT / f"{sha}.patch").write_text(body, encoding="utf-8")
