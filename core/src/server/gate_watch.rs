@@ -111,20 +111,52 @@ fn with_deployed_engine_at(
         .map_err(|e| format!("shared engine deployment record is unreadable: {e}"))?;
     let document: Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("shared engine deployment record is unparseable: {e}"))?;
+    let shared_root = path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("shared");
+    let shared_root = std::fs::canonicalize(&shared_root)
+        .map_err(|e| format!("shared engine root is unreadable: {e}"))?;
     let engine = document
         .get("shared_engine")
         .and_then(Value::as_array)
         .filter(|rows| !rows.is_empty())
         .ok_or_else(|| "shared engine deployment record names no engine files".to_string())?;
     for row in engine {
-        let path = row
+        row.get("file")
+            .and_then(Value::as_str)
+            .filter(|file| !file.is_empty())
+            .ok_or_else(|| "shared engine deployment record has a file with no name".to_string())?;
+        row.get("sha256")
+            .and_then(Value::as_str)
+            .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| "shared engine deployment record has an invalid sha256".to_string())?;
+        let raw_path = row
             .get("path")
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty())
             .ok_or_else(|| "shared engine deployment record has a file with no path".to_string())?;
-        if !discovered.iter().any(|(_, existing)| existing == path) {
-            discovered.push((ENGINE_PLUGIN_ID.into(), path.into()));
+        if !raw_path.starts_with('/') {
+            return Err(format!("shared engine path is not absolute: {raw_path}"));
         }
+        let real = std::fs::canonicalize(raw_path)
+            .map_err(|e| format!("shared engine path is unreadable: {raw_path}: {e}"))?;
+        if !real.starts_with(&shared_root) {
+            return Err(format!("shared engine path escapes the shared root: {raw_path}"));
+        }
+        if !real.is_file() {
+            return Err(format!("shared engine path is not a regular file: {raw_path}"));
+        }
+        let real = real.to_string_lossy().into_owned();
+        if discovered.iter().any(|(_, existing)| {
+            existing == &real
+                || std::fs::canonicalize(existing)
+                    .map(|other| other.to_string_lossy() == real)
+                    .unwrap_or(false)
+        }) {
+            continue;
+        }
+        discovered.push((ENGINE_PLUGIN_ID.into(), real));
     }
     Ok(discovered)
 }
@@ -436,8 +468,8 @@ mod tests {
     use super::*;
     use crate::vault::gate_integrity::GateExpectation;
 
-    fn gate(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
-        let p = dir.path().join(name);
+    fn gate(dir: impl AsRef<Path>, name: &str, body: &str) -> String {
+        let p = dir.as_ref().join(name);
         std::fs::write(&p, body).unwrap();
         p.to_string_lossy().into_owned()
     }
@@ -458,10 +490,12 @@ mod tests {
     fn shared_engine_mutation_flips_production_readiness() {
         let dir = tempfile::tempdir().unwrap();
         let shim = gate(&dir, "shim.py", "reviewed shim");
-        let engine = gate(&dir, "engine.py", "reviewed engine");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let engine = gate(&shared, "engine.py", "reviewed engine");
         let manifest = dir.path().join("current-build.json");
         std::fs::write(&manifest, serde_json::json!({
-            "shared_engine": [{"file": "engine.py", "path": engine.clone(), "sha256": "recorded"}]
+            "shared_engine": [{"file": "engine.py", "path": engine.clone(), "sha256": "0".repeat(64)}]
         }).to_string()).unwrap();
         let discovered = with_deployed_engine_at(
             Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest));
@@ -496,6 +530,74 @@ mod tests {
         assert_eq!(seen[0].key, COVERAGE_KEY);
         assert_eq!(seen[0].status, "unknown");
         assert_eq!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "UNKNOWN");
+    }
+
+    #[test]
+    fn an_empty_engine_discovery_is_coverage_not_a_manifest_free_pass() {
+        let discovered = with_deployed_engine_at(Ok(vec![]), None);
+        assert!(discovered.as_ref().unwrap().is_empty());
+        let seen = observe(&GateExpectations::new(), discovered.map(|rows| {
+            rows.into_iter().map(|(_, path)| path).collect::<Vec<_>>()
+        }));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].key, COVERAGE_KEY);
+        assert_eq!(seen[0].status, "unknown");
+        assert_eq!(status_document(&seen, &HashMap::new(), 0, 0)["status"], "UNKNOWN");
+    }
+
+    #[test]
+    fn shared_engine_paths_dedupe_realpaths_and_reject_external_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = gate(&dir, "shim.py", "shim");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let engine = gate(&shared, "engine.py", "engine");
+        let alias = shared.join("alias.py");
+        std::os::unix::fs::symlink(&engine, &alias).unwrap();
+        let manifest = dir.path().join("current-build.json");
+        std::fs::write(&manifest, serde_json::json!({
+            "shared_engine": [
+                {"file": "alias.py", "path": alias, "sha256": "0".repeat(64)},
+                {"file": "engine.py", "path": engine.clone(), "sha256": "0".repeat(64)},
+            ]
+        }).to_string()).unwrap();
+        let discovered = with_deployed_engine_at(
+            Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest)).unwrap();
+        assert_eq!(discovered, vec![
+            ("claude-code".into(), shim.clone()),
+            (ENGINE_PLUGIN_ID.into(), engine.clone()),
+        ]);
+
+        let outside = gate(&dir, "outside.py", "outside");
+        std::fs::write(&manifest, serde_json::json!({
+            "shared_engine": [{"file": "outside.py", "path": outside, "sha256": "0".repeat(64)}]
+        }).to_string()).unwrap();
+        let err = with_deployed_engine_at(
+            Ok(vec![("claude-code".into(), shim)]), Some(&manifest)).unwrap_err();
+        assert!(err.contains("escapes the shared root"), "{err}");
+    }
+
+    #[test]
+    fn shared_engine_manifest_rejects_bad_paths_and_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = gate(&dir, "shim.py", "shim");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let engine = gate(&shared, "engine.py", "engine");
+        let manifest = dir.path().join("current-build.json");
+        let missing = shared.join("missing.py").to_string_lossy().into_owned();
+        for (path, digest, expected) in [
+            ("relative/engine.py", "0".repeat(64), "not absolute".to_string()),
+            (engine.as_str(), "short".to_string(), "invalid sha256".to_string()),
+            (missing.as_str(), "0".repeat(64), "unreadable".to_string()),
+        ] {
+            std::fs::write(&manifest, serde_json::json!({
+                "shared_engine": [{"file": "engine.py", "path": path, "sha256": digest}]
+            }).to_string()).unwrap();
+            let err = with_deployed_engine_at(
+                Ok(vec![("claude-code".into(), shim.clone())]), Some(&manifest)).unwrap_err();
+            assert!(err.contains(&expected), "{expected}: {err}");
+        }
     }
 
     /// Apply transitions the way `check` does when every witness lands.
