@@ -1,4 +1,4 @@
-"""v6: REFUTED 2026-09-20. Kept as the measured record; the candidate is v7.
+r"""v6: REFUTED 2026-09-20. Kept as the measured record; the candidate is v7.
 
 The battery that cleared v6 had no ORDER dimension -- every generated case put the
 binding before the write, so (V5) was the one invariant it could not vary. With that

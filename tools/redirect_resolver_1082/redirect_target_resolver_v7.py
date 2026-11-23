@@ -1,4 +1,4 @@
-"""v7: v6, scanning the rendering it proves over.
+r"""v7: v6, scanning the rendering it proves over.
 
 v6 is REFUTED -- see (V6) below. Everything from here to (V5) is v6's docstring and
 still holds; v7 changes exactly one thing, and it is not an added clause.

@@ -9,6 +9,17 @@ counterexamples. v5 and v6 are included because their failures are reproducible 
 v7 is included only as the next historical control. A green battery is not certification,
 and none of these files may be imported by the runtime gate.
 
+That last clause is a test, not a search result:
+`python3 tools/redirect_resolver_1082_quarantine_test.py` fails if any Python file outside
+this directory imports one of these modules or names this directory in code, and if any
+file here stops parsing cleanly.
+
+One departure from the source bytes: the module docstrings of
+`redirect_target_resolver_v6.py` and `redirect_target_resolver_v7.py` carry an `r` prefix
+that the source commit does not. Each contains the literal `OUT\=x`, an invalid escape
+sequence that is a `SyntaxWarning` today and a `SyntaxError` in a future Python. No
+executable line differs.
+
 ## Generated evidence
 
 From the repository root:
