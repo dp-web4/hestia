@@ -1729,7 +1729,20 @@ pub enum DecideError {
     /// An invoked factor arrived with a blank backend, model, or prompt digest. Provenance is
     /// the positive obligation that makes the lean path recordable at all.
     InvokedWithoutProvenance,
+    /// The asker already has this exact self-declared statement (same stance, same argument)
+    /// on this escalation. Recording it again would add a factor and a chain row that say
+    /// nothing new (#935).
+    SelfEvidenceRepeated,
+    /// The asker has reached `SELF_EVIDENCE_MAX` self-declared statements on this escalation.
+    SelfEvidenceLimit,
 }
+
+/// How many `Channel::SelfEvidence` factors one escalation holds (#935, NOVA's review of
+/// PR #1658). Each corroboration row carries the whole factor set, so N statements cost
+/// O(N^2) chain bytes, and nothing else bounds what one proven asker can append to its own
+/// ask. The number is a judgement, not a measurement: enough to state a case, correct it and
+/// answer a peer; small enough that self statements cannot bury the peers' factors.
+pub const SELF_EVIDENCE_MAX: usize = 4;
 
 impl std::fmt::Display for DecideError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1750,6 +1763,17 @@ impl std::fmt::Display for DecideError {
                 f,
                 "a decision must name its decider — an anonymous approval in an attribution \
                  record is worse than no record"
+            ),
+            DecideError::SelfEvidenceRepeated => write!(
+                f,
+                "this exact statement is already on the record for this escalation; nothing \
+                 was added. A different argument or stance is recorded as a new statement"
+            ),
+            DecideError::SelfEvidenceLimit => write!(
+                f,
+                "this escalation already holds {SELF_EVIDENCE_MAX} self-declared statements \
+                 from its asker, which is the limit; nothing was added. Your earlier \
+                 statements stay on the record"
             ),
             DecideError::InvokedCannotRule => write!(
                 f,
@@ -3760,6 +3784,21 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
         argument: Option<&str>,
         now: u64,
     ) -> Result<Escalation, DecideError> {
+        // Bounded and de-duplicated BEFORE any mutation, so a refused repeat leaves neither a
+        // factor nor a chain row. Compared on the trimmed argument, which is what is stored.
+        if let Some(esc) = self.by_id.get(id) {
+            let wanted = argument.map(str::trim).filter(|a| !a.is_empty());
+            let mut held = 0usize;
+            for f in esc.factors.iter().filter(|f| f.channel == Channel::SelfEvidence) {
+                if f.dissent == dissent && f.argument.as_deref() == wanted {
+                    return Err(DecideError::SelfEvidenceRepeated);
+                }
+                held += 1;
+            }
+            if held >= SELF_EVIDENCE_MAX {
+                return Err(DecideError::SelfEvidenceLimit);
+            }
+        }
         self.corroborate_with_channel(id, by, role, None, dissent, argument, now, Channel::SelfEvidence)
     }
 

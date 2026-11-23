@@ -9005,8 +9005,18 @@ pub(crate) fn record_newly_lapsed(s: &mut super::state::ServerState, now: u64) -
                 // verbatim prose and belongs in the escalation, not copied into a
                 // second append-only store where no retention rule reaches it.
                 "factors_present": esc.factors.len(),
-                "factors_concurring": esc.factors.iter().filter(|f| !f.dissent).count(),
-                "factors_dissenting": esc.factors.iter().filter(|f| f.dissent).count(),
+                // The asker's own statements (#935) are counted apart. Folded into the two
+                // counts below, an ask nobody answered would read as one a peer answered,
+                // which is the distinction these fields exist to make.
+                "factors_concurring": esc.factors.iter()
+                    .filter(|f| f.channel != crate::server::gate_escalation::Channel::SelfEvidence && !f.dissent)
+                    .count(),
+                "factors_dissenting": esc.factors.iter()
+                    .filter(|f| f.channel != crate::server::gate_escalation::Channel::SelfEvidence && f.dissent)
+                    .count(),
+                "factors_self_evidence": esc.factors.iter()
+                    .filter(|f| f.channel == crate::server::gate_escalation::Channel::SelfEvidence)
+                    .count(),
                 "factors_by": esc.factors.iter().map(|f| &f.by).collect::<Vec<_>>(),
                 // Who was asked, and which of them no watcher had ever read for at
                 // invite time. Without these, an unanswered petition cannot be
@@ -20856,6 +20866,103 @@ mod tests {
         assert_eq!(restored.peer_participation().self_evidence, 2);
     }
 
+    /// NOVA's three questions on PR #1658, each as a control that can fail.
+    #[tokio::test]
+    async fn self_evidence_is_bounded_deduplicated_and_never_a_peer_answer() {
+        use crate::server::gate_escalation::{Channel, SELF_EVIDENCE_MAX};
+        let (_dir, shared) = make_shared_state();
+        let mut session_of = std::collections::HashMap::new();
+        for id in ["claude-code", "codex", "kimi-code"] {
+            let r = tool_connect(&shared, &json!({ "plugin_id": id, "host_agent": "h" }))
+                .await.unwrap();
+            session_of.insert(id, r["sessionId"].as_str().unwrap().to_string());
+        }
+        let opened = tool_gate_escalation_open(&shared, &json!({
+            "plugin_id": "claude-code", "session_id": session_of["claude-code"],
+            "tool_name": "Edit", "marker": "law_inject.py", "act": "Edit -> law_inject.py",
+        })).await.unwrap();
+        let id = opened["escalation_id"].as_str().unwrap().to_string();
+        let say = |who: &'static str, stance: &'static str, argument: String| {
+            let (shared, id, sid) = (shared.clone(), id.clone(), session_of[who].clone());
+            async move {
+                tool_gate_escalation_corroborate(&shared, &json!({
+                    "escalation_id": id, "session_id": sid, "stance": stance, "argument": argument,
+                })).await
+            }
+        };
+        let corroborated_rows = |s: &crate::server::state::ServerState| s.chain_store.read_recent(200).unwrap()
+            .into_iter().filter(|e| e.event_type == "gate_escalation_corroborated").count();
+
+        // (3) REPEATS. The same statement twice adds nothing: no factor, no chain row.
+        say("claude-code", "concur", "statement 0".into()).await.unwrap();
+        let err = say("claude-code", "concur", "  statement 0  ".into()).await
+            .expect_err("an identical self statement must not be recorded twice");
+        assert!(format!("{err}").contains("already on the record"), "{err}");
+        {
+            let s = shared.lock().await;
+            assert_eq!(s.gate_escalations.get(&id).unwrap().factors.len(), 1);
+            assert_eq!(corroborated_rows(&s), 1, "a refused repeat writes no chain row");
+        }
+        // The same words under the other stance are a different statement.
+        say("claude-code", "dissent", "statement 0".into()).await.unwrap();
+
+        // (2) MIXED. A genuine peer dissents; the two kinds are counted apart, and the peer's
+        // absence bookkeeping is not touched by the asker's statements.
+        assert!(
+            !shared.lock().await.gate_escalations.get(&id).unwrap().bar_met(),
+            "a concur and a dissent from the asker itself meet no bar"
+        );
+        let before = shared.lock().await.gate_escalations.get(&id).unwrap().peer_participation();
+        assert_eq!((before.concurred, before.dissented, before.self_evidence), (0, 0, 2));
+        say("codex", "dissent", "a peer's reason".into()).await.unwrap();
+        {
+            let s = shared.lock().await;
+            let esc = s.gate_escalations.get(&id).unwrap();
+            let after = esc.peer_participation();
+            assert_eq!((after.concurred, after.dissented, after.self_evidence), (0, 1, 2));
+            assert_eq!(after.absent, before.absent, "self evidence must not move peer absence");
+            // What a peer factor does to `bar_met` is unchanged by this PR and not asserted
+            // here; the self statements' share of it is pinned below, after the bound.
+        }
+
+        // (3) THE BOUND. Distinct statements stop at the limit, and the refusal says so.
+        for n in 2..SELF_EVIDENCE_MAX {
+            say("claude-code", "concur", format!("statement {n}")).await.unwrap();
+        }
+        let err = say("claude-code", "concur", "one too many".into()).await
+            .expect_err("self evidence is bounded per escalation");
+        assert!(format!("{err}").contains("limit"), "{err}");
+        {
+            let s = shared.lock().await;
+            let esc = s.gate_escalations.get(&id).unwrap();
+            let own = esc.factors.iter().filter(|f| f.channel == Channel::SelfEvidence).count();
+            assert_eq!(own, SELF_EVIDENCE_MAX);
+            assert_eq!(esc.factors.len(), SELF_EVIDENCE_MAX + 1, "the peer's factor is still there");
+            assert_eq!(corroborated_rows(&s), SELF_EVIDENCE_MAX + 1);
+        }
+        // The bound is the asker's alone: a peer may still answer after it is reached.
+        say("kimi-code", "concur", "a second peer".into()).await
+            .expect("the self-evidence limit must not close the door on peers");
+
+        // (1) AN ASSERTED ASK. The named member, with a real live session, gets no
+        // self-evidence path on an ask nobody proved it opened, and neither does a peer.
+        let asserted = tool_gate_escalation_open(&shared, &json!({
+            "plugin_id": "codex", "tool_name": "Edit",
+            "marker": "pre_tool_use.py", "act": "Edit -> pre_tool_use.py",
+        })).await.unwrap();
+        assert_eq!(asserted["asker_basis"], "asserted", "{asserted}");
+        let asserted_id = asserted["escalation_id"].as_str().unwrap().to_string();
+        for who in ["codex", "kimi-code"] {
+            let err = tool_gate_escalation_corroborate(&shared, &json!({
+                "escalation_id": asserted_id, "session_id": session_of[who],
+                "stance": "concur", "argument": "evidence against a name nobody proved",
+            })).await.expect_err("an asserted ask collects no factor of any channel");
+            assert!(format!("{err}").contains("you may not corroborate"), "{who}: {err}");
+        }
+        let s = shared.lock().await;
+        assert!(s.gate_escalations.get(&asserted_id).unwrap().factors.is_empty());
+    }
+
     /// Two members with live sessions and one escalation opened by the first — the fixture
     /// every corroborate-stance test below starts from. Returns (state, escalation_id,
     /// corroborator's session_id).
@@ -31981,6 +32088,45 @@ mod disposition_durability_tests {
     /// one that matters: "the deadline passed with no decision" is TRUE over a
     /// petition a peer looked at, argued against, and left short of its bar, and a
     /// reader that cannot see the factor scores that as society-wide silence.
+    /// #935: an ask that only its own asker spoke on must not lapse looking like an ask a
+    /// peer answered. Control arm: the same statement from a peer DOES count.
+    #[tokio::test]
+    async fn the_expiry_row_counts_self_evidence_apart_from_peer_answers() {
+        let (dir, _) = super::inbox_tests::seeded_home();
+        let state = super::inbox_tests::open_state(&dir);
+        let real_now = now_secs();
+        let mut s = state.lock().await;
+
+        let own = witness_open(&mut s, "kimi-code", None, real_now - 100, 200);
+        s.gate_escalations
+            .corroborate_self(&own, "kimi-code", "role:constellation:member", false,
+                Some("I think this is fine"), real_now - 50)
+            .expect("the asker may state its case");
+        let peer = witness_open(&mut s, "claude-code", None, real_now - 100, 200);
+        s.gate_escalations
+            .corroborate(&peer, "codex", "role:constellation:member", None, false,
+                Some("I think this is fine"), real_now - 50)
+            .expect("a peer may answer");
+
+        assert_eq!(record_newly_lapsed(&mut s, real_now + 300), 2);
+        let rows: Vec<_> = s.recent_chain(40).into_iter()
+            .filter(|e| e.event_type == "gate_escalation_expired").collect();
+        let row = |id: &str| rows.iter()
+            .find(|e| e.event_data.get("escalation_id").and_then(Value::as_str) == Some(id))
+            .unwrap_or_else(|| panic!("no expiry row for {id}")).event_data.clone();
+        let count = |r: &Value, k: &str| r.get(k).and_then(Value::as_u64);
+
+        let a = row(&own);
+        assert_eq!(count(&a, "factors_present"), Some(1), "the statement is on the record: {a}");
+        assert_eq!(count(&a, "factors_self_evidence"), Some(1), "{a}");
+        assert_eq!(count(&a, "factors_concurring"), Some(0), "nobody else concurred: {a}");
+        assert_eq!(count(&a, "factors_dissenting"), Some(0), "{a}");
+
+        let b = row(&peer);
+        assert_eq!(count(&b, "factors_self_evidence"), Some(0), "{b}");
+        assert_eq!(count(&b, "factors_concurring"), Some(1), "{b}");
+    }
+
     #[tokio::test]
     async fn the_expiry_row_records_the_bar_and_the_evidence_that_was_present() {
         let (dir, _) = super::inbox_tests::seeded_home();
