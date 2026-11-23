@@ -30122,6 +30122,66 @@ mod standing_scope_surface_tests {
         assert_eq!(witnessed.event_data["expires_at"], expires_at);
     }
 
+    /// NOVA's hold on #1660: the constant alone does not show what a grant gets. End to end: an
+    /// ask opened with the 24h window, approved with no `expires_in_secs`, is served as an 8h
+    /// grant; and an ask whose window ran out cannot be approved at all.
+    #[tokio::test]
+    async fn an_approved_ask_is_an_eight_hour_grant_and_an_expired_ask_cannot_be_approved() {
+        use crate::server::http::{scope_decide_as, ScopeDecider};
+        let (dir, state) = test_state().await;
+        let sid = tool_connect(&state, &json!({"plugin_id": "kimi-code", "host_agent": "t"}))
+            .await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        let ask = |name: &'static str| {
+            let (state, sid, path) = (state.clone(), sid.clone(), dir.path().join(name));
+            async move {
+                std::fs::write(&path, "a real file the member may ask to read").unwrap();
+                let out = tool_request_scope(&state, &json!({
+                    "plugin_id": "kimi-code", "session_id": sid, "path": path.to_string_lossy(),
+                    "reason": "an ask that waits for its answer"
+                })).await.unwrap();
+                (out["request_id"].as_str().unwrap().to_string(), out["expires_at"].as_u64().unwrap())
+            }
+        };
+        let approve = |id: String| {
+            let state = state.clone();
+            async move {
+                scope_decide_as(state, json!({
+                    "request_id": id, "granted": true, "reason": "the work is in scope"
+                }), ScopeDecider::operator()).await
+            }
+        };
+
+        // 1. Approve inside the window, naming no expiry.
+        let (id, asked_until) = ask("granted.txt").await;
+        let before = crate::server::gate_escalation::now_secs();
+        let (status, axum::Json(out)) = approve(id.clone()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{out}");
+        let after = crate::server::gate_escalation::now_secs();
+        let granted_until = state.lock().await.scope_requests[&id].expires_at;
+        let grant = crate::server::state::SCOPE_GRANT_TTL_SECS;
+        assert!(
+            (before + grant..=after + grant).contains(&granted_until),
+            "the grant runs 8h from the decision, not to the ask's 24h horizon: {granted_until}"
+        );
+        assert!(granted_until < asked_until, "approval must shorten the record's life, not inherit the ask's");
+        // What the gate is served is the same 8h, not the ask's day.
+        let served = tool_scope_status(&state, &json!({"plugin_id": "kimi-code", "session_id": sid}))
+            .await.unwrap();
+        let rows = served["live_grants"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{served}");
+        assert_eq!(rows[0]["expires_at"], granted_until, "{served}");
+
+        // 2. An ask whose window has run out is not approvable; the refusal says why.
+        let (late, _) = ask("late.txt").await;
+        state.lock().await.scope_requests.get_mut(&late).unwrap().expires_at = before - 1;
+        let (status, axum::Json(out)) = approve(late.clone()).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{out}");
+        assert!(out["error"].as_str().unwrap().contains("expired"), "{out}");
+        let s = state.lock().await;
+        assert_eq!(s.scope_requests[&late].granted, None, "a refused decide must not mark the ask");
+        assert_eq!(s.scope_requests[&late].expires_at, before - 1);
+    }
+
     /// (e) `hestia_scope_status` carries BOTH lists, additively: `live_grants` keeps its
     /// exact pre-existing shape (a consumer keyed on it must not notice this PR), and
     /// `standing_grants` + `generation` + `snapshot_expires_at` arrive beside it.
