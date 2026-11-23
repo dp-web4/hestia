@@ -26,6 +26,14 @@ ROOT = Path(__file__).resolve().parents[1]
 NAMES = ("valid", "altered", "swapped", "missing-key")
 EXPECTED = {"valid": ("valid", 0), "altered": ("tampered", 1),
             "swapped": ("tampered", 1), "missing-key": ("unverifiable", 1)}
+# This harness owns its time budget. hestia_gate_mechanism's default per-request cap
+# (HESTIA_PRE_REQUEST_TIMEOUT_S, 5 s) is the gate hook's own deadline: right for a hook that must
+# answer fast, wrong for a cold disposable daemon in a debug build on a loaded runner, where
+# `hestia_connect` alone has outlasted it. So every MCP call here gets an explicit cap that the
+# gate's environment cannot shorten, inside one whole-run deadline.
+MCP_CALL_TIMEOUT_S = 60.0
+MCP_RUN_DEADLINE_S = 300.0
+MCP_READY_DEADLINE_S = 120.0
 
 
 def load(name: str, path: Path):
@@ -44,6 +52,45 @@ def unwrap(payload: dict) -> dict:
     if not text:
         raise RuntimeError(f"tool returned no content: {payload}")
     return json.loads(text)
+
+
+def wait_for_mcp(mechanism, endpoint: str, daemon: subprocess.Popen, log_path: Path):
+    """Return an initialized MCP client once the daemon lists `hestia_connect`.
+
+    `/api/version` answering proves the HTTP listener is up, not that the MCP surface can serve a
+    tool call. Retry the handshake and `tools/list` until the tool is listed, and fail by name if
+    it never is."""
+    give_up = time.monotonic() + MCP_READY_DEADLINE_S
+    last = "no attempt completed"
+    while time.monotonic() < give_up:
+        if daemon.poll() is not None:
+            raise RuntimeError(f"daemon exited before MCP was ready: {log_path.read_text()}")
+        mcp = mechanism._McpHttp(endpoint, time.monotonic() + MCP_RUN_DEADLINE_S,
+                                 request_cap=MCP_CALL_TIMEOUT_S)
+        try:
+            if "result" not in mcp.initialize():
+                raise RuntimeError("initialize returned no result")
+            mcp.initialized()
+            listed = mcp._request({"jsonrpc": "2.0", "id": mcp._id(),
+                                   "method": "tools/list", "params": {}}) or {}
+            names = {t.get("name") for t in (listed.get("result") or {}).get("tools") or []}
+            if "hestia_connect" in names:
+                return mcp
+            last = f"tools/list did not list hestia_connect ({len(names)} tools)"
+        except Exception as exc:  # not ready yet: retry until the readiness deadline
+            last = f"{type(exc).__name__}: {exc}"
+        time.sleep(0.25)
+    raise RuntimeError(f"MCP did not become ready within {MCP_READY_DEADLINE_S:.0f}s: {last}")
+
+
+def call(mcp, name: str, arguments: dict) -> dict:
+    """One MCP tool call that names the tool and the elapsed time when it does not answer."""
+    started = time.monotonic()
+    try:
+        return unwrap(mcp.call_tool(name, arguments))
+    except (TimeoutError, OSError) as exc:
+        raise RuntimeError(f"{name} did not answer after {time.monotonic() - started:.1f}s "
+                           f"(per-call cap {MCP_CALL_TIMEOUT_S:.0f}s): {exc}") from exc
 
 
 def run(args: list[str], env: dict, **kwargs) -> subprocess.CompletedProcess:
@@ -79,14 +126,11 @@ def generate_valid(binary: Path, home: Path, passphrase: str) -> dict:
             raise RuntimeError("daemon did not become ready")
 
         mechanism = load("chain_segment_mechanism", ROOT / "plugins" / "_shared" / "hestia_gate_mechanism.py")
-        mcp = mechanism._McpHttp(endpoint, time.monotonic() + 30)
-        if "result" not in mcp.initialize():
-            raise RuntimeError("MCP initialize failed")
-        mcp.initialized()
-        connected = unwrap(mcp.call_tool("hestia_connect", {
+        mcp = wait_for_mcp(mechanism, endpoint, daemon, home / "daemon.log")
+        connected = call(mcp, "hestia_connect", {
             "plugin_id": "fixture-member", "host_agent": "chain-segment-smoke",
             "host_agent_version": "1", "requested_role": "citizen",
-        }))
+        })
         session = connected["sessionId"]
 
         seed = load("chain_segment_seed", ROOT / "tools" / "seed_seat_config.py")
@@ -104,27 +148,27 @@ def generate_valid(binary: Path, home: Path, passphrase: str) -> dict:
         outside.write_text("denied fixture content\n", encoding="utf-8")
         denied_path = str(outside)
         for decision, target in (("allow", "/fixture/book.txt"), ("deny", denied_path)):
-            answer = unwrap(mcp.call_tool("hestia_witness_decision", {
+            answer = call(mcp, "hestia_witness_decision", {
                 "plugin_id": "fixture-member", "decision": decision,
                 "adjudicator": "install-smoke", "reason": f"fixture {decision}",
                 "rule_id": "mrh.path", "tool_name": "Read", "target": target,
                 "attempted": f"Read -> {target}", "session_id": session,
-            }))
+            })
             if answer.get("_hestia_error") or not answer.get("witnessEntryHash"):
                 raise RuntimeError(f"{decision} witness failed: {answer}")
 
-        claim = unwrap(mcp.call_tool("hestia_scope_claim", {
+        claim = call(mcp, "hestia_scope_claim", {
             "plugin_id": "fixture-member", "session_id": session,
             "path": denied_path, "rule": "mrh.path", "tool_name": "Read",
             "act": f"Read -> {denied_path}", "act_digest": "1" * 64, "spend": False,
-        }))
+        })
         if claim.get("verdict") != "not_asked" or not claim.get("refusal_id"):
             raise RuntimeError(f"scope refusal was not recorded: {claim}")
-        opened = unwrap(mcp.call_tool("hestia_scope_escalate", {
+        opened = call(mcp, "hestia_scope_escalate", {
             "plugin_id": "fixture-member", "session_id": session,
             "refusal_id": claim["refusal_id"],
             "reason": "install-smoke escalation for the denied read",
-        }))
+        })
         if opened.get("verdict") != "opened":
             raise RuntimeError(f"scope escalation failed: {opened}")
 
