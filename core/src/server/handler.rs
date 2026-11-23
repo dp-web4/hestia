@@ -9397,6 +9397,8 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         return Ok(json!({ "total": 0, "secrets": [], "note": "no hub connection" }));
     };
 
+    let rest_endpoint = crate::hub::absolute_rest_endpoint(&conn.url, &conn.rest_endpoint)?;
+
     // Member identity keypair — same load path as tool_inbox.
     let secret_hex = s
         .vault
@@ -9417,7 +9419,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
     for p in &snapshot {
         // Need the (active) pair detail for the peer ephemeral; skip inactive pairs.
         let detail = match client
-            .get_pair(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id)
+            .get_pair(&rest_endpoint, conn.hub_lct_id, p.pair_id)
             .await
         {
             Ok(d) if d.is_active() => d,
@@ -9429,7 +9431,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         };
         let since = pairings.cursor(&p.pair_id);
         let msgs = match client
-            .get_pair_messages(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id, since)
+            .get_pair_messages(&rest_endpoint, conn.hub_lct_id, p.pair_id, since)
             .await
         {
             Ok(m) => m,
@@ -25008,6 +25010,34 @@ mod authority_attribution_tests {
             format!("{r}").contains("pair_inbox_unattributed"),
             "an unattributed paired-channel drain must be refused: {r}"
         );
+    }
+
+    #[tokio::test]
+    async fn pair_inbox_rejects_a_cross_origin_stored_endpoint_before_dialing() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat_session(&state, "bystander-member").await;
+        {
+            let mut s = state.lock().await;
+            let mut store = crate::hub::HubStore::default();
+            store.connections.push(crate::hub::HubConnection {
+                id: Uuid::new_v4(),
+                url: "https://hub.example".into(),
+                hub_lct_id: Uuid::new_v4(),
+                our_lct_id: Uuid::new_v4(),
+                connected_at: Utc::now(),
+                last_seen: None,
+                api_version: "v1".into(),
+                rest_endpoint: "https://evil.example/v1".into(),
+                hubs_joined: vec![],
+                member_key_source: crate::hub::MemberKeySource::VaultIdentity,
+            });
+            store.save(&mut s.vault).unwrap();
+        }
+        let err = tool_pair_inbox(&state, &json!({"session_id": sid.to_string()}))
+            .await
+            .expect_err("a stored cross-origin endpoint must be refused before dialing");
+        assert!(err.to_string().contains("cross-origin discovery endpoint refused"), "{err}");
     }
 
     /// The fifth site, caught in review of this PR's own "zero call sites" claim:

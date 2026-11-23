@@ -165,27 +165,7 @@ fn resolve_from_list(list: &HubUrls) -> (String, HubUrlSource) {
 /// Discovery may advertise a relative REST path (e.g. "/v1"); make it absolute,
 /// but never let discovery choose a different origin than the operator selected.
 fn abs_rest(base: &str, rest: &str) -> Result<String, String> {
-    if rest.contains('?') || rest.contains('#') {
-        return Err("discovery endpoint query/fragment is not allowed".into());
-    }
-    if rest.starts_with("http://") || rest.starts_with("https://") {
-        let base = reqwest::Url::parse(base).map_err(|e| format!("invalid selected hub URL: {e}"))?;
-        let endpoint = reqwest::Url::parse(rest).map_err(|e| format!("invalid discovery endpoint: {e}"))?;
-        if base.scheme() != endpoint.scheme()
-            || base.host_str() != endpoint.host_str()
-            || base.port_or_known_default() != endpoint.port_or_known_default()
-        {
-            return Err(format!("cross-origin discovery endpoint refused: {rest}"));
-        }
-        if !endpoint.username().is_empty() || endpoint.password().is_some() {
-            return Err("discovery endpoint user-info is not allowed".into());
-        }
-        return Ok(endpoint.to_string().trim_end_matches('/').to_string());
-    }
-    if rest.contains("://") {
-        return Err(format!("non-http discovery endpoint refused: {rest}"));
-    }
-    Ok(format!("{}/{}", base.trim_end_matches('/'), rest.trim_matches('/')))
+    crate::hub::absolute_rest_endpoint(base, rest).map_err(|e| e.to_string())
 }
 
 fn hex_to_32(s: &str) -> Option<[u8; 32]> {
