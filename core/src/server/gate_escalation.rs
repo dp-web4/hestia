@@ -847,6 +847,9 @@ pub struct Factor {
     /// True when a ruling already existed at acceptance. This distinguishes retrospective
     /// review from decision-relevant evidence; `post_claim` separately means the permit
     /// was already spent. Historical factors default false rather than being reclassified.
+    /// So `false` on a REPLAYED legacy factor (written before this field existed) means
+    /// "not recorded", NOT "came before the ruling": it does not prove pre-ruling provenance,
+    /// and no reader may infer from it that the factor informed the decision.
     #[serde(default)]
     pub post_decision: bool,
 }
@@ -4575,6 +4578,62 @@ mod tests {
         assert_eq!(esc.peer_participation().concurred, 0);
     }
 
+    /// NOVA 11-22: an old `gate_escalation_corroborated` event, written before
+    /// `post_decision` existed, replays as `false` even when its own `at` is AFTER the
+    /// ruling. That is "not recorded", not "pre-ruling" (see the field's doc). A current
+    /// event that carries the key is believed.
+    #[test]
+    fn replay_of_a_legacy_corroboration_without_post_decision_loads_false_not_reclassified() {
+        let opened = chain_entry(
+            "gate_escalation_opened",
+            serde_json::json!({
+                "escalation_id": "old1", "plugin_id": "claude-code",
+                "role": "role:constellation:member", "tool_name": "Edit",
+                "marker": "law_inject.py", "opened_at": T0, "expires_at": T0 + 3600,
+            }),
+        );
+        let decided = chain_entry(
+            "gate_escalation_decided",
+            serde_json::json!({
+                "escalation_id": "old1", "status": "denied", "decided_by": "operator",
+                "decided_via": "operator_session",
+                "factors_present": [{"channel": "operator_session", "by": "operator",
+                                     "role": null, "independence": null, "at": T0 + 10}],
+            }),
+        );
+        let factors = |with_key: bool| {
+            let mut late = serde_json::json!({
+                "channel": "peer_member", "by": "codex", "role": "role:constellation:member",
+                "independence": "cross_vendor", "at": T0 + 20, "dissent": true,
+                "argument": "after the fact", "post_claim": false,
+            });
+            if with_key {
+                late["post_decision"] = serde_json::json!(true);
+            }
+            serde_json::json!([
+                {"channel": "operator_session", "by": "operator", "role": null,
+                 "independence": null, "at": T0 + 10},
+                late,
+            ])
+        };
+        let corroborated = |with_key: bool| chain_entry(
+            "gate_escalation_corroborated",
+            serde_json::json!({"escalation_id": "old1", "factors_present": factors(with_key)}),
+        );
+
+        let mut legacy = EscalationStore::default();
+        legacy.rehydrate(&[opened.clone(), decided.clone(), corroborated(false)], T0 + 60);
+        let row = legacy.get("old1").expect("restored");
+        assert_eq!(row.factors.len(), 2, "the legacy factor must still load, not be dropped");
+        assert!(row.factors[1].at > row.decided_at.unwrap(), "fixture: the factor is late");
+        assert!(!row.factors[1].post_decision, "missing history is not reclassified on replay");
+        assert!(row.factors[1].dissent, "the rest of the legacy factor survives");
+
+        let mut current = EscalationStore::default();
+        current.rehydrate(&[opened, decided, corroborated(true)], T0 + 60);
+        assert!(current.get("old1").unwrap().factors[1].post_decision, "a recorded key is believed");
+    }
+
     /// #128, the restore half. A `gate_escalation_opened` entry written before `asker_basis`
     /// existed restores as ASSERTED — fail closed, so a daemon restart cannot launder an
     /// unproven asker into a peer-clearable one — and an entry that carries the basis
@@ -7016,6 +7075,53 @@ mod bar_factor_tests {
         let historical: Factor = serde_json::from_value(legacy).unwrap();
         assert!(!historical.post_decision, "missing history is not reclassified");
         assert!(historical.post_claim, "the independent older field is preserved");
+    }
+
+    /// NOVA 11-22: the same-second ruling boundary. `post_decision` is keyed on whether the
+    /// ruling EXISTED when the factor was accepted, not on comparing seconds, so a factor
+    /// filed in the ruling's own second reads by order: before the ruling false, after true.
+    #[test]
+    fn a_factor_in_the_same_second_as_the_ruling_is_labelled_by_order_not_by_clock() {
+        let (mut s, id) = open_with("law_inject.py");
+        let ruling_second = T0 + 2;
+        s.corroborate(&id, "codex", "role:constellation:member", None,
+                      false, Some("just before"), ruling_second).unwrap();
+        s.decide(&id, true, "dp", "role:constellation:sovereign",
+                 Channel::OperatorSession, None, Some("ok"), ruling_second).unwrap();
+        let after = s.corroborate(&id, "codex", "role:constellation:member", None,
+                                  true, Some("just after"), ruling_second).unwrap();
+        assert_eq!(after.decided_at, Some(ruling_second));
+        assert!(!after.factors[0].post_decision, "filed before the ruling, same second");
+        assert!(after.factors[2].post_decision, "filed after the ruling, same second");
+        assert!(!after.factors[2].post_claim);
+    }
+
+    /// NOVA 11-22: a late `attach_invoked` on a DENIED row (operator deny, and a
+    /// self-withdrawal, which is a deny via `SelfWithdrawn`) lands, is typed
+    /// `post_decision`, is not `post_claim` (nothing was spent), and moves nothing.
+    #[test]
+    fn a_late_invoked_factor_on_a_denied_or_withdrawn_row_is_post_decision_and_inert() {
+        for via in [Channel::OperatorSession, Channel::SelfWithdrawn] {
+            let (mut s, id) = open_with("law_inject.py");
+            s.decide(&id, false, "claude-code", "role:constellation:member",
+                     via, None, Some("no"), T0 + 2).unwrap();
+            let late = s.attach_invoked(
+                &id,
+                "lct:web4:filler:ollama-qwen3",
+                "role:constellation:classifier",
+                crate::arbiter::Independence::CrossVendor,
+                false,
+                Some("late classification"),
+                invocation(),
+                T0 + 3,
+            ).unwrap_or_else(|e| panic!("{via:?}: a denied row takes late evidence: {e:?}"));
+            let f = late.factors.last().unwrap();
+            assert_eq!(f.channel, Channel::Invoked);
+            assert!(f.post_decision, "{via:?}: late invoked factor not typed post_decision");
+            assert!(!f.post_claim, "{via:?}: a denied row was never spent");
+            assert_eq!(late.stored_status(), Status::Denied, "{via:?}: the ruling is untouched");
+            assert!(!late.is_claimable(T0 + 3), "{via:?}: nothing became claimable");
+        }
     }
 
     #[test]
