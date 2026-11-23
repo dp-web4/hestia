@@ -949,17 +949,20 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
     // real connect also re-checks. Both are reads.
     let found = match state.published().sessions.find_reuse(&plugin_id, &host_session_id) {
         Some(id) => Some((id.session_id, id.soft_lct.clone(), id.assigned_role.clone(),
-                          id.constellation_role.clone(), id.role_basis.clone())),
+                          id.constellation_role.clone(), id.role_basis.clone(),
+                          id.identity_basis, id.canonical_principal.clone())),
         None => {
             let s = state.lock().await;
             s.sessions
                 .find_reuse_id(&plugin_id, &host_session_id)
                 .and_then(|id| s.sessions.get(&id))
                 .map(|e| (e.session_id, e.soft_lct.clone(), e.assigned_role.clone(),
-                          e.constellation_role.clone(), e.role_basis.clone()))
+                          e.constellation_role.clone(), e.role_basis.clone(),
+                          e.identity_basis, e.canonical_principal.clone()))
         }
     };
-    let Some((session_id, soft_lct, assigned_role, constellation_role, role_basis)) = found else {
+    let Some((session_id, soft_lct, assigned_role, constellation_role, role_basis,
+              identity_basis, canonical_principal)) = found else {
         return Ok(hestia_error_envelope(
             "hestia.connect_dry_run_no_session",
             "no live session for this (plugin_id, host_session_id): a real connect would mint \
@@ -975,6 +978,8 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
         "constellationRole": constellation_role,
         "roleDeclarationHonored": !declared_role.is_empty() && declared_role == constellation_role,
         "roleBasis": role_basis,
+        "identityBasis": identity_basis,
+        "canonicalPrincipal": canonical_principal,
         "gateCapabilityReportAccepted": false,
         "protocolVersion": 1,
         "reused": true,
@@ -1109,6 +1114,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "identityBasis": existing.identity_basis,
+                "canonicalPrincipal": existing.canonical_principal,
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
@@ -1153,6 +1160,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "identityBasis": existing.identity_basis,
+                "canonicalPrincipal": existing.canonical_principal,
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
@@ -1179,6 +1188,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         assigned_role: requested_role.clone(),
         constellation_role: constellation_role.clone(),
         role_basis,
+        identity_basis: crate::server::state::IdentityBasis::Asserted,
+        canonical_principal: None,
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
         host_session_id,
@@ -1261,6 +1272,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // and a later policy change can't silently split them.
     let assigned_role = s.sessions[&session_id].assigned_role.clone();
     let role_basis = s.sessions[&session_id].role_basis.clone();
+    let identity_basis = s.sessions[&session_id].identity_basis;
+    let canonical_principal = s.sessions[&session_id].canonical_principal.clone();
 
     // session_started is intentionally NOT written to the witness chain.
     // Sessions are RAM-only by design (transport artifacts); every hook
@@ -1275,6 +1288,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         "softLct": soft_lct,
         "assignedRole": assigned_role,
         "constellationRole": constellation_role,
+        "identityBasis": identity_basis,
+        "canonicalPrincipal": canonical_principal,
         "roleDeclarationHonored": role_declaration_honored,
         "roleBasis": role_basis,
         "gateCapabilityReportAccepted": gate_capability_report_accepted,
@@ -2214,6 +2229,8 @@ fn resolve_attributed_caller(
 }
 
 /// Keep a valid caller key, or derive the hook's act-bound key for an open-door refusal (#540).
+/// The basis says what the key can and cannot correlate; a derived key is not assumed to be
+/// hook-compatible, an act identity, or evidence that an act was even supplied.
 fn refusal_request_key(
     s: &super::state::ServerState,
     plugin_id: &str,
@@ -2221,19 +2238,30 @@ fn refusal_request_key(
     attempted_act: Option<&str>,
     session_id_arg: Option<&str>,
     supplied: Option<&str>,
-) -> String {
+    identity_mismatch: bool,
+) -> (String, &'static str) {
     if let Some(key) = supplied.filter(|key| super::gate_escalation::valid_request_key(key)) {
-        return key.to_string();
+        return (key.to_string(), "caller_supplied");
     }
     let host_session_id = session_id_arg
         .and_then(|raw| Uuid::parse_str(raw).ok())
         .and_then(|uuid| s.sessions.get(&uuid))
         .and_then(|session| session.host_session_id.as_deref());
-    super::gate_escalation::request_key_for_act(
-        plugin_id,
-        marker,
-        attempted_act.unwrap_or(""),
-        host_session_id,
+    let basis = if identity_mismatch {
+        "derived_identity_mismatch"
+    } else if attempted_act.unwrap_or("").is_empty() {
+        "derived_without_act"
+    } else {
+        "derived"
+    };
+    (
+        super::gate_escalation::request_key_for_act(
+            plugin_id,
+            marker,
+            attempted_act.unwrap_or(""),
+            host_session_id,
+        ),
+        basis,
     )
 }
 
@@ -2269,8 +2297,8 @@ fn refuse_asker_mismatch(
 ) -> anyhow::Error {
     let session = session_id_arg.unwrap_or("?");
     let session_prefix: String = session.chars().take(8).collect();
-    let attempt_key = refusal_request_key(
-        s, plugin_id, marker, attempted_act, session_id_arg, request_key,
+    let (attempt_key, basis) = refusal_request_key(
+        s, plugin_id, marker, attempted_act, session_id_arg, request_key, true,
     );
     let _ = s.append_chain(
         "gate_escalation_refused",
@@ -2278,7 +2306,7 @@ fn refuse_asker_mismatch(
             "plugin_id": plugin_id,
             "tool_name": tool_name,
             "marker": marker,
-            "request_key": attempt_key,
+            "request_key": attempt_key, "request_key_basis": basis,
             "why": "asker mismatch",
             "asserted_plugin_id": plugin_id,
             "proven_plugin_id": who.plugin_id,
@@ -2329,8 +2357,8 @@ fn refuse_host_session_mismatch(
     attempted_act: Option<&str>,
     request_key: Option<&str>,
 ) -> anyhow::Error {
-    let attempt_key = refusal_request_key(
-        s, plugin_id, marker, attempted_act, session_id_arg, request_key,
+    let (attempt_key, basis) = refusal_request_key(
+        s, plugin_id, marker, attempted_act, session_id_arg, request_key, true,
     );
     let _ = s.append_chain(
         "gate_escalation_refused",
@@ -2338,7 +2366,7 @@ fn refuse_host_session_mismatch(
             "plugin_id": plugin_id,
             "tool_name": tool_name,
             "marker": marker,
-            "request_key": attempt_key,
+            "request_key": attempt_key, "request_key_basis": basis,
             "why": "host session mismatch",
             "asserted_host_session_id": stated,
             "proven_host_session_id": proven,
@@ -12508,6 +12536,8 @@ mod inbox_tests {
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -12688,6 +12718,8 @@ mod inbox_tests {
                     assigned_role: "citizen".into(),
                     constellation_role: "role:constellation:mesh-worker".into(),
                     role_basis: None,
+                    identity_basis: crate::server::state::IdentityBasis::Asserted,
+                    canonical_principal: None,
                     soft_lct: "lct:test".into(),
                     connected_at: chrono::Utc::now(),
                     host_session_id: None,
@@ -15737,6 +15769,8 @@ mod tests {
                 assigned_role: "citizen".into(),
                 constellation_role: role.into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: "lct:test".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
@@ -16071,6 +16105,42 @@ mod tests {
         assert_eq!(s.sessions.len(), 2, "one session per (member, host session)");
         assert!(s.sessions.values().any(|session| session.plugin_id == "victim"));
         assert!(s.sessions.values().any(|session| session.plugin_id == "other-member"));
+    }
+
+    /// #824 stage A: the identity basis is explicit metadata, never a caller-selected
+    /// upgrade. Current sessions are asserted/A1, and Guard-A reuse cannot change that fact.
+    #[tokio::test]
+    async fn connect_labels_legacy_identity_basis_asserted_and_reuse_does_not_upgrade() {
+        let (_dir, shared) = make_shared_state();
+        let fresh = tool_connect(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(fresh["identityBasis"], "asserted");
+        assert!(fresh["canonicalPrincipal"].is_null());
+        let session_id = fresh["sessionId"].as_str().unwrap();
+        {
+            let s = shared.lock().await;
+            let stored = &s.sessions[&Uuid::parse_str(session_id).unwrap()];
+            assert_eq!(stored.identity_basis, crate::server::state::IdentityBasis::Asserted);
+            assert_eq!(stored.canonical_principal, None);
+        }
+
+        let reused = tool_connect(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["sessionId"], session_id);
+        assert_eq!(reused["identityBasis"], "asserted");
+        assert!(reused["canonicalPrincipal"].is_null());
+
+        let dry = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(dry["identityBasis"], "asserted");
+        assert!(dry["canonicalPrincipal"].is_null());
     }
 
     /// The declared constellation role must be READABLE BACK. Before this, a member
@@ -18544,6 +18614,7 @@ mod tests {
         assert_eq!(row.event_data["proven_plugin_id"], "claude-code");
         assert_eq!(row.event_data["spent"], false);
         assert_eq!(row.event_data["request_key"], "a".repeat(64));
+        assert_eq!(row.event_data["request_key_basis"], "caller_supplied");
         // The chain is broadly readable; the session id is a live capability.
         let prefix = row.event_data["session_prefix"].as_str().unwrap();
         assert_eq!(prefix.len(), 8, "a prefix, not the whole session: {prefix}");
@@ -19852,11 +19923,44 @@ mod tests {
         assert_eq!(refused.event_data["proven_host_session_id"], "host-wake-proven");
         assert_eq!(refused.event_data["spent"], false);
         assert_eq!(refused.event_data["request_key"], "b".repeat(64));
+        assert_eq!(refused.event_data["request_key_basis"], "caller_supplied");
         assert!(
             !rows.iter().any(|e| e.event_type == "gate_escalation_claimed"),
             "a refused claim must mint NO claimed row — a spend recorded for a write that \
              never happened is the inverse of the defect this whole change fixes"
         );
+        drop(rows);
+
+        let err = gate_claim_and_escalate(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "<gate-hook>",
+                "reason": "Edit -> <gate-hook>",
+                "host_session_id": "host-wake-asserted-elsewhere",
+            }),
+        )
+        .await
+        .expect_err("the derived-key arm must refuse the same mismatch");
+        assert!(err.to_string().contains("host session mismatch"), "{err}");
+        let rows = shared.lock().await.recent_chain(50);
+        let refused = rows
+            .iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_refused"
+                    && e.event_data["why"] == "host session mismatch"
+                    && e.event_data["request_key_basis"] == "derived_identity_mismatch"
+            })
+            .expect("a mismatch without a caller key must record its derived basis");
+        assert_eq!(
+            refused.event_data["request_key"],
+            crate::server::gate_escalation::request_key_for_act(
+                "kimi-code", "<gate-hook>", "Edit -> <gate-hook>", Some("host-wake-proven"),
+            )
+        );
+        assert_eq!(refused.event_data["spent"], false);
         drop(rows);
 
         // And the approval was not burned by the refusal: the corrected claim still works.
@@ -19977,11 +20081,32 @@ mod tests {
                 "codex", "pre_tool_use.py", "Edit -> pre_tool_use.py", None,
             )
         );
+        assert_eq!(row.event_data["request_key_basis"], "derived_identity_mismatch");
         // O: a denied act leaves state bit-identical — nothing was opened.
         assert!(
             !rows.iter().any(|e| e.event_type == "gate_escalation_opened"),
             "a refused open must not also open: {rows:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn refusal_request_key_basis_is_explicit() {
+        let (_dir, shared) = make_shared_state();
+        let s = shared.lock().await;
+        for (act, mismatch, expected) in [
+            (Some("Edit -> pre_tool_use.py"), false, "derived"),
+            (Some(""), false, "derived_without_act"),
+            (Some("Edit -> pre_tool_use.py"), true, "derived_identity_mismatch"),
+        ] {
+            let (key, basis) = refusal_request_key(
+                &s, "kimi-code", "pre_tool_use.py", act, None, None, mismatch);
+            assert!(crate::server::gate_escalation::valid_request_key(&key));
+            assert_eq!(basis, expected);
+        }
+        let supplied = "a".repeat(64);
+        let (_, basis) = refusal_request_key(
+            &s, "kimi-code", "pre_tool_use.py", Some(""), None, Some(&supplied), true);
+        assert_eq!(basis, "caller_supplied", "a caller key keeps its basis even across a mismatch");
     }
 
     #[tokio::test]
@@ -20028,6 +20153,43 @@ mod tests {
         );
         assert!(keys.contains(&derived), "the open refusal derives the same hook rule: {keys:?}");
         assert!(keys.iter().all(|key| crate::server::gate_escalation::valid_request_key(key)));
+        let open_row = rows.iter().find(|e| e.event_type == "gate_escalation_refused").unwrap();
+        assert_eq!(open_row.event_data["request_key_basis"], "derived_without_act");
+        assert!(rows.iter().all(|e| e.event_type != "gate_escalation_claimed"),
+                "#540 chain invariant: claimed without decided is zero");
+        assert!(rows.iter().all(|e| e.event_type != "gate_escalation_decided"),
+                "the fixture has not decided an escalation yet");
+        drop(rows);
+
+        let opened = gate_claim_and_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Edit", "marker": "approved-540.py",
+            "reason": "Edit -> approved-540.py",
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap();
+        let peer = tool_connect(&shared, &json!({
+            "plugin_id": "codex", "host_agent": "h",
+        })).await.unwrap();
+        let decided = tool_gate_arbitrate_escalation(&shared, &json!({
+            "escalation_id": esc_id, "approve": true,
+            "session_id": peer["sessionId"], "reason": "cross-peer approval for the claim invariant",
+        })).await.unwrap();
+        assert_eq!(decided["status"], "approved", "{decided}");
+        let claimed = gate_claim_and_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Edit", "marker": "approved-540.py",
+            "reason": "Edit -> approved-540.py",
+        })).await.unwrap();
+        assert_eq!(claimed["claimed"], true, "{claimed}");
+
+        let rows = shared.lock().await.recent_chain(50);
+        let approved = rows.iter().filter(|e| {
+            e.event_type == "gate_escalation_decided" && e.event_data["status"] == "approved"
+        }).count();
+        let claimed = rows.iter().filter(|e| e.event_type == "gate_escalation_claimed").count();
+        assert_eq!(approved, 1, "the invariant needs a real approved decision: {rows:?}");
+        assert!(claimed <= approved,
+                "#540 chain invariant: every claimed row needs an approved decision: {rows:?}");
     }
 
     /// Negative control for both tests above. A row that appears no matter what the guard
@@ -21603,6 +21765,8 @@ mod open_appeals_tests {
                     assigned_role: "citizen".into(),
                     constellation_role: crate::reputation::DEFAULT_CONSTELLATION_ROLE.into(),
                     role_basis: None,
+                    identity_basis: crate::server::state::IdentityBasis::Asserted,
+                    canonical_principal: None,
                     soft_lct: format!("lct:{m}"),
                     connected_at: Utc::now(),
                     host_session_id: None,
@@ -22686,6 +22850,8 @@ mod appeal_tests {
                 assigned_role: "citizen".into(),
                 constellation_role: APPELLANT_ROLE.into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -24631,6 +24797,8 @@ mod vault_hst001_tests {
             assigned_role: "citizen".into(),
             constellation_role: "role:constellation:member".into(),
             role_basis: None,
+            identity_basis: crate::server::state::IdentityBasis::Asserted,
+            canonical_principal: None,
             soft_lct: format!("lct:test:{plugin_id}"),
             connected_at: chrono::Utc::now(),
             host_session_id: None,
@@ -25913,8 +26081,8 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
         // A refusal to OPEN is itself a deny of the write, so it is witnessed rather than
         // returned as a bare error the caller might log and forget.
         Err(e) => {
-            let attempt_key = refusal_request_key(
-                &s, &plugin_id, &marker, act.as_deref(), session_id_arg.as_deref(), None,
+            let (attempt_key, basis) = refusal_request_key(
+                &s, &plugin_id, &marker, act.as_deref(), session_id_arg.as_deref(), None, false,
             );
             let _ = s.append_chain(
                 "gate_escalation_refused",
@@ -25922,7 +26090,7 @@ async fn tool_gate_escalation_open(state: &SharedState, args: &Value) -> ToolRes
                     "plugin_id": plugin_id,
                     "tool_name": tool_name,
                     "marker": marker,
-                    "request_key": attempt_key,
+                    "request_key": attempt_key, "request_key_basis": basis,
                     "why": e.to_string(),
                 }),
             );
@@ -29073,15 +29241,15 @@ record is not repriced; this ask needs its own approval at the stronger bar.",
             }))
         }
         Err(e) => {
-            let attempt_key = refusal_request_key(
+            let (attempt_key, basis) = refusal_request_key(
                 &s, &plugin_id, &marker, attempted_act.as_deref(), session_id_arg.as_deref(),
-                request_key.as_deref(),
+                request_key.as_deref(), false,
             );
             let _ = s.append_chain(
                 "gate_escalation_refused",
                 json!({
                     "plugin_id": plugin_id, "tool_name": tool_name,
-                    "marker": marker, "request_key": attempt_key, "why": e.to_string(),
+                    "marker": marker, "request_key": attempt_key, "request_key_basis": basis, "why": e.to_string(),
                 }),
             );
             // Still a refusal of the write — reported as one rather than as a tool error the
