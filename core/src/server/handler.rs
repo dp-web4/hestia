@@ -26168,11 +26168,14 @@ pub(crate) const READ_ONLY_PATH_TOOLS: &[&str] = &[
 ];
 
 /// The decider's reason belongs to the original act; this guidance belongs to the current one.
-/// SAGE's paged directory `memory_read` is a cbp-being affordance (#1667, SAGE #707), not a
-/// fleet-wide verb. No concrete alternative path is invented from the display act: the member
-/// chooses a target its effective grants actually admit.
+/// Paged directory `memory_read` is SAGE's affordance (#1667; SAGE #707 landed it in SAGE's
+/// shared dispatcher), so every SAGE being has it and no other host does. A SAGE being is
+/// recognised by the fleet's `<machine>-being` member-id convention. No concrete alternative
+/// path is invented from the display act: the member chooses a target its effective grants
+/// actually admit.
 fn standing_refusal_next(plugin_id: &str, tool: &str) -> &'static str {
-    if plugin_id == "cbp-being" {
+    let sage_being = plugin_id.strip_suffix("-being").is_some_and(|machine| !machine.is_empty());
+    if sage_being {
         if tool == "search" {
             "use hestia_scope_status to choose a narrower directory whose effective grants include \
              read, then memory_read path=<held-directory> with start_line paging instead of \
@@ -30336,6 +30339,52 @@ mod standing_scope_surface_tests {
                 assert!(next.contains("hestia_scope_status") && next.contains("narrower"), "{out}");
             } else {
                 assert!(next.contains("your host's supported listing operation"), "{out}");
+            }
+        }
+    }
+
+    /// SAGE #707 landed in SAGE's shared dispatcher, so the paged directory verb belongs to
+    /// every SAGE being, not to one member id. The negative controls are ids that merely
+    /// resemble the `<machine>-being` convention.
+    #[tokio::test]
+    async fn standing_guidance_offers_the_sage_verb_to_every_sage_being() {
+        let (_dir, shared, path) = standing_refusal_fixture().await;
+        let members = [
+            ("mcnugget-being", true), ("hub-being", true), ("cbp-being", true),
+            ("-being", false), ("being", false), ("cbp-being-helper", false),
+            ("kimi-code", false),
+        ];
+        for (member, sage) in members {
+            if member != "cbp-being" {
+                shared.lock().await.standing_scope.refusals.push(
+                    crate::server::standing_scope::StandingRefusal {
+                        member: member.into(),
+                        path: path.clone(),
+                        recursive: false,
+                        refused_at: 1,
+                        refused_by: "operator".into(),
+                        reason: ORIGINAL_REFUSAL_REASON.into(),
+                        request_id: None,
+                        modes: Some(crate::server::grant_modes::Modes::READ),
+                    },
+                );
+            }
+            for tool in ["search", "Read"] {
+                let out = tool_scope_claim(&shared, &json!({
+                    "plugin_id": member, "path": path, "rule": "mrh.path",
+                    "tool_name": tool, "act": format!("{tool} -> visible.txt"),
+                    "act_digest": "a".repeat(64), "spend": false,
+                }))
+                .await
+                .unwrap();
+                assert_eq!(out["standing"], true, "{member} {tool}: {out}");
+                let next = out["next"].as_str().unwrap();
+                let detail = out["detail"].as_str().unwrap();
+                let offered = next.contains("memory_read path=<held-directory>")
+                    && next.contains("start_line");
+                assert_eq!(offered, sage, "{member} {tool}: {out}");
+                assert_eq!(detail.contains("memory_read"), sage, "{member} {tool}: {out}");
+                assert!(!next.contains(&path), "{member} {tool}: {out}");
             }
         }
     }
