@@ -814,7 +814,10 @@ def run(fx: Fixture) -> dict:
             ("1329-url-httpie-exact-long", f"cd {out_cwd} && http --body --follow http://h/x"),
             ("1329-url-httpie-stdout", f"cd {out_cwd} && http -b http://h/x"),
             ("1329-url-httpie-output", f"cd {out_cwd} && http -o {ws}/granted/out.txt http://h/x"),
-            ("1329-url-xh-stdout", f"cd {out_cwd} && xh -b http://h/x"),
+            ("1329-url-config-name-in-prose", f"cd {out_cwd} && echo CURL_HOME=cfg && curl -q -sS http://h/x"),
+            ("1329-url-config-export-in-prose", f"cd {out_cwd} && echo export CURL_HOME=cfg && curl -q -sS http://h/x"),
+            ("1329-url-config-name-in-printf", f"cd {out_cwd} && printf %s CURL_HOME=cfg && curl -q -sS http://h/x"),
+            ("1329-url-attached-printf-in-prose", f"cd {out_cwd} && echo 'printf -vCURL_HOME cfg' && curl -q -sS http://h/x"),
         ):
             r = fx.reach(cmd, scopes=cwd_exact, cwd=out_cwd)
             check(f"allow-outside-cwd:{name}", r[0] is True, f"{cmd!r} -> {r}")
@@ -837,6 +840,27 @@ def run(fx: Fixture) -> dict:
             ("1329-control-httpie-download", f"cd {out_cwd} && http --download http://h/fresh.txt"),
             ("1329-control-httpie-download-abbrev", f"cd {out_cwd} && http --down http://h/fresh.txt"),
             ("1329-control-httpie-download-short", f"cd {out_cwd} && http -bd http://h/fresh.txt"),
+            ("1329-control-export-curl-home", f"cd {out_cwd} && export CURL_HOME=cfg && curl -sS http://h/fresh.txt"),
+            ("1329-control-bare-curl-home-then-export", f"cd {out_cwd} && CURL_HOME=cfg; export CURL_HOME; curl -sS http://h/fresh.txt"),
+            ("1329-control-declare-httpie-config", f"cd {out_cwd} && declare -x HTTPIE_CONFIG_DIR=cfg && http -b http://h/fresh.txt"),
+            ("1329-control-typeset-curl-home", f"cd {out_cwd} && typeset -x CURL_HOME=cfg && curl -sS http://h/fresh.txt"),
+            ("1329-control-typeset-httpie-config", f"cd {out_cwd} && typeset -x HTTPIE_CONFIG_DIR=cfg && http -b http://h/fresh.txt"),
+            ("1329-control-eval-export", f"cd {out_cwd} && eval export CURL_HOME=cfg && curl -sS http://h/fresh.txt"),
+            ("1329-control-brace-group-export", f"cd {out_cwd} && {{ export CURL_HOME=cfg; }} && curl -sS http://h/fresh.txt"),
+            ("1329-control-if-then-export", f"cd {out_cwd} && if true; then export CURL_HOME=cfg; fi; curl -sS http://h/fresh.txt"),
+            ("1329-control-for-do-export", f"cd {out_cwd} && for i in 1; do export CURL_HOME=cfg; done; curl -sS http://h/fresh.txt"),
+            ("1329-control-function-export", f"cd {out_cwd} && f() {{ export CURL_HOME=cfg; }}; f && curl -sS http://h/fresh.txt"),
+            ("1329-control-builtin-export", f"cd {out_cwd} && builtin export CURL_HOME=cfg && curl -sS http://h/fresh.txt"),
+            ("1329-control-command-export", f"cd {out_cwd} && command export CURL_HOME=cfg && curl -sS http://h/fresh.txt"),
+            ("1329-control-set-a-printf-v", f"cd {out_cwd} && set -a; printf -v CURL_HOME cfg; curl -sS http://h/fresh.txt"),
+            ("1329-control-eval-quoted-export", f"cd {out_cwd} && eval 'export CURL_HOME=cfg' && curl -sS http://h/fresh.txt"),
+            ("1329-control-eval-quoted-printf-v", f"cd {out_cwd} && set -a; eval 'printf -v CURL_HOME cfg'; curl -sS http://h/fresh.txt"),
+            ("1329-control-set-a-printf-v-attached", f"cd {out_cwd} && set -a; printf -vCURL_HOME cfg; curl -sS http://h/fresh.txt"),
+            ("1329-control-eval-quoted-printf-v-attached", f"cd {out_cwd} && set -a; eval 'printf -vCURL_HOME cfg'; curl -sS http://h/fresh.txt"),
+            ("1329-control-export-home", f"cd {out_cwd} && export HOME=cfg && curl -sS http://h/fresh.txt"),
+            ("1329-control-xh-stdout-unmeasured", f"cd {out_cwd} && xh -b http://h/fresh.txt"),
+            ("1329-control-xhs-stdout-unmeasured", f"cd {out_cwd} && xhs -b http://h/fresh.txt"),
+            ("1329-control-xh-config-unmeasured", f"cd {out_cwd} && export XH_CONFIG_DIR=cfg && xh -b http://h/fresh.txt"),
             ("1329-control-wget-default", f"cd {out_cwd} && wget -q http://h/fresh.txt"),
             ("1329-control-curl-next", f"cd {out_cwd} && curl -sS http://h/x --next -O http://h/fresh.txt"),
             ("1329-control-sudo-curl", f"cd {out_cwd} && sudo curl -sS http://h/fresh.txt"),
@@ -867,7 +891,7 @@ def run(fx: Fixture) -> dict:
             os.makedirs(config.parent, exist_ok=True)
             config.write_text('{"default_options":["--download"]}\n')
             try:
-                for head in ("http", "xh"):
+                for head in ("http",):
                     r = fx.reach(f"cd {out_cwd} && {head} -b http://h/fresh.txt",
                                  scopes=cwd_exact, cwd=out_cwd)
                     check(f"deny-outside-cwd:1329-default-config:{head}:{config_dir}",

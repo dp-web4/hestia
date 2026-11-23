@@ -2237,7 +2237,7 @@ def _shell_words(cmd: str, depth: int = 0, origin=None) -> list:
 
 #: #1329: network operands are data only for a whole simple command whose output grammar is
 #: understood. Unknown options, abbreviations and implicit downloads retain the old path judgment.
-_URL_HEADS = frozenset(("curl", "http", "https", "xh", "xhs"))
+_URL_HEADS = frozenset(("curl", "http", "https"))
 _HTTPIE_HEADS = frozenset(("http", "https", "xh", "xhs"))
 _HOSTPORT = re.compile(r"^(?:localhost|[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
                        r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|\[[0-9A-Fa-f:.]+\])"
@@ -2301,7 +2301,41 @@ def _client_config_unknown(head: str, first_arg: Optional[str], prefix_unknown: 
     return any(os.path.isfile(os.path.join(config, "config.json")) for config in candidates)
 
 
+_CLIENT_CONFIG_NAME_PATTERN = r"(?:HOME|CURL_HOME|XDG_CONFIG_HOME|HTTPIE_CONFIG_DIR|XH_CONFIG_DIR)"
+_CLIENT_CONFIG_WORD = re.compile(
+    rf"(?<![A-Za-z0-9_]){_CLIENT_CONFIG_NAME_PATTERN}(?![A-Za-z0-9_])"
+)
+_CLIENT_CONFIG_PRINTF_ATTACHED = re.compile(
+    rf"(?<![A-Za-z0-9_])-v{_CLIENT_CONFIG_NAME_PATTERN}(?![A-Za-z0-9_])"
+)
+
+
+def _client_config_changed(toks, at: int) -> bool:
+    prose = None
+    assigning_printf = False
+    for kind, word, _uglob in toks[:at]:
+        if kind in ("sep", "mark"):
+            prose = None
+            assigning_printf = False
+            continue
+        if kind != "word":
+            continue
+        if prose is None:
+            prose = word if word in ("echo", "printf") else ""
+        attached_printf = _CLIENT_CONFIG_PRINTF_ATTACHED.search(word)
+        if prose == "printf" and (word == "-v" or attached_printf):
+            assigning_printf = True
+        if not _CLIENT_CONFIG_WORD.search(word) and not attached_printf:
+            continue
+        if prose in ("echo", "printf") and not assigning_printf:
+            continue
+        return True
+    return False
+
+
 def _url_data_words(toks, at: int, head: str, prefix_unknown: bool = False) -> set:
+    if _client_config_changed(toks, at):
+        return set()
     for kind, word, _uglob in reversed(toks[:at]):
         if kind in ("sep", "mark"):
             break
