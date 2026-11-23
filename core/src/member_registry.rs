@@ -513,9 +513,20 @@ fn persist_mint(
     let public_key = keypair.verifying_key();
 
     // Persist: reload the doc, append, save (append-only; other members untouched).
+    // An absent doc loads as `Ok(empty)`; a present-but-unreadable one is `Err`, and
+    // minting over it would both run the duplicate check against nothing and save a
+    // roster that erases every earlier member — so refuse before signing or saving.
     let mut persisted: Vec<PersistedMember> =
-        crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE)
-            .unwrap_or_default();
+        match crate::vault::load_doc(vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE) {
+            Ok(persisted) => persisted,
+            Err(e) => {
+                eprintln!(
+                    "[members] REFUSED: '{id}' mint — the member document is unreadable ({e:#}); \
+                     not minting over it"
+                );
+                return None;
+            }
+        };
     if let Some(existing) = persisted
         .iter()
         .find(|p| p.keypair_secret_hex == secret_hex || p.lct.public_key == public_key)
@@ -661,6 +672,62 @@ mod tests {
         let reloaded = load_members(&vault);
         assert_eq!(reloaded.len(), 1, "the refusal added no vault row");
         assert_eq!(reloaded.get("first-member").unwrap().lct_id(), first);
+    }
+
+    #[test]
+    fn member_seed_already_present_by_public_key_alone_cannot_mint() {
+        // Same public key, different stored secret: only the public-key arm can match.
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        persist_mint(&mut vault, &mut reg, "first-member", false, "sid", "anchor", mint_from_seed([7; 32]))
+            .expect("the first use of a nonzero seed mints");
+        let mut persisted: Vec<PersistedMember> =
+            crate::vault::load_doc(&vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE).unwrap();
+        persisted[0].keypair_secret_hex = hex::encode([9u8; 32]);
+        crate::vault::save_doc(&mut vault, MEMBERS_NAMESPACE, MEMBERS_DOC, MEMBERS_LEGACY_FILE, &persisted)
+            .unwrap();
+        assert!(persist_mint(
+            &mut vault,
+            &mut reg,
+            "second-member",
+            false,
+            "sid",
+            "anchor",
+            mint_from_seed([7; 32]),
+        ).is_none(), "a public key already present cannot mint another plugin identity");
+        assert_eq!(load_members(&vault).len(), 1, "the refusal added no vault row");
+    }
+
+    #[test]
+    fn member_mint_refuses_over_an_unreadable_member_document() {
+        let (_dir, mut vault) = fresh_vault();
+        let mut reg = MemberRegistry::default();
+        persist_mint(&mut vault, &mut reg, "first-member", false, "sid", "anchor", mint_from_seed([7; 32]))
+            .expect("the first use of a nonzero seed mints");
+        // Corrupt-but-present: append a row that does not parse as a member.
+        let mut rows: Vec<serde_json::Value> =
+            serde_json::from_slice(vault.get_document(MEMBERS_NAMESPACE, MEMBERS_DOC).unwrap()).unwrap();
+        rows.push(serde_json::json!({"bogus": 1}));
+        vault
+            .put_document(MEMBERS_NAMESPACE, MEMBERS_DOC, serde_json::to_vec(&rows).unwrap())
+            .unwrap();
+        let before = vault.get_document(MEMBERS_NAMESPACE, MEMBERS_DOC).unwrap().to_vec();
+        let mut fresh_reg = MemberRegistry::default();
+        assert!(persist_mint(
+            &mut vault,
+            &mut fresh_reg,
+            "second-member",
+            false,
+            "sid",
+            "anchor",
+            mint_from_seed([7; 32]),
+        ).is_none(), "an unreadable member document refuses the mint, duplicate or not");
+        assert!(fresh_reg.is_empty(), "no presence is advertised");
+        assert_eq!(
+            vault.get_document(MEMBERS_NAMESPACE, MEMBERS_DOC).unwrap(),
+            before.as_slice(),
+            "the stored document is untouched — the first member is not erased"
+        );
     }
 
     #[test]
