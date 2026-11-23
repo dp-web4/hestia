@@ -22756,6 +22756,70 @@ mod appeal_tests {
                 .contains("unattributed"));
         }
 
+        // An id that is not id-shaped is never written raw: length and a digest prefix only.
+        let pasted = format!("token=hunter2 {}", "x".repeat(4096));
+        let _ = tool_gate_arbitrate_escalation(&state, &json!({"escalation_id": pasted, "approve": false}))
+            .await
+            .expect_err("still refused");
+        {
+            let s = state.lock().await;
+            let row = s.recent_chain(1).pop().unwrap();
+            assert_eq!(row.event_type, "gate_escalation_arbiter_refused");
+            let text = row.event_data.to_string();
+            assert!(!text.contains("hunter2") && text.len() < 400, "{text}");
+            assert_eq!(row.event_data["escalation_id"]["not_id_shaped"], true);
+            assert_eq!(row.event_data["escalation_id"]["len"], pasted.len());
+        }
+
+        // THE BUDGET. Three rows so far in this window; two more are written, then the rest are
+        // tallied without a row, and the next window's first row carries the tally.
+        let unattributed = || async {
+            let _ = tool_gate_arbitrate_escalation(&state, &json!({"escalation_id": "flood", "approve": true}))
+                .await
+                .expect_err("refused every time, witnessed or not");
+        };
+        let before = state.lock().await.chain_len();
+        for _ in 0..40 {
+            unattributed().await;
+        }
+        {
+            let mut s = state.lock().await;
+            assert_eq!(
+                s.chain_len(), before + 2,
+                "an unattributed caller writes at most {UNATTRIBUTED_REFUSAL_ROWS_PER_WINDOW} rows per window"
+            );
+            assert_eq!(s.unattributed_arbiter_refusals.2, 38, "the unwritten refusals are counted");
+            // The window passes.
+            s.unattributed_arbiter_refusals.0 = 0;
+        }
+        unattributed().await;
+        {
+            let s = state.lock().await;
+            let row = s.recent_chain(1).pop().unwrap();
+            assert_eq!(row.event_data["unattributed_refusals_not_written_before"], 38, "{:?}", row.event_data);
+            assert_eq!(s.unattributed_arbiter_refusals.2, 0);
+        }
+
+        // A CHAIN THAT CANNOT TAKE THE ROW. The refusal stands, nothing is ruled, and the caller
+        // is told the record is missing instead of getting the ordinary message.
+        {
+            let mut s = state.lock().await;
+            s.unattributed_arbiter_refusals = (0, 0, 0);
+            s.chain_fault_on.insert("gate_escalation_arbiter_refused".into());
+        }
+        let before = state.lock().await.chain_len();
+        let error = tool_gate_arbitrate_escalation(&state, &json!({"escalation_id": "no-chain", "approve": true}))
+            .await
+            .expect_err("refused, and the missing record is named");
+        assert!(error.to_string().contains("refusal_unwitnessed"), "{error}");
+        assert!(error.to_string().contains("requires your own live session_id"), "{error}");
+        {
+            let mut s = state.lock().await;
+            assert_eq!(s.chain_len(), before, "nothing was written");
+            assert_eq!(s.unattributed_arbiter_refusals.1, 0, "a row that did not land spends no budget");
+            s.chain_fault_on.clear();
+        }
+
         let sid = seat(&state, "claude-code").await;
         let before = state.lock().await.chain_len();
         let _ = tool_gate_arbitrate_escalation(&state, &json!({
@@ -29612,6 +29676,47 @@ fn escalation_miss_reason(s: &super::state::ServerState, escalation_id: &str) ->
     }
 }
 
+/// Chain rows an unattributed would-be arbiter may cause per window. The row also lands in the
+/// operator's governance ledger, so an unbounded caller could bury it.
+const UNATTRIBUTED_REFUSAL_ROWS_PER_WINDOW: u32 = 5;
+const UNATTRIBUTED_REFUSAL_WINDOW_SECS: u64 = 60;
+
+/// May this unattributed refusal be written? `Some(n)`: yes, and `n` earlier refusals were not
+/// written since the last row (so the count survives even though the rows do not). `None`: the
+/// window's budget is spent; the refusal is tallied only.
+fn unattributed_refusal_slot(budget: &mut (u64, u32, u64), now: u64) -> Option<u64> {
+    let (start, rows, not_written) = budget;
+    if now.saturating_sub(*start) >= UNATTRIBUTED_REFUSAL_WINDOW_SECS {
+        *start = now;
+        *rows = 0;
+    }
+    if *rows >= UNATTRIBUTED_REFUSAL_ROWS_PER_WINDOW {
+        *not_written = not_written.saturating_add(1);
+        return None;
+    }
+    *rows += 1;
+    Some(std::mem::take(not_written))
+}
+
+/// What of a caller-supplied `escalation_id` may be written to the chain when the caller is
+/// nobody. A value shaped like an id is kept, so the row can be joined to the ask. Anything else
+/// (oversized, free text, something pasted by mistake) is recorded as its length and a digest
+/// prefix only: an unauthenticated caller must not be able to place arbitrary text on the chain.
+fn witnessable_escalation_id(raw: &str) -> Value {
+    let id_shaped = !raw.is_empty()
+        && raw.len() <= 64
+        && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if id_shaped {
+        return json!(raw);
+    }
+    let digest = Sha256::digest(raw.as_bytes());
+    json!({
+        "not_id_shaped": true,
+        "len": raw.len(),
+        "sha256_16": digest.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>(),
+    })
+}
+
 async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> ToolResult {
     use crate::arbiter::{eligibility_for, AppealParties, Disposition, Eligibility};
     use crate::server::gate_escalation::{now_secs, Channel};
@@ -29633,14 +29738,34 @@ async fn tool_gate_arbitrate_escalation(state: &SharedState, args: &Value) -> To
     // credited, and a decision that moves nobody's conduct score teaches the society nothing —
     // the same rule hestia_appeal enforces on appellants.
     let Some(arb) = resolve_attributed_caller(&s, session_id_arg.as_deref()) else {
-        let _ = s.append_chain(
-            "gate_escalation_arbiter_refused",
-            json!({
-                "escalation_id": escalation_id,
-                "would_be_arbiter": Value::Null,
-                "why": "unattributed — no resolvable live session_id presented",
-            }),
-        );
+        // WITNESSED, within a budget, and never silently lost (NOVA's review of #1664).
+        let slot = unattributed_refusal_slot(&mut s.unattributed_arbiter_refusals, now);
+        // Over budget (`None`): counted, and carried on the next row that is written.
+        let unwitnessed = slot.and_then(|not_written_before| {
+            s.append_chain(
+                "gate_escalation_arbiter_refused",
+                json!({
+                    "escalation_id": witnessable_escalation_id(&escalation_id),
+                    "would_be_arbiter": Value::Null,
+                    "why": "unattributed — no resolvable live session_id presented",
+                    "unattributed_refusals_not_written_before": not_written_before,
+                }),
+            )
+            .err()
+        });
+        if let Some(e) = unwitnessed {
+            // The row did not land: it spends no budget, and the tally it would have carried
+            // is put back for the next row that does land.
+            let (_, rows, not_written) = &mut s.unattributed_arbiter_refusals;
+            *rows = rows.saturating_sub(1);
+            *not_written = not_written.saturating_add(slot.unwrap_or(0));
+            return Err(anyhow::anyhow!(
+                "ruling on an escalation requires your own live session_id (from hestia_connect). \
+                 refusal_unwitnessed: this refusal could NOT be recorded on the chain ({e:#}); \
+                 nothing was ruled and no conduct score moved, but the record of this attempt is \
+                 missing — report it as a chain integrity anomaly"
+            ));
+        }
         return Err(anyhow::anyhow!(
             "ruling on an escalation requires your own live session_id (from hestia_connect); \
              an unattributable arbiter cannot be credited and its ruling moves no conduct score"
