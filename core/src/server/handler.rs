@@ -26280,6 +26280,20 @@ fn nonexistent_scope_detail(s: &crate::server::state::ServerState, plugin_id: &s
     out
 }
 
+fn act_mentions_path_token(act: &str, target: &str) -> bool {
+    fn boundary(c: char) -> bool {
+        c.is_whitespace()
+            || matches!(c, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+                | ',' | ';' | ':' | '=' | '|' | '&')
+    }
+
+    act.match_indices(target).any(|(start, matched)| {
+        let before = act[..start].chars().next_back();
+        let after = act[start + matched.len()..].chars().next();
+        before.map_or(true, boundary) && after.map_or(true, boundary)
+    })
+}
+
 fn dispatcher_origin(
     s: &super::state::ServerState,
     plugin_id: &str,
@@ -26312,12 +26326,12 @@ fn dispatcher_origin(
     if !is_deny {
         return None;
     }
-    let target = d.get("target").and_then(Value::as_str)?.trim();
-    if !target.starts_with('/') {
+    let raw_target = d.get("target").and_then(Value::as_str)?.trim();
+    if !raw_target.starts_with('/') {
         return None;
     }
-    let subtree = target.ends_with("/*");
-    let target = super::state::normalize_scope_path(target);
+    let subtree = raw_target.ends_with("/*");
+    let target = super::state::normalize_scope_path(raw_target);
     let parent = std::path::Path::new(&target)
         .parent()
         .map(|p| super::state::normalize_scope_path(&p.to_string_lossy()));
@@ -26329,8 +26343,18 @@ fn dispatcher_origin(
     }
     let tool = d.get("tool_name").and_then(Value::as_str).unwrap_or("unknown");
     let act = d.get("attempted").and_then(Value::as_str).filter(|act| {
-        !act.trim().is_empty() && !act.trim_end().ends_with("…[truncated]")
+        !act.trim().is_empty()
+            && !act.trim_end().ends_with("…[truncated]")
+            && act_mentions_path_token(act, raw_target)
     })?;
+    let latest = s.chain_store.find_latest_policy_decision_for_member(plugin_id, |candidate| {
+        candidate.event_data.get("target").and_then(Value::as_str).is_some_and(|candidate| {
+            super::state::normalize_scope_path(candidate.trim()) == target
+        })
+    }).ok().flatten()?;
+    if latest.hash != hash {
+        return None;
+    }
     // A policy deny retains a display act, not the gate's complete-act authorization digest.
     // Keep that distinction explicit: session/standing rulings are available, ONCE is not.
     let act_digest = String::new();
@@ -30448,6 +30472,77 @@ mod dispatcher_origin_tests {
             let id = opened["request_id"].as_str().unwrap();
             assert!(state.lock().await.scope_requests[id].ext.gate.is_none(), "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn superseded_dispatcher_denials_stay_member_filed() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "kimi-code").await;
+        let path = evidence(_dir.path(), "child/evidence.txt");
+        let oldest = deny_for(&state, "kimi-code", &path, "mrh.path").await;
+        let newest = deny_for(&state, "kimi-code", &path, "mrh.path").await;
+
+        let old = request(&state, Some(&asker), &path,
+                          Some("dispatcher_after_deny"), Some(&oldest.hash)).await;
+        assert_eq!(old["origin"], "member_request", "{old}");
+        assert!(state.lock().await.scope_requests[old["request_id"].as_str().unwrap()].ext.gate.is_none());
+        let current = request(&state, Some(&asker), &path,
+                              Some("dispatcher_after_deny"), Some(&newest.hash)).await;
+        assert_eq!(current["origin"], "dispatcher_after_deny", "{current}");
+
+        let allowed = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["decision"] = json!("allow");
+        }).await;
+        for (name, hash) in [("oldest deny", &oldest.hash), ("newer deny", &newest.hash),
+                             ("latest allow", &allowed.hash)] {
+            let opened = request(&state, Some(&asker), &path,
+                                 Some("dispatcher_after_deny"), Some(hash)).await;
+            assert_eq!(opened["origin"], "member_request", "{name}: {opened}");
+            assert!(state.lock().await.scope_requests[opened["request_id"].as_str().unwrap()]
+                .ext.gate.is_none(), "{name}");
+        }
+
+        raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row.as_object_mut().unwrap().remove("enforced");
+        }).await;
+        let malformed_successor = request(&state, Some(&asker), &path,
+                                          Some("dispatcher_after_deny"), Some(&newest.hash)).await;
+        assert_eq!(malformed_successor["origin"], "member_request", "{malformed_successor}");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_act_must_name_the_deny_target_as_a_path_token() {
+        let (_dir, state) = test_state().await;
+        let asker = connect(&state, "kimi-code").await;
+        let path = evidence(_dir.path(), "child/evidence.txt");
+        let other = evidence(_dir.path(), "child/other.txt");
+        let mismatched = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["attempted"] = json!(format!("Read -> {other}"));
+        }).await;
+        let substring = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["attempted"] = json!(format!("Read -> {path}.backup"));
+        }).await;
+        for (name, hash) in [("different target", &mismatched.hash), ("path prefix", &substring.hash)] {
+            let opened = request(&state, Some(&asker), &path,
+                                 Some("dispatcher_after_deny"), Some(hash)).await;
+            assert_eq!(opened["origin"], "member_request", "{name}: {opened}");
+            assert!(state.lock().await.scope_requests[opened["request_id"].as_str().unwrap()]
+                .ext.gate.is_none(), "{name}");
+        }
+
+        let wrapped = raw_deny_for(&state, "kimi-code", &path, "mrh.path", |row| {
+            row["attempted"] = json!(format!("Read(\"{path}\")"));
+        }).await;
+        let opened = request(&state, Some(&asker), &path,
+                             Some("dispatcher_after_deny"), Some(&wrapped.hash)).await;
+        assert_eq!(opened["origin"], "dispatcher_after_deny", "{opened}");
+        let id = opened["request_id"].as_str().unwrap();
+        assert_eq!(state.lock().await.scope_requests[id].ext.gate.as_ref().unwrap().act_digest, "");
+
+        let origin_only = request(&state, Some(&asker), &path,
+                                  Some("dispatcher_after_deny"), None).await;
+        assert_eq!(origin_only["origin"], "member_request", "{origin_only}");
+        assert!(origin_only["invited_peers"].as_array().unwrap().is_empty(), "{origin_only}");
     }
 
     #[tokio::test]

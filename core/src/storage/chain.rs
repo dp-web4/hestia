@@ -1589,6 +1589,29 @@ impl SqliteChainStore {
         }
     }
 
+    pub fn find_latest_policy_decision_for_member(
+        &self,
+        plugin_id: &str,
+        mut matches: impl FnMut(&ChainEntry) -> bool,
+    ) -> Result<Option<ChainEntry>> {
+        let conn = self.observed(&self.conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT chain_position, hash, prev_hash, event_type, event_data, signer_lct, timestamp
+             FROM chain_entries
+             WHERE event_type = 'policy_decision'
+               AND json_extract(event_data, '$.plugin_id') = ?1
+             ORDER BY chain_position DESC",
+        )?;
+        let rows = stmt.query_map(params![plugin_id], row_to_entry)?;
+        for row in rows {
+            let entry = row??;
+            if matches(&entry) {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
+    }
+
     /// Resolve a hash PREFIX to at most `cap` entries (ascending by position so
     /// the report is stable). Exists because the only place most members ever
     /// see an entry id is prose that abbreviates it — the operating law cites
