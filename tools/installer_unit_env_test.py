@@ -55,6 +55,14 @@ def installer_unit_body(text):
     return m.group(1)
 
 
+def last_memory_high(text):
+    section = re.search(r"(?ms)^\[Service\][ \t]*\n(.*?)(?=^\[|\Z)", text)
+    if not section:
+        return None
+    assignments = re.findall(r"^MemoryHigh=(.*)$", section.group(1), re.M)
+    return assignments[-1].strip() if assignments else None
+
+
 def main():
     template = TEMPLATE.read_text(encoding="utf-8")
     installer = INSTALLER.read_text(encoding="utf-8")
@@ -82,15 +90,23 @@ def main():
     )
 
     for name, text in (("template", template), ("installer", unit)):
-        assert re.search(r"^MemoryHigh=1G$", text, re.M), (
-            f"{name} drops the provisional #592 memory bound. Validate 1G against cgroup "
+        assert last_memory_high(text) == "1G", (
+            f"{name} does not end [Service] with MemoryHigh=1G. Validate 1G against cgroup "
             "MemoryCurrent/MemoryPeak and memory.stat during the soak, and record both "
             "memory.events high and gate-unavailable frequency before treating it as "
             "validated. Process RSS alone is not the cgroup memory controlled here."
         )
 
+    for label, control, expected in [
+        ("removed", "[Service]\nMemoryCurrent=1G\n", None),
+        ("later override", "[Service]\nMemoryHigh=1G\nMemoryHigh=infinity\n", "infinity"),
+        ("misplaced", "[Install]\nMemoryHigh=1G\n", None),
+        ("last valid", "[Service]\nMemoryHigh=infinity\nMemoryHigh=1G\n", "1G"),
+    ]:
+        assert last_memory_high(control) == expected, f"{label}: memory control was not detected"
+
     print(f"ok: installer sets all {len(declared)} declared Environment vars {sorted(declared)}")
-    print("ok: both systemd producers carry MemoryHigh=1G")
+    print("ok: both systemd producers end [Service] with MemoryHigh=1G")
     return 0
 
 
