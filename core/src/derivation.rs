@@ -1128,16 +1128,31 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
     // Independently confirmed self-correction (0.9): revalidate the whole graph at read
     // time; never trust the confirmation's stored score. Multiple confirmations of one
     // reversal remain receipts but cannot multiply one act into multiple observations.
+    //
+    // THE ACT IS THE PAIR OF OUTCOMES, NOT THE REVERSAL. A self-correction reversal costs
+    // nothing and one outcome can be reversed any number of times, so de-duplicating on the
+    // reversal alone let one original outcome be reversed N times and credited N times
+    // (Legion's probe on #1632: three reversals of one Edit, obs 0 -> 3). One original
+    // outcome earns at most one credit, and one corrective outcome backs at most one credit.
+    // The earliest valid confirmation in the chain wins; the window's order does not decide.
     let mut confirmed_reversals: HashSet<&str> = HashSet::new();
-    for confirmation in entries.iter().copied().filter(|entry| {
-        entry.event_type == "conduct_confirmation"
-            && entry_str(entry, "schema") == Some(CONDUCT_CONFIRMATION_SCHEMA_V1)
-            && entry_str(entry, "conduct") == Some("self-correction")
-            && is_member(entry_str(entry, "subject_plugin_id"))
-            && entry_str(entry, "subject_role")
-                .map_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE, |r| r)
-                == role_lct
-    }) {
+    let mut credited_targets: HashMap<&str, u64> = HashMap::new(); // target hash -> confirmation #
+    let mut spent_corrections: HashMap<&str, u64> = HashMap::new(); // correction hash -> confirmation #
+    let mut confirmations: Vec<&ChainEntry> = entries
+        .iter()
+        .copied()
+        .filter(|entry| {
+            entry.event_type == "conduct_confirmation"
+                && entry_str(entry, "schema") == Some(CONDUCT_CONFIRMATION_SCHEMA_V1)
+                && entry_str(entry, "conduct") == Some("self-correction")
+                && is_member(entry_str(entry, "subject_plugin_id"))
+                && entry_str(entry, "subject_role")
+                    .map_or(crate::reputation::DEFAULT_CONSTELLATION_ROLE, |r| r)
+                    == role_lct
+        })
+        .collect();
+    confirmations.sort_by_key(|entry| entry.chain_position);
+    for confirmation in confirmations {
         let confirmer = confirmation
             .event_data
             .get("confirmed_by")
@@ -1216,6 +1231,29 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             });
             continue;
         }
+        let already = credited_targets
+            .get(target.hash.as_str())
+            .map(|by| ("original outcome", target.chain_position, *by))
+            .or_else(|| {
+                spent_corrections
+                    .get(correction.hash.as_str())
+                    .map(|by| ("corrective outcome", correction.chain_position, *by))
+            });
+        if let Some((what, position, by)) = already {
+            temperament_evidence.push(Evidence {
+                chain_position: confirmation.chain_position,
+                hash: confirmation.hash.clone(),
+                event_type: confirmation.event_type.clone(),
+                timestamp: confirmation.timestamp,
+                contribution: format!(
+                    "EXCLUDED — {what} #{position} was already credited by confirmation #{by}"
+                ),
+                reference: Some(format!("chain:{}", reversal.hash)),
+            });
+            continue;
+        }
+        credited_targets.insert(target.hash.as_str(), confirmation.chain_position);
+        spent_corrections.insert(correction.hash.as_str(), confirmation.chain_position);
         temperament_scores.push(SELF_CORRECTION_SCORE);
         temperament_evidence.push(Evidence {
             chain_position: confirmation.chain_position,
@@ -1460,7 +1498,8 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
          escalation must carry `answers_deny` (the deny's chain hash) or it cannot be credited, \
          because the link is never inferred from timing. Independently confirmed self-correction \
          scores 0.9 and requires a subject-reported reversal, witnessed original and successful \
-         corrective outcomes, plus a not-the-subject confirmation; duplicate confirmations count once. \
+         corrective outcomes, plus a not-the-subject confirmation; duplicate confirmations count once, and one original \
+         or corrective outcome is credited at most once however often it is reversed. \
          Synthetic probe sessions (test/probe/verify/e2e/debug markers) are excluded from conduct.",
     );
     // An unmeasured grain that says WHY beats one that just says nothing.
@@ -2014,6 +2053,92 @@ mod tests {
         assert!(derived.veracity.evidence.iter().any(|e| {
             e.hash == "hash-1" && e.contribution.contains("EXCLUDED — superseded by reversal #2")
         }));
+    }
+
+    /// One self-correction graph for `codex`: outcome `target`, a self-reported reversal of
+    /// it at `reversal`, corrective outcome `correction`, confirmed by `claude-code` at `at`.
+    fn self_correction_graph(target: u64, reversal: u64, correction: u64, at: u64) -> Vec<ChainEntry> {
+        let role = "role:constellation:interactive-dev";
+        vec![
+            entry(reversal, reversal as i64, "reversal", json!({
+                "subject_plugin_id":"codex","subject_role":role,"kind":"edit-reverted",
+                "cause":"self-correction","ref":format!("chain:hash-{target}"),
+                "reported_by":{"plugin_id":"codex"}
+            })),
+            entry(at, at as i64, "conduct_confirmation", json!({
+                "schema":CONDUCT_CONFIRMATION_SCHEMA_V1,"conduct":"self-correction",
+                "subject_plugin_id":"codex","subject_role":role,
+                "reversal_hash":format!("hash-{reversal}"),"target_hash":format!("hash-{target}"),
+                "correction_hash":format!("hash-{correction}"),
+                "confirmed_by":{"plugin_id":"claude-code"}
+            })),
+        ]
+    }
+
+    fn subject_outcome(pos: u64) -> ChainEntry {
+        entry(pos, pos as i64, "outcome", json!({
+            "plugin_id":"codex","role_lct":"role:constellation:interactive-dev","success":true
+        }))
+    }
+
+    fn self_correction_credits(d: &DerivedTrust) -> usize {
+        d.temperament.evidence.iter()
+            .filter(|e| e.contribution.starts_with("confirmed self-correction"))
+            .count()
+    }
+
+    /// Legion's probe on #1632: one outcome reversed three times, each reversal confirmed.
+    /// De-duplication was per reversal, so one act became three observations.
+    #[test]
+    fn one_outcome_reversed_many_times_is_credited_once() {
+        let role = "role:constellation:interactive-dev";
+        let mut window = vec![subject_outcome(1), subject_outcome(2)];
+        window.extend(self_correction_graph(1, 3, 2, 4));
+        window.extend(self_correction_graph(1, 5, 2, 6));
+        window.extend(self_correction_graph(1, 7, 2, 8));
+        let derived = derive("codex", role, &window);
+        assert_eq!(self_correction_credits(&derived), 1, "{:#?}", derived.temperament.evidence);
+        let excluded: Vec<_> = derived.temperament.evidence.iter()
+            .filter(|e| e.contribution.contains(
+                "EXCLUDED — original outcome #1 was already credited by confirmation #4"))
+            .map(|e| e.chain_position)
+            .collect();
+        assert_eq!(excluded.len(), 2, "the later confirmations are receipted, not dropped");
+        // The earliest confirmation wins whatever order the window arrives in.
+        window.reverse();
+        let reversed = derive("codex", role, &window);
+        assert_eq!(self_correction_credits(&reversed), 1);
+        assert!(reversed.temperament.evidence.iter().any(|e| {
+            e.chain_position == 4 && e.contribution.starts_with("confirmed self-correction")
+        }));
+    }
+
+    /// One corrective outcome cannot back the correction of two different originals.
+    #[test]
+    fn one_corrective_outcome_backs_one_credit() {
+        let role = "role:constellation:interactive-dev";
+        let mut window = vec![subject_outcome(1), subject_outcome(2), subject_outcome(3)];
+        window.extend(self_correction_graph(1, 4, 3, 5));
+        window.extend(self_correction_graph(2, 6, 3, 7));
+        let derived = derive("codex", role, &window);
+        assert_eq!(self_correction_credits(&derived), 1);
+        assert!(derived.temperament.evidence.iter().any(|e| {
+            e.chain_position == 7 && e.contribution.contains(
+                "EXCLUDED — corrective outcome #3 was already credited by confirmation #5")
+        }));
+    }
+
+    /// Two real, separate self-corrections are still two credits.
+    #[test]
+    fn distinct_self_corrections_each_count() {
+        let role = "role:constellation:interactive-dev";
+        let mut window = vec![
+            subject_outcome(1), subject_outcome(2), subject_outcome(3), subject_outcome(4),
+        ];
+        window.extend(self_correction_graph(1, 5, 2, 6));
+        window.extend(self_correction_graph(3, 7, 4, 8));
+        let derived = derive("codex", role, &window);
+        assert_eq!(self_correction_credits(&derived), 2);
     }
 
     #[test]
