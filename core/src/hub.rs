@@ -363,6 +363,12 @@ pub fn absolute_rest_endpoint(base_url: &str, rest: &str) -> Result<String> {
         anyhow::bail!("discovery endpoint query/fragment is not allowed");
     }
     let base = reqwest::Url::parse(base_url.trim()).context("invalid selected hub URL")?;
+    if !base.username().is_empty() || base.password().is_some() {
+        anyhow::bail!("selected hub URL user-info is not allowed");
+    }
+    if base.query().is_some() || base.fragment().is_some() {
+        anyhow::bail!("selected hub URL query/fragment is not allowed");
+    }
     let candidate = if rest.starts_with("http://") || rest.starts_with("https://") {
         rest.to_string()
     } else {
@@ -1726,6 +1732,14 @@ mod tests {
             "/v1#fragment",
         ] {
             assert!(absolute_rest_endpoint(selected, endpoint).is_err(), "{endpoint}");
+        }
+        for selected in [
+            "http://user@127.0.0.1:8770",
+            "http://127.0.0.1:8770/?query=1",
+            "http://127.0.0.1:8770/#fragment",
+        ] {
+            assert!(absolute_rest_endpoint(selected, "/v1").is_err(), "{selected}");
+            assert!(absolute_rest_endpoint(selected, "http://127.0.0.1:8770/v1").is_err(), "{selected}");
         }
     }
 
