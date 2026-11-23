@@ -1372,8 +1372,8 @@ impl ServerState {
         // (kimi-code) falls out of it entirely though its grain is intact. Seed the active set
         // from the trust store for every registry harness so it shows its most recent standing.
         // Insert-if-absent: a harness active in the window keeps its window entry untouched.
-        // The derived LEVEL comes from the derivation cache, over `derivation::scan_window`, whose
-        // governance budget is deep precisely so a member idle for days still shows the
+        // The derived LEVEL comes from the derivation cache, over per-member subject windows
+        // whose governance budget is deep precisely so a member idle for days still shows the
         // standing it earned. When this comment last claimed the window "reaches back much
         // further", the dashboard was in fact passing STATS_WINDOW (~17 hours of chain) and
         // kimi-code/codex rendered `unmeasured` beside 24k and 8k actions.

@@ -233,7 +233,7 @@ impl DerivationCache {
     /// invalidate, and a governance write must not wait on a display derivation.
     pub fn refresh(&self, chain_store: &SqliteChainStore) -> usize {
         let now = Instant::now();
-        let (due, everyone_epoch, member_epoch) = {
+        let (due, everyone_epoch, member_epoch, relearn) = {
             let mut inner = self.lock();
             inner.settle(now);
             let due = inner.due(now);
@@ -241,19 +241,34 @@ impl DerivationCache {
                 return 0;
             }
             inner.last_scan = Some(now);
-            (due, inner.everyone_epoch, inner.member_epoch.clone())
+            (due, inner.everyone_epoch, inner.member_epoch.clone(), !inner.relearned)
+        };
+        let wall_now = Utc::now();
+        let window_len = chrono::Duration::minutes(RETRY_WINDOW_MINUTES);
+        let observed_denies = if relearn {
+            let cutoff = (wall_now - window_len).to_rfc3339();
+            match chain_store.scan_recent(
+                Some(&cutoff),
+                Some(&["policy_decision"]),
+                crate::derivation::DERIVATION_GOVERNANCE_SCAN,
+                crate::derivation::project_row,
+            ) {
+                Ok(window) => Some(window),
+                Err(e) => {
+                    tracing::error!("derivation recheck re-learn chain read failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
         };
         let mut due_by_member: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (plugin_id, role) in due {
             due_by_member.entry(plugin_id).or_default().push(role);
         }
-        let mut observed_denies = Vec::new();
         let mut derived = Vec::new();
         for (plugin_id, roles) in due_by_member {
             let window = crate::derivation::scan_subject_window(chain_store, &plugin_id);
-            observed_denies.extend(window.iter().filter_map(|event| {
-                Self::denied_member(event).map(|member| (member.to_string(), event.timestamp))
-            }));
             let refs: Vec<&ChainEntry> = window.iter().collect();
             for role in roles {
                 let member_epochs = aliased_identities(&plugin_id, &refs)
@@ -274,16 +289,18 @@ impl DerivationCache {
                 derived.push(((plugin_id.clone(), role), cached));
             }
         }
-        // A restart forgets pending rechecks. Re-learn them from the windows on the first scan,
-        // so a deny whose retry window straddles a restart still gets its follow-up.
-        let wall_now = Utc::now();
-        let window_len = chrono::Duration::minutes(RETRY_WINDOW_MINUTES);
+        // A restart forgets pending rechecks. Re-learn every member's recent denies once,
+        // independently of which grains happened to be due on the first scan.
         let mut inner = self.lock();
-        let relearn = !std::mem::replace(&mut inner.relearned, true);
-        for (member, timestamp) in observed_denies.into_iter().filter(|_| relearn) {
-            let closes_in = timestamp + window_len - wall_now;
-            if let Ok(left) = closes_in.to_std() {
-                inner.schedule_recheck(&member, now + left + Duration::from_secs(5));
+        if let Some(window) = observed_denies {
+            inner.relearned = true;
+            for event in &window {
+                if let Some(member) = Self::denied_member(event) {
+                    let closes_in = event.timestamp + window_len - wall_now;
+                    if let Ok(left) = closes_in.to_std() {
+                        inner.schedule_recheck(member, now + left + Duration::from_secs(5));
+                    }
+                }
             }
         }
         let n = derived.len();
@@ -453,13 +470,13 @@ mod tests {
     }
 
     /// A deny whose retry window straddles a restart still gets its follow-up: a fresh cache
-    /// re-learns it from the chain on its first scan.
+    /// re-learns every member from the chain, not only the member whose grain is due.
     #[test]
     fn a_restart_relearns_pending_follow_ups() {
         let (_d, s) = store();
         deny(&s, "kimi-code", "s-k", "/etc/a");
         let fresh = DerivationCache::new();
-        fresh.lookup("kimi-code", ROLE);
+        fresh.lookup("codex", ROLE);
         fresh.refresh(&s);
         assert!(fresh.inner.lock().unwrap().rechecks.contains_key("kimi-code"));
     }

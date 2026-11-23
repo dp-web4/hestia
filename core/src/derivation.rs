@@ -1535,6 +1535,50 @@ mod tests {
     }
 
     #[test]
+    fn a_subject_window_keeps_member_evidence_when_the_global_budget_binds() {
+        use crate::storage::chain::SqliteChainStore;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteChainStore::open(dir.path().join("w.db"), [7u8; 32]).unwrap();
+        store.append(
+            "policy_decision",
+            json!({"plugin_id": "kimi-code", "decision": "allow", "evidence": "older"}),
+            "lct:test",
+        ).unwrap();
+        for _ in 0..3 {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": "codex", "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+        store.append(
+            "policy_decision",
+            json!({"plugin_id": "kimi-code", "decision": "allow", "evidence": "recent"}),
+            "lct:test",
+        ).unwrap();
+        for _ in 0..3 {
+            store.append(
+                "policy_decision",
+                json!({"plugin_id": "codex", "decision": "allow"}),
+                "lct:test",
+            ).unwrap();
+        }
+
+        let global = scan_window_with(&store, 2, 4);
+        let subject = scan_subject_window_with(&store, "kimi-code", 2, 4);
+        let member_positions = |window: &[ChainEntry]| {
+            window.iter().filter(|event| {
+                event.event_data.get("plugin_id").and_then(Value::as_str) == Some("kimi-code")
+            }).map(|event| event.chain_position).collect::<Vec<_>>()
+        };
+        let global_positions = member_positions(&global);
+        let subject_positions = member_positions(&subject);
+        assert_eq!(global_positions, vec![4], "the global budget must bind for this control");
+        assert_eq!(subject_positions, vec![4, 0]);
+        assert!(global_positions.iter().all(|position| subject_positions.contains(position)));
+    }
+
+    #[test]
     fn a_subject_window_preserves_alias_and_global_invalidation_evidence() {
         use crate::storage::chain::SqliteChainStore;
         let dir = tempfile::TempDir::new().unwrap();

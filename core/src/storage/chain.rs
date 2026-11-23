@@ -135,6 +135,21 @@ pub fn chain_id_for_genesis(genesis_hash: &str) -> String {
 }
 
 const META_SUBJECTS_BACKFILLED_THROUGH: &str = "subjects_backfilled_through";
+const META_SUBJECTS_DEFINITION_SHA256: &str = "subjects_definition_sha256";
+const SUBJECT_INDEX_DEFINITION_VERSION: u64 = 1;
+const DERIVATION_SUBJECT_KEYS: &[&str] = &["plugin_id", "subject_plugin_id"];
+const DERIVATION_GLOBAL_EVENT_TYPES: &[&str] = &["identity_alias", "amnesty", "exoneration"];
+
+fn subject_index_definition_digest() -> String {
+    let definition = serde_json::to_vec(&(
+        SUBJECT_INDEX_DEFINITION_VERSION,
+        crate::derivation::DERIVATION_EVENT_TYPES,
+        DERIVATION_SUBJECT_KEYS,
+        DERIVATION_GLOBAL_EVENT_TYPES,
+    ))
+    .expect("static subject-index definition serializes");
+    hex::encode(Sha256::digest(&definition))
+}
 
 fn derivation_subjects(event_data: &serde_json::Value) -> Vec<String> {
     let mut subjects = Vec::new();
@@ -145,9 +160,9 @@ fn derivation_subjects(event_data: &serde_json::Value) -> Vec<String> {
             }
         }
     };
-    for key in ["plugin_id", "subject_plugin_id"] {
-        push(event_data.get(key));
-        push(event_data.get("data").and_then(|data| data.get(key)));
+    for key in DERIVATION_SUBJECT_KEYS {
+        push(event_data.get(*key));
+        push(event_data.get("data").and_then(|data| data.get(*key)));
     }
     push(event_data.get("requested_by").and_then(|who| who.get("plugin_id")));
     push(event_data
@@ -176,6 +191,28 @@ fn index_chain_subjects(
 }
 
 fn backfill_chain_subjects(conn: &Connection) -> Result<()> {
+    let definition_digest = subject_index_definition_digest();
+    let previous_definition = conn
+        .query_row(
+            "SELECT value FROM chain_meta WHERE key = ?1",
+            params![META_SUBJECTS_DEFINITION_SHA256],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if previous_definition.as_deref() != Some(definition_digest.as_str()) {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM chain_subjects", [])?;
+        tx.execute(
+            "DELETE FROM chain_meta WHERE key = ?1",
+            params![META_SUBJECTS_BACKFILLED_THROUGH],
+        )?;
+        tx.execute(
+            "INSERT INTO chain_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_SUBJECTS_DEFINITION_SHA256, definition_digest],
+        )?;
+        tx.commit()?;
+    }
     let backfilled_through = conn
         .query_row(
             "SELECT value FROM chain_meta WHERE key = ?1",
@@ -1532,6 +1569,7 @@ impl SqliteChainStore {
         let conn = self.observed(&self.read_conn)?;
         let type_placeholders = vec!["?"; event_types.len()].join(",");
         let subject_placeholders = vec!["?"; subject_plugin_ids.len()].join(",");
+        let global_placeholders = vec!["?"; DERIVATION_GLOBAL_EVENT_TYPES.len()].join(",");
         let mut sql = format!(
             "SELECT e.chain_position, e.hash, e.prev_hash, e.event_type, e.event_data,
                     e.signer_lct, e.timestamp
@@ -1541,7 +1579,7 @@ impl SqliteChainStore {
                         SELECT chain_position FROM chain_subjects
                          WHERE plugin_id IN ({subject_placeholders})
                     )
-                    OR e.event_type IN ('identity_alias', 'amnesty', 'exoneration'))"
+                    OR e.event_type IN ({global_placeholders}))"
         );
         if cutoff_rfc3339.is_some() {
             sql.push_str(" AND e.timestamp >= ?");
@@ -1554,6 +1592,9 @@ impl SqliteChainStore {
         }
         for plugin_id in subject_plugin_ids {
             binds.push(Box::new(plugin_id.to_string()));
+        }
+        for event_type in DERIVATION_GLOBAL_EVENT_TYPES {
+            binds.push(Box::new(event_type.to_string()));
         }
         if let Some(cutoff) = cutoff_rfc3339 {
             binds.push(Box::new(cutoff.to_string()));
@@ -2988,6 +3029,61 @@ mod tests {
         let reopened = SqliteChainStore::open(&path, TEST_KEY).unwrap();
         assert_eq!(positions(&reopened, "alpha"), vec![7, 6, 5, 2, 0]);
         assert_eq!(positions(&reopened, "requester"), vec![7, 6, 5, 4, 3]);
+    }
+
+    #[test]
+    fn subject_index_definition_digest_is_a_versioned_ratchet() {
+        assert_eq!(SUBJECT_INDEX_DEFINITION_VERSION, 1);
+        assert_eq!(
+            subject_index_definition_digest(),
+            "7235e9785b54b461d8cd2815434d1ae2d33e2ff1e2afd7128c5e6b79ef753d5f"
+        );
+    }
+
+    #[test]
+    fn subject_backfill_rebuilds_when_the_definition_changes_at_a_current_watermark() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("w.db");
+        let store = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let entry = store.append(
+            "adjudication",
+            json!({"data": {"subject_plugin_id": "new-key-subject"}}),
+            "lct:test",
+        ).unwrap();
+        assert_eq!(entry.chain_position, 0);
+        store.conn.lock().unwrap().execute_batch(
+            "DELETE FROM chain_subjects;
+             INSERT INTO chain_subjects (chain_position, plugin_id) VALUES (0, 'stale-subject');
+             INSERT INTO chain_meta (key, value) VALUES ('subjects_definition_sha256', 'previous-definition')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+        ).unwrap();
+        drop(store);
+
+        let reopened = SqliteChainStore::open(&path, TEST_KEY).unwrap();
+        let positions = |plugin_id: &str| {
+            reopened.scan_subjects_recent(
+                &[plugin_id],
+                None,
+                crate::derivation::DERIVATION_EVENT_TYPES,
+                100,
+                |row| Some(row.chain_position),
+            ).unwrap()
+        };
+        assert_eq!(positions("new-key-subject"), vec![0]);
+        assert!(positions("stale-subject").is_empty());
+        let conn = raw(&path);
+        let digest: String = conn.query_row(
+            "SELECT value FROM chain_meta WHERE key = 'subjects_definition_sha256'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(digest, subject_index_definition_digest());
+        let through: String = conn.query_row(
+            "SELECT value FROM chain_meta WHERE key = 'subjects_backfilled_through'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(through, "0");
     }
 
     #[test]
