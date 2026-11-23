@@ -262,11 +262,23 @@ def _actually_touched_closure(root, before, after):
     return False, changed
 
 
+def _sed_bundled_in_place():
+    """Use GNU or BSD sed's no-backup spelling, as appropriate for this host."""
+    try:
+        gnu = subprocess.run(
+            ["sed", "--version"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+    except OSError:
+        gnu = False
+    empty_suffix = "" if gnu else " ''"
+    return f"sed -Ei{empty_suffix} 's/orig/edited/' plugins/kimi/hooks/{HOOK}"
+
+
 # (name, command, expected_classifier_write?) — write-arm commands touch ONLY the sandbox.
 _DIFF_CASES = [
     ("redirect_into_hook", f"echo pwned > plugins/kimi/hooks/{HOOK}", True),
     ("cp_into_shared", f"cp src.txt plugins/_shared/{CORE}", True),
-    ("sed_bundled_in_place", f"sed -Ei 's/orig/edited/' plugins/kimi/hooks/{HOOK}", True),
+    ("sed_bundled_in_place", _sed_bundled_in_place(), True),
     ("cd_then_relative", f"cd plugins/kimi/hooks && echo x > {HOOK}", True),
     ("redirect_benign", "echo hi > docs/readme.md", False),
     ("cp_benign", "cp src.txt docs/notes.txt", False),
