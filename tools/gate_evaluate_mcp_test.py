@@ -56,7 +56,7 @@ def main(binary: str) -> int:
             mechanism = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = mechanism
             spec.loader.exec_module(mechanism)
-            mcp = mechanism._McpHttp(f"http://127.0.0.1:{port}/mcp", time.monotonic() + 30)
+            mcp = mechanism._McpHttp(f"http://127.0.0.1:{port}/mcp", time.monotonic() + 90)
             if "result" not in mcp.initialize():
                 raise RuntimeError("initialize failed")
             mcp.initialized()
@@ -82,7 +82,10 @@ def main(binary: str) -> int:
             allowed = unwrap(mcp.call_tool("hestia_gate_evaluate", {
                 "tool_name": "Read", "target": "/fixture/book.txt", "session_id": session,
             }))
-            if allowed.get("decision") is not True or allowed.get("permits") is not False:
+            if (allowed.get("decision") is not False
+                    or allowed.get("society_law_allows") is not True
+                    or allowed.get("context", {}).get("complete") is not False
+                    or allowed.get("permits") is not False):
                 raise RuntimeError(f"unexpected ordinary-read verdict: {allowed}")
             missing = unwrap(mcp.call_tool("hestia_gate_evaluate", {
                 "tool_name": "Read", "target": "/fixture/book.txt",

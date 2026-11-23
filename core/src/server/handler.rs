@@ -715,7 +715,7 @@ fn hestia_tools() -> Vec<Tool> {
         ),
         t_args(
             "hestia_gate_evaluate",
-            "Side-effect-free SOCIETY-LAW evaluation for a trusted local client. Resolves the member from your live session, evaluates tool_name plus optional target/command against the SAME publication and law fold as hestia_query_policy, and returns an AuthZEN-shaped subject/action/resource, boolean decision, verdict, rule, reason and law generation. It never begins an action, appends a witness, charges trust, consumes rate-limit capacity, opens a scope request or escalation, or grants permission. Local MRH/scope, governance closure and egress are explicitly NOT evaluated here; use the gate's dry run for those stages. Session identity is claimed, not authenticated (#824/#954)",
+            "Side-effect-free SOCIETY-LAW evaluation for a trusted local client. Resolves the member from your live session, evaluates tool_name plus optional target/command against the SAME publication and law fold as hestia_query_policy, and returns an AuthZEN-shaped subject/action/resource, a fail-closed boolean decision plus a separate society_law_allows result, verdict, rule, reason and law generation. The decision is positive only when every required stage and input has been evaluated; unevaluable or partial probes are not authorization. It never begins an action, appends a witness, charges trust, consumes rate-limit capacity, opens a scope request or escalation, or grants permission. Local MRH/scope, governance closure and egress are explicitly NOT evaluated here; use the gate's dry run for those stages. Session identity is claimed, not authenticated (#824/#954)",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1837,7 +1837,11 @@ async fn tool_gate_evaluate(state: &SharedState, args: &Value) -> ToolResult {
     let evaluation = published.evaluate_read_only(&who.plugin_id, &who.role_lct, &pa);
     let law_generation = published.policy_generation();
     let policy_version = published.version;
-    let authorized = !(evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced);
+    let not_evaluated = ["local_mrh_scope", "governance_closure", "egress"];
+    let complete = not_evaluated.is_empty() && !unevaluable;
+    let society_law_allows = !unevaluable
+        && !(evaluation.decision == crate::policy::PolicyDecision::Deny && evaluation.enforced);
+    let decision = complete && society_law_allows;
     let resource = if shell && command.is_some() {
         json!({"type": "command", "id": command})
     } else {
@@ -1847,7 +1851,8 @@ async fn tool_gate_evaluate(state: &SharedState, args: &Value) -> ToolResult {
         "subject": {"type": "member", "id": who.plugin_id},
         "action": {"name": tool_name, "properties": {"command": command}},
         "resource": resource.clone(),
-        "decision": authorized,
+        "decision": decision,
+        "society_law_allows": society_law_allows,
         "context": {
             "verdict": evaluation.decision.as_str(),
             "rule": evaluation.rule_id,
@@ -1855,7 +1860,8 @@ async fn tool_gate_evaluate(state: &SharedState, args: &Value) -> ToolResult {
             "reason": evaluation.reason,
             "enforced": evaluation.enforced,
             "stage": "society_law",
-            "not_evaluated": ["local_mrh_scope", "governance_closure", "egress"],
+            "not_evaluated": not_evaluated,
+            "complete": complete,
             "evaluated": !unevaluable,
             "unevaluable": unevaluable,
             "inert_content_skipped": evaluation.inert_content_skipped,
@@ -30194,6 +30200,8 @@ mod gate_evaluate_tests {
             .await
             .unwrap();
             assert_eq!(out["decision"], false, "{out}");
+            assert_eq!(out["society_law_allows"], false, "{out}");
+            assert_eq!(out["context"]["complete"], false, "{out}");
             assert_eq!(out["context"]["verdict"], expected.decision.as_str(), "{out}");
             assert_eq!(out["context"]["rule"], json!(expected.rule_id), "{out}");
             assert_eq!(out["subject"]["id"], "codex", "{out}");
@@ -30233,6 +30241,9 @@ mod gate_evaluate_tests {
             .unwrap();
         assert_eq!(unevaluable["context"]["unevaluable"], true, "{unevaluable}");
         assert_eq!(unevaluable["context"]["evaluated"], false, "{unevaluable}");
+        assert_eq!(unevaluable["context"]["complete"], false, "{unevaluable}");
+        assert_eq!(unevaluable["decision"], false, "{unevaluable}");
+        assert_eq!(unevaluable["society_law_allows"], false, "{unevaluable}");
         assert_eq!(unevaluable["permits"], false, "{unevaluable}");
         let outside = tool_gate_evaluate(&state, &json!({
             "tool_name": "Read", "target": "/outside", "session_id": session,
@@ -30240,7 +30251,14 @@ mod gate_evaluate_tests {
         .await
         .unwrap();
         assert!(outside["context"]["not_evaluated"].as_array().unwrap().contains(&json!("local_mrh_scope")));
+        assert_eq!(outside["context"]["complete"], false, "{outside}");
+        assert_eq!(outside["society_law_allows"], true, "{outside}");
+        assert_eq!(outside["decision"], false, "{outside}");
         assert_eq!(outside["permits"], false);
+        {
+            let s = state.lock().await;
+            assert!(matches!(space_of(&s, "codex", "/outside"), SpaceAnswer::Outside));
+        }
         let s = state.lock().await;
         assert_eq!(s.chain_store.len().unwrap(), before);
         assert!(s.actions.is_empty() && s.scope_requests.is_empty() && s.gate_escalations.is_empty());
