@@ -389,6 +389,27 @@ describe("Decide — scope requests (Sprint 2)", () => {
     expect(ruleScopeRequest.mock.calls[0][3]).toMatchObject({ recursive: false });
   });
 
+  it("shows, selects, and grants a member's requested recursive reach", async () => {
+    const req = scopeRequest({ recursive: true });
+    getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [req] });
+    operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });
+    ruleScopeRequest.mockResolvedValue({ outcome: "decided", result: {} });
+
+    render(<Decide />);
+    const reach = (await screen.findByRole("combobox", { name: /reach/i })) as HTMLSelectElement;
+    expect(reach.value).toBe("1");
+    expect([...reach.options][0].textContent).toMatch(/^exactly/);
+    expect(screen.getByText("member asks for this path and below")).toBeTruthy();
+    screen.getByRole("button", { name: /grant/i }).click();
+    await waitFor(() => expect(ruleScopeRequest).toHaveBeenCalled());
+    expect(ruleScopeRequest.mock.calls[0][3]).toEqual({
+      standing: false,
+      recursive: true,
+      grantPath: null,
+      askedPath: req.path,
+    });
+  });
+
   it("reports a ruling another view already made as an outcome", async () => {
     getDashboard.mockResolvedValue({ pending_escalations: [], pending_scope_requests: [scopeRequest()] });
     operatorStatus.mockResolvedValue({ signed_in: true, lct_id: "lct:x" });

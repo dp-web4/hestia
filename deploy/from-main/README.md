@@ -44,8 +44,10 @@ The class that actually locks a seat out is **no verdict**: under `HESTIA_PRE_FA
 a gate that cannot reach its daemon — or cannot import the shared mechanism two levels up from
 itself, which is what a hot-swapped tree does to it — refuses *every* tool, including the remedy.
 And policy resolution reports an empty scope when nothing answers, so **both states print the
-identical `(granted: )` banner**. That is why the cheap observable cannot tell them apart: the
-emptiness pub saw was a symptom of the daemon failure, read at the wrong layer.
+identical `(granted: )` banner**. That is why the cheap observable cannot tell them apart. But
+pub's Aug 28 emptiness was not a daemon-failure symptom: the live snapshot preserved in #1097
+shows the daemon answering with `in_scope: []`. The envelope really was empty (#715). Check the
+verdict and daemon reachability instead of inferring either state from the empty banner.
 
 Measured — the arms this preflight distinguishes. The first three are one box, one gate, one
 event (CBP); the last two were added 2026-09-07 from Sprout and Legion, and they are the reason
@@ -54,7 +56,7 @@ the verdict column alone is not enough to act on:
 | seat state | `--preflight` | the probe's own message says |
 |---|---|---|
 | healthy, envelope empty or not | `ok`, exit 0 | — |
-| daemon unreachable (the pub signature) | `FAILED(gate refuses a benign read)`, exit 4 | connection refused / no endpoint |
+| daemon unreachable | `FAILED(gate refuses a benign read)`, exit 4 | connection refused / no endpoint |
 | gate registered in a worktree | `FAILED(rule-0: …)`, exit 4 | `rule-0: …` |
 | **seat config never rendered** (timer arm, `HESTIA_HOME` set) | `FAILED(gate refuses a benign read)`, exit 4 | `deny [config.unbacked] — no rendered projection for <seat> at ~/.hestia/seats/<seat>.env` |
 | **`HESTIA_HOME` not supplied** (fired-session arm) | `FAILED(gate refuses a benign read)`, exit 4 | `deny [config.unbacked] — HESTIA_HOME is not set; the launcher must supply the bootstrap locator` |
@@ -105,7 +107,8 @@ preflight and refuses identically, so there is nothing for the seat to retry.
 
 **On a checkout install, `deploy/fleet/install.sh` now does this for you** (`step_deploy_supervisor`):
 it clones the two deploy checkouts over https, installs `hestia-deploy` and both units with
-`HESTIA_WORKSPACE` rendered, and leaves the **timer off**. The dashboard's update button works
+`HESTIA_WORKSPACE` rendered, and writes the same root as a one-line `$HESTIA_HOME/workspace`
+pointer for older hand-installed units. The deploy **timer stays off**. The dashboard's update button works
 straight away. Scheduled deploys stay off until the operator switches them on, either with the
 dashboard toggle (#1334) or with `HESTIA_AUTO_UPDATE=1` at install time. It also installs the
 **update check** (`hestia-deploy-check.{service,timer}`) and switches its timer on: every 4h, at
@@ -243,8 +246,10 @@ primitive that is not there must never be indistinguishable from a lock that is 
   installing, for a pre-flight before a hold. Any other argument is usage, exit 2,
   and does not take the lock — the default is refusal, not deployment.
 - A half deploy heals on the **next timer cycle**: a full cycle that finds the binary
-  `CURRENT` but `current-build.json` behind it (or absent) re-runs the members' install
-  from the same synced checkout and logs `CURRENT <v> manifest-repair hooks=ok`. Until
+  `CURRENT` but `current-build.json` behind it (or absent), or a registrar dry-run that reports
+  owned registration drift, re-runs the members' install from the same synced checkout and logs
+  `CURRENT <v> manifest-repair hooks=ok`. Build-id equality alone no longer hides a hook moved
+  out of its worktree (#1097A); foreign registration lines are never rewritten. Until
   2026-08-27 that cycle logged `CURRENT` and exited before the installer, so a half deploy
   stayed half until someone ran `--hooks-only` by hand — and mcnugget measured that the
   someone, when it is an agent session, cannot (below). The timer is the one caller that
@@ -272,8 +277,9 @@ primitive that is not there must never be indistinguishable from a lock that is 
   (`HALF-DEPLOYED` is the last line, and it names the repair for that value), the unit
   reads failed, and the next timer cycle repairs the manifest. The binary is not rolled
   back: a stale daemon would be a worse state than a stale manifest, and the manifest is
-  what the repair rewrites. `hooks=ok` is checked against the **file**, not the installer's
-  exit code: the installer exits 0 without writing anything when no member is registered on
+  what the repair rewrites. `hooks=ok` is checked against the **file** and a post-install
+  registration dry-run, not the installer's exit code: the installer exits 0 without writing
+  anything when no member is registered on
   the host (and under `DRY_RUN=1`), and mcnugget measured the repair path reading that as
   `manifest-repair hooks=ok`, rc=0, under a real launchd timer, twice, with no manifest on
   disk — green every 4h, forever, on exactly the headless profile being onboarded next. It
@@ -340,13 +346,14 @@ remembering to clone agent-atlas and run `plugins/agent-inventory/install.sh` by
   It is the deploy's own clone on purpose — `<workspace>/agent-atlas` is a working tree that
   seats add descriptors to, and this script hard-resets what it owns.
 - **The inventory step** runs wherever the members' install runs, and on the ordinary
-  `CURRENT` cycle. It reports `inventory=ok(current)`, `ok(<enumeration>)`, `skipped(<why>)`,
+  `CURRENT` cycle. It reports `inventory=ok(current)`, `ok(<enumeration>)`, `SKIPPED(<why>)`,
   `refused(governed session)` or `FAILED(<why>)`. Its post-condition is the installed bytes
   matching the checkout's `inventory.py`, not the installer's exit code.
-- **It needs `HESTIA_WORKSPACE` in the deploy unit** — the directory holding the seat's repos.
-  Both unit templates carry the key EMPTY: render it from explicit operator configuration. With
-  it empty the step says `skipped(no HESTIA_WORKSPACE in the deploy unit)`; set to something
-  that is not a directory it says so too. It never guesses one, because `install.sh` would pin
+- **It needs `HESTIA_WORKSPACE` in the deploy unit or the one-line `$HESTIA_HOME/workspace`
+  pointer** — the directory holding the seat's repos. Both unit templates carry the key EMPTY;
+  `deploy/fleet/install.sh` renders it and writes the pointer for older hand-installed units.
+  With neither the step says `SKIPPED(no HESTIA_WORKSPACE in the deploy unit)`; a non-directory
+  or a multi-line pointer is refused too. It never guesses one, because `install.sh` would pin
   the guess into three triggers. `HESTIA_DEPLOY_INVENTORY=0` switches the step off.
 
 `inventory_step_test.py` runs both functions under `set -euo pipefail` through every failure
