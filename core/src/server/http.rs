@@ -4333,35 +4333,98 @@ async fn config_seed_seats(
         &members,
         super::handler::ConfigPass::Author,
     );
-    let not_ready: Vec<_> = verdicts
-        .iter()
-        .filter(|v| !matches!(v, sc::ConfigVerdict::Verified { .. }))
-        .collect();
-    let ready = !members.is_empty() && verdicts.len() == members.len() && not_ready.is_empty();
-    if let Err(e) = s.append_chain(
+    let readiness = seed_readiness(&members, &verdicts);
+    // A POINT-IN-TIME OBSERVATION, and it says so. This row is what the render found at the
+    // moment of the seed; it is never rewritten. What happens to a seat's projection afterwards
+    // is witnessed per seat by the render pass (`config_integrity_finding` / `config_miswire`
+    // when it is wrong, `config_integrity_resolved` when a later pass verifies it), so a seed
+    // that was not ready does not leave `ready: false` as the last word on the chain.
+    //
+    // RECORDED OR SAID NOT TO BE (NOVA's review of #1665). The seats' readiness is a fact about
+    // the disk and stands either way, but a caller must not be told a witnessed readiness exists
+    // when the append failed: `readiness_recorded` is false and there is no entry hash.
+    let recorded = s.append_chain(
         "config_seed_readiness",
         serde_json::json!({
             "intent": intent.hash,
             "authority_committed": true,
-            "ready": ready,
+            "ready": readiness.ready,
+            "ready_reason": readiness.reason,
+            "missing_verdicts": readiness.missing,
+            "duplicate_verdicts": readiness.duplicated,
             "verdicts": verdicts,
+            "observation": "at_seed",
+            "later_state": "per-seat config_integrity_finding / config_miswire / config_integrity_resolved rows",
         }),
-    ) {
-        tracing::warn!(error = %e, "seed projection readiness could not be witnessed");
-    }
+    );
+    let (readiness_recorded, readiness_hash) = match recorded {
+        Ok(entry) => (true, serde_json::json!(entry.hash)),
+        Err(e) => {
+            tracing::warn!(error = %e, "seed projection readiness could not be witnessed");
+            (false, serde_json::Value::Null)
+        }
+    };
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "authority_committed": true,
-            "ready": ready,
+            "ready": readiness.ready,
+            "ready_reason": readiness.reason,
+            "readiness_recorded": readiness_recorded,
+            "readinessEntryHash": readiness_hash,
             "seeded": parsed.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
             "verdict": verdicts,
-            "not_ready": not_ready,
+            "not_ready": readiness.not_verified,
+            "missing_verdicts": readiness.missing,
+            "duplicate_verdicts": readiness.duplicated,
             "intentEntryHash": intent.hash,
         })),
     )
+}
+
+/// Whether a seed's projections are ready, judged per seat rather than by counting.
+struct SeedReadiness<'a> {
+    ready: bool,
+    /// One word for why: `verified`, `no_seats`, `missing_verdict`, `duplicate_verdict`,
+    /// `not_verified`. The first that applies, in that order of severity of ignorance.
+    reason: &'static str,
+    /// Verdicts that are not `verified`.
+    not_verified: Vec<&'a super::seat_config::ConfigVerdict>,
+    /// Seeded seats the render pass returned no verdict for.
+    missing: Vec<String>,
+    /// Seats the render pass returned more than one verdict for.
+    duplicated: Vec<String>,
+}
+
+/// Ready means: at least one seat was seeded, and EVERY seeded seat has exactly one verdict and
+/// that verdict is `verified`. The first version compared `verdicts.len() == members.len()`,
+/// which two verdicts for one seat and none for another satisfy.
+fn seed_readiness<'a>(
+    members: &[String],
+    verdicts: &'a [super::seat_config::ConfigVerdict],
+) -> SeedReadiness<'a> {
+    use super::seat_config::ConfigVerdict;
+    let count = |m: &String| verdicts.iter().filter(|v| v.member() == m).count();
+    let missing: Vec<String> = members.iter().filter(|m| count(m) == 0).cloned().collect();
+    let duplicated: Vec<String> = members.iter().filter(|m| count(m) > 1).cloned().collect();
+    let not_verified: Vec<&ConfigVerdict> = verdicts
+        .iter()
+        .filter(|v| !matches!(v, ConfigVerdict::Verified { .. }))
+        .collect();
+    let reason = if members.is_empty() {
+        "no_seats"
+    } else if !missing.is_empty() {
+        "missing_verdict"
+    } else if !duplicated.is_empty() {
+        "duplicate_verdict"
+    } else if !not_verified.is_empty() {
+        "not_verified"
+    } else {
+        "verified"
+    };
+    SeedReadiness { ready: reason == "verified", reason, not_verified, missing, duplicated }
 }
 
 async fn config_put_seat(
@@ -10024,6 +10087,8 @@ mod disposition_tests {
         assert_eq!(result["authority_committed"], true);
         assert_eq!(result["ready"], true, "{result}");
         assert!(result["not_ready"].as_array().unwrap().is_empty(), "{result}");
+        assert_eq!(result["readiness_recorded"], true, "{result}");
+        assert!(result["readinessEntryHash"].as_str().is_some_and(|h| !h.is_empty()), "{result}");
 
         let s = state.lock().await;
         assert_eq!(
@@ -10135,12 +10200,129 @@ mod disposition_tests {
         assert!(repaired.iter().all(|v| matches!(v, sc::ConfigVerdict::Verified { .. })),
             "repair needs only a re-render, not another seed: {repaired:?}");
 
+        // The at-seed row said not ready and is never rewritten. The LATER state is on the chain
+        // as the per-seat closing edge, so `ready: false` is not the last word (NOVA's review).
+        {
+            let s = state.lock().await;
+            let resolved = s
+                .chain_store
+                .read_recent_by_types(None, &["config_integrity_resolved"], 5)
+                .unwrap();
+            assert!(
+                resolved.iter().any(|e| e.event_data["member"] == "claude-code"),
+                "the repair must be witnessed for the seat that was not ready: {resolved:?}"
+            );
+            let readiness = s
+                .chain_store
+                .read_recent_by_types(None, &["config_seed_readiness"], 5)
+                .unwrap();
+            assert_eq!(readiness.len(), 1, "a re-render does not mint a second at-seed row");
+            assert_eq!(readiness[0].event_data["observation"], "at_seed");
+            assert_eq!(readiness[0].event_data["ready_reason"], "not_verified");
+        }
+
         let (status, _) = seed_json(&state, seed).await;
         assert_eq!(status, StatusCode::CONFLICT, "the empty-only ratchet remains intact");
         let s = state.lock().await;
         for (member, bytes) in committed {
             assert_eq!(s.vault.get_document(sc::SEAT_CONFIG_NS, &member).unwrap(), &bytes[..]);
         }
+    }
+
+    /// Readiness is per seat. Counting verdicts is not enough: two for one seat and none for
+    /// another has the right length.
+    #[test]
+    fn seed_readiness_needs_exactly_one_verified_verdict_per_seat() {
+        use super::super::seat_config::ConfigVerdict as V;
+        let ok = |m: &str| V::Verified { member: m.into(), sha256: "h".into() };
+        let bad = |m: &str| V::Unreadable { member: m.into(), error: "e".into() };
+        let seats = vec!["a".to_string(), "b".to_string()];
+
+        let v = vec![ok("a"), ok("b")];
+        let r = super::seed_readiness(&seats, &v);
+        assert!(r.ready && r.reason == "verified");
+
+        // A shared-only seed has no seat that could act.
+        let r = super::seed_readiness(&[], &[]);
+        assert!(!r.ready && r.reason == "no_seats");
+
+        let v = vec![ok("a")];
+        let r = super::seed_readiness(&seats, &v);
+        assert!(!r.ready && r.reason == "missing_verdict" && r.missing == ["b"], "{:?}", r.missing);
+
+        // Same length as the seat list, and every verdict verified: the old check passed this.
+        let v = vec![ok("a"), ok("a")];
+        let r = super::seed_readiness(&seats, &v);
+        assert!(!r.ready && r.missing == ["b"] && r.duplicated == ["a"]);
+
+        let v = vec![ok("a"), ok("b"), ok("b")];
+        let r = super::seed_readiness(&seats, &v);
+        assert!(!r.ready && r.reason == "duplicate_verdict" && r.duplicated == ["b"]);
+
+        let v = vec![ok("a"), bad("b")];
+        let r = super::seed_readiness(&seats, &v);
+        assert!(!r.ready && r.reason == "not_verified" && r.not_verified.len() == 1);
+    }
+
+    /// A shared-only seed commits authority and is not ready: there is no seat to act.
+    #[tokio::test]
+    async fn a_shared_only_seed_commits_and_is_not_ready() {
+        let (_dir, state) = test_state().await;
+        let (status, text) = seed_json(&state, serde_json::json!({"documents": {
+            "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": "society facts"},
+        }})).await;
+        // Whatever the door decides about a seed with no seat, it must never say ready.
+        let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if status == StatusCode::OK {
+            assert_eq!(result["authority_committed"], true, "{result}");
+            assert_eq!(result["ready"], false, "{result}");
+            assert_eq!(result["ready_reason"], "no_seats", "{result}");
+        } else {
+            assert!(result.get("ready").is_none(), "a refused seed reports no readiness: {result}");
+        }
+    }
+
+    /// The two witness failures, on either side of the commit.
+    /// BEFORE (the authority row `config_seeded`): the seed is undone and nothing reports ready.
+    /// AFTER (the readiness row): the commit stands, the seats are ready, and the response says
+    /// the readiness was NOT recorded instead of implying a witness that does not exist.
+    #[tokio::test]
+    async fn a_seed_whose_witness_fails_never_claims_a_record_it_does_not_have() {
+        use super::super::seat_config as sc;
+        let seed = serde_json::json!({"documents": {
+            "_shared": {"env": {"HESTIA_WORKSPACE": "/w/ai"}, "note": "society facts"},
+            "claude-code": {"env": {"HESTIA_PLUGIN_ID": "claude-code"}, "note": ""},
+        }});
+        let readiness_rows = |s: &crate::server::state::ServerState| {
+            s.chain_store.read_recent_by_types(None, &["config_seed_readiness"], 5).unwrap().len()
+        };
+
+        // BEFORE the commit is final.
+        let (_dir, state) = test_state().await;
+        state.lock().await.chain_fault_on.insert("config_seeded".into());
+        let (status, text) = seed_json(&state, seed.clone()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+        let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(result.get("ready").is_none() && result.get("authority_committed").is_none(), "{result}");
+        {
+            let s = state.lock().await;
+            assert!(s.vault.get_document(sc::SEAT_CONFIG_NS, "claude-code").is_none(), "the seed is undone");
+            assert_eq!(readiness_rows(&s), 0);
+        }
+
+        // AFTER the commit.
+        let (_dir, state) = test_state().await;
+        state.lock().await.chain_fault_on.insert("config_seed_readiness".into());
+        let (status, text) = seed_json(&state, seed).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let result: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(result["authority_committed"], true, "{result}");
+        assert_eq!(result["ready"], true, "the projection did verify: {result}");
+        assert_eq!(result["readiness_recorded"], false, "{result}");
+        assert!(result["readinessEntryHash"].is_null(), "{result}");
+        let s = state.lock().await;
+        assert!(s.vault.get_document(sc::SEAT_CONFIG_NS, "claude-code").is_some(), "the commit stands");
+        assert_eq!(readiness_rows(&s), 0, "no readiness row exists, and the response said so");
     }
 
     /// A namespace that is not empty is refused, and says what occupies it.

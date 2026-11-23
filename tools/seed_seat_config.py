@@ -313,20 +313,34 @@ def verify_rendered(hestia_home: Path, documents: list[tuple[str, dict]]) -> lis
 
 
 def projection_problems(result: dict, documents: list[tuple[str, dict]]) -> list[str]:
-    verdicts = {
-        verdict.get("member"): verdict.get("status")
-        for verdict in result.get("verdict") or []
-        if isinstance(verdict, dict)
-    }
+    """Why this seed's projections are NOT ready, or [] when they are.
+
+    Ready needs both halves: the daemon's typed `ready: true`, and exactly one `verified` verdict
+    for every seat this tool asked for. Neither is trusted alone. A daemon that predates #993
+    sends no `ready` at all, and its `ok: true` meant only that the vault commit landed; that
+    is reported as "did not report readiness", never read as ready.
+    """
+    statuses: dict[str, list] = {}
+    for verdict in result.get("verdict") or []:
+        if isinstance(verdict, dict):
+            statuses.setdefault(verdict.get("member"), []).append(verdict.get("status"))
     problems = []
-    if result.get("ready") is not True:
-        problems.append("daemon: ready is not true")
+    if "ready" not in result:
+        problems.append("daemon: did not report readiness (a daemon older than #993?); "
+                        "its ok/seeded answer covers the vault commit only")
+    elif result.get("ready") is not True:
+        reason = result.get("ready_reason")
+        problems.append("daemon: ready is not true" + (f" ({reason})" if reason else ""))
     for member, _ in documents:
         if member == SHARED_MEMBER:
             continue
-        status = verdicts.get(member)
-        if status != "verified":
-            problems.append(f"{member}: {status or 'no projection verdict'}")
+        seen = statuses.get(member) or []
+        if not seen:
+            problems.append(f"{member}: no projection verdict")
+        elif len(seen) > 1:
+            problems.append(f"{member}: {len(seen)} verdicts for one seat ({', '.join(map(str, seen))})")
+        elif seen[0] != "verified":
+            problems.append(f"{member}: {seen[0]}")
     return problems
 
 
@@ -355,6 +369,14 @@ def report_seed_result(result: dict, documents: list[tuple[str, dict]],
             print(f"  ! {line}")
         return 1
     print("Every seeded seat's projection rendered with its keys.")
+    if result.get("readiness_recorded") is not True:
+        # The projections verified, here and at the daemon, but the daemon could not write its
+        # readiness observation to the chain. Say what is true and no more: nothing on the
+        # chain witnesses this readiness, so this run does not end as a clean success.
+        print("\nSEATS READY; READINESS NOT WITNESSED — the projections verified, but the daemon")
+        print("  did not record that on the chain (readiness_recorded is not true). The vault commit")
+        print("  and its own record stand. Check the daemon's chain before relying on this as evidence.")
+        return 1
     print("The seats can act; the operator grants anything beyond the minimum.")
     return 0
 
