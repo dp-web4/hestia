@@ -55,6 +55,65 @@ console.log(JSON.stringify(Object.fromEntries(
         check("enforcing strict stays calm", got["strict"] is False)
         check("missing policy is not a healthy claim", got["missing"] is False)
 
+check("the witness indicator is a non-interactive status span",
+      '<span id="witness-policy" class="witness-policy" role="status" aria-live="polite"></span>' in UI
+      and '<button id="witness-policy"' not in UI
+      and 'id="witness-policy" class="witness-policy" role="status" aria-live="polite" onclick' not in UI)
+check("the witness indicator is prominent and warning-aware",
+      "font-size: 1.1rem" in UI
+      and ".witness-policy.policy-btn-scoped, .witness-policy.policy-btn-loosened { color: var(--warning); }" in UI)
+
+
+def witness_state(data):
+    start = UI.index("    const polBtn = (() => {")
+    end = UI.index("    const filterLabel =", start)
+    block = match.group(0) + UI[start:end]
+    js = """
+const els = {};
+function el(id) {
+  if (els[id]) return els[id];
+  const classes = new Set();
+  return els[id] = {
+    textContent: '', title: '',
+    classList: {
+      add(c) { classes.add(c); }, remove(c) { classes.delete(c); },
+    },
+    get classes() { return Array.from(classes).sort(); },
+  };
+}
+const $ = el;
+const lastData = DATA;
+const pol = lastData.policy;
+const selectedOrch = lastData.selectedOrch || null;
+BLOCK
+console.log(JSON.stringify({ text: $('witness-policy').textContent,
+  classes: $('witness-policy').classes, title: $('witness-policy').title }));
+""".replace("DATA", json.dumps(data)).replace("BLOCK", block)
+    result = subprocess.run([node, "-e", js], capture_output=True, text=True, timeout=30)
+    check("witness indicator executes", result.returncode == 0, result.stderr.strip()[:500])
+    return json.loads(result.stdout) if result.returncode == 0 else {}
+
+
+if node:
+    cases = [
+        ({"policy": {"preset": "permissive", "enforce": True}, "instance_grants": []},
+         "policy: permissive", ["policy-btn-loosened"]),
+        ({"policy": {"preset": "safety", "enforce": False}, "instance_grants": []},
+         "policy: safety (audit)", ["policy-btn-loosened"]),
+        ({"policy": {"preset": "safety", "enforce": True},
+          "instance_grants": [{"plugin_id": "other", "preset": "permissive"}]},
+         "policy: safety · 1 grant", ["policy-btn-scoped"]),
+        ({"policy": {"preset": "strict", "enforce": True}, "instance_grants": []},
+         "policy: strict", []),
+        ({"policy": {"preset": "safety", "enforce": True}, "selectedOrch": "claude-code",
+          "instance_grants": [{"plugin_id": "claude-code", "preset": "permissive", "reason": "x"}]},
+         "policy: permissive · claude-code", ["policy-btn-scoped"]),
+    ]
+    for data, text, classes in cases:
+        got = witness_state(data)
+        check(f"witness indicator renders {text}", got.get("text") == text, got)
+        check(f"witness indicator classes for {text}", got.get("classes") == classes, got)
+
 if FAILURES:
     raise SystemExit("dashboard policy posture contract failed: " + ", ".join(FAILURES))
 print("dashboard policy posture contract: PASS")
