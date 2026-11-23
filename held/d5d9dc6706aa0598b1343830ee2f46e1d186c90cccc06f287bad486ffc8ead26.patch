@@ -1,0 +1,262 @@
+diff --git a/plugins/_shared/hestia_governance_closure.py b/plugins/_shared/hestia_governance_closure.py
+--- a/plugins/_shared/hestia_governance_closure.py
++++ b/plugins/_shared/hestia_governance_closure.py
+@@ -1420,6 +1420,17 @@
+         _, pos, seen, vals = _parse_opts(args, *_SED)
+         scripts = vals.get("-e", []) + vals.get("--expression", [])
+         operands = pos if scripts else pos[1:]
++        bsd_suffix = (not scripts and not vals.get("-f") and not vals.get("--file")
++                      and vals.get("-i") and all(v is None for v in vals["-i"])
++                      and "--in-place" not in seen and len(pos) >= 3
++                      and (pos[0] == "" or pos[0].startswith(".")))
++        if bsd_suffix:
++            # BSD sed (macOS): a BARE `-i` takes the backup suffix as the NEXT argument
++            # (`sed -i '' SCRIPT FILE`, `sed -i .bak SCRIPT FILE`), so the script is the second
++            # positional, not an operand (#1598: a script naming a closure path was refused as a
++            # closure write). Taken only on this shape: as a GNU script, `''` edits nothing and a
++            # dot-led one is a syntax error, so no GNU act that writes content reads this way.
++            scripts, operands = pos[1:2], pos[2:]
+         if not scripts:
+             scripts = pos[:1]
+         if any(_SED_WRITE.search(sc) for sc in scripts):
+diff --git a/hooks-gt/_shared/hestia_governance_closure.py b/hooks-gt/_shared/hestia_governance_closure.py
+--- a/hooks-gt/_shared/hestia_governance_closure.py
++++ b/hooks-gt/_shared/hestia_governance_closure.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 44ab6242455da28bb28d5b7537db14ddf6ae0a494cd9451503b078cd32b97e8e  (published ground truth; manifest: hooks-gt)
+ """hestia_governance_closure — ONE governance-access classifier for every harness shim.
+ 
+ PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
+@@ -1421,6 +1421,17 @@
+         _, pos, seen, vals = _parse_opts(args, *_SED)
+         scripts = vals.get("-e", []) + vals.get("--expression", [])
+         operands = pos if scripts else pos[1:]
++        bsd_suffix = (not scripts and not vals.get("-f") and not vals.get("--file")
++                      and vals.get("-i") and all(v is None for v in vals["-i"])
++                      and "--in-place" not in seen and len(pos) >= 3
++                      and (pos[0] == "" or pos[0].startswith(".")))
++        if bsd_suffix:
++            # BSD sed (macOS): a BARE `-i` takes the backup suffix as the NEXT argument
++            # (`sed -i '' SCRIPT FILE`, `sed -i .bak SCRIPT FILE`), so the script is the second
++            # positional, not an operand (#1598: a script naming a closure path was refused as a
++            # closure write). Taken only on this shape: as a GNU script, `''` edits nothing and a
++            # dot-led one is a syntax error, so no GNU act that writes content reads this way.
++            scripts, operands = pos[1:2], pos[2:]
+         if not scripts:
+             scripts = pos[:1]
+         if any(_SED_WRITE.search(sc) for sc in scripts):
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -17,7 +17,7 @@
+     },
+     {
+       "path": "hestia_governance_closure.py",
+-      "sha256": "41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2",
++      "sha256": "44ab6242455da28bb28d5b7537db14ddf6ae0a494cd9451503b078cd32b97e8e",
+       "source": "plugins/_shared/hestia_governance_closure.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538"
++  "gt_version": "7fb864491caab997f2deee1e4fd6098ee14419f0ba6a23de4debb51abfcb6340"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "7fb864491caab997f2deee1e4fd6098ee14419f0ba6a23de4debb51abfcb6340",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2"
++        "sha256": "44ab6242455da28bb28d5b7537db14ddf6ae0a494cd9451503b078cd32b97e8e"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "e0cb5326d0b3071e0c8a216f20ee87cf3e636adf1ac9fdcff6ef7b744065911a"
++  "gt_version": "3c88e6b91dc21257dac70274ff16078987cb535bedca309d020eed84ca1b76ef"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "7fb864491caab997f2deee1e4fd6098ee14419f0ba6a23de4debb51abfcb6340",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2"
++        "sha256": "44ab6242455da28bb28d5b7537db14ddf6ae0a494cd9451503b078cd32b97e8e"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "f8bf2a3cc826fb82358df2e5967effccba0940b00ba321202982418c79ffcfa6"
++  "gt_version": "ee4a7600614b76b9de6039d6b803b84a779c79a07e065736c2bb93f8d9216201"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "7fb864491caab997f2deee1e4fd6098ee14419f0ba6a23de4debb51abfcb6340",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2"
++        "sha256": "44ab6242455da28bb28d5b7537db14ddf6ae0a494cd9451503b078cd32b97e8e"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "d66f48fbaeeedbc1cbe20cbc251692633e1c58b6d07bd5ab1769309bca241be4"
++  "gt_version": "eefb986052281b012cfbd69bcc1d3951ba95494105ffd917f16db6438ffd102b"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,7 +33,7 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "7fb864491caab997f2deee1e4fd6098ee14419f0ba6a23de4debb51abfcb6340",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+@@ -45,7 +45,7 @@
+       },
+       {
+         "path": "hestia_governance_closure.py",
+-        "sha256": "41732bc102837da39118ab90c5fa091a0e032da35a85c74e1ca4700872d7c3e2"
++        "sha256": "44ab6242455da28bb28d5b7537db14ddf6ae0a494cd9451503b078cd32b97e8e"
+       },
+       {
+         "path": "hestia_shell_classifier.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "60a50827ea822861975251d46651a2c09c8a8b199c5dd5e0ee5b6f0c9f79255c"
++  "gt_version": "d722fa70aabbe492c93c0f9c21c08afa83534072c8c0645cb951b7d46fee7f82"
+ }
+diff --git a/tools/closure_bsd_sed_test.py b/tools/closure_bsd_sed_test.py
+new file mode 100755
+--- /dev/null
++++ b/tools/closure_bsd_sed_test.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""Closure: BSD `sed -i '' SCRIPT FILE` reads SCRIPT as the script, not an in-place operand (#1598).
++
++On macOS, BSD sed's `-i` takes the backup suffix as a SEPARATE argument (`sed -i '' s/a/b/ F`,
++`sed -i .bak s/a/b/ F`). The classifier parsed only the GNU form (suffix attached, `-i.bak`), so it read
++`''` as the script and the real script as a file edited in place. A script whose text names a closure
++path was refused as `gate.self_access` and opened an escalation (McNugget, 2026-11-14, 8af5057f7a77a15c).
++
++The BSD reading is taken only on its unambiguous shape: a BARE `-i`, no `-e` / `-f` script, at least three
++positionals, and a first positional that is empty or dot-led (a BSD suffix; as a GNU script, `''` edits
++nothing and `.bak` is a sed syntax error, so no GNU act is admitted that writes content).
++
++Run:  ./tools/closure_bsd_sed_test.py
++      HESTIA_CLOSURE_CORE=<path> ./tools/closure_bsd_sed_test.py   (a staged classifier)
++"""
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "plugins" / "_shared"))
++_staged = os.getenv("HESTIA_CLOSURE_CORE")
++if _staged:
++    _spec = importlib.util.spec_from_file_location("hestia_governance_closure", _staged)
++    C = importlib.util.module_from_spec(_spec)
++    sys.modules["hestia_governance_closure"] = C
++    _spec.loader.exec_module(C)
++else:
++    import hestia_governance_closure as C  # noqa: E402
++
++FAIL = []
++REPO = str(ROOT)
++GOV = f"{REPO}/plugins/_shared/hestia_gate_core.py"
++M = "/plugins/" + "_shared/x"
++OUT = "/private/tmp/x.py"
++
++
++def verdict(cmd):
++    return C.classify("Bash", {"command": cmd}, cwd=REPO).classification
++
++
++def row(name, cmd, want):
++    got = verdict(cmd)
++    # "not-write": `none` or `read` (a closure path named as text is a witnessed read, and allowed).
++    ok = got == "write" if want == "write" else got != "write"
++    print(("  ok    " if ok else "  FAIL  ") + f"{name}: {got}" + ("" if ok else f" (want {want})"))
++    if not ok:
++        FAIL.append(name)
++
++
++def main() -> int:
++    # ---- the false escalation: a BSD script naming a closure path, editing a file outside it ----
++    row("BSD -i '' with a closure path in the script", f"sed -i '' 's|a|{M}|' {OUT}", "not-write")
++    row("BSD -i .bak with a closure path in the script", f"sed -i .bak 's|a|{M}|' {OUT}", "not-write")
++    row("BSD -n -i '' (separate flags)", f"sed -n -i '' 's|a|{M}|p' {OUT}", "not-write")
++    row("BSD -i '' two files outside", f"sed -i '' 's|a|{M}|' {OUT} /private/tmp/y.py", "not-write")
++
++    # ---- must stay write ----
++    row("must write: BSD -i '' on a closure file", f"sed -i '' 's|a|b|' {GOV}", "write")
++    row("must write: BSD -i .bak on a closure file", f"sed -i .bak 's|a|b|' {GOV}", "write")
++    row("must write: BSD -i '' closure file second", f"sed -i '' 's|a|b|' {OUT} {GOV}", "write")
++    row("must write: GNU -i on a closure file", f"sed -i 's|a|b|' {GOV}", "write")
++    row("must write: GNU -i.bak attached", f"sed -i.bak 's|a|b|' {GOV}", "write")
++    row("must write: -i '' -e script on a closure file", f"sed -i '' -e 's|a|b|' {GOV}", "write")
++    row("must write: -i '' with only two positionals keeps the GNU reading", f"sed -i '' {GOV}", "write")
++    row("must write: a first positional that is not suffix-shaped keeps GNU", f"sed -i 's|a|b|' {GOV} {OUT}", "write")
++    row("must write: --in-place= with a closure file", f"sed --in-place=.bak 's|a|b|' {GOV}", "write")
++
++    print(f"\n{'FAIL' if FAIL else 'PASS'}: {len(FAIL)} failing")
++    return 1 if FAIL else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

@@ -1,0 +1,271 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -3599,7 +3599,14 @@
+             probe = _glob_probe(cand) if globbed else cand
+             if not _is_reach(probe.rstrip("*").rstrip("/") or "/"):
+                 continue
+-            if not os.path.lexists(os.path.dirname(probe.rstrip("*").rstrip("/")) or "/"):
++            # WHERE IT COULD NAME SOMETHING (#1317): a plain path when its parent exists; a glob
++            # only when its OWN directory does, since a glob expands inside that directory and a
++            # missing one leaves the word literal. Taking the dirname of a glob probe's `<dir>`
++            # climbed a level, so after `cd D &&` the event-cwd reading `<cwd>/tools/*` was refused
++            # while `<cwd>/tools` did not exist (McNugget, 2026-11-13 and 2026-11-16).
++            anchor = (probe[:-2] if globbed and probe.endswith("/*")
++                      else os.path.dirname(probe.rstrip("*").rstrip("/")))
++            if not os.path.lexists(anchor or "/"):
+                 continue
+             if cand == ws or cand.startswith(ws + "/"):
+                 seg = cand[len(ws):].lstrip("/").split("/", 1)[0]
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 63da54c047cbea9b6fe18c53b209aaa3f14f5468fe0f20fbdf069933b681442c  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -3600,7 +3600,14 @@
+             probe = _glob_probe(cand) if globbed else cand
+             if not _is_reach(probe.rstrip("*").rstrip("/") or "/"):
+                 continue
+-            if not os.path.lexists(os.path.dirname(probe.rstrip("*").rstrip("/")) or "/"):
++            # WHERE IT COULD NAME SOMETHING (#1317): a plain path when its parent exists; a glob
++            # only when its OWN directory does, since a glob expands inside that directory and a
++            # missing one leaves the word literal. Taking the dirname of a glob probe's `<dir>`
++            # climbed a level, so after `cd D &&` the event-cwd reading `<cwd>/tools/*` was refused
++            # while `<cwd>/tools` did not exist (McNugget, 2026-11-13 and 2026-11-16).
++            anchor = (probe[:-2] if globbed and probe.endswith("/*")
++                      else os.path.dirname(probe.rstrip("*").rstrip("/")))
++            if not os.path.lexists(anchor or "/"):
+                 continue
+             if cand == ws or cand.startswith(ws + "/"):
+                 seg = cand[len(ws):].lstrip("/").split("/", 1)[0]
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "63da54c047cbea9b6fe18c53b209aaa3f14f5468fe0f20fbdf069933b681442c",
++      "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "238c89e15d5b4a4b66440dc83068fe21c8b6d49161effc422afeb4fa525aedb2"
++  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "238c89e15d5b4a4b66440dc83068fe21c8b6d49161effc422afeb4fa525aedb2",
++    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "63da54c047cbea9b6fe18c53b209aaa3f14f5468fe0f20fbdf069933b681442c"
++        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "2e1461cf60938aec53456a4e4d35436502cc77b240c95dc0a766fc8af075e2a3"
++  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "238c89e15d5b4a4b66440dc83068fe21c8b6d49161effc422afeb4fa525aedb2",
++    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "63da54c047cbea9b6fe18c53b209aaa3f14f5468fe0f20fbdf069933b681442c"
++        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "4d3986e2ad63b84da2eb6f8eed667e9d80b695c42620510bcdc1a4c5763fa1ff"
++  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "238c89e15d5b4a4b66440dc83068fe21c8b6d49161effc422afeb4fa525aedb2",
++    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "63da54c047cbea9b6fe18c53b209aaa3f14f5468fe0f20fbdf069933b681442c"
++        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "165ee71511e1ac5817da77fe39361c7e026df630b890acb40d061c615ce41484"
++  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "238c89e15d5b4a4b66440dc83068fe21c8b6d49161effc422afeb4fa525aedb2",
++    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "63da54c047cbea9b6fe18c53b209aaa3f14f5468fe0f20fbdf069933b681442c"
++        "sha256": "e1ec416b229e30e8bae3e77b03b9726ae05254152a08ddfde3438137d52c5ecc"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "8c7ef52c479cb8683f425f2fcf59a04ae70e84edea634b206bb207b8a431fd0b"
++  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
+ }
+diff --git a/tools/gate_glob_after_cd_test.py b/tools/gate_glob_after_cd_test.py
+new file mode 100755
+--- /dev/null
++++ b/tools/gate_glob_after_cd_test.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""Command scope: an unquoted glob after `cd D &&` is judged where it expands (#1317, glob variant).
++
++McNugget 2026-11-13 and again 2026-11-16 (v0.3.0-118-g480279d3): `cd ~/repos/hestia && ls tools/*x*`
++was refused as `~/ai-workspace/tools/*`, the event cwd, and opened a peer-ruled scope request for a
++directory that does not exist. The same act with a plain relative path (`cat tools/x.py`) was allowed.
++
++The cause was one line in pass 3's relative vote. An interpretation is judged only if it could name
++something: a plain path when its PARENT exists. A glob's probe is `<dir>/*`, and stripping the `*`
++and taking the dirname climbed one level too far, so `<cwd>/tools/*` was judged because `<cwd>`
++exists although `<cwd>/tools` does not. A glob expands only inside its own directory; where that
++directory does not exist the shell passes the word through literally and nothing is reached, which
++is the same reasoning the plain-path rule already uses.
++
++Run:  ./tools/gate_glob_after_cd_test.py
++      HESTIA_SCOPE_BATTERY_CORE=<path> ./tools/gate_glob_after_cd_test.py   (a staged core)
++"""
++from __future__ import annotations
++
++import importlib.util
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "plugins" / "_shared"))
++_staged = os.getenv("HESTIA_SCOPE_BATTERY_CORE")
++if _staged:
++    _spec = importlib.util.spec_from_file_location("hestia_gate_core", _staged)
++    G = importlib.util.module_from_spec(_spec)
++    sys.modules["hestia_gate_core"] = G
++    _spec.loader.exec_module(G)
++else:
++    import hestia_gate_core as G  # noqa: E402
++
++FAIL = []
++
++
++def check(name, cond, detail=""):
++    print(("  ok    " if cond else "  FAIL  ") + name + ("" if cond else f"  {detail}"))
++    if not cond:
++        FAIL.append(name)
++
++
++def main() -> int:
++    ws = os.path.realpath(tempfile.mkdtemp(prefix="ws-"))
++    launch = os.path.realpath(tempfile.mkdtemp(prefix="launch-"))   # the event cwd: outside ws, ungranted
++    out = os.path.realpath(tempfile.mkdtemp(prefix="outside-"))     # an outside directory that exists
++    os.makedirs(f"{ws}/granted/tools/sub")
++    open(f"{ws}/granted/tools/a_store.py", "w").close()
++    os.makedirs(f"{launch}/secret")
++    open(f"{launch}/secret/k", "w").close()
++    open(f"{out}/f", "w").close()
++    # A `path:` grant, as every live seat holds them (McNugget's are all `path:<abs>/**`). A bare
++    # segment grant ("granted") would put the repo root among the vote's bases, and that
++    # interpretation would vote the glob in scope and hide the defect.
++    scopes = (f"path:{ws}/granted/**",)
++    # Temp-root admission off (as grant_modes_gate_test._Workspace does): every directory here is a
++    # mkdtemp, and path_in_scope admits anything under a temp root before it consults grants, which
++    # would make the event-cwd rows pass for the wrong reason.
++    G._under_temp_root = lambda *a, **k: False
++
++    def reach(c):
++        return G.command_scope_reach(c, scopes, ws, cwd=launch)
++
++    # ---- the #1317 act: the glob expands under the cd target, which is granted ----
++    ok, off, _ = reach(f"cd {ws}/granted && ls tools/*store*")
++    check("cd <granted> && ls tools/*x*: allowed (the #1317 act)", ok, off)
++    ok, off, _ = reach(f"cd {ws}/granted && ls tools/*")
++    check("a bare dir/* under the cd target: allowed", ok, off)
++    ok, off, _ = reach(f"cd {ws}/granted && ls tools/sub/*.py")
++    check("a deeper glob under the cd target: allowed", ok, off)
++    ok, off, _ = reach(f"cd {ws}/granted && git status && cd {ws}/granted/tools && ls sub/*")
++    check("a later && cd governs the glob too (the 11-13 shape)", ok, off)
++
++    # ---- controls that already passed ----
++    ok, off, _ = reach(f"cd {ws}/granted && cat tools/a_store.py")
++    check("control: a plain relative path under the cd target", ok, off)
++    ok, off, _ = reach(f"ls {ws}/granted/tools/*")
++    check("control: an absolute glob inside the grant", ok, off)
++
++    # ---- must still refuse ----
++    ok, off, _ = reach(f"cd {ws}/granted && ls ../../{os.path.basename(out)}/*")
++    check("must deny: a glob that climbs out of the cd target to an existing outside dir", not ok, off)
++    ok, off, _ = reach("ls secret/*")
++    check("must deny: a glob whose directory EXISTS at the event cwd, with no cd", not ok, off)
++    ok, off, _ = reach(f"ls {out}/*")
++    check("must deny: an absolute glob outside the grant", not ok, off)
++    ok, off, _ = reach(f"cd {ws}/granted && cat ../../{os.path.basename(out)}/f")
++    check("must deny: a plain relative escape from the cd target", not ok, off)
++
++    # ---- under a bare segment grant the repo root also votes; a glob it does not hold no longer
++    # votes in scope for a directory that exists only at the event cwd (a tightening) ----
++    seg = G.command_scope_reach("ls secret/*", ("granted",), ws, cwd=launch)
++    check("must deny (segment grant): a glob whose dir exists only at the event cwd", not seg[0], seg[1])
++    seg = G.command_scope_reach(f"cd {ws}/granted && ls tools/*", ("granted",), ws, cwd=launch)
++    check("segment grant: the cd-then-glob act is still allowed", seg[0], seg[1])
++
++    print()
++    print("PASS: 0 failing" if not FAIL else f"FAIL: {len(FAIL)} failing")
++    return 1 if FAIL else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
