@@ -949,17 +949,20 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
     // real connect also re-checks. Both are reads.
     let found = match state.published().sessions.find_reuse(&plugin_id, &host_session_id) {
         Some(id) => Some((id.session_id, id.soft_lct.clone(), id.assigned_role.clone(),
-                          id.constellation_role.clone(), id.role_basis.clone())),
+                          id.constellation_role.clone(), id.role_basis.clone(),
+                          id.identity_basis, id.canonical_principal.clone())),
         None => {
             let s = state.lock().await;
             s.sessions
                 .find_reuse_id(&plugin_id, &host_session_id)
                 .and_then(|id| s.sessions.get(&id))
                 .map(|e| (e.session_id, e.soft_lct.clone(), e.assigned_role.clone(),
-                          e.constellation_role.clone(), e.role_basis.clone()))
+                          e.constellation_role.clone(), e.role_basis.clone(),
+                          e.identity_basis, e.canonical_principal.clone()))
         }
     };
-    let Some((session_id, soft_lct, assigned_role, constellation_role, role_basis)) = found else {
+    let Some((session_id, soft_lct, assigned_role, constellation_role, role_basis,
+              identity_basis, canonical_principal)) = found else {
         return Ok(hestia_error_envelope(
             "hestia.connect_dry_run_no_session",
             "no live session for this (plugin_id, host_session_id): a real connect would mint \
@@ -975,6 +978,8 @@ async fn tool_connect_dry_run(state: &SharedState, args: &Value) -> ToolResult {
         "constellationRole": constellation_role,
         "roleDeclarationHonored": !declared_role.is_empty() && declared_role == constellation_role,
         "roleBasis": role_basis,
+        "identityBasis": identity_basis,
+        "canonicalPrincipal": canonical_principal,
         "gateCapabilityReportAccepted": false,
         "protocolVersion": 1,
         "reused": true,
@@ -1109,6 +1114,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "identityBasis": existing.identity_basis,
+                "canonicalPrincipal": existing.canonical_principal,
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
@@ -1153,6 +1160,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
                 "constellationRole": existing.constellation_role,
                 "roleDeclarationHonored": honored,
                 "roleBasis": existing.role_basis,
+                "identityBasis": existing.identity_basis,
+                "canonicalPrincipal": existing.canonical_principal,
                 "gateCapabilityReportAccepted": gate_capability_report_accepted,
                 "protocolVersion": 1,
                 "reused": true,
@@ -1179,6 +1188,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         assigned_role: requested_role.clone(),
         constellation_role: constellation_role.clone(),
         role_basis,
+        identity_basis: crate::server::state::IdentityBasis::Asserted,
+        canonical_principal: None,
         soft_lct: soft_lct.clone(),
         connected_at: Utc::now(),
         host_session_id,
@@ -1261,6 +1272,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
     // and a later policy change can't silently split them.
     let assigned_role = s.sessions[&session_id].assigned_role.clone();
     let role_basis = s.sessions[&session_id].role_basis.clone();
+    let identity_basis = s.sessions[&session_id].identity_basis;
+    let canonical_principal = s.sessions[&session_id].canonical_principal.clone();
 
     // session_started is intentionally NOT written to the witness chain.
     // Sessions are RAM-only by design (transport artifacts); every hook
@@ -1275,6 +1288,8 @@ pub(crate) async fn tool_connect(state: &SharedState, args: &Value) -> ToolResul
         "softLct": soft_lct,
         "assignedRole": assigned_role,
         "constellationRole": constellation_role,
+        "identityBasis": identity_basis,
+        "canonicalPrincipal": canonical_principal,
         "roleDeclarationHonored": role_declaration_honored,
         "roleBasis": role_basis,
         "gateCapabilityReportAccepted": gate_capability_report_accepted,
@@ -9382,6 +9397,8 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         return Ok(json!({ "total": 0, "secrets": [], "note": "no hub connection" }));
     };
 
+    let rest_endpoint = crate::hub::absolute_rest_endpoint(&conn.url, &conn.rest_endpoint)?;
+
     // Member identity keypair — same load path as tool_inbox.
     let secret_hex = s
         .vault
@@ -9402,7 +9419,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
     for p in &snapshot {
         // Need the (active) pair detail for the peer ephemeral; skip inactive pairs.
         let detail = match client
-            .get_pair(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id)
+            .get_pair(&rest_endpoint, conn.hub_lct_id, p.pair_id)
             .await
         {
             Ok(d) if d.is_active() => d,
@@ -9414,7 +9431,7 @@ async fn tool_pair_inbox(state: &SharedState, args: &Value) -> ToolResult {
         };
         let since = pairings.cursor(&p.pair_id);
         let msgs = match client
-            .get_pair_messages(&conn.rest_endpoint, conn.hub_lct_id, p.pair_id, since)
+            .get_pair_messages(&rest_endpoint, conn.hub_lct_id, p.pair_id, since)
             .await
         {
             Ok(m) => m,
@@ -12521,6 +12538,8 @@ mod inbox_tests {
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -12701,6 +12720,8 @@ mod inbox_tests {
                     assigned_role: "citizen".into(),
                     constellation_role: "role:constellation:mesh-worker".into(),
                     role_basis: None,
+                    identity_basis: crate::server::state::IdentityBasis::Asserted,
+                    canonical_principal: None,
                     soft_lct: "lct:test".into(),
                     connected_at: chrono::Utc::now(),
                     host_session_id: None,
@@ -15750,6 +15771,8 @@ mod tests {
                 assigned_role: "citizen".into(),
                 constellation_role: role.into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: "lct:test".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
@@ -16084,6 +16107,42 @@ mod tests {
         assert_eq!(s.sessions.len(), 2, "one session per (member, host session)");
         assert!(s.sessions.values().any(|session| session.plugin_id == "victim"));
         assert!(s.sessions.values().any(|session| session.plugin_id == "other-member"));
+    }
+
+    /// #824 stage A: the identity basis is explicit metadata, never a caller-selected
+    /// upgrade. Current sessions are asserted/A1, and Guard-A reuse cannot change that fact.
+    #[tokio::test]
+    async fn connect_labels_legacy_identity_basis_asserted_and_reuse_does_not_upgrade() {
+        let (_dir, shared) = make_shared_state();
+        let fresh = tool_connect(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(fresh["identityBasis"], "asserted");
+        assert!(fresh["canonicalPrincipal"].is_null());
+        let session_id = fresh["sessionId"].as_str().unwrap();
+        {
+            let s = shared.lock().await;
+            let stored = &s.sessions[&Uuid::parse_str(session_id).unwrap()];
+            assert_eq!(stored.identity_basis, crate::server::state::IdentityBasis::Asserted);
+            assert_eq!(stored.canonical_principal, None);
+        }
+
+        let reused = tool_connect(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(reused["reused"], true);
+        assert_eq!(reused["sessionId"], session_id);
+        assert_eq!(reused["identityBasis"], "asserted");
+        assert!(reused["canonicalPrincipal"].is_null());
+
+        let dry = tool_connect_dry_run(&shared, &json!({
+            "plugin_id": "legacy-member", "host_agent": "legacy-harness",
+            "host_session_id": "legacy-wake",
+        })).await.unwrap();
+        assert_eq!(dry["identityBasis"], "asserted");
+        assert!(dry["canonicalPrincipal"].is_null());
     }
 
     /// The declared constellation role must be READABLE BACK. Before this, a member
@@ -21708,6 +21767,8 @@ mod open_appeals_tests {
                     assigned_role: "citizen".into(),
                     constellation_role: crate::reputation::DEFAULT_CONSTELLATION_ROLE.into(),
                     role_basis: None,
+                    identity_basis: crate::server::state::IdentityBasis::Asserted,
+                    canonical_principal: None,
                     soft_lct: format!("lct:{m}"),
                     connected_at: Utc::now(),
                     host_session_id: None,
@@ -22791,6 +22852,8 @@ mod appeal_tests {
                 assigned_role: "citizen".into(),
                 constellation_role: APPELLANT_ROLE.into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: format!("lct:test:{plugin_id}"),
                 connected_at: chrono::Utc::now(),
                 host_session_id: None,
@@ -24667,6 +24730,8 @@ mod vault_hst001_tests {
             assigned_role: "citizen".into(),
             constellation_role: "role:constellation:member".into(),
             role_basis: None,
+            identity_basis: crate::server::state::IdentityBasis::Asserted,
+            canonical_principal: None,
             soft_lct: format!("lct:test:{plugin_id}"),
             connected_at: chrono::Utc::now(),
             host_session_id: None,
@@ -24945,6 +25010,34 @@ mod authority_attribution_tests {
             format!("{r}").contains("pair_inbox_unattributed"),
             "an unattributed paired-channel drain must be refused: {r}"
         );
+    }
+
+    #[tokio::test]
+    async fn pair_inbox_rejects_a_cross_origin_stored_endpoint_before_dialing() {
+        let (dir, _) = seeded_home();
+        let state = open_state(&dir);
+        let sid = seat_session(&state, "bystander-member").await;
+        {
+            let mut s = state.lock().await;
+            let mut store = crate::hub::HubStore::default();
+            store.connections.push(crate::hub::HubConnection {
+                id: Uuid::new_v4(),
+                url: "https://hub.example".into(),
+                hub_lct_id: Uuid::new_v4(),
+                our_lct_id: Uuid::new_v4(),
+                connected_at: Utc::now(),
+                last_seen: None,
+                api_version: "v1".into(),
+                rest_endpoint: "https://evil.example/v1".into(),
+                hubs_joined: vec![],
+                member_key_source: crate::hub::MemberKeySource::VaultIdentity,
+            });
+            store.save(&mut s.vault).unwrap();
+        }
+        let err = tool_pair_inbox(&state, &json!({"session_id": sid.to_string()}))
+            .await
+            .expect_err("a stored cross-origin endpoint must be refused before dialing");
+        assert!(err.to_string().contains("cross-origin discovery endpoint refused"), "{err}");
     }
 
     /// The fifth site, caught in review of this PR's own "zero call sites" claim:
