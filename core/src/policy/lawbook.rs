@@ -458,6 +458,30 @@ pub fn corpus_coverage(lawbook: &LocalLawbook, cases: &[LocalCase<'_>]) -> Vec<I
     }).collect()
 }
 
+/// Advisory witness that a role overlay may loosen its base.
+///
+/// The engine sorts by priority (lower first) and the first match wins, so an
+/// overlay can widen a base in more ways than relaxing a rule in place. This
+/// check reports:
+///
+/// 1. an overlay default less strict than the base default;
+/// 2. a same-id rule whose decision is less severe;
+/// 3. a same-id rule that keeps its decision but changes its matcher or its
+///    priority — reported as *not checked*, because whether the new matcher
+///    covers less (for a strict rule) or more (for a permissive one) is not
+///    decided here;
+/// 4. a rule the base does not have that *may outrank* a stricter base rule
+///    (it is evaluated at or before that rule's priority; an equal priority is
+///    a tie broken by config order), or that is less strict than the base
+///    default it would pre-empt.
+///
+/// (3) and (4) are conservative: matcher overlap is not decided, so they can
+/// fire on an overlay that is in fact disjoint from the stricter rule. They
+/// never stay silent on the shape, which is the point of a witness.
+///
+/// NOT checked: a base rule that is absent from the overlay. Whether that is a
+/// removal depends on whether the overlay replaces the base or is layered on
+/// it, and this module does not define that composition.
 pub fn overlay_widening(base: &LocalLawbook, overlay: &LocalLawbook) -> Vec<IntegrityFinding> {
     let mut findings = Vec::new();
     if overlay.default_policy.severity() < base.default_policy.severity() {
@@ -473,7 +497,33 @@ pub fn overlay_widening(base: &LocalLawbook, overlay: &LocalLawbook) -> Vec<Inte
                     IntegrityWitness::RoleOverlayWidensBase,
                     format!("{}: overlay relaxes {:?} to {:?}", overlay_rule.rule_id, base_rule.decision, overlay_rule.decision),
                 ));
+            } else if overlay_rule.r#match != base_rule.r#match || overlay_rule.priority != base_rule.priority {
+                findings.push(IntegrityFinding::advisory(
+                    IntegrityWitness::RoleOverlayWidensBase,
+                    format!(
+                        "{}: overlay changes the matcher or priority of a base rule; whether that widens the base was not checked",
+                        overlay_rule.rule_id
+                    ),
+                ));
             }
+            continue;
+        }
+        let severity = overlay_rule.decision.severity();
+        let mut outranked: Vec<String> = base.rules.iter()
+            .filter(|rule| rule.priority >= overlay_rule.priority && rule.decision.severity() > severity)
+            .map(|rule| format!("{} ({:?}, priority {})", rule.rule_id, rule.decision, rule.priority))
+            .collect();
+        if base.default_policy.severity() > severity {
+            outranked.push(format!("the base default ({:?})", base.default_policy));
+        }
+        if !outranked.is_empty() {
+            findings.push(IntegrityFinding::advisory(
+                IntegrityWitness::RoleOverlayWidensBase,
+                format!(
+                    "{}: new overlay rule ({:?}, priority {}) may outrank stricter base law: {}; matcher overlap was not decided",
+                    overlay_rule.rule_id, overlay_rule.decision, overlay_rule.priority, outranked.join(", ")
+                ),
+            ));
         }
     }
     findings
@@ -831,6 +881,136 @@ mod tests {
         let mut overlay = local_book();
         overlay.rules[2].decision = PolicyDecision::Allow;
         assert!(overlay_widening(&book, &overlay).iter().any(|finding| finding.witness == IntegrityWitness::RoleOverlayWidensBase));
+    }
+
+    fn overlay_rule(id: &str, priority: i32, decision: PolicyDecision) -> LocalRule {
+        LocalRule {
+            rule_id: id.into(),
+            rule_version: "1.0.0".into(),
+            name: id.into(),
+            priority,
+            decision,
+            reason: None,
+            r#match: PolicyMatch {
+                tools: Some(vec!["Bash".into()]),
+                command_patterns: Some(vec![r"rm\s".into()]),
+                command_patterns_are_regex: true,
+                ..Default::default()
+            },
+            resolution: None,
+        }
+    }
+
+    fn widening(findings: &[IntegrityFinding]) -> Vec<&str> {
+        findings.iter()
+            .filter(|finding| finding.witness == IntegrityWitness::RoleOverlayWidensBase)
+            .map(|finding| finding.evidence.as_str())
+            .collect()
+    }
+
+    /// mcnugget-claude's hold on #1695: the engine is priority-ordered and
+    /// first-match-wins, so the usual way to widen a base is to ADD a rule that
+    /// is evaluated before a stricter base rule. The shipped preset does this on
+    /// purpose (`allow-rm-whitelisted-scratch` at 0 carves
+    /// `deny-destructive-commands` at 1). A new-id rule used to yield no finding.
+    #[test]
+    fn a_new_overlay_rule_that_may_outrank_a_stricter_base_rule_is_a_widening_witness() {
+        let preset = super::super::presets::get_preset("safety").unwrap();
+        let base = LocalLawbook::from_policy_config(
+            provenance(AuthorityDomain::LocalOperator), &preset.config, "1.0.0",
+        ).unwrap();
+        let mut overlay = base.clone();
+        overlay.provenance.authority_domain = AuthorityDomain::RoleOverlay;
+        overlay.rules.push(overlay_rule("allow-rm-anywhere", 0, PolicyDecision::Allow));
+
+        // The widening is real, not hypothetical: the overlay turns a Deny into an Allow.
+        let action = PolicyAction {
+            tool_name: "Bash",
+            category: "shell",
+            target: Some("rm -rf /var/data"),
+            full_command: Some("rm -rf /var/data"),
+        };
+        let before = PolicyEngine::new(base.compile().unwrap().config).evaluate(&action);
+        assert_eq!(before.decision, PolicyDecision::Deny);
+        let mut widened = overlay.compile().unwrap().config;
+        // Put the overlay rule first so the equal-priority tie resolves its way.
+        widened.rules.rotate_right(1);
+        let after = PolicyEngine::new(widened).evaluate(&action);
+        assert_eq!(after.decision, PolicyDecision::Allow);
+        assert_eq!(after.rule_id.as_deref(), Some("allow-rm-anywhere"));
+
+        let findings = overlay_widening(&base, &overlay);
+        let evidence = widening(&findings);
+        assert!(
+            evidence.iter().any(|text| text.contains("allow-rm-anywhere") && text.contains("deny-destructive-commands")),
+            "a new priority-0 Allow over the safety preset must be a widening witness, got {evidence:?}"
+        );
+        assert!(findings.iter().all(|finding| finding.severity == WitnessSeverity::Advisory));
+    }
+
+    /// Negative controls: the new arm must not fire on additions that cannot widen.
+    #[test]
+    fn overlay_additions_that_cannot_outrank_a_stricter_base_rule_are_not_widening() {
+        let base = local_book(); // default Allow; Deny@10, Deny@20, Warn@30
+
+        // A new Deny evaluated first only tightens.
+        let mut tighter = base.clone();
+        tighter.rules.push(overlay_rule("deny-rm", 0, PolicyDecision::Deny));
+        assert!(widening(&overlay_widening(&base, &tighter)).is_empty());
+
+        // A new Allow evaluated after every stricter base rule, under an Allow default.
+        let mut late = base.clone();
+        late.rules.push(overlay_rule("allow-rm-late", 31, PolicyDecision::Allow));
+        assert!(widening(&overlay_widening(&base, &late)).is_empty());
+
+        // A new Warn between the Denies and the Warn outranks nothing stricter.
+        let mut warn = base.clone();
+        warn.rules.push(overlay_rule("warn-rm", 25, PolicyDecision::Warn));
+        assert!(widening(&overlay_widening(&base, &warn)).is_empty());
+
+        // Boundary: equal priority is a tie the engine breaks by config order, so it counts.
+        let mut tie = base.clone();
+        tie.rules.push(overlay_rule("allow-rm-tie", 30, PolicyDecision::Allow));
+        let tie_findings = overlay_widening(&base, &tie);
+        let evidence = widening(&tie_findings);
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert!(evidence[0].contains("allow-rm-tie") && evidence[0].contains("warn-network"));
+        assert!(!evidence[0].contains("deny-credential-read"), "priority 20 is evaluated first: {evidence:?}");
+    }
+
+    /// A new rule that outranks no base rule still widens when it is less strict
+    /// than the default the action would otherwise have reached.
+    #[test]
+    fn a_new_overlay_rule_less_strict_than_the_base_default_is_a_widening_witness() {
+        let mut base = local_book();
+        base.default_policy = PolicyDecision::Deny;
+        let mut overlay = base.clone();
+        overlay.rules.push(overlay_rule("allow-rm-late", 99, PolicyDecision::Allow));
+        let findings = overlay_widening(&base, &overlay);
+        let evidence = widening(&findings);
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert!(evidence[0].contains("allow-rm-late") && evidence[0].contains("base default"));
+    }
+
+    /// A same-id rule that keeps its decision can still widen by moving in the
+    /// order or by changing what it matches. Matcher containment is not decided
+    /// here, so the report must say "not checked" rather than stay silent.
+    #[test]
+    fn a_same_id_overlay_rule_with_a_changed_matcher_or_priority_is_reported_as_unchecked() {
+        let base = local_book();
+        let mut narrowed = base.clone();
+        narrowed.rules[0].r#match.command_patterns = Some(vec![r"rm\s+-rf\s+/$".into()]);
+        let narrowed_findings = overlay_widening(&base, &narrowed);
+        let evidence = widening(&narrowed_findings);
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert!(evidence[0].contains("deny-destructive-shell") && evidence[0].contains("not checked"));
+
+        let mut moved = base.clone();
+        moved.rules[2].priority = 5;
+        let moved_findings = overlay_widening(&base, &moved);
+        let evidence = widening(&moved_findings);
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert!(evidence[0].contains("warn-network") && evidence[0].contains("not checked"));
     }
 
     #[test]
