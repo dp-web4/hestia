@@ -1235,7 +1235,7 @@ def test_a_forbidden_token_inside_a_longer_word_is_pinned_open():
     # THE RED ARMS. A narrowing that greens the rows above and ANY of these is a hole, not a
     # fix: each names a real secret, and only the first carries a leading separator.
     for name, cmd in (
-        ("absolute_path", "cat /home/dp/" + tok),
+        ("absolute_path", "cat /home/member/" + tok),
         ("bare_filename_at_word_start", "cat " + tok),
         ("relative_path", "cat ../service/" + tok),
         ("dotted_suffix", "cat " + tok + ".production"),

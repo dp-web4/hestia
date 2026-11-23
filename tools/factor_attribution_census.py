@@ -42,7 +42,9 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime
 
-TERMINAL = ("gate_escalation_decided", "gate_escalation_expired", "gate_escalation_withdrawn")
+from chain_walk import ESCALATION_TERMINAL_EVENTS
+
+TERMINAL = ESCALATION_TERMINAL_EVENTS
 
 
 def ts(e):

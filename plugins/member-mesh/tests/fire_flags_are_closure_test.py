@@ -22,7 +22,7 @@ import hestia_governance_closure as g  # noqa: E402
 
 FLOOR = g.LITERAL_FLOOR
 _CWD = tempfile.mkdtemp(prefix="fire-flags-closure-")
-HH = "/home/someone/.hestia"
+HH = "/home/member/.hestia"
 FLAG = HH + "/mesh-fire.d/claude-code"
 
 

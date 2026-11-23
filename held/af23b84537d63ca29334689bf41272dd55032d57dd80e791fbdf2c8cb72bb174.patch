@@ -1,0 +1,233 @@
+diff --git a/plugins/_shared/hestia_gate_core.py b/plugins/_shared/hestia_gate_core.py
+--- a/plugins/_shared/hestia_gate_core.py
++++ b/plugins/_shared/hestia_gate_core.py
+@@ -3027,9 +3027,28 @@
+                 continue
+             run = re.match(r"-[A-Za-z0-9]+", w) if not w.startswith("--") and len(w) > 2 else None
+             valued = spec.get("file_opts", set()) | spec.get("value_opts", set())
+-            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued), None) if run else None
++            # Pattern and delimiter options only: string options are head-wide and some are booleans in
++            # another subcommand (`git checkout -m`), so a cluster ending in one keeps the old scan.
++            worded = spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
++            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued | worded), None) if run else None
+             if fat is not None and head == "sed" and "i" in w[1:fat]:
+                 fat = None          # GNU `sed -if S`: `-i` takes the rest as its backup suffix
++            if fat is not None and "-" + w[fat] in worded:
++                # A clustered option whose value is TEXT (`grep -nefoo`: `-e` takes `foo`, #1560): getopt
++                # hands it the rest of the word, or the next word, so the letters after it are its value,
++                # not options (before this the scan went on and judged `oo` as a `-f` program file). Its
++                # value is skipped as the attached spelling's is (`-efoo`), unless it carries an unquoted
++                # glob the shell expands. A pattern option still means every operand is a file.
++                opt = "-" + w[fat]
++                if opt in spec.get("pattern_opts", ()):
++                    state["pattern_given"] = True
++                if fat == len(w) - 1:
++                    state["pending"] = opt
++                elif uglob:
++                    emit(w[fat + 1:], uglob)
++                elif opt in spec.get("pattern_opts", ()):
++                    pattern(w[fat + 1:], judge=False)
++                continue
+             if fat is not None:
+                 # A clustered option that takes a value (`grep -rf P`, `grep -nfP`, `jq -rf F`,
+                 # `jq -nL DIR`): getopt reads the letters before it as flags and hands it the rest of
+diff --git a/hooks-gt/_shared/hestia_gate_core.py b/hooks-gt/_shared/hestia_gate_core.py
+--- a/hooks-gt/_shared/hestia_gate_core.py
++++ b/hooks-gt/_shared/hestia_gate_core.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-# hestia-gt-sha256: 8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: f2c7ea5e8cc2800459613d8f29b9d5e4d874c535b31ec76292fe3c793829ae96  (published ground truth; manifest: hooks-gt)
+ """hestia_gate_core — ONE policy gate. Harnesses get adapter shims, not their own gates.
+ 
+ dp, 2026-08-02:
+@@ -3028,9 +3028,28 @@
+                 continue
+             run = re.match(r"-[A-Za-z0-9]+", w) if not w.startswith("--") and len(w) > 2 else None
+             valued = spec.get("file_opts", set()) | spec.get("value_opts", set())
+-            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued), None) if run else None
++            # Pattern and delimiter options only: string options are head-wide and some are booleans in
++            # another subcommand (`git checkout -m`), so a cluster ending in one keeps the old scan.
++            worded = spec.get("delim_opts", set()) | spec.get("pattern_opts", set())
++            fat = next((k for k in range(1, run.end()) if "-" + w[k] in valued | worded), None) if run else None
+             if fat is not None and head == "sed" and "i" in w[1:fat]:
+                 fat = None          # GNU `sed -if S`: `-i` takes the rest as its backup suffix
++            if fat is not None and "-" + w[fat] in worded:
++                # A clustered option whose value is TEXT (`grep -nefoo`: `-e` takes `foo`, #1560): getopt
++                # hands it the rest of the word, or the next word, so the letters after it are its value,
++                # not options (before this the scan went on and judged `oo` as a `-f` program file). Its
++                # value is skipped as the attached spelling's is (`-efoo`), unless it carries an unquoted
++                # glob the shell expands. A pattern option still means every operand is a file.
++                opt = "-" + w[fat]
++                if opt in spec.get("pattern_opts", ()):
++                    state["pattern_given"] = True
++                if fat == len(w) - 1:
++                    state["pending"] = opt
++                elif uglob:
++                    emit(w[fat + 1:], uglob)
++                elif opt in spec.get("pattern_opts", ()):
++                    pattern(w[fat + 1:], judge=False)
++                continue
+             if fat is not None:
+                 # A clustered option that takes a value (`grep -rf P`, `grep -nfP`, `jq -rf F`,
+                 # `jq -nL DIR`): getopt reads the letters before it as flags and hands it the rest of
+diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
+--- a/hooks-gt/_shared/manifest.json
++++ b/hooks-gt/_shared/manifest.json
+@@ -7,7 +7,7 @@
+   "files": [
+     {
+       "path": "hestia_gate_core.py",
+-      "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b",
++      "sha256": "f2c7ea5e8cc2800459613d8f29b9d5e4d874c535b31ec76292fe3c793829ae96",
+       "source": "plugins/_shared/hestia_gate_core.py"
+     },
+     {
+@@ -38,5 +38,5 @@
+   ],
+   "engine": null,
+   "requires": [],
+-  "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538"
++  "gt_version": "ceee418561b1a1db5db14b3438c047fae080847594673b9d2c7ec5c304ce739e"
+ }
+diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
+--- a/hooks-gt/claude-code/manifest.json
++++ b/hooks-gt/claude-code/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "ceee418561b1a1db5db14b3438c047fae080847594673b9d2c7ec5c304ce739e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
++        "sha256": "f2c7ea5e8cc2800459613d8f29b9d5e4d874c535b31ec76292fe3c793829ae96"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "e0cb5326d0b3071e0c8a216f20ee87cf3e636adf1ac9fdcff6ef7b744065911a"
++  "gt_version": "b32eb968d7fc0226362db4dea8f0ecd06c1dc8129477a172749638e08247e37d"
+ }
+diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
+--- a/hooks-gt/codex/manifest.json
++++ b/hooks-gt/codex/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "ceee418561b1a1db5db14b3438c047fae080847594673b9d2c7ec5c304ce739e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
++        "sha256": "f2c7ea5e8cc2800459613d8f29b9d5e4d874c535b31ec76292fe3c793829ae96"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "f8bf2a3cc826fb82358df2e5967effccba0940b00ba321202982418c79ffcfa6"
++  "gt_version": "75aa7654e0b437f0553e2d678cf2560db479aecb6f7e012aeb47eddef27466d2"
+ }
+diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
+--- a/hooks-gt/gemini/manifest.json
++++ b/hooks-gt/gemini/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "ceee418561b1a1db5db14b3438c047fae080847594673b9d2c7ec5c304ce739e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
++        "sha256": "f2c7ea5e8cc2800459613d8f29b9d5e4d874c535b31ec76292fe3c793829ae96"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -62,5 +62,5 @@
+     ]
+   },
+   "requires": [],
+-  "gt_version": "d66f48fbaeeedbc1cbe20cbc251692633e1c58b6d07bd5ab1769309bca241be4"
++  "gt_version": "63e303dea1c13f149b0acaa7f8d632c32debc940bf1a08cec7e3cb4d01f20556"
+ }
+diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
+--- a/hooks-gt/kimi/manifest.json
++++ b/hooks-gt/kimi/manifest.json
+@@ -33,11 +33,11 @@
+   ],
+   "engine": {
+     "unit": "_shared",
+-    "gt_version": "196163f333904c26d9f285c8370debcbeea5d0098913edc2df09d7fd92a4f538",
++    "gt_version": "ceee418561b1a1db5db14b3438c047fae080847594673b9d2c7ec5c304ce739e",
+     "files": [
+       {
+         "path": "hestia_gate_core.py",
+-        "sha256": "8303739de9ed162f9341ab3249ab851fada80877d89604e37842e15795a6cd4b"
++        "sha256": "f2c7ea5e8cc2800459613d8f29b9d5e4d874c535b31ec76292fe3c793829ae96"
+       },
+       {
+         "path": "hestia_gate_mechanism.py",
+@@ -78,5 +78,5 @@
+       "sha256": "8eae8260507188bc1d2179df0718da4a1687a759a252fc6d8363f2c37b792205"
+     }
+   ],
+-  "gt_version": "60a50827ea822861975251d46651a2c09c8a8b199c5dd5e0ee5b6f0c9f79255c"
++  "gt_version": "5482d2b8c4de571701dbd04df53426a0affb766724b54b7a55c703384d658463"
+ }
+diff --git a/tools/gate_false_deny_test.py b/tools/gate_false_deny_test.py
+--- a/tools/gate_false_deny_test.py
++++ b/tools/gate_false_deny_test.py
+@@ -10,6 +10,9 @@
+ 3. Found while measuring: with the program from a FILE (`grep -f`, `sed -f`, `awk -f`, `jq -f`, and
+    clustered as `-rf`), the first operand was still taken as the pattern and never judged, so
+    `grep -f P /outside` passed.
++4. #1560 (legion-claude's #1550 v2 review): the cluster rule went on scanning past a letter whose value
++   is text, so in `grep -nefoo FILE` the `f` inside `-e`'s pattern `foo` was read as `-f` and `oo`
++   judged as a program file. The first text-valued letter now owns the rest of the word.
+ 
+ Every FALSE row below fails on main's core; every DENY row passes on both. Strings only: nothing
+ here opens a file it names. No forbidden token is spelled in this source (tools/marker_bar_probe.py's
+@@ -105,11 +108,31 @@
+     ("jq -L/DIR attached outside", "jq -n -L/etc 'include \"x\"; .'"),
+     ("jq -nL clustered outside", "jq -nL /etc 'include \"x\"; .'"),
+     ("jq -nL/DIR clustered attached", "jq -nL/etc 'include \"x\"; .'"),
++    # #1560: a clustered PATTERN letter owns the rest of the word; every operand is still a file
++    ("grep -nefoo, outside data", "grep -nefoo " + OUTSIDE),
++    ("grep -ne PAT, outside data", "grep -ne foo " + OUTSIDE),
++    ("grep -nef: `f` is -e's pattern, outside data", "grep -nef " + OUTSIDE),
++    ("grep -nefoo, granted then outside", "grep -nefoo {ws}/repo/a.json " + OUTSIDE),
++    ("sed -ne SCRIPT, outside data", "sed -ne p " + OUTSIDE),
++    # an UNQUOTED glob in the clustered value is expanded by the shell (a directory read), so it is
++    # judged, as the attached `-e/x/*` already is. Main left it unjudged: a small tightening.
++    ("grep -ne with an unquoted glob value", "grep -ne/etc/* {ws}/repo"),
++    # string options are head-wide (git's `-m` is a boolean under checkout): a cluster ending in one
++    # does not hand the next word over unjudged
++    ("git checkout -fm, outside path", "git checkout -fm " + OUTSIDE),
+ ]
+ # Shapes that must not be over-judged by the cluster rule.
+ SCOPE_ALLOW += [
+     ("sed -if: `f` is -i's backup suffix", "sed -if 's/a/b/' {ws}/repo/a.json"),
+     ("jq -n --library-path granted", "jq -n --library-path {ws}/repo 'include \"x\"; .'"),
++    # #1560: `-e` owns `foo`; the `f` inside it is not -f (legion-claude's #1550 v2 review)
++    ("grep -nefoo: `foo` is -e's pattern", "grep -nefoo {ws}/repo/a.json"),
++    ("grep -inef: `f` is -e's pattern", "grep -inef {ws}/repo/a.json"),
++    ("grep -nefoo/bar: a pattern, not a path", "grep -nefoo/bar {ws}/repo/a.json"),
++    # the shape that is a false deny on main: the text after the misread `f` names an existing outside
++    # path, so `-f`'s "program file" /etc/hosts was judged, though grep reads the pattern `f/etc/hosts`
++    ("grep -nef/etc/hosts: the pattern `f/etc/hosts`", "grep -nef/etc/hosts {ws}/repo/a.json"),
++    ("grep -ief/etc/hosts: the pattern `f/etc/hosts`", "grep -ief/etc/hosts {ws}/repo/a.json"),
+ ]
+ 
+ 
