@@ -2,7 +2,7 @@
 
 | file | sha256 |
 |---|---|
-| `7fc56c4d8ae8403ae563baafbbbe4c6411464ecdc1f244ffd1ad4e1a9e1a9fed.patch` | `7fc56c4d8ae8403ae563baafbbbe4c6411464ecdc1f244ffd1ad4e1a9e1a9fed` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
+| `dcab675552db5fce4769251e6fd0600804c7770f0e9de68ff429948250522071.patch` | `dcab675552db5fce4769251e6fd0600804c7770f0e9de68ff429948250522071` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
 
 ## The defect
 
@@ -14,24 +14,29 @@ directory even when the launcher supplied that directory through the profile's d
 
 Explicit launch configuration is now evaluated before the legacy workspace-substring fallback:
 
-- an absolute directory named by `profile.launch_cwd_env` receives `path:<resolved-launch-dir>/**`, so the launch
-  directory and its descendants are reachable;
+- an absolute existing directory named by `profile.launch_cwd_env` receives `path:<resolved-launch-dir>/**`, so
+  the launch directory and its descendants are reachable;
 - a directory inside the workspace keeps the existing repo-segment grant;
-- a relative value, the workspace itself, or an ancestor of the workspace grants nothing;
-- without the declared launch variable, an external cwd grants nothing and the legacy behavior is unchanged.
+- a relative value, filesystem root, a missing path, a regular file, the workspace itself, or an ancestor of the
+  workspace grants nothing;
+- symlinks are resolved before those checks, so an alias cannot change the granted real directory;
+- without the declared launch variable, an external cwd grants nothing and the fallback uses canonical path
+  boundaries rather than workspace-substring matching.
 
 This deliberately does **not** grant a member-chosen event cwd, a parent directory, or an arbitrary absolute path
 that the launcher did not declare. It also does not claim to finish the larger migration to a certified launch
-grant in the policy snapshot: that authority/evidence replacement remains future work.
+grant in the policy snapshot: that authority/evidence replacement remains future work. Which launcher may set the
+variable, and whether that provenance is sufficient for an external recursive grant, remains a design-owner hold.
 
 ## Verification
 
 On base `59f2478e`, with the generated core loaded from a faithful scratch `plugins/_shared` layout:
 
-- `test_gate_core.py`: **ALL CHECKS PASS**, including external launch allowed, external sibling denied, ancestor
-  refused, relative paths refused (including one containing the workspace string), the existing in-workspace grant,
-  and no-declaration denied. Shim presence and scope-rule inventory checks run against the intended plugin set.
-- The same revised suite against the unpatched core fails **exactly the two positive external-launch checks**.
+- `test_gate_core.py`: **ALL CHECKS PASS**, including external launch allowed, external sibling denied, missing
+  paths, regular files, root, relative values, workspace/ancestor paths, and symlink controls. The fallback rejects
+  both a workspace string outside its root and a same-prefix sibling while preserving a real descendant.
+- The two revised launch tests against the unpatched core fail **exactly five intended checks** in an in-memory
+  control: three positive external-launch cases and the two fallback boundary cases.
 - `one_gate_decide_contract_test.py`: **PASS, 25 tests + 31x4 shim-parity cells** with the core overlay.
 - `tools/hooks_gt.py check`: clean on the base. The builder strictly reproduces all eight patch files, including
   the hooks-gt copy and five manifests. `git apply --check` passes.

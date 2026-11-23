@@ -39,33 +39,40 @@ def patch_core(src):
         seg = rest.split("/", 1)[0] if rest else ""
         return [seg] if seg else []
     return []
-''', r'''def launch_cwd_repo(profile: HarnessProfile, workspace: str) -> list:
+''', r'''def _launch_repo_segment(candidate: str, workspace: str) -> list:
+    candidate = os.path.realpath(os.path.expanduser(candidate)).replace("\\", "/").rstrip("/") or "/"
+    ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/") or "/"
+    prefix = ws if ws == "/" else ws + "/"
+    if candidate.startswith(prefix):
+        rest = candidate[len(prefix):].lstrip("/")
+        return [rest.split("/", 1)[0]] if rest else []
+    return []
+
+
+def launch_cwd_repo(profile: HarnessProfile, workspace: str) -> list:
     """The launch directory is in scope, as a per-launch dynamic grant.
 
-    Inside the workspace that is the first repo segment, as before. An ABSOLUTE directory supplied
-    through the profile's declared launch variable may instead be outside the workspace: it gets a
-    recursive `path:` grant for that directory alone. A relative path, a workspace ancestor, or an
-    external cwd with no declared launch variable grants nothing.
+    Inside the workspace that is the first repo segment, as before. An ABSOLUTE existing directory
+    supplied through the profile's declared launch variable may instead be outside the workspace:
+    it gets a recursive `path:` grant for that directory alone. A relative path, root, a missing or
+    non-directory target, a workspace ancestor, or an external cwd with no declaration grants nothing.
     """
     env = os.environ.get(profile.launch_cwd_env) if profile.launch_cwd_env else None
-    cwd = (env or os.getcwd()).replace("\\", "/")
     if env:
-        expanded = os.path.expanduser(cwd).replace("\\", "/")
+        expanded = os.path.expanduser(env).replace("\\", "/")
         if not expanded.startswith("/"):
             return []
-        candidate = os.path.realpath(expanded).replace("\\", "/").rstrip("/")
-        ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/")
+        candidate = os.path.realpath(expanded).replace("\\", "/").rstrip("/") or "/"
+        ws = os.path.realpath(os.path.expanduser(workspace)).replace("\\", "/").rstrip("/") or "/"
+        if candidate == "/" or not os.path.isdir(candidate):
+            return []
         if candidate == ws or ws.startswith(candidate + "/"):
             return []
-        if candidate.startswith(ws + "/"):
-            rest = candidate[len(ws):].lstrip("/")
-            return [rest.split("/", 1)[0]]
+        inside = _launch_repo_segment(candidate, ws)
+        if inside:
+            return inside
         return ["path:" + candidate + "/**"]
-    if workspace in cwd:
-        rest = cwd.split(workspace, 1)[1].lstrip("/")
-        seg = rest.split("/", 1)[0] if rest else ""
-        return [seg] if seg else []
-    return []
+    return _launch_repo_segment(os.getcwd(), workspace)
 ''')
 
 
@@ -106,6 +113,26 @@ import json
         os.environ[key] = "relative/" + ws
         check("relative-path-containing-workspace-is-not-a-grant", G.launch_cwd_repo(prof, ws) == [],
               G.launch_cwd_repo(prof, ws))
+        os.environ[key] = os.path.join(launched, "nope", "deeper")
+        check("missing-launch-dir-is-not-a-grant", G.launch_cwd_repo(prof, ws) == [],
+              G.launch_cwd_repo(prof, ws))
+        os.environ[key] = target
+        check("regular-file-launch-target-is-not-a-grant", G.launch_cwd_repo(prof, ws) == [],
+              G.launch_cwd_repo(prof, ws))
+        os.environ[key] = os.path.abspath(os.sep)
+        check("filesystem-root-is-not-a-launch-grant", G.launch_cwd_repo(prof, ws) == [],
+              G.launch_cwd_repo(prof, ws))
+        launch_alias = os.path.join(sibling, "launch-alias")
+        os.symlink(launched, launch_alias, target_is_directory=True)
+        os.environ[key] = launch_alias
+        check("launch-symlink-resolves-to-the-exact-directory",
+              G.launch_cwd_repo(prof, ws) == [expected], G.launch_cwd_repo(prof, ws))
+        ancestor_alias = os.path.join(sibling, "ancestor-alias")
+        os.symlink(os.path.dirname(ws), ancestor_alias, target_is_directory=True)
+        os.environ[key] = ancestor_alias
+        check("workspace-ancestor-symlink-is-not-a-grant", G.launch_cwd_repo(prof, ws) == [],
+              G.launch_cwd_repo(prof, ws))
+        os.makedirs(os.path.join(ws, "granted"), exist_ok=True)
         os.environ[key] = os.path.join(ws, "granted")
         check("in-workspace-launch-keeps-repo-grant", G.launch_cwd_repo(prof, ws) == ["granted"],
               G.launch_cwd_repo(prof, ws))
@@ -120,15 +147,35 @@ import json
             os.environ[key] = previous
 
 
+def test_legacy_launch_fallback_uses_path_boundaries():
+    ws = _workspace()
+    prof = dataclasses.replace(_profile(ws, []), launch_cwd_env="")
+    real_getcwd = G.os.getcwd
+    try:
+        G.os.getcwd = lambda: os.path.join(os.sep, "evil", ws.lstrip(os.sep), "SAGE", "y")
+        check("fallback-rejects-a-workspace-substring-outside-its-root",
+              G.launch_cwd_repo(prof, ws) == [], G.launch_cwd_repo(prof, ws))
+        G.os.getcwd = lambda: ws + "-other/x"
+        check("fallback-rejects-a-sibling-with-the-same-prefix",
+              G.launch_cwd_repo(prof, ws) == [], G.launch_cwd_repo(prof, ws))
+        G.os.getcwd = lambda: os.path.join(ws, "granted", "nested")
+        check("fallback-keeps-a-real-workspace-descendant",
+              G.launch_cwd_repo(prof, ws) == ["granted"], G.launch_cwd_repo(prof, ws))
+    finally:
+        G.os.getcwd = real_getcwd
+
+
 def test_path_and_command_scope():
 ''')
     src = once(src, """    "test_path_and_command_scope",
 """, """    "test_path_and_command_scope",
     "test_an_explicit_external_launch_dir_is_the_launch_grant",
+    "test_legacy_launch_fallback_uses_path_boundaries",
 """)
     return once(src, """    test_path_and_command_scope()
 """, """    test_path_and_command_scope()
     test_an_explicit_external_launch_dir_is_the_launch_grant()
+    test_legacy_launch_fallback_uses_path_boundaries()
 """)
 
 
@@ -144,6 +191,9 @@ def hunks(section):
             m = re.match(r"@@ -(\d+)(?:,(\d+))?", line)
             cur = {"start": int(m.group(1)) - 1, "old": [], "new": []}
             out.append(cur)
+        elif cur is not None and not line.strip():
+            cur["old"].append(line)
+            cur["new"].append(line)
         elif cur is not None and line[:1] in " +-" and not line.startswith(("--- ", "+++ ")):
             if line[0] in " -":
                 cur["old"].append(line[1:])
@@ -204,6 +254,7 @@ def main():
     print(f"hooks_gt emitted {n} files")
 
     body = diff(CORE, blob(CORE), core) + gt_out.read_text(encoding="utf-8") + diff(TEST, blob(TEST), test_new)
+    body = re.sub(r"(?m)^ $", "", body)
     gt_out.unlink()
     sha = hashlib.sha256(body.encode()).hexdigest()
     (OUT / f"{sha}.patch").write_text(body, encoding="utf-8")
