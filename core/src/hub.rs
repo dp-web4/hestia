@@ -635,10 +635,6 @@ impl HubClient {
         HubChannel::from_hub_info(&info, pair_id)
     }
 
-    /// Run a query over an established channel. The request `{tool, args}` is
-    /// sealed to the hub, POSTed to `/v1/hubs/{hub_id}/channel`, and the sealed
-    /// response is opened — nothing in the clear. `my` is the member's vault
-    /// keypair; `my_lct_id` identifies which pinned pubkey the hub uses.
     /// Resolve a member LCT by display name through the sealed `list_members` channel read.
     /// Exact (case-insensitive) name match first, then a unique prefix (`thor` → `thor-sage`);
     /// an ambiguous prefix fails closed. The public operator-only roster is never a fallback.
@@ -656,19 +652,32 @@ impl HubClient {
             .await
             .map_err(|e| {
                 let message = format!("{e:#}");
-                if message.contains("HTTP 403") || message.contains("HTTP 409") {
+                // Only the hub's external-tier refusal means "you are not a member". A member
+                // whose role the hub's law denies this read also gets a 403, and telling that
+                // member to request citizenship would send it down the wrong repair path.
+                if message.contains("HTTP 403") && message.contains("external LCT") {
                     anyhow::anyhow!(
                         "hub membership is required before roster reads: request citizenship or a denial review ({message})"
                     )
                 } else {
-                    anyhow::anyhow!("resolving member through sealed hub roster: {message}")
+                    anyhow::anyhow!("the hub refused or failed the sealed roster read; nothing was resolved ({message})")
                 }
             })?;
+        // A hub that capped the list has not shown every member, so "no match" and "the only
+        // match" are both unproven. Refuse rather than notify whoever happened to be listed.
+        if body.get("truncated").and_then(|t| t.as_bool()).unwrap_or(false) {
+            anyhow::bail!(
+                "the hub returned a truncated roster, so '{name}' cannot be resolved by name; use the LCT id"
+            );
+        }
         let members = body
             .get("members")
             .and_then(|m| m.as_array())
             .ok_or_else(|| anyhow::anyhow!("list_members response has no `members` array"))?;
-        let want = name.to_lowercase();
+        let want = name.trim().to_lowercase();
+        if want.is_empty() {
+            anyhow::bail!("an empty member name resolves to nobody; name the peer or use the LCT id");
+        }
         let name_of = |m: &serde_json::Value| {
             m.get("name")
                 .and_then(|n| n.as_str())
@@ -680,8 +689,16 @@ impl HubClient {
                 .and_then(|l| l.as_str())
                 .and_then(|s| Uuid::parse_str(s).ok())
         };
-        if let Some(m) = members.iter().find(|m| name_of(m) == want) {
-            return lct_of(m).ok_or_else(|| anyhow::anyhow!("member '{name}' has no valid lct_id"));
+        // An exact name is not unique by construction: two members may carry the same display
+        // name. Taking the first would notify whichever the hub happened to list first.
+        let exact: Vec<&serde_json::Value> = members.iter().filter(|m| name_of(m) == want).collect();
+        match exact.as_slice() {
+            [] => {}
+            [m] => return lct_of(m).ok_or_else(|| anyhow::anyhow!("member '{name}' has no valid lct_id")),
+            _ => anyhow::bail!(
+                "ambiguous member name '{name}' — {} members carry exactly that name; use the LCT id",
+                exact.len()
+            ),
         }
         let pref: Vec<&serde_json::Value> = members
             .iter()
@@ -697,6 +714,10 @@ impl HubClient {
         }
     }
 
+    /// Run a query over an established channel. The request `{tool, args}` is
+    /// sealed to the hub, POSTed to `/v1/hubs/{hub_id}/channel`, and the sealed
+    /// response is opened — nothing in the clear. `my` is the member's vault
+    /// keypair; `my_lct_id` identifies which pinned pubkey the hub uses.
     pub async fn channel_query(
         &self,
         rest_endpoint: &str,
@@ -1806,6 +1827,23 @@ mod sealed_roster_tests {
         pair_id: Uuid,
         answer: Value,
         calls: Arc<Mutex<Vec<String>>>,
+        /// Every opened inner request, whole: tool, args, nonce, issued_at.
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    fn mock(hub: &KeyPair, member: &KeyPair, pair_id: Uuid, answer: Value) -> MockHub {
+        MockHub {
+            hub: hub.clone(), member: member.verifying_key(), pair_id, answer,
+            calls: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// A status and a plain-text body, as the hub's `ApiError` renders them.
+    fn refusing(status: u16, text: &'static str) -> Router {
+        Router::new().route("/v1/hubs/:id/channel", post(move || async move {
+            (axum::http::StatusCode::from_u16(status).unwrap(), text).into_response()
+        }))
     }
 
     async fn answer(State(mock): State<MockHub>, Json(req): Json<Value>) -> Response {
@@ -1813,6 +1851,7 @@ mod sealed_roster_tests {
         let plaintext = pair_channel::open(&mock.hub, &mock.member, mock.pair_id, &sealed).unwrap();
         let request: Value = serde_json::from_slice(&plaintext).unwrap();
         mock.calls.lock().unwrap().push(request["tool"].as_str().unwrap().to_string());
+        mock.requests.lock().unwrap().push(request.clone());
         let sealed = pair_channel::seal(
             &mock.hub,
             &mock.member,
@@ -1847,13 +1886,9 @@ mod sealed_roster_tests {
         let peer_lct = Uuid::new_v4();
         let pair_id = Uuid::new_v4();
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let mock = MockHub {
-            hub: hub.clone(),
-            member: member.verifying_key(),
-            pair_id,
-            answer: json!({"members": [{"name": "Peer Example", "lct_id": peer_lct}]}),
-            calls: calls.clone(),
-        };
+        let mut mock = mock(&hub, &member, pair_id,
+            json!({"members": [{"name": "Peer Example", "lct_id": peer_lct}]}));
+        mock.calls = calls.clone();
         let (rest, task) = serve(Router::new().route("/v1/hubs/:id/channel", post(answer)).with_state(mock)).await;
         let channel = HubChannel::new(hub_lct, pair_id, &hub.verifying_key().to_hex()).unwrap();
         let client = HubClient::new();
@@ -1885,6 +1920,132 @@ mod sealed_roster_tests {
         assert!(text.contains("HTTP 403"), "{text}");
         assert!(text.contains("request citizenship or a denial review"), "{text}");
         assert!(!text.contains("404"), "{text}");
+        task.abort();
+    }
+
+    /// NOVA's hold on #1715: the notify flow is resolve, then `referenced_act`, on ONE channel.
+    /// Each request must be fresh (its own nonce and issued_at, or the hub's ReplayGuard would
+    /// drop the second), the act must name exactly the LCT the roster returned, and nothing may
+    /// leave the sealed route.
+    #[tokio::test]
+    async fn resolve_then_referenced_act_share_a_channel_with_fresh_requests_and_no_public_route() {
+        let (hub, member) = (KeyPair::generate(), KeyPair::generate());
+        let (peer_lct, pair_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mock = mock(&hub, &member, pair_id, json!({"members": [
+            {"name": "peer-example", "lct_id": peer_lct},
+            {"name": "someone-else", "lct_id": Uuid::new_v4()},
+        ]}));
+        let requests = mock.requests.clone();
+        let stray = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = stray.clone();
+        let router = Router::new()
+            .route("/v1/hubs/:id/channel", post(answer))
+            .with_state(mock)
+            // Anything else the client reaches for (the old public `/tools/list_members`) lands here.
+            .fallback(move |uri: axum::http::Uri| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(uri.to_string());
+                    axum::http::StatusCode::NOT_FOUND
+                }
+            });
+        let (rest, task) = serve(router).await;
+        let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+        let client = HubClient::new();
+        let me = Uuid::new_v4();
+        let resolved = client.resolve_member_by_name(&rest, &channel, &member, me, "peer").await.unwrap();
+        assert_eq!(resolved, peer_lct);
+        client
+            .channel_query(&rest, &channel, &member, me, "referenced_act",
+                           json!({"peer_lct_id": resolved, "ref_uri": "x", "content_hash": "y"}))
+            .await
+            .unwrap();
+        let got = requests.lock().unwrap().clone();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0]["tool"].as_str(), got[1]["tool"].as_str()), (Some("list_members"), Some("referenced_act")));
+        assert_eq!(got[1]["args"]["peer_lct_id"], json!(peer_lct), "the act names the LCT the roster returned");
+        let nonce = |r: &Value| r["nonce"].as_str().unwrap().to_string();
+        assert!(!nonce(&got[0]).is_empty() && nonce(&got[0]) != nonce(&got[1]), "one nonce per request: {got:?}");
+        assert!(got.iter().all(|r| r["issued_at"].as_str().is_some()), "{got:?}");
+        assert!(stray.lock().unwrap().is_empty(), "left the sealed route: {:?}", stray.lock().unwrap());
+        task.abort();
+    }
+
+    /// A 403 is not always "you are not a member". The hub's read gate answers a MEMBER whose
+    /// role its law denies with a 403 too; that caller must not be told to request citizenship.
+    /// Nor is a 409 or a 500 a membership fact.
+    #[tokio::test]
+    async fn only_the_external_tier_refusal_is_reported_as_missing_membership() {
+        let (hub, member) = (KeyPair::generate(), KeyPair::generate());
+        for (status, text) in [
+            (403, "read denied by hub law (norm: citizens-may-not-list)"),
+            (409, "council mode active"),
+            (500, "ledger unavailable"),
+        ] {
+            let pair_id = Uuid::new_v4();
+            let (rest, task) = serve(refusing(status, text)).await;
+            let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+            let err = HubClient::new()
+                .resolve_member_by_name(&rest, &channel, &member, Uuid::new_v4(), "peer")
+                .await
+                .unwrap_err();
+            let shown = format!("{err:#}");
+            assert!(shown.contains(&format!("HTTP {status}")) && shown.contains(text), "{shown}");
+            assert!(!shown.contains("citizenship"), "HTTP {status} is not a membership fact: {shown}");
+            task.abort();
+        }
+    }
+
+    /// Fail closed wherever the roster cannot name exactly one member.
+    #[tokio::test]
+    async fn a_name_that_does_not_pick_exactly_one_member_resolves_to_nobody() {
+        let (hub, member) = (KeyPair::generate(), KeyPair::generate());
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let cases: Vec<(Value, &str, &str)> = vec![
+            // two members with the same exact name (case-insensitively)
+            (json!({"members": [{"name": "Twin", "lct_id": a}, {"name": "twin", "lct_id": b}]}),
+             "twin", "members carry exactly that name"),
+            // an ambiguous prefix
+            (json!({"members": [{"name": "thor-a", "lct_id": a}, {"name": "thor-b", "lct_id": b}]}),
+             "thor", "ambiguous member name"),
+            // an empty or blank name would otherwise prefix-match everyone
+            (json!({"members": [{"name": "only", "lct_id": a}]}), "  ", "empty member name"),
+            // a capped roster proves neither absence nor uniqueness
+            (json!({"members": [{"name": "peer-one", "lct_id": a}], "total": 9, "truncated": true}),
+             "peer", "truncated roster"),
+            (json!({"members": [{"name": "peer-one", "lct_id": a}]}), "nobody", "no hub member matches"),
+        ];
+        for (answer, name, want) in cases {
+            let pair_id = Uuid::new_v4();
+            let (rest, task) = serve(
+                Router::new().route("/v1/hubs/:id/channel", post(self::answer))
+                    .with_state(mock(&hub, &member, pair_id, answer)),
+            ).await;
+            let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+            let got = HubClient::new()
+                .resolve_member_by_name(&rest, &channel, &member, Uuid::new_v4(), name)
+                .await;
+            let shown = match got {
+                Ok(lct) => panic!("'{name}' resolved to {lct}; expected a refusal ({want})"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(shown.contains(want), "'{name}': {shown}");
+            task.abort();
+        }
+        // Control: an exact name still wins over a longer name it prefixes.
+        let pair_id = Uuid::new_v4();
+        let (rest, task) = serve(
+            Router::new().route("/v1/hubs/:id/channel", post(self::answer)).with_state(mock(
+                &hub, &member, pair_id,
+                json!({"members": [{"name": "thor", "lct_id": a}, {"name": "thor-sage", "lct_id": b}]}),
+            )),
+        ).await;
+        let channel = HubChannel::new(Uuid::new_v4(), pair_id, &hub.verifying_key().to_hex()).unwrap();
+        let got = HubClient::new()
+            .resolve_member_by_name(&rest, &channel, &member, Uuid::new_v4(), "THOR")
+            .await
+            .unwrap();
+        assert_eq!(got, a);
         task.abort();
     }
 }
