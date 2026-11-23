@@ -7,7 +7,9 @@ Usage:
 Environment: HESTIA_MESH_PLUGIN (required member identity), HESTIA_ENDPOINT,
 HESTIA_MESH_HOST_AGENT, HESTIA_ROLE, HESTIA_MESH_TIMEOUT. This is a thin client,
 not a second transport or an MCP registration. Exit codes: 0 ok, 1 unreachable,
-2 usage, 3 daemon refusal, 4 undetermined outcome.
+2 usage, 3 daemon refusal, 4 undetermined outcome. Transport, HTTP, and result-shape
+failures after dispatch return 4 and are not proof a mutation failed; inspect durable
+state before retrying. A caller-supplied session_id is replaced by the connected session.
 """
 from __future__ import annotations
 
@@ -25,6 +27,13 @@ _mesh = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_mesh)
 
 
+def _transport_failure(payload) -> bool:
+    return (
+        isinstance(payload, dict)
+        and payload.get("_hestia_error", {}).get("code", "").startswith("hestia_mesh.")
+    )
+
+
 def call(tool_name: str, arguments: dict):
     """Call one tool with a connected, attributed session; never hide a refusal."""
     if not isinstance(tool_name, str) or not tool_name:
@@ -34,6 +43,8 @@ def call(tool_name: str, arguments: dict):
     h, session_id = _mesh.connect()
     out = _mesh.rpc(h, tool_name, dict(arguments, session_id=session_id))
     if _mesh.failed(out):
+        if _transport_failure(out):
+            raise _mesh.Undetermined(out)
         raise _mesh.DaemonRefusal(out)
     return out
 
@@ -61,6 +72,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"_hestia_error": {"code": "undetermined", "message": str(e)}}))
         return 4
     except _mesh.DaemonRefusal as e:
+        if _transport_failure(e.payload):
+            print(json.dumps({"_hestia_error": {"code": "undetermined",
+                                                "message": str(e.payload)}}))
+            return 4
         print(json.dumps(e.payload))
         return 3
 

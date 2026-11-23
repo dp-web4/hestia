@@ -142,12 +142,13 @@ def test_unreachable_is_rc1_not_a_traceback():
     assert out["_hestia_error"]["code"] == "unreachable", out
 
 
-def test_empty_reply_is_not_success():
+def test_commit_then_no_frame_is_undetermined_rc4():
     stub = Stub(mode="no_frame")
     try:
         rc, out, _ = invoke("hestia_appeal", {"deny_hash": "h", "reason": "false positive"}, stub.url)
-        assert rc == 3, (rc, out)
-        assert out["_hestia_error"]["code"] == "hestia_mesh.no_data_frame", out
+        assert rc == 4, (rc, out)
+        assert out["_hestia_error"]["code"] == "undetermined", out
+        assert stub.calls[-1][0] == "hestia_appeal", stub.calls
     finally:
         stub.close()
 
@@ -156,5 +157,5 @@ if __name__ == "__main__":
     test_generic_call_reaches_the_tool()
     test_refusal_reaches_the_caller_as_rc3()
     test_unreachable_is_rc1_not_a_traceback()
-    test_empty_reply_is_not_success()
+    test_commit_then_no_frame_is_undetermined_rc4()
     print("ok: tracked generic client reaches tools and exposes every failure class")
