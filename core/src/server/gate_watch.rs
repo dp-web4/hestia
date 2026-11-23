@@ -19,6 +19,14 @@
 //! bypass class for installed artifacts without adding another lexical classifier or a hot-path
 //! inventory; source checkouts are deployment inputs, not the executing surface this watches.
 //!
+//! WHAT THE MANIFEST IS NOT. `current-build.json` is written by the deploy as the same host user
+//! that writes the artifacts, and it is not signed. A writer who changes an artifact AND its
+//! recorded digest is invisible to this pass; only a vault-ratified expectation catches that.
+//! So a `basis: current-build` row is drift evidence against the last deploy's own record, never
+//! ratification. What this pass does guarantee about the manifest: a row with no usable baseline
+//! (digest not 64 hex, or a row the reader had to drop) is `UNKNOWN`, never `modified` and never
+//! silently uncovered; and losing the manifest never resolves a finding that was open (below).
+//!
 //! WHAT IS PROJECTED. Every pass writes `<home>/status/gate-integrity.json`: when it looked, what
 //! it hashed, what it concluded, and the chain hash of each open finding. That file is a
 //! readable projection, not an authority — anyone who can write `<home>` can edit it, exactly as
@@ -49,7 +57,8 @@ pub const STATUS_FILE: &str = "status/gate-integrity.json";
 /// The key for "the gate set itself could not be established" — a finding about coverage,
 /// which has no gate path of its own. Parenthesised so it can never collide with a real path.
 pub const COVERAGE_KEY: &str = "(coverage)";
-/// The deployment manifest was configured but could not supply a non-empty file set (#923).
+/// The deployment manifest was configured but could not supply a non-empty, wholly valid file
+/// set (#923): unreadable, empty, or carrying rows with no usable expected digest.
 pub const DEPLOYMENT_COVERAGE_KEY: &str = "(deployment-coverage)";
 
 /// A finding that is open, as the daemon last witnessed it.
@@ -193,13 +202,28 @@ fn deployed_observations(deployed: Option<&Value>, configured: bool, existing: &
         }];
     };
     let build_id = deployed.and_then(|d| d.get("build_id")).cloned().unwrap_or(Value::Null);
+    // Rows the manifest reader could not read at all (no string path or digest). They have no
+    // key to report under, so they are counted, and the inventory as a whole is UNKNOWN.
+    let unreadable_rows = deployed.and_then(|d| d.get("invalid_rows")).and_then(Value::as_u64).unwrap_or(0);
+    // One file, one row: the installer records `<shared link>/<file>` while a vault-backed row
+    // may be keyed by realpath (#1614), so "already judged" is decided on the resolved path.
+    let existing_real: Vec<PathBuf> =
+        existing.iter().filter_map(|o| std::fs::canonicalize(&o.key).ok()).collect();
+    let mut invalid_paths: Vec<String> = Vec::new();
     let mut rows: Vec<_> = files.iter().collect();
     rows.sort_by_key(|(path, _)| *path);
-    rows.into_iter().filter_map(|(path, expected)| {
-        if existing.iter().any(|o| &o.key == path) {
+    let mut out: Vec<Observation> = rows.into_iter().filter_map(|(path, expected)| {
+        if existing.iter().any(|o| &o.key == path)
+            || std::fs::canonicalize(path).map(|real| existing_real.contains(&real)).unwrap_or(false)
+        {
             return None;
         }
-        let expected = expected.as_str().unwrap_or_default();
+        // No usable baseline is not a mismatch. Judging the file against "" would report
+        // `modified` for an inventory defect, and name the wrong thing as broken.
+        let Some(expected) = expected.as_str().filter(|e| is_sha256_hex(e)) else {
+            invalid_paths.push(path.clone());
+            return None;
+        };
         let (status, found, detail) = if !Path::new(path).is_file() {
             ("missing", None, json!({}))
         } else {
@@ -226,7 +250,58 @@ fn deployed_observations(deployed: Option<&Value>, configured: bool, existing: &
             plugin_id: None,
             detail: observation_detail,
         })
-    }).collect()
+    }).collect();
+    if unreadable_rows > 0 || !invalid_paths.is_empty() {
+        out.push(Observation {
+            key: DEPLOYMENT_COVERAGE_KEY.into(),
+            status: "unknown".into(),
+            found_sha256: None,
+            plugin_id: None,
+            detail: json!({
+                "reason": "the deployment manifest has rows with no usable expected sha256; those files are not covered",
+                "basis": "current-build",
+                "build_id": build_id,
+                "invalid_paths": invalid_paths,
+                "unreadable_rows": unreadable_rows,
+            }),
+        });
+    }
+    out
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// While deployment coverage is UNKNOWN, an open finding this pass did not see is HELD, not
+/// resolved. `transitions` reads "not seen" as "no longer wired or expected", which is right
+/// when the set of things to look at is known. It is wrong when the manifest that named the
+/// file is the thing that went missing: deleting the baseline would then be witnessed as the
+/// repair. Returns the surviving transitions and the keys held open, sorted.
+fn hold_unseen_while_deployment_unknown(
+    ts: Vec<Transition>,
+    seen: &[Observation],
+) -> (Vec<Transition>, Vec<String>) {
+    if !seen.iter().any(|o| o.key == DEPLOYMENT_COVERAGE_KEY) {
+        return (ts, Vec::new());
+    }
+    let mut held = Vec::new();
+    let kept = ts
+        .into_iter()
+        .filter(|t| match t {
+            Transition::Resolve { key, payload }
+                if payload["resolution"] == "no_longer_present"
+                    && key != COVERAGE_KEY
+                    && key != DEPLOYMENT_COVERAGE_KEY =>
+            {
+                held.push(key.clone());
+                false
+            }
+            _ => true,
+        })
+        .collect();
+    held.sort();
+    (kept, held)
 }
 
 /// A chain row this pass owes.
@@ -424,7 +499,9 @@ fn check_with_deployed(
     let mut seen = observe(&exp, discovered);
     seen.extend(deployed_observations(deployed, configured, &seen));
     let mut failures = 0usize;
-    for t in transitions(&s.gate_findings_open, &seen, now) {
+    let (edges, held_open) =
+        hold_unseen_while_deployment_unknown(transitions(&s.gate_findings_open, &seen, now), &seen);
+    for t in edges {
         match t {
             Transition::Open { key, fingerprint, payload } => match s.append_chain(FINDING_EVENT, payload) {
                 Ok(entry) => {
@@ -451,7 +528,12 @@ fn check_with_deployed(
             },
         }
     }
-    let doc = status_document(&seen, &s.gate_findings_open, now, failures);
+    let mut doc = status_document(&seen, &s.gate_findings_open, now, failures);
+    if !held_open.is_empty() {
+        // Findings that are still open but could not be re-observed this pass. Without this the
+        // status file would list only the UNKNOWN row and a reader could not tell what it hides.
+        doc["held_open"] = json!(held_open);
+    }
     // DURABLE READS: the status file names finding chain hashes; it may not precede them.
     if let Err(e) = s.chain_store.durability().flush_committed_blocking() {
         tracing::warn!(error = %e, "gate integrity status NOT written: chain not durable");
@@ -614,6 +696,99 @@ mod tests {
             assert_eq!(status_document(&seen, &HashMap::new(), 1, 0)["status"], "UNKNOWN");
         }
         assert!(deployed_observations(None, false, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_expected_digest_is_unknown_inventory_not_a_modified_file() {
+        let d = tempfile::tempdir().unwrap();
+        let good = gate(&d, "good.py", "v1");
+        let bad = gate(&d, "bad.py", "v1");
+        let good_sha = hash_file(Path::new(&good)).unwrap();
+        for malformed in ["", "abc", &"g".repeat(64), &good_sha[..63]] {
+            let deployed = deployed_manifest(&[(&good, &good_sha), (&bad, malformed)]);
+            let seen = deployed_observations(Some(&deployed), true, &[]);
+            assert!(
+                !seen.iter().any(|o| o.key == bad),
+                "a row with no usable baseline must not be judged at all: {seen:?}"
+            );
+            let coverage = seen.iter().find(|o| o.key == DEPLOYMENT_COVERAGE_KEY)
+                .unwrap_or_else(|| panic!("invalid inventory must be UNKNOWN ({malformed:?}): {seen:?}"));
+            assert_eq!(coverage.status, "unknown");
+            assert_eq!(coverage.detail["invalid_paths"], json!([bad]));
+            assert_eq!(seen.iter().find(|o| o.key == good).unwrap().status, "verified",
+                "a valid sibling row is still judged");
+            assert_eq!(status_document(&seen, &HashMap::new(), 1, 0)["status"], "UNKNOWN");
+        }
+        // Rows the manifest reader had to drop (no string path or digest) are the same finding.
+        let mut deployed = deployed_manifest(&[(&good, &good_sha)]);
+        deployed["invalid_rows"] = json!(2);
+        let seen = deployed_observations(Some(&deployed), true, &[]);
+        let coverage = seen.iter().find(|o| o.key == DEPLOYMENT_COVERAGE_KEY).expect("dropped rows are UNKNOWN");
+        assert_eq!(coverage.detail["unreadable_rows"], 2);
+    }
+
+    #[test]
+    fn a_vault_backed_gate_named_through_a_symlink_is_not_duplicated() {
+        let d = tempfile::tempdir().unwrap();
+        let real_dir = d.path().join("build-1");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real = real_dir.join("engine.py");
+        std::fs::write(&real, "v1").unwrap();
+        let real = std::fs::canonicalize(&real).unwrap().to_string_lossy().into_owned();
+        let link_dir = d.path().join("shared");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+        let via_link = link_dir.join("engine.py").to_string_lossy().into_owned();
+        assert_ne!(real, via_link);
+
+        let mut expectations = GateExpectations::new();
+        ratify(&mut expectations, &real);
+        let existing = observe(&expectations, Ok(vec![real.clone()]));
+        // The installer records `<shared link>/<file>`; the vault-backed row is keyed by realpath.
+        let deployed = deployed_manifest(&[(&via_link, &hash_file(Path::new(&real)).unwrap())]);
+        let extra = deployed_observations(Some(&deployed), true, &existing);
+        assert!(extra.is_empty(), "one file, one row, and the vault-backed one wins: {extra:?}");
+    }
+
+    #[test]
+    fn losing_the_manifest_is_witnessed_as_unknown_and_never_resolves_an_open_drift_finding() {
+        let d = tempfile::tempdir().unwrap();
+        let vault = crate::vault::Vault::init(d.path().join("v.enc"), "p".into()).unwrap();
+        let mut state = crate::server::state::ServerState::open(vault, d.path(), "p").unwrap();
+        let engine = gate(&d, "shared-law.py", "v1");
+        let deployed = deployed_manifest(&[(&engine, &hash_file(Path::new(&engine)).unwrap())]);
+        let events = |state: &crate::server::state::ServerState, kind: &str, key: &str| {
+            state.recent_chain(50).into_iter()
+                .filter(|e| e.event_type == kind && e.event_data["gate"] == key).count()
+        };
+
+        // Clean, then the manifest goes away: UNKNOWN is opened once, and comes back resolved.
+        check_with_deployed(&mut state, Ok(vec![]), true, Some(&deployed));
+        assert_eq!(events(&state, FINDING_EVENT, DEPLOYMENT_COVERAGE_KEY), 0);
+        let lost = check_with_deployed(&mut state, Ok(vec![]), true, None);
+        assert_eq!(lost["status"], "UNKNOWN");
+        check_with_deployed(&mut state, Ok(vec![]), true, None);
+        assert_eq!(events(&state, FINDING_EVENT, DEPLOYMENT_COVERAGE_KEY), 1, "edge-only");
+        check_with_deployed(&mut state, Ok(vec![]), true, Some(&deployed));
+        assert_eq!(events(&state, RESOLVED_EVENT, DEPLOYMENT_COVERAGE_KEY), 1);
+
+        // Drift is open, then the manifest goes away. Deleting the baseline is not a repair.
+        std::fs::write(&engine, "v2").unwrap();
+        check_with_deployed(&mut state, Ok(vec![]), true, Some(&deployed));
+        assert_eq!(events(&state, FINDING_EVENT, &engine), 1);
+        let lost = check_with_deployed(&mut state, Ok(vec![]), true, None);
+        assert_eq!(lost["status"], "UNKNOWN");
+        assert_eq!(events(&state, RESOLVED_EVENT, &engine), 0,
+            "an unreadable manifest must not witness the drift as resolved");
+        assert!(state.gate_findings_open.contains_key(&engine), "the finding stays open");
+        assert_eq!(lost["held_open"], json!([engine]), "and the status file names it");
+
+        // The manifest returns with the drift still there: no second finding row. Repair resolves.
+        check_with_deployed(&mut state, Ok(vec![]), true, Some(&deployed));
+        assert_eq!(events(&state, FINDING_EVENT, &engine), 1);
+        std::fs::write(&engine, "v1").unwrap();
+        check_with_deployed(&mut state, Ok(vec![]), true, Some(&deployed));
+        assert_eq!(events(&state, RESOLVED_EVENT, &engine), 1);
+        assert!(!state.gate_findings_open.contains_key(&engine));
     }
 
     #[test]

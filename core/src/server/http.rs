@@ -8408,12 +8408,17 @@ fn deployed_gate_digests_from(path: &std::path::Path) -> Option<serde_json::Valu
         .filter_map(|m| m.get("files").and_then(|f| f.as_array()))
         .flatten()
         .chain(v.get("shared_engine").and_then(|f| f.as_array()).into_iter().flatten());
+    // A row without a string path and a string digest cannot be keyed, so it is counted rather
+    // than silently dropped: the watcher reports the inventory as UNKNOWN when this is not 0.
+    let mut invalid_rows = 0u64;
     for f in file_rows {
         if let (Some(p), Some(h)) = (
             f.get("path").and_then(|x| x.as_str()),
             f.get("sha256").and_then(|x| x.as_str()),
         ) {
             files.insert(p.to_string(), serde_json::Value::String(h.to_string()));
+        } else {
+            invalid_rows += 1;
         }
     }
     Some(serde_json::json!({
@@ -8421,6 +8426,7 @@ fn deployed_gate_digests_from(path: &std::path::Path) -> Option<serde_json::Valu
         "head_sha": v.get("head_sha"),
         "installed_at_iso": v.get("installed_at_iso"),
         "files": files,
+        "invalid_rows": invalid_rows,
     }))
 }
 
@@ -9649,6 +9655,25 @@ mod disposition_tests {
         assert_eq!(d["files"]["/h/witness.py"], "2222");
         assert_eq!(d["files"]["/s/core.py"], "3333");
         assert_eq!(d["files"].as_object().unwrap().len(), 3);
+        assert_eq!(d["invalid_rows"], 0);
+
+        // A row that cannot be keyed is counted, not dropped without a trace (#1657).
+        std::fs::write(
+            &p,
+            serde_json::json!({
+                "members": [{"member": "claude-code", "files": [
+                    {"file": "a.py", "path": "/h/a.py", "sha256": "1111"},
+                    {"file": "b.py", "path": "/h/b.py", "sha256": null},
+                    {"file": "c.py", "sha256": "3333"}
+                ]}],
+                "shared_engine": [{"file": "core.py", "path": "/s/core.py", "sha256": 7}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let d = deployed_gate_digests_from(&p).unwrap();
+        assert_eq!(d["files"].as_object().unwrap().len(), 1);
+        assert_eq!(d["invalid_rows"], 3);
 
         // Absent or unparseable authority is "no evidence", never an invented one.
         assert!(deployed_gate_digests_from(&dir.path().join("absent.json")).is_none());
