@@ -39,7 +39,11 @@ class Daemon(BaseHTTPRequestHandler):
         if name == "hestia_connect":
             result = {"sessionId": "egress-test-session"}
         elif name == "hestia_egress_pending":
-            if "mark_forwarded" in args or "mark_failed" in args:
+            if args.get("mark_forwarded") in getattr(self.server, "fail_forward", ()):
+                # the hand-off landed but the daemon cannot record it (NOVA, #1654)
+                self.server.refused.append(args)
+                result = {"_hestia_error": {"code": "unavailable", "message": "mark_forwarded"}}
+            elif "mark_forwarded" in args or "mark_failed" in args:
                 self.server.calls.append(args)
                 result = {"ok": True}
             else:
@@ -126,6 +130,63 @@ with tempfile.TemporaryDirectory() as raw:
             check("the log records both local and transport spellings",
                   "kind=review_request hub_kind=pr_review_request" in log, log[-1000:])
             check("the queued record was not rewritten", server.rows[0]["kind"] == "review_request")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+# NOVA (#1654): the hand-off is at-least-once. When the notifier accepts a mapped root but
+# mark_forwarded fails, the row stays pending and the next tick sends it AGAIN; the duplicate
+# must be exposed in the log under the transport spelling, never silently swallowed.
+with tempfile.TemporaryDirectory() as raw:
+    tmp = Path(raw)
+    notifier_log = tmp / "notifier.jsonl"
+    notifier = tmp / "hub-notify"
+    notifier.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['HUB_KIND_LOG'], 'a', encoding='utf-8') as f:\n"
+        "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n",
+        encoding="utf-8",
+    )
+    notifier.chmod(0o755)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Daemon)
+    server.calls, server.refused, server.fail_forward = [], [], {70}
+    server.rows = [
+        {"id": 70, "dest_peer": "peer/member", "forward_on": "peer/member",
+         "forward_on_is_lct": True, "kind": "review_request", "pointer_uri": "thread:70"},
+    ]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    env = os.environ.copy()
+    env.update({
+        "HESTIA_ENDPOINT": f"http://127.0.0.1:{server.server_address[1]}/mcp",
+        "HESTIA_HUB_NOTIFY": str(notifier),
+        "EGRESS_DRAIN_LOG": str(tmp / "drain.log"),
+        "EGRESS_DRAIN_PLUGIN_ID": "egress-test",
+        "HUB_KIND_LOG": str(notifier_log),
+    })
+    try:
+        if bash:
+            for _tick in range(2):
+                subprocess.run([bash, str(SCRIPT), "--once"], env=env,
+                               capture_output=True, text=True, timeout=60)
+            sent = [json.loads(line) for line in notifier_log.read_text().splitlines()] \
+                if notifier_log.exists() else []
+            check("an unrecorded hand-off is re-sent next tick (duplicate exposed, not dropped)",
+                  [s[1] for s in sent] == ["pr_review_request", "pr_review_request"], repr(sent))
+            check("a hand-off the daemon could not record is never counted forwarded",
+                  len(server.refused) == 2 and not server.calls, repr((server.refused, server.calls)))
+            log = (tmp / "drain.log").read_text() if (tmp / "drain.log").exists() else ""
+            check("each duplicate risk is logged under the transport spelling",
+                  log.count("DUPRISK   id=70") == 2
+                  and log.count("kind=review_request hub_kind=pr_review_request (hub accepted it") == 2,
+                  log[-1000:])
+            server.fail_forward = set()
+            subprocess.run([bash, str(SCRIPT), "--once"], env=env,
+                           capture_output=True, text=True, timeout=60)
+            check("once the daemon records it, the row is marked forwarded exactly once",
+                  [c.get("mark_forwarded") for c in server.calls] == [70], repr(server.calls))
     finally:
         server.shutdown()
         server.server_close()

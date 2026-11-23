@@ -178,7 +178,7 @@ PY
         # send it AGAIN. A duplicate is the honest outcome here and the log has to
         # say which one it was; silently swallowing this is how a double-delivery
         # becomes untraceable.
-        say "DUPRISK   id=$id -> $peer kind=$kind (hub accepted it, mark_forwarded \
+        say "DUPRISK   id=$id -> $peer kind=$kind hub_kind=$hub_kind (hub accepted it, mark_forwarded \
 FAILED — this row will be re-sent next tick)"
       fi
     elif [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
