@@ -10870,6 +10870,99 @@ mod accountability_tests {
         assert!(outcome["error"].is_null());
     }
 
+    /// NOVA's hold on #1663: the refusal row is evidence, and losing it must not cost the owner
+    /// anything. When `outcome_refused` cannot be appended, the call fails, the action is
+    /// byte-for-byte what it was, no outcome or trust delta exists, and the owner still closes.
+    #[tokio::test]
+    async fn a_refusal_that_cannot_be_witnessed_never_consumes_the_action() {
+        let (_dir, state) = test_state().await;
+        let connect = |host: &'static str| {
+            let state = state.clone();
+            async move {
+                tool_connect(&state, &json!({
+                    "plugin_id": "shared-member", "host_agent": "t", "host_session_id": host
+                })).await.unwrap()["sessionId"].as_str().unwrap().to_string()
+            }
+        };
+        let owner = connect("host-owner").await;
+        let foreign = connect("host-foreign").await;
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name": "Bash", "target": "make test", "session_id": owner,
+            "host_session_id": "host-owner", "intent": "owned"
+        })).await.unwrap();
+        let action_id = begin["actionId"].as_str().unwrap().to_string();
+        let action_uuid = Uuid::parse_str(&action_id).unwrap();
+        let (before, chain_before) = {
+            let mut s = state.lock().await;
+            s.chain_fault_on.insert("outcome_refused".into());
+            (format!("{:?}", s.actions.get(&action_uuid).unwrap()), s.chain_len())
+        };
+
+        for args in [
+            json!({"action_id": action_id, "session_id": foreign, "success": false, "error": "sabotage"}),
+            json!({"action_id": action_id, "success": false}),
+        ] {
+            let got = tool_record_outcome(&state, &args).await;
+            assert!(got.is_err(), "an unwitnessable refusal must fail loudly, not answer: {got:?}");
+        }
+        {
+            let mut s = state.lock().await;
+            assert_eq!(format!("{:?}", s.actions.get(&action_uuid).unwrap()), before,
+                       "the action must be untouched when its refusal could not be recorded");
+            assert_eq!(s.chain_len(), chain_before, "no row of any kind was written");
+            s.chain_fault_on.clear();
+        }
+        assert!(sink_deltas(&state).await.is_empty(), "nothing was scored");
+
+        let closed = tool_record_outcome(&state, &json!({
+            "action_id": action_id, "session_id": owner, "success": true, "magnitude": 0.4
+        })).await.unwrap();
+        assert!(closed["witnessEntryHash"].is_string(), "the owner still closes: {closed}");
+        assert!(!state.lock().await.actions.contains_key(&action_uuid));
+    }
+
+    /// "Same session" is exactly that, and it is weaker AND narrower than "same member". A member
+    /// that connects twice WITHOUT a host_session_id gets two session UUIDs (reuse is keyed on
+    /// (plugin_id, host_session_id)), so its second connection cannot close what its first began.
+    /// This pins the consequence for a Pre/Post hook pair on a host that reports no session id:
+    /// the Post hook is refused, and only the beginning session can close.
+    #[tokio::test]
+    async fn a_reconnect_under_a_new_session_uuid_does_not_own_the_earlier_action() {
+        let (_dir, state) = test_state().await;
+        let connect = || {
+            let state = state.clone();
+            async move {
+                let c = tool_connect(&state, &json!({"plugin_id": "one-member", "host_agent": "t"}))
+                    .await.unwrap();
+                assert_ne!(c["reused"], true, "no host_session_id, so nothing to reuse: {c}");
+                c["sessionId"].as_str().unwrap().to_string()
+            }
+        };
+        let pre = connect().await;
+        let post = connect().await;
+        assert_ne!(pre, post, "the same member, reconnecting, is a new session");
+        let begin = tool_begin_action(&state, &json!({
+            "tool_name": "Read", "target": "a.txt", "session_id": pre, "intent": "pre hook"
+        })).await.unwrap();
+        let action_id = begin["actionId"].as_str().unwrap().to_string();
+
+        let refused = tool_record_outcome(&state, &json!({
+            "action_id": action_id, "session_id": post, "success": true
+        })).await.unwrap();
+        assert_eq!(refused["_hestia_error"]["code"], "hestia.action_not_owned", "{refused}");
+        assert_eq!(refused["_hestia_error"]["data"]["reason"], "foreign_close");
+        // The refusal names both sessions' member: the same one. It is not evidence of a second party.
+        assert_eq!(refused["_hestia_error"]["data"]["caller_plugin_id"], "one-member");
+        assert_eq!(refused["_hestia_error"]["data"]["action_plugin_id"], "one-member");
+        assert!(state.lock().await.actions.contains_key(&Uuid::parse_str(&action_id).unwrap()),
+                "the action stays resident for the session that began it");
+
+        let closed = tool_record_outcome(&state, &json!({
+            "action_id": action_id, "session_id": pre, "success": true
+        })).await.unwrap();
+        assert!(closed["witnessEntryHash"].is_string(), "{closed}");
+    }
+
     /// **The call-site classification guard (web4 #703 / R7a).**
     ///
     /// The builder-level tests prove `delta_from_change` carries whatever class
