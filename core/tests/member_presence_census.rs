@@ -311,9 +311,25 @@ const MEMBER_LCT_CENSUS: &[(&str, &[&str], SiteClass)] = &[
     ("server/handler.rs::tool_record_outcome", &[
         "let instance_lct = s.member_lct(&plugin_id);",
     ], SiteClass::Naming),
+    // #689 (2026-11-23, hub-claude second pass on #1631): `tool_record_reversal` gained a
+    // second call, `reporter_instance_lct`, on the `cause=corrected-adjudication` arm only.
+    //
+    // READING, both questions. (1) Does it change who gets named? No. `subject_instance_lct`
+    // still names the subject in the reversal entry exactly as before; the reporter's derived
+    // name is written nowhere — the reporter is recorded by its session identity, as it was.
+    // (2) Is any derived name COMPARED to decide control flow? YES, and that is why the class
+    // changed. The two names are compared to refuse `hestia.corrected_adjudication_self`: a
+    // subject may not tombstone an adjudication of itself. That is the same shape as
+    // `tool_witness_adjudication`'s `adjudication_self` — a plugin_id string compare first, then
+    // the name-gate, which catches one entity reporting under a second plugin_id. The
+    // `is_some()` guard matters: `member_lct` returns `None` for an empty or synthetic id, and
+    // without the guard two unnameable parties would compare equal and be refused as "self".
+    // With it, an unnameable subject falls back to the plugin_id compare alone, so the gate is
+    // only as strong as that compare for synthetic ids. Predicate; comparison pinned below.
     ("server/handler.rs::tool_record_reversal", &[
+        "let reporter_instance_lct = s.member_lct(&reporter.plugin_id);",
         "let subject_instance_lct = s.member_lct(&subject_plugin_id);",
-    ], SiteClass::Naming),
+    ], SiteClass::Predicate),
     // A DELEGATE's answer to a scope request (#952, `hestia_scope_arbitrate`). A peer seat
     // holding an operator delegation rules another member's request; these lines name the
     // SUBJECT — the asking member — in the resulting chain entries.
@@ -890,6 +906,11 @@ const MEMBER_LCT_PREDICATE_CENSUS: &[(&str, &[&str])] = &[
     // name-gate, pinned.
     ("server/handler.rs::tool_witness_adjudication", &[
         "|| (subject_instance_lct.is_some() && subject_instance_lct == adjudicator_instance_lct)",
+    ]),
+    // The `hestia.corrected_adjudication_self` refusal (#689), same two-conjunct shape as the
+    // site above: plugin_id strings first (not this census's symbol), then the name-gate.
+    ("server/handler.rs::tool_record_reversal", &[
+        "|| (subject_instance_lct.is_some() && subject_instance_lct == reporter_instance_lct)",
     ]),
 ];
 
