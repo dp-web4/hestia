@@ -7171,7 +7171,11 @@
       d = await r.json();
       if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
     } catch (e) {
-      box.innerHTML = '<div class="empty">could not read hub list</div>'; return;
+      // Keep the daemon's reason (e.g. config_invalid + its recovery step): a bare
+      // "could not read" leaves the operator no way to the fix. Text, not HTML.
+      box.innerHTML = '<div class="empty"></div>';
+      box.firstChild.textContent = 'could not read hub list: ' + ((e && e.message) || e);
+      return;
     }
     const sup = d.supported || {};
     const rows = (d.hubs || []);
