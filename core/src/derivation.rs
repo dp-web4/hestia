@@ -397,6 +397,10 @@ fn entry_str<'a>(e: &'a ChainEntry, key: &str) -> Option<&'a str> {
     e.event_data.get(key).and_then(Value::as_str)
 }
 
+fn entry_feedback_act(e: &ChainEntry) -> Option<&str> {
+    e.event_data.get("feedback")?.get("act")?.as_str().filter(|act| !act.is_empty())
+}
+
 /// Derive temperament + collect adjudication evidence for one grain from a
 /// chain window (oldest-first order is established internally).
 /// Chain event type that records "identity A's evidence belongs to identity B".
@@ -694,14 +698,15 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
             entry_str(deny, "target").unwrap_or(""),
         );
         let denied_cmd = entry_str(deny, "attempted").unwrap_or_default();
-        let complete_attempted = |attempted: &str| {
-            !attempted.is_empty()
-                && !attempted.contains('…')
-                && !attempted.ends_with("...")
-                && !attempted.contains("[REDACTED —")
-                && !attempted.contains("***")
+        let complete_act_text = |text: &str| {
+            let text = text.trim_end();
+            !text.is_empty()
+                && !text.contains('…')
+                && !text.ends_with("...")
+                && !text.contains("[REDACTED —")
+                && !text.contains("***")
         };
-        let denied_complete = complete_attempted(denied_cmd);
+        let denied_complete = complete_act_text(denied_cmd);
         let shell_tool = deny_sig.1.eq_ignore_ascii_case("bash")
             || deny_sig.1.eq_ignore_ascii_case("shell");
         let retried = entries.iter().copied().find(|e| {
@@ -713,16 +718,20 @@ pub fn derive_evidence(plugin_id: &str, role_lct: &str, window: &[ChainEntry]) -
                 && entry_str(e, "tool_name").unwrap_or("") == deny_sig.1
                 && {
                     let attempted = entry_str(e, "attempted").unwrap_or_default();
-                    denied_complete
-                        && complete_attempted(attempted)
-                        && (attempted == denied_cmd
-                            || (!deny_sig.2.is_empty()
-                                && entry_str(e, "payload_sha256").unwrap_or("") == deny_sig.2)
-                            || (!shell_tool
-                                && !deny_sig.3.is_empty()
-                                && deny_sig.3.contains('/')
-                                && !deny_sig.3.ends_with("...")
-                                && entry_str(e, "target").unwrap_or("") == deny_sig.3))
+                    let target = entry_str(e, "target").unwrap_or_default();
+                    match (entry_feedback_act(deny), entry_feedback_act(e)) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => denied_complete
+                            && complete_act_text(attempted)
+                            && (attempted == denied_cmd
+                                || (!deny_sig.2.is_empty()
+                                    && entry_str(e, "payload_sha256").unwrap_or("") == deny_sig.2)
+                                || (!shell_tool
+                                    && complete_act_text(deny_sig.3)
+                                    && complete_act_text(target)
+                                    && deny_sig.3.contains('/')
+                                    && target == deny_sig.3)),
+                    }
                 }
         });
         // Ask/appeal-after-deny (1.0): a witnessed `appeal` event referencing
@@ -2331,13 +2340,35 @@ mod recast_tests {
                     "a shared bounded/redacted summary is not act identity: {d:?}");
         }
 
-        let target = format!("/tmp/{}...", "x".repeat(237));
-        let w = vec![
-            retry_policy_for_tool("Read", 1, "Read first", &target, ""),
-            retry_policy_for_tool("Read", 2, "Read second", &target, ""),
-        ];
-        let d = derive("m", ROLE, &w);
+        for suffix in ["...", "…[truncated]", " …"] {
+            let target = format!("/tmp/{}{suffix}", "x".repeat(237));
+            let w = vec![
+                retry_policy_for_tool("Read", 1, "Read first", &target, ""),
+                retry_policy_for_tool("Read", 2, "Read second", &target, ""),
+            ];
+            let d = derive("m", ROLE, &w);
+            assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
+                    "a truncated target ({suffix}) cannot corroborate identity: {d:?}");
+        }
+    }
+
+    #[test]
+    fn retried_uses_feedback_act_for_exact_identity() {
+        let attempted = format!("{}…[truncated]", "x".repeat(400));
+        let with_feedback = |pos: u64, act: &str| {
+            let mut entry = retry_policy(pos, &attempted, "same-target", "");
+            entry.event_data["feedback"] = json!({"act": act});
+            entry
+        };
+        let denied = with_feedback(1, "whole-act-one");
+        let same = with_feedback(2, "whole-act-one");
+        let d = derive("m", ROLE, &[denied.clone(), same]);
+        assert!(d.temperament.evidence[0].contribution.starts_with("retry-after-deny"),
+                "equal whole-act digests prove a retry despite truncated display text: {d:?}");
+
+        let different = with_feedback(2, "whole-act-two");
+        let d = derive("m", ROLE, &[denied, different]);
         assert!(d.temperament.evidence[0].contribution.starts_with("comply-after-deny"),
-                "a truncated target cannot corroborate identity: {d:?}");
+                "different whole-act digests cannot establish a retry: {d:?}");
     }
 }
