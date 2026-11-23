@@ -8,7 +8,7 @@ This is an implementation audit, not a conformance claim, an intent classifier, 
 
 No `hestia_query_counterfactual` surface exists. `hestia_query_policy` and `hestia policy test` are not that surface:
 
-- `tool_query_policy` in `core/src/server/handler.rs` requires an in-flight `action_id` and appends live chain entries, so it is not a hypothetical, side-effect-free query.
+- `tool_query_policy` in `core/src/server/handler.rs` requires an in-flight `action_id` and can append live chain entries (for a non-allow decision, and for a probe it could not evaluate; an evaluated allow appends nothing), so it is not a hypothetical, side-effect-free query.
 - `cmd_policy_test` in `core/src/cli.rs` opens the operator vault directly and evaluates only the preset/destructive-rule family. It cannot evaluate scope or governance-closure decisions, and it is not a member-facing query.
 - Pure evaluators exist in `evaluate` and `command_scope_reach` (`plugins/_shared/hestia_gate_core.py`) and `classify` (`plugins/_shared/hestia_governance_closure.py`). Calling them from a checkout supplies caller-asserted profiles, grants, and engine bytes. It does not supply an authoritative deployed context, and it does not create the PRD's typed response or side-effect guarantees.
 
