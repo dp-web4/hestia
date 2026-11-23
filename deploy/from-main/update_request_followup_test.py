@@ -6,8 +6,11 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
 
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "hestia-deploy.sh"
@@ -169,7 +172,204 @@ def test_completion_latch_is_wired_on_real_success_exits():
     assert "DEPLOY_COMPLETED=1\n  exit 0" in text
 
 
+def _git_repo(path: Path, files: dict[str, str]) -> None:
+    path.mkdir(parents=True)
+    for name, text in files.items():
+        target = path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
+    subprocess.run(["git", "add", "--", "."], cwd=path, check=True)
+    subprocess.run([
+        "git", "-c", "user.name=Deployment fixture",
+        "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture",
+    ], cwd=path, check=True)
+
+
+def _service_value(unit: str, key: str) -> str:
+    result = subprocess.run([
+        "systemctl", "--user", "show", f"{unit}.service", "-p", key, "--value",
+    ], capture_output=True, text=True, check=False)
+    return result.stdout.strip()
+
+
+def _service_stopped(unit: str) -> bool:
+    return _service_value(unit, "ActiveState") in {"inactive", "failed"}
+
+
+def _wait_for(predicate, description: str, timeout: float = 25) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"timed out waiting for {description}")
+
+
+def _stop_systemd_fixture(unit: str) -> None:
+    subprocess.run([
+        "systemctl", "--user", "stop", f"{unit}.timer", f"{unit}.service",
+    ], capture_output=True, check=False)
+    subprocess.run([
+        "systemctl", "--user", "reset-failed", f"{unit}.service",
+    ], capture_output=True, check=False)
+
+
+def _run_systemd_scenario(scenario: str) -> None:
+    assert shutil.which("systemd-run"), "systemd-run is required for the real supervisor smoke"
+    real_systemctl = shutil.which("systemctl")
+    assert real_systemctl, "systemctl is required for the real supervisor smoke"
+    with tempfile.TemporaryDirectory(prefix=f"hestia-followup-{scenario}-") as raw:
+        root = Path(raw)
+        home = root / "home"
+        hestia_home = home / ".hestia"
+        deploy_root = root / "deploy"
+        sources = root / "sources"
+        stubs = root / "stubs"
+        installed = home / ".local/bin/hestia-deploy"
+        binary = home / ".local/bin/hestia"
+        unit = f"hestia-followup-{os.getpid()}-{scenario}"
+        hestia_home.mkdir(parents=True)
+        hestia_home.chmod(0o700)
+        stubs.mkdir()
+        installed.parent.mkdir(parents=True)
+
+        script_text = SCRIPT.read_text()
+        if scenario == "interrupt":
+            followup_exec = '      trap - EXIT\n      HESTIA_DEPLOY_FOLLOWUP=1 exec "$SELF_INSTALL" full'
+            interrupted_exec = '''      trap - EXIT
+      printf 'interrupted after trap removal before exec\\n' > "$HESTIA_HOME/interrupted-exec.txt"
+      kill -KILL $$
+      HESTIA_DEPLOY_FOLLOWUP=1 exec "$SELF_INSTALL" full'''
+            assert followup_exec in script_text
+            script_text = script_text.replace(followup_exec, interrupted_exec, 1)
+        _git_repo(sources / "hestia", {
+            "deploy/from-main/hestia-deploy.sh": script_text,
+        })
+        _git_repo(sources / "web4", {"README": "web4 fixture\n"})
+        _git_repo(sources / "atlas", {"README": "atlas fixture\n"})
+        for name in ("hestia", "web4"):
+            subprocess.run([
+                "git", "clone", "-q", str(sources / name), str(deploy_root / name),
+            ], check=True)
+        target = subprocess.run([
+            "git", "-C", str(deploy_root / "hestia"), "describe", "--tags", "--match",
+            "v[0-9]*", "--always",
+        ], capture_output=True, text=True, check=True).stdout.strip()
+
+        installed.write_text(script_text)
+        installed.chmod(0o755)
+        binary.write_text("#!/usr/bin/env bash\nprintf 'hestia 0.0.0 (%s)\\n' \"$FIXTURE_TARGET\"\n")
+        binary.chmod(0o755)
+        curl = stubs / "curl"
+        curl.write_text(
+            "#!/usr/bin/env bash\n"
+            "printf '{\"serverInfo\":{\"name\":\"fixture\",\"version\":\"hestia 0.0.0 (%s)\"}}\\n' "
+            "\"$FIXTURE_TARGET\"\n")
+        curl.chmod(0o755)
+        systemctl = stubs / "systemctl"
+        systemctl.write_text("""#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "--user" ] && [ "${2:-}" = "show" ]; then
+  count=0
+  if [ -f "$HESTIA_HOME/systemctl.count" ]; then
+    count="$(<"$HESTIA_HOME/systemctl.count")"
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$HESTIA_HOME/systemctl.count"
+  case "${FIXTURE_SCENARIO}:${count}" in
+    nested:1|interrupt:1) printf 'request-new\n' > "$HESTIA_HOME/deploy-update.request" ;;
+    nested:2) printf 'request-nested\n' > "$HESTIA_HOME/deploy-update.request" ;;
+  esac
+  printf '0\n'
+  exit 0
+fi
+exec "$REAL_SYSTEMCTL" "$@"
+""")
+        systemctl.chmod(0o755)
+        request = hestia_home / "deploy-update.request"
+        status = hestia_home / "deploy-status.tsv"
+        count = hestia_home / "systemctl.count"
+        interrupted = hestia_home / "interrupted-exec.txt"
+        request.write_text("request-old\n")
+        env = {
+            "HOME": str(home),
+            "PATH": f"{stubs}:{os.environ['PATH']}",
+            "HESTIA_HOME": str(hestia_home),
+            "HESTIA_DEPLOY_ROOT": str(deploy_root),
+            "HESTIA_DEPLOY_BRANCH": "main",
+            "HESTIA_BIN": str(binary),
+            "HESTIA_UNIT": f"{unit}-daemon",
+            "HESTIA_RESTART_CMD": "/bin/true",
+            "HESTIA_ATLAS_URL": str(sources / "atlas"),
+            "HESTIA_DEPLOY_HOOKS": "0",
+            "HESTIA_DEPLOY_INVENTORY": "0",
+            "HESTIA_DEPLOY_MESH": "0",
+            "HESTIA_DEPLOY_POST": "0",
+            "FIXTURE_TARGET": target,
+            "FIXTURE_SCENARIO": scenario,
+            "REAL_SYSTEMCTL": real_systemctl,
+        }
+        command = [
+            "systemd-run", "--user", f"--unit={unit}", "--service-type=oneshot",
+            "--on-active=1", "--on-unit-inactive=20", "--timer-property=AccuracySec=1s",
+            "--property=TimeoutStartSec=30",
+        ]
+        command.extend(f"--setenv={key}={value}" for key, value in env.items())
+        command.extend(["/usr/bin/bash", str(installed)])
+
+        def status_is(request_id: str) -> bool:
+            return status.exists() and status.read_text().startswith(f"succeeded\t{request_id}\t")
+
+        def count_is(expected: int) -> bool:
+            return count.exists() and count.read_text().strip() == str(expected)
+
+        try:
+            subprocess.run(command, capture_output=True, text=True, check=True, timeout=15)
+            if scenario == "interrupt":
+                _wait_for(lambda: (
+                    _service_stopped(unit)
+                    and count_is(1) and status_is("request-old") and interrupted.exists()
+                    and request.exists() and request.read_text() == "request-new\n"
+                ), "interrupted parent with the new request still queued")
+                assert "exec" in interrupted.read_text()
+                assert _service_value(unit, "Result") == "signal"
+                _wait_for(lambda: (
+                    _service_stopped(unit)
+                    and count_is(2) and status_is("request-new") and not request.exists()
+                ), "next timer tick recovering the interrupted request")
+            else:
+                _wait_for(lambda: (
+                    _service_stopped(unit)
+                    and count_is(2) and status_is("request-new")
+                    and request.exists() and request.read_text() == "request-nested\n"
+                ), "nested request deferred by the bounded follow-up")
+                _wait_for(lambda: (
+                    _service_stopped(unit)
+                    and count_is(3) and status_is("request-nested") and not request.exists()
+                ), "next timer tick recovering the nested request")
+        except Exception as error:
+            log = hestia_home / "deploy.log"
+            detail = log.read_text() if log.exists() else "no deploy log"
+            for name in ("interrupted-exec.txt",):
+                marker = hestia_home / name
+                if marker.exists():
+                    detail += f"\n{name}:\n{marker.read_text()}"
+            raise AssertionError(f"{scenario} fixture failed: {error}\n{detail}") from error
+        finally:
+            _stop_systemd_fixture(unit)
+
+
+def test_real_systemd_timer_recovery() -> None:
+    _run_systemd_scenario("interrupt")
+    _run_systemd_scenario("nested")
+
+
 def main() -> None:
+    if "--systemd-smoke" in sys.argv[1:]:
+        test_real_systemd_timer_recovery()
+        print("ok: 2 real systemd update-followup recovery checks")
+        return
     test_new_request_gets_one_immediate_followup()
     test_request_from_prior_claim_gets_followup_too()
     test_followup_guard_prevents_an_immediate_loop()
