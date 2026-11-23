@@ -332,9 +332,9 @@ def test_hub_deploy_closure_is_write():
     # PR #415 / web4 #709 hand-off: the hub deploy closure joins the floor. Refusing the
     # WRITE is the R7c limb; #708's STALE detection after the fact is not the same control.
     for tgt in ("/etc/systemd/system/web4-hub.service",
-                "/mnt/c/exe/projects/ai-agents/web4/ratified-build.json",
-                "/mnt/c/exe/projects/ai-agents/web4/tools/ratify-build.sh",
-                "/mnt/c/exe/projects/ai-agents/web4/hub/target/release/hub"):
+                "/opt/web4/ratified-build.json",
+                "/opt/web4/tools/ratify-build.sh",
+                "/opt/web4/hub/target/release/hub"):
         v = cls("Write", {"file_path": tgt})
         check(f"hub_write:{tgt}", v.classification == "write", str(v))
     # Segment discipline: a bare "hub" elsewhere must NOT match the executable entry.
