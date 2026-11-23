@@ -5,7 +5,7 @@ use std::process::Command;
 fn gate_evaluate_is_callable_through_real_mcp() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
     let out = Command::new("python3")
-        .arg(root.join("tools/gate_evaluate_mcp_test.py"))
+        .arg(root.join("tools/gate_evaluate_mcp_smoke.py"))
         .arg(env!("CARGO_BIN_EXE_hestia"))
         .output()
         .unwrap();

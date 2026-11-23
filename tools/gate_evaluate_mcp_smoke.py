@@ -56,7 +56,7 @@ def main(binary: str) -> int:
             mechanism = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = mechanism
             spec.loader.exec_module(mechanism)
-            mcp = mechanism._McpHttp(f"http://127.0.0.1:{port}/mcp", time.monotonic() + 90)
+            mcp = mechanism._McpHttp(f"http://127.0.0.1:{port}/mcp", time.monotonic() + 90, request_cap=None)
             if "result" not in mcp.initialize():
                 raise RuntimeError("initialize failed")
             mcp.initialized()
@@ -107,5 +107,5 @@ def main(binary: str) -> int:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        raise SystemExit("usage: gate_evaluate_mcp_test.py <hestia-binary>")
+        raise SystemExit("usage: gate_evaluate_mcp_smoke.py <hestia-binary>")
     sys.exit(main(sys.argv[1]))
