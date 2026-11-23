@@ -87,7 +87,7 @@ def run_hook(home: Path, endpoint: str, host_session: str,
         "tool_input": {"command": "echo hi"},
     }
     if event_name == "PostToolUseFailure":
-        event["error"] = {"code": "internal", "message": "exit status 1"}
+        event["error"] = "Exit code 1\nError: Cannot find module 'express'"
     else:
         event["tool_response"] = {"stdout": "hi"}
     env = {k: v for k, v in os.environ.items() if not k.startswith("HESTIA_")}
@@ -170,7 +170,8 @@ def main() -> int:
             if failures:
                 args = failures[0]["args"]
                 check("the terminal outcome is a failure, not success-by-default",
-                      args.get("success") is False and args.get("error") == "exit status 1",
+                      args.get("success") is False
+                      and args.get("error") == "Exit code 1\nError: Cannot find module 'express'",
                       json.dumps(args))
     finally:
         server.shutdown()

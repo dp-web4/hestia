@@ -1121,6 +1121,15 @@ def prepare_member(member: str, spec: dict, template: dict, home: str, *, dry: b
     L = got
     flat = L.layout == "flat"
     regs = index_hooks(L.hooks, flat)
+    post_targets = {os.path.normpath(d.target) for d in L.desired
+                    if d.event == "PostToolUse" and d.base == "witness.py" and d.target}
+    foreign_post = any(r.event == "PostToolUse" and r.base == "witness.py"
+                       and os.path.normpath(r.target) not in post_targets for r in regs)
+    if foreign_post:
+        # A foreign witness owns the whole outcome lifecycle. Do not split success and failure
+        # across two witnesses by installing Hestia only for failures.
+        L.desired = [d for d in L.desired
+                     if not (d.event == "PostToolUseFailure" and d.base == "witness.py")]
     P = plan_reconcile(L.desired, regs, L.hooks, L.layout, installed=installed, dry=dry, plan_mode=plan)
     if plan:
         return "plan", [f"{b}\t{t}" for b, t in P.planned] + \
