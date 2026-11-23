@@ -19874,6 +19874,38 @@ mod tests {
         );
         drop(rows);
 
+        let err = gate_claim_and_escalate(
+            &shared,
+            &json!({
+                "plugin_id": "kimi-code",
+                "session_id": session,
+                "tool_name": "Edit",
+                "marker": "<gate-hook>",
+                "reason": "Edit -> <gate-hook>",
+                "host_session_id": "host-wake-asserted-elsewhere",
+            }),
+        )
+        .await
+        .expect_err("the derived-key arm must refuse the same mismatch");
+        assert!(err.to_string().contains("host session mismatch"), "{err}");
+        let rows = shared.lock().await.recent_chain(50);
+        let refused = rows
+            .iter()
+            .find(|e| {
+                e.event_type == "gate_escalation_refused"
+                    && e.event_data["why"] == "host session mismatch"
+                    && e.event_data["request_key_basis"] == "derived_identity_mismatch"
+            })
+            .expect("a mismatch without a caller key must record its derived basis");
+        assert_eq!(
+            refused.event_data["request_key"],
+            crate::server::gate_escalation::request_key_for_act(
+                "kimi-code", "<gate-hook>", "Edit -> <gate-hook>", Some("host-wake-proven"),
+            )
+        );
+        assert_eq!(refused.event_data["spent"], false);
+        drop(rows);
+
         // And the approval was not burned by the refusal: the corrected claim still works.
         let ok = gate_claim_and_escalate(
             &shared,
@@ -20069,7 +20101,38 @@ mod tests {
         assert!(rows.iter().all(|e| e.event_type != "gate_escalation_claimed"),
                 "#540 chain invariant: claimed without decided is zero");
         assert!(rows.iter().all(|e| e.event_type != "gate_escalation_decided"),
-                "the fixture never decided an escalation");
+                "the fixture has not decided an escalation yet");
+        drop(rows);
+
+        let opened = gate_claim_and_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Edit", "marker": "approved-540.py",
+            "reason": "Edit -> approved-540.py",
+        })).await.unwrap();
+        let esc_id = opened["escalation_id"].as_str().unwrap();
+        let peer = tool_connect(&shared, &json!({
+            "plugin_id": "codex", "host_agent": "h",
+        })).await.unwrap();
+        let decided = tool_gate_arbitrate_escalation(&shared, &json!({
+            "escalation_id": esc_id, "approve": true,
+            "session_id": peer["sessionId"], "reason": "cross-peer approval for the claim invariant",
+        })).await.unwrap();
+        assert_eq!(decided["status"], "approved", "{decided}");
+        let claimed = gate_claim_and_escalate(&shared, &json!({
+            "plugin_id": "kimi-code", "session_id": session,
+            "tool_name": "Edit", "marker": "approved-540.py",
+            "reason": "Edit -> approved-540.py",
+        })).await.unwrap();
+        assert_eq!(claimed["claimed"], true, "{claimed}");
+
+        let rows = shared.lock().await.recent_chain(50);
+        let approved = rows.iter().filter(|e| {
+            e.event_type == "gate_escalation_decided" && e.event_data["status"] == "approved"
+        }).count();
+        let claimed = rows.iter().filter(|e| e.event_type == "gate_escalation_claimed").count();
+        assert_eq!(approved, 1, "the invariant needs a real approved decision: {rows:?}");
+        assert!(claimed <= approved,
+                "#540 chain invariant: every claimed row needs an approved decision: {rows:?}");
     }
 
     /// Negative control for both tests above. A row that appears no matter what the guard
