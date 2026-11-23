@@ -9,7 +9,8 @@ Usage:
 The JSON is the editable source. The Markdown report and its blocker index are derived
 artifacts. A rung names the strongest evidence, not a product-completion verdict. A successful
 `check --remote` stamps that verification into the JSON and rewrites the report; a failed check
-changes nothing.
+changes nothing. Offline `check` requires the baseline to be an ancestor of HEAD; `generate`
+and `check --remote` also require it to equal current origin/main (a re-measure is claimed).
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import json
 import pathlib
 import re
 import subprocess
+import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 DATA = pathlib.Path("docs/PRD_READINESS.json")
@@ -49,25 +51,48 @@ def _positive_ints(value: object) -> bool:
             and len(set(value)) == len(value))
 
 
-def validate(data: dict, root: pathlib.Path = REPO) -> list[str]:
+def _git(root: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=False)
+
+
+def baseline_problems(baseline: dict, root: pathlib.Path = REPO) -> list[str]:
+    """Offline baseline check: well-formed, and an existing ancestor of HEAD.
+
+    Freshness against origin/main is not checked here: main moves after every merge, and a
+    shallow CI checkout has no origin/main. When history is shallow and the commit is absent,
+    ancestry is skipped with a note on stderr rather than failed.
+    """
     problems = []
-    baseline = data.get("baseline", {})
     if baseline.get("ref") != "origin/main":
         problems.append("baseline.ref must be origin/main")
     commit = baseline.get("commit", "")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        problems.append("baseline.commit must be a full lowercase Git commit id")
-    else:
-        head = subprocess.run(["git", "rev-parse", "origin/main"], cwd=root,
-                              capture_output=True, text=True, check=False)
-        if head.returncode != 0:
-            problems.append("origin/main could not be resolved")
-        elif commit != head.stdout.strip():
-            problems.append("baseline.commit is not current origin/main")
-        exists = subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], cwd=root,
-                                capture_output=True, text=True, check=False)
-        if exists.returncode != 0:
+        return problems + ["baseline.commit must be a full lowercase Git commit id"]
+    if _git(root, "cat-file", "-e", f"{commit}^{{commit}}").returncode != 0:
+        if _git(root, "rev-parse", "--is-shallow-repository").stdout.strip() == "true":
+            print(f"SKIP baseline.commit {commit[:12]} is not in this shallow history; "
+                  "ancestry unchecked", file=sys.stderr)
+        else:
             problems.append("baseline.commit does not exist")
+    elif _git(root, "merge-base", "--is-ancestor", commit, "HEAD").returncode != 0:
+        problems.append("baseline.commit is not an ancestor of HEAD")
+    return problems
+
+
+def freshness_problems(baseline: dict, root: pathlib.Path = REPO) -> list[str]:
+    """Re-measure check, run only by `generate` and `check --remote`."""
+    head = _git(root, "rev-parse", "--verify", "-q", "origin/main^{commit}")
+    if head.returncode != 0:
+        return ["origin/main could not be resolved"]
+    if baseline.get("commit") != head.stdout.strip():
+        return ["baseline.commit is not current origin/main"]
+    return []
+
+
+def validate(data: dict, root: pathlib.Path = REPO) -> list[str]:
+    problems = []
+    baseline = data.get("baseline", {})
+    problems.extend(baseline_problems(baseline, root))
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", baseline.get("measured_at", "")):
         problems.append("baseline.measured_at must be a UTC ISO timestamp")
 
@@ -249,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     data = load()
     problems = validate(data)
+    if args.remote or args.command == "generate":
+        problems.extend(freshness_problems(data["baseline"]))
     if args.remote:
         problems.extend(remote_problems(data))
     if args.remote and not problems:

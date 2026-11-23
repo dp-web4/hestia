@@ -7,6 +7,7 @@ import copy
 import importlib.util
 import json
 import pathlib
+import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -16,6 +17,24 @@ ROOT = HERE.parent
 SPEC = importlib.util.spec_from_file_location("prd_readiness", HERE / "prd_readiness.py")
 PR = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PR)
+
+
+def _run_git(cwd: pathlib.Path, *args: str) -> str:
+    result = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                            cwd=cwd, capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
+def _two_commit_repo(repo: pathlib.Path) -> tuple[str, str]:
+    repo.mkdir()
+    _run_git(repo, "init", "-q")
+    commits = []
+    for name in ("a", "b"):
+        (repo / name).write_text(name, encoding="utf-8")
+        _run_git(repo, "add", name)
+        _run_git(repo, "commit", "-q", "-m", name)
+        commits.append(_run_git(repo, "rev-parse", "HEAD"))
+    return commits[0], commits[1]
 
 
 class ReadinessTest(unittest.TestCase):
@@ -35,10 +54,45 @@ class ReadinessTest(unittest.TestCase):
         broken["rows"] = [row for row in broken["rows"] if row["id"] != "5.5"]
         self.assertIn("missing required PRD row: 5.5", PR.validate(broken))
 
-    def test_stale_baseline_is_rejected(self):
-        broken = copy.deepcopy(self.data)
-        broken["baseline"]["commit"] = "7f0a9da8f910b7d5505278e072bf3e4f4d79103f"
-        self.assertIn("baseline.commit is not current origin/main", PR.validate(broken))
+    def test_offline_baseline_check_does_not_require_current_origin_main(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp) / "repo"
+            first, second = _two_commit_repo(repo)
+            # origin/main moved past the baseline: offline check still passes.
+            _run_git(repo, "update-ref", "refs/remotes/origin/main", second)
+            self.assertEqual(PR.baseline_problems({"ref": "origin/main", "commit": first}, repo), [])
+            # No origin/main at all (shallow CI checkout): offline check still passes.
+            _run_git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+            self.assertEqual(PR.baseline_problems({"ref": "origin/main", "commit": first}, repo), [])
+
+    def test_shallow_checkout_without_baseline_commit_skips_ancestry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp) / "repo"
+            first, _second = _two_commit_repo(repo)
+            shallow = pathlib.Path(tmp) / "shallow"
+            _run_git(pathlib.Path(tmp), "clone", "-q", "--depth", "1", repo.as_uri(), str(shallow))
+            self.assertEqual(PR.baseline_problems({"ref": "origin/main", "commit": first}, shallow), [])
+
+    def test_baseline_must_exist_and_be_an_ancestor_in_full_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp) / "repo"
+            first, second = _two_commit_repo(repo)
+            self.assertIn("baseline.commit does not exist", PR.baseline_problems(
+                {"ref": "origin/main", "commit": "7f0a9da8f910b7d5505278e072bf3e4f4d79103f"}, repo))
+            _run_git(repo, "checkout", "-q", first)
+            self.assertIn("baseline.commit is not an ancestor of HEAD", PR.baseline_problems(
+                {"ref": "origin/main", "commit": second}, repo))
+
+    def test_stale_baseline_is_rejected_by_the_remeasure_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = pathlib.Path(tmp) / "repo"
+            first, second = _two_commit_repo(repo)
+            self.assertEqual(PR.freshness_problems({"commit": first}, repo),
+                             ["origin/main could not be resolved"])
+            _run_git(repo, "update-ref", "refs/remotes/origin/main", second)
+            self.assertEqual(PR.freshness_problems({"commit": first}, repo),
+                             ["baseline.commit is not current origin/main"])
+            self.assertEqual(PR.freshness_problems({"commit": second}, repo), [])
 
     def test_rung_cannot_exceed_named_evidence(self):
         broken = copy.deepcopy(self.data)
@@ -89,24 +143,45 @@ class ReadinessTest(unittest.TestCase):
 
         self.assertEqual(PR.remote_problems(self.data, runner=runner), [])
 
+    def _run_main_in(self, root, data, argv, remote=()):
+        (root / "docs").mkdir(exist_ok=True)
+        (root / PR.DATA).write_text(json.dumps(data), encoding="utf-8")
+        saved = PR.REPO, PR.validate, PR.remote_problems, PR.freshness_problems
+        PR.REPO = root
+        PR.validate = lambda _data: []
+        PR.remote_problems = lambda _data, **_kwargs: list(remote)
+        PR.freshness_problems = lambda _baseline: []
+        try:
+            return PR.main(argv)
+        finally:
+            PR.REPO, PR.validate, PR.remote_problems, PR.freshness_problems = saved
+
     def test_remote_check_stamps_success_into_json_and_report(self):
+        unstamped = copy.deepcopy(self.data)
+        unstamped.pop("remote_verified_at", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.assertEqual(self._run_main_in(root, unstamped, ["check", "--remote"]), 0)
+            written = json.loads((root / PR.DATA).read_text(encoding="utf-8"))
+            stamp = written.get("remote_verified_at")
+            self.assertIsNotNone(stamp, "a successful remote check must stamp the JSON")
+            self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+            self.assertIn(f"Open work remotely verified:** `{stamp}`",
+                          (root / PR.REPORT).read_text(encoding="utf-8"))
+
+    def test_failed_remote_check_changes_nothing(self):
+        unstamped = copy.deepcopy(self.data)
+        unstamped.pop("remote_verified_at", None)
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             (root / "docs").mkdir()
-            (root / PR.DATA).write_text(json.dumps(self.data), encoding="utf-8")
-            old_repo, old_validate, old_remote = PR.REPO, PR.validate, PR.remote_problems
-            PR.REPO = root
-            PR.validate = lambda _data: []
-            PR.remote_problems = lambda _data, **_kwargs: []
-            try:
-                self.assertEqual(PR.main(["check", "--remote"]), 0)
-                written = json.loads((root / PR.DATA).read_text(encoding="utf-8"))
-                stamp = written["remote_verified_at"]
-                self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-                self.assertIn(f"Open work remotely verified:** `{stamp}`",
-                              (root / PR.REPORT).read_text(encoding="utf-8"))
-            finally:
-                PR.REPO, PR.validate, PR.remote_problems = old_repo, old_validate, old_remote
+            (root / PR.REPORT).write_text("previous report\n", encoding="utf-8")
+            before = json.dumps(unstamped)
+            status = self._run_main_in(root, unstamped, ["check", "--remote"],
+                                       remote=["5.1: issue #1 is closed or missing"])
+            self.assertEqual(status, 1)
+            self.assertEqual((root / PR.DATA).read_text(encoding="utf-8"), before)
+            self.assertEqual((root / PR.REPORT).read_text(encoding="utf-8"), "previous report\n")
 
     def test_remote_check_rejects_closed_or_missing_references(self):
         def runner(args, **_kwargs):
@@ -131,20 +206,12 @@ class ReadinessTest(unittest.TestCase):
     def test_future_row_update_can_regenerate_incrementally(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            (root / "docs").mkdir()
             updated = copy.deepcopy(self.data)
             updated["rows"][0]["unknown"] = "A new measurement is still owed."
-            (root / PR.DATA).write_text(json.dumps(updated), encoding="utf-8")
-            old_repo, old_validate = PR.REPO, PR.validate
-            PR.REPO = root
-            PR.validate = lambda _data: []
-            try:
-                self.assertEqual(PR.main(["generate"]), 0)
-                report = root / PR.REPORT
-                self.assertTrue(report.exists())
-                self.assertIn("A new measurement is still owed.", report.read_text(encoding="utf-8"))
-            finally:
-                PR.REPO, PR.validate = old_repo, old_validate
+            self.assertEqual(self._run_main_in(root, updated, ["generate"]), 0)
+            report = root / PR.REPORT
+            self.assertTrue(report.exists())
+            self.assertIn("A new measurement is still owed.", report.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
