@@ -18831,14 +18831,21 @@ mod tests {
         {
             let s = shared.lock().await;
             let req = &s.scope_requests[&request_id];
+            let terminal: Vec<_> = s.recent_chain(50).into_iter().filter(|e| {
+                matches!(e.event_type.as_str(), "scope_granted" | "scope_refused" | "scope_withdrawn")
+                    && e.event_data["request_id"] == request_id
+            }).collect();
+            assert_eq!(terminal.len(), 1, "exactly one terminal witness is required: {terminal:?}");
             match req.status(crate::server::gate_escalation::now_secs()) {
                 "withdrawn" => {
+                    assert_eq!(terminal[0].event_type, "scope_withdrawn");
                     assert_eq!(withdrawal["status"], "withdrawn", "{withdrawal}");
                     assert_eq!(decision["_hestia_error"]["code"],
                                "hestia.scope_peer_decide_refused", "{decision}");
                     assert!(!s.has_scope_grant("kimi-code", &req.path));
                 }
                 "granted" => {
+                    assert_eq!(terminal[0].event_type, "scope_granted");
                     assert_eq!(decision["granted"], true, "{decision}");
                     assert_eq!(withdrawal["_hestia_error"]["code"],
                                "hestia.scope_withdraw_not_pending", "{withdrawal}");
