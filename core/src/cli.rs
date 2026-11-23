@@ -6162,7 +6162,7 @@ fn cmd_hub_disconnect(home: &std::path::Path, target: &str) -> AnyResult<()> {
 fn ensure_member_identity(
     vault: &mut Vault,
 ) -> AnyResult<(uuid::Uuid, web4_core::crypto::KeyPair)> {
-    crate::hub::ensure_member_identity(vault)
+    hestia::hub::ensure_member_identity(vault)
 }
 
 fn cmd_hub_join(home: &std::path::Path, target: &str, name: Option<String>) -> AnyResult<()> {
