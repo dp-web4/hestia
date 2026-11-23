@@ -6472,11 +6472,18 @@
         }
         const coverageOverlaps = Array.isArray(out.coverage_overlaps) ? out.coverage_overlaps : [];
         if (coverageOverlaps.length) {
-          const described = coverageOverlaps.slice(0, 3).map(o =>
-            `${o.relation === 'existing_covers_new' ? 'existing covers new' : 'new covers existing'}: ${o.path}`);
+          // PATH containment only (NOVA, #1638): the server compares paths, not modes, reach or
+          // expiry, so the label says "path" and the existing grant's own terms are shown beside it.
+          const described = coverageOverlaps.slice(0, 3).map(o => {
+            const reach = o.recursive ? 'recursive' : 'exact';
+            const until = o.expires_at ? `expires ${new Date(o.expires_at * 1000).toISOString().slice(0, 16)}Z` : 'until revoked';
+            return `${o.relation === 'existing_path_covers_new' ? 'existing path covers new' : 'new path covers existing'}: `
+              + `${o.path} (modes ${o.modes || '?'}, ${reach}, ${until})`;
+          });
           const remainder = coverageOverlaps.length > 3 ? ` (+${coverageOverlaps.length - 3} more)` : '';
-          ok.innerHTML += `<br><strong>Coverage overlap:</strong> ${escapeHtml(described.join('; ') + remainder)}.
-            Existing rows are retained; modes, exact/recursive reach, and expiry can differ intentionally.`;
+          ok.innerHTML += `<br><strong>Path overlap:</strong> ${escapeHtml(described.join('; ') + remainder)}.
+            Existing rows are retained; a path overlap does not make either grant redundant —
+            modes, exact/recursive reach, and expiry can differ intentionally.`;
         }
         ok.hidden = false;
         path.value = ''; reason.value = '';

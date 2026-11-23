@@ -4959,12 +4959,16 @@ async fn scope_grant(
         .iter()
         .filter(|g| g.member == plugin_id && g.is_live(now) && g.path != path)
         .filter_map(|g| {
+            // A PATH relation, and named as one (NOVA, #1638): containment of paths alone.
+            // Modes, reach and expiry are NOT compared, so neither grant is implied redundant;
+            // the row carries the existing grant's own modes/reach/expiry for the reader to
+            // compare. This label is recorded in the witnessed intent, so it must not overclaim.
             let relation = if g.covers(&path) {
-                "existing_covers_new"
+                "existing_path_covers_new"
             } else if recursive
                 && crate::server::standing_scope::covers_path(&path, true, &g.path)
             {
-                "new_covers_existing"
+                "new_path_covers_existing"
             } else {
                 return None;
             };
@@ -9650,7 +9654,7 @@ mod disposition_tests {
         })).await;
         assert_eq!(st, StatusCode::OK, "{child}");
         assert_eq!(child["coverage_overlaps"].as_array().unwrap().len(), 1, "{child}");
-        assert_eq!(child["coverage_overlaps"][0]["relation"], "existing_covers_new");
+        assert_eq!(child["coverage_overlaps"][0]["relation"], "existing_path_covers_new");
         assert_eq!(child["coverage_overlaps"][0]["path"], "/w/root");
         assert_eq!(child["replaced_existing"], serde_json::json!(false));
 
@@ -9667,9 +9671,104 @@ mod disposition_tests {
         assert_eq!(st, StatusCode::OK, "{wider}");
         let overlaps = wider["coverage_overlaps"].as_array().unwrap();
         assert_eq!(overlaps.len(), 2, "{wider}");
-        assert!(overlaps.iter().all(|row| row["relation"] == "new_covers_existing"), "{wider}");
+        assert!(overlaps.iter().all(|row| row["relation"] == "new_path_covers_existing"), "{wider}");
         assert_eq!(state.lock().await.standing_scope.grants.len(), 3,
                    "coverage is reported, never silently merged");
+    }
+
+    /// The overlap row is a PATH relation carrying the existing grant's own terms, so the
+    /// reader compares modes, reach and expiry instead of inferring redundancy (NOVA, #1638).
+    #[tokio::test]
+    async fn a_coverage_overlap_carries_the_existing_grants_modes_reach_and_expiry() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, root) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root", "recursive": true, "modes": "r",
+            "expires_in_secs": 3600, "reason": "read the tree for an hour"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{root}");
+        let (st, child) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root/child", "modes": "rw", "reason": "write one"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{child}");
+        let o = &child["coverage_overlaps"][0];
+        assert_eq!(o["relation"], "existing_path_covers_new", "{child}");
+        assert_eq!(o["modes"], "r", "the EXISTING grant's modes, not the new one's: {child}");
+        assert_eq!(o["recursive"], serde_json::json!(true), "{child}");
+        assert_eq!(o["expires_at"], root["expires_at"], "{child}");
+    }
+
+    /// An EXPIRED grant reaches nothing, so it overlaps nothing: a lapsed recursive row over
+    /// the new path must not be reported as covering it (the `is_live` filter).
+    #[tokio::test]
+    async fn an_expired_grant_is_not_reported_as_a_coverage_overlap() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "hub-being".into(), path: "/w/old".into(), granted_at: now - 7200,
+                granted_by: "operator".into(), reason: "lapsed".into(), expires_at: Some(now - 1),
+                request_id: None, recursive: true,
+                modes: crate::server::grant_modes::Modes::ALL,
+            })).unwrap();
+        }
+        let (st, out) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/old/child", "reason": "after it lapsed"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert!(out["coverage_overlaps"].as_array().unwrap().is_empty(),
+                "an expired row covers nothing: {out}");
+    }
+
+    /// The SAME path with different modes and expiry is a replacement, not an overlap: last
+    /// edit wins, one row remains, and it holds the new terms -- nothing merged.
+    #[tokio::test]
+    async fn the_same_path_with_other_modes_and_expiry_replaces_and_is_not_an_overlap() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, first) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/same", "modes": "r", "expires_in_secs": 3600,
+            "reason": "read for an hour"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{first}");
+        let (st, second) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/same", "modes": "rw", "reason": "read and write"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{second}");
+        assert_eq!(second["replaced_existing"], serde_json::json!(true), "{second}");
+        assert!(second["coverage_overlaps"].as_array().unwrap().is_empty(), "{second}");
+        let s = state.lock().await;
+        let rows: Vec<_> = s.standing_scope.grants.iter()
+            .filter(|g| g.member == "hub-being" && g.path == "/w/same").collect();
+        assert_eq!(rows.len(), 1, "replaced, not merged or duplicated");
+        assert_eq!(rows[0].modes.as_letters(), "rw");
+        assert_eq!(rows[0].expires_at, None, "the new grant's expiry, not the old one's");
+    }
+
+    /// Containment is at the separator at the route too: `/w/a` (recursive) and `/w/ab` share
+    /// a string prefix and no path, in either order of granting.
+    #[tokio::test]
+    async fn a_sibling_prefix_is_not_a_coverage_overlap_in_either_direction() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, ab) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/ab", "reason": "sibling"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{ab}");
+        let (st, a) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/a", "recursive": true, "reason": "tree"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{a}");
+        assert!(a["coverage_overlaps"].as_array().unwrap().is_empty(),
+                "new /w/a/** does not cover existing /w/ab: {a}");
+        let (st, abc) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/abc", "reason": "another sibling"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{abc}");
+        assert!(abc["coverage_overlaps"].as_array().unwrap().is_empty(),
+                "existing /w/a/** does not cover new /w/abc: {abc}");
     }
 
     #[test]

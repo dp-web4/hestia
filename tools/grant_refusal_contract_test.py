@@ -141,10 +141,14 @@ COVERAGE = {"status": 200, "body": {
     "ok": True, "member_known": True, "plugin_id": "claude-code", "path": "/w/root/child",
     "replaced_existing": True,
     "coverage_overlaps": [
-        {"path": "/w/root", "relation": "existing_covers_new"},
-        {"path": "/w/root/other", "relation": "new_covers_existing"},
-        {"path": "/w/root/third", "relation": "existing_covers_new"},
-        {"path": "/w/root/fourth", "relation": "existing_covers_new"},
+        {"path": "/w/root", "relation": "existing_path_covers_new", "modes": "r", "recursive": True,
+         "expires_at": 1798761600},
+        {"path": "/w/root/other", "relation": "new_path_covers_existing", "modes": "rwed", "recursive": False,
+         "expires_at": None},
+        {"path": "/w/root/third", "relation": "existing_path_covers_new", "modes": "rw", "recursive": True,
+         "expires_at": None},
+        {"path": "/w/root/fourth", "relation": "existing_path_covers_new", "modes": "rwed", "recursive": True,
+         "expires_at": None},
     ],
 }}
 
@@ -208,10 +212,16 @@ def behaviour() -> None:
     html = next((row["html"] for row in run([COVERAGE], "coverage") if "html" in row), "")
     check("replacement is rendered, not left only in the JSON response",
           "Replaced the existing grant on this member and path." in html)
-    for fragment in ("existing covers new: /w/root", "new covers existing: /w/root/other",
-                     "existing covers new: /w/root/third", "(+1 more)",
+    # A PATH relation is labelled as one, with the existing grant's own modes/reach/expiry
+    # beside it -- never the bare "covers" that reads as authority redundancy (NOVA, #1638).
+    for fragment in ("existing path covers new: /w/root (modes r, recursive, expires 2027-01-01T00:00Z)",
+                     "new path covers existing: /w/root/other (modes rwed, exact, until revoked)",
+                     "existing path covers new: /w/root/third (modes rw, recursive, until revoked)",
+                     "(+1 more)", "a path overlap does not make either grant redundant",
                      "modes, exact/recursive reach, and expiry can differ intentionally"):
         check(f"coverage feedback includes {fragment!r}", fragment in html)
+    for bare in ("existing covers new", "new covers existing"):
+        check(f"no bare authority-sounding label {bare!r}", bare not in html)
 
 
 def test_grant_refusal_contract() -> None:
