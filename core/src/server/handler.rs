@@ -18662,8 +18662,7 @@ mod tests {
         r["sessionId"].as_str().unwrap().to_string()
     }
 
-    #[tokio::test]
-    async fn an_asker_can_withdraw_a_pending_scope_request() {
+    async fn pending_scope_withdrawal() -> (TempDir, SharedState, String, String, String) {
         let (_dir, shared) = make_shared_state();
         let asker = connect_as(&shared, "kimi-code").await;
         let peer = connect_as(&shared, "codex").await;
@@ -18694,6 +18693,12 @@ mod tests {
         .unwrap();
         let request_id = opened["request_id"].as_str().unwrap().to_string();
         assert_eq!(opened["verdict"], "opened", "{opened}");
+        (_dir, shared, asker, peer, request_id)
+    }
+
+    #[tokio::test]
+    async fn an_asker_can_withdraw_a_pending_scope_request() {
+        let (_dir, shared, asker, peer, request_id) = pending_scope_withdrawal().await;
 
         let err = tool_scope_withdraw(
             &shared,
@@ -18804,6 +18809,141 @@ mod tests {
         assert_eq!(historical["granted"], false, "{historical}");
         assert_eq!(historical["decided_by"], "asker:kimi-code", "{historical}");
         assert_eq!(historical["withdrawn_by"], "kimi-code", "{historical}");
+    }
+
+    #[tokio::test]
+    async fn scope_withdrawal_and_peer_decision_have_one_terminal_winner() {
+        let (_dir, shared, asker, peer, request_id) = pending_scope_withdrawal().await;
+        let decide_args = json!({
+            "request_id": request_id, "session_id": peer,
+            "decision": "session", "reason": "review and grant this exact pending read",
+        });
+        let withdraw_args = json!({
+            "request_id": request_id, "session_id": asker,
+            "reason": "withdraw this probe before any peer grants it",
+        });
+        let (decision, withdrawal) = tokio::join!(
+            tool_scope_peer_decide(&shared, &decide_args),
+            tool_scope_withdraw(&shared, &withdraw_args),
+        );
+        let decision = decision.unwrap();
+        let withdrawal = withdrawal.unwrap();
+        {
+            let s = shared.lock().await;
+            let req = &s.scope_requests[&request_id];
+            match req.status(crate::server::gate_escalation::now_secs()) {
+                "withdrawn" => {
+                    assert_eq!(withdrawal["status"], "withdrawn", "{withdrawal}");
+                    assert_eq!(decision["_hestia_error"]["code"],
+                               "hestia.scope_peer_decide_refused", "{decision}");
+                    assert!(!s.has_scope_grant("kimi-code", &req.path));
+                }
+                "granted" => {
+                    assert_eq!(decision["granted"], true, "{decision}");
+                    assert_eq!(withdrawal["_hestia_error"]["code"],
+                               "hestia.scope_withdraw_not_pending", "{withdrawal}");
+                    assert!(s.has_scope_grant("kimi-code", &req.path));
+                }
+                other => panic!("one terminal winner is required, got {other}"),
+            }
+        }
+
+        let (_dir2, shared, asker, peer, request_id) = pending_scope_withdrawal().await;
+        let granted = tool_scope_peer_decide(&shared, &json!({
+            "request_id": request_id, "session_id": peer,
+            "decision": "session", "reason": "the peer ruling lands before the withdrawal",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(granted["granted"], true, "{granted}");
+        let late = tool_scope_withdraw(&shared, &json!({
+            "request_id": request_id, "session_id": asker,
+            "reason": "a late withdrawal cannot erase a prior ruling",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(late["_hestia_error"]["code"], "hestia.scope_withdraw_not_pending", "{late}");
+        let s = shared.lock().await;
+        let path = s.scope_requests[&request_id].path.clone();
+        assert!(s.has_scope_grant("kimi-code", &path));
+    }
+
+    #[tokio::test]
+    async fn an_expired_scope_request_cannot_be_withdrawn_or_granted() {
+        let (_dir, shared, asker, peer, request_id) = pending_scope_withdrawal().await;
+        shared.lock().await.scope_requests.get_mut(&request_id).unwrap().expires_at =
+            crate::server::gate_escalation::now_secs().saturating_sub(1);
+        let withdrawn = tool_scope_withdraw(&shared, &json!({
+            "request_id": request_id, "session_id": asker,
+            "reason": "an already expired request is not withdrawable",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(withdrawn["_hestia_error"]["code"], "hestia.scope_withdraw_not_pending");
+        assert_eq!(withdrawn["_hestia_error"]["data"]["status"], "expired");
+        let decided = tool_scope_peer_decide(&shared, &json!({
+            "request_id": request_id, "session_id": peer,
+            "decision": "session", "reason": "an expired request is not grantable either",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(decided["_hestia_error"]["code"], "hestia.scope_peer_decide_refused");
+        let s = shared.lock().await;
+        let path = s.scope_requests[&request_id].path.clone();
+        assert!(!s.has_scope_grant("kimi-code", &path));
+        assert!(s.recent_chain(50).iter().all(|e| e.event_type != "scope_withdrawn"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_withdrawal_append_restores_the_pending_request() {
+        let (_dir, shared, asker, _peer, request_id) = pending_scope_withdrawal().await;
+        shared.lock().await.chain_fault_on.insert("scope_withdrawn".into());
+        let err = tool_scope_withdraw(&shared, &json!({
+            "request_id": request_id, "session_id": asker,
+            "reason": "the witness append must fail before mutation",
+        }))
+        .await
+        .expect_err("the injected append failure must abort withdrawal");
+        assert!(err.to_string().contains("NOT applied"), "{err}");
+        let s = shared.lock().await;
+        let req = &s.scope_requests[&request_id];
+        assert_eq!(req.status(crate::server::gate_escalation::now_secs()), "pending");
+        assert_eq!(req.granted, None);
+        assert!(req.ext.withdrawn.is_none());
+        assert!(s.recent_chain(50).iter().all(|e| e.event_type != "scope_withdrawn"));
+    }
+
+    #[tokio::test]
+    async fn restart_after_withdrawal_append_preserves_only_the_terminal_fact() {
+        let (_dir, shared, asker, _peer, request_id) = pending_scope_withdrawal().await;
+        let withdrawn = tool_scope_withdraw(&shared, &json!({
+            "request_id": request_id, "session_id": asker,
+            "reason": "withdraw and restart immediately after the append",
+        }))
+        .await
+        .unwrap();
+        assert_eq!(withdrawn["status"], "withdrawn", "{withdrawn}");
+        let path = shared.lock().await.scope_requests[&request_id].path.clone();
+        drop(shared);
+
+        let vault = Vault::open(_dir.path().join("v.enc"), "p".into()).unwrap();
+        let restarted = crate::server::build_state(vault, _dir.path(), "p").unwrap();
+        {
+            let s = restarted.lock().await;
+            assert!(s.scope_requests.is_empty(), "live requests remain memory-only");
+            assert!(!s.has_scope_grant("kimi-code", &path));
+            assert!(s.live_scope_grants("kimi-code").is_empty());
+            assert!(s.live_standing_grants("kimi-code").is_empty());
+            let pointer = resolve_scope_pointer(&s, &request_id);
+            assert_eq!(pointer["source"], "witness_chain", "{pointer}");
+            assert_eq!(pointer["status"], "withdrawn", "{pointer}");
+            assert_eq!(pointer["granted"], false, "{pointer}");
+            let rows = crate::server::governance_ledger::project(
+                &s.recent_chain(50), crate::server::gate_escalation::now_secs());
+            let row = rows.iter().find(|r| r.id == request_id).unwrap();
+            assert_eq!(row.status, crate::server::governance_ledger::LedgerStatus::Withdrawn);
+            assert!(!row.status.matches("denied"));
+        }
     }
 
     /// The claim alone ASKS NOTHING: no escalation, no opened row, nobody invited. It answers

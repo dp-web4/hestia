@@ -464,7 +464,13 @@ pub fn project(entries: &[ChainEntry], now: u64) -> Vec<LedgerRow> {
                         _ => d.get("approve").and_then(serde_json::Value::as_bool).unwrap_or(false),
                     }
                 };
-                let status = if approved { LedgerStatus::Approved } else { LedgerStatus::Denied };
+                let status = if e.event_type == "scope_withdrawn" {
+                    LedgerStatus::Withdrawn
+                } else if approved {
+                    LedgerStatus::Approved
+                } else {
+                    LedgerStatus::Denied
+                };
 
                 if let Some(row) = keyed.get_mut(&id) {
                     row.status = status;
@@ -1169,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_withdrawal_closes_the_request_as_denied_by_its_asker() {
+    fn a_scope_withdrawal_closes_the_request_as_withdrawn_not_denied() {
         let rows = project(
             &[
                 entry(1, 0, "scope_requested",
@@ -1185,7 +1191,9 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, LedgerKind::ScopeRequest);
-        assert_eq!(rows[0].status, LedgerStatus::Denied);
+        assert_eq!(rows[0].status, LedgerStatus::Withdrawn);
+        assert!(rows[0].status.matches("withdrawn"));
+        assert!(!rows[0].status.matches("denied"));
         assert_eq!(rows[0].decided_by.as_deref(), Some("asker:kimi-code"));
         assert_eq!(rows[0].decided_via.as_deref(), Some("asker_withdrawal"));
         assert_eq!(rows[0].decision_reason.as_deref(), Some("the probe was mistaken"));
