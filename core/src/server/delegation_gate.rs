@@ -15,15 +15,31 @@ use web4_core::delegation::DelegatedAuthority;
 
 use crate::delegation::{agent_key_for_lct, DelegationStore};
 
+fn canonical_absolute(path: &str) -> Option<String> {
+    if path != path.trim() {
+        return None;
+    }
+    let path = path.trim();
+    if !path.starts_with('/') || path.ends_with("//") {
+        return None;
+    }
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return Some("/".into());
+    }
+    if path.split('/').skip(1).any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+        return None;
+    }
+    Some(path.to_string())
+}
+
 fn path_within(target: &str, prefix: &str) -> bool {
-    let prefix = prefix.trim().trim_end_matches('/');
-    if prefix.is_empty() || !prefix.starts_with('/') || !target.starts_with('/') {
+    let Some(prefix) = canonical_absolute(prefix) else { return false };
+    // Preserve the existing refusal to delegate an entire filesystem root as a path bound.
+    if prefix == "/" {
         return false;
     }
-    if target.split('/').any(|seg| seg == "." || seg == "..") {
-        return false;
-    }
-    let target = target.trim_end_matches('/');
+    let Some(target) = canonical_absolute(target) else { return false };
     target == prefix || target.starts_with(&format!("{prefix}/"))
 }
 
@@ -139,6 +155,8 @@ pub struct Finding {
     pub delegator_lct: Option<String>,
     pub matched_via: Option<&'static str>,
     pub matched_action: Option<String>,
+    pub coverage_basis: Option<&'static str>,
+    pub coverage_uncertainty: Option<&'static str>,
     pub detail: Option<String>,
 }
 
@@ -155,6 +173,8 @@ impl Finding {
             "delegator_lct": self.delegator_lct,
             "matched_via": self.matched_via,
             "matched_action": self.matched_action,
+            "coverage_basis": self.coverage_basis,
+            "coverage_uncertainty": self.coverage_uncertainty,
             "detail": self.detail,
             "verdict_changed": false,
         })
@@ -174,6 +194,8 @@ pub fn assess(snap: &Snapshot, act: &Act, now: DateTime<Utc>) -> Finding {
         delegator_lct: None,
         matched_via: None,
         matched_action: None,
+        coverage_basis: None,
+        coverage_uncertainty: None,
         detail: None,
     };
     let Some(store) = snap.store.as_ref() else {
@@ -220,7 +242,7 @@ pub fn assess(snap: &Snapshot, act: &Act, now: DateTime<Utc>) -> Finding {
         });
         return finding;
     }
-    let is_expired = |d: &DelegatedAuthority| d.expires_at.is_some_and(|e| now > e);
+    let is_expired = |d: &DelegatedAuthority| d.expires_at.is_some_and(|e| now >= e);
     let mut matches = Vec::new();
     let mut invalid = Vec::new();
     let mut revoked = Vec::new();
@@ -237,12 +259,24 @@ pub fn assess(snap: &Snapshot, act: &Act, now: DateTime<Utc>) -> Finding {
             }
         }
     }
+    matches.sort_by_key(|(d, _)| match via(d) {
+        Some("member") => 0,
+        Some("role") => 1,
+        _ => 2,
+    });
     if let Some((first, action)) = matches.first() {
         finding.status = Status::Match;
         finding.delegation_ids = matches.iter().map(|(d, _)| d.id.to_string()).collect();
         finding.delegator_lct = Some(first.delegator_lct_id.to_string());
         finding.matched_via = via(first);
         finding.matched_action = Some(action.clone());
+        finding.coverage_basis = Some("operator-signed act scope matched to the A1 session identity");
+        finding.coverage_uncertainty = Some(
+            "strict lexical absolute-path comparison; filesystem aliases and the physical actor are not verified",
+        );
+        finding.detail = Some(
+            "record only: the named action covers this act; this is not authorization or proof of the physical actor".into(),
+        );
         return finding;
     }
     let (status, closest) = if !invalid.is_empty() {
@@ -316,9 +350,15 @@ mod tests {
         assert!(!c("act:Bash", "Shell", "command", Some("ls")));
         assert!(!c("scope.decide", "Bash", "command", Some("ls")));
         assert!(c("act:file_write:/w", "Write", "file_write", Some("/w/x")));
+        assert!(c("act:file_write:/w/", "Write", "file_write", Some("/w/x")));
         assert!(c("act:*:/w", "Read", "file_read", Some("/w")));
         assert!(!c("act:file_write:/w", "Write", "file_write", Some("/wx/a")));
         assert!(!c("act:file_write:/w", "Write", "file_write", Some("/w/../etc/passwd")));
+        assert!(!c("act:file_write:/w", "Write", "file_write", Some("/w//etc/passwd")));
+        assert!(!c("act:file_write:/w//", "Write", "file_write", Some("/w/etc/passwd")));
+        assert!(!c("act:file_write:/w/../etc", "Write", "file_write", Some("/w/../etc/passwd")));
+        assert!(!c("act:file_write:/w/./", "Write", "file_write", Some("/w/etc/passwd")));
+        assert!(!c("act:file_write:/w", "Write", "file_write", Some("/w/etc/passwd ")));
         assert!(!c("act:file_write:/w", "Write", "file_write", Some("relative")));
         assert!(!c("act:*:/usr", "Bash", "command", Some("/usr/bin/rm -rf /")));
     }
@@ -334,6 +374,10 @@ mod tests {
         let j = r.to_json("query_policy");
         assert_eq!(j["mode"], "record");
         assert_eq!(j["verdict_changed"], false);
+        assert!(j["coverage_basis"].as_str().unwrap().contains("A1 session identity"));
+        assert!(j["coverage_uncertainty"].as_str().unwrap().contains("lexical"));
+        assert!(j["coverage_uncertainty"].as_str().unwrap().contains("physical actor"));
+        assert!(j["detail"].as_str().unwrap().contains("not authorization"));
     }
 
     #[test]
@@ -345,6 +389,48 @@ mod tests {
         );
         let r = assess(&f.snap, &act("Read", "file_read", Some("/x")), Utc::now());
         assert_eq!((r.status, r.matched_via), (Status::Match, Some("role")));
+    }
+
+    #[test]
+    fn role_only_unrestricted_scope_does_not_acquire_tool_act_coverage() {
+        let mut f = fx();
+        let role_key = agent_key_for_lct("lct:web4:mb32:role-worker");
+        f.snap.store.as_mut().unwrap().create_delegation(
+            Uuid::new_v4(), role_key, vec![], vec![], None, &f.op,
+        );
+        let r = assess(&f.snap, &act("Read", "file_read", Some("/x")), Utc::now());
+        assert_eq!(r.status, Status::Uncovered);
+        assert!(r.detail.unwrap().contains("unrestricted"));
+    }
+
+    #[test]
+    fn member_coverage_precedes_role_coverage_regardless_of_grant_order() {
+        let mut f = fx();
+        let role_key = agent_key_for_lct("lct:web4:mb32:role-worker");
+        let role_id = f.snap.store.as_mut().unwrap().create_delegation(
+            Uuid::new_v4(), role_key, vec![], vec!["act".into()], None, &f.op,
+        ).id.to_string();
+        let member_id = grant(&mut f, &["act"], None, None);
+        let r = assess(&f.snap, &act("Read", "file_read", Some("/x")), Utc::now());
+        assert_eq!(r.matched_via, Some("member"));
+        assert_eq!(r.delegation_ids.first(), Some(&member_id));
+        assert!(r.delegation_ids.contains(&role_id));
+    }
+
+    #[test]
+    fn exact_expiry_is_closed_and_valid_overlap_wins_over_revoked() {
+        let mut f = fx();
+        let expired_id = grant(&mut f, &["act"], Some(1), None);
+        let expires_at = f.snap.store.as_ref().unwrap().delegations.iter()
+            .find(|d| d.id.to_string() == expired_id).unwrap().expires_at.unwrap();
+        let r = assess(&f.snap, &act("Bash", "command", Some("ls")), expires_at);
+        assert_eq!(r.status, Status::Expired);
+
+        let valid_id = grant(&mut f, &["act"], None, None);
+        f.snap.store.as_mut().unwrap().revoke(Uuid::parse_str(&expired_id).unwrap()).unwrap();
+        let r = assess(&f.snap, &act("Bash", "command", Some("ls")), Utc::now());
+        assert_eq!(r.status, Status::Match);
+        assert_eq!(r.delegation_ids, vec![valid_id]);
     }
 
     #[test]
