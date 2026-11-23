@@ -22,6 +22,24 @@ use web4_trust_core::EntityTrust;
 use crate::storage::{ChainEntry, SqliteChainStore, TrustStore};
 use crate::vault::Vault;
 
+/// How the principal behind a session was established. `Asserted` is the legacy A1
+/// posture: caller labels describe the session but do not authenticate it. The other
+/// classes are explicit so strong enrollment can be added without a second identity model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityBasis {
+    Asserted,
+    Custodial,
+    ProofOfPossession,
+    PairedChannel,
+}
+
+impl Default for IdentityBasis {
+    fn default() -> Self {
+        Self::Asserted
+    }
+}
+
 /// Active plugin session, created on `hestia_connect`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -52,6 +70,14 @@ pub struct Session {
     /// fire's exports reads `null` even if every later connect supplied one
     /// (claude-code review of #238, point 2).
     pub role_basis: Option<String>,
+    /// Authentication evidence for THIS session, distinct from role provenance and from
+    /// `session_id`, which remains a correlation handle only. Legacy JSON defaults to A1.
+    #[serde(default)]
+    pub identity_basis: IdentityBasis,
+    /// The canonical member/LCT principal established by strong enrollment. `None` on
+    /// asserted sessions: a caller-supplied `plugin_id` is only their label.
+    #[serde(default)]
+    pub canonical_principal: Option<String>,
     pub soft_lct: String,
     pub connected_at: DateTime<Utc>,
     /// The caller's stable host-session id (e.g. Claude Code's `session_id`), if supplied. A
@@ -2737,6 +2763,35 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_json_defaults_to_asserted_identity_basis() {
+        let legacy = serde_json::json!({
+            "session_id": Uuid::nil(),
+            "plugin_id": "legacy-member",
+            "host_agent": "legacy-harness",
+            "assigned_role": "citizen",
+            "constellation_role": "role:constellation:member",
+            "soft_lct": "lct:test:legacy",
+            "connected_at": "2026-01-01T00:00:00Z",
+        });
+        let session: Session = serde_json::from_value(legacy).unwrap();
+        assert_eq!(session.identity_basis, IdentityBasis::Asserted);
+        assert_eq!(session.canonical_principal, None);
+        assert_eq!(session.plugin_id, "legacy-member");
+    }
+
+    #[test]
+    fn identity_basis_wire_names_cover_every_enrollment_class() {
+        for (basis, wire) in [
+            (IdentityBasis::Asserted, "asserted"),
+            (IdentityBasis::Custodial, "custodial"),
+            (IdentityBasis::ProofOfPossession, "proof_of_possession"),
+            (IdentityBasis::PairedChannel, "paired_channel"),
+        ] {
+            assert_eq!(serde_json::to_value(basis).unwrap(), wire);
+        }
+    }
+
+    #[test]
     fn startup_warms_configured_member_lcts_before_any_connect() {
         let dir = TempDir::new().unwrap();
         let vault = Vault::init(dir.path().join("v.enc"), "p".into()).unwrap();
@@ -3393,6 +3448,8 @@ mod tests {
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: "lct:test:a".into(),
                 connected_at: Utc::now(),
                 host_session_id: None,
@@ -3409,6 +3466,8 @@ mod tests {
                 assigned_role: "citizen".into(),
                 constellation_role: "role:constellation:member".into(),
                 role_basis: None,
+                identity_basis: crate::server::state::IdentityBasis::Asserted,
+                canonical_principal: None,
                 soft_lct: "lct:test:b".into(),
                 connected_at: Utc::now() + chrono::Duration::seconds(1),
                 host_session_id: None,

@@ -593,6 +593,12 @@
     border-bottom: 1px solid var(--border);
   }
   .card-head h2 { border-bottom: none; padding-right: 0.75rem; flex: 1; }
+  .witness-policy {
+    align-self: center; padding: 0.35rem 0.65rem; border: 1px solid currentColor;
+    border-radius: 0.35rem; font-size: 1.1rem; line-height: 1.2; font-weight: 700;
+    white-space: nowrap;
+  }
+  .witness-policy.policy-btn-scoped, .witness-policy.policy-btn-loosened { color: var(--warning); }
   .feed-filter {
     display: flex; gap: 0.25rem; align-items: center;
     padding: 0.5rem 1rem;
@@ -1231,7 +1237,7 @@
                force); that signal was too useful to delete with the button, so it moved to
                `#govern-chip-state` on the nav chip, where it is visible from every screen
                instead of only from the agents view. -->
-
+          <span id="witness-policy" class="witness-policy" role="status" aria-live="polite"></span>
           <div class="feed-filter" role="group" aria-label="Filter chain entries">
             <button type="button" class="filter-btn selected" data-filter="all">all</button>
             <button type="button" class="filter-btn" data-filter="warn">warn</button>
@@ -3091,19 +3097,27 @@
     // element ids is the likeliest way to reintroduce one of them. So the logic is not touched:
     // `textContent`, `title` and `classList` keep working exactly as written.
     const polBtn = (() => {
-      const chip = $('govern-chip-state'), head = $('policy-state-label');
-      if (!chip && !head) return null;
+      const chip = $('govern-chip-state'), head = $('policy-state-label'),
+            witness = $('witness-policy');
+      if (!chip && !head && !witness) return null;
       return {
         set textContent(v) {
           if (head) head.textContent = v;
           // The chip is a nav element, so it carries the state WITHOUT the "policy:" prefix
           // the pane head keeps — on the chip the surrounding word is already `govern`.
           if (chip) chip.textContent = String(v).replace(/^policy:\s*/, '');
+          if (witness) witness.textContent = v;
         },
-        set title(v) { if (chip) chip.title = v; if (head) head.title = v; },
+        set title(v) {
+          if (chip) chip.title = v;
+          if (head) head.title = v;
+          if (witness) witness.title = v;
+        },
         classList: {
-          add:    c => { if (chip) chip.classList.add(c);    if (head) head.classList.add(c); },
-          remove: c => { if (chip) chip.classList.remove(c); if (head) head.classList.remove(c); },
+          add:    c => { if (chip) chip.classList.add(c);    if (head) head.classList.add(c);
+                         if (witness) witness.classList.add(c); },
+          remove: c => { if (chip) chip.classList.remove(c); if (head) head.classList.remove(c);
+                         if (witness) witness.classList.remove(c); },
         },
       };
     })();

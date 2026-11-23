@@ -179,11 +179,14 @@ enum Command {
         args: Vec<String>,
     },
 
-    /// Governance-surface escalations — the remedy every gate deny already names.
+    /// Governance-write and scope escalations: escalate a refusal, then poll, approve or deny it.
     ///
-    /// Stage 2 (#114) prints `hestia gate approve <id>` on every refusal; the
-    /// subcommand was never written (#116). This is a client over tools the daemon
-    /// already ships — it adds no authority and can only reach verdicts the daemon
+    /// A gate deny names a refusal id. The refused member escalates it deliberately with
+    /// `hestia gate escalate <refusal_id> --as <member> --reason '...'` (dp, 2026-11-05: the
+    /// gate opens none on its own); a scope refusal id is accepted too and goes to
+    /// `hestia_scope_escalate`, or scope is asked for up front with `hestia_request_scope`.
+    /// Deciders rule with approve, deny and corroborate. This is a client over tools the
+    /// daemon already ships — it adds no authority and can only reach verdicts the daemon
     /// would already permit.
     Gate {
         #[command(subcommand)]
@@ -281,6 +284,25 @@ enum GateCmd {
         /// Why. Optional against a peer's ask; REQUIRED to withdraw your own.
         #[arg(long)]
         reason: Option<String>,
+    },
+
+    /// Ratify the exact gate bytes the daemon just verified. With no --path this is the bulk
+    /// arm, accepted only when every discovered gate matches the deploy record. Repeated
+    /// --path selects individual gates for a per-gate merge.
+    Ratify {
+        /// Operator credential file (JSON `{lct_id, secret_key_hex}`) whose public
+        /// half is law-listed in `operator_access`. Read, never printed.
+        #[arg(long, env = "HESTIA_OPERATOR_KEY")]
+        key: PathBuf,
+        /// Why these bytes are the ones you reviewed (single line, <=512 bytes)
+        #[arg(long)]
+        reason: String,
+        /// Discovered gate path to ratify; repeat for a per-gate merge
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        /// Emit the daemon's response as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Add evidence WITHOUT deciding (#122 — approval accumulates as factors)
@@ -1287,6 +1309,9 @@ pub fn run() -> AnyResult<()> {
                 GateCmd::Deny { escalation_id, reason } => gate_cli::arbitrate(
                     &endpoint, &escalation_id, false, reason, asserted_id, &role,
                 ),
+                GateCmd::Ratify { key, reason, paths, json } => {
+                    gate_cli::ratify(&endpoint, &key, &reason, &paths, json)
+                }
                 GateCmd::Corroborate { escalation_id, stance, argument } => {
                     gate_cli::corroborate(&endpoint, &escalation_id, &stance, argument, asserted_id, &role)
                 }
@@ -6586,4 +6611,42 @@ mod member_key_source_tests {
 
     // `expand_tilde` moved to `hestia::hub` with member_signing_keypair; its test
     // moved with it (hub.rs `expand_tilde_expands_leading_home`).
+}
+
+
+#[cfg(test)]
+mod gate_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn gate_help_distinguishes_governance_escalations_from_scope_requests() {
+        let mut gate = Cli::command()
+            .find_subcommand("gate")
+            .cloned()
+            .expect("gate subcommand");
+        let mut bytes = Vec::new();
+        gate.write_long_help(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("governance-write"), "{text}");
+        assert!(text.contains("hestia_request_scope"), "{text}");
+        assert!(!text.contains("on every refusal"), "{text}");
+        // Since dp 2026-11-05 the deny names a refusal id and the refused member's
+        // remedy is `gate escalate`; approve is the decider's verb, and it exists.
+        assert!(text.contains("hestia gate escalate <refusal_id>"), "{text}");
+        assert!(!text.contains("never written"), "{text}");
+    }
+
+    #[test]
+    fn gate_short_about_does_not_claim_every_deny_names_it() {
+        // `hestia --help` prints the `about` line in the command list, so the
+        // every-refusal claim must be absent there too, not only in long help.
+        let gate = Cli::command()
+            .find_subcommand("gate")
+            .cloned()
+            .expect("gate subcommand");
+        let about = gate.get_about().map(|s| s.to_string()).unwrap_or_default();
+        assert!(!about.contains("every gate deny"), "{about}");
+        assert!(about.contains("escalate"), "{about}");
+    }
 }
