@@ -24601,8 +24601,8 @@ mod vault_hst001_tests {
     }
 
     /// A pre-existing exposed entry (empty list, e.g. written before this fix) still reads —
-    /// compatibility — but the read is WITNESSED with exposed:true. The disclosure is no
-    /// longer invisible, which was the gap in Finding A.
+    /// compatibility — even with ConsumerOnly recorded for later enforcement. The read is
+    /// WITNESSED with exposed:true. The disclosure is no longer invisible, which was Finding A.
     #[tokio::test]
     async fn an_exposed_read_is_allowed_but_witnessed() {
         let (dir, _) = seeded_home();
@@ -24610,7 +24610,8 @@ mod vault_hst001_tests {
         // Simulate a legacy entry: write it directly with an empty consumer list.
         {
             let mut s = state.lock().await;
-            s.vault.upsert(VaultEntry::new("legacy-cred", "DUMMY-SECRET")).unwrap();
+            s.vault.upsert(VaultEntry::new("legacy-cred", "DUMMY-SECRET")
+                .with_release_rule(crate::vault::rules::ReleaseRule::ConsumerOnly)).unwrap();
         }
         let before = { state.lock().await.recent_chain(200).len() };
         let anon = seat_session(&state, "some-random-caller").await;

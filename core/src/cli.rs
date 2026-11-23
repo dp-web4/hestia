@@ -1939,7 +1939,7 @@ mod vault_add_tests {
     use hestia::vault::rules::{PresentationAudience, ReleaseRule};
 
     #[test]
-    fn no_explicit_consumer_or_presenter_preserves_legacy_runtime_and_records_consumer_only() {
+    fn no_explicit_consumer_or_presenter_records_consumer_only_without_changing_exposed_runtime() {
         let (release, presentation) = vault_rules_for_add(false, &[], &[], None, None, None).unwrap();
         assert_eq!(release, ReleaseRule::ConsumerOnly);
         assert!(presentation.is_none(), "an unstated presenter escalates rather than publishing");
@@ -1948,7 +1948,7 @@ mod vault_add_tests {
             .with_consumers(Vec::new());
         assert!(!entry.allows("claude-code"));
         assert!(!entry.allows("kimi-code"),
-                "the legacy empty consumer list, not the release rule, decides at this increment");
+                "allows is deny-all for an empty list, but tool_vault_get releases that row as exposed; the real read control pins the distinction");
     }
 
     #[test]
