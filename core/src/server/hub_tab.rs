@@ -184,16 +184,49 @@ fn resolve_from_list(list: &HubUrls) -> (Option<String>, HubUrlSource) {
     (None, HubUrlSource::Unconfigured)
 }
 
-fn config_error(source: HubUrlSource) -> axum::response::Response {
+/// The refusal for a non-dialing configuration, naming WHAT is wrong and the
+/// operator step that clears it. The dashboard and the `/api/hub/urls*` routes
+/// refuse to edit a corrupt stored list (they would have to guess at it), so the
+/// body must name the break-glass path rather than leave the operator stuck.
+fn config_error(source: HubUrlSource, vault: &Vault) -> axum::response::Response {
     let state = match source {
         HubUrlSource::ConfigInvalid => "config_invalid",
         HubUrlSource::Unconfigured => "unconfigured",
         _ => "unavailable",
     };
-    err_json(
+    let mut recovery: Vec<String> = Vec::new();
+    if matches!(source, HubUrlSource::ConfigInvalid) {
+        if matches!(env_hub_url(), Some((None, _))) {
+            recovery.push(
+                "HESTIA_HUB_URL is set but is not a dialable http(s) origin: unset it or set it \
+                 to one, then restart the daemon."
+                    .into(),
+            );
+        }
+        if HubUrls::load(vault).is_err() {
+            recovery.push(format!(
+                "The stored hub list (vault entry '{HUB_URLS_VAULT_KEY}') is unparseable or holds \
+                 an invalid URL, and it cannot be edited from the dashboard or /api/hub/urls. \
+                 Stop the daemon, run `hestia vault remove {HUB_URLS_VAULT_KEY}`, restart it, \
+                 then re-add hubs (Hub tab or POST /api/hub/urls)."
+            ));
+        }
+    }
+    if recovery.is_empty() {
+        recovery.push("Add a hub (Hub tab or POST /api/hub/urls).".into());
+    }
+    (
         axum::http::StatusCode::FAILED_DEPENDENCY,
-        format!("hub configuration is {state}; no outbound request was made"),
+        Json(serde_json::json!({
+            "error": format!(
+                "hub configuration is {state}; no outbound request was made. {}",
+                recovery.join(" ")
+            ),
+            "source": state,
+            "recovery": recovery,
+        })),
     )
+        .into_response()
 }
 
 /// Discovery may advertise a relative REST path (e.g. "/v1"); make it absolute,
@@ -305,7 +338,7 @@ pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoRespo
         let s = state.lock().await;
         let list = match HubUrls::load(&s.vault) {
             Ok(list) => list,
-            Err(source) => return config_error(source),
+            Err(source) => return config_error(source, &s.vault),
         };
         let me = read_member_identity(&s.vault).map(|(lct, _)| lct);
         // The EFFECTIVE target (an env override wins), not just the stored selection, so the
@@ -314,7 +347,7 @@ pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoRespo
         if active.is_none()
             && (!list.entries.is_empty() || matches!(source, HubUrlSource::ConfigInvalid))
         {
-            return config_error(source);
+            return config_error(source, &s.vault);
         }
         (list.entries, active, source, me)
     };
@@ -427,7 +460,7 @@ pub async fn hub_withdraw(
         };
         let list = match HubUrls::load(&s.vault) {
             Ok(list) => list,
-            Err(source) => return config_error(source),
+            Err(source) => return config_error(source, &s.vault),
         };
         if !list.contains(&url) {
             return err_json(axum::http::StatusCode::NOT_FOUND,
@@ -483,7 +516,7 @@ pub async fn hub_status(State(state): State<SharedState>) -> impl IntoResponse {
         let s = state.lock().await;
         let (url, src) = match resolve_hub_url(&s.vault) {
             (Some(url), source) => (url, source),
-            (_, source) => return config_error(source),
+            (_, source) => return config_error(source, &s.vault),
         };
         let identity =
             read_member_identity(&s.vault).map(|(lct, kp)| (lct, kp.verifying_key().to_hex()));
@@ -681,7 +714,7 @@ pub async fn hub_urls_add(
     let mut s = state.lock().await;
     let mut list = match HubUrls::load(&s.vault) {
         Ok(list) => list,
-        Err(source) => return config_error(source),
+        Err(source) => return config_error(source, &s.vault),
     };
     let previous = list.clone();
 
@@ -735,7 +768,7 @@ pub async fn hub_urls_remove(
     let mut s = state.lock().await;
     let mut list = match HubUrls::load(&s.vault) {
         Ok(list) => list,
-        Err(source) => return config_error(source),
+        Err(source) => return config_error(source, &s.vault),
     };
     let previous = list.clone();
     let before = list.entries.len();
@@ -775,7 +808,7 @@ pub async fn hub_urls_set_active(
     let mut s = state.lock().await;
     let mut list = match HubUrls::load(&s.vault) {
         Ok(list) => list,
-        Err(source) => return config_error(source),
+        Err(source) => return config_error(source, &s.vault),
     };
     if !list.contains(&url) {
         return err_json(
@@ -810,7 +843,7 @@ pub async fn hub_join(
         let s = state.lock().await;
         match resolve_hub_url(&s.vault) {
             (Some(url), _) => url,
-            (_, source) => return config_error(source),
+            (_, source) => return config_error(source, &s.vault),
         }
     };
 
@@ -874,7 +907,7 @@ pub async fn hub_topics(State(state): State<SharedState>) -> impl IntoResponse {
         let s = state.lock().await;
         match resolve_hub_url(&s.vault) {
             (Some(url), _) => url,
-            (_, source) => return config_error(source),
+            (_, source) => return config_error(source, &s.vault),
         }
     };
     let info = match discover_with_timeout(&url).await {
@@ -963,7 +996,7 @@ async fn submit_act(
         let s = state.lock().await;
         match resolve_hub_url(&s.vault) {
             (Some(url), _) => url,
-            (_, source) => return config_error(source),
+            (_, source) => return config_error(source, &s.vault),
         }
     };
 
@@ -1340,6 +1373,54 @@ mod tests {
             hub_memberships(State(state.clone())).await.into_response(),
             "config_invalid",
         ).await;
+        restore_hub_env(previous);
+    }
+
+    /// The list-editing routes refuse a corrupt stored list (they cannot repair what
+    /// they cannot read), so the refusal itself must name the key and the break-glass
+    /// step; and an invalid env override is named as the env, not blamed on the vault.
+    #[tokio::test]
+    async fn config_invalid_refusals_name_the_recovery_step() {
+        let _guard = HUB_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = take_hub_env();
+        let (_dir, state) = shared_state();
+        state.lock().await.vault.upsert(
+            VaultEntry::new(HUB_URLS_VAULT_KEY, "not json {{{"),
+        ).unwrap();
+        let url = "https://repair.example";
+        let refusals = vec![
+            hub_urls_add(
+                State(state.clone()),
+                None,
+                Json(HubUrlAddReq { url: url.into(), label: None, activate: Some(true) }),
+            ).await.into_response(),
+            hub_urls_remove(State(state.clone()), None, Json(HubUrlRefReq { url: url.into() }))
+                .await.into_response(),
+            hub_urls_set_active(State(state.clone()), None, Json(HubUrlRefReq { url: url.into() }))
+                .await.into_response(),
+            hub_status(State(state.clone())).await.into_response(),
+        ];
+        for response in refusals {
+            assert_eq!(response.status(), axum::http::StatusCode::FAILED_DEPENDENCY);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let error = body["error"].as_str().unwrap();
+            assert!(error.contains("vault entry 'hub_urls'"), "{error}");
+            assert!(error.contains("hestia vault remove hub_urls"), "{error}");
+            assert!(!error.contains("HESTIA_HUB_URL"), "the env is not the cause: {error}");
+            assert_eq!(body["source"], "config_invalid");
+            assert_eq!(body["recovery"].as_array().unwrap().len(), 1, "{body}");
+        }
+
+        std::env::set_var("HESTIA_HUB_URL", "not a url");
+        state.lock().await.vault.remove(HUB_URLS_VAULT_KEY).unwrap();
+        let response = hub_status(State(state.clone())).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::FAILED_DEPENDENCY);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("HESTIA_HUB_URL is set but is not a dialable"), "{error}");
+        assert!(!error.contains("hestia vault remove"), "the vault is not the cause: {error}");
         restore_hub_env(previous);
     }
 
