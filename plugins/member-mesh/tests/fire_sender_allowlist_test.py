@@ -417,6 +417,50 @@ for script, stub, peer in CASES:
               prompt is not None and "id=12" in (prompt or ""),
               f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
 
+    # B10. The scope namespace (#1709 emits `hestia://scope/<id>#withdrawn`) is quiet
+    #      on the same terms as the escalation one.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://scope/scope-0123456789ab#withdrawn"
+        r, prompt = fire(script, stub,
+                         [notice(13, "hestia", kind="disposition", pointer=ptr)], tmp)
+        check(f"B10. {script}: a scope self-withdrawal alone exits 0 WITHOUT firing",
+              r.returncode == 0 and prompt is None,
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+
+    # B11. Quiet is the DAEMON's disposition, never a pointer shape a member can send.
+    #      The same `#withdrawn` pointer from an allowlisted peer is ordinary mail and
+    #      wakes; from the daemon under another kind it wakes too.
+    for nid, sender, kind in ((14, peer, "disposition"), (15, peer, "reply"),
+                              (16, "hestia", "unreachable")):
+        with tempfile.TemporaryDirectory() as tmp:
+            ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+            r, prompt = fire(script, stub, [notice(nid, sender, kind=kind, pointer=ptr)], tmp)
+            check(f"B11. {script}: a #withdrawn pointer from {sender}/{kind} still fires",
+                  prompt is not None and f"id={nid}" in (prompt or ""),
+                  f"a member-sent or wrong-kind notice was consumed without a wake; "
+                  f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+
+    # B12. A withheld sender beside a quiet withdrawal is still WITHHELD: the batch
+    #      must not exit 0, or the watcher deletes a primer nobody was shown.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+        r, prompt = fire(script, stub, [
+            notice(17, "hestia", kind="disposition", pointer=ptr),
+            notice(18, "some-unknown-member"),
+        ], tmp)
+        check(f"B12. {script}: withheld + quiet exits 70 and fires nothing (primer retained)",
+              r.returncode == 70 and prompt is None,
+              f"rc={r.returncode} prompt={str(prompt)[:300]!r}")
+
+    # B13. An unallowlisted sender cannot make itself quiet by naming the daemon's kind.
+    with tempfile.TemporaryDirectory() as tmp:
+        ptr = "hestia://escalation/0123456789abcdef#withdrawn"
+        r, prompt = fire(script, stub,
+                         [notice(19, "some-unknown-member", kind="disposition", pointer=ptr)], tmp)
+        check(f"B13. {script}: an unknown sender's 'disposition' is withheld, not quiet",
+              r.returncode == 70 and prompt is None and "WITHHELD" in (r.stderr or ""),
+              f"rc={r.returncode} stderr={str(r.stderr)[-300:]!r}")
+
 
 print()
 if failures:
