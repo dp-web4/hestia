@@ -1,8 +1,8 @@
-# held/: hestia#656, escalation detail carries the act's cwd. NOT applied
+# held/: hestia#656, escalation detail carries write-time cwd evidence. NOT applied
 
 | file | sha256 |
 |---|---|
-| `0ebffc80e0463cf4f250f1da8fcb02b1255d38f79cace287d8e4433f89cfa2b4.patch` | `0ebffc80e0463cf4f250f1da8fcb02b1255d38f79cace287d8e4433f89cfa2b4` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
+| `57d63986ba6784d2584ace369d91760c033c3d4c018e8119954100249f4d0b55.patch` | `57d63986ba6784d2584ace369d91760c033c3d4c018e8119954100249f4d0b55` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
 
 ## The defect
 
@@ -11,11 +11,14 @@ that location. A reviewer could not tell which worktree the act would change wit
 
 ## The change
 
-- `_bash_write_targets` can optionally return the effective cwd it already computes during write-target analysis.
-- The public `effective_cwd` helper uses that exact resolver, falling back to the harness cwd when the command is
-  not inspectable. It never widens authority and never introduces a second location rule.
-- `claim_self_write` accepts an optional `event_cwd` and appends `Event cwd: <resolved path>` to the existing
-  free-text escalation detail. The common gate supplies it, using the process cwd when the harness omits one.
+- `_bash_write_targets` can additionally record the effective cwd at each write append, so a trailing `cd`
+  cannot move an earlier write's evidence to the command's final directory.
+- The public `effective_cwd` helper returns per-write `(target, cwd)` pairs for a conservative supported subset,
+  `fallback` for non-shell or absent command input, and `unknown` for subshells, pipelines, `||`, `pushd`, `cd -`,
+  variable-based `cd`, out-of-grammar input, or a literal `cd` into a nonexistent directory. It never widens authority.
+- `claim_self_write` accepts an optional `event_cwd` and appends resolved per-write locations or an explicit
+  `UNKNOWN`/fallback basis to the existing free-text escalation detail. The common gate supplies it, using the
+  process cwd when the harness omits one. All six shell-tool spellings are covered.
 - Approval keys, `act_digest`, resolved targets, bar pricing, and callers that omit the new argument are unchanged.
   No stored schema migration is needed.
 
@@ -23,9 +26,10 @@ that location. A reviewer could not tell which worktree the act would change wit
 
 On base `59f2478e`, with all three generated engine modules supplied through documented overlay seams:
 
-- `seat_gate_boundary_test.py`: **PASS, 17 tests x 4 seats**. Every real shim carries event cwd; direct,
-  `cd`-then-write, and `..` forms carry the correct effective location; target resolution stays intact.
-  The unpatched control fails the new detail assertions.
+- `seat_gate_boundary_test.py`: **PASS, 17 tests x 4 seats**. Direct input carries a fallback basis; literal
+  `cd` and `..` forms carry resolved write-time locations; a trailing `cd` cannot overwrite them; `pushd`
+  reports `UNKNOWN`. A further 15 review-shaped probes cover subshells, pipelines, `||`, `cd -`, variable-based
+  `cd`, missing directories, and out-of-grammar input.
 - `one_gate_decide_contract_test.py`: **PASS, 25 tests + 31x4 shim-parity cells**.
 - `hestia_governance_closure_test.py`: **PASS, 39 tests**.
 - `claim_self_write_test.py`: **PASS, 45/45 checks**.

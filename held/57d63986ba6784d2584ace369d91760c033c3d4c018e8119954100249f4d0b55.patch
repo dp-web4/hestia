@@ -9,41 +9,99 @@ diff --git a/plugins/_shared/hestia_governance_closure.py b/plugins/_shared/hest
      "declared_dest",
      "registered_closure",
  ]
-@@ -1667,7 +1668,7 @@
+@@ -1667,13 +1668,46 @@
      return "\n".join(out)
- 
- 
+
+
 -def _bash_write_targets(command: str) -> list:
++class _WriteTargets(list):
++    """A target list that also remembers the effective cwd at each append."""
++
++    def __init__(self):
++        super().__init__()
++        self.eff = ""
++        self.locations = []
++
++    def append(self, target):
++        self.locations.append((target, self.eff))
++        super().append(target)
++
++    def extend(self, targets):
++        for target in targets:
++            self.append(target)
++
++
++def _cwd_model_supported(command: str) -> bool:
++    """Only literal same-shell walks whose cwd can be stated without guessing."""
++    try:
++        toks = _tokenize(_strip_heredoc_bodies(command))
++    except Exception:
++        return False
++    for i, tok in enumerate(toks):
++        if tok in _SEPARATORS and tok not in (";", "&&", "\n"):
++            return False
++        if tok in _SHELL_BLOCK_KEYWORDS or tok in ("pushd", "popd") or _has_subst(tok):
++            return False
++        if tok == "cd" and i + 1 < len(toks) and toks[i + 1] == "-":
++            return False
++    return True
++
++
 +def _bash_write_targets(command: str, *, with_cwd: bool = False) -> list:
      """All write-position arguments across a compound command: redirect targets plus each
      simple command's write positions, each resolved against the cd-tracked effective cwd.
      Raises on tokenizer failure (caller -> unparseable posture) and raises _OutOfGrammar on
-@@ -1738,7 +1739,25 @@
+     any out-of-grammar construct (caller -> out-of-grammar posture)."""
+     toks = _tokenize(_strip_heredoc_bodies(command))
+-    targets, cur = [], []
++    targets, cur = _WriteTargets(), []
+     # An out-of-grammar SIMPLE command is remembered, not raised on the spot: the walk goes on,
+     # so a later opaque writer (an unreadable `git apply` / `patch`, which refuses
+     # unconditionally) still decides. Raising at the first one let `tar -x ... && git apply
+@@ -1700,6 +1734,7 @@
+             if cur:
+                 try:
+                     eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
++                    targets.eff = eff
+                 except _OutOfGrammar:
+                     deferred_oog = True
+                 cur = []
+@@ -1734,11 +1769,35 @@
+     if cur:
+         try:
+             eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
++            targets.eff = eff
+         except _OutOfGrammar:
              deferred_oog = True
      if deferred_oog:
          raise _OutOfGrammar()
 -    return targets
-+    return (targets, eff) if with_cwd else targets
++    return (targets, targets.locations) if with_cwd else targets
 +
 +
-+def effective_cwd(tool_name: str, tool_input: Any, cwd: Optional[str] = None) -> Optional[str]:
-+    """The act's cwd after literal `cd` commands, or the supplied harness cwd when unknown.
-+
-+    This uses the same walk as write-target resolution, so location evidence and the write's
-+    resolved targets cannot disagree. It never raises and never widens authority.
-+    """
-+    if tool_name not in ("Bash", "Shell") or not isinstance(tool_input, dict):
-+        return cwd
++def effective_cwd(tool_name: str, tool_input: Any, cwd: Optional[str] = None) -> dict:
++    """Per-write cwd evidence, or an explicit unknown rather than a guessed location."""
++    if tool_name not in ("Bash", "Shell", "run_shell_command", "shell", "exec_command", "bash") \
++            or not isinstance(tool_input, dict):
++        return {"cwd": cwd, "basis": "fallback", "writes": []}
 +    command = tool_input.get("command")
 +    if not isinstance(command, str) or not command.strip():
-+        return cwd
++        return {"cwd": cwd, "basis": "fallback", "writes": []}
++    if not _cwd_model_supported(command):
++        return {"cwd": cwd, "basis": "unknown", "writes": []}
 +    try:
-+        _, effective = _bash_write_targets(command, with_cwd=True)
-+    except Exception:  # noqa: BLE001 — unknown evidence falls back to the harness's cwd
-+        return cwd
-+    return resolve_location(effective, cwd) if effective else cwd
- 
- 
++        _, writes = _bash_write_targets(command, with_cwd=True)
++    except Exception:  # noqa: BLE001 — unmodelled evidence is unknown, never the harness's guess
++        return {"cwd": cwd, "basis": "unknown", "writes": []}
++    resolved = []
++    for target, effective in writes:
++        write_cwd = resolve_location(effective, cwd) if effective else cwd
++        if not write_cwd or not os.path.isdir(write_cwd):
++            return {"cwd": cwd, "basis": "unknown", "writes": []}
++        resolved.append((target, write_cwd))
++    return {"cwd": cwd, "basis": "resolved", "writes": resolved}
+
+
  # ── Classification ──────────────────────────────────────────────────────────────────────────
 diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_gate_mechanism.py
 --- a/plugins/_shared/hestia_gate_mechanism.py
@@ -56,22 +114,42 @@ diff --git a/plugins/_shared/hestia_gate_mechanism.py b/plugins/_shared/hestia_g
 +                     resolved_targets_complete=True, event_cwd=None):
      """Ask ONCE whether a human has already approved this exact (member, marker) write.
      Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
- 
-@@ -1656,7 +1656,12 @@
+
+@@ -1656,7 +1656,32 @@
      `resolved_targets_for_claim`). `resolved_targets_complete=False` says the gate could not
      enumerate the write set; the daemon then prices the highest bar. Not part of the request
      key: they are derived from the same act. Old daemons ignore the key; callers that omit
 -    it price exactly as before."""
-+    it price exactly as before. `event_cwd` rides the existing free-text detail, so a reviewer
-+    can locate a path-relative act without a schema migration (#656).
++    it price exactly as before. `event_cwd` rides the existing free-text detail, with per-write
++    resolved locations or an explicit unknown basis (#656).
 +    """
 +    location = ""
-+    if isinstance(event_cwd, str) and event_cwd.strip():
-+        location = f" Event cwd: {os.path.realpath(os.path.expanduser(event_cwd))}"
++    if isinstance(event_cwd, dict):
++        basis = event_cwd.get("basis", "unknown")
++        harness = event_cwd.get("cwd")
++        if isinstance(harness, str) and harness.strip():
++            harness = os.path.realpath(os.path.expanduser(harness))
++        else:
++            harness = "unknown"
++        writes = event_cwd.get("writes") or []
++        if basis == "resolved" and writes:
++            rendered = [
++                f"{target} (cwd={os.path.realpath(write_cwd)}; basis=resolved)"
++                for target, write_cwd in writes[:4]
++            ]
++            if len(writes) > 4:
++                rendered.append(f"+{len(writes) - 4} more")
++            location = " Event writes: " + "; ".join(rendered) + "."
++        elif basis == "unknown":
++            location = f" Event cwd: UNKNOWN (basis=unknown; harness={harness})."
++        else:
++            location = f" Event cwd: {harness} (basis={basis})."
++    elif isinstance(event_cwd, str) and event_cwd.strip():
++        location = f" Event cwd: {os.path.realpath(os.path.expanduser(event_cwd))} (basis=fallback)."
      claim_args = {
          "plugin_id": plugin_id,
          "role": role,
-@@ -1668,7 +1673,8 @@
+@@ -1668,7 +1693,8 @@
          # explained itself. A member that wants to state a why opens the escalation itself.
          "reason": attempted or f"{tool_name} -> {marker}",
          "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
@@ -100,9 +178,9 @@ diff --git a/hooks-gt/_shared/hestia_gate_mechanism.py b/hooks-gt/_shared/hestia
 @@ -1,5 +1,5 @@
  #!/usr/bin/env python3
 -# hestia-gt-sha256: 7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2  (published ground truth; manifest: hooks-gt)
-+# hestia-gt-sha256: c98f6c9f1b980cd722db6a385bcc6f1dfccff65bc82bce93b0e04fddbc44fe35  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 92bf84a17562afb3a4de4dbce304496f0d5f12605b633785032322fcbbac0710  (published ground truth; manifest: hooks-gt)
  """Shared in-process daemon-query mechanism — the society-safety verdict path.
- 
+
  PRD gate-consolidation §6.E (the shared TRANSPORT / mechanism module). Extracted from the
 @@ -1637,7 +1637,7 @@
  def claim_self_write(marker, tool_name, attempted, *,
@@ -112,22 +190,42 @@ diff --git a/hooks-gt/_shared/hestia_gate_mechanism.py b/hooks-gt/_shared/hestia
 +                     resolved_targets_complete=True, event_cwd=None):
      """Ask ONCE whether a human has already approved this exact (member, marker) write.
      Returns (verdict, detail, escalation_id, how_to_decide); only 'approved' permits.
- 
-@@ -1657,7 +1657,12 @@
+
+@@ -1657,7 +1657,32 @@
      `resolved_targets_for_claim`). `resolved_targets_complete=False` says the gate could not
      enumerate the write set; the daemon then prices the highest bar. Not part of the request
      key: they are derived from the same act. Old daemons ignore the key; callers that omit
 -    it price exactly as before."""
-+    it price exactly as before. `event_cwd` rides the existing free-text detail, so a reviewer
-+    can locate a path-relative act without a schema migration (#656).
++    it price exactly as before. `event_cwd` rides the existing free-text detail, with per-write
++    resolved locations or an explicit unknown basis (#656).
 +    """
 +    location = ""
-+    if isinstance(event_cwd, str) and event_cwd.strip():
-+        location = f" Event cwd: {os.path.realpath(os.path.expanduser(event_cwd))}"
++    if isinstance(event_cwd, dict):
++        basis = event_cwd.get("basis", "unknown")
++        harness = event_cwd.get("cwd")
++        if isinstance(harness, str) and harness.strip():
++            harness = os.path.realpath(os.path.expanduser(harness))
++        else:
++            harness = "unknown"
++        writes = event_cwd.get("writes") or []
++        if basis == "resolved" and writes:
++            rendered = [
++                f"{target} (cwd={os.path.realpath(write_cwd)}; basis=resolved)"
++                for target, write_cwd in writes[:4]
++            ]
++            if len(writes) > 4:
++                rendered.append(f"+{len(writes) - 4} more")
++            location = " Event writes: " + "; ".join(rendered) + "."
++        elif basis == "unknown":
++            location = f" Event cwd: UNKNOWN (basis=unknown; harness={harness})."
++        else:
++            location = f" Event cwd: {harness} (basis={basis})."
++    elif isinstance(event_cwd, str) and event_cwd.strip():
++        location = f" Event cwd: {os.path.realpath(os.path.expanduser(event_cwd))} (basis=fallback)."
      claim_args = {
          "plugin_id": plugin_id,
          "role": role,
-@@ -1669,7 +1674,8 @@
+@@ -1669,7 +1694,8 @@
          # explained itself. A member that wants to state a why opens the escalation itself.
          "reason": attempted or f"{tool_name} -> {marker}",
          "detail": ("Auto-opened by the gate on a refused write; the member stated no rationale "
@@ -143,9 +241,9 @@ diff --git a/hooks-gt/_shared/hestia_governance_closure.py b/hooks-gt/_shared/he
 @@ -1,5 +1,5 @@
  #!/usr/bin/env python3
 -# hestia-gt-sha256: ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc  (published ground truth; manifest: hooks-gt)
-+# hestia-gt-sha256: 39ea192fd3deb992a17f01dab16d3f620be73a742184c3250eab15b594f25044  (published ground truth; manifest: hooks-gt)
++# hestia-gt-sha256: 738921fdce223bf38b378780a51e56990ebb6bfe6b5a7459e67dd6742da12faf  (published ground truth; manifest: hooks-gt)
  """hestia_governance_closure — ONE governance-access classifier for every harness shim.
- 
+
  PRD gate-consolidation §5 / §6.B / §7.3(8): the effective governance CLOSURE — the files that
 @@ -134,6 +134,7 @@
      "default_closure",
@@ -155,41 +253,99 @@ diff --git a/hooks-gt/_shared/hestia_governance_closure.py b/hooks-gt/_shared/he
      "declared_dest",
      "registered_closure",
  ]
-@@ -1668,7 +1669,7 @@
+@@ -1668,13 +1669,46 @@
      return "\n".join(out)
- 
- 
+
+
 -def _bash_write_targets(command: str) -> list:
++class _WriteTargets(list):
++    """A target list that also remembers the effective cwd at each append."""
++
++    def __init__(self):
++        super().__init__()
++        self.eff = ""
++        self.locations = []
++
++    def append(self, target):
++        self.locations.append((target, self.eff))
++        super().append(target)
++
++    def extend(self, targets):
++        for target in targets:
++            self.append(target)
++
++
++def _cwd_model_supported(command: str) -> bool:
++    """Only literal same-shell walks whose cwd can be stated without guessing."""
++    try:
++        toks = _tokenize(_strip_heredoc_bodies(command))
++    except Exception:
++        return False
++    for i, tok in enumerate(toks):
++        if tok in _SEPARATORS and tok not in (";", "&&", "\n"):
++            return False
++        if tok in _SHELL_BLOCK_KEYWORDS or tok in ("pushd", "popd") or _has_subst(tok):
++            return False
++        if tok == "cd" and i + 1 < len(toks) and toks[i + 1] == "-":
++            return False
++    return True
++
++
 +def _bash_write_targets(command: str, *, with_cwd: bool = False) -> list:
      """All write-position arguments across a compound command: redirect targets plus each
      simple command's write positions, each resolved against the cd-tracked effective cwd.
      Raises on tokenizer failure (caller -> unparseable posture) and raises _OutOfGrammar on
-@@ -1739,7 +1740,25 @@
+     any out-of-grammar construct (caller -> out-of-grammar posture)."""
+     toks = _tokenize(_strip_heredoc_bodies(command))
+-    targets, cur = [], []
++    targets, cur = _WriteTargets(), []
+     # An out-of-grammar SIMPLE command is remembered, not raised on the spot: the walk goes on,
+     # so a later opaque writer (an unreadable `git apply` / `patch`, which refuses
+     # unconditionally) still decides. Raising at the first one let `tar -x ... && git apply
+@@ -1701,6 +1735,7 @@
+             if cur:
+                 try:
+                     eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
++                    targets.eff = eff
+                 except _OutOfGrammar:
+                     deferred_oog = True
+                 cur = []
+@@ -1735,11 +1770,35 @@
+     if cur:
+         try:
+             eff = _flush_simple_command(cur, eff, targets, stdin_src, path_pinned)
++            targets.eff = eff
+         except _OutOfGrammar:
              deferred_oog = True
      if deferred_oog:
          raise _OutOfGrammar()
 -    return targets
-+    return (targets, eff) if with_cwd else targets
++    return (targets, targets.locations) if with_cwd else targets
 +
 +
-+def effective_cwd(tool_name: str, tool_input: Any, cwd: Optional[str] = None) -> Optional[str]:
-+    """The act's cwd after literal `cd` commands, or the supplied harness cwd when unknown.
-+
-+    This uses the same walk as write-target resolution, so location evidence and the write's
-+    resolved targets cannot disagree. It never raises and never widens authority.
-+    """
-+    if tool_name not in ("Bash", "Shell") or not isinstance(tool_input, dict):
-+        return cwd
++def effective_cwd(tool_name: str, tool_input: Any, cwd: Optional[str] = None) -> dict:
++    """Per-write cwd evidence, or an explicit unknown rather than a guessed location."""
++    if tool_name not in ("Bash", "Shell", "run_shell_command", "shell", "exec_command", "bash") \
++            or not isinstance(tool_input, dict):
++        return {"cwd": cwd, "basis": "fallback", "writes": []}
 +    command = tool_input.get("command")
 +    if not isinstance(command, str) or not command.strip():
-+        return cwd
++        return {"cwd": cwd, "basis": "fallback", "writes": []}
++    if not _cwd_model_supported(command):
++        return {"cwd": cwd, "basis": "unknown", "writes": []}
 +    try:
-+        _, effective = _bash_write_targets(command, with_cwd=True)
-+    except Exception:  # noqa: BLE001 — unknown evidence falls back to the harness's cwd
-+        return cwd
-+    return resolve_location(effective, cwd) if effective else cwd
- 
- 
++        _, writes = _bash_write_targets(command, with_cwd=True)
++    except Exception:  # noqa: BLE001 — unmodelled evidence is unknown, never the harness's guess
++        return {"cwd": cwd, "basis": "unknown", "writes": []}
++    resolved = []
++    for target, effective in writes:
++        write_cwd = resolve_location(effective, cwd) if effective else cwd
++        if not write_cwd or not os.path.isdir(write_cwd):
++            return {"cwd": cwd, "basis": "unknown", "writes": []}
++        resolved.append((target, write_cwd))
++    return {"cwd": cwd, "basis": "resolved", "writes": resolved}
+
+
  # ── Classification ──────────────────────────────────────────────────────────────────────────
 diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_single_gate.py
 --- a/hooks-gt/_shared/hestia_single_gate.py
@@ -198,7 +354,7 @@ diff --git a/hooks-gt/_shared/hestia_single_gate.py b/hooks-gt/_shared/hestia_si
 -# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
 +# hestia-gt-sha256: 43df3c78a06e501e34e09315108270849bfcaaa8d032db0579d4732acfc8f19f  (published ground truth; manifest: hooks-gt)
  """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
- 
+
  One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
 @@ -1114,7 +1114,8 @@
              # them, highest wins — `inv.attempted` is a bounded, self-censoring summary that can
@@ -218,13 +374,13 @@ diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
      {
        "path": "hestia_gate_mechanism.py",
 -      "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2",
-+      "sha256": "c98f6c9f1b980cd722db6a385bcc6f1dfccff65bc82bce93b0e04fddbc44fe35",
++      "sha256": "92bf84a17562afb3a4de4dbce304496f0d5f12605b633785032322fcbbac0710",
        "source": "plugins/_shared/hestia_gate_mechanism.py"
      },
      {
        "path": "hestia_governance_closure.py",
 -      "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc",
-+      "sha256": "39ea192fd3deb992a17f01dab16d3f620be73a742184c3250eab15b594f25044",
++      "sha256": "738921fdce223bf38b378780a51e56990ebb6bfe6b5a7459e67dd6742da12faf",
        "source": "plugins/_shared/hestia_governance_closure.py"
      },
      {
@@ -242,7 +398,7 @@ diff --git a/hooks-gt/_shared/manifest.json b/hooks-gt/_shared/manifest.json
    "engine": null,
    "requires": [],
 -  "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069"
-+  "gt_version": "3926c8b4286a4e33b2e9689fd83f9d8ea0453f4ace7cc8a16d31c2444ec3f454"
++  "gt_version": "5d34646da9887a469e2c7a02b26bf9c0ab3e50d5df30a8760e1068eda83660ed"
  }
 diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.json
 --- a/hooks-gt/claude-code/manifest.json
@@ -252,7 +408,7 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "3926c8b4286a4e33b2e9689fd83f9d8ea0453f4ace7cc8a16d31c2444ec3f454",
++    "gt_version": "5d34646da9887a469e2c7a02b26bf9c0ab3e50d5df30a8760e1068eda83660ed",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -261,12 +417,12 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
        {
          "path": "hestia_gate_mechanism.py",
 -        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
-+        "sha256": "c98f6c9f1b980cd722db6a385bcc6f1dfccff65bc82bce93b0e04fddbc44fe35"
++        "sha256": "92bf84a17562afb3a4de4dbce304496f0d5f12605b633785032322fcbbac0710"
        },
        {
          "path": "hestia_governance_closure.py",
 -        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
-+        "sha256": "39ea192fd3deb992a17f01dab16d3f620be73a742184c3250eab15b594f25044"
++        "sha256": "738921fdce223bf38b378780a51e56990ebb6bfe6b5a7459e67dd6742da12faf"
        },
        {
          "path": "hestia_shell_classifier.py",
@@ -284,7 +440,7 @@ diff --git a/hooks-gt/claude-code/manifest.json b/hooks-gt/claude-code/manifest.
      }
    ],
 -  "gt_version": "cbd883492ed6635518bed0e032296f50cbbaafd2e385a8db92ca92204cf4ff63"
-+  "gt_version": "892d08313df8b7aa817a1eadb182cdcbf8c5931aa9f55b22c4cd0c6f04498cc7"
++  "gt_version": "89374b913d861e70b41641eb24df9eb12e7badfb8513d803396affe2c08ab2c3"
  }
 diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
 --- a/hooks-gt/codex/manifest.json
@@ -294,7 +450,7 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "3926c8b4286a4e33b2e9689fd83f9d8ea0453f4ace7cc8a16d31c2444ec3f454",
++    "gt_version": "5d34646da9887a469e2c7a02b26bf9c0ab3e50d5df30a8760e1068eda83660ed",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -303,12 +459,12 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
        {
          "path": "hestia_gate_mechanism.py",
 -        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
-+        "sha256": "c98f6c9f1b980cd722db6a385bcc6f1dfccff65bc82bce93b0e04fddbc44fe35"
++        "sha256": "92bf84a17562afb3a4de4dbce304496f0d5f12605b633785032322fcbbac0710"
        },
        {
          "path": "hestia_governance_closure.py",
 -        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
-+        "sha256": "39ea192fd3deb992a17f01dab16d3f620be73a742184c3250eab15b594f25044"
++        "sha256": "738921fdce223bf38b378780a51e56990ebb6bfe6b5a7459e67dd6742da12faf"
        },
        {
          "path": "hestia_shell_classifier.py",
@@ -326,7 +482,7 @@ diff --git a/hooks-gt/codex/manifest.json b/hooks-gt/codex/manifest.json
      }
    ],
 -  "gt_version": "4ac83b5081a460ab4e7dc453e58ff774996018710cb0e7a62cb82026a20b91c7"
-+  "gt_version": "80dfe601626ecbb70d42792c8a89fcabd1ffedbe6b6a5af5e08d8946026bdd35"
++  "gt_version": "d6a86033546fa4e083df2a938608bdd61c747a46de2be69290867e808b0d30b2"
  }
 diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
 --- a/hooks-gt/gemini/manifest.json
@@ -336,7 +492,7 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "3926c8b4286a4e33b2e9689fd83f9d8ea0453f4ace7cc8a16d31c2444ec3f454",
++    "gt_version": "5d34646da9887a469e2c7a02b26bf9c0ab3e50d5df30a8760e1068eda83660ed",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -345,12 +501,12 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
        {
          "path": "hestia_gate_mechanism.py",
 -        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
-+        "sha256": "c98f6c9f1b980cd722db6a385bcc6f1dfccff65bc82bce93b0e04fddbc44fe35"
++        "sha256": "92bf84a17562afb3a4de4dbce304496f0d5f12605b633785032322fcbbac0710"
        },
        {
          "path": "hestia_governance_closure.py",
 -        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
-+        "sha256": "39ea192fd3deb992a17f01dab16d3f620be73a742184c3250eab15b594f25044"
++        "sha256": "738921fdce223bf38b378780a51e56990ebb6bfe6b5a7459e67dd6742da12faf"
        },
        {
          "path": "hestia_shell_classifier.py",
@@ -368,7 +524,7 @@ diff --git a/hooks-gt/gemini/manifest.json b/hooks-gt/gemini/manifest.json
    },
    "requires": [],
 -  "gt_version": "3516ff0e8543bb9a2bb36cbe568caa2ffc900e976ddc79813f48fb93d40d4709"
-+  "gt_version": "7acd17944046ea10eaa9a53ad20bbe32f668531eeb60948ecb059687247e7e2e"
++  "gt_version": "5fcaa168f298957dd28f2d003eaa22f3cb71f52834a37a7e0c49e69a268f35dc"
  }
 diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
 --- a/hooks-gt/kimi/manifest.json
@@ -378,7 +534,7 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
    "engine": {
      "unit": "_shared",
 -    "gt_version": "d2eee298bcd869f6768a674bc3fa9889d58f77087d7419166a1f1da242f17069",
-+    "gt_version": "3926c8b4286a4e33b2e9689fd83f9d8ea0453f4ace7cc8a16d31c2444ec3f454",
++    "gt_version": "5d34646da9887a469e2c7a02b26bf9c0ab3e50d5df30a8760e1068eda83660ed",
      "files": [
        {
          "path": "hestia_gate_core.py",
@@ -387,12 +543,12 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
        {
          "path": "hestia_gate_mechanism.py",
 -        "sha256": "7853c14c8a1177f3a8347b81cb2b9e10bcdca0b248dab5e17b8a696e665a09c2"
-+        "sha256": "c98f6c9f1b980cd722db6a385bcc6f1dfccff65bc82bce93b0e04fddbc44fe35"
++        "sha256": "92bf84a17562afb3a4de4dbce304496f0d5f12605b633785032322fcbbac0710"
        },
        {
          "path": "hestia_governance_closure.py",
 -        "sha256": "ceca7959b695f720de5eee661abaf336056e93f33953fb563dea3a418b5636cc"
-+        "sha256": "39ea192fd3deb992a17f01dab16d3f620be73a742184c3250eab15b594f25044"
++        "sha256": "738921fdce223bf38b378780a51e56990ebb6bfe6b5a7459e67dd6742da12faf"
        },
        {
          "path": "hestia_shell_classifier.py",
@@ -410,7 +566,7 @@ diff --git a/hooks-gt/kimi/manifest.json b/hooks-gt/kimi/manifest.json
      }
    ],
 -  "gt_version": "edb260ca779f9f5019b61f38152e7302e84662a8a1afe9834156ecdf095e2d73"
-+  "gt_version": "b2bbfedab2f8f4a6b34202b9111f00f874a2e342d99e5eab5fcdb3f1cddf7d83"
++  "gt_version": "7c399a6841c931c872f11dcde238161ffad14d3c656efb27eeacc785df927b0d"
  }
 diff --git a/plugins/_shared/seat_gate_boundary_test.py b/plugins/_shared/seat_gate_boundary_test.py
 --- a/plugins/_shared/seat_gate_boundary_test.py
@@ -426,23 +582,48 @@ diff --git a/plugins/_shared/seat_gate_boundary_test.py b/plugins/_shared/seat_g
              check(f"{seat}-denied", v == "deny", text)
              check(f"{seat}-rule", "gate.self_access" in text, text)
              check(f"{seat}-escalation-surfaced", "esc-stub-1" in text, text)
-@@ -312,6 +314,8 @@
+@@ -312,6 +314,9 @@
              check(f"{seat}-claim-declares-hard-stop", claims and claims[0].get("supersession") == "hard_stop", claims)
              # #810 (recut of #812): the claim carries the closure's resolved targets — the
              # write-position paths, which name the file even when the marker is a directory.
 +            check(f"{seat}-claim-carries-event-cwd",
-+                  claims and claims[0].get("detail", "").endswith(f"Event cwd: {fx.repo}"), claims)
++                  claims and claims[0].get("detail", "").endswith(
++                      f"Event cwd: {fx.repo} (basis=fallback)."), claims)
              check(f"{seat}-claim-carries-resolved-target",
                    claims and claims[0].get("resolved_targets") == [gate_file(fx, seat)], claims)
              check(f"{seat}-witnessed", any(a.get("event_type") == "gate_self_access"
-@@ -490,6 +494,10 @@
+@@ -477,6 +482,8 @@
+             forms = [
+                 ("relative-write", "Write", {"file_path": base, "content": "x"}, dest),
+                 ("cd-then-touch", "Bash", {"command": f"cd {dest} && touch {base}"}, None),
++                ("trailing-cd", "Bash", {"command": f"cd {dest} && touch {base} && cd /tmp"}, None),
++                ("pushd-write", "Bash", {"command": f"pushd {dest} >/dev/null; touch {target}"}, None),
+                 ("dotdot", "Bash", {"command": f"touch {dest}/sub/../{base}"}, None),
+             ]
+             for n, (label, tool, ti, cwd) in enumerate(forms, start=40):
+@@ -490,6 +497,25 @@
                  check(f"{seat}-{label}-claim-carries-resolved-location",
                        claims and want in (claims[0].get("resolved_targets") or []),
                        (want, claims and claims[0].get("resolved_targets")))
-+            expected_cwd = os.path.realpath(dest if label in ("relative-write", "cd-then-touch") else fx.repo)
-+            check(f"{seat}-{label}-claim-carries-effective-cwd",
-+                  claims and claims[0].get("detail", "").endswith(
-+                      f"Event cwd: {expected_cwd}"), claims)
++            if label != "pushd-write":
++                check(f"{seat}-{label}-claim-carries-resolved-location",
++                      claims and want in (claims[0].get("resolved_targets") or []),
++                      (want, claims and claims[0].get("resolved_targets")))
++            detail = claims[0].get("detail", "") if claims else ""
++            if label == "relative-write":
++                check(f"{seat}-{label}-claim-carries-fallback-cwd",
++                      detail.endswith(f"Event cwd: {os.path.realpath(dest)} (basis=fallback)."), detail)
++            elif label == "pushd-write":
++                check(f"{seat}-{label}-cwd-is-explicitly-unknown",
++                      "Event cwd: UNKNOWN (basis=unknown;" in detail
++                      and "Event writes:" not in detail, detail)
++            else:
++                expected_cwd = os.path.realpath(dest if label in ("cd-then-touch", "trailing-cd") else fx.repo)
++                check(f"{seat}-{label}-claim-carries-effective-cwd",
++                      f"(cwd={expected_cwd}; basis=resolved)" in detail, detail)
++            if label == "trailing-cd":
++                check(f"{seat}-{label}-does-not-use-the-final-directory",
++                      "cwd=/tmp; basis=resolved" not in detail, detail)
          finally:
              stub.close()
      _each_seat(arm)
