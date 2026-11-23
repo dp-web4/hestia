@@ -23,7 +23,7 @@
 //! |                     |  + memory (#1306)               |                  |
 //! | STANDING loosening  | vault (`scope/standing` doc)    | **yes**          |
 //!
-//! What keeps a DURABLE loosening safe where the instance-grant rule used restart as the
+//! What keeps a DURABLE loosening safe where the memory-only rule used restart as the
 //! backstop:
 //!   * **operator-decided only** — the sole mutation path is the challenge-signed operator
 //!     HTTP surface (`POST /api/scope/decide` with `standing: true`, and the revoke

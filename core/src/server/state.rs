@@ -232,9 +232,6 @@ pub struct ScopeRequest {
 /// standing, the breadth.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScopeRequestExt {
-    /// Reach only the directory's immediate entries, never a deeper descendant (#919).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub shallow: bool,
     /// `Some` when the gate opened this request on a refusal; `None` when the member filed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateDenyOrigin>,
@@ -288,10 +285,6 @@ pub struct ScopeRequestExt {
     /// refused it as a live twin: "converted, then could not be edited".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted_at: Option<u64>,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 impl ScopeRequestExt {
@@ -540,12 +533,41 @@ fn scope_origin(data: &serde_json::Value) -> Option<GateDenyOrigin> {
     })
 }
 
-fn rehydrate_scope_requests(
-    chain: &SqliteChainStore,
-    now: u64,
-) -> (HashMap<String, ScopeRequest>, bool) {
+/// What the scope replay found. `ok == false` means the chain could not be read: the map is
+/// empty because nothing was looked at, not because nothing was there.
+struct ScopeReplay {
+    requests: HashMap<String, ScopeRequest>,
+    /// Granted rows deliberately NOT restored: a widening in force (live or standing).
+    grants_not_restored: usize,
+    ok: bool,
+}
+
+/// Rebuild `scope_requests` from the chain at startup (#1233).
+///
+/// WHAT COMES BACK: pending asks, refusals, and ONE-TIME approvals with their reservation,
+/// release and spend state. None of those is reach in force: a pending ask and a refusal permit
+/// nothing, and a one-time approval permits one act the chain can prove was not yet spent.
+///
+/// WHAT DOES NOT: a request row that was GRANTED as reach (live or standing). The row is dropped,
+/// exactly as before this replay existed.
+/// - A LIVE grant ends at restart by doctrine (see the table on `ServerState`): restart is what
+///   ends a widening nobody revokes.
+/// - A STANDING grant lives in the vault's standing-scope document and is loaded from there. Its
+///   request row is provenance, not authority.
+/// - Restoring either from `scope_granted` alone would WIDEN: the success row of a standing
+///   grant and of a promotion carries no `modes` (which would default to ALL), a promotion
+///   retires the live row in memory only, and `scope_reach_changed` / `scope_grant_edited`
+///   narrow a live row with no event this fold reads. Each of those was a restart that handed
+///   back more than the operator's last ruling.
+///
+/// Nothing is inferred from a missing field: a row with no recorded `expires_at` is not restored.
+fn rehydrate_scope_requests(chain: &SqliteChainStore, now: u64) -> ScopeReplay {
+    // The oldest `scope_requested` that can still matter: a request lives at most its TTL
+    // undecided, and a one-time approval given at the last moment lives one claim window more.
+    let horizon = SCOPE_REQUEST_TTL_SECS
+        + crate::server::gate_escalation::APPROVAL_CLAIM_WINDOW_SECS;
     let cutoff = DateTime::<Utc>::from_timestamp(
-        now.saturating_sub(SCOPE_REQUEST_TTL_SECS) as i64,
+        now.saturating_sub(horizon) as i64,
         0,
     )
     .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
@@ -558,11 +580,12 @@ fn rehydrate_scope_requests(
         Ok(window) => window,
         Err(e) => {
             tracing::error!("scope request replay read failed: {e}");
-            return (HashMap::new(), false);
+            return ScopeReplay { requests: HashMap::new(), grants_not_restored: 0, ok: false };
         }
     };
     window.reverse();
     let mut restored: HashMap<String, ScopeRequest> = HashMap::new();
+    let mut grants_not_restored = 0usize;
     for entry in window {
         let data = &entry.event_data;
         let at = entry.timestamp.timestamp().max(0) as u64;
@@ -573,6 +596,11 @@ fn rehydrate_scope_requests(
                     scope_text(data, "plugin_id"),
                     scope_text(data, "path"),
                 ) else {
+                    continue;
+                };
+                // The recorded expiry or nothing: a default here would be today's constant,
+                // not the window the request was witnessed with (#956 changes that constant).
+                let Some(expires_at) = data.get("expires_at").and_then(|v| v.as_u64()) else {
                     continue;
                 };
                 restored.insert(
@@ -589,10 +617,7 @@ fn rehydrate_scope_requests(
                             .get("requested_at")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(at),
-                        expires_at: data
-                            .get("expires_at")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(at + SCOPE_REQUEST_TTL_SECS),
+                        expires_at,
                         granted: None,
                         decided_by: None,
                         decided_at: None,
@@ -615,10 +640,21 @@ fn rehydrate_scope_requests(
                 let Some(id) = scope_text(data, "request_id") else {
                     continue;
                 };
+                let granted = entry.event_type == "scope_granted";
+                // A grant of reach is not restored (see the function doc). Only a ONE-TIME
+                // approval that records its own claim window comes back, and `once` is written
+                // by exactly one door (`scope_decide`), which also writes `expires_at`.
+                let once = granted && scope_bool(data, "once");
+                let once_expiry = data.get("expires_at").and_then(|v| v.as_u64());
+                if granted && (!once || once_expiry.is_none()) {
+                    if restored.remove(&id).is_some() {
+                        grants_not_restored += 1;
+                    }
+                    continue;
+                }
                 let Some(request) = restored.get_mut(&id) else {
                     continue;
                 };
-                let granted = entry.event_type == "scope_granted";
                 request.granted = Some(granted);
                 request.decided_by = scope_text(data, "granted_by")
                     .or_else(|| scope_text(data, "decided_by"));
@@ -627,19 +663,10 @@ fn rehydrate_scope_requests(
                 if let Some(expires_at) = data.get("expires_at").and_then(|v| v.as_u64()) {
                     request.expires_at = expires_at;
                 }
-                request.recursive = scope_bool(data, "recursive");
-                request.ext.modes = data
-                    .get("modes")
-                    .cloned()
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .unwrap_or_default();
                 request.ext.peer_basis = data.get("peer_basis").cloned();
-                if granted {
-                    request.ext.once = scope_bool(data, "once");
-                    request.ext.shallow = scope_bool(data, "shallow");
-                    request.ext.granted_path = scope_text(data, "grant_path")
-                        .filter(|path| path != &request.path);
-                }
+                // A one-time approval has no breadth and no modes to choose (`scope_decide`
+                // refuses both), so `recursive` stays false and nothing else is read.
+                request.ext.once = once;
             }
             "scope_once_reserved" => {
                 let Some(operation) = scope_text(data, "op_key") else {
@@ -685,13 +712,14 @@ fn rehydrate_scope_requests(
             _ => {}
         }
     }
-    (
-        restored
+    ScopeReplay {
+        requests: restored
             .into_iter()
             .filter(|(_, request)| request.expires_at > now)
             .collect(),
-        true,
-    )
+        grants_not_restored,
+        ok: true,
+    }
 }
 
 /// The disposition projector's cursor row name (inbox.db `projection_cursors`).
@@ -711,8 +739,11 @@ pub const SCOPE_REQUEST_TTL_SECS: u64 = 8 * 3600;
 /// | direction           | where it lives                      | survives restart |
 /// |---------------------|-------------------------------------|------------------|
 /// | TIGHTENING          | vault (`instance_overlays`)         | **yes**          |
-/// | LIVE loosening      | memory (`instance_grants`)          | **no**           |
-/// | scope requests      | memory + chain replay               | **until expiry** |
+/// | LIVE loosening      | memory (`instance_grants`,          | **no**           |
+/// |                     |  granted `scope_requests`)          |                  |
+/// | scope asks, refusals| memory + chain replay (#1233)       | **until expiry** |
+/// | and ONE-TIME        |                                     |                  |
+/// | approvals           |                                     |                  |
 /// | EXPIRING loosening  | vault (`policy/expiring-grants`)    | **until expiry** |
 /// |                     |  + memory (`instance_grants`)       |                  |
 /// | STANDING loosening  | vault (`scope`/`standing` document) | **yes**          |
@@ -1511,8 +1542,9 @@ impl ServerState {
             // still does not survive a restart: restart is what ends a widening nobody revokes.
             // Escalations DO survive — see the rehydrate call after construction.
             instance_grants: crate::server::published::Watched::new(restored_grants),
-            // Replaced below with the chain projection: pending asks and once-approvals
-            // survive restart inside their recorded windows, rather than becoming durable grants.
+            // Replaced below with the chain projection: pending asks, refusals and one-time
+            // approvals survive restart inside their recorded windows. A row GRANTED as reach is
+            // not restored: same reasoning, same lifetime, a widening dies with the daemon.
             scope_requests: crate::server::published::Watched::new(HashMap::new()),
             // Refusals are the deny's memory, not asks: they die with the daemon.
             gate_refusals: HashMap::new(),
@@ -1574,11 +1606,16 @@ impl ServerState {
             }
         };
         window.reverse();
-        let (restored_scope_requests, scope_replay_ok) = rehydrate_scope_requests(&st.chain_store, now);
-        let restored_scope_count = restored_scope_requests.len();
-        st.scope_requests = crate::server::published::Watched::new(restored_scope_requests);
-        if scope_replay_ok {
-            eprintln!("[hestia] restored {restored_scope_count} scope request(s) from the chain");
+        let scope_replay = rehydrate_scope_requests(&st.chain_store, now);
+        let restored_scope_count = scope_replay.requests.len();
+        let live_ended = scope_replay.grants_not_restored;
+        st.scope_requests = crate::server::published::Watched::new(scope_replay.requests);
+        if scope_replay.ok {
+            eprintln!(
+                "[hestia] restored {restored_scope_count} scope request(s) from the chain \
+                 (pending, refused, one-time); {live_ended} granted row(s) not restored: a live \
+                 grant ends at restart and a standing grant is read from the vault"
+            );
         } else {
             eprintln!(
                 "[hestia] CRITICAL: scope request replay read FAILED — requests and unspent \
@@ -3225,11 +3262,7 @@ mod tests {
                         "decision_reason": "reviewed",
                         "expires_at": expires,
                         "once": id != "scope-live" && id != "scope-shallow" && id != "scope-refused" && id != "scope-revoked",
-                        "grant_path": if id == "scope-once" {
-                            "/w".to_string()
-                        } else {
-                            format!("/w/{}", id.trim_start_matches("scope-"))
-                        },
+                        "grant_path": format!("/w/{}", id.trim_start_matches("scope-")),
                         "recursive": id != "scope-shallow",
                         "shallow": id == "scope-shallow",
                         "modes": if id == "scope-shallow" { "r" } else { "rwed" },
@@ -3284,15 +3317,18 @@ mod tests {
             r.once_spendable(now)
                 && r.ext.gate.as_ref().is_some_and(|g| g.act_digest == "digest-scope-once")
                 && r.ext.invited_peers == ["codex"]
-                && r.ext.granted_path.as_deref() == Some("/w")
+                && r.ext.granted_path.is_none()
+                && !r.recursive
+                // A one-time approval is never reach in force: it is spent by the claim verb.
+                && !r.is_live(now)
+                && !r.grants("/w/once", now)
         }));
-        assert!(restored.scope_requests.get("scope-live").is_some_and(|r| {
-            r.status(now) == "granted" && r.grants("/w/live/child.txt", now)
-        }));
-        assert!(restored.scope_requests.get("scope-shallow").is_some_and(|r| {
-            r.status(now) == "granted" && r.ext.shallow && !r.recursive
-                && r.ext.modes == crate::server::grant_modes::Modes::READ
-        }));
+        // A grant of REACH is not restored, live or shallow, revoked or not: a live widening
+        // ends at restart, and the fold does not read every event that narrows one.
+        for id in ["scope-live", "scope-shallow", "scope-revoked"] {
+            assert!(!restored.scope_requests.contains_key(id), "{id} was restored");
+        }
+        assert!(!restored.scope_requests.values().any(|r| r.is_live(now)));
         assert!(restored.scope_requests.get("scope-refused").is_some_and(|r| {
             r.status(now) == "refused" && r.decided_by.as_deref() == Some("codex")
         }));
@@ -3307,10 +3343,177 @@ mod tests {
         assert!(restored.scope_requests.get("scope-spent").is_some_and(|r| {
             r.status(now) == "spent" && !r.once_spendable(now)
         }));
-        assert!(restored.scope_requests.get("scope-revoked").is_some_and(|r| {
-            r.status(now) == "revoked" && !r.grants("/w/revoked/child.txt", now)
-        }));
         assert!(!restored.scope_requests.contains_key("scope-expired"));
+    }
+
+    /// A `scope_requested` row in the shape `hestia_scope_claim` writes (handler.rs).
+    fn scope_open(state: &ServerState, id: &str, path: &str, expires_at: Option<u64>) {
+        let mut data = serde_json::json!({
+            "request_id": id, "plugin_id": "kimi-code", "role": "role:constellation:member",
+            "path": path, "path_as_asked": path, "reason": "need it",
+            "origin": "gate_deny", "rule": "mrh.path", "tool_name": "Edit",
+            "act": format!("Edit -> {path}"), "act_digest": format!("digest-{id}"),
+            "request_key": format!("key-{id}"), "host_session_id": "host-session",
+            "subtree": false, "invited_peers": ["codex"], "asker_basis": "session",
+        });
+        if let Some(e) = expires_at {
+            data["expires_at"] = serde_json::json!(e);
+        }
+        state.append_chain("scope_requested", data).unwrap();
+    }
+
+    /// A memory-only `scope_granted` row in the shape `scope_decide` writes (http.rs).
+    fn scope_grant_live(state: &ServerState, id: &str, path: &str, expires_at: u64, recursive: bool, modes: &str) {
+        state.append_chain("scope_granted", serde_json::json!({
+            "request_id": id, "plugin_id": "kimi-code", "path": path,
+            "decision_reason": "reviewed", "granted_by": "dp", "via": "operator_session",
+            "expires_at": expires_at, "standing": false, "recursive": recursive, "modes": modes,
+            "once": false, "grant_path": path, "origin": "gate_deny",
+        })).unwrap();
+    }
+
+    fn restart(dir: &TempDir, state: ServerState) -> ServerState {
+        drop(state);
+        let vault = Vault::open(dir.path().join("v.enc"), "p".into()).unwrap();
+        ServerState::open(vault, dir.path(), "p").unwrap()
+    }
+
+    /// #1400 retires a promoted live grant in memory only (`promoted_at`). The promotion's
+    /// `scope_granted` row names the live request and carries no `modes`. Replaying it as a
+    /// decision brought the retired read-only live grant back, in force, with every mode.
+    #[test]
+    fn a_promoted_live_grant_is_not_revived_by_restart() {
+        let (dir, state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        scope_open(&state, "scope-promoted", "/w/promoted", Some(now + 3600));
+        scope_grant_live(&state, "scope-promoted", "/w/promoted", now + 3600, false, "r");
+        // The promotion's success row, as `scope_promote` writes it.
+        state.append_chain("scope_granted", serde_json::json!({
+            "request_id": "scope-promoted", "plugin_id": "kimi-code", "path": "/w/promoted",
+            "decision_reason": "keep it", "granted_by": "operator", "via": "operator_session",
+            "origin": "promoted_from_live", "recursive": false, "standing": true,
+            "standing_expires_at": null, "standing_generation": 1, "intent": "h",
+            "live_superseded": "scope-promoted",
+        })).unwrap();
+        let restored = restart(&dir, state);
+        assert!(
+            !restored.scope_requests.values().any(|r| r.is_live(now)),
+            "a retired live grant came back in force"
+        );
+        assert!(!restored.scope_requests.values().any(|r| {
+            r.grants_for("/w/promoted", now, crate::server::grant_modes::Modes::ALL)
+        }), "a read-only grant came back with every mode");
+    }
+
+    /// `scope_reach_changed` narrows a live grant from recursive to exact. The replay does not
+    /// read that event, so a restored live grant would reach the whole tree again.
+    #[test]
+    fn a_narrowed_live_grant_does_not_come_back_recursive() {
+        let (dir, state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        scope_open(&state, "scope-narrowed", "/w/narrowed", Some(now + 3600));
+        scope_grant_live(&state, "scope-narrowed", "/w/narrowed", now + 3600, true, "rwed");
+        state.append_chain("scope_reach_changed", serde_json::json!({
+            "plugin_id": "kimi-code", "path": "/w/narrowed", "recursive": false, "phase": "terminal",
+        })).unwrap();
+        let restored = restart(&dir, state);
+        assert!(
+            !restored.scope_requests.values().any(|r| r.grants("/w/narrowed/deep/child.txt", now)),
+            "the operator narrowed this grant to exact; the restart widened it back"
+        );
+    }
+
+    /// A STANDING decision writes `scope_grant_intent` (with the modes) and then a
+    /// `scope_granted` success row with none. The vault carries the grant; the request row
+    /// must not come back as a second grant with the default, which is every mode.
+    #[test]
+    fn a_standing_grant_row_is_not_restored_with_every_mode() {
+        let (dir, state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        scope_open(&state, "scope-standing", "/w/standing", Some(now + 3600));
+        state.append_chain("scope_grant_intent", serde_json::json!({
+            "request_id": "scope-standing", "plugin_id": "kimi-code", "path": "/w/standing",
+            "expires_at": now + 3600, "standing": true, "recursive": false, "modes": "r",
+            "once": false, "grant_path": "/w/standing",
+        })).unwrap();
+        state.append_chain("scope_granted", serde_json::json!({
+            "request_id": "scope-standing", "plugin_id": "kimi-code", "path": "/w/standing",
+            "asked_path": "/w/standing", "recursive": false, "decision_reason": "read only",
+            "granted_by": "dp", "via": "operator_session", "origin": "gate_deny",
+            "standing": true, "standing_expires_at": null, "standing_generation": 1, "intent": "h",
+        })).unwrap();
+        let restored = restart(&dir, state);
+        assert!(!restored.scope_requests.values().any(|r| {
+            r.grants_for("/w/standing", now, crate::server::grant_modes::Modes::ALL)
+        }), "a read-only standing grant's request row came back granting every mode");
+    }
+
+    /// A one-time approval REVOKED before the restart stays unspendable after it.
+    #[test]
+    fn a_revoked_once_approval_stays_revoked_across_restart() {
+        let (dir, state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        scope_open(&state, "scope-once-revoked", "/w/once-revoked", Some(now + 3600));
+        state.append_chain("scope_granted", serde_json::json!({
+            "request_id": "scope-once-revoked", "plugin_id": "kimi-code", "path": "/w/once-revoked",
+            "granted_by": "dp", "expires_at": now + 600, "standing": false, "recursive": false,
+            "modes": "rwed", "once": true, "grant_path": "/w/once-revoked",
+        })).unwrap();
+        state.append_chain("scope_revoked", serde_json::json!({
+            "request_id": "scope-once-revoked", "plugin_id": "kimi-code", "path": "/w/once-revoked",
+            "reason": "changed my mind", "revoked_by": "operator", "lifetime": "live",
+        })).unwrap();
+        let restored = restart(&dir, state);
+        assert!(restored.scope_requests.get("scope-once-revoked").is_some_and(|r| {
+            r.status(now) == "revoked" && !r.once_spendable(now)
+        }));
+    }
+
+    /// A one-time approval with no recorded claim window is dropped, not given the request's.
+    #[test]
+    fn a_once_approval_with_no_recorded_expiry_is_not_restored() {
+        let (dir, state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        scope_open(&state, "scope-once-open", "/w/once-open", Some(now + 3600));
+        state.append_chain("scope_granted", serde_json::json!({
+            "request_id": "scope-once-open", "plugin_id": "kimi-code", "path": "/w/once-open",
+            "granted_by": "dp", "once": true,
+        })).unwrap();
+        let restored = restart(&dir, state);
+        assert!(!restored.scope_requests.contains_key("scope-once-open"));
+    }
+
+    /// A request approved once in its last minutes outlives the request TTL by the claim
+    /// window. The replay must still read its `scope_requested` row: a cutoff of one TTL
+    /// dropped the row and the unspent approval with it.
+    #[test]
+    fn a_late_once_approval_is_inside_the_replay_horizon() {
+        let (_dir, state) = make_state();
+        let now = crate::server::gate_escalation::now_secs();
+        // Rows are stamped `now`; the replay is asked as of TTL + 60s later.
+        let later = now + SCOPE_REQUEST_TTL_SECS + 60;
+        scope_open(&state, "scope-late", "/w/late", Some(now + SCOPE_REQUEST_TTL_SECS));
+        state.append_chain("scope_granted", serde_json::json!({
+            "request_id": "scope-late", "plugin_id": "kimi-code", "path": "/w/late",
+            "granted_by": "dp", "expires_at": later + 300, "standing": false, "recursive": false,
+            "modes": "rwed", "once": true, "grant_path": "/w/late",
+        })).unwrap();
+        let replay = rehydrate_scope_requests(&state.chain_store, later);
+        assert!(replay.ok);
+        assert!(replay.requests.get("scope-late").is_some_and(|r| r.once_spendable(later)));
+        // And one claim window further on, it is gone.
+        let gone = rehydrate_scope_requests(&state.chain_store, later + 301);
+        assert!(!gone.requests.contains_key("scope-late"));
+    }
+
+    /// Nothing is inferred from a missing field: a request with no recorded expiry is not
+    /// given today's TTL constant.
+    #[test]
+    fn a_request_with_no_recorded_expiry_is_not_restored() {
+        let (dir, state) = make_state();
+        scope_open(&state, "scope-no-expiry", "/w/no-expiry", None);
+        let restored = restart(&dir, state);
+        assert!(!restored.scope_requests.contains_key("scope-no-expiry"));
     }
 
     #[test]
