@@ -18556,6 +18556,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn distinct_acts_sharing_a_request_key_keep_distinct_chain_identities() {
+        let (_dir, shared) = make_shared_state();
+        let session = tool_connect(&shared, &json!({
+            "plugin_id": "claude-code", "host_agent": "h", "host_session_id": "hs-acts",
+        })).await.unwrap()["sessionId"].as_str().unwrap().to_string();
+        for tool_name in ["Edit", "Write"] {
+            let error = gate_claim_and_escalate(&shared, &json!({
+                "plugin_id": "codex", "session_id": &session,
+                "tool_name": tool_name, "marker": "pre_tool_use.py",
+                "reason": format!("{tool_name} -> pre_tool_use.py"),
+                "request_key": "a".repeat(64),
+            })).await.expect_err("the mismatched asker must be refused");
+            assert!(error.to_string().contains("asker mismatch"), "{error}");
+        }
+
+        let rows: Vec<_> = shared.lock().await.recent_chain(20)
+            .into_iter()
+            .filter(|e| e.event_type == "gate_escalation_refused")
+            .collect();
+        assert_eq!(rows.len(), 2, "distinct acts must not be deduplicated");
+        let request_keys: std::collections::HashSet<_> = rows.iter()
+            .map(|e| e.event_data["request_key"].as_str().unwrap())
+            .collect();
+        assert_eq!(request_keys.len(), 1, "the correlation key groups retries, not act identities");
+        let chain_hashes: std::collections::HashSet<_> = rows.iter().map(|e| &e.hash).collect();
+        assert_eq!(chain_hashes.len(), 2, "chain identity remains exact per act");
+        let tool_names: std::collections::HashSet<_> = rows.iter()
+            .map(|e| e.event_data["tool_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(tool_names.len(), 2, "the different act classes remain distinguishable");
+        let s = shared.lock().await;
+        assert!(s.recent_chain(20).iter().all(|e| {
+            !matches!(e.event_type.as_str(),
+                "gate_escalation_opened" | "gate_escalation_coalesced" | "gate_escalation_claimed")
+        }), "the correlation key confers no authority, coalescing, or spend");
+    }
+
     /// Open + sovereign-approve, the setup half of the claim-joinability test below —
     /// a plain fn rather than a closure so the borrows across `.await` stay obvious.
     async fn open_and_sovereign_approve(shared: &SharedState, session: &str, marker: &str) {

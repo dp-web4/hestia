@@ -106,6 +106,17 @@ def payload(entry: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
+def terminal_escalation_ids(entries) -> set[str]:
+    terminal = set()
+    for entry in entries:
+        if entry.get("eventType") not in ESCALATION_TERMINAL_EVENTS:
+            continue
+        escalation_id = payload(entry).get("escalation_id")
+        if escalation_id:
+            terminal.add(escalation_id)
+    return terminal
+
+
 class ChainWalker:
     def __init__(self, endpoint: str = DEFAULT_ENDPOINT, timeout: float = 30.0):
         self.endpoint = endpoint
