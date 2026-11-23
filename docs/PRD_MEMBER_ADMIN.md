@@ -171,7 +171,9 @@ with the actual generation. A failed terminal witness rolls the candidate back. 
 is reported as a live, unconfirmed mutation, never as a successful rollback. No cross-store
 atomicity is claimed.
 
-`drain_member` is the authoritative local admission point. It returns admitted notices plus a
+`drain_member` is the authoritative local admission point. Enqueue also runs a withhold-only
+pre-classification (§2.4): it can place a row in the withheld class but never admits one, so every
+row that reaches drain is still decided there. Drain returns admitted notices plus a
 bounded withheld summary; a denied notice's pointer is not returned for rendering. `peek_member`
 uses the same admission rule so it cannot become a bypass. Fire templates, the CLI, and the SAGE
 heartbeat sanitize and render the daemon's decision; none re-reads `MEMBERS` or derives its own
@@ -195,14 +197,33 @@ notice, a withheld row gets `withheld_at`, never `drained_at`; `drained_at` is s
 admitted and delivered, or when its withheld projection is first replayed. Retries do not move that
 first-delivery mark.
 
+Classification happens at enqueue as well as at drain. `enqueue_member_on` evaluates the sender
+against the current `member_mesh` generation before the row is counted against any cap: with no
+matching live grant, the row is stored already withheld (`withheld_at`, `withheld_reason`,
+`decision_generation`) and never enters the ordinary undrained-local class. A failed policy read at
+enqueue withholds the same way, as §6 requires for any failed read. Only rows whose sender held a
+matching live grant at enqueue enter the ordinary queue, and `drain_member` still re-decides each of
+them; a grant revoked or suspended in between withholds the row at drain, which sets `withheld_at`
+and moves it out of the ordinary class. Enqueue can only withhold early; it never admits.
+
 Withheld rows use a separate bounded retention class, not the ordinary undrained-local class. They
 are excluded from the local seven-day TTL prune and from the per-recipient admission cap and its
 oldest-row eviction. Ordinary `drain_member`/`peek_member` selection excludes rows with
 `withheld_at`, so an old withheld row is not re-evaluated or admitted without an explicit replay.
 An operator-bounded withheld-retention policy applies instead: reaching its bound transitions the
 oldest withheld rows to `expired` with a witness and an operator-visible count, never a silent delete.
-A flood from a default-denied sender therefore consumes only withheld retention; it cannot evict an
-admitted pending notice or turn another sender's admission budget into a denial channel.
+If that `expired` witness cannot be appended, the oldest row is neither expired nor deleted: it stays
+withheld past the bound, the incoming withheld row is still stored, the overshoot is shown in the
+operator count, and the transition is retried on the next enqueue — the same choice main's cap makes
+for undrained dispositions, so a witness outage never becomes unwitnessed loss.
+
+Because a default-denied sender's rows are withheld before the cap counts anything, a flood from that
+sender consumes only withheld retention between drains as well as after them; it cannot evict a
+granted sender's undrained notice or turn another sender's admission budget into a denial channel.
+This claim is limited to senders without a live grant. Main's residual intra-recipient channel
+(`core/src/storage/inbox.rs:1287-1292`) remains among granted senders: one granted sender can still
+displace another granted sender's undrained mail to the same recipient at the ordinary cap, bounded
+by the existing flood guard and recorded in the existing `member_queue_evictions` counter.
 
 For the existing backlog, migration starts from **already-drained notices with positive legacy
 render-time withholding evidence**, such as an operator-inspected retained primer/fire record. It
@@ -258,8 +279,8 @@ author.
    not at snapshot publication; no live grant at all means default deny. When that fall-through
    lowers the observed `min_identity`, the delivery receipt records both the observed level and the
    expired narrow grant's higher level, so expiry never silently lowers assurance.
-4. **Preflight dominates effects.** The daemon evaluates authority at drain before sanitization,
-   primer creation, or fire. It evaluates again immediately before the outward act. If revocation
+4. **Preflight dominates effects.** Enqueue may withhold a no-grant row early (§2.4) but never
+   admits. The daemon evaluates authority at drain before sanitization, primer creation, or fire. It evaluates again immediately before the outward act. If revocation
    lands between those checks, nothing fires or is externally delivered.
 5. **Revocation is a tombstone, not deletion.** The previous grant and its witness history remain
    inspectable. Already running CLI sessions are not claimed to stop retroactively; the outcome is
@@ -372,9 +393,13 @@ Suspension and revocation are visually distinct, and a stale view cannot offer a
 - **Replay after restart:** receipts and grants reconstruct from the `member_mesh` document and
   witness history. A lost projection is repaired, never redelivered. If a replay receipt cannot be
   appended, the replay refuses before delivery and leaves the row eligible for a later retry.
-- **Withheld flood:** TTL pruning and the ordinary admission cap never delete or evict withheld rows
-  or let them evict admitted mail. The separate withheld bound expires the oldest rows with a witness;
-  ordinary drains exclude them regardless of sender volume.
+- **Withheld flood:** a default-denied sender's rows are withheld at enqueue, before the ordinary
+  cap counts them, so even before any drain they cannot evict a granted sender's undrained mail. TTL
+  pruning and the ordinary cap never delete or evict withheld rows. The separate withheld bound
+  expires the oldest rows with a witness; if that witness fails, the row is kept past the bound and
+  the overshoot is reported. Ordinary drains exclude withheld rows regardless of sender volume.
+  Displacement among granted senders at the ordinary cap is main's existing residual channel, not
+  closed here.
 - **Forwarded notice:** a missing or unverified daemon-owned `authenticated_origin` cannot use an
   origin grant. Two authors relayed by one courier remain separate authorization cases, and a
   courier-only grant is never reported as origin authentication.
@@ -402,8 +427,13 @@ Suspension and revocation are visually distinct, and a stale view cannot offer a
    rather than falling back to `MEMBERS`.
 6. **Withheld retention and replay:** admission does not replay automatically; a newly withheld row
    has `withheld_at` and no `drained_at`; ordinary drain/peek never selects it. It survives the local
-   seven-day prune and cannot evict admitted mail at the ordinary cap. A denied-sender flood affects
-   only withheld retention, whose bound expires the oldest rows with a witness. The first explicit
+   seven-day prune. With a granted sender's notices already queued and **no drain in between**, a
+   default-denied sender floods the same recipient past the ordinary cap: every flood row is stored
+   withheld at enqueue, the ordinary undrained count is unchanged, `member_queue_evictions` does not move,
+   and the next drain still returns every granted notice. A sender whose grant is revoked after
+   enqueue is withheld at that drain. The flood affects only withheld retention, whose bound expires
+   the oldest rows with a witness; an injected `expired`-witness failure keeps the row past the bound
+   and reports the overshoot. The first explicit
    replay delivers once and sets the delivery mark; single and per-sender batch retries, watcher
    polls, and daemon restart create no duplicate delivery, moved mark, or response debt. An injected
    replay-witness failure refuses before delivery, leaves the row eligible with no `drained_at`, and
@@ -455,8 +485,9 @@ claims external-release readiness without the external smoke and live acceptance
 - **Withheld delivery state and retention:** new withheld rows receive `withheld_at`, never
   `drained_at`; first delivery or replay sets `drained_at`, while legacy drain evidence remains
   separately labelled. Ordinary drains exclude them, local TTL/cap eviction does not apply, and the
-  separate bounded retention expires rows with a witness so a denied-sender flood cannot evict
-  admitted mail.
+  separate bounded retention expires rows with a witness. No-grant rows are classified withheld at
+  enqueue, so a denied-sender flood cannot evict a granted sender's undrained mail even before a
+  drain; displacement among granted senders remains main's existing residual channel.
 - **Expiry precedence:** an expired narrow grant falls through to a less-specific live grant;
   suspension and revocation remain overriding tombstones. Any resulting lower observed
   `min_identity` is recorded beside the expired higher level.
