@@ -972,7 +972,7 @@ fire_one_stale_primer() {
       if fire_ran 0 "$t0"; then seat_recovered; fi
     else
       rc=$?
-      down=$(seat_unavailable_class "$rc")
+      down=$(seat_unavailable_class "$rc" "$t0")
       if [ -n "$down" ]; then
         # The seat's outage, not this list's fault (#910): refund the attempt, keep holding.
         if [ "$attempts" -gt 0 ]; then echo "$attempts" > "$attempts_file"; else rm -f "$attempts_file"; fi
@@ -1376,6 +1376,19 @@ classify_fire_failure() {
   fi
   if [ "$RC" = "124" ]; then
     # #530: size only, never the tail — <=15 bytes is empty or bare Execution error.
+    # Two guards keep a size verdict from naming a working seat down (#1584 review):
+    # (1) fire-claude.sh runs `claude -p` in text mode, which writes NOTHING until the
+    #     session ends — a working wake killed at the bound leaves 0 bytes. Its size says
+    #     nothing, so a buffering launcher's timeout stays undetermined: `timeout`.
+    # (2) the log must be THIS fire's: the one path that is new since the pre-fire mark
+    #     (arg 3, from fire_log_mark), as fire_ran does — never the newest mtime, which a
+    #     clock step hands to an earlier fire. No mark, no new log, or more than one new
+    #     log: undetermined, `timeout`.
+    case "$PREFIX" in claude) echo timeout; return 0 ;; esac
+    [ "$#" -ge 3 ] || { echo timeout; return 0; }
+    LOG=$(LC_ALL=C comm -13 <(printf '%s\n' "$3" | cut -s -d' ' -f2- | LC_ALL=C sort -u) \
+                            <(fire_log_mark | cut -s -d' ' -f2- | LC_ALL=C sort -u)) || LOG=""
+    case "$LOG" in ""|*$'\n'*) echo timeout; return 0 ;; esac
     BYTES=$(wc -c < "$LOG" 2>/dev/null) || BYTES=""
     if [ -n "$BYTES" ] && [ "$BYTES" -le 15 ]; then echo timeout-no-output; else echo timeout; fi
     return 0
@@ -1547,11 +1560,13 @@ fire_ran() {
   [ -n "$(LC_ALL=C comm -13 <(printf '%s\n' "$MARK") <(printf '%s\n' "$NOW") | grep -v '^$')" ]
 }
 
-# seat_unavailable_class <rc>: the class when this failure is a seat outage, else empty.
+# seat_unavailable_class <rc> [mark]: the class when this failure is a seat outage, else
+# empty. <mark> is the pre-fire fire_log_mark; rc=124 judges only the log it proves new.
 # Judged on the run's terminal lines, not the wide `why=` window (see the table).
 seat_unavailable_class() {
   local RC="$1" CLS
-  CLS=$(classify_fire_failure "$RC" terminal)
+  if [ "$#" -ge 2 ]; then CLS=$(classify_fire_failure "$RC" terminal "$2")
+  else CLS=$(classify_fire_failure "$RC" terminal); fi
   if fire_class_unavailable "$CLS" "$RC"; then echo "$CLS"; fi
   return 0
 }
@@ -2078,9 +2093,9 @@ json.dump(d,sys.stdout)
         if fire_ran 0 "$FIRE_MARK"; then seat_recovered; fi
       else
         RC=$?
-        WHY=$(classify_fire_failure "$RC")
+        WHY=$(classify_fire_failure "$RC" "" "$FIRE_MARK")
         echo "[hestia-watch] fire command failed rc=$RC why=$WHY (notices preserved in $PRIMER)"
-        DOWN=$(seat_unavailable_class "$RC")
+        DOWN=$(seat_unavailable_class "$RC" "$FIRE_MARK")
         if [ -n "$DOWN" ]; then
           # The seat is out: hold the list and tell each sender once (see SEAT OUTAGE).
           seat_unavailable "$DOWN" "$RC" "$PRIMER"
