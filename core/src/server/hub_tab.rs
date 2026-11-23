@@ -270,6 +270,57 @@ fn membership_row(entry: &HubUrlEntry, active: bool) -> serde_json::Value {
     })
 }
 
+/// What a 404 from `…/members/{lct}/pubkey` says about enrollment. `Ok(())` is the ONE answer
+/// that means "not enrolled": the hub's own body for a member with no pinned key. Everything
+/// else is "not determined", with the reason for the row's `probe_error`.
+///
+/// A 404 is not a membership fact by itself (NOVA's hold on #1700). The same route answers 404
+/// for a mismatched hub id; a proxy or a wrong REST root answers 404 with a body that is not the
+/// hub's; and a body cut at the read cap may have lost the phrase that tells these apart. Before
+/// this, each of those read as `enrolled: false`.
+fn classify_pubkey_404(body: &str) -> Result<(), &'static str> {
+    if body.ends_with(crate::hub::HUB_ERROR_BODY_TRUNCATED) {
+        return Err("the hub's 404 body exceeded the read cap — enrollment not determined");
+    }
+    let error = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string));
+    let Some(error) = error else {
+        return Err("a 404 that is not the hub's error shape — enrollment not determined");
+    };
+    if error.contains("does not match this hub") {
+        return Err("hub id mismatch — enrollment not determined");
+    }
+    if error.contains("has no pinned pubkey") {
+        return Ok(());
+    }
+    Err("an unrecognised 404 from the hub — enrollment not determined")
+}
+
+/// How many hubs are probed at once. A long configured list must not open one connection (and
+/// one task) per entry in the same instant.
+const MEMBERSHIP_PROBE_CONCURRENCY: usize = 8;
+
+/// One hub's probe under an overall bound that covers discovery AND the pubkey read. When the
+/// bound passes, the probe is dropped (its requests are cancelled) and the row says so:
+/// `enrolled` stays null.
+async fn bounded_probe(
+    entry: HubUrlEntry,
+    active: bool,
+    me: Option<Uuid>,
+    http: reqwest::Client,
+    bound: std::time::Duration,
+) -> Result<serde_json::Value, String> {
+    let mut fallback = membership_row(&entry, active);
+    match tokio::time::timeout(bound, probe_membership(entry, active, me, http)).await {
+        Ok(result) => result,
+        Err(_) => {
+            fallback["probe_error"] = serde_json::json!("membership probe timed out");
+            Ok(fallback)
+        }
+    }
+}
+
 async fn probe_membership(
     entry: HubUrlEntry,
     active: bool,
@@ -297,11 +348,9 @@ async fn probe_membership(
                         row["enrolled"] = serde_json::json!(true);
                     } else if status.as_u16() == 404 {
                         let body = crate::hub::bounded_error_text(resp).await;
-                        if body.contains("does not match this hub") {
-                            row["probe_error"] = serde_json::json!(
-                                "hub id mismatch — enrollment not determined");
-                        } else {
-                            row["enrolled"] = serde_json::json!(false);
+                        match classify_pubkey_404(&body) {
+                            Ok(()) => row["enrolled"] = serde_json::json!(false),
+                            Err(why) => row["probe_error"] = serde_json::json!(why),
                         }
                     } else {
                         row["probe_error"] = serde_json::json!(format!("probe HTTP {status}"));
@@ -352,24 +401,17 @@ pub async fn hub_memberships(State(state): State<SharedState>) -> impl IntoRespo
     // Start every hub's discovery + pubkey probe before awaiting any of them. Awaiting in input
     // order preserves the response shape; it does not serialize the requests themselves. Each
     // task also has one overall bound covering both network steps, not only a bound per step.
+    // At most MEMBERSHIP_PROBE_CONCURRENCY run at once; the rest wait for a permit. The bound
+    // starts when a probe starts, not while it queues.
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MEMBERSHIP_PROBE_CONCURRENCY));
     let mut tasks = Vec::new();
     for entry in entries {
         let is_active = hub_urls_match(&entry.url, &active);
-        let mut fallback = membership_row(&entry, is_active);
         let http = http.clone();
+        let permits = permits.clone();
         tasks.push(tokio::spawn(async move {
-            match tokio::time::timeout(
-                NET_TIMEOUT.saturating_mul(2),
-                probe_membership(entry, is_active, me, http),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    fallback["probe_error"] = serde_json::json!("membership probe timed out");
-                    Ok(fallback)
-                }
-            }
+            let _permit = permits.acquire_owned().await;
+            bounded_probe(entry, is_active, me, http, NET_TIMEOUT.saturating_mul(2)).await
         }));
     }
     let mut out = Vec::new();
@@ -1083,6 +1125,101 @@ mod tests {
         assert!(hubs.iter().all(|row| row["enrolled"] == true), "{hubs:?}");
         assert_eq!(hubs[0]["active"], true, "a trailing slash must not hide active: {hubs:?}");
         assert_eq!(hubs[1]["active"], false);
+    }
+
+    /// Only the hub's own "no pinned pubkey" body is an enrollment-negative.
+    #[test]
+    fn only_the_hubs_own_no_pubkey_404_means_not_enrolled() {
+        let me = Uuid::new_v4();
+        let hub_body = |msg: String| serde_json::json!({"error": msg}).to_string();
+        assert_eq!(
+            classify_pubkey_404(&hub_body(format!("member {me} has no pinned pubkey — not an admitted member?"))),
+            Ok(())
+        );
+        let undetermined = [
+            hub_body(format!("hub id {me} does not match this hub {me}")),
+            hub_body("lct is not published here".into()),
+            "<html><body>404 Not Found</body></html>".to_string(),
+            String::new(),
+            "{\"detail\": \"Not Found\"}".to_string(),
+            // The distinguishing phrase lies past the cap: the retained prefix alone looked like
+            // "anything else", which used to mean `enrolled: false`.
+            format!("{}{}", "x".repeat(crate::hub::HUB_ERROR_BODY_CAP), crate::hub::HUB_ERROR_BODY_TRUNCATED),
+            // Even a recognisable negative is not trusted once the body was cut.
+            format!("{}{}", hub_body("member x has no pinned pubkey".into()), crate::hub::HUB_ERROR_BODY_TRUNCATED),
+        ];
+        for body in undetermined {
+            let got = classify_pubkey_404(&body);
+            assert!(
+                matches!(got, Err(why) if why.contains("enrollment not determined")),
+                "{:?} classified as {got:?}", &body[..body.len().min(80)]
+            );
+        }
+    }
+
+    /// A hub whose routes all answer one status and body, after one discovery document.
+    async fn spawn_404_hub(body: String, hang: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let id = Uuid::new_v4();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let body = body.clone();
+            async move {
+                if hang {
+                    std::future::pending::<()>().await;
+                }
+                if uri.path().ends_with("/pubkey") {
+                    (axum::http::StatusCode::NOT_FOUND, body).into_response()
+                } else {
+                    Json(serde_json::json!({
+                        "hub_lct_id": id,
+                        "endpoints": {"rest": format!("http://{addr}/v1"), "mcp": ""},
+                        "hubs": [{"id": id, "name": "h", "public": true}],
+                    })).into_response()
+                }
+            }
+        });
+        (addr, tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }))
+    }
+
+    /// End to end through `probe_membership`: the row's `enrolled` is false for the hub's own
+    /// negative and null (with a reason) for a 404 that proves nothing.
+    #[tokio::test]
+    async fn a_404_that_is_not_the_hubs_answer_leaves_enrollment_unknown() {
+        let me = Uuid::new_v4();
+        let cases = [
+            (serde_json::json!({"error": format!("member {me} has no pinned pubkey — not an admitted member?")}).to_string(),
+             serde_json::json!(false)),
+            ("<html>404</html>".to_string(), serde_json::Value::Null),
+            ("y".repeat(crate::hub::HUB_ERROR_BODY_CAP + 512) + "does not match this hub", serde_json::Value::Null),
+        ];
+        for (body, want) in cases {
+            let (addr, server) = spawn_404_hub(body.clone(), false).await;
+            let entry = HubUrlEntry { url: format!("http://{addr}"), label: None, added_at: None };
+            let row = probe_membership(entry, false, Some(me), reqwest::Client::new()).await.unwrap();
+            server.abort();
+            assert_eq!(row["reachable"], true, "{row}");
+            assert_eq!(row["enrolled"], want, "body {:?}: {row}", &body[..body.len().min(40)]);
+            assert_eq!(row.get("probe_error").is_some(), want.is_null(), "{row}");
+        }
+    }
+
+    /// A hub that accepts the connection and never answers costs the overall bound, not
+    /// NET_TIMEOUT per step, and the row is UNKNOWN.
+    #[tokio::test]
+    async fn a_probe_past_its_overall_bound_is_cancelled_and_reads_unknown() {
+        let (addr, server) = spawn_404_hub(String::new(), true).await;
+        let entry = HubUrlEntry { url: format!("http://{addr}"), label: Some("slow".into()), added_at: None };
+        let started = std::time::Instant::now();
+        let row = bounded_probe(
+            entry, true, Some(Uuid::new_v4()), reqwest::Client::new(),
+            std::time::Duration::from_millis(150),
+        ).await.unwrap();
+        server.abort();
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+        assert_eq!(row["probe_error"], "membership probe timed out");
+        assert!(row["enrolled"].is_null() && row["reachable"] == false, "{row}");
+        assert_eq!((row["label"].as_str(), row["active"].as_bool()), (Some("slow"), Some(true)), "{row}");
     }
 
     #[test]

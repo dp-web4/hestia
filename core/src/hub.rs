@@ -76,6 +76,9 @@ pub struct ChallengeResponse {
 }
 
 pub(crate) const HUB_ERROR_BODY_CAP: usize = 16 * 1024;
+/// Appended by [`bounded_error_text`] when the body was cut. A caller that classifies an error by
+/// its text must treat a body ending in this as incomplete.
+pub(crate) const HUB_ERROR_BODY_TRUNCATED: &str = "…[truncated]";
 
 /// Read an upstream error body without letting an unbounded stream exhaust memory.
 pub(crate) async fn bounded_error_text(mut resp: reqwest::Response) -> String {
@@ -93,7 +96,7 @@ pub(crate) async fn bounded_error_text(mut resp: reqwest::Response) -> String {
     bytes.truncate(HUB_ERROR_BODY_CAP);
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
     if truncated {
-        text.push_str("…[truncated]");
+        text.push_str(HUB_ERROR_BODY_TRUNCATED);
     }
     text
 }
