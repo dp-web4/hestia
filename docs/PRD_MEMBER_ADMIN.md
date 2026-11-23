@@ -195,6 +195,15 @@ notice, a withheld row gets `withheld_at`, never `drained_at`; `drained_at` is s
 admitted and delivered, or when its withheld projection is first replayed. Retries do not move that
 first-delivery mark.
 
+Withheld rows use a separate bounded retention class, not the ordinary undrained-local class. They
+are excluded from the local seven-day TTL prune and from the per-recipient admission cap and its
+oldest-row eviction. Ordinary `drain_member`/`peek_member` selection excludes rows with
+`withheld_at`, so an old withheld row is not re-evaluated or admitted without an explicit replay.
+An operator-bounded withheld-retention policy applies instead: reaching its bound transitions the
+oldest withheld rows to `expired` with a witness and an operator-visible count, never a silent delete.
+A flood from a default-denied sender therefore consumes only withheld retention; it cannot evict an
+admitted pending notice or turn another sender's admission budget into a denial channel.
+
 For the existing backlog, migration starts from **already-drained notices with positive legacy
 render-time withholding evidence**, such as an operator-inspected retained primer/fire record. It
 preserves the old mark as `legacy_drained_at` and attaches the migration evidence. A bare
@@ -246,7 +255,9 @@ author.
    same registered member + recipient + kind + MRH. Suspension or revocation at any matching scope
    wins over admission. An expired grant is not live: it falls through to a less-specific live grant,
    including `local_mesh`, rather than acting as a narrow denial. Expiry is checked at decision time,
-   not at snapshot publication; no live grant at all means default deny.
+   not at snapshot publication; no live grant at all means default deny. When that fall-through
+   lowers the observed `min_identity`, the delivery receipt records both the observed level and the
+   expired narrow grant's higher level, so expiry never silently lowers assurance.
 4. **Preflight dominates effects.** The daemon evaluates authority at drain before sanitization,
    primer creation, or fire. It evaluates again immediately before the outward act. If revocation
    lands between those checks, nothing fires or is externally delivered.
@@ -254,11 +265,14 @@ author.
    inspectable. Already running CLI sessions are not claimed to stop retroactively; the outcome is
    recorded as `revoked_after_fire` if revocation landed after the final preflight.
 6. **Admission is not replay.** Admission creates eligibility only. Withheld content requires a
-   separate operator replay act after the pointer has been inspected outside a model prompt.
-7. **Replay is idempotent.** A duplicate replay, per-sender batch retry, watcher retry, restart, or
-   daemon recovery cannot create a second delivered copy. The first replay sets `drained_at` as §2.4
-   specifies; retries leave it unchanged, and no replay rewrites `legacy_drained_at`, answer bindings,
-   or `in_reply_to`. Replay must not manufacture a second open review debt.
+   separate operator replay act after the pointer has been inspected outside a model prompt. Ordinary
+   drain and peek exclude withheld rows rather than re-evaluating them for automatic delivery.
+7. **Replay is idempotent and witnessed.** A duplicate replay, per-sender batch retry, watcher retry,
+   restart, or daemon recovery cannot create a second delivered copy. The first replay sets
+   `drained_at` as §2.4 specifies; retries leave it unchanged, and no replay rewrites
+   `legacy_drained_at`, answer bindings, or `in_reply_to`. Replay must not manufacture a second open
+   review debt. If its receipt cannot be witnessed, replay is refused before delivery: the row stays
+   eligible with no `drained_at` and may be retried, never delivered without a receipt.
 8. **Daemon kinds are structural.** `unreachable` and `disposition` remain admitted only by their
    daemon-minting construction, never by `local_mesh` or a member-editable sender grant.
 9. **Courier and origin are distinct.** A courier cannot lend its grant to an asserted origin, and an
@@ -356,7 +370,11 @@ Suspension and revocation are visually distinct, and a stale view cannot offer a
   delivery is reported as success. If the outward act already won, report that honestly instead of
   claiming rollback.
 - **Replay after restart:** receipts and grants reconstruct from the `member_mesh` document and
-  witness history. A lost projection is repaired, never redelivered.
+  witness history. A lost projection is repaired, never redelivered. If a replay receipt cannot be
+  appended, the replay refuses before delivery and leaves the row eligible for a later retry.
+- **Withheld flood:** TTL pruning and the ordinary admission cap never delete or evict withheld rows
+  or let them evict admitted mail. The separate withheld bound expires the oldest rows with a witness;
+  ordinary drains exclude them regardless of sender volume.
 - **Forwarded notice:** a missing or unverified daemon-owned `authenticated_origin` cannot use an
   origin grant. Two authors relayed by one courier remain separate authorization cases, and a
   courier-only grant is never reported as origin authentication.
@@ -382,10 +400,15 @@ Suspension and revocation are visually distinct, and a stale view cannot offer a
    no notice fires. A completed act is reported `revoked_after_fire`, never rolled back in prose.
 5. **Stale policy:** an expired external snapshot, stale grant, and failed vault read each withhold
    rather than falling back to `MEMBERS`.
-6. **Replay:** admission does not replay automatically; a newly withheld row has `withheld_at` and
-   no `drained_at`; the first explicit replay delivers once and sets the delivery mark; single and
-   per-sender batch retries, watcher polls, and daemon restart create no duplicate delivery, moved
-   mark, or response debt.
+6. **Withheld retention and replay:** admission does not replay automatically; a newly withheld row
+   has `withheld_at` and no `drained_at`; ordinary drain/peek never selects it. It survives the local
+   seven-day prune and cannot evict admitted mail at the ordinary cap. A denied-sender flood affects
+   only withheld retention, whose bound expires the oldest rows with a witness. The first explicit
+   replay delivers once and sets the delivery mark; single and per-sender batch retries, watcher
+   polls, and daemon restart create no duplicate delivery, moved mark, or response debt. An injected
+   replay-witness failure refuses before delivery, leaves the row eligible with no `drained_at`, and
+   permits a later retry. Expiry fall-through to a weaker `local_mesh` records both the observed and
+   expired-higher `min_identity` values.
 7. **External independence:** a fresh instance imports nothing by default, and two instances with
    different operator keys and grants cannot broaden one another.
 8. **Migration:** old documents load as `migration=pending`; explicit import produces the expected
@@ -429,10 +452,14 @@ claims external-release readiness without the external smoke and live acceptance
   `routing | reported | verified` per grant. Verified local delivery depends on #824; weaker levels
   remain visible and cannot claim spoof resistance. Relay-only members can import at routing level
   without a hidden hub-join prerequisite.
-- **Withheld delivery state:** new withheld rows receive `withheld_at`, never `drained_at`; first
-  delivery or replay sets `drained_at`, while legacy drain evidence remains separately labelled.
+- **Withheld delivery state and retention:** new withheld rows receive `withheld_at`, never
+  `drained_at`; first delivery or replay sets `drained_at`, while legacy drain evidence remains
+  separately labelled. Ordinary drains exclude them, local TTL/cap eviction does not apply, and the
+  separate bounded retention expires rows with a witness so a denied-sender flood cannot evict
+  admitted mail.
 - **Expiry precedence:** an expired narrow grant falls through to a less-specific live grant;
-  suspension and revocation remain overriding tombstones.
+  suspension and revocation remain overriding tombstones. Any resulting lower observed
+  `min_identity` is recorded beside the expired higher level.
 - **Replay:** confirmed as manual and inspected, now including idempotent per-sender batches so a
   large backlog does not recreate the per-notice administrative bottleneck.
 - **Policy storage and generation:** revised from a `scope/standing` object to a separate
