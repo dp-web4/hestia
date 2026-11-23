@@ -21,7 +21,7 @@ IVL="${WATCH_INTERVAL:-60}"
 # primer as its authoritative work list.
 STATE="${HESTIA_MESH_STATE:-$HOME/.local/state/hestia-mesh}"
 # PER-MEMBER NAMESPACE (2026-07-31). Primers used to live in ONE directory for every
-# member on the host, named `notice-XXXXXX.json` by mktemp and recording `from_plugin`
+# member on the host, named `notice-<random>.json` (mkstemp, #1606) and recording `from_plugin`
 # on each notice and the recipient NOWHERE. The stale-retry loop below then globbed that
 # whole directory and re-fired whatever it found through its own $FIRE — so which member
 # received a retained work list was decided by whichever watcher's glob got there first.
@@ -1988,7 +1988,12 @@ while true; do
   fi
   N=$(echo "$OUT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('total',0))" 2>/dev/null || echo 0)
   if [ "$N" -gt 0 ]; then
-    PRIMER=$(mktemp "$PRIMERS/notice-XXXXXX.json")
+    # #1606: NOT `mktemp "$PRIMERS/notice-XXXXXX.json"`. That suffix form is GNU-only: BSD
+    # mktemp (macOS without coreutils first on PATH) replaces only TRAILING Xs, so it creates
+    # the literal `notice-XXXXXX.json` once and fails "File exists" on every later wake.
+    # mkstemp is atomic, keeps the `notice-*.json` name every sweep globs, and is the same
+    # on both. Prints nothing and exits nonzero on failure, as mktemp did.
+    PRIMER=$(python3 -c 'import os,sys,tempfile; fd,p=tempfile.mkstemp(prefix="notice-",suffix=".json",dir=sys.argv[1]); os.close(fd); print(p)' "$PRIMERS")
     # The strong asker: fold the member's outstanding debt into the primer, so
     # the question is asked where an answer is possible — inside the wake that
     # is happening anyway. Costs one read; never causes a fire on its own.
