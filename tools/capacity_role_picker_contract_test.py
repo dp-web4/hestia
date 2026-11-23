@@ -97,8 +97,10 @@ def cfg_save_behavior(data):
     js = """
 const sent = [], confirms = [];
 const data = DATA;
-const cfgRows = data.previous ? [{ key: 'HESTIA_ROLE', value: data.previous }] : [];
-const cfgReadRows = () => data.next ? [{ key: 'HESTIA_ROLE', value: data.next }] : [];
+let cfgRows = data.previous ? [{ key: 'HESTIA_ROLE', value: data.previous }] : [];
+const cfgStored = { role: data.previous || '', note: data.stored_note || '' };
+// as the real one does: the draft REPLACES cfgRows, so cfgRows no longer holds the stored role
+const cfgReadRows = () => (cfgRows = data.next ? [{ key: 'HESTIA_ROLE', value: data.next }] : []);
 const cfgSelected = 'claude-code';
 const confirm = message => { confirms.push(message); return data.ack !== false; };
 const els = {};
@@ -137,6 +139,10 @@ def approval_behaviour() -> None:
     approved = cfg_save_behavior({"previous": "member", "next": "reviewer", "note": "review duty"})
     check("a reasoned role change sends the note as its auditable reason",
           approved["sent"] and approved["sent"][0]["body"]["config"]["note"] == "review duty")
+    stale = cfg_save_behavior({"previous": "member", "next": "reviewer",
+                               "note": "initial setup", "stored_note": "initial setup"})
+    check("the stored note (the editor opens with it) is not a reason for a new role change",
+          stale["sent"] == [] and "reason (note) is required" in stale["err"])
     unchanged = cfg_save_behavior({"previous": "member", "next": "member"})
     check("a no-op role save does not manufacture an acknowledgement",
           unchanged["confirms"] == [] and bool(unchanged["sent"]))

@@ -6006,6 +6006,7 @@
   let cfgSelected = null;       // member currently open in the editor
   let cfgShared = { configured: false, keys: [] };   // the shared set, from the last list
   let cfgRows = [];             // [{key, value}] the editor holds (a draft, not the vault)
+  let cfgStored = { role: '', note: '' };   // the vault's document as opened (cfgRows is the draft)
   let cfgSeats = [];            // last list
 
   function cfgVerdictHtml(v) {
@@ -6122,6 +6123,7 @@
     $('cfg-err').hidden = true; $('cfg-saved').hidden = true;
     $('cfg-editor-verdict').innerHTML = ''; $('cfg-editor-digest').textContent = '';
     document.querySelectorAll('#cfg-seat-list .cfg-seat').forEach(el => el.classList.toggle('selected', el.dataset.member === member));
+    cfgStored = { role: '', note: '' };
     if (!configured) { cfgRows = []; $('cfg-note').value = ''; $('cfg-inherited').hidden = true; cfgRenderRows(); return; }
     try {
       const res = await apiFetch('/api/config/seat/' + encodeURIComponent(member));
@@ -6130,6 +6132,7 @@
       const env = (data.config && data.config.env) || {};
       cfgRows = Object.keys(env).sort().map(k => ({ key: k, value: env[k] }));
       $('cfg-note').value = (data.config && data.config.note) || '';
+      cfgStored = { role: env.HESTIA_ROLE || '', note: $('cfg-note').value };
       // INHERITED, READ-ONLY. The lines this seat gets from the shared set, with their values,
       // shown above its own rows so the whole projection is visible while only the seat's own
       // lines are editable here. Editing a shared value means opening the shared set.
@@ -6174,12 +6177,15 @@
       if (k in env) { err.textContent = 'duplicate key ' + k; err.hidden = false; return; }
       env[k] = r.value;
     }
-    const previousRole = cfgRows.find(r => r.key === 'HESTIA_ROLE')?.value || '';
+    // Against the STORED role (cfgReadRows just replaced cfgRows with the draft), and a reason
+    // that is new: the note field opens holding the last change's reason.
+    const previousRole = cfgStored.role;
     const nextRole = env.HESTIA_ROLE || '';
     if (previousRole !== nextRole) {
       if (!confirm(`Change capacity role for ${cfgSelected} from ${previousRole || 'member'} to ${nextRole || 'member'}?`)) return;
-      if (!$('cfg-note').value.trim()) {
-        err.textContent = 'a reason (note) is required to change a capacity role';
+      const note = $('cfg-note').value.trim();
+      if (!note || note === cfgStored.note.trim()) {
+        err.textContent = 'a new reason (note) is required to change a capacity role';
         err.hidden = false;
         return;
       }
