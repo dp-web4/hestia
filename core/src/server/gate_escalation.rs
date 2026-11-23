@@ -3674,9 +3674,16 @@ pub fn normalize_payload(v: Option<&str>) -> Option<String> {
             by: decided_by.trim().to_string(),
             role: esc.decided_role.clone(),
             independence,
-            // A decision is concurrence with itself. Dissent is a PEER verb, and the
-            // decision's own rationale already lives on `reason`.
-            dissent: false,
+            // A decision is concurrence with itself, for the operator's channels. Dissent is
+            // a PEER verb, and the decision's own rationale already lives on `reason`.
+            //
+            // BUT A PEER CAN NOW BE THE DECIDER (#1578, `peer_answer`), and its factor rides
+            // `Channel::PeerMember`, which `peer_participation()` counts. Hardcoded `false`
+            // published a peer's DENY as `concurred` (#1633). Measured three times on
+            // 2026-11-21: codex dissented, claude-code peer-ruled deny, and the record read
+            // `concurred: 1, dissented: 1`, a split where both peers refused. A peer's ruling
+            // is its stance, so a peer deny is a dissent and a peer approval a concurrence.
+            dissent: via == Channel::PeerMember && !approve,
             argument: None,
             invocation: None,
             post_claim: false,
@@ -7042,6 +7049,48 @@ mod bar_factor_tests {
             "and it MUST NOT turn an unclaimable approval into a claimable one"
         );
         assert_eq!(after.peer_participation().concurred, 1, "but it is on the record");
+    }
+
+    #[test]
+    fn a_peer_deny_is_counted_as_dissent_not_concurrence() {
+        // #1633. `law_inject.py` is SingleApprover, the bar on which a NOT-SAME peer's ruling
+        // decides. codex dissents first, then a second peer rules DENY. Both refused, so the
+        // record must show two dissents. Before the fix it read `concurred: 1, dissented: 1`.
+        let (mut s, id) = open_with("law_inject.py");
+        assert_eq!(s.get(&id).unwrap().bar, Bar::SingleApprover);
+        s.corroborate(&id, "codex", "role:constellation:member", None, true, Some("cannot see the act"), T0 + 2)
+            .expect("peer dissent lands while pending");
+        let e = s
+            .decide(&id, false, "claude-code", "role:constellation:member", Channel::PeerMember, None, Some("refused"), T0 + 4)
+            .expect("a peer may rule on single_approver");
+        assert_eq!(e.stored_status(), Status::Denied);
+        let decider = e.factors.last().expect("the decider's factor is recorded");
+        assert_eq!(decider.channel, Channel::PeerMember);
+        assert!(decider.dissent, "a peer's deny is its dissent");
+        let p = e.peer_participation();
+        assert_eq!((p.concurred, p.dissented), (0, 2), "both peers refused; the record must say so");
+    }
+
+    #[test]
+    fn a_peer_approval_still_counts_as_concurrence_and_operator_rulings_are_unchanged() {
+        // The other three cells of (channel x ruling). A peer approve concurs. An operator
+        // ruling (approve OR deny) keeps `dissent: false` and is not a peer factor at all.
+        let (mut s, id) = open_with("law_inject.py");
+        let e = s
+            .decide(&id, true, "kimi-code", "role:constellation:member", Channel::PeerMember, None, Some("ok"), T0 + 4)
+            .expect("peer approve");
+        assert!(!e.factors.last().unwrap().dissent);
+        assert_eq!((e.peer_participation().concurred, e.peer_participation().dissented), (1, 0));
+
+        for approve in [true, false] {
+            let (mut s, id) = open_with("law_inject.py");
+            let e = s
+                .decide(&id, approve, "dp", "role:constellation:sovereign", Channel::OperatorSession, None, None, T0 + 4)
+                .expect("operator ruling");
+            assert!(!e.factors.last().unwrap().dissent, "operator factors stay dissent:false (approve={approve})");
+            let p = e.peer_participation();
+            assert_eq!(p.concurred + p.dissented, 0, "an operator ruling is not peer participation");
+        }
     }
 
     #[test]
