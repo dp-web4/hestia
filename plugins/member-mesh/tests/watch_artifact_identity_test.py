@@ -11,6 +11,7 @@ length, and requires an explicit restart-required drift event.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -18,7 +19,9 @@ import select
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 HERE = Path(__file__).resolve().parent
@@ -26,8 +29,9 @@ WATCHER = HERE.parent / "hestia-watch-member.sh"
 TIMEOUT = 8.0
 
 
-def read_until(proc: subprocess.Popen[str], needle: str, accept=None) -> str:
+def read_until(proc: subprocess.Popen[str], needle: str, accept=None, count: int = 1) -> str:
     lines: list[str] = []
+    seen = 0
     deadline = time.monotonic() + TIMEOUT
     assert proc.stdout is not None
     while time.monotonic() < deadline:
@@ -41,9 +45,11 @@ def read_until(proc: subprocess.Popen[str], needle: str, accept=None) -> str:
             break
         lines.append(line)
         if needle in line and (accept is None or accept(line)):
-            return "".join(lines)
+            seen += 1
+            if seen == count:
+                return "".join(lines)
     raise AssertionError(
-        f"did not observe {needle!r}; rc={proc.poll()} output={''.join(lines)!r}"
+        f"did not observe {needle!r} {count} time(s); rc={proc.poll()} output={''.join(lines)!r}"
     )
 
 
@@ -63,9 +69,10 @@ def start(script: Path, home: Path, **extra_env: str) -> subprocess.Popen[str]:
         HESTIA_MESH_STATE=str(home / "state"),
         HESTIA_ENDPOINT="http://127.0.0.1:1/mcp",
         WATCH_INTERVAL="0.1",
-        UNANSWERED_EVERY="1",
-        **extra_env,
+        LEVEL_EVERY="1",
+        UNANSWERED_EVERY="3600",
     )
+    env.update(extra_env)
     return subprocess.Popen(
         [str(script), "artifact-test", "test-host"],
         stdout=subprocess.PIPE,
@@ -73,6 +80,63 @@ def start(script: Path, home: Path, **extra_env: str) -> subprocess.Popen[str]:
         text=True,
         env=env,
     )
+
+
+class OneDebtDaemon:
+    def __init__(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                pass
+
+            def _sse(self, payload: dict) -> None:
+                body = f"data: {json.dumps(payload)}\n\n".encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    req = json.loads(self.rfile.read(length) or b"{}")
+                except Exception:
+                    req = {}
+                if req.get("method") == "initialize":
+                    self._sse({"jsonrpc": "2.0", "id": req.get("id"), "result": {
+                        "protocolVersion": "2024-11-05", "capabilities": {},
+                        "serverInfo": {"name": "hestia", "version": "artifact-test"},
+                    }})
+                    return
+                if req.get("method") != "tools/call":
+                    self.send_response(202)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                name = req.get("params", {}).get("name")
+                if name == "hestia_connect":
+                    result = {"sessionId": "artifact-session"}
+                elif name == "hestia_member_unanswered":
+                    result = {"i_owe": [{"id": 1, "kind": "review_request",
+                                         "from_plugin": "claude-code", "to_plugin": "artifact-test",
+                                         "pointer_uri": "shared-context/one-debt", "drained_at": None,
+                                         "queued_at": "2026-01-01T00:00:00Z"}], "owed_to_me": []}
+                else:
+                    result = {"total": 0, "notices": []}
+                self._sse({"jsonrpc": "2.0", "id": req.get("id"),
+                           "result": {"content": [{"type": "text", "text": json.dumps(result)}]}})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def endpoint(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}/mcp"
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
 
 
 def real_drift_stays_visible() -> None:
@@ -169,17 +233,49 @@ def unavailable_startup_is_absorbing() -> None:
 
 def default_gauge_cadence_fits_measured_journal_retention() -> None:
     text = WATCHER.read_text()
-    match = re.search(r'^UNANSWERED_EVERY="\$\{UNANSWERED_EVERY:-(\d+)\}"', text, re.MULTILINE)
-    assert match is not None, "the watcher must declare a default level-gauge cadence"
-    seconds = int(match.group(1))
-    assert seconds == 600, (
-        f"default cadence {seconds}s does not put about three level lines in the measured "
-        "~1900s journal retention window; the UNANSWERED_EVERY override remains available"
-    )
+    level = re.search(r'^LEVEL_EVERY="\$\{LEVEL_EVERY:-(\d+)\}"', text, re.MULTILINE)
+    debt = re.search(r'^UNANSWERED_EVERY="\$\{UNANSWERED_EVERY:-(\d+)\}"', text, re.MULTILINE)
+    assert level is not None and debt is not None, "level and debt cadences must be independent"
+    assert int(level.group(1)) == 600, "the level gauge must fit the measured retention window"
+    assert int(debt.group(1)) == 3600, "per-row debt announcements must remain hourly"
+
+
+def level_and_debt_cadences_schedule_independently() -> None:
+    with tempfile.TemporaryDirectory() as td_raw:
+        td = Path(td_raw)
+        script = td / "hestia-watch-member.sh"
+        script.write_bytes(WATCHER.read_bytes())
+        script.chmod(0o755)
+        script.with_name("peek-new.py").write_bytes(WATCHER.with_name("peek-new.py").read_bytes())
+        daemon = OneDebtDaemon()
+        proc = start(script, td / "home", HESTIA_ENDPOINT=daemon.endpoint,
+                     LEVEL_EVERY="1", UNANSWERED_EVERY="3")
+        try:
+            output = read_until(proc, "UNANSWERED (", count=2)
+            assert output.count("UNANSWERED (") == 2, output
+            assert output.count("ARTIFACT plugin=") >= 2, output
+        finally:
+            stop(proc)
+            daemon.stop()
+
+
+def malformed_cadence_fails_at_startup() -> None:
+    with tempfile.TemporaryDirectory() as td_raw:
+        td = Path(td_raw)
+        script = td / "hestia-watch-member.sh"
+        script.write_bytes(WATCHER.read_bytes())
+        script.chmod(0o755)
+        for name, value in (("LEVEL_EVERY", "abc"), ("UNANSWERED_EVERY", "0")):
+            proc = start(script, td / "home", **{name: value})
+            output, _ = proc.communicate(timeout=5)
+            assert proc.returncode == 2, (name, proc.returncode, output)
+            assert f"invalid {name}={value}" in output, (name, output)
 
 
 def main() -> None:
     default_gauge_cadence_fits_measured_journal_retention()
+    level_and_debt_cadences_schedule_independently()
+    malformed_cadence_fails_at_startup()
     real_drift_stays_visible()
     unavailable_startup_is_absorbing()
 

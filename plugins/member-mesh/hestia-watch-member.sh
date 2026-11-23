@@ -1023,7 +1023,16 @@ retire_discharged_primers() {
 # lands in the woken session's own prompt). What is NOT done: firing a member
 # because it owes a response. Auto-waking a CLI is a consequential act; debt is
 # not a reason to spend one.
-UNANSWERED_EVERY="${UNANSWERED_EVERY:-600}"    # journal cadence, seconds; ~3 level lines in a ~1900s retention window
+LEVEL_EVERY="${LEVEL_EVERY:-600}"              # artifact/daemon gauge; ~3 level lines in a ~1900s retention window
+UNANSWERED_EVERY="${UNANSWERED_EVERY:-3600}"   # per-row debt announcements stay hourly
+for CADENCE_NAME in LEVEL_EVERY UNANSWERED_EVERY; do
+  CADENCE_VALUE="${!CADENCE_NAME}"
+  if ! [[ "$CADENCE_VALUE" =~ ^[0-9]+$ ]] || [ "$CADENCE_VALUE" -le 0 ]; then
+    echo "[hestia-watch] invalid $CADENCE_NAME=$CADENCE_VALUE — positive integer seconds required" >&2
+    exit 2
+  fi
+done
+unset CADENCE_NAME CADENCE_VALUE
 STALE_AFTER="${STALE_AFTER:-21600}"            # a notice is stale at 6h unbound
 
 # THE WATCHER IS NOT THE MEMBER (F3, CBP notice 699/701/702 thread, 2026-08-03).
@@ -1952,19 +1961,23 @@ print(live+(" — "+note if note else ""))' 2>/dev/null)
 }
 
 announce_unanswered
-LAST_ANNOUNCE=$(date +%s)
-LAST_SWEEP=$LAST_ANNOUNCE
+LAST_LEVEL_ANNOUNCE=$(date +%s)
+LAST_UNANSWERED_ANNOUNCE=$LAST_LEVEL_ANNOUNCE
+LAST_SWEEP=$LAST_LEVEL_ANNOUNCE
 
 while true; do
   check_artifact_drift
   maybe_self_deploy
   check_daemon_drift
   NOW=$(date +%s)
-  if [ $((NOW - LAST_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
+  if [ $((NOW - LAST_LEVEL_ANNOUNCE)) -ge "$LEVEL_EVERY" ]; then
     announce_artifact
     announce_daemon
+    LAST_LEVEL_ANNOUNCE=$NOW
+  fi
+  if [ $((NOW - LAST_UNANSWERED_ANNOUNCE)) -ge "$UNANSWERED_EVERY" ]; then
     announce_unanswered
-    LAST_ANNOUNCE=$NOW
+    LAST_UNANSWERED_ANNOUNCE=$NOW
   fi
   if [ $((NOW - LAST_SWEEP)) -ge "$DISCHARGE_SWEEP_EVERY" ]; then
     retire_discharged_primers
