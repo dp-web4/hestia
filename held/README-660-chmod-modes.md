@@ -2,7 +2,7 @@
 
 | file | sha256 |
 |---|---|
-| `672c7cda595b649408afd242ad34ad975f4966a45b2501e55a329bcac9f76d61.patch` | `672c7cda595b649408afd242ad34ad975f4966a45b2501e55a329bcac9f76d61` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
+| `619f31fc96bf84591750343697da1cd4f040e12aa1549aa5388d622acb5cda28.patch` | `619f31fc96bf84591750343697da1cd4f040e12aa1549aa5388d622acb5cda28` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
 
 ## The defect
 
@@ -11,8 +11,8 @@ discarded `FILE` as the mode. Adding an exec bit escalated; removing it was free
 
 ## The change
 
-- Parse chmod's mode explicitly. Symbolic forms such as `-x`, `-w`, `-r`, `-rwx`, `a-x`, `go-rwx`, and `a=r`,
-  numeric modes, and the `--` delimiter all preserve the target.
+- Parse chmod's mode explicitly. Symbolic forms such as `-x`, `-w`, `-r`, `-rwx`, `a-x`, `go-rwx`, `u-x,g+w`, and
+  `a=r`, numeric modes, and the `--` delimiter all preserve the target.
 - Consume known chmod flags by name, including recursion and common verbosity flags. Unknown options use the
   existing out-of-grammar fail-closed posture.
 - Handle `--reference FILE` and `--reference=FILE` as supplying the mode, so remaining arguments are targets.

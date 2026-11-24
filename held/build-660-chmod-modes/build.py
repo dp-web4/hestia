@@ -28,7 +28,7 @@ def once(text, old, new):
 
 def patch_core(src):
     src = once(src, """def _command_write_targets(words: list, stdin_src=None, path_pinned: bool = False) -> list:
-""", '''_CHMOD_MODE = re.compile(r"(?:[ugoa]*[-+=][rwxXstugo]*|[0-7]{3,4})")
+""", '''_CHMOD_MODE = re.compile(r"(?:[ugoa]*[-+=][rwxXstugo]*(?:,[ugoa]*[-+=][rwxXstugo]*)*|[0-7]{3,4})")
 _CHMOD_FLAGS = frozenset({
     "-R", "--recursive", "-v", "--verbose", "-f", "--silent", "--quiet", "-c", "--changes",
     "--preserve-root", "--no-preserve-root",
@@ -50,9 +50,13 @@ def _chmod_write_targets(args: list) -> list:
         if a in ("--help", "--version"):
             return []
         if a == "--reference":
+            if i + 1 >= len(args):
+                raise _OutOfGrammar()
             reference, i = True, i + 2
             continue
         if a.startswith("--reference="):
+            if a == "--reference=":
+                raise _OutOfGrammar()
             reference, i = True, i + 1
             continue
         if a in _CHMOD_FLAGS or (
@@ -93,6 +97,7 @@ def patch_test(src):
             f"chmod -x {target}", f"chmod -w {target}", f"chmod -r {target}",
             f"chmod -rwx {target}", f"chmod -R -x {target}", f"chmod -- -x {target}",
             f"chmod +x {target}", f"chmod a-x {target}", f"chmod go-rwx {target}",
+            f"chmod u-x,g+w {target}", f"chmod -R u-x,g+w {target}",
             f"chmod 000 {target}", f"chmod a=r {target}",
             f"chmod --reference=/tmp/reference {target}",
             f"chmod --reference /tmp/reference {target}"):
@@ -102,9 +107,12 @@ def patch_test(src):
     check("chmod-help-is-not-a-write", v.classification != "write", str(v))
     v = cls("Bash", {"command": "chmod -R -x"}, cwd="/w/hestia")
     check("chmod-without-target-is-not-invented", v.classification != "write", str(v))
-    v = cls("Bash", {"command": f"chmod --some-future-option {target}"}, cwd="/w/hestia")
-    check("chmod-unknown-option-fails-closed",
-          v.classification == "write" and v.rule == g.RULE_OUT_OF_GRAMMAR, str(v))
+    v = cls("Bash", {"command": "chmod --reference"}, cwd="/w/hestia")
+    check("chmod-missing-reference-value-invents-no-target", v.classification != "write", str(v))
+    for command in (f"chmod --some-future-option {target}", f"chmod --reference= {target}"):
+        v = cls("Bash", {"command": command}, cwd="/w/hestia")
+        check(f"chmod-malformed-mode-or-option-fails-closed: {command}",
+              v.classification == "write" and v.rule == g.RULE_OUT_OF_GRAMMAR, str(v))
     v = cls("Bash", {"command": f"chown -R member {target}"}, cwd="/w/hestia")
     check("chown-still-writes", v.classification == "write", str(v))
 
