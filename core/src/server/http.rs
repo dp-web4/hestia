@@ -4953,6 +4953,24 @@ async fn scope_grant(
         .grants
         .iter()
         .any(|g| g.member == plugin_id && g.path == path);
+    // WHAT was replaced, not only THAT something was (NOVA, #1638): the same path with other
+    // modes, reach or expiry is a replacement -- last edit wins -- and never an overlap, so
+    // without the old row's terms the reader cannot see what the new grant narrowed or
+    // widened. `live: false` says the row being replaced had already lapsed.
+    let replaced_terms = s
+        .standing_scope
+        .grants
+        .iter()
+        .find(|g| g.member == plugin_id && g.path == path)
+        .map(|g| {
+            serde_json::json!({
+                "modes": g.modes.as_letters(),
+                "recursive": g.recursive,
+                "expires_at": g.expires_at,
+                "live": g.is_live(now),
+            })
+        })
+        .unwrap_or(serde_json::Value::Null);
     let coverage_overlaps: Vec<serde_json::Value> = s
         .standing_scope
         .grants
@@ -5010,6 +5028,7 @@ async fn scope_grant(
         "standing": true,
         "standing_expires_at": expires_at,
         "replaces_existing": replaces,
+        "replaced_terms": replaced_terms.clone(),
         "coverage_overlaps": coverage_overlaps.clone(),
         "member_known": member_known,
         "durability": "STANDING — written to the vault's standing-scope document; survives \
@@ -5085,6 +5104,7 @@ async fn scope_grant(
             "expires_at": expires_at,
             "generation": s.standing_scope.generation,
             "replaced_existing": replaces,
+            "replaced_terms": replaced_terms,
             "coverage_overlaps": coverage_overlaps,
             // Surfaced so a typo is visible at the moment it is made, not at the moment the
             // grant fails to help someone.
@@ -9739,6 +9759,11 @@ mod disposition_tests {
         assert_eq!(st, StatusCode::OK, "{second}");
         assert_eq!(second["replaced_existing"], serde_json::json!(true), "{second}");
         assert!(second["coverage_overlaps"].as_array().unwrap().is_empty(), "{second}");
+        // The OLD row's terms are reported, so the reader sees what changed (r+1h -> rw+none).
+        assert_eq!(second["replaced_terms"], serde_json::json!({
+            "modes": "r", "recursive": false, "expires_at": first["expires_at"], "live": true,
+        }), "{second}");
+        assert_eq!(first["replaced_terms"], serde_json::Value::Null, "{first}");
         let s = state.lock().await;
         let rows: Vec<_> = s.standing_scope.grants.iter()
             .filter(|g| g.member == "hub-being" && g.path == "/w/same").collect();
@@ -9769,6 +9794,93 @@ mod disposition_tests {
         assert_eq!(st, StatusCode::OK, "{abc}");
         assert!(abc["coverage_overlaps"].as_array().unwrap().is_empty(),
                 "existing /w/a/** does not cover new /w/abc: {abc}");
+    }
+
+    /// Replacing a LAPSED row says so: `replaced_existing` stays true (the row is replaced),
+    /// and `replaced_terms.live: false` keeps the reader from taking it as a narrowing of
+    /// reach that was in force.
+    #[tokio::test]
+    async fn replacing_a_lapsed_row_reports_its_terms_as_not_live() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let now = crate::server::gate_escalation::now_secs();
+        {
+            let mut s = state.lock().await;
+            s.commit_standing_scope(|st| st.add(crate::server::standing_scope::StandingGrant {
+                member: "hub-being".into(), path: "/w/old".into(), granted_at: now - 7200,
+                granted_by: "operator".into(), reason: "lapsed".into(), expires_at: Some(now - 1),
+                request_id: None, recursive: true,
+                modes: crate::server::grant_modes::Modes::ALL,
+            })).unwrap();
+        }
+        let (st, out) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/old", "modes": "r", "reason": "again, read only"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["replaced_existing"], serde_json::json!(true), "{out}");
+        assert_eq!(out["replaced_terms"], serde_json::json!({
+            "modes": "rwed", "recursive": true, "expires_at": now - 1, "live": false,
+        }), "{out}");
+    }
+
+    /// Coverage is LEXICAL over normalised paths (NOVA's normalisation ask): every spelling
+    /// is normalised before comparing (`normalize_scope_path`), so `/w/root//x/../child/.` is
+    /// `/w/root/child` -- covered by `/w/root/**`, and a replacement of an existing
+    /// `/w/root/child` rather than a second row or an overlap with itself.
+    #[tokio::test]
+    async fn coverage_compares_normalised_spellings() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let (st, _) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root/", "recursive": true, "reason": "tree"
+        })).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, child) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w/root//x/../child/.", "reason": "child"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{child}");
+        assert_eq!(child["path"], "/w/root/child", "{child}");
+        assert_eq!(child["coverage_overlaps"].as_array().unwrap().len(), 1, "{child}");
+        assert_eq!(child["coverage_overlaps"][0]["path"], "/w/root", "{child}");
+        let (st, again) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": "/w//root/child", "reason": "same, respelled"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{again}");
+        assert_eq!(again["replaced_existing"], serde_json::json!(true), "{again}");
+        assert_eq!(again["coverage_overlaps"].as_array().unwrap().len(), 1,
+                   "only /w/root; the respelled row is the same row, not an overlap: {again}");
+        assert_eq!(state.lock().await.standing_scope.grants.len(), 2);
+    }
+
+    /// Symlinks are NOT resolved (`normalize_scope_path` is textual by design, state.rs: the
+    /// daemon records and the plugin gate enforces, and the two may not see the same mount).
+    /// So a grant under a symlink to a granted tree is reported as NO overlap, even though on
+    /// this filesystem it reaches the same file. The report under-claims; it never infers
+    /// reach, and the "Path overlap" label says which relation it is.
+    #[tokio::test]
+    async fn coverage_does_not_resolve_symlinks() {
+        let (_dir, state) = test_state().await;
+        register_member(&state, "hub-being").await;
+        let fs = tempfile::tempdir().unwrap();
+        let root = fs.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("child"), b"x").unwrap();
+        let link = fs.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let (st, _) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": root.to_str().unwrap(), "recursive": true,
+            "reason": "tree"
+        })).await;
+        assert_eq!(st, StatusCode::OK);
+        let via_link = link.join("child");
+        assert!(via_link.exists(), "the link really reaches the granted tree");
+        let (st, out) = grant(&state, serde_json::json!({
+            "plugin_id": "hub-being", "path": via_link.to_str().unwrap(), "reason": "via link"
+        })).await;
+        assert_eq!(st, StatusCode::OK, "{out}");
+        assert_eq!(out["path"], via_link.to_str().unwrap(), "recorded as spelled, not resolved");
+        assert!(out["coverage_overlaps"].as_array().unwrap().is_empty(),
+                "lexical: a symlinked spelling is a different path: {out}");
     }
 
     #[test]

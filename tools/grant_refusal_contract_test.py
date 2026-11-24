@@ -140,6 +140,7 @@ GRANTED = {"status": 200, "body": {"ok": True, "member_known": False, "plugin_id
 COVERAGE = {"status": 200, "body": {
     "ok": True, "member_known": True, "plugin_id": "claude-code", "path": "/w/root/child",
     "replaced_existing": True,
+    "replaced_terms": {"modes": "rwed", "recursive": True, "expires_at": 1767225600, "live": False},
     "coverage_overlaps": [
         {"path": "/w/root", "relation": "existing_path_covers_new", "modes": "r", "recursive": True,
          "expires_at": 1798761600},
@@ -211,7 +212,13 @@ def behaviour() -> None:
 
     html = next((row["html"] for row in run([COVERAGE], "coverage") if "html" in row), "")
     check("replacement is rendered, not left only in the JSON response",
-          "Replaced the existing grant on this member and path." in html)
+          "Replaced the existing grant on this member and path" in html)
+    # WHAT was replaced: the same path with other terms is never an overlap, so the old row's
+    # own terms are shown, and a lapsed row is named as lapsed (NOVA, #1638).
+    check("the replaced row's terms are rendered",
+          "(was modes rwed, recursive, expires 2026-01-01T00:00Z, already lapsed)." in html)
+    check("the caveat says the comparison is lexical",
+          "symlinks are not resolved" in html)
     # A PATH relation is labelled as one, with the existing grant's own modes/reach/expiry
     # beside it -- never the bare "covers" that reads as authority redundancy (NOVA, #1638).
     for fragment in ("existing path covers new: /w/root (modes r, recursive, expires 2027-01-01T00:00Z)",
