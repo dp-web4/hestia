@@ -525,7 +525,7 @@ def inspect_being(atlas_id: str, roots: list[str], atlas: dict, units: list[Path
                     if text.startswith("more than one being id launched here"):
                         continue
                     if text.startswith(("launcher ", "LAW-SOURCE:", "LAUNCHER-NOT-ENABLED:")):
-                        if any(unit in text for unit in units):
+                        if any(names_unit(text, unit) for unit in units):
                             out.append(text)
                     else:
                         out.append(text)
@@ -546,6 +546,17 @@ def inspect_being(atlas_id: str, roots: list[str], atlas: dict, units: list[Path
             rows.append(row)
         rec["member_rows"] = rows
     return rec
+
+
+def names_unit(text: str, unit: str) -> bool:
+    """Whether a finding names this unit file as a WHOLE path, not as a prefix of another one.
+
+    Substring matching attached a finding about `com.web4.sage.mcnugget.plist.retired-2026-09-18`
+    to the live `com.web4.sage.mcnugget.plist` sitting beside it (McNugget's own LaunchAgents).
+    A path character on either side means the match is part of a longer name; a trailing full
+    stop that ends the sentence (`… .plist.`) does not.
+    """
+    return re.search(r"(?<![\w./-])" + re.escape(unit) + r"(?![\w-]|\.\w)", text) is not None
 
 
 def expand_being_record(rec: dict) -> list[dict]:
