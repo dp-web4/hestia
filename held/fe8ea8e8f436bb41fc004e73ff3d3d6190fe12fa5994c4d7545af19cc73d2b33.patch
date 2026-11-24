@@ -86,7 +86,7 @@ diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.
  import json
  import os
  import re
-@@ -289,6 +290,89 @@
+@@ -289,6 +290,94 @@
          json.dump({"mrh": mrh, "role": "role:constellation:member"}, fh)
      return G.HarnessProfile(member_id="test-member", identity_path=p,
                              home_markers=("~/.test-member",))
@@ -155,13 +155,18 @@ diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.
 +        fh.write("x\n")
 +    ok, offending = G.command_in_scope(f"cat {sibling}/README.md", ["granted"], ws, ws)
 +    check("workspace-prefix-sibling-is-not-inside", not ok and offending, (ok, offending))
++    parent = os.path.dirname(ws)
++    leaf = os.path.basename(ws)
 +    for label, command in (
-+            ("dot-segment", f"cat {ws}/ungranted/./README.md"),
-+            ("dotdot-segment", f"cat {ws}/ungranted/sub/../README.md"),
++            ("parent-dot-segment", f"cat {parent}/./{leaf}/ungranted/README.md"),
++            ("parent-dotdot-segment", f"cat {parent}/x/../{leaf}/ungranted/README.md"),
++            ("parent-double-slash", f"cat {parent}//{leaf}/ungranted/README.md"),
 +            ("pattern-is-data-file-is-reach",
-+             f"grep -e {ws}/ungranted/README.md {ws}/ungranted/./README.md")):
++             f"grep -e {ws}/ungranted/README.md {parent}/./{leaf}/ungranted/README.md")):
 +        ok, offending = G.command_in_scope(command, ["granted"], ws, ws)
 +        check(f"normalized-absolute-pass-denies-{label}", not ok and offending, (ok, offending))
++    ok, offending = G.command_in_scope(f"cat {parent}/./{leaf}/granted/README.md", ["granted"], ws, ws)
++    check("normalized-absolute-pass-allows-granted-control", ok, (ok, offending))
 +    for label, command in (
 +            ("sed-write", f"sed 'w {ws}/ungranted/README.md' {ws}/granted/README.md"),
 +            ("pythonpath-import", f"PYTHONPATH={ws}/ungranted python3 -c 'import mod'"),
@@ -176,7 +181,7 @@ diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.
 
 
  def test_path_and_command_scope():
-@@ -1311,6 +1395,8 @@
+@@ -1311,6 +1400,8 @@
      "test_egress_offers_no_door",
      "test_scope_remedy_distinguishes_itself_from_appeal",
      "test_path_and_command_scope",
@@ -185,7 +190,7 @@ diff --git a/plugins/_shared/test_gate_core.py b/plugins/_shared/test_gate_core.
      "test_path_grant_reaches_a_sibling_of_the_repos",
      "test_path_grants_keep_their_type_and_match_resolved_boundaries",
      "test_a_symlinked_reach_is_judged_by_its_target_as_if_named_directly",
-@@ -1390,6 +1476,8 @@
+@@ -1390,6 +1481,8 @@
      test_egress_offers_no_door()
      test_scope_remedy_distinguishes_itself_from_appeal()
      test_path_and_command_scope()

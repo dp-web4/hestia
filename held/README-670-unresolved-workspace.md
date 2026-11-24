@@ -2,7 +2,7 @@
 
 | file | sha256 |
 |---|---|
-| `2c08e37ff4bec2734274d8332267e4d2383fa8639f2344397915b4a29f7d2f12.patch` | `2c08e37ff4bec2734274d8332267e4d2383fa8639f2344397915b4a29f7d2f12` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
+| `fe8ea8e8f436bb41fc004e73ff3d3d6190fe12fa5994c4d7545af19cc73d2b33.patch` | `fe8ea8e8f436bb41fc004e73ff3d3d6190fe12fa5994c4d7545af19cc73d2b33` (base main `59f2478eb70314a26c1538c166d9e938738e73fc`) |
 
 ## The defect
 
@@ -34,7 +34,9 @@ On base `59f2478e`, with the generated core loaded from a faithful scratch `plug
 
 - `test_gate_core.py`: **ALL CHECKS PASS**, including no-env/no-marker denial, valid env override, marker
   resolution, stale-env fallback, absolute-path refusal at root and other cwds, and prefix-sibling denial. New
-  discriminating controls cover sed writes, `PYTHONPATH`, data operands, and unenumerated-lift widening.
+  discriminating controls place dot, dotdot, and duplicate separators above the workspace leaf, cover grep pattern
+  text separately from the reached file, and retain a granted control. Removing the normalized absolute pass fails
+  all four denial arms; restoring its old normalized-pattern check fails the grep arm.
 - `public_boundary_test.py`: **PASS**. `hestia_gate_mechanism_test.py`: **PASS, 35 tests**, including marker-based
   discovery and explicit unmarked-workspace resolution. The previously red grep/toolchain suite also passes.
 - `one_gate_decide_contract_test.py`: **PASS, 25 tests + 31x4 shim-parity cells** with the core overlay.

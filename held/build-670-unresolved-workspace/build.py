@@ -298,13 +298,18 @@ def test_absolute_scope_paths_do_not_depend_on_process_cwd():
         fh.write("x\n")
     ok, offending = G.command_in_scope(f"cat {sibling}/README.md", ["granted"], ws, ws)
     check("workspace-prefix-sibling-is-not-inside", not ok and offending, (ok, offending))
+    parent = os.path.dirname(ws)
+    leaf = os.path.basename(ws)
     for label, command in (
-            ("dot-segment", f"cat {ws}/ungranted/./README.md"),
-            ("dotdot-segment", f"cat {ws}/ungranted/sub/../README.md"),
+            ("parent-dot-segment", f"cat {parent}/./{leaf}/ungranted/README.md"),
+            ("parent-dotdot-segment", f"cat {parent}/x/../{leaf}/ungranted/README.md"),
+            ("parent-double-slash", f"cat {parent}//{leaf}/ungranted/README.md"),
             ("pattern-is-data-file-is-reach",
-             f"grep -e {ws}/ungranted/README.md {ws}/ungranted/./README.md")):
+             f"grep -e {ws}/ungranted/README.md {parent}/./{leaf}/ungranted/README.md")):
         ok, offending = G.command_in_scope(command, ["granted"], ws, ws)
         check(f"normalized-absolute-pass-denies-{label}", not ok and offending, (ok, offending))
+    ok, offending = G.command_in_scope(f"cat {parent}/./{leaf}/granted/README.md", ["granted"], ws, ws)
+    check("normalized-absolute-pass-allows-granted-control", ok, (ok, offending))
     for label, command in (
             ("sed-write", f"sed 'w {ws}/ungranted/README.md' {ws}/granted/README.md"),
             ("pythonpath-import", f"PYTHONPATH={ws}/ungranted python3 -c 'import mod'"),
