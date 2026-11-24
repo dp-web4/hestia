@@ -60,16 +60,8 @@ fn connection_from_binding(binding: &crate::receiver_routing::LocalMailboxBindin
     }
 }
 
-fn abs_rest(conn: &HubConnection) -> String {
-    if conn.rest_endpoint.starts_with("http://") || conn.rest_endpoint.starts_with("https://") {
-        conn.rest_endpoint.trim_end_matches('/').to_string()
-    } else {
-        format!(
-            "{}/{}",
-            conn.url.trim_end_matches('/'),
-            conn.rest_endpoint.trim_matches('/')
-        )
-    }
+fn abs_rest(conn: &HubConnection) -> Result<String> {
+    crate::hub::absolute_rest_endpoint(&conn.url, &conn.rest_endpoint)
 }
 
 fn value_string(v: &serde_json::Value, key: &str) -> Option<String> {
@@ -83,7 +75,7 @@ async fn open_verified_channel(
 ) -> Result<(crate::hub::HubChannel, web4_core::crypto::KeyPair, String)> {
     let keypair = member_signing_keypair(vault, &conn.member_key_source)
         .with_context(|| format!("resolving credential for Hub member {}", conn.our_lct_id))?;
-    let rest = abs_rest(conn);
+    let rest = abs_rest(conn)?;
 
     // Identity resolution is not credential resolution (#1210). Before polling,
     // prove that the unattended key Hestia is about to use is the key the Hub
