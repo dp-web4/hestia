@@ -1,4 +1,4 @@
-# hestia-gt-sha256: 3ce0c64177e6fd221833fb97a0dd23769ec708ad4f8c83ddd0d40f1c84a19f21  (published ground truth; manifest: hooks-gt)
+# hestia-gt-sha256: 3ffa0c9461f2270ad2d29425f0eacb9903bccaafc9ca8b2dfa3939a18c180cd7  (published ground truth; manifest: hooks-gt)
 """The one Hestia gate orchestrator: `decide(GateEvent, GateProfile) -> GateDecision`.
 
 One-gate stage C (docs/one-gate-convergence-plan.md §4): THE GATE OF EVERY SEAT. Each seat's
@@ -1137,10 +1137,21 @@ def _governance_closure(inv: _Invocation) -> Optional[GateDecision]:
         pass
     esc = (f" Escalation {esc_id} is open — a human decides out of band ({how}); re-issue the "
            f"write afterwards to claim the approval." if esc_id else "")
-    v = core._deny("gate.self_access",
-                   f"'{ev.tool}' would WRITE the governance surface: {cv.resource or marker} "
-                   f"(matched marker {marker!r}; rule {cv.rule or 'gate-self'}; {detail}).{esc}",
-                   innate=True)
+    if cv.rule == closure.RULE_OPAQUE_WRITER:
+        v = core.Verdict(
+            "deny",
+            "gate.self_access",
+            f"'{ev.tool}' writes a patch the gate cannot read yet: {cv.resource or 'stdin'}. {detail}.{esc}",
+            "Create or expose the patch in its own call first, then run the write separately "
+            "so its targets can be reviewed.",
+            True,
+            cv.resource or marker,
+        )
+    else:
+        v = core._deny("gate.self_access",
+                       f"'{ev.tool}' would WRITE the governance surface: {cv.resource or marker} "
+                       f"(matched marker {marker!r}; rule {cv.rule or 'gate-self'}; {detail}).{esc}",
+                       innate=True)
     return _verdict_deny(v, escalation_id=esc_id)
 
 
