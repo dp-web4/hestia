@@ -418,9 +418,10 @@ bash4() {
 #     endpoint closed, fail-open:    Read /tmp/x -> rc=0
 # And policy resolution returns an EMPTY scope with source "unresolved" when nothing answers,
 # which renders the identical `(granted: )` banner as a live daemon whose policy is genuinely
-# empty. That is why the amendment's cheap observable cannot discriminate: the emptiness pub saw
-# was a SYMPTOM of the daemon failure, printed at the wrong layer. A preflight keyed on it
-# disarms healthy seats and still misses the mechanism that actually locks one.
+# empty. That is why the amendment's cheap observable cannot discriminate. Pub's Aug 28 emptiness
+# was REAL, not a daemon-failure symptom: #1097 preserves the live snapshot of the daemon answering
+# with in_scope: [] (#715). A preflight keyed on emptiness disarms healthy seats and still misses
+# the mechanism that actually locks one.
 #
 # So this tests the artifact by RUNNING it — the same post-condition discipline the binary
 # (`same_build "$newv" "$target"`) and the manifest already get here. Execute the gate this cycle
@@ -793,6 +794,10 @@ install_hooks() {
     after="$(manifest_build_id)"
     if ! same_build "$after" "$target"; then
       hooks="FAILED(installer rc=0, manifest '${after:-none}')"
+    elif registration_drift; then
+      hooks="FAILED(installer rc=0, registration drift persists)"
+    elif [ "$registration_drift_status" != "current" ]; then
+      hooks="FAILED(registration drift $registration_drift_status)"
     fi
   else
     rc=$?
@@ -1055,6 +1060,35 @@ manifest_build_id() {
   sed -n 's/.*"build_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$HESTIA_HOME/current-build.json" | head -1
 }
 
+# #1097A: build_id equality says nothing about where the harness actually points. The registrar's
+# dry run compares its owned lines with the rendered templates and writes nothing. Return 0 for
+# drift, 1 for current, and 2 when the comparison itself failed; FOREIGN lines stay out of scope.
+registration_drift() {
+  local out rc=0
+  registration_drift_status="unmeasured"
+  out="$(DRY_RUN=1 HESTIA_HOME="$HESTIA_HOME" python3 "$DEPLOY_ROOT/hestia/deploy/register-members.py" --home "$HOME" 2>&1)" || rc=$?
+  if [ "$rc" != 0 ]; then
+    case "$rc" in
+      8|9|10)
+        registration_drift_status="drift(rc=$rc)"
+        printf '%s\n' "$out" | sed 's/^/  registration-drift: /' >>"$LOG"
+        return 0 ;;
+      *)
+        registration_drift_status="unmeasured(rc=$rc)"
+        printf '%s\n' "$out" | sed 's/^/  registration-drift: /' >>"$LOG"
+        printf '%s\n' "  registration-drift: $registration_drift_status" >>"$LOG"
+        return 2 ;;
+    esac
+  fi
+  if grep -Eq 'would [^:]+: would (add|rewrite|remove|ensure) ' <<<"$out"; then
+    registration_drift_status="drift"
+    printf '%s\n' "$out" | sed 's/^/  registration-drift: /' >>"$LOG"
+    return 0
+  fi
+  registration_drift_status="current"
+  return 1
+}
+
 # What a hooks value means for the exit code, and how the tail is worded. ONE table for the
 # three places that end a cycle with a hooks value (DEPLOYED, CURRENT-with-repair, HOOKS-ONLY).
 #   ok, or skipped by explicit HESTIA_DEPLOY_HOOKS=0            -> 0
@@ -1293,15 +1327,25 @@ if [ "$MODE" = "--hooks-only" ]; then
 fi
 
 if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
-  # A current binary with a manifest that does not say so is a half deploy left behind by an
-  # earlier cycle (hooks != ok), and until 2026-08-27 nothing retried it: this branch logged
-  # CURRENT and exited before the installer, and the only repair was --hooks-only — which the
-  # party most likely to be reading the failure (an agent session) cannot run, because the
-  # installer refuses it (rc=3). The timer is the one caller that is not a session, so the
-  # timer's own CURRENT cycle is where the repair belongs. Full mode only: --check reports.
+  # A current binary with a stale manifest OR stale owned registration is a half deploy. Until
+  # 2026-08-27 nothing retried the former; #1097A is the latter: a hook moved out of the worktree
+  # left build_id equal, so this branch read CURRENT while the manifest named a path nothing
+  # registered. The timer is not a governed session, so its CURRENT cycle repairs both. Full mode
+  # only: --check reports, and HESTIA_DEPLOY_HOOKS=0 remains the explicit opt-out.
   manifest="$(manifest_build_id)"
-  if [ "$MODE" = "full" ] && [ "${HESTIA_DEPLOY_HOOKS:-1}" = "1" ] && ! same_build "$manifest" "$target"; then
-    log "CURRENT $target but manifest says '${manifest:-none}'; re-running the members' install"
+  repair_reason=""
+  if [ "$MODE" = "full" ] && [ "${HESTIA_DEPLOY_HOOKS:-1}" = "1" ]; then
+    if ! same_build "$manifest" "$target"; then
+      repair_reason="manifest says '${manifest:-none}'"
+    elif registration_drift; then
+      repair_reason="registration drift (registered hooks differ from the rendered templates)"
+    elif [ "$registration_drift_status" != "current" ]; then
+      log "HALF-DEPLOYED $target: binary and manifest current, registration drift $registration_drift_status; $(hooks_repair_hint)"
+      exit 1
+    fi
+  fi
+  if [ -n "$repair_reason" ]; then
+    log "CURRENT $target but $repair_reason; re-running the members' install"
     install_hooks
     install_inventory
     install_mesh
@@ -1309,7 +1353,7 @@ if same_build "$running" "$target" && same_build "$ondisk" "$target"; then
     log "CURRENT $target manifest-repair hooks=$hooks inventory=$inventory mesh=$mesh seats=$seats post_deploy=$post_deploy"
     case "$hooks" in
       ok) exit 0 ;;
-      *)  log "HALF-DEPLOYED $target: binary current, manifest still '${manifest:-none}' (hooks=$hooks); $(hooks_repair_hint)"; exit 1 ;;
+      *)  log "HALF-DEPLOYED $target: binary current, $repair_reason (hooks=$hooks); $(hooks_repair_hint)"; exit 1 ;;
     esac
   fi
   # The ordinary cycle is where a stale inventory copy gets noticed: most cycles are this

@@ -85,8 +85,11 @@ fn safety_rules() -> Vec<PolicyRule> {
             // that one phrasing failed (dp, 2026-07-26: "'rm must be standalone' is a
             // good law").
             reason: Some(
-                "rm is PERMITTED when it stands alone and every target is an absolute path \
-                 under /tmp. It must be the ONLY command in the call: no &&, ;, |, newline, \
+                "rm is PERMITTED only when it carries at least one flag (for example -f or \
+                 -rf), stands alone, and every target is an absolute path under /tmp. A \
+                 flagless `rm` is NOT covered by this allow: it falls through to \
+                 `warn-file-delete`, which WARNS and proceeds, including outside /tmp. The \
+                 flagged form must be the ONLY command in the call: no &&, ;, |, newline, \
                  backticks or $(...) alongside it, and no .. in any path. Need to delete \
                  then recreate? Send them as two separate commands — chaining is what the \
                  deny catches, not the deletion."
@@ -119,10 +122,12 @@ fn safety_rules() -> Vec<PolicyRule> {
             decision: PolicyDecision::Deny,
             reason: Some(
                 "Destructive command blocked by the safety preset. Two classes land here. \
-                 (1) Destroying a FILESYSTEM: rm is allowed ONLY standing alone against \
-                 absolute /tmp paths (see the allow rule); anything chained, relative, \
+                 (1) Destroying a FILESYSTEM: a FLAGGED `rm` is allowed ONLY standing alone \
+                 against absolute /tmp paths (see the allow rule); anything chained, relative, \
                  path-escaping (..) or outside /tmp lands here, as does mkfs in any \
-                 spelling (`mkfs`, `mkfs.ext4`). (2) Writing raw bytes at a BLOCK DEVICE \
+                 spelling (`mkfs`, `mkfs.ext4`). A flagless `rm` does NOT match this deny: \
+                 `warn-file-delete` WARNS and proceeds, including outside /tmp. \
+                 (2) Writing raw bytes at a BLOCK DEVICE \
                  (/dev/sdX, nvme, vd, hd, mmcblk, xvd) — via `of=`, a `>` redirect, a \
                  `tee` target, or a `cp`/`mv`/`install` destination — plus `shred` with or \
                  without flags. That list is EXHAUSTIVE, not illustrative: a write whose \
@@ -523,6 +528,45 @@ mod tests {
         assert_eq!(v.decision, PolicyDecision::Deny);
         assert_eq!(v.rule_id.as_deref(), Some("deny-destructive-commands"));
         assert!(v.enforced);
+    }
+
+    /// #1108: the published law must name the flag discriminator and the warn fallthrough.
+    #[test]
+    fn published_rm_law_names_flag_requirement_and_flagless_warn() {
+        use crate::policy::{PolicyAction, PolicyEngine};
+
+        let config = get_preset("safety").unwrap().config;
+        let reason = |id: &str| {
+            config.rules.iter().find(|rule| rule.id == id)
+                .and_then(|rule| rule.reason.as_deref())
+                .unwrap_or_else(|| panic!("{id} has no published reason"))
+        };
+        let allow = reason("allow-rm-whitelisted-scratch");
+        for needle in ["at least one flag", "flagless `rm`", "`warn-file-delete`",
+                       "WARNS and proceeds", "outside /tmp"] {
+            assert!(allow.contains(needle), "allow reason omits {needle:?}: {allow}");
+        }
+        let deny = reason("deny-destructive-commands");
+        for needle in ["FLAGGED `rm`", "flagless `rm` does NOT match this deny",
+                       "`warn-file-delete`", "WARNS and proceeds", "outside /tmp"] {
+            assert!(deny.contains(needle), "deny reason omits {needle:?}: {deny}");
+        }
+
+        let engine = PolicyEngine::new(config);
+        let judge = |cmd: &str| {
+            engine.evaluate(&PolicyAction {
+                tool_name: "Bash",
+                category: "command",
+                target: Some(cmd),
+                full_command: Some(cmd),
+            })
+        };
+        let flagless = judge("rm /home/user/notes.txt");
+        assert_eq!(flagless.decision, PolicyDecision::Warn);
+        assert_eq!(flagless.rule_id.as_deref(), Some("warn-file-delete"));
+        let flagged = judge("rm -f /home/user/notes.txt");
+        assert_eq!(flagged.decision, PolicyDecision::Deny);
+        assert_eq!(flagged.rule_id.as_deref(), Some("deny-destructive-commands"));
     }
 
     /// Raw-block-device writes. Until 2026-08-07 `deny-destructive-commands`

@@ -37,7 +37,7 @@ Each row: rule id, where it lives, what it keys on, harm it targets, and whether
 
 | Rule id | Where (`core/src/policy/presets.rs` @ c7ec7bd) | Keys on | Harm targeted |
 |---|---|---|---|
-| `allow-rm-whitelisted-scratch` | `:42-80` (priority 0) | `rm` standing alone against absolute `/tmp` paths, no chaining, no `..` | (allow rule; carves the deny below) |
+| `allow-rm-whitelisted-scratch` | `:42-80` (priority 0) | flagged `rm` standing alone against absolute `/tmp` paths, no chaining, no `..`; flagless `rm` instead warns and proceeds through `warn-file-delete`, including outside `/tmp` | (allow rule; carves the deny below) |
 | `deny-destructive-commands` | `:81-195` (priority 1) | Regexes over **executable positions** (`MatchScope::ExecutablePositions`, `shell.rs`): delete-verb `\b<rm>\s+-`, `\bmkfs\b`, `\bshred\b`, `\bof=<dev>`, `>\s*<dev>`, `\btee ... <dev>`, `\b(cp|mv|install) ... <dev>` | Destroying a filesystem or block device |
 | `warn-file-delete` | `:198-225` (priority 2, warn) | delete-verb `\b<rm>\s+[^-]` in executable positions | Flagging plain deletes |
 | `deny-secret-files` | `:225-262` (priority 3) | Glob patterns on `file_read`/`credential_access` targets: secret/key file globs (env files, key files, cloud/service configs) | Reading secret files (path-shaped, not substring) |
